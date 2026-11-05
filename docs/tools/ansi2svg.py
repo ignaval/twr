@@ -3,6 +3,7 @@
 
 Usage: ansi2svg.py CAPTURE.ans OUTPUT.svg [--title TEXT]
        ansi2svg.py --frames DIR OUTPUT.svg [--title TEXT] [--max-hold SECS] [--poster-time T]
+                   [--still STILL.svg]
 
 CAPTURE.ans is what `tmux capture-pane -e -p` prints: one line per terminal row, with SGR
 escape sequences. The SVG is a grid of monospace cells on a dark background, as wide as the
@@ -16,7 +17,8 @@ the Unix time it was taken. The SVG plays them in a loop with CSS animation, eac
 long as it was on screen, at most --max-hold seconds (default 3). A frame that differs from the
 one before only in the working icon is dropped. Every element is drawn once and shown in the
 frames that have it, so a frame costs only what changed. Viewers that ask for reduced motion
-see one still frame: the one on screen at --poster-time, else the last.
+see one still frame: the one on screen at --poster-time, else the last. --still also writes
+that frame alone to STILL.svg, a still image of the same size (for a page's pause control).
 
 Python standard library only.
 """
@@ -241,9 +243,10 @@ def header(ncols, nrows, title, extra_css=""):
     return out
 
 
-def render(rows, title=None):
-    ncols = max((len(r) for r in rows), default=0)
-    out = header(ncols, len(rows), title)
+def render(rows, title=None, size=None):
+    """An SVG of ROWS, as large as they are or SIZE (ncols, nrows)."""
+    ncols, nrows = size or (max((len(r) for r in rows), default=0), len(rows))
+    out = header(ncols, nrows, title)
     for layer in layers(rows):
         out += layer
     out.append("</svg>")
@@ -425,6 +428,13 @@ def load_frames(directory, max_hold):
     return frames
 
 
+def poster_index(frames, poster_time):
+    """The frame on screen at POSTER_TIME, else the last."""
+    if poster_time is None:
+        return len(frames) - 1
+    return max((i for i, f in enumerate(frames) if f[2] <= poster_time), default=0)
+
+
 def animate(frames, title=None, poster_time=None):
     """One SVG that plays FRAMES ([(rows, seconds, start_time)]) in a loop."""
     nrows = max(len(trim(rows)) for rows, _, _ in frames)
@@ -435,9 +445,7 @@ def animate(frames, title=None, poster_time=None):
     for _, d, _ in frames:
         starts.append(at)
         at += d
-    poster = len(frames) - 1
-    if poster_time is not None:
-        poster = max((i for i, f in enumerate(frames) if f[2] <= poster_time), default=0)
+    poster = poster_index(frames, poster_time)
 
     # Each element, per layer, with the set of frames it is in.
     seen = [{}, {}, {}, {}]
@@ -496,11 +504,20 @@ def main(argv):
     frames_dir = option(args, "--frames")
     max_hold = float(option(args, "--max-hold", "3"))
     poster_time = option(args, "--poster-time")
-    if len(args) != (1 if frames_dir else 2):
+    still = option(args, "--still")
+    if len(args) != (1 if frames_dir else 2) or (still and not frames_dir):
         sys.exit(__doc__.split("\n\n")[1])
     if frames_dir:
         frames = load_frames(frames_dir, max_hold)
-        svg = animate(frames, title, float(poster_time) if poster_time else None)
+        at = float(poster_time) if poster_time else None
+        svg = animate(frames, title, at)
+        if still:
+            # As large as the animation, so the one can stand in for the other.
+            nrows = max(len(trim(list(rows))) for rows, _, _ in frames)
+            ncols = max((len(r) for rows, _, _ in frames for r in rows), default=0)
+            rows = trim(list(frames[poster_index(frames, at)][0]))
+            with open(still, "w", encoding="utf-8") as f:
+                f.write(render(rows, title, (ncols, nrows)))
     else:
         svg = render(trim(read_rows(args[0])), title)
     with open(args[-1], "w", encoding="utf-8") as f:

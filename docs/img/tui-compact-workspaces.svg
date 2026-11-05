@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="364" height="388" viewBox="0 0 364 388" role="img" aria-label="twr on a phone: the Threads screen&#x27;s last cards of the current workspace, then the other workspaces with their threads">
+<title>twr on a phone: the Threads screen&#x27;s last cards of the current workspace, then the other workspaces with their threads</title>
+<style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<rect x="14" y="14" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="14" width="109.2" height="18" fill="#444444"/>
+<rect x="240.8" y="14" width="92.4" height="18" fill="#c9d1d9"/>
+<rect x="14" y="32" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="32" width="109.2" height="18" fill="#444444"/>
+<rect x="30.8" y="230" width="67.2" height="18" fill="#ffd700"/>
+<rect x="14" y="284" width="159.6" height="18" fill="#444444"/>
+<rect x="182" y="284" width="92.4" height="18" fill="#444444"/>
+<rect x="22.4" y="302" width="134.4" height="18" fill="#5fd7d7"/>
+<rect x="22.4" y="74.8" width="8.4" height="11.2" fill="#d7875f"/>
+<path d="M18.2 311H22.4M266 311H345.8M18.2 347H345.8M18.2 311V347M345.8 311V347" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M43.4 113H47.6M43.4 149H47.6M43.4 185H47.6M43.4 104V185" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<text x="47.6" y="27.5" fill="#d0d0d0" textLength="33.6">Chat</text>
+<text x="131.6" y="27.5" fill="#ffd700" class="b" textLength="92.4">Needs you 3</text>
+<text x="249.2" y="27.5" fill="#0d1117" class="b" textLength="84">Threads ⚠1</text>
+<text x="341.6" y="63.5" fill="#6e7681">↑</text>
+<text x="39.2" y="81.5" fill="#c9d1d9" class="b" textLength="67.2">client-x</text>
+<text x="299.6" y="81.5" fill="#d29922" class="b" textLength="16.8">⚠1</text>
+<text x="324.8" y="81.5" fill="#c9d1d9" class="b" textLength="16.8">●1</text>
+<text x="39.2" y="99.5" fill="#d29922" class="b" textLength="201.6">working · waiting on you</text>
+<text x="56" y="117.5" fill="#87af00" class="b" textLength="100.8">crash-triage</text>
+<text x="72.8" y="135.5" fill="#d29922" class="b" textLength="117.6">waiting on you</text>
+<text x="56" y="153.5" fill="#ff00ff" class="b" textLength="84">push-retry</text>
+<text x="72.8" y="171.5" fill="#3fb950" textLength="58.8">running</text>
+<text x="56" y="189.5" fill="#0087af" class="b" textLength="92.4">store-notes</text>
+<text x="72.8" y="207.5" fill="#58a6ff" textLength="33.6">done</text>
+<text x="22.4" y="243.5" fill="#6e7681">○</text>
+<text x="39.2" y="243.5" fill="#000000" class="b" textLength="58.8">scratch</text>
+<text x="39.2" y="261.5" fill="#6e7681" textLength="126">hub not running</text>
+<text x="22.4" y="297.5" fill="#d0d0d0" textLength="126">+ New workspace</text>
+<text x="190.4" y="297.5" fill="#d0d0d0" textLength="84">⚙ Settings</text>
+<text x="30.8" y="315.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
+<text x="165.2" y="315.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
+<text x="22.4" y="333.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
+<text x="14" y="369.5" fill="#6e7681" textLength="336">↑↓/tap select · Enter/tap again: actions</text>
+</svg>

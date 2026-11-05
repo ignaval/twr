@@ -306,6 +306,6 @@ rec_pid=""
 
 mkdir -p docs/img
 python3 docs/tools/ansi2svg.py --frames "$work/frames" docs/img/tui-demo.svg --max-hold 3.5 \
-    --poster-time "$(cat "$work/poster.t")" \
+    --poster-time "$(cat "$work/poster.t")" --still docs/img/tui-demo-still.svg \
     --title "twr in use: the user asks the orchestrator for two threads, answers one permission in its card's popup and one in the conversation, and opens a thread's transcript"
-ls -l docs/img/tui-demo.svg
+ls -l docs/img/tui-demo.svg docs/img/tui-demo-still.svg
