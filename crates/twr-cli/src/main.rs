@@ -9297,11 +9297,7 @@ fn history_lock(ws: &Paths) -> anyhow::Result<WorkspaceLock> {
 /// twr's data directory (its `runner-<box>.db`): its worktrees and trash are `default`'s
 /// directories too, which the removal would take.
 fn runner_in_root_why(root: &Paths) -> Option<String> {
-    let runner = std::fs::read_dir(&root.data_dir)
-        .ok()?
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .find(|n| n.starts_with("runner-") && n.ends_with(".db"))?;
+    let runner = twr_core::workspaces::runner_spool(root)?;
     Some(format!(
         "a `twr runner` of this machine keeps its data in {} ({runner}), and its worktrees and \
          trash there are this workspace's directories too: stop it and give it a `--data-dir` \

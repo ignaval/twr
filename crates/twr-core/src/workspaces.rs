@@ -355,6 +355,16 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
             bail!(why);
         }
         crate::paths::check_socket_path(&root.socket)?;
+        // What a removal cut short left goes (`worktrees/` and `trash/` among it), which a
+        // `twr runner` keeping its data here would use as its own.
+        if let Some(spool) = runner_spool(&root) {
+            bail!(
+                "a `twr runner` of this machine keeps its data in {} ({spool}), whose worktrees \
+                 and trash there `default` would take for its own: stop it and give it a \
+                 `--data-dir` of its own, then make the workspace again",
+                root.data_dir.display()
+            );
+        }
         clear_root_leftovers(&root)?;
         new_generation(&root)?;
         let had_default = root.default_id().is_some();
@@ -410,6 +420,16 @@ fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The spool of a `twr runner` keeping its data in the root's data directory (its default),
+/// `runner-<box>.db`, if there is one.
+pub fn runner_spool(root: &Paths) -> Option<String> {
+    std::fs::read_dir(&root.root().data_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("runner-") && n.ends_with(".db"))
 }
 
 /// Whether `name`, an entry of the root's data directory, is the root slot's own: one of
@@ -686,6 +706,12 @@ mod tests {
         // Nothing to select without `-w`; `default` names none.
         assert!(root.default_workspace().is_none());
         assert!(!root.find_workspace("default").unwrap().exists());
+        // Not while a runner keeps its data there: its worktrees and trash would go.
+        std::fs::write(root.data_dir.join("runner-gpu.db"), "").unwrap();
+        let e = create(&root, "default").unwrap_err().to_string();
+        assert!(e.contains("a `twr runner` of this machine"), "{e}");
+        assert!(root.data_dir.join("twr.db").exists() && root.root_removed());
+        std::fs::remove_file(root.data_dir.join("runner-gpu.db")).unwrap();
         // A half done removal's leftovers go when it is made again; the rest stays.
         let made = create(&root, "default").unwrap();
         assert!(made.root_slot && made.made_default);
