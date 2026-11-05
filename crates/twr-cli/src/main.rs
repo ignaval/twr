@@ -9764,11 +9764,22 @@ async fn plan_removal_of(
             (workers, items, true)
         }
         Probe::Absent => {
+            // Read under the workspace's lock (as `twr ws rm` and its hub take it): its log is
+            // never opened, and so never made again, once a removal has it.
             let ws2 = ws.clone();
-            let ((threads, _, unfinished), trash) = tokio::task::spawn_blocking(move || {
-                anyhow::Ok((ws_threads(&ws2)?, trash_items(&ws2)?))
+            let read = tokio::task::spawn_blocking(move || {
+                let Some(_lock) = lock_workspace(&ws2)? else {
+                    return anyhow::Ok(None);
+                };
+                if !ws2.exists() {
+                    bail!("there is no workspace {} any more", ws2.workspace_id());
+                }
+                anyhow::Ok(Some((ws_threads(&ws2)?, trash_items(&ws2)?)))
             })
             .await??;
+            let Some(((threads, _, unfinished), trash)) = read else {
+                return refused("its hub is starting or stopping: try again in a moment".into());
+            };
             if unfinished && threads.is_empty() && trash == 0 {
                 return refused(unfinished_why(&name));
             }
