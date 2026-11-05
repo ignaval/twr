@@ -447,10 +447,11 @@ pub fn check_private_dir(dir: &Path) -> anyhow::Result<()> {
 fn private_dir(dir: &Path, create: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let mut created = false;
-    if !create && std::fs::symlink_metadata(dir).is_err() {
-        return Err(anyhow!("{} does not exist", dir.display()));
-    }
     if std::fs::symlink_metadata(dir).is_err() {
+        // (One check: a directory removed after it would otherwise be made here.)
+        if !create {
+            return Err(anyhow!("{} does not exist", dir.display()));
+        }
         if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .map_err(|e| anyhow!("creating {}: {e}", parent.display()))?;
@@ -1119,6 +1120,21 @@ mod tests {
         assert_eq!(workspace_selection("default", Some("default")), "");
         assert_eq!(workspace_selection("default", Some("a")), " -w default");
         assert_eq!(workspace_selection("default", None), " -w default");
+    }
+
+    /// `check_private_dir` checks a directory that exists and never makes one that does not:
+    /// whatever happens between its looks, it opens what is there (`open_dir`, which fails on
+    /// none).
+    #[test]
+    fn a_checked_private_dir_is_never_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        assert!(check_private_dir(&gone).is_err());
+        assert!(!gone.exists());
+        std::fs::create_dir(&gone).unwrap();
+        check_private_dir(&gone).unwrap();
+        ensure_private_dir(&dir.path().join("made")).unwrap();
+        assert!(dir.path().join("made").is_dir());
     }
 
     #[test]
