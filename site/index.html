@@ -3,644 +3,667 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>twr: one conversation for all your coding agents</title>
-<meta name="description" content="Talk to one orchestrator and it runs Claude Code, Codex, Grok Build and any ACP agent in parallel, each in its own git worktree, on this machine or on remote boxes. Reports, questions and permission prompts come back into the same conversation, on a desktop terminal or a phone. One local binary for Linux and macOS.">
+<title>twr: talk to one agent, it runs the rest</title>
+<meta name="description" content="In twr you talk to one orchestrator. It starts named threads on Claude Code, Codex, Grok Build or any ACP agent, each in its own git worktree, sends them your follow-ups by name, and brings their questions, permissions and results back to the same conversation. One local binary for Linux and macOS.">
 <link rel="canonical" href="https://twr.tools/">
-<meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#f7f5f0" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#101113" media="(prefers-color-scheme: dark)">
-<meta property="og:title" content="twr: one conversation for all your coding agents">
-<meta property="og:description" content="One orchestrator runs Claude Code, Codex, Grok Build and ACP agents in parallel, each in its own git worktree. What needs you comes back to one conversation.">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0f1115">
+<meta property="og:title" content="twr: talk to one agent, it runs the rest">
+<meta property="og:description" content="One conversation with an orchestrator that starts coding-agent threads, sends them follow-ups by name and brings back what they need from you.">
 <meta property="og:url" content="https://twr.tools/">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23141413'/%3E%3Cpath d='M8 23h16' stroke='%23e88a4f' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="preload" as="image" href="tui-demo.svg" type="image/svg+xml" media="(prefers-reduced-motion: no-preference)">
 <style>
   :root {
-    --bg: #f7f5f0;
-    --fg: #1b1a18;
-    --muted: #5b574f;
-    --rule: #dcd7cc;
-    --panel: #eeeae1;
-    --accent: #a5441a;
-    --accent-fg: #fff;
-    --cyan: #0b6a73;
-    --yellow: #7a5a00;
-    --term: #0d1117;
-    --term-rule: #2b313b;
-    --term-fg: #c9d1d9;
-    --term-muted: #8b949e;
+    --bg: #0f1115; --panel: #151821; --panel2: #1b1f2a; --deep: #0c0e13; --line: #2a303c; --wire: #3a4252;
+    --text: #e8e6e1; --muted: #a3a9b4; --dim: #7f8794;
+    --accent: #f0935a; --teal: #5fd0d8; --ok: #7fd18b; --warn: #f2c14e;
+    --t1: #1aa3d1; --t2: #ff5ef7;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
-    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    --wide: 1180px;
-    --text: 680px;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #101113;
-      --fg: #ecebe6;
-      --muted: #a8a59c;
-      --rule: #2b2c30;
-      --panel: #18191c;
-      --accent: #f0935a;
-      --accent-fg: #141413;
-      --cyan: #5fd0d8;
-      --yellow: #e6c35c;
-      --term-rule: #30363d;
-    }
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html { -webkit-text-size-adjust: 100%; }
   @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--fg);
-    font: 17px/1.6 var(--sans);
-    overflow-wrap: break-word;
-  }
-  a { color: var(--accent); text-underline-offset: 0.18em; }
-  a:hover { text-decoration-thickness: 2px; }
-  :focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; border-radius: 3px; }
-  code, kbd, .mono { font-family: var(--mono); font-size: 0.88em; }
-  code { background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; padding: 0.05em 0.35em; }
-  kbd {
-    display: inline-block;
-    border: 1px solid var(--rule);
-    border-bottom-width: 2px;
-    border-radius: 4px;
-    padding: 0 0.35em;
-    background: var(--panel);
-    line-height: 1.45;
-    white-space: nowrap;
-  }
-  p { margin: 0 0 16px; }
-  ul { margin: 0 0 16px; padding-left: 1.2em; }
-  li { margin-bottom: 6px; }
-  li::marker { color: var(--muted); }
-  .wrap { max-width: var(--wide); margin: 0 auto; padding: 0 20px; }
-  .muted { color: var(--muted); }
-  .skip {
-    position: absolute; left: 12px; top: -48px; z-index: 10;
-    background: var(--fg); color: var(--bg); padding: 8px 12px; border-radius: 6px;
-  }
-  .skip:focus { top: 12px; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 var(--sans); overflow-wrap: break-word; }
+  a { color: var(--teal); text-underline-offset: 3px; }
+  a:hover { color: #9be7ec; }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+  code, pre, kbd { font-family: var(--mono); font-size: .92em; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; margin: 0; }
+  .skip { position: absolute; left: -999px; top: 8px; background: var(--accent); color: #111; padding: 8px 14px; border-radius: 6px; z-index: 10; }
+  .skip:focus { left: 8px; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px; }
 
-  /* Header: the wordmark and a short nav, like a terminal's status line. */
-  header.top { border-bottom: 1px solid var(--rule); }
-  header.top .wrap { display: flex; align-items: center; gap: 16px; min-height: 56px; flex-wrap: wrap; }
-  .brand {
-    font: 700 22px/1 var(--mono); color: var(--fg); text-decoration: none; letter-spacing: -0.02em;
-    padding: 6px 0;
-  }
-  .brand span { color: var(--accent); }
-  /* The cursor breathes, like the TUI's working icon; still for reduced motion. */
-  @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-  /* A few breaths only: nothing on the page blinks for more than five seconds. */
-  @media (prefers-reduced-motion: no-preference) { .brand span, .wordmark span { animation: breathe 1.5s ease-in-out 3; } }
-  nav.links { margin-left: auto; }
-  nav.links ul { display: flex; flex-wrap: wrap; gap: 4px 18px; list-style: none; margin: 0; padding: 0; }
-  nav.links li { margin: 0; }
-  nav.links a { color: var(--fg); text-decoration: none; font: 500 15px/1 var(--mono); display: inline-block; padding: 8px 0; }
-  nav.links a:hover { color: var(--accent); }
-  @media (max-width: 620px) { nav.links .opt { display: none; } }
+  header.top { border-bottom: 1px solid var(--line); }
+  header.top .wrap { display: flex; align-items: center; gap: 24px; min-height: 60px; flex-wrap: wrap; }
+  .logo { font: 700 20px var(--mono); color: var(--text); text-decoration: none; }
+  .logo span { color: var(--accent); }
+  nav.links { display: flex; gap: 6px 20px; flex-wrap: wrap; margin-left: auto; font-size: 15px; }
+  nav.links a { color: var(--muted); text-decoration: none; padding: 6px 0; }
+  nav.links a:hover { color: var(--text); }
 
-  /* Hero. */
-  .hero { padding-top: 56px; padding-bottom: 24px; }
-  .eyebrow { font: 600 14px/1.4 var(--mono); color: var(--muted); margin: 0 0 14px; letter-spacing: 0.02em; }
-  .eyebrow b { color: var(--accent); font-weight: 600; }
-  h1 {
-    font: 700 clamp(34px, 6vw, 60px)/1.05 var(--mono);
-    letter-spacing: -0.035em;
-    margin: 0 0 18px;
-    max-width: 16ch;
-  }
-  .lede { font-size: clamp(18px, 2.1vw, 21px); line-height: 1.5; max-width: 40em; margin: 0 0 28px; }
-  .lede b { font-weight: 600; }
-  .cta { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; margin: 0 0 8px; }
-  .install {
-    display: flex; align-items: center; gap: 8px;
-    background: var(--term); color: var(--term-fg);
-    border: 1px solid var(--term-rule); border-radius: 10px;
-    padding: 8px 8px 8px 16px;
-    max-width: 100%;
-    flex: 0 1 560px;
-  }
-  .install code {
-    flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap;
-    background: none; border: 0; padding: 6px 0; color: var(--term-fg);
-    font-size: 15px; scrollbar-width: thin;
-  }
-  .install code::before { content: "$ "; color: var(--term-muted); }
-  /* On a phone the whole command shows, wrapped, rather than scrolled out of sight. */
-  @media (max-width: 480px) { .install code { white-space: normal; overflow-wrap: anywhere; } }
-  .copy {
-    font: 600 14px/1 var(--mono);
-    color: #141413; background: #f0935a;
-    border: 0; border-radius: 7px;
-    padding: 10px 14px; min-height: 40px; min-width: 76px;
-    cursor: pointer; flex: none;
-  }
-  .copy:hover { background: #f5a877; }
-  .copy:focus-visible { outline-color: #5fd0d8; }
-  .links-row { display: flex; flex-wrap: wrap; gap: 8px 20px; font: 500 15px/1.4 var(--mono); }
-  .links-row a { padding: 6px 0; display: inline-block; }
-  .fine { font-size: 14px; color: var(--muted); margin: 8px 0 0; }
-  .copy-status { min-height: 1.4em; font-size: 14px; color: var(--muted); margin: 6px 0 0; }
+  /* Hero: the pitch and the install command, then the conversation across the page. */
+  .hero { padding: 40px 0 56px; display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); grid-template-areas: "pitch lead" "pitch cta" "board board"; gap: 0 56px; }
+  .pitch { grid-area: pitch; } .hero .lead { grid-area: lead; } .cta { grid-area: cta; } .demo { grid-area: board; margin-top: 30px; }
+  .eyebrow { font: 13px var(--mono); color: var(--dim); margin: 0 0 18px; }
+  h1 { font-size: clamp(34px, 4.8vw, 56px); line-height: 1.04; letter-spacing: -.02em; margin: 0; }
+  h1 em { font-style: normal; color: var(--accent); }
+  .lead { font-size: 17.5px; color: #d0d3d9; margin: 4px 0 18px; }
+  .lead b { color: var(--text); }
+  .install { display: flex; align-items: stretch; border: 1px solid var(--line); background: var(--panel); border-radius: 10px; overflow: hidden; max-width: 100%; }
+  .install code { flex: 1; min-width: 0; padding: 13px 14px; overflow-x: auto; white-space: nowrap; font-size: 14px; }
+  .install code::before { content: "$ "; color: var(--dim); }
+  .copy { font: 600 14px var(--sans); background: var(--accent); color: #17110c; border: 0; padding: 0 18px; min-width: 84px; cursor: pointer; }
+  .copy:hover { background: #ffa874; }
+  .status { min-height: 1.4em; font-size: 14px; color: var(--muted); margin: 6px 0 0; }
+  .more { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 15px; margin-top: 4px; }
 
-  /* Terminal frames around the real captures. */
-  .term {
-    margin: 0;
-    background: var(--term);
-    border: 1px solid var(--term-rule);
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 18px 50px -24px rgba(0,0,0,.45);
-  }
-  .term-bar {
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    padding: 8px 12px 8px 14px;
-    border-bottom: 1px solid var(--term-rule);
-    color: var(--term-muted);
-    font: 13px/1.4 var(--mono);
-  }
-  .term-bar .label { color: var(--term-fg); }
-  .term-bar .size { margin-left: auto; }
-  @media (max-width: 620px) { .term-bar .aside { display: none; } }
-  .term-bar button {
-    font: 600 13px/1 var(--mono);
-    color: var(--term-fg); background: transparent;
-    border: 1px solid var(--term-rule); border-radius: 6px;
-    padding: 7px 10px; min-height: 32px; cursor: pointer;
-  }
-  .term-bar button:hover { border-color: var(--term-muted); }
-  .term-bar button:focus-visible { outline-color: #5fd0d8; }
-  .pan { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; scrollbar-color: var(--term-rule) transparent; }
-  .pan img { display: block; width: 100%; height: auto; }
-  /* A wide capture stays readable on a narrow screen: it keeps a minimum width and pans. */
-  @media (max-width: 760px) {
-    .pan.wide img { width: 760px; max-width: none; }
-    .pan-hint { display: block; }
-  }
-  .pan-hint { display: none; font: 13px/1.4 var(--mono); color: var(--muted); margin: 8px 0 0; }
-  figcaption { font-size: 15px; color: var(--muted); margin-top: 12px; max-width: 62em; }
-  figure { margin: 0; }
-  .hero-shot { margin: 36px 0 0; }
+  /* The switchboard: the conversation, the orchestrator and the threads, with wires between
+     them that carry each message. */
+  .convo { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; box-shadow: 0 30px 80px -40px #000; }
+  .convo-bar { margin: 0; display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); font: 400 13px var(--mono); letter-spacing: 0; color: var(--muted); }
+  .convo-bar b { background: var(--teal); color: #071214; padding: 1px 7px; border-radius: 3px; }
+  .convo-bar .tag { margin-left: auto; color: var(--dim); }
+  .board { position: relative; display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, .6fr) minmax(0, .95fr); grid-template-areas: "chat orch threads"; gap: 0 84px; padding: 18px; }
+  .wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; z-index: 2; }
+  .wires path { fill: none; stroke: var(--wire); stroke-width: 1.5; stroke-dasharray: 4 5; }
+  .wires path.idle-hub { stroke-dasharray: 2 6; opacity: .8; }
+  .wires path.live { stroke: var(--c); stroke-dasharray: none; stroke-width: 2; }
+  .wires circle { fill: var(--c); }
+  .wires text { font: 600 12px var(--mono); fill: var(--text); text-anchor: middle; paint-order: stroke; stroke: var(--panel); stroke-width: 5px; stroke-linejoin: round; }
 
-  /* Sections. */
-  section { padding: 72px 0 8px; scroll-margin-top: 8px; }
-  .kicker { font: 600 14px/1.4 var(--mono); color: var(--accent); margin: 0 0 10px; }
-  .kicker::before { content: "## "; color: var(--muted); }
-  h2 { font: 700 clamp(26px, 3.4vw, 36px)/1.15 var(--mono); letter-spacing: -0.025em; margin: 0 0 16px; max-width: 24ch; }
-  h3 { font: 700 18px/1.3 var(--mono); margin: 0 0 10px; letter-spacing: -0.01em; }
-  .intro { max-width: var(--text); }
+  .chat { grid-area: chat; position: relative; z-index: 1; display: flex; flex-direction: column; min-width: 0; background: var(--deep); border: 1px solid var(--line); border-radius: 8px; }
+  .log { list-style: none; margin: 0; padding: 12px 14px 4px; height: 340px; overflow-y: auto; font: 13.5px/1.55 var(--mono); }
+  .log li { margin: 0 0 11px; display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 6px; }
+  .log li.hidden { display: none; }
+  .log li.in { animation: rise .35s ease-out; }
+  @keyframes rise { from { transform: translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .log .g { color: var(--dim); }
+  .log .you .g { color: var(--accent); }
+  .log .you .t { background: #262b36; padding: 1px 6px; border-radius: 3px; justify-self: start; }
+  .log .orch .g { color: var(--teal); }
+  .log .tool .t { color: var(--dim); }
+  .log .hub .t { color: var(--muted); }
+  .log .rep .g { color: var(--ok); }
+  .log .h { color: var(--c); font-weight: 700; }
+  .log .note { display: block; font: 12.5px/1.4 var(--sans); color: var(--accent); margin-top: 3px; }
+  .log .note code { font-size: 12px; }
+  .perm { border: 1px solid var(--c); border-radius: 6px; padding: 7px 9px; }
+  .perm .badge { background: #f28c7a; color: #1b0d0a; padding: 0 5px; font-weight: 700; }
+  .perm-done { display: none; color: var(--muted); }
+  .perm-row.resolved .perm { display: none; }
+  .perm-row.resolved .perm-done { display: block; }
+  .inbox { margin: 6px 12px 12px; border: 1px solid var(--teal); border-radius: 6px; padding: 7px 10px; font: 13.5px var(--mono); min-height: 40px; color: var(--text); position: relative; }
+  .inbox .lbl { position: absolute; top: -10px; left: 10px; background: var(--deep); padding: 0 6px; font-size: 12px; color: var(--teal); }
+  .inbox .ph { color: var(--dim); }
+  .caret { display: inline-block; width: 8px; height: 1.1em; background: var(--accent); vertical-align: -2px; margin-left: 1px; }
 
-  /* How it works: three steps on a rule, numbered like turns. */
-  .steps { list-style: none; padding: 0; margin: 28px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border-top: 2px solid var(--fg); }
-  .steps li { margin: 0; padding: 18px 22px 8px 0; }
-  .steps li + li { padding-left: 22px; border-left: 1px solid var(--rule); }
-  .steps .n { font: 700 14px/1 var(--mono); color: var(--accent); display: block; margin-bottom: 10px; }
-  .steps p { margin-bottom: 8px; }
-  @media (max-width: 820px) {
+  .col-orch { grid-area: orch; position: relative; z-index: 1; display: flex; align-items: center; }
+  .node { border: 1px solid var(--c); background: var(--deep); border-radius: 6px; padding: 8px 10px; font: 13px/1.45 var(--mono); min-width: 0; }
+  .node .n { display: block; color: var(--c); font-weight: 700; overflow-wrap: anywhere; }
+  .node .p { display: block; color: var(--dim); font-size: 12px; }
+  .node .s { display: block; margin-top: 4px; color: var(--muted); font-size: 12.5px; }
+  .node .s.running { color: var(--ok); } .node .s.waiting { color: var(--warn); } .node .s.done { color: var(--teal); }
+  .node.orch { --c: var(--teal); width: 100%; }
+  .threads { grid-area: threads; position: relative; z-index: 1; display: flex; flex-direction: column; justify-content: center; gap: 22px; min-width: 0; }
+  .threads h3 { margin: 0; font: 600 12px var(--mono); color: var(--dim); letter-spacing: .08em; }
+  .node.pop { animation: pop .45s ease-out; }
+  @keyframes pop { from { transform: scale(.94); opacity: 0; } to { transform: none; opacity: 1; } }
+  .threads .empty { border: 1px dashed var(--wire); border-radius: 6px; padding: 9px 10px; color: var(--dim); font: 12.5px var(--mono); margin: 0; }
+
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); background: var(--panel2); }
+  .controls button { font: 600 13px var(--sans); background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; min-height: 36px; cursor: pointer; }
+  .controls button:hover { border-color: var(--muted); }
+  .says { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto; min-width: 0; }
+  .says .lbl { font: 12.5px var(--mono); color: var(--dim); margin-right: 2px; }
+  .controls .chip { font: 400 13px var(--mono); text-align: left; color: var(--muted); max-width: 100%; }
+  .controls .chip .k { color: var(--accent); }
+  .controls .chip.next { color: var(--text); border-color: var(--accent); }
+  .controls .chip.said { color: var(--dim); }
+  .fine { font-size: 13.5px; color: var(--dim); }
+  .fine a { color: var(--muted); }
+  .board-note { margin: 10px 2px 0; }
+  .board-note .key { color: var(--accent); }
+
+  section { padding: 64px 0; border-top: 1px solid var(--line); }
+  .kicker { font: 13px var(--mono); color: var(--accent); margin: 0 0 10px; }
+  h2 { font-size: clamp(26px, 3.2vw, 38px); line-height: 1.15; letter-spacing: -.01em; margin: 0 0 14px; }
+  .intro { color: #c9ccd2; max-width: 720px; margin: 0 0 32px; font-size: 17px; }
+
+  /* What happened, step by step. */
+  .steps { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px; counter-reset: s; }
+  .steps li { border: 1px solid var(--line); border-radius: 12px; padding: 18px; background: var(--panel); counter-increment: s; }
+  .steps li::before { content: "0" counter(s); font: 600 13px var(--mono); color: var(--accent); }
+  .steps h3 { margin: 6px 0 8px; font-size: 18px; }
+  .steps .say { font: 13.5px/1.45 var(--mono); background: #262b36; padding: 6px 8px; border-radius: 4px; margin: 0 0 10px; }
+  .steps p { margin: 0 0 8px; font-size: 15px; color: #c9ccd2; }
+  .steps .under { font: 12.5px/1.45 var(--mono); color: var(--dim); }
+
+  /* The real recording. */
+  .term { margin: 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #0d1117; }
+  .term-bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); font: 13px var(--mono); color: var(--muted); }
+  .term-bar button { margin-left: auto; font: 600 13px var(--sans); background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; min-height: 36px; cursor: pointer; }
+  .term img { display: block; width: 100%; height: auto; }
+  .term figcaption { padding: 10px 14px; font-size: 13.5px; color: var(--dim); border-top: 1px solid var(--line); }
+
+  /* Around the conversation. */
+  .around { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .around div { padding: 20px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .around div:nth-child(3n) { border-right: 0; }
+  .around div:nth-last-child(-n+3) { border-bottom: 0; }
+  .around h3 { margin: 0 0 6px; font-size: 16px; }
+  .around p { margin: 0; font-size: 14.5px; color: #c4c8cf; }
+  .local { margin-top: 26px; font-size: 15px; color: var(--muted); max-width: 820px; }
+
+  .install-steps { padding-left: 22px; max-width: 820px; }
+  .install-steps li { margin-bottom: 18px; }
+  .install-steps li::marker { color: var(--accent); font-weight: 700; }
+  pre.cmd { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-size: 13.5px; line-height: 1.6; margin: 10px 0; }
+  pre.cmd .c { color: var(--dim); }
+  footer { border-top: 1px solid var(--line); padding: 28px 0 40px; font-size: 14px; color: var(--dim); }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+  footer a { color: var(--muted); }
+
+  @media (max-width: 1020px) {
+    .hero { grid-template-columns: minmax(0, 1fr); grid-template-areas: "pitch" "lead" "board" "cta"; padding-top: 32px; }
+    .hero .lead { margin: 18px 0 0; }
+    .demo { margin: 24px 0 28px; }
+    .board { gap: 0 56px; }
+    .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 720px) {
+    .wrap { padding: 0 16px; }
+    .lead { font-size: 16.5px; }
+    nav.links .inpage { display: none; }
+    .convo-bar .tag { display: none; }
+    /* The orchestrator and the threads side by side, the conversation under them. */
+    .board { grid-template-columns: minmax(0, 36fr) minmax(0, 64fr); grid-template-areas: "orch threads" "chat chat"; gap: 38px 14px; padding: 12px; }
+    .log { height: min(270px, 42vh); padding: 10px 10px 4px; font-size: 13px; }
+    .inbox { margin: 6px 10px 10px; font-size: 13px; }
+    .node { padding: 6px 8px; font-size: 12px; }
+    .node .s { font-size: 11.5px; margin-top: 2px; }
+    .node .p { display: none; }
+    .threads { justify-content: flex-start; gap: 8px; min-height: 118px; }
+    .threads h3 { display: none; }
+    .says { margin-left: 0; width: 100%; }
     .steps { grid-template-columns: minmax(0, 1fr); }
-    .steps li, .steps li + li { padding: 16px 0 6px; border-left: 0; border-bottom: 1px solid var(--rule); }
+    .around { grid-template-columns: minmax(0, 1fr); }
+    .around div { border-right: 0 !important; border-bottom: 1px solid var(--line) !important; }
+    .around div:last-child { border-bottom: 0 !important; }
+    section { padding: 48px 0; }
   }
-
-  /* A capture with its notes under it, in columns. */
-  .split { margin-top: 28px; }
-  .notes { list-style: none; padding: 0; margin: 28px 0 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0 28px; }
-  .notes li { padding: 14px 0 6px; border-top: 2px solid var(--fg); margin: 0 0 12px; font-size: 16px; }
-  .notes b { font-family: var(--mono); font-size: 15px; display: block; margin-bottom: 4px; }
-
-  /* The phone. */
-  /* The phone captures show at their own size (40 columns) or larger, never shrunk below it
-     while the screen has the room. */
-  .phones { display: grid; grid-template-columns: repeat(2, minmax(0, 384px)); gap: 28px; margin-top: 28px; }
-  .phones .term { border-radius: 22px; padding: 10px; }
-  .phones .term img { display: block; width: 100%; height: auto; border-radius: 10px; }
-  .phone-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 40px; align-items: start; margin-top: 8px; }
-  .phone-row .phones { margin-top: 20px; }
-  .phone-row ul { margin-top: 20px; max-width: var(--text); }
-  @media (max-width: 1220px) { .phone-row { grid-template-columns: minmax(0, 1fr); } .phone-row ul { margin-top: 8px; } }
-  @media (max-width: 700px) { .phones { grid-template-columns: minmax(0, 400px); } }
-
-  /* Feature groups: a terminal-ish index, not cards. */
-  .groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 48px; margin-top: 28px; }
-  .group { border-top: 2px solid var(--fg); padding: 18px 0 12px; }
-  .group h3 .tag { color: var(--accent); }
-  .group ul { padding-left: 1.1em; }
-  .more { font: 500 14px/1.4 var(--mono); }
-  .more a { display: inline-block; padding: 4px 0; }
-  @media (max-width: 820px) { .groups { grid-template-columns: minmax(0, 1fr); } }
-
-  /* What runs where. */
-  .ledger { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin-top: 28px; border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; }
-  .ledger > div { padding: 20px 22px 8px; background: var(--panel); }
-  .ledger > div + div { border-left: 1px solid var(--rule); }
-  .ledger h3 { font-size: 16px; }
-  .ledger .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
-  @media (max-width: 900px) {
-    .ledger { grid-template-columns: minmax(0, 1fr); }
-    .ledger > div + div { border-left: 0; border-top: 1px solid var(--rule); }
+  @media (max-width: 360px) {
+    .board { grid-template-columns: minmax(0, 39fr) minmax(0, 61fr); }
+    .node.orch { padding: 6px; }
+    .node.orch .n { font-size: 11px; }
   }
-
-  /* Install. */
-  .install-steps { counter-reset: s; list-style: none; padding: 0; margin: 24px 0 0; max-width: 760px; }
-  .install-steps > li { counter-increment: s; position: relative; padding: 0 0 18px 44px; margin: 0; }
-  .install-steps > li::before {
-    content: counter(s); position: absolute; left: 0; top: 0;
-    width: 28px; height: 28px; border-radius: 50%;
-    border: 1px solid var(--rule); background: var(--panel);
-    font: 700 14px/26px var(--mono); text-align: center; color: var(--accent);
+  @media (prefers-reduced-motion: reduce) {
+    .log li.in, .node.pop { animation: none; }
   }
-  pre.cmd {
-    background: var(--term); color: var(--term-fg);
-    border: 1px solid var(--term-rule); border-radius: 8px;
-    padding: 12px 14px; margin: 8px 0 0; overflow-x: auto;
-    font: 14px/1.6 var(--mono);
-  }
-  pre.cmd .c { color: var(--term-muted); }
-
-  footer { border-top: 1px solid var(--rule); margin-top: 80px; padding: 28px 0 40px; font-size: 14px; color: var(--muted); }
-  footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: baseline; }
-  footer nav ul { display: flex; flex-wrap: wrap; gap: 6px 18px; list-style: none; margin: 0; padding: 0; }
-  footer nav li { margin: 0; }
-  footer nav a { display: inline-block; padding: 4px 0; }
-  footer .legal { flex-basis: 100%; margin: 8px 0 0; }
-  .wordmark { font: 700 16px/1 var(--mono); color: var(--fg); }
-  .wordmark span { color: var(--accent); }
 </style>
 </head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
 <header class="top">
   <div class="wrap">
-    <a class="brand" href="/" aria-label="twr home">twr<span aria-hidden="true">_</span></a>
-    <nav class="links" aria-label="Main">
-      <ul>
-        <li class="opt"><a href="#how">How it works</a></li>
-        <li class="opt"><a href="#phone">Phone</a></li>
-        <li><a href="#features">Features</a></li>
-        <li><a href="#install">Install</a></li>
-        <li><a href="https://github.com/ignaval/twr/blob/main/docs/README.md">Docs</a></li>
-        <li><a href="https://github.com/ignaval/twr">GitHub</a></li>
-      </ul>
+    <a class="logo" href="/">twr<span>_</span></a>
+    <nav class="links" aria-label="Site">
+      <a class="inpage" href="#how">How it works</a>
+      <a class="inpage" href="#watch">Watch it</a>
+      <a class="inpage" href="#around">Features</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/ignaval/twr/blob/main/docs/README.md">Docs</a>
+      <a href="https://github.com/ignaval/twr">GitHub</a>
     </nav>
   </div>
 </header>
 
 <main id="main">
   <div class="wrap hero">
-    <p class="eyebrow"><b>v0.3.0</b> · Linux and macOS · Apache-2.0</p>
-    <h1>One conversation for all your coding agents.</h1>
-    <p class="lede">You talk to <b>one orchestrator</b>. It starts Claude Code, Codex, Grok Build or any Agent Client Protocol agent, each in its own git worktree, here or on another machine. When a thread finishes, asks a question or wants a permission, it comes back to that same conversation, and you answer there or on its card.</p>
+    <div class="pitch">
+      <p class="eyebrow">v0.3.0 · Linux and macOS · Apache-2.0</p>
+      <h1>Talk to one agent. <em>It runs the rest.</em></h1>
+    </div>
+    <p class="lead">In twr you have <b>one conversation, with an orchestrator</b>. Ask for work and it starts named threads on Claude Code, Codex, Grok Build or any ACP agent, each in its own git worktree. Send a thread a follow-up by name. Questions, permissions and results come back here.</p>
     <div class="cta">
       <div class="install">
-        <code id="cmd">curl -fsSL https://twr.tools/install.sh | sh</code>
-        <button type="button" class="copy" id="copy" aria-describedby="copy-status">Copy</button>
+        <code id="cmd1">curl -fsSL https://twr.tools/install.sh | sh</code>
+        <button type="button" class="copy" data-copy="cmd1" aria-describedby="status1">Copy</button>
       </div>
-      <div class="links-row">
+      <p class="status" id="status1" role="status" aria-live="polite"></p>
+      <div class="more">
         <a href="#install">Install steps</a>
-        <a href="https://github.com/ignaval/twr/blob/main/docs/usage.md">Read the docs</a>
-        <a href="https://github.com/ignaval/twr">Source on GitHub</a>
+        <a href="https://github.com/ignaval/twr/blob/main/docs/orchestrator.md">How the orchestrator works</a>
       </div>
     </div>
-    <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
 
-    <figure class="term hero-shot" id="demo">
-      <div class="term-bar">
-        <span class="label">twr · a recorded session</span>
-        <span class="aside">scripted agents, real hub and TUI</span>
-        <span class="size">128×32</span>
-        <button type="button" id="demo-toggle" aria-label="Pause the recording" hidden>Pause</button>
+    <div class="demo">
+      <div class="convo" role="region" aria-labelledby="convo-h">
+        <h2 id="convo-h" class="convo-bar"><b>ORCHESTRATOR</b> your conversation <span class="tag">illustration · the messages of a recorded session</span></h2>
+        <div class="board" id="board">
+          <svg class="wires" id="wires" aria-hidden="true"></svg>
+          <div class="chat" id="chat">
+            <ol class="log" id="log" aria-label="The conversation" tabindex="0">
+              <li class="you" id="m1"><span class="g" aria-hidden="true">❯</span><span class="t"><span class="sr">You: </span>On api, rate limit logins per IP. On billing, round tax once on the invoice total.</span></li>
+              <li class="tool" id="m2"><span class="g" aria-hidden="true">·</span><span class="t"><span class="sr">Orchestrator: </span>Called 2 tools<span class="note"><code>spawn_thread</code> × 2: a named thread each, with its own worktree and branch.</span></span></li>
+              <li class="orch" id="m3"><span class="g" aria-hidden="true">●</span><span class="t"><span class="sr">Orchestrator: </span>Started ratelimit on api and invoice-rounding on billing. I'll tell you when they need you.</span></li>
+              <li class="perm-row resolved" id="m4" style="--c: var(--t1)"><span class="g" aria-hidden="true"></span><div><div class="perm-done"><span style="color:var(--ok)">✓</span> <b style="color:var(--t1)">ratelimit</b> allowed · Allow execute: cargo test -p api</div><div class="perm"><span class="h">ratelimit · permission</span><br><span class="badge">PERMISSION</span> Allow execute: cargo test -p api<br><span style="color:var(--dim)">task: Rate limit POST /login per client IP: 5 attempts a minute, then 429.</span><br>1 allow  2 deny<span class="note">The hub puts it here and on the thread's card. No orchestrator turn.</span></div></div></li>
+              <li class="you" id="m5"><span class="g" aria-hidden="true">❯</span><span class="t"><span class="sr">You: </span>allow ratelimit</span></li>
+              <li class="hub" id="m6"><span class="g" aria-hidden="true">·</span><span class="t"><span class="sr">Hub: </span>Applied: ratelimit: allow.<span class="note">The hub applies a short command as typed. Any other answer goes on a card only you can confirm.</span></span></li>
+              <li class="rep" id="m7" style="--c: var(--t1)"><span class="g" aria-hidden="true">●</span><span class="t"><span class="h">ratelimit</span> finished · success<br>Added a per-IP limiter to POST /login: 5 attempts a minute, then 429 with Retry-After. All 31 api tests pass, including the new one.</span></li>
+              <li class="rep" id="m8" style="--c: var(--t2)"><span class="g" aria-hidden="true">●</span><span class="t"><span class="h">invoice-rounding</span> finished · success<br>Tax is now rounded once on the invoice total instead of per line. The 12 invoice tests pass.</span></li>
+              <li class="you" id="m9"><span class="g" aria-hidden="true">❯</span><span class="t"><span class="sr">You: </span>Tell ratelimit to cover POST /signup the same way.</span></li>
+              <li class="tool" id="m10"><span class="g" aria-hidden="true">·</span><span class="t"><span class="sr">Orchestrator: </span>Called 1 tool<span class="note"><code>send</code> to ratelimit: “Also limit POST /signup the same way: 5 attempts a minute per client IP, then 429.” Queued if the thread is busy.</span></span></li>
+              <li class="orch" id="m11"><span class="g" aria-hidden="true">●</span><span class="t"><span class="sr">Orchestrator: </span>Sent to ratelimit. I'll tell you when it's done.</span></li>
+              <li class="rep" id="m12" style="--c: var(--t1)"><span class="g" aria-hidden="true">●</span><span class="t"><span class="h">ratelimit</span> finished · success<br>POST /signup now shares the login limiter: 5 attempts a minute per IP, then 429. All 33 api tests pass.</span></li>
+            </ol>
+            <div class="inbox" aria-hidden="true"><span class="lbl">→ orchestrator · Enter sends</span><span id="typing"></span><span class="caret" id="caret" hidden></span><span class="ph" id="ph">message the orchestrator…</span></div>
+          </div>
+          <div class="col-orch">
+            <div class="node orch" id="n-orch"><span class="n">orchestrator</span><span class="p">starts and messages threads; writes no code</span></div>
+          </div>
+          <div class="threads" id="threads" role="group" aria-label="Threads">
+            <h3>THREADS</h3>
+            <p class="empty" id="no-threads" hidden>No threads yet.</p>
+            <div class="node thread" id="n-ratelimit" style="--c: var(--t1)"><span class="n">ratelimit</span><span class="p">api · twr/ratelimit</span><span class="s done">done ✓ · 2 ahead of main</span></div>
+            <div class="node thread" id="n-invoice-rounding" style="--c: var(--t2)"><span class="n">invoice-rounding</span><span class="p">billing · twr/invoice-rounding</span><span class="s done">done ✓ · 1 ahead of main</span></div>
+          </div>
+        </div>
+        <div class="controls" id="controls" hidden>
+          <button type="button" id="play" hidden>Play</button>
+          <button type="button" id="all">Show all</button>
+          <div class="says" role="group" aria-labelledby="says-l">
+            <span class="lbl" id="says-l">Say it:</span>
+            <button type="button" class="chip" data-act="0"><span class="k" aria-hidden="true">1</span> On api, rate limit logins per IP. On billing, round tax once…</button>
+            <button type="button" class="chip" data-act="1"><span class="k" aria-hidden="true">2</span> allow ratelimit</button>
+            <button type="button" class="chip" data-act="2"><span class="k" aria-hidden="true">3</span> Tell ratelimit to cover POST /signup the same way.</button>
+          </div>
+        </div>
       </div>
-      <div class="pan wide" tabindex="0" role="region" aria-label="Recorded twr session, scrolls sideways on a narrow screen">
-        <picture>
-        <source media="(prefers-reduced-motion: reduce)" srcset="tui-demo-still.svg" type="image/svg+xml">
-        <img id="demo-img" src="tui-demo.svg" data-still="tui-demo-still.svg" width="1103" height="604" fetchpriority="high" decoding="async"
-          alt="A recording of the twr terminal UI. The Threads sidebar on the left holds the default workspace with its thread cards; the conversation with the orchestrator fills the right. The user asks for two threads, ratelimit and invoice-rounding, which appear as cards. invoice-rounding's git push permission is allowed from its card's action popup, ratelimit's test run by typing allow ratelimit in the conversation, each report comes back into the conversation, and the user opens ratelimit's transcript and returns.">
-        </picture>
-      </div>
-    </figure>
-    <p class="pan-hint" aria-hidden="true">← swipe the recording sideways →</p>
-    <p class="fine">Recorded from the real hub, MCP tools and TUI by <code>docs/tools/make-demo.sh</code>. The orchestrator and the two workers are small scripted ACP agents, so the threads show <code>scripted-1</code> as their model; nothing here is a mock-up.</p>
+      <p class="fine board-note">An illustration of the session <a href="#watch">recorded below</a>, with its real messages; in twr it's a terminal UI. The TUI folds the orchestrator's tool calls into “Called 2 tools”; the <span class="key">orange notes</span> say what they did.</p>
+    </div>
   </div>
 
   <section id="how" aria-labelledby="how-h">
     <div class="wrap">
       <p class="kicker">how it works</p>
-      <h2 id="how-h">Say what you want. Hear back when it matters.</h2>
-      <p class="intro">Most multi-agent setups give you a tab per agent and leave you to notice which one is waiting. In twr you stay in one conversation, and the hub keeps track of every thread for you.</p>
+      <h2 id="how-h">Four things you just saw.</h2>
+      <p class="intro">The orchestrator writes no code and runs no commands. It starts and messages threads with twr's tools, and the hub brings back what they need from you.</p>
       <ol class="steps">
         <li>
-          <span class="n">01 · you</span>
-          <h3>Ask the orchestrator</h3>
-          <p>Type <code>on api, rate limit logins per IP</code>. The orchestrator picks or starts a thread, on the runtime you choose, in a worktree on its own branch.</p>
+          <h3>You ask</h3>
+          <p class="say">On api, rate limit logins per IP. On billing, …</p>
+          <p>It starts one named thread per task, on the runtime you choose, each in a git worktree on its own branch.</p>
+          <p class="under">spawn_thread × 2</p>
         </li>
         <li>
-          <span class="n">02 · the threads</span>
-          <h3>Agents work in parallel</h3>
-          <p>Each thread runs its agent's own CLI under your login. Tests and builds queue on the machine's job slots, and a thread's background work wakes it when it ends.</p>
+          <h3>A thread needs you</h3>
+          <p class="say">allow ratelimit</p>
+          <p>Permissions and questions land in the conversation and on the thread's card. You answer there, or open the card with Enter and press a digit.</p>
+          <p class="under">applied by the hub, never decided by an agent</p>
         </li>
         <li>
-          <span class="n">03 · the hub</span>
-          <h3>What needs you comes back</h3>
-          <p>Reports, questions and permission prompts land in the conversation and on the thread's card. Open the card with <kbd>Enter</kbd> and press a digit, or just type <code>allow ratelimit</code>.</p>
+          <h3>Results come back</h3>
+          <p class="say">ratelimit finished · success</p>
+          <p>Each report arrives in the same conversation, and the card keeps the branch and how far ahead it is.</p>
+          <p class="under">no orchestrator turn spent</p>
+        </li>
+        <li>
+          <h3>You follow up by name</h3>
+          <p class="say">Tell ratelimit to cover POST /signup …</p>
+          <p>The orchestrator sends it to that thread, which picks up with its own context. Or open its card and type to it directly.</p>
+          <p class="under">send · queued if busy</p>
         </li>
       </ol>
     </div>
   </section>
 
-  <section id="threads" aria-labelledby="threads-h">
+  <section id="watch" aria-labelledby="watch-h">
     <div class="wrap">
-      <p class="kicker">the desktop</p>
-      <h2 id="threads-h">Every workspace and thread in one sidebar.</h2>
-      <p class="intro">Threads, on the left, lists your workspaces with the current one's thread cards nested under it. The big pane stays your conversation with the orchestrator, and what you type always goes there until you dive into a thread.</p>
-      <div class="split">
-        <figure>
-          <div class="term">
-            <div class="term-bar"><span class="label">stack view</span><span class="size">160×42</span></div>
-            <div class="pan wide" tabindex="0" role="region" aria-label="Stack view capture, scrolls sideways on a narrow screen">
-              <img src="tui-stack.svg" width="1372" height="784" loading="lazy" decoding="async"
-                alt="The twr stack view at 160 by 42. The Threads sidebar shows the default workspace, working and waiting on you, with two nested cards: ratelimit waiting on a Bash permission with 1 allow and 2 deny, and invoice-rounding asking whether to round tax per line or on the invoice total. Below it the client-x workspace lists crash-triage waiting on you, push-retry running and store-notes done, then scratch, whose hub isn't running, and the New workspace and Settings buttons. The conversation on the right shows the hub's update that deploy-fix failed, the question and permission boxes, and the orchestrator's answer to What needs me right now?">
-            </div>
-          </div>
-          <p class="pan-hint" aria-hidden="true">← swipe the capture sideways →</p>
-          <figcaption>Two workspaces and a stopped third, with worker threads on twr's scripted test runtime, <code>fake</code>. Captured by <code>docs/tools/make-screenshots.sh</code>.</figcaption>
-        </figure>
-        <ul class="notes">
-          <li><b>Workspaces</b>Each is its own hub, orchestrator and threads, for a client or a side project. Its card counts what waits on you, <span class="mono">⚠2</span>, and what runs, <span class="mono">●1</span>. A click or <kbd>Alt-1</kbd>…<kbd>9</kbd> switches.</li>
-          <li><b>Cards that say where a thread stands</b>State, what it's doing or what it reported, who runs it and its git line, <span class="mono">3 ahead of dev · 2 behind</span>. The waiting item's options are on the card.</li>
-          <li><b>A color per thread</b>Its card, name and conversation boxes share one of 30 distinct colors, kept across restarts.</li>
-          <li><b><kbd>Ctrl-B</kbd> hides it whole</b>The view takes every column, with a strip of tabs once you have two workspaces. <kbd>Ctrl-G</kbd> switches to the grid, <kbd>Ctrl-F</kbd> to focus mode.</li>
-          <li><b><kbd>Enter</kbd> <kbd>Enter</kbd> dives in</b>On a card, the pane shows that thread's transcript and what you type goes straight to it. <kbd>Esc</kbd> brings you back.</li>
-        </ul>
-      </div>
-
-      <figure class="term" style="margin-top:36px">
-        <div class="term-bar"><span class="label">grid view · Ctrl-G</span><span class="size">160×25</span></div>
-        <div class="pan wide" tabindex="0" role="region" aria-label="Grid view capture, scrolls sideways on a narrow screen">
-          <img src="tui-grid.svg" width="1372" height="478" loading="lazy" decoding="async"
-            alt="The twr grid view at 160 by 25, the Threads sidebar with the default, client-x and scratch workspaces at its left: one tile per worker thread, each in its own color, with its state, its waiting item or last report and its git line. ratelimit waits on a permission, invoice-rounding asks a question, deploy-fix failed on a Terraform state lock, checkout-ui is running, and changelog and a11y-audit are done.">
-        </div>
+      <p class="kicker">the real thing</p>
+      <h2 id="watch-h">The same session, in the terminal.</h2>
+      <p class="intro">Threads on the left, your conversation on the right. Press Enter twice on a card to open a thread and type to it directly; Esc brings you back. On a phone, under 60 columns, the TUI turns into one screen at a time, so you can answer from anywhere over SSH or mosh.</p>
+      <figure class="term">
+        <div class="term-bar"><span>twr · recorded session</span><button type="button" id="rec-toggle" hidden>Pause</button></div>
+        <picture>
+          <source media="(prefers-reduced-motion: reduce) and (max-width: 720px)" srcset="tui-conversation-phone-still.svg" width="414" height="676">
+          <source media="(prefers-reduced-motion: reduce)" srcset="tui-conversation-still.svg" width="902" height="568">
+          <source media="(max-width: 720px)" srcset="tui-conversation-phone.svg" data-moving="tui-conversation-phone.svg" data-still="tui-conversation-phone-still.svg" width="414" height="676">
+          <img id="rec" src="tui-conversation.svg" data-moving="tui-conversation.svg" data-still="tui-conversation-still.svg" width="902" height="568" loading="lazy" decoding="async" alt="The twr TUI: the user asks for two threads, they appear in the Threads sidebar, ratelimit asks to run its tests, the user types allow ratelimit, both threads report back, the user sends ratelimit a follow-up, it reports again, and the user opens ratelimit's transcript.">
+        </picture>
+        <figcaption>Recorded from the real hub, MCP tools and TUI. The orchestrator and the workers are small scripted ACP agents, so no model ran; nothing here is a mock-up.</figcaption>
       </figure>
-      <p class="pan-hint" aria-hidden="true">← swipe the capture sideways →</p>
     </div>
   </section>
 
-  <section id="phone" aria-labelledby="phone-h">
+  <section id="around" aria-labelledby="around-h">
     <div class="wrap">
-      <p class="kicker">on a phone</p>
-      <h2 id="phone-h">Answer from your phone, however long the card.</h2>
-      <p class="intro">Below 60 columns the TUI turns compact: one screen at a time under a tab bar of <b>Chat</b>, <b>Needs you</b> and <b>Threads</b>, every tab and menu choice two rows tall for a finger. Run it in any phone terminal over SSH or mosh. There is no app to install and no server in between.</p>
-      <div class="phone-row">
-      <div>
-        <ul>
-          <li><b>Threads</b> scrolls through the same workspaces and cards as the desktop sidebar.</li>
-          <li>A card longer than the screen opens with its options under the first lines of text. Tap an option to pick it and again to send it, or press its digit. The rest of the text scrolls above the options, and a tap on <span class="mono">↓ 10 more lines · tap</span> turns a page.</li>
-          <li><kbd>/c</kbd>, <kbd>/n</kbd> and <kbd>/t</kbd> switch screens where Tab is awkward. A <a href="https://github.com/ignaval/twr/blob/main/docs/notifications.md">notification command</a> can push to your phone when something needs you.</li>
-        </ul>
-        <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/tui.md#on-a-phone">More on the phone layout</a></p>
+      <p class="kicker">around the conversation</p>
+      <h2 id="around-h">What makes the threads worth delegating to.</h2>
+      <div class="around">
+        <div><h3>Any agent you use</h3><p>Claude Code, Codex, Grok Build or any ACP agent, under your own login. Switch the orchestrator or a thread to another runtime mid-task. <a href="https://github.com/ignaval/twr/blob/main/docs/runtimes.md">Runtimes</a></p></div>
+        <div><h3>A worktree per thread</h3><p>Parallel threads on one repo never touch each other's files. Park one to free its worktree and resume it later. <a href="https://github.com/ignaval/twr/blob/main/docs/worktrees.md">Worktrees</a></p></div>
+        <div><h3>Your permissions stay yours</h3><p>Thread agents can't answer a permission, change a mode or prompt another thread, and the orchestrator passes on only an answer you gave. twr is not a sandbox: <a href="https://github.com/ignaval/twr/blob/main/docs/security-model.md">the security model</a> says what it covers.</p></div>
+        <div><h3>Threads on other machines</h3><p>Run a thread on a box over SSH, in a container, or on a machine that dials in. It keeps going across disconnects and laptop sleep. <a href="https://github.com/ignaval/twr/blob/main/docs/runners.md">Boxes</a></p></div>
+        <div><h3>Answer from your phone</h3><p>A compact layout for any phone terminal, with tabs for Chat, Needs you and Threads. No app and no server in between. <a href="https://github.com/ignaval/twr/blob/main/docs/tui.md#on-a-phone">Phone layout</a></p></div>
+        <div><h3>Built for long work</h3><p>The orchestrator keeps notes on your setup across sessions; threads compact their context; jobs queue on the machine's slots. <a href="https://github.com/ignaval/twr/blob/main/docs/orchestrator.md#memory">Memory</a></p></div>
       </div>
-      <div class="phones">
-        <figure>
-          <div class="term">
-            <img src="tui-compact-card.svg" width="364" height="388" loading="lazy" decoding="async"
-              alt="twr at 40 by 20, a phone's size, on the Needs you tab. invoice-rounding's question is open in its action popup: the first lines of the question about rounding tax per line or on the invoice total, then a line saying 10 more lines below with tap to page, the two options per line, as the PDFs and once on the total, as the ledger, and talk to invoice-rounding, with 3 more rows below.">
-          </div>
-          <figcaption>A long question, answerable without scrolling to its end.</figcaption>
-        </figure>
-        <figure>
-          <div class="term">
-            <img src="tui-compact-workspaces.svg" width="364" height="388" loading="lazy" decoding="async"
-              alt="twr at 40 by 20 on the Threads tab, scrolled down: the client-x workspace, working and waiting on you, with its threads crash-triage waiting on you, push-retry running and store-notes done; the scratch workspace selected, its hub not running; and the New workspace and Settings buttons.">
-          </div>
-          <figcaption>The Threads screen, scrolled to the other workspaces.</figcaption>
-        </figure>
-      </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="answers" aria-labelledby="answers-h">
-    <div class="wrap">
-      <p class="kicker">permissions</p>
-      <h2 id="answers-h">It relays your answers. It never makes one up.</h2>
-      <div class="groups" style="margin-top:8px">
-        <div>
-          <p>The orchestrator can pass on an answer you gave. A short command such as <code>allow both</code> or <code>deny the webapp one</code> answers a permission at once. Anything else, and every answer to a question, goes on a card that only you can confirm, and every answer names the exact revision of the item you saw.</p>
-          <p>The agents twr runs can read the hub and run jobs for their own thread. They can't answer a permission or a question, change a mode, delete a thread or send prompts. twr is not a sandbox, and <a href="https://github.com/ignaval/twr/blob/main/docs/security-model.md">the security model</a> says what this guard covers and what it doesn't.</p>
-        </div>
-        <div>
-          <p>Some runtimes decide a few things themselves. A Codex thread in <code>auto</code> mode has, by default, <b>Codex's own reviewer agent</b> approve or deny a command its sandbox refused; each decision shows in the transcript as an <code>auto_review</code> call. Set <code>[codex] auto = "ask"</code> to get a card instead.</p>
-          <p>A card's popup answers only what it drew in full and you had time to read, so a key pressed as an item changed answers nothing. <kbd>Enter</kbd> on an empty line opens it; <kbd>1</kbd>-<kbd>9</kbd> answer.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="features" aria-labelledby="features-h">
-    <div class="wrap">
-      <p class="kicker">features</p>
-      <h2 id="features-h">What else is in the binary.</h2>
-      <div class="groups">
-        <div class="group">
-          <h3><span class="tag">runtimes</span> · any agent you already use</h3>
-          <ul>
-            <li>Claude Code, Codex and Grok Build run through their headless modes. Any Agent Client Protocol agent works too, <code>--runtime 'acp:gemini --experimental-acp'</code> for example, and other CLIs get a clearly marked PTY fallback.</li>
-            <li>Move the orchestrator to another runtime mid-conversation, with a handoff. Move a thread to Codex and back to Claude Code and its earlier Claude Code session resumes.</li>
-            <li>Several logins of one runtime, a work and a personal Claude subscription for example, chosen per thread. twr never reads or stores a token. Accounts on remote boxes, balancing and failover aren't supported yet.</li>
-            <li><code>twr attach</code> opens the agent's own CLI on a thread's session.</li>
-          </ul>
-          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/runtimes.md">runtimes.md</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/accounts.md">accounts.md</a></p>
-        </div>
-        <div class="group">
-          <h3><span class="tag">isolation</span> · worktrees and background work</h3>
-          <ul>
-            <li>Each thread works in its own git worktree, on branch <code>twr/&lt;name&gt;</code>, or in your checkout if you ask.</li>
-            <li>Park a thread to free its worktree and resume it later on the same session. Deleted threads go to a trash you can restore from.</li>
-            <li>Jobs queue on the machine's slots; <code>send --after</code> holds a prompt until another thread finishes. Messages waiting for a thread list above the input box, to edit, delete or send now.</li>
-            <li>A card tells a hung turn from one waiting on its own tests, by what it has in flight.</li>
-          </ul>
-          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/worktrees.md">worktrees.md</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/usage.md#jobs">jobs</a></p>
-        </div>
-        <div class="group">
-          <h3><span class="tag">remote boxes</span> · SSH, containers, dial-in</h3>
-          <ul>
-            <li>After <code>twr box add gpu me@gpu-box</code> the hub installs its own build over SSH (<code>twr box install</code> for a box of another OS or CPU) and starts a box daemon there. Threads keep running across disconnects, hub restarts and laptop sleep, with no token, listener or tunnel to set up.</li>
-            <li>Container boxes through <code>docker exec</code>, podman or <code>kubectl exec</code>, for repositories you don't trust.</li>
-            <li>Dial-in boxes, for a machine the hub can't reach, connect out over <code>wss://</code> with a token.</li>
-            <li>Linux and Mac boxes; on a Mac the daemon starts where Claude Code can read its keychain login. <code>twr box doctor</code> says what's wrong and how to fix it.</li>
-          </ul>
-          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/runners.md">runners.md</a></p>
-        </div>
-        <div class="group">
-          <h3><span class="tag">memory &amp; context</span> · long-running work</h3>
-          <ul>
-            <li>The orchestrator keeps notes on your preferences and setup, one memory per workspace, across sessions, restarts and runtime switches. Notes are information, never authority. <code>twr memory</code> manages them.</li>
-            <li>Context compactions show as a line in the conversation. <code>/compact-context</code> compacts a thread between turns, and before a message goes to a Claude Code thread with a large context whose prompt cache has expired, twr asks whether to compact first.</li>
-            <li>A hub with weeks of history starts from a checkpoint instead of replaying its whole log, and old turns' detail moves to an archive.</li>
-          </ul>
-          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/orchestrator.md#memory">memory</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/runtimes.md#context-compaction">compaction</a></p>
-        </div>
-        <div class="group">
-          <h3><span class="tag">in the terminal</span> · the input box</h3>
-          <ul>
-            <li>A line starting with <code>!</code> runs a shell command of yours, in the thread's worktree when you're in a dive. <code>!!</code> also hands the output to the thread.</li>
-            <li>Ghost-text suggestions for your next message: <kbd>Tab</kbd> takes one, nothing is sent until you press <kbd>Enter</kbd>.</li>
-            <li><kbd>Shift-Enter</kbd> for a new line, over mosh and SSH too, after <code>twr terminal-setup</code>. <code>/settings</code> changes the common options and writes back only that line of your config.</li>
-          </ul>
-          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/tui.md">tui.md</a></p>
-        </div>
-        <div class="group">
-          <h3><span class="tag">read aloud</span> · and keeping track</h3>
-          <ul>
-            <li><code>/read on</code> reads the orchestrator's replies as they come. On a server over SSH or mosh, <code>twr speak --ssh &lt;server&gt;</code> plays them on your laptop, with nothing on the server's audio.</li>
-            <li><code>twr usage</code> shows each subscription's 5-hour and weekly windows, and what each thread's turns spent.</li>
-            <li><code>/decisions</code> opens an audit table of the hub's routing and grading decisions, with the provider that made each one.</li>
-          </ul>
-          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/read-aloud.md">read-aloud.md</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/tui.md#decision-audit-view">decisions</a></p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="local" aria-labelledby="local-h">
-    <div class="wrap">
-      <p class="kicker">what runs where</p>
-      <h2 id="local-h">twr is local. Your agents are not.</h2>
-      <p class="intro">twr itself has no account, no cloud service and no telemetry. The agents it runs call their providers under your own logins, so their terms and quotas apply. The hub also asks a small model, with the same logins, for suggestions and summaries until you turn them off.</p>
-      <div class="ledger">
-        <div>
-          <h3><span class="dot" style="background:#3fb950" aria-hidden="true"></span>On machines you run</h3>
-          <ul>
-            <li>The hub, its append-only SQLite log and the TUI: one Rust binary.</li>
-            <li>Worktrees and jobs, here or on your boxes; cards, the orchestrator's memory and checkpoints.</li>
-            <li>Boxes you add, reached over SSH, a container command or a connection they open.</li>
-          </ul>
-        </div>
-        <div>
-          <h3><span class="dot" style="background:#f0935a" aria-hidden="true"></span>Model calls, with your logins</h3>
-          <ul>
-            <li>The orchestrator and every worker: each runtime's CLI, signed in by you.</li>
-            <li>Next-message suggestions and one-line thread summaries, both on by default: the hub asks a small model through Claude Code or Codex. Turn them off in <code>/settings</code> or with <code>[tui] suggest = false</code> and <code>summaries = false</code>.</li>
-            <li>Codex's reviewer, for Codex threads in <code>auto</code> unless you set <code>ask</code>.</li>
-          </ul>
-        </div>
-        <div>
-          <h3><span class="dot" style="background:#5fd0d8" aria-hidden="true"></span>What you bring</h3>
-          <ul>
-            <li>git, and at least one of <code>claude</code>, <code>codex</code> or <code>grok</code>, signed in with its own CLI.</li>
-            <li>For heavy automation, an API key rather than a personal subscription is the safe choice.</li>
-          </ul>
-        </div>
-      </div>
+      <p class="local">twr itself has no account, no cloud service and no telemetry. Your agents call their providers under your logins, so their terms and quotas apply; the hub also asks a small model for suggestions and summaries until you turn them off.</p>
     </div>
   </section>
 
   <section id="install" aria-labelledby="install-h">
     <div class="wrap">
       <p class="kicker">install</p>
-      <h2 id="install-h">Three steps to the first thread.</h2>
+      <h2 id="install-h">Your first conversation in three steps.</h2>
       <ol class="install-steps">
-        <li>
-          <b>Install twr.</b> The script puts the release build for your machine in <code>~/.local/bin</code>, without sudo, after checking it against the release's checksums, and their signature where your <code>openssl</code> can verify it.
-          <pre class="cmd">curl -fsSL https://twr.tools/install.sh | sh</pre>
-          <p class="fine">Linux x86_64 and aarch64, macOS on Apple silicon and Intel. Or download an archive from <a href="https://github.com/ignaval/twr/releases/latest">the releases page</a>, or build it with Rust 1.89 or newer: <code>cargo install --locked --git https://github.com/ignaval/twr twr-cli</code>.</p>
+        <li><b>Install twr.</b> The release build for your machine goes in <code>~/.local/bin</code>, without sudo, checked against the release's checksums.
+          <div class="install" style="margin-top:10px"><code id="cmd2">curl -fsSL https://twr.tools/install.sh | sh</code><button type="button" class="copy" data-copy="cmd2" aria-describedby="status2">Copy</button></div>
+          <p class="status" id="status2" role="status" aria-live="polite"></p>
         </li>
-        <li>
-          <b>Sign in to an agent.</b> twr runs <code>claude</code> (Claude Code 2.1.110 or newer), <code>codex</code> or <code>grok</code> as you; log in with each one's own CLI first.
-        </li>
-        <li>
-          <b>Open it.</b> The first run asks which agent runs your orchestrator.
-          <pre class="cmd">twr                                  <span class="c"># the TUI; starts the hub</span>
-twr thread new ~/code/api --name api <span class="c"># or let the orchestrator start threads</span>
-twr update                           <span class="c"># later: the latest release</span></pre>
+        <li><b>Sign in to an agent.</b> twr runs <code>claude</code>, <code>codex</code> or <code>grok</code> as you; log in with each one's own CLI first.</li>
+        <li><b>Open it and say what you want.</b> The first run asks which agent runs your orchestrator.
+          <pre class="cmd">twr        <span class="c"># the TUI; starts the hub</span>
+twr update <span class="c"># later: the latest release</span></pre>
         </li>
       </ol>
-      <p class="fine" style="max-width:760px">twr is before 1.0 and has one maintainer: commands, config keys and the socket API may still change between releases. macOS is built and tested in CI but has had less hands-on use than Linux. Windows is unsupported. <a href="https://github.com/ignaval/twr/blob/main/docs/install.md">install.md</a> covers versions, signatures and the installer's options; <a href="https://github.com/ignaval/twr/blob/main/CHANGELOG.md">the changelog</a> lists what each release changed.</p>
+      <p class="fine">Linux x86_64 and aarch64, macOS on Apple silicon and Intel; Windows is unsupported. Or download an archive from <a href="https://github.com/ignaval/twr/releases/latest">the releases page</a>, or build it with Rust 1.89 or newer: <code>cargo install --locked --git https://github.com/ignaval/twr twr-cli</code>. twr is before 1.0 and has one maintainer. <a href="https://github.com/ignaval/twr/blob/main/docs/install.md">install.md</a> · <a href="https://github.com/ignaval/twr/blob/main/CHANGELOG.md">changelog</a></p>
     </div>
   </section>
 </main>
 
 <footer>
   <div class="wrap">
-    <span class="wordmark">twr<span aria-hidden="true">_</span></span>
-    <nav aria-label="Footer">
-      <ul>
-        <li><a href="https://github.com/ignaval/twr">GitHub</a></li>
-        <li><a href="https://github.com/ignaval/twr/blob/main/docs/README.md">Docs</a></li>
-        <li><a href="https://github.com/ignaval/twr/blob/main/CHANGELOG.md">Changelog</a></li>
-        <li><a href="https://github.com/ignaval/twr/blob/main/SECURITY.md">Security</a></li>
-        <li><a href="https://github.com/ignaval/twr/blob/main/LICENSE">Apache-2.0</a></li>
-      </ul>
-    </nav>
-    <p class="legal">twr is not affiliated with Anthropic, OpenAI or xAI. Claude Code, Codex and Grok are trademarks of their owners.</p>
+    <span>twr · Apache-2.0</span>
+    <a href="https://github.com/ignaval/twr">GitHub</a>
+    <a href="https://github.com/ignaval/twr/blob/main/docs/README.md">Docs</a>
+    <a href="https://github.com/ignaval/twr/blob/main/CHANGELOG.md">Changelog</a>
+    <a href="https://github.com/ignaval/twr/blob/main/SECURITY.md">Security</a>
+    <a href="https://github.com/ignaval/twr/blob/main/LICENSE">License</a>
   </div>
 </footer>
 
 <script>
-  // Copy the install command; where the clipboard is refused, select it for the user to copy.
-  (function () {
-    var button = document.getElementById("copy");
-    var cmd = document.getElementById("cmd");
-    var status = document.getElementById("copy-status");
+  // Copy buttons: the clipboard, or select the command where the clipboard is refused.
+  document.querySelectorAll("[data-copy]").forEach(function (button) {
+    var cmd = document.getElementById(button.getAttribute("data-copy"));
+    var status = document.getElementById(button.getAttribute("aria-describedby"));
     var timer;
     function say(label, message) {
-      button.textContent = label;
-      status.textContent = message;
+      button.textContent = label; status.textContent = message;
       clearTimeout(timer);
       timer = setTimeout(function () { button.textContent = "Copy"; status.textContent = ""; }, 4000);
     }
-    function selectCommand() {
-      var range = document.createRange();
-      range.selectNodeContents(cmd);
-      var sel = window.getSelection();
-      sel.removeAllRanges();
-      sel.addRange(range);
+    function select() {
+      var r = document.createRange(); r.selectNodeContents(cmd);
+      var s = getSelection(); s.removeAllRanges(); s.addRange(r);
     }
     button.addEventListener("click", function () {
-      var text = cmd.textContent;
       if (navigator.clipboard && window.isSecureContext) {
-        navigator.clipboard.writeText(text).then(function () {
-          say("Copied", "Install command copied to the clipboard.");
-        }, function () {
-          selectCommand();
-          say("Selected", "The command is selected: press Ctrl-C or ⌘C to copy it.");
-        });
-      } else {
-        selectCommand();
-        say("Selected", "The command is selected: press Ctrl-C or ⌘C to copy it.");
-      }
+        navigator.clipboard.writeText(cmd.textContent).then(function () { say("Copied", "Install command copied to the clipboard."); },
+          function () { select(); say("Selected", "The command is selected: press Ctrl-C or ⌘C to copy it."); });
+      } else { select(); say("Selected", "The command is selected: press Ctrl-C or ⌘C to copy it."); }
     });
+  });
+
+  // The switchboard. Without JavaScript the whole conversation shows. Each act starts with
+  // something you say; its steps reveal messages, change a thread's card and send a pulse down
+  // a wire. It plays once when it comes into view; Pause holds it, the "Say it" buttons play
+  // one act, and with reduced motion every step lands at once.
+  (function () {
+    var reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var $ = function (id) { return document.getElementById(id); };
+    var board = $("board"), svg = $("wires"), log = $("log");
+    var typing = $("typing"), caret = $("caret"), ph = $("ph");
+    var playBtn = $("play"), allBtn = $("all");
+    var chips = Array.prototype.slice.call(document.querySelectorAll("[data-act]"));
+    var items = Array.prototype.slice.call(log.children);
+    var nodes = { chat: $("chat"), orch: $("n-orch"), ratelimit: $("n-ratelimit"), "invoice-rounding": $("n-invoice-rounding") };
+    var color = { ratelimit: "var(--t1)", "invoice-rounding": "var(--t2)", orch: "var(--teal)", chat: "var(--accent)" };
+    var NS = "http://www.w3.org/2000/svg";
+
+    // ["say", message]: typed into the input box, then sent. ["show", message]. ["wire", from,
+    // to, label]. ["card", thread, state, label]. ["resolve", message]. ["wait", ms].
+    var acts = [
+      [["say", "m1"], ["wire", "chat", "orch", "your message"],
+       ["wire", "orch", "ratelimit", "spawn_thread"], ["card", "ratelimit", "running", "running · reading login.rs"],
+       ["wire", "orch", "invoice-rounding", "spawn_thread"], ["card", "invoice-rounding", "running", "running · editing totals.rs"],
+       ["show", "m2"], ["wire", "orch", "chat", "reply"], ["show", "m3"], ["wait", 1300],
+       ["card", "ratelimit", "waiting", "waiting · permission"], ["wire", "ratelimit", "chat", "permission"], ["show", "m4"], ["wait", 1200]],
+      [["say", "m5"], ["wire", "chat", "ratelimit", "applied by the hub"], ["show", "m6"], ["resolve", "m4"],
+       ["card", "ratelimit", "running", "running · cargo test -p api"], ["wait", 1100],
+       ["wire", "ratelimit", "chat", "report"], ["card", "ratelimit", "done", "done ✓ · 1 ahead of main"], ["show", "m7"], ["wait", 900],
+       ["wire", "invoice-rounding", "chat", "report"], ["card", "invoice-rounding", "done", "done ✓ · 1 ahead of main"], ["show", "m8"], ["wait", 900]],
+      [["say", "m9"], ["wire", "chat", "orch", "your message"], ["wire", "orch", "ratelimit", "send"],
+       ["card", "ratelimit", "running", "running · editing signup.rs"], ["show", "m10"],
+       ["wire", "orch", "chat", "reply"], ["show", "m11"], ["wait", 1300],
+       ["wire", "ratelimit", "chat", "report"], ["card", "ratelimit", "done", "done ✓ · 2 ahead of main"], ["show", "m12"]]
+    ];
+
+    // A clock that stops while paused: every wait and animation reads it.
+    var pausedAt = null, lost = 0, parked = [];
+    function now() { return (pausedAt === null ? performance.now() : pausedAt) - lost; }
+    // The next frame, or, while paused, the first frame after resume().
+    function later(f) { if (pausedAt === null) requestAnimationFrame(f); else parked.push(f); }
+    function sleep(ms, my) {
+      var end = now() + ms;
+      return new Promise(function (resolve) {
+        (function tick() { if (my !== token || now() >= end) resolve(); else later(tick); })();
+      });
+    }
+
+    var token = 0, done = 0, busy = false, auto = false;
+
+    // Wires: a cubic curve between two boxes, in the board's coordinates. Wide, the three
+    // columns sit side by side; stacked (phones), the conversation is under the other two.
+    function box(name) {
+      var b = board.getBoundingClientRect(), r = nodes[name].getBoundingClientRect();
+      return { l: r.left - b.left, r: r.right - b.left, t: r.top - b.top, b: r.bottom - b.top, cx: r.left - b.left + r.width / 2, cy: r.top - b.top + r.height / 2 };
+    }
+    function stacked() { return nodes.chat.getBoundingClientRect().top >= nodes.orch.getBoundingClientRect().bottom; }
+    function route(from, to) {
+      var thread = function (n) { return n !== "chat" && n !== "orch"; };
+      var flip = (from === "orch" && to === "chat") || thread(from);
+      var a = flip ? to : from, z = flip ? from : to, pts;
+      var A = box(a), Z = box(z), st = stacked();
+      if (a === "chat" && z === "orch") {
+        pts = st ? [[Z.cx, A.t], [Z.cx, A.t - 16], [Z.cx, Z.b + 16], [Z.cx, Z.b]]
+                 : [[A.r, Z.cy], [A.r + 40, Z.cy], [Z.l - 40, Z.cy], [Z.l, Z.cy]];
+      } else if (a === "orch") {
+        pts = [[A.r, A.cy], [A.r + 30, A.cy], [Z.l - 30, Z.cy - 6], [Z.l, Z.cy - 6]];
+      } else if (st) {
+        // Up the gutter between the orchestrator and the threads, into the card's side.
+        var gx = Z.l - 7;
+        pts = [[gx, A.t], [gx, Z.cy + 12], [gx + 2, Z.cy + 6], [Z.l, Z.cy + 6]];
+      } else {
+        // The conversation and a thread talk through the hub: under the orchestrator, into
+        // the card's side.
+        var y = A.b - 70;
+        pts = [[A.r, y], [A.r + (Z.l - A.r) / 2, y + 20], [Z.l - 44, Z.cy + 34], [Z.l, Z.cy + 8]];
+      }
+      if (flip) pts.reverse();
+      return "M" + pts[0] + " C" + pts[1] + " " + pts[2] + " " + pts[3];
+    }
+    function drawIdle() {
+      svg.innerHTML = "";
+      var pairs = [["chat", "orch", ""]];
+      ["ratelimit", "invoice-rounding"].forEach(function (n) {
+        if (nodes[n].hidden || nodes[n].style.visibility) return;
+        pairs.push(["orch", n, ""]);
+        if (!stacked()) pairs.push(["chat", n, "idle-hub"]);
+      });
+      pairs.forEach(function (p) {
+        var path = document.createElementNS(NS, "path");
+        path.setAttribute("d", route(p[0], p[1]));
+        if (p[2]) path.setAttribute("class", p[2]);
+        svg.appendChild(path);
+      });
+    }
+    function pulse(from, to, label, my) {
+      var n = nodes[to];
+      if (n.hidden) { n.hidden = false; n.style.visibility = "hidden"; $("no-threads").hidden = true; }
+      drawIdle();
+      var c = color[from === "chat" || from === "orch" ? (to === "chat" ? from : to) : from];
+      var path = document.createElementNS(NS, "path"), dot = document.createElementNS(NS, "circle"), text = document.createElementNS(NS, "text");
+      path.setAttribute("d", route(from, to)); path.setAttribute("class", "live"); path.style.setProperty("--c", c);
+      dot.setAttribute("r", 5); dot.style.setProperty("--c", c);
+      text.textContent = label;
+      svg.appendChild(path); svg.appendChild(dot); svg.appendChild(text);
+      var len = path.getTotalLength(), mid = path.getPointAtLength(len / 2), t0 = now(), dur = 800;
+      if (stacked()) {
+        // Labels go in the gap under the conversation, clear of the cards.
+        var w = board.clientWidth, gap = box("chat").t - 13;
+        text.setAttribute("x", Math.max(70, Math.min(w - 70, mid.x))); text.setAttribute("y", gap);
+      } else { text.setAttribute("x", mid.x); text.setAttribute("y", mid.y - 10); }
+      return new Promise(function (resolve) {
+        (function frame() {
+          if (my !== token) { resolve(); return; }
+          var k = Math.min(1, (now() - t0) / dur), p = path.getPointAtLength(len * k);
+          dot.setAttribute("cx", p.x); dot.setAttribute("cy", p.y);
+          if (k < 1) later(frame); else sleep(250, my).then(resolve);
+        })();
+      });
+    }
+    function reveal(id, animate) {
+      var li = $(id);
+      li.classList.remove("hidden");
+      if (animate) { li.classList.remove("in"); void li.offsetWidth; li.classList.add("in"); }
+      log.scrollTop = log.scrollHeight;
+    }
+    function setCard(name, state, label, animate) {
+      var n = nodes[name], s = n.querySelector(".s");
+      if (n.hidden || n.style.visibility) { n.hidden = false; n.style.visibility = ""; if (animate) n.classList.add("pop"); }
+      $("no-threads").hidden = true;
+      s.className = "s " + state; s.textContent = label;
+    }
+    function clearInput() { typing.textContent = ""; caret.hidden = true; ph.hidden = false; }
+    function type(id, my) {
+      var text = $(id).querySelector(".t").textContent.replace(/^You: /, ""), k = 0;
+      ph.hidden = true; caret.hidden = false;
+      return new Promise(function (resolve) {
+        (function more() {
+          if (my !== token) { resolve(); return; }
+          k = Math.min(text.length, k + 2);
+          typing.textContent = text.slice(0, k);
+          if (k < text.length) sleep(42, my).then(more); else sleep(500, my).then(resolve);
+        })();
+      });
+    }
+    // One step; animated, it waits as long as the step takes.
+    function apply(step, animate, my) {
+      var kind = step[0];
+      if (kind === "say") {
+        if (!animate) { reveal(step[1], false); return Promise.resolve(); }
+        return type(step[1], my).then(function () { if (my === token) { clearInput(); reveal(step[1], true); } return sleep(300, my); });
+      }
+      if (kind === "show") { reveal(step[1], animate); return animate ? sleep(600, my) : Promise.resolve(); }
+      if (kind === "resolve") { $(step[1]).classList.add("resolved"); return Promise.resolve(); }
+      if (kind === "card") { setCard(step[1], step[2], step[3], animate); return animate ? sleep(300, my) : Promise.resolve(); }
+      if (kind === "wire") return animate ? pulse(step[1], step[2], step[3], my) : Promise.resolve();
+      if (kind === "wait") return animate ? sleep(step[1], my) : Promise.resolve();
+    }
+    function mark() {
+      chips.forEach(function (c, i) {
+        c.classList.toggle("said", i < done);
+        c.classList.toggle("next", i === done);
+      });
+      if (busy || auto) playBtn.textContent = pausedAt === null ? "Pause" : "Play";
+      else playBtn.textContent = done >= acts.length ? "Replay" : "Play";
+    }
+    function reset() {
+      token++; busy = false; auto = false; done = 0; resume();
+      items.forEach(function (li) { li.classList.add("hidden"); li.classList.remove("in", "resolved"); });
+      ["ratelimit", "invoice-rounding"].forEach(function (n) { nodes[n].hidden = true; nodes[n].style.visibility = ""; nodes[n].classList.remove("pop"); });
+      $("no-threads").hidden = false;
+      clearInput(); drawIdle(); mark();
+    }
+    // The state after the first n acts, at once.
+    function upTo(n) {
+      reset();
+      for (var i = 0; i < n; i++) acts[i].forEach(function (s) { apply(s, false); });
+      done = n; drawIdle(); mark();
+    }
+    function play(i) {
+      var my = token;
+      busy = true; mark();
+      return acts[i].reduce(function (p, s) { return p.then(function () { if (my === token) return apply(s, true, my); }); }, Promise.resolve())
+        .then(function () { if (my !== token) return false; done = i + 1; busy = false; drawIdle(); mark(); return true; });
+    }
+    function autoplay() {
+      upTo(done >= acts.length ? 0 : done);
+      auto = true;
+      var my = token;
+      (function next() {
+        if (my !== token || done >= acts.length) { if (my === token) { auto = false; mark(); } return; }
+        play(done).then(function (ok) { if (ok && my === token) sleep(1500, my).then(next); });
+      })();
+    }
+    function pause() { if (pausedAt === null) pausedAt = performance.now(); mark(); }
+    function resume() {
+      if (pausedAt === null) return;
+      lost += performance.now() - pausedAt; pausedAt = null;
+      parked.splice(0).forEach(function (f) { requestAnimationFrame(f); });
+    }
+
+    playBtn.addEventListener("click", function () {
+      if (busy || auto) { if (pausedAt === null) pause(); else { resume(); mark(); } }
+      else autoplay();
+    });
+    allBtn.addEventListener("click", function () { upTo(acts.length); });
+    chips.forEach(function (c, i) {
+      c.addEventListener("click", function () {
+        // Everything before this act at once, then this act alone.
+        upTo(i);
+        if (reduce) { acts[i].forEach(function (s) { apply(s, false); }); done = i + 1; drawIdle(); mark(); }
+        else play(i);
+      });
+    });
+    // Redraw the wires when the board's width changes, not when a phone's toolbar slides
+    // (a pulse in flight is dropped; the act goes on).
+    var width = board.clientWidth;
+    window.addEventListener("resize", function () { if (board.clientWidth !== width) { width = board.clientWidth; drawIdle(); } });
+
+    $("controls").hidden = false;
+    var mq = matchMedia("(prefers-reduced-motion: reduce)");
+    if (mq.addEventListener) mq.addEventListener("change", function (e) {
+      if (e.matches && !reduce) { reduce = true; playBtn.hidden = true; upTo(acts.length); }
+    });
+    if (reduce) { upTo(acts.length); return; }
+    playBtn.hidden = false;
+    upTo(0);
+    if (!("IntersectionObserver" in window)) { autoplay(); return; }
+    var seen = false, timer = null;
+    var io = new IntersectionObserver(function (es) {
+      seen = es[es.length - 1].intersectionRatio >= 0.35;
+      clearTimeout(timer);
+      if (seen) timer = setTimeout(function () {
+        if (!seen) return;
+        io.disconnect();
+        if (done === 0 && !busy) autoplay();
+      }, 600);
+    }, { threshold: [0, 0.35] });
+    io.observe(board);
   })();
 
-  // A pause for the recording: it swaps in the recording's own still frame. Viewers who ask
-  // for reduced motion get that still frame from the <picture> source, and no control.
+  // Pause for the recording: swap in its still frames (the phone one and the desktop one).
   (function () {
-    var img = document.getElementById("demo-img");
-    var toggle = document.getElementById("demo-toggle");
-    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
-    var moving = img.getAttribute("src");
-    var still = img.getAttribute("data-still");
-    function sync() {
-      if (reduce && reduce.matches) {
-        toggle.hidden = true;
-        setPaused(false);
-        return;
-      }
-      toggle.hidden = false;
-    }
+    var img = document.getElementById("rec"), toggle = document.getElementById("rec-toggle");
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     var paused = false;
-    function setPaused(on) {
-      paused = on;
-      img.src = on ? still : moving;
-      toggle.textContent = on ? "Play" : "Pause";
-      toggle.setAttribute("aria-label", on ? "Play the recording" : "Pause the recording");
-    }
-    toggle.addEventListener("click", function () { setPaused(!paused); });
-    sync();
-    if (reduce && reduce.addEventListener) reduce.addEventListener("change", sync);
+    var swappable = Array.prototype.slice.call(img.parentNode.querySelectorAll("[data-moving]"));
+    toggle.hidden = false;
+    toggle.setAttribute("aria-label", "Pause the recording");
+    toggle.addEventListener("click", function () {
+      paused = !paused;
+      swappable.forEach(function (el) {
+        var url = el.getAttribute(paused ? "data-still" : "data-moving");
+        if (el.tagName === "SOURCE") el.srcset = url; else el.src = url;
+      });
+      toggle.textContent = paused ? "Play" : "Pause";
+      toggle.setAttribute("aria-label", paused ? "Play the recording" : "Pause the recording");
+    });
   })();
 </script>
 </body>

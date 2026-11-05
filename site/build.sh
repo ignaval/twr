@@ -9,7 +9,7 @@ sh -n install.sh
 rm -rf site-dist
 mkdir site-dist
 cp site/index.html install.sh site-dist/
-for img in tui-demo tui-demo-still tui-stack tui-grid tui-compact-card tui-compact-workspaces; do
+for img in tui-conversation tui-conversation-still tui-conversation-phone tui-conversation-phone-still; do
     cp "docs/img/$img.svg" site-dist/
 done
 # Every src, srcset, data-still and same-site href in the page names a file in site-dist/.
