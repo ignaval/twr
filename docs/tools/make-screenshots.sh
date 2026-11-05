@@ -4,20 +4,20 @@
 #
 #   docs/tools/make-screenshots.sh
 #
-# It builds twr (or uses TWR_BIN=<path>, a twr binary you already have) and starts a throwaway hub (TWR_HOME under /tmp) with the scripted test
-# runtime (`fake`, TWR_ENABLE_FAKE=1) for the worker threads, and a scripted orchestrator: a
-# small ACP agent written below (orch.py) that answers the messages in script.json and sums
-# up each hub notice in a sentence. It makes five small git repositories, says hello to the
-# orchestrator through the TUI, and drives eight threads into different states: waiting on a
-# permission, asking a question longer than a phone's screen, failed, running, done and
-# parked. The orchestrator hears about them from the hub, and then the TUI asks it what needs
-# the user. A second workspace, client-x, gets a hub of its own and three threads, which the
-# sidebar lists under its card, and a third, scratch, stays stopped. Then it runs `twr` in a
-# private tmux server, captures the stack view (160x42), the grid view (160x25), and at 40x20
-# (a phone) the compact layout's Threads screen twice (its cards, then scrolled to the other
-# workspaces) and the long question open in its popup on Needs you, with their colors, and
-# turns the captures into SVG with docs/tools/ansi2svg.py. No real agent
-# runs: the hub and the TUI get a PATH without claude, codex or grok, and HOME is the
+# It builds twr (or uses TWR_BIN=<path>, a twr binary you already have) and starts a throwaway
+# hub (TWR_HOME under /tmp) with the scripted test runtime (`fake`, TWR_ENABLE_FAKE=1) for the
+# worker threads, and a scripted orchestrator: a small ACP agent written below (orch.py) that
+# answers the messages in script.json and sums up each hub notice in a sentence. It makes six
+# small git repositories, says hello to the orchestrator through the TUI, and drives eight
+# threads into different states: waiting on a permission, asking a question longer than a
+# phone's screen, failed, running, done and parked. The orchestrator hears about them from the
+# hub, and then the TUI asks it what needs the user. A second workspace, client-x, gets a hub of
+# its own and three threads, which the sidebar lists under its card, and a third, scratch, stays
+# stopped. Then it runs `twr` in a private tmux server, captures the stack view (160x42), the
+# grid view (160x25), and at 40x20 (a phone) the compact layout's Threads screen twice (its
+# cards, then scrolled to the other workspaces) and the long question open in its popup on Needs
+# you, with their colors, and turns the captures into SVG with docs/tools/ansi2svg.py. No real
+# agent runs: the hub and the TUI get a PATH without claude, codex or grok, and HOME is the
 # temporary directory. Everything the script started is stopped and removed on exit.
 #
 # Needs git, tmux and python3. Takes a minute or two (it waits for the hub's 30 s git tick).
@@ -38,7 +38,7 @@ work=$(mktemp -d /tmp/twr-shots.XXXXXX)
 tmux_name="twrshots-$$"
 hub_pid=""
 hub2_pid=""
-# The workspace the helpers below act in (empty: default).
+# The workspace the helpers below act in (empty: default; TWR_WORKSPACE is unset below).
 ws=""
 
 # stop_hub PID: stop a hub this shell started.
@@ -95,6 +95,7 @@ mkrepo infra main.tf versions.tf .github/workflows/deploy.yml
 mkrepo mobile package.json src/push/retry.ts src/crash/report.ts fastlane/Fastfile
 
 export TWR_HOME="$work/twr"
+unset TWR_WORKSPACE
 mkdir -p "$TWR_HOME" "$work/home"
 cat > "$TWR_HOME/config.toml" << EOF
 default_runtime = "fake"
@@ -520,8 +521,7 @@ capture grid 160 25 C-g Tab
 # selected; three Downs (past the permission, the question and the failure) select the running
 # one, the cards following it.
 capture compact 40 20 /t Enter Down Down Down
-# The phone's Threads screen further down: the last of the current workspace's cards, then
-# the other workspaces with their threads.
+# The phone's Threads screen scrolled down to the other workspaces with their threads.
 capture compact-threads 40 20 /t Enter Down Down Down Down Down Down Down Down
 # A phone answering a card longer than its screen: Needs you, the question, its popup.
 capture compact-card 40 20 /n Enter Down Enter
@@ -546,7 +546,7 @@ python3 docs/tools/ansi2svg.py "$work/grid.ans" docs/img/tui-grid.svg \
 python3 docs/tools/ansi2svg.py "$work/compact.ans" docs/img/tui-compact.svg \
     --title "twr on a phone: the compact layout's tab bar over the Threads screen's cards"
 python3 docs/tools/ansi2svg.py "$work/compact-threads.ans" docs/img/tui-compact-workspaces.svg \
-    --title "twr on a phone: the Threads screen's last cards of the current workspace, then the other workspaces with their threads"
+    --title "twr on a phone: the Threads screen scrolled down to the other workspaces with their threads"
 python3 docs/tools/ansi2svg.py "$work/compact-card.ans" docs/img/tui-compact-card.svg \
     --title "twr on a phone: a question longer than the screen in its action popup, its options under the first lines of its text"
 ls -l docs/img/tui-stack.svg docs/img/tui-grid.svg docs/img/tui-compact.svg \

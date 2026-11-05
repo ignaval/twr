@@ -14,7 +14,7 @@
 <meta property="og:url" content="https://twr.tools/">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23141413'/%3E%3Cpath d='M8 23h16' stroke='%23e88a4f' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="preload" as="image" href="tui-demo.svg" type="image/svg+xml">
+<link rel="preload" as="image" href="tui-demo.svg" type="image/svg+xml" media="(prefers-reduced-motion: no-preference)">
 <style>
   :root {
     --bg: #f7f5f0;
@@ -96,7 +96,8 @@
   .brand span { color: var(--accent); }
   /* The cursor breathes, like the TUI's working icon; still for reduced motion. */
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-  @media (prefers-reduced-motion: no-preference) { .brand span, .wordmark span { animation: breathe 1.5s ease-in-out infinite; } }
+  /* A few breaths only: nothing on the page blinks for more than five seconds. */
+  @media (prefers-reduced-motion: no-preference) { .brand span, .wordmark span { animation: breathe 1.5s ease-in-out 3; } }
   nav.links { margin-left: auto; }
   nav.links ul { display: flex; flex-wrap: wrap; gap: 4px 18px; list-style: none; margin: 0; padding: 0; }
   nav.links li { margin: 0; }
@@ -314,8 +315,11 @@
         <button type="button" id="demo-toggle" aria-label="Pause the recording" hidden>Pause</button>
       </div>
       <div class="pan wide" tabindex="0" role="region" aria-label="Recorded twr session, scrolls sideways on a narrow screen">
+        <picture>
+        <source media="(prefers-reduced-motion: reduce)" srcset="tui-demo-still.svg" type="image/svg+xml">
         <img id="demo-img" src="tui-demo.svg" data-still="tui-demo-still.svg" width="1103" height="604" fetchpriority="high" decoding="async"
-          alt="An animated recording of the twr terminal UI. The Threads sidebar on the left holds the default workspace with its thread cards; the conversation with the orchestrator fills the right. The user asks for two threads, ratelimit and invoice-rounding, which appear as cards. invoice-rounding's git push permission is allowed from its card's action popup, ratelimit's test run by typing allow ratelimit in the conversation, each report comes back into the conversation, and the user opens ratelimit's transcript and returns.">
+          alt="A recording of the twr terminal UI. The Threads sidebar on the left holds the default workspace with its thread cards; the conversation with the orchestrator fills the right. The user asks for two threads, ratelimit and invoice-rounding, which appear as cards. invoice-rounding's git push permission is allowed from its card's action popup, ratelimit's test run by typing allow ratelimit in the conversation, each report comes back into the conversation, and the user opens ratelimit's transcript and returns.">
+        </picture>
       </div>
     </figure>
     <p class="pan-hint" aria-hidden="true">← swipe the recording sideways →</p>
@@ -377,7 +381,7 @@
         <div class="term-bar"><span class="label">grid view · Ctrl-G</span><span class="size">160×25</span></div>
         <div class="pan wide" tabindex="0" role="region" aria-label="Grid view capture, scrolls sideways on a narrow screen">
           <img src="tui-grid.svg" width="1372" height="478" loading="lazy" decoding="async"
-            alt="The twr grid view at 160 by 25: one tile per worker thread, each in its own color, with its state, its waiting item or last report and its git line. ratelimit waits on a permission, invoice-rounding asks a question, deploy-fix failed on a Terraform state lock, checkout-ui is running, and changelog and a11y-audit are done.">
+            alt="The twr grid view at 160 by 25, the Threads sidebar with the default, client-x and scratch workspaces at its left: one tile per worker thread, each in its own color, with its state, its waiting item or last report and its git line. ratelimit waits on a permission, invoice-rounding asks a question, deploy-fix failed on a Terraform state lock, checkout-ui is running, and changelog and a11y-audit are done.">
         </div>
       </figure>
       <p class="pan-hint" aria-hidden="true">← swipe the capture sideways →</p>
@@ -424,7 +428,7 @@
       <h2 id="answers-h">It relays your answers. It never makes one up.</h2>
       <div class="groups" style="margin-top:8px">
         <div>
-          <p>The orchestrator can pass on an answer you gave. A short command such as <code>allow both</code> or <code>deny the webapp one</code> applies at once; anything longer goes on a card that only you can confirm, and every answer names the exact revision of the question you saw.</p>
+          <p>The orchestrator can pass on an answer you gave. A short command such as <code>allow both</code> or <code>deny the webapp one</code> answers a permission at once. Anything else, and every answer to a question, goes on a card that only you can confirm, and every answer names the exact revision of the item you saw.</p>
           <p>The agents twr runs can read the hub and run jobs for their own thread. They can't answer a permission or a question, change a mode, delete a thread or send prompts. twr is not a sandbox, and <a href="https://github.com/ignaval/twr/blob/main/docs/security-model.md">the security model</a> says what this guard covers and what it doesn't.</p>
         </div>
         <div>
@@ -463,7 +467,7 @@
         <div class="group">
           <h3><span class="tag">remote boxes</span> · SSH, containers, dial-in</h3>
           <ul>
-            <li>After <code>twr box add gpu me@gpu-box</code> the hub installs its own build over SSH and starts a box daemon there. Threads keep running across disconnects, hub restarts and laptop sleep, with no token, listener or tunnel to set up.</li>
+            <li>After <code>twr box add gpu me@gpu-box</code> the hub installs its own build over SSH (<code>twr box install</code> for a box of another OS or CPU) and starts a box daemon there. Threads keep running across disconnects, hub restarts and laptop sleep, with no token, listener or tunnel to set up.</li>
             <li>Container boxes through <code>docker exec</code>, podman or <code>kubectl exec</code>, for repositories you don't trust.</li>
             <li>Dial-in boxes, for a machine the hub can't reach, connect out over <code>wss://</code> with a token.</li>
             <li>Linux and Mac boxes; on a Mac the daemon starts where Claude Code can read its keychain login. <code>twr box doctor</code> says what's wrong and how to fix it.</li>
@@ -505,13 +509,13 @@
     <div class="wrap">
       <p class="kicker">what runs where</p>
       <h2 id="local-h">twr is local. Your agents are not.</h2>
-      <p class="intro">twr itself has no account, no cloud service and no telemetry. The agents it runs call their providers, under your own logins, so their terms and quotas apply.</p>
+      <p class="intro">twr itself has no account, no cloud service and no telemetry. The agents it runs call their providers under your own logins, so their terms and quotas apply. The hub also asks a small model, with the same logins, for suggestions and summaries until you turn them off.</p>
       <div class="ledger">
         <div>
-          <h3><span class="dot" style="background:#3fb950" aria-hidden="true"></span>On your machine</h3>
+          <h3><span class="dot" style="background:#3fb950" aria-hidden="true"></span>On machines you run</h3>
           <ul>
             <li>The hub, its append-only SQLite log and the TUI: one Rust binary.</li>
-            <li>Worktrees, jobs, cards, the orchestrator's memory and checkpoints.</li>
+            <li>Worktrees and jobs, here or on your boxes; cards, the orchestrator's memory and checkpoints.</li>
             <li>Boxes you add, reached over SSH, a container command or a connection they open.</li>
           </ul>
         </div>
@@ -519,7 +523,7 @@
           <h3><span class="dot" style="background:#f0935a" aria-hidden="true"></span>Model calls, with your logins</h3>
           <ul>
             <li>The orchestrator and every worker: each runtime's CLI, signed in by you.</li>
-            <li>Next-message suggestions and one-line thread summaries, both on by default, ask a small model through Claude Code or Codex. <code>/suggest off</code> and <code>/summaries off</code> stop them.</li>
+            <li>Next-message suggestions and one-line thread summaries, both on by default: the hub asks a small model through Claude Code or Codex. Turn them off in <code>/settings</code> or with <code>[tui] suggest = false</code> and <code>summaries = false</code>.</li>
             <li>Codex's reviewer, for Codex threads in <code>auto</code> unless you set <code>ask</code>.</li>
           </ul>
         </div>
@@ -540,7 +544,7 @@
       <h2 id="install-h">Three steps to the first thread.</h2>
       <ol class="install-steps">
         <li>
-          <b>Install twr.</b> The script puts the release build for your machine in <code>~/.local/bin</code>, without sudo, after checking it against the release's signed checksums.
+          <b>Install twr.</b> The script puts the release build for your machine in <code>~/.local/bin</code>, without sudo, after checking it against the release's checksums, and their signature where your <code>openssl</code> can verify it.
           <pre class="cmd">curl -fsSL https://twr.tools/install.sh | sh</pre>
           <p class="fine">Linux x86_64 and aarch64, macOS on Apple silicon and Intel. Or download an archive from <a href="https://github.com/ignaval/twr/releases/latest">the releases page</a>, or build it with Rust 1.89 or newer: <code>cargo install --locked --git https://github.com/ignaval/twr twr-cli</code>.</p>
         </li>
@@ -612,7 +616,7 @@ twr update                           <span class="c"># later: the latest release
   })();
 
   // A pause for the recording: it swaps in the recording's own still frame. Viewers who ask
-  // for reduced motion get the still frame from the image itself, and no control.
+  // for reduced motion get that still frame from the <picture> source, and no control.
   (function () {
     var img = document.getElementById("demo-img");
     var toggle = document.getElementById("demo-toggle");
@@ -622,20 +626,19 @@ twr update                           <span class="c"># later: the latest release
     function sync() {
       if (reduce && reduce.matches) {
         toggle.hidden = true;
-        paused = false;
-        toggle.textContent = "Pause";
-        img.src = moving;
+        setPaused(false);
         return;
       }
       toggle.hidden = false;
     }
     var paused = false;
-    toggle.addEventListener("click", function () {
-      paused = !paused;
-      img.src = paused ? still : moving;
-      toggle.textContent = paused ? "Play" : "Pause";
-      toggle.setAttribute("aria-label", paused ? "Play the recording" : "Pause the recording");
-    });
+    function setPaused(on) {
+      paused = on;
+      img.src = on ? still : moving;
+      toggle.textContent = on ? "Play" : "Pause";
+      toggle.setAttribute("aria-label", on ? "Play the recording" : "Pause the recording");
+    }
+    toggle.addEventListener("click", function () { setPaused(!paused); });
     sync();
     if (reduce && reduce.addEventListener) reduce.addEventListener("change", sync);
   })();
