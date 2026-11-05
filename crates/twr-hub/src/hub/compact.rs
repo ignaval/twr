@@ -5,12 +5,10 @@
 //!   orchestrator's identity is refused here as well, and a prompt of anyone else whose first
 //!   word is `/compact` (which Claude Code and Grok Build would run as the command) is refused
 //!   where prompts are queued ([`refuse_compact_command`]);
-//! - the user, through the hub's offer before a message goes to a worker whose prompt cache
-//!   expired (`Compact first`, `hub::idle_compact`): only the user answers that card, and the
-//!   compaction is the user's (their source), recorded with `ext.twr.compact_by: "offer"`;
-//! - the hub itself, only when the user configured `[threads] idle_compaction =
-//!   "before_expiry"`: an idle worker's context just before its prompt cache expires
-//!   (`hub::idle_compact`), with `source: hub` and `ext.twr.compact_by: "idle"`.
+//! - the hub, automatically before the next user/orchestrator message when a worker's large
+//!   prompt cache expired (`hub::idle_compact`, source `hub`, `compact_by: "expired"`);
+//! - the hub, under `before_expiry`, just before an idle worker's hour-long cache expires
+//!   (`compact_by: "idle"`). Legacy offer answers are still understood (`compact_by: "offer"`).
 //!
 //! Never the orchestrator or an agent. The user's own `thread.compact` records no
 //! `compact_by` ([`CompactBy::User`]), as before it existed.
@@ -26,7 +24,7 @@
 //! ask waits in memory ([`CompactAsk`]), so a hub restart before it starts forgets it, and is
 //! checked again when it is due: one asked of a session that is no longer the thread's (a
 //! move to another runtime, a new session) is dropped. It is consumed once its `turn.started`
-//! is recorded. While the hub's offer to compact before a held message is open
+//! is recorded. While a legacy offer to compact before a held message is open
 //! (`hub::idle_compact`), the user's `thread.compact` answers it `Compact first` (recorded as
 //! their answer): the compaction then runs before the messages the card held.
 //!
@@ -47,7 +45,7 @@
 //! and a parked or attached one.
 //!
 //! `thread.compact {thread, offers: "on" | "off"}` (the user only) compacts nothing: it turns
-//! the hub's offers for the thread on or off (`hub::idle_compact`), recorded as a
+//! automatic cache compaction for the thread on or off (`hub::idle_compact`), recorded as a
 //! `conversation.update` on it with `ext.twr.idle_compaction`.
 //!
 //! [`AdapterCmd::Compact`]: twr_core::adapter::AdapterCmd::Compact
@@ -107,11 +105,13 @@ pub(super) const COMPACT_BY_KEY: &str = "compact_by";
 pub(super) enum CompactBy {
     /// The user's `thread.compact`.
     User,
-    /// The user's `Compact first` on the hub's offer (`hub::idle_compact`).
+    /// Legacy: the user's `Compact first` on the hub's offer (`hub::idle_compact`).
     Offer,
     /// The hub, before the prompt cache expired, under `[threads] idle_compaction =
     /// "before_expiry"` (`hub::idle_compact`).
     Idle,
+    /// The hub, before the next message after the prompt cache expired.
+    Expired,
 }
 
 impl CompactBy {
@@ -121,6 +121,7 @@ impl CompactBy {
             CompactBy::User => None,
             CompactBy::Offer => Some("offer"),
             CompactBy::Idle => Some("idle"),
+            CompactBy::Expired => Some("expired"),
         }
     }
 }
@@ -389,6 +390,11 @@ impl Core {
             }),
         );
         self.append_batch(hub, batch)?;
+        if ask.by == CompactBy::Expired {
+            if let (Some(session), Some(expiry)) = (&ask.session, view.cache_expires_at) {
+                self.rt(thread).offer_waived = Some((session.clone(), expiry));
+            }
+        }
         self.rt(thread).compact = None;
         let sent = match self.rt.get(thread).and_then(|r| r.live.as_ref()) {
             Some(live) => live
@@ -492,6 +498,14 @@ impl Core {
         );
         self.append_batch(hub, batch)?;
         Ok(())
+    }
+
+    /// Whether this turn is automatic maintenance preparing an expired cache's message.
+    pub(super) fn is_expired_compaction(&self, thread: &str, turn: u64) -> bool {
+        matches!(self.stored_event(thread, Some(turn), "turn.started"),
+            Ok(Some(Event {source: Source::Hub, body: EventBody::TurnStarted(p), ..}))
+            if is_compact_turn(&p) && super::twr_ext(&p.ext)
+                .and_then(|x| x.get(COMPACT_BY_KEY)).and_then(Value::as_str) == Some("expired"))
     }
 
     /// Whether turn `turn` of `thread` is a compaction the user asked for (its `turn.started`).

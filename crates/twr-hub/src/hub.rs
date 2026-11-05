@@ -1103,9 +1103,8 @@ struct ThreadRt {
     /// the next turn once the messages queued before it are done. Memory only.
     #[serde(skip)]
     compact: Option<compact::CompactAsk>,
-    /// The session and prompt cache expiry for which the user answered the hub's offer to
-    /// compact the context first (`hub::idle_compact`): not offered again for them. Memory
-    /// only.
+    /// The session and cache expiry already attempted automatically or answered on a legacy
+    /// offer (`hub::idle_compact`): no further attempt for that cache. Memory only.
     #[serde(skip)]
     offer_waived: Option<(String, DateTime<Utc>)>,
 }
@@ -1575,6 +1574,8 @@ struct PendingExit {
     park: bool,
     /// The plan is a crash's (`thread.crashed` and its `error` item).
     crash: bool,
+    /// A crash during automatic expired-cache maintenance continues its queued message.
+    continue_after_compaction: bool,
     /// The runner frame (`exited`) this exit came in, committed with the closing sequence
     /// while its connection still holds `fence` (`hub::runners`).
     runner_ack: Option<store::RunnerAck>,
@@ -2326,14 +2327,12 @@ impl Core {
             return Ok(None);
         }
         let next = self.store.next_pending(thread)?;
+        // Automatically compact an expired large context before the next message, and
+        // retire any offer cards left by an older hub (`hub::idle_compact`).
+        self.prepare_idle_compaction(hub, thread, next.as_ref())?;
         // A compaction the user asked for, once what was queued before it ran (`hub::compact`).
         if self.compaction_due(hub, thread, next.as_ref().map(|p| p.id)) {
             return Ok(Some((self.start_compact_turn(hub, thread)?, None)));
-        }
-        // The hub's offer to compact the context first, the user's to answer, when the
-        // thread's prompt cache expired (`hub::idle_compact`): the message waits for it.
-        if self.idle_offer_holds(hub, thread, next.as_ref()) {
-            return Ok(None);
         }
         let Some(p) = next else {
             return Ok(None);

@@ -156,7 +156,7 @@ A thread on a remote box has a box token after its runtime, in its card's title:
 
 The TUI asks the hub how its boxes are (`hub.info`) every 10 seconds, and a runner connecting or leaving shows at once. In a card's title the token gives way last, as above: the runtime first, then the model, then the box's name (`@gpu-wo… offline`); the box's state is never cut. `twr box status gpu` and `twr box doctor gpu` say more ([runners.md](runners.md)).
 
-When the hub itself has a question, such as which thread should get a message, it shows up as a `twr asks` card at the top of the column. So does its offer to compact a worker's context before your message goes to it, once the worker's prompt cache has expired: `Compact first`, `Send as is` or `Don't ask for <thread>`, and the message waits for your answer ([runtimes.md](runtimes.md#the-prompt-cache)). `/compact-context` on that thread answers it `Compact first`, and `send now` on the held message `Send as is`.
+When the hub itself has a question, such as which thread should get a message, it shows up as a `twr asks` card at the top of the column. A worker whose large prompt cache expired is compacted automatically before the next message, then continues without a confirmation card ([runtimes.md](runtimes.md#the-prompt-cache)).
 
 ### The activity line
 
@@ -452,7 +452,7 @@ Each row shows the start of its message, `…` when there is more, and who sent 
 - **Act:** `Enter` on an empty line, or a tap on the selected row, opens its [action popup](#the-action-popup), with the message's text and who sent it, and these rows:
   - `edit: back into the box` (only your own messages; it is picked as the popup opens, so `Enter`, `Enter` edits it);
   - `delete`: takes it out of the queue; the text of a message of yours goes to the history (`↑`), someone else's (the orchestrator's, a `!!` command's output) goes for good, so it can never be sent again as yours;
-  - `send now: interrupts <thread>'s turn` (only the next message to run): the hub interrupts the turn that runs and the message runs next. The interrupted turn keeps what it did; it gets no report, review or retry. A turn on a runtime that can't be interrupted (a `pty:` runtime, a remote box) can't be cut short: the status bar says so, and the message runs when the turn ends. A failure that held the queue lets it go, and so does the hub's offer to compact the thread's context first: `send now` answers it `Send as is`.
+  - `send now: interrupts <thread>'s turn` (only the next message to run): the hub interrupts the turn that runs and the message runs next. The interrupted turn keeps what it did; it gets no report, review or retry. A turn on a runtime that can't be interrupted (a `pty:` runtime, a remote box) can't be cut short: the status bar says so, and the message runs when the turn ends. A failure that held the queue lets it go, and automatic cache compaction is bypassed for this message.
   With the mouse, `delete` and `send now` take two taps, as `stop` does.
 
 `Esc` twice, and `/unsend`, still take back the last message you sent, queued or not ([above](#taking-back-a-message)). Deleting or editing takes back with the same `message.withdraw`, so a message whose turn has just started, and hasn't acted yet, is taken back from its turn as `Esc Esc` would.
@@ -679,7 +679,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]]` | start a thread in a configured project, a path, or a repository folder name found under your code folders ([usage](usage.md)) |
 | `/park [thread]`, `/stop [thread]` | park or stop a thread, the one you dived into or the selected one by default; asks `y` |
 | `/resume [thread]` | resume a parked thread |
-| `/compact-context [thread]` | compact a thread's context, as its agent's own `/compact` does: a turn of its own, after the turn that runs and the messages queued before; the one you dived into or the selected one by default ([runtimes.md](runtimes.md#context-compaction)). The hub's offers to compact before a message are turned off for a thread with its card's `Don't ask for <thread>`, and on again with `twr compact <thread> --offers on`. `/compact` is the phone layout |
+| `/compact-context [thread]` | compact a thread's context, as its agent's own `/compact` does: a turn of its own, after the turn that runs and the messages queued before; the one you dived into or the selected one by default ([runtimes.md](runtimes.md#context-compaction)). Automatic compaction before a message is turned off for a thread with `twr compact <thread> --offers off`, and on again with `--offers on`. `/compact` is the phone layout |
 | `/trim [thread]` | delete an idle thread's build output (`target/`, `node_modules/`, ...), the one you dived into or the selected one by default ([worktrees.md](worktrees.md#trim)) |
 | `/pin [thread]` | pin or unpin a thread's card, the selected one by default |
 | `/delete <thread>...` | delete one or more threads: their worktrees and branches go to the trash; asks on a delete card |
