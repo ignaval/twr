@@ -438,7 +438,8 @@ pub fn waiting_alerts(
         if !before.is_some_and(|b| waiting > b) {
             continue;
         }
-        match notifier.workspace_waiting(&tab.name, waiting, now) {
+        // Named as shown (a rename shows here too).
+        match notifier.workspace_waiting(&tab.label, waiting, now) {
             WorkspaceAlert::Send(bytes) => out.push(bytes),
             WorkspaceAlert::Seen => {}
             WorkspaceAlert::Later => {

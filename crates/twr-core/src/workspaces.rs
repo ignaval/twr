@@ -342,6 +342,9 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
     }
     let ws = root.workspace(name)?;
     crate::paths::check_socket_path(&ws.socket)?;
+    // A record of the default naming this id is left from a workspace that went (a removal cut
+    // short): the new one does not become the default by it.
+    forget_default(&root, name).context("updating the default workspace")?;
     crate::paths::ensure_private_dir(&root.workspaces_dir())?;
     match std::fs::DirBuilder::new().mode(0o700).create(&ws.data_dir) {
         Ok(()) => {}
