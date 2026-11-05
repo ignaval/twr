@@ -1493,7 +1493,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     twr_core::trace::mark_with(|| {
         let role = match &cli.cmd {
             None => "tui",
@@ -1546,8 +1546,11 @@ fn main() -> ExitCode {
         // root slot too), so an agent's own `twr` calls reach this hub whatever its name
         // becomes, and whichever workspace becomes the default (a selection that fails, or is
         // not UTF-8, stays as it is: `run` refuses it, before anything starts).
+        // Resolved once: the hub serves that id too (`run` resolves `-w` again, and a name
+        // may go to another workspace meanwhile).
         if let Ok(paths) = Paths::from_env_in(cli.workspace.as_deref()) {
             std::env::set_var(WORKSPACE_ENV, paths.workspace_id());
+            cli.workspace = Some(paths.workspace_id().to_string());
         }
     }
     // A runner serves whichever hub it connects to: no workspace of this machine is its, and
