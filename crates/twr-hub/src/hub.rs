@@ -3061,7 +3061,9 @@ impl Hub {
         // A turn, or anything left running in the background: a runtime's task, a job, a `!`
         // command the user runs (none of which its status says).
         let busy = core.jobs_running()
-            || views.iter().any(|v| !v.background_tasks.is_empty())
+            || views
+                .iter()
+                .any(|v| !v.background_tasks.is_empty() || v.attached.is_some())
             || views.iter().any(|v| {
                 v.is_orchestrator()
                     && !v.retired

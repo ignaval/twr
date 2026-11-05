@@ -9247,9 +9247,9 @@ fn stop_workspace_lock(ws: &Paths) -> anyhow::Result<StopWorkspaceLock> {
 /// The names of the worker threads in the stopped workspace's log (deleted ones are gone; the
 /// orchestrator does not count), the orchestrator threads' conversation: how many there are
 /// (one per runtime it ran on) and their turns in all, and whether it shows orchestrator work
-/// that never ended: a turn left open, or a task, a job or a `!` command still recorded
-/// running. Its hub stopped without ending it (a crash, say), so its processes may still run:
-/// the next hub of the workspace finds and ends them.
+/// that never ended: a turn left open, a task, a job or a `!` command still recorded running,
+/// or a CLI still attached to it. Its hub stopped without ending it (a crash, say), so its
+/// processes may still run: the next hub of the workspace finds and ends them.
 fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64), bool)> {
     let db = ws.db_file();
     if !db.exists() {
@@ -9259,8 +9259,10 @@ fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64), bool)> {
     let events = store.load_all()?;
     let registry = twr_core::reduce::Registry::from_events(&events);
     let views = registry.list();
+    // (An interactive CLI attached to it too: attaching closes the headless turn.)
     let unfinished = views.iter().any(|t| {
-        t.is_orchestrator() && (t.current_turn.is_some() || !t.background_tasks.is_empty())
+        t.is_orchestrator()
+            && (t.current_turn.is_some() || !t.background_tasks.is_empty() || t.attached.is_some())
     });
     let (orchestrators, workers): (Vec<_>, Vec<_>) =
         views.into_iter().partition(|t| t.is_orchestrator());
@@ -9735,6 +9737,7 @@ async fn plan_removal_of(
                 t["background_tasks"]
                     .as_object()
                     .is_some_and(|m| !m.is_empty())
+                    || !t["attached"].is_null()
             });
             let busy = background
                 || all.iter().any(|t| {
@@ -10320,6 +10323,30 @@ mod tests {
                 .await
                 .unwrap();
             hub.append("o", None, Source::Adapter("fake".into()), task(false), None)
+                .unwrap();
+        }
+        // A CLI still attached to it (attaching closed its headless turn) keeps it too.
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let attached = EventBody::ThreadAttached(twr_core::event::ClientPayload {
+                client: "cli".into(),
+                ..Default::default()
+            });
+            hub.append("o", None, Source::User("t".into()), attached, None)
+                .unwrap();
+        }
+        let e = remove_workspace(&root, "a", None, Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("never ended"), "{e:#}");
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let detached = EventBody::ThreadDetached(Default::default());
+            hub.append("o", None, Source::User("t".into()), detached, None)
                 .unwrap();
         }
         remove_workspace(&root, "a", None, Consent::Yes)
