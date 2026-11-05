@@ -3058,21 +3058,26 @@ impl Hub {
                 ),
             ));
         }
-        let busy = views.iter().any(|v| {
-            v.is_orchestrator()
-                && !v.retired
-                && matches!(
-                    v.status(),
-                    twr_core::reduce::ThreadStatus::Running
-                        | twr_core::reduce::ThreadStatus::Background
-                        | twr_core::reduce::ThreadStatus::Waiting
-                        | twr_core::reduce::ThreadStatus::Attached
-                )
-        });
+        // A turn, or anything left running in the background: a runtime's task, a job, a `!`
+        // command the user runs (none of which its status says).
+        let busy = core.jobs_running()
+            || views.iter().any(|v| !v.background_tasks.is_empty())
+            || views.iter().any(|v| {
+                v.is_orchestrator()
+                    && !v.retired
+                    && matches!(
+                        v.status(),
+                        twr_core::reduce::ThreadStatus::Running
+                            | twr_core::reduce::ThreadStatus::Background
+                            | twr_core::reduce::ThreadStatus::Waiting
+                            | twr_core::reduce::ThreadStatus::Attached
+                    )
+            });
         if busy {
             return Err(RpcError::new(
                 codes::CONFLICT,
-                "its orchestrator is at work now: wait until it is done",
+                "its orchestrator, a job or a `!` command is at work now: wait until it is \
+                 done, or stop it",
             ));
         }
         let items = std::fs::read_dir(&trash).map_or(0, |d| d.count());

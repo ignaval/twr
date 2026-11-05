@@ -9671,18 +9671,26 @@ async fn removal_plan(
                 return refused(older_hub_why(&name));
             }
             let all = threads.as_array().cloned().unwrap_or_default();
-            let busy = all.iter().any(|t| {
-                t["role"] == "orchestrator"
-                    && t["retired"] != true
-                    && matches!(
-                        t["status"].as_str(),
-                        Some("running" | "background" | "waiting" | "attached")
-                    )
+            // A turn, a task left running, a job or a `!` command (none of which a status
+            // says), as the hub's own check counts them.
+            let background = all.iter().any(|t| {
+                t["background_tasks"]
+                    .as_object()
+                    .is_some_and(|m| !m.is_empty())
             });
+            let busy = background
+                || all.iter().any(|t| {
+                    t["role"] == "orchestrator"
+                        && t["retired"] != true
+                        && matches!(
+                            t["status"].as_str(),
+                            Some("running" | "background" | "waiting" | "attached")
+                        )
+                });
             if busy {
                 return refused(
-                    "its orchestrator is at work: deleting would stop it mid-turn. Wait until \
-                     it is done, or stop it first"
+                    "its orchestrator, a job or a `!` command is at work: deleting would stop \
+                     it. Wait until it is done, or stop it first"
                         .into(),
                 );
             }

@@ -3690,23 +3690,30 @@ where
                             }
                             // The workspace menu's changes ([`wsmenu`]): the CLI makes them,
                             // and the tabs are listed again at once.
+                            // Off the loop: they wait for the lock a removal holds meanwhile.
                             Action::WsRename { id, to } => {
-                                if let Some(ws) = &ctx.workspaces {
-                                    let msg = match ws.rename(&id, &to) {
-                                        Ok(msg) => msg,
-                                        Err(e) => format!("rename: {e:#}"),
-                                    };
-                                    let _ = ctx.ws_done_tx.send((msg, ws.list().ok()));
+                                if let Some(ws) = ctx.workspaces.clone() {
+                                    let done = ctx.ws_done_tx.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let msg = match ws.rename(&id, &to) {
+                                            Ok(msg) => msg,
+                                            Err(e) => format!("rename: {e:#}"),
+                                        };
+                                        let _ = done.send((msg, ws.list().ok()));
+                                    });
                                 }
                                 continue;
                             }
                             Action::WsDefault { id } => {
-                                if let Some(ws) = &ctx.workspaces {
-                                    let msg = match ws.set_default(&id) {
-                                        Ok(msg) => msg,
-                                        Err(e) => format!("make default: {e:#}"),
-                                    };
-                                    let _ = ctx.ws_done_tx.send((msg, ws.list().ok()));
+                                if let Some(ws) = ctx.workspaces.clone() {
+                                    let done = ctx.ws_done_tx.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let msg = match ws.set_default(&id) {
+                                            Ok(msg) => msg,
+                                            Err(e) => format!("make default: {e:#}"),
+                                        };
+                                        let _ = done.send((msg, ws.list().ok()));
+                                    });
                                 }
                                 continue;
                             }

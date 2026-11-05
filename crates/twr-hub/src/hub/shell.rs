@@ -224,6 +224,11 @@ impl Hub {
         };
         let program = shell_program();
         let mut core = self.inner.core();
+        // The shutdown would end it at once (and the TUI's Delete counts on nothing starting
+        // once it is decided, `Hub::shutdown_if_idle`).
+        if core.shutting_down {
+            return Err(rpc(codes::CONFLICT, "hub is shutting down"));
+        }
         let id = match &req.thread {
             Some(t) => core.resolve(t)?,
             None => core.orch.thread.clone().ok_or_else(|| {

@@ -1434,6 +1434,50 @@ mod tests {
         let hub = Hub::open(HubOptions::new(&db, twr_core::config::Config::default()))
             .await
             .unwrap();
+        // An orchestrator whose status says done, with a `!` command still running.
+        hub.append(
+            "o",
+            None,
+            Source::User("test".into()),
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "orchestrator".into(),
+                box_name: "local".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ext: crate::hub::twr_ext_map(serde_json::json!({"role": "orchestrator"})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        hub.append(
+            "o",
+            None,
+            Source::Adapter("fake".into()),
+            EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                task_id: "sh1".into(),
+                running: true,
+                description: "cargo test".into(),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("at work now"), "{}", e.message);
+        assert!(!hub.inner.core().shutting_down);
+        hub.append(
+            "o",
+            None,
+            Source::Adapter("fake".into()),
+            EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                task_id: "sh1".into(),
+                running: false,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
         hub.shutdown_if_idle().unwrap();
         assert!(hub.inner.core().shutting_down);
         hub.shutdown().await;
