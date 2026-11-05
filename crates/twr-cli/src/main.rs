@@ -10482,6 +10482,18 @@ mod tests {
         assert!(!ws.data_dir.exists());
     }
 
+    /// Waits (10 s at most) until no hub holds workspace `ws`'s lock: a hub let go of
+    /// releases it once its background tasks have.
+    async fn unlocked(ws: &Paths) {
+        for _ in 0..200 {
+            if super::lock_workspace(ws).unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("the hub kept the workspace's lock");
+    }
+
     /// A stopped workspace whose log shows its orchestrator's work that never ended (its hub
     /// went without ending it, as a crash leaves it) is kept: its processes may still run,
     /// and its next hub ends them. Ended, it is removed.
@@ -10518,6 +10530,7 @@ mod tests {
             hub.append("o", None, Source::Adapter("fake".into()), task(true), None)
                 .unwrap();
         }
+        unlocked(&a).await;
         let e = remove_workspace(&root, "a", None, Consent::Yes)
             .await
             .unwrap_err();
@@ -10546,6 +10559,7 @@ mod tests {
             hub.append("o", None, Source::User("t".into()), attached, None)
                 .unwrap();
         }
+        unlocked(&a).await;
         let e = remove_workspace(&root, "a", None, Consent::Yes)
             .await
             .unwrap_err();
@@ -10558,6 +10572,7 @@ mod tests {
             hub.append("o", None, Source::User("t".into()), detached, None)
                 .unwrap();
         }
+        unlocked(&a).await;
         remove_workspace(&root, "a", None, Consent::Yes)
             .await
             .unwrap();
@@ -10594,6 +10609,7 @@ mod tests {
             hub.append("w", None, user(), deleted, None).unwrap();
             hub.shutdown().await;
         }
+        unlocked(&a).await;
         assert!(!a.data_dir.join("trash").exists());
         let e = remove_workspace(&root, "a", None, Consent::Yes)
             .await
@@ -10616,12 +10632,14 @@ mod tests {
                 .unwrap();
             hub.shutdown().await;
         }
+        unlocked(&a).await;
         {
             let mut store = twr_hub::store::Store::open(&a.db_file()).unwrap();
             store
                 .enqueue_prompt("o", "then do X", Default::default(), None, &user(), 0)
                 .unwrap();
         }
+        unlocked(&a).await;
         let e = remove_workspace(&root, "a", None, Consent::Yes)
             .await
             .unwrap_err();
