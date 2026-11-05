@@ -219,7 +219,7 @@ These GitHub settings close gaps the workflows can't close by themselves:
 
 ## Website
 
-[twr.tools](https://twr.tools) is a Vercel project linked to this repository. Each push to `main` that changes `site/`, `install.sh`, `docs/img/` or `vercel.json` deploys it. `vercel.json`'s build runs `site/build.sh`, which checks `install.sh` with `sh -n` and copies `site/index.html`, `install.sh` and the images the page shows from `docs/img/` (the demo recording and its still frame, the stack and grid views and the two phone captures) into the output. An image the page starts using has to be added to its list: the build fails when the page refers to a file it didn't copy. (Vercel allows `buildCommand` 256 characters, and refuses a longer one before building.) The page is one static file with its CSS and a few lines of script inline, no build step and nothing loaded from another site. Other branches don't deploy. `install.sh` is served as plain text with a 5-minute cache, so a fix reaches users quickly. `twr.codes` and both `www.` names redirect to `twr.tools` with a 308, keeping the path.
+[twr.tools](https://twr.tools) is a Vercel project linked to this repository. Each push to `main` that changes `site/`, `install.sh`, `docs/img/` or `vercel.json` deploys it. `vercel.json`'s build runs `site/build.sh`, which checks `install.sh` with `sh -n` and copies `site/index.html`, `install.sh` and the images the page shows from `docs/img/` (the conversation recording, desktop and phone, and their still frames) into the output. An image the page starts using has to be added to its list: the build fails when the page refers to a file it didn't copy. (Vercel allows `buildCommand` 256 characters, and refuses a longer one before building.) The page is one static file with its CSS and a few lines of script inline, no build step and nothing loaded from another site. Other branches don't deploy. `install.sh` is served as plain text with a 5-minute cache, so a fix reaches users quickly. `twr.codes` and both `www.` names redirect to `twr.tools` with a 308, keeping the path.
 
 ## Screenshots
 
@@ -233,15 +233,23 @@ The script builds twr and starts a throwaway hub with `TWR_HOME` under `/tmp` an
 
 It needs git, tmux and python3, and takes about a minute because it waits for the hub's 30-second git snapshot. Set `TWR_SHOTS_KEEP=<dir>` to keep the raw captures, and `TWR_BIN=<path>` to use a twr binary you already built instead of building one.
 
-The animated recording at the top of the README and the site, `docs/img/tui-demo.svg`, is a real session too:
+The animated recording at the top of the README, `docs/img/tui-demo.svg`, is a real session too:
 
 ```sh
 docs/tools/make-demo.sh
 ```
 
-Its orchestrator and workers are small scripted ACP agents, `docs/tools/demo/orch.py` and `docs/tools/demo/worker.py`. The orchestrator calls twr's real MCP tools, so it really starts the two threads and relays "allow ratelimit". The workers write and commit files in their worktrees and ask for permissions over ACP, which become cards. The script types into the TUI in a private tmux server, captures the screen about ten times a second, and `ansi2svg.py --frames` turns the captures into one SVG that loops with CSS animation. Each element is drawn once and shown in the frames that have it, so the file stays under 100 KB. Viewers that ask for reduced motion see one still frame, which the script also writes alone to `docs/img/tui-demo-still.svg` for the site's pause button. The workers wait on files the script creates, so the script decides when each permission comes up.
+Its orchestrator and workers are small scripted ACP agents, `docs/tools/demo/orch.py` and `docs/tools/demo/worker.py`. The orchestrator calls twr's real MCP tools, so it really starts the two threads and relays "allow ratelimit". The workers write and commit files in their worktrees and ask for permissions over ACP, which become cards. The script types into the TUI in a private tmux server, captures the screen about ten times a second, and `ansi2svg.py --frames` turns the captures into one SVG that loops with CSS animation. Each element is drawn once and shown in the frames that have it, so the file stays under 100 KB. Viewers that ask for reduced motion see one still frame, which the script also writes alone to `docs/img/tui-demo-still.svg`. The workers wait on files the script creates, so the script decides when each permission comes up.
 
 It needs git, tmux and python3 and takes about a minute. `TWR_DEMO_KEEP=<dir>` keeps the raw frames and the hub's log, and `TWR_BIN=<path>` uses a twr binary you already built.
+
+The site's recording, `docs/img/tui-conversation.svg` and its phone version `tui-conversation-phone.svg`, is one conversation with the orchestrator, recorded the same way:
+
+```sh
+docs/tools/make-conversation.sh
+```
+
+The user asks for two threads, answers ratelimit's permission with "allow ratelimit", hears both reports, then asks the orchestrator to send ratelimit a follow-up, which it does with the `send` tool; at the end the script opens ratelimit's transcript, where the follow-up arrives from the orchestrator. A desktop TUI (104x30) and a phone one (46x36) watch the same hub, and each becomes an SVG with a still frame (`-still.svg`, for reduced motion and the site's pause button). The hub runs with a temporary `HOME` and no `TWR_HOME`, so the branches are `twr/<name>` as for any user. The workers run with `--no-push`, so invoice-rounding runs its tests instead of asking to push. The site's hero replays the same messages as HTML. Record with a build of the released code (`TWR_BIN=<path>`), so no unreleased UI shows. It needs git, tmux and python3 and takes about a minute and a half; `TWR_DEMO_KEEP=<dir>` keeps the raw frames.
 
 ## Docs
 
