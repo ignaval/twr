@@ -305,7 +305,14 @@ impl Core {
                 // retry aside. Folded from the log, so a hub restart and a runner's
                 // reconnection keep it (a runtime that died with the previous hub is the
                 // exception: `close_stale_runtimes`).
-                if matches!(ev.body, EventBody::ThreadCrashed(_)) && failed_worker {
+                let automatic_compaction_crash = matches!(&ev.body,
+                    EventBody::ThreadCrashed(p) if ev.source == Source::Hub && twr_ext(&p.ext)
+                        .and_then(|x| x.get(super::compact::COMPACT_BY_KEY))
+                        .and_then(Value::as_str) == Some("expired"));
+                if matches!(ev.body, EventBody::ThreadCrashed(_))
+                    && failed_worker
+                    && !automatic_compaction_crash
+                {
                     rt.queue_held = true;
                     rt.crash_hold = Some(gseq);
                 }

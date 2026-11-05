@@ -368,9 +368,9 @@ enum Cmd {
     Compact {
         /// Thread id, name, alias or unique prefix.
         thread: String,
-        /// Instead of compacting: turn the hub's offers to compact this thread's context once
-        /// its prompt cache expired on or off (`[threads] idle_compaction`; a card's "Don't
-        /// ask for <thread>" turns them off).
+        /// Instead of compacting: turn automatic compaction of this thread's context once
+        /// its prompt cache expired on or off (`[threads] idle_compaction`). The flag keeps
+        /// its legacy name for compatibility.
         #[arg(long, value_parser = ["on", "off"])]
         offers: Option<String>,
     },
@@ -3004,7 +3004,7 @@ fn compact_outcome(thread: &str, r: &Value) -> String {
     let name = r["thread_name"].as_str().unwrap_or(thread);
     if let Some(offers) = r["offers"].as_str() {
         return format!(
-            "{name}: offers to compact its context once its prompt cache expired are {offers}"
+            "{name}: automatic compaction of its context once its prompt cache expired is {offers}"
         );
     }
     match (r["state"].as_str(), r["turn"].as_u64()) {
@@ -9141,7 +9141,7 @@ mod tests {
         assert!(Cli::try_parse_from(["twr", "compact", "api", "--offers", "maybe"]).is_err());
         assert_eq!(
             compact_outcome("api", &json!({"thread_name": "api", "offers": "on"})),
-            "api: offers to compact its context once its prompt cache expired are on"
+            "api: automatic compaction of its context once its prompt cache expired is on"
         );
         assert_eq!(
             compact_outcome(

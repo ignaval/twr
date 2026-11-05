@@ -135,6 +135,12 @@ impl Core {
                     body: EventBody::ThreadCrashed(ThreadCrashed {
                         exit_code,
                         stderr_tail: tail,
+                        // Keep this exception to crash holds in the log, so replay also
+                        // continues a message whose automatic preparation crashed.
+                        ext: view
+                            .current_turn
+                            .filter(|t| self.is_expired_compaction(thread, *t))
+                            .and_then(|_| twr_ext_map(json!({"compact_by": "expired"}))),
                         ..Default::default()
                     }),
                 });
@@ -351,6 +357,11 @@ impl Core {
         stderr_tail: String,
         fence: Option<&Fence>,
     ) -> Option<PendingExit> {
+        let continue_after_compaction = self
+            .registry
+            .get(thread)
+            .and_then(|v| v.current_turn.filter(|_| v.current_turn_compact))
+            .is_some_and(|t| self.is_expired_compaction(thread, t));
         let live = self.remove_live(thread, generation)?;
         let rt = self.rt(thread);
         rt.exiting = true;
@@ -390,6 +401,7 @@ impl Core {
             stopped: stopped && given_up.is_none(),
             park: parking,
             crash,
+            continue_after_compaction,
             runner_ack: None,
             fence: fence.cloned(),
             at: None,
@@ -462,7 +474,10 @@ impl Core {
             self.park_quiesced(thread, closed);
         }
         // Prompts sent while the runtime was stopping start a fresh (resumed) session.
-        closed && exit.stopped && exit.attach_client.is_none() && !exit.park
+        closed
+            && (exit.stopped || (exit.crash && exit.continue_after_compaction))
+            && exit.attach_client.is_none()
+            && !exit.park
     }
 }
 
