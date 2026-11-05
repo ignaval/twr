@@ -1891,6 +1891,8 @@ fn removing_the_default_and_the_last_workspace() {
         e.contains("twr ws default <name>") && e.contains("workspaces: z"),
         "{e}"
     );
+    // What is about every workspace needs no default one.
+    ok(home, &["log", "checkpoint", "--all"]);
     let listing = twr(home, &["ws", "list"]);
     assert!(listing.status.success());
     assert!(String::from_utf8_lossy(&listing.stderr).contains("there is no default workspace"));

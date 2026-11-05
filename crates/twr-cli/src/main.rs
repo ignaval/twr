@@ -2207,9 +2207,20 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         cmd => Cli { cmd, ..cli },
     };
-    // (A socket given explicitly is that hub's, whichever workspace: none need be the
-    // default.)
-    if !paths.exists() && !(cli.socket.is_some() && !selected) {
+    // (A socket given explicitly is that hub's, whichever workspace, and a command about
+    // every workspace is the root's: none need be the default.)
+    let every = matches!(
+        &cli.cmd,
+        Some(Cmd::Speech {
+            cmd: SpeechCmd::Feed {
+                all_workspaces: true,
+                ..
+            }
+        }) | Some(Cmd::Log {
+            cmd: LogCmd::Checkpoint { all: true, .. }
+        })
+    );
+    if !paths.exists() && !((cli.socket.is_some() || every) && !selected) {
         if !selected {
             bail!("{}", no_default_why(&paths.root()));
         }
