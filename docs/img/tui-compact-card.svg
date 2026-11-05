@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="364" height="388" viewBox="0 0 364 388" role="img" aria-label="twr on a phone: a question longer than the screen in its action popup, its options under the first lines of its text">
+<title>twr on a phone: a question longer than the screen in its action popup, its options under the first lines of its text</title>
+<style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<rect x="14" y="14" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="14" width="109.2" height="18" fill="#c9d1d9"/>
+<rect x="240.8" y="14" width="92.4" height="18" fill="#444444"/>
+<rect x="14" y="32" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="32" width="109.2" height="18" fill="#c9d1d9"/>
+<rect x="30.8" y="68" width="84" height="18" fill="#d29922"/>
+<rect x="22.4" y="230" width="319.2" height="18" fill="#303030"/>
+<rect x="22.4" y="248" width="319.2" height="18" fill="#303030"/>
+<rect x="22.4" y="266" width="319.2" height="18" fill="#444444"/>
+<rect x="22.4" y="284" width="319.2" height="18" fill="#444444"/>
+<rect x="22.4" y="302" width="319.2" height="18" fill="#c9d1d9"/>
+<rect x="22.4" y="320" width="319.2" height="18" fill="#c9d1d9"/>
+<path d="M18.2 59H22.4M173.6 59H316.4M341.6 59H345.8M18.2 347H114.8M341.6 347H345.8M18.2 59V347M345.8 59V347" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M22.4 221H39.2M232.4 221H341.6" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<text x="47.6" y="27.5" fill="#d0d0d0" textLength="33.6">Chat</text>
+<text x="131.6" y="27.5" fill="#0d1117" class="b" textLength="92.4">Needs you 3</text>
+<text x="249.2" y="27.5" fill="#ffd700" class="b" textLength="84">Threads ⚠1</text>
+<text x="30.8" y="63.5" fill="#39c5cf" class="b" textLength="134.4">invoice-rounding</text>
+<text x="324.8" y="63.5" fill="#39c5cf">✕</text>
+<text x="39.2" y="81.5" fill="#1b1f24" class="b" textLength="67.2">QUESTION</text>
+<text x="30.8" y="99.5" fill="#c9d1d9" textLength="277.2">Round tax per line or once on the</text>
+<text x="30.8" y="117.5" fill="#c9d1d9" textLength="294">invoice total? Per line matches the</text>
+<text x="30.8" y="135.5" fill="#c9d1d9" textLength="260.4">PDF invoices; once on the total</text>
+<text x="30.8" y="153.5" fill="#c9d1d9" textLength="294">matches the ledger, which posts one</text>
+<text x="30.8" y="171.5" fill="#c9d1d9" textLength="184.8">tax amount per invoice</text>
+<text x="30.8" y="189.5" fill="#c9d1d9" textLength="302.4">(src/ledger/post.rs). They differ by</text>
+<text x="30.8" y="207.5" fill="#c9d1d9" textLength="294">a cent on 214 of last month's 9 880</text>
+<text x="47.6" y="225.5" fill="#d29922" textLength="176.4">↓ 10 more lines · tap</text>
+<text x="30.8" y="243.5" fill="#d29922" class="b">1</text>
+<text x="47.6" y="243.5" fill="#c9d1d9" textLength="176.4">per line, as the PDFs</text>
+<text x="30.8" y="279.5" fill="#d29922" class="b">2</text>
+<text x="47.6" y="279.5" fill="#c9d1d9" textLength="268.8">once on the total, as the ledger</text>
+<text x="30.8" y="315.5" fill="#0d1117" class="b" textLength="201.6">talk to invoice-rounding</text>
+<text x="123.2" y="351.5" fill="#39c5cf" textLength="210">↓3 more rows · Esc closes</text>
+<text x="14" y="369.5" fill="#6e7681" textLength="327.6">wheel/PgDn scroll · 1-9 answer · ↑↓/tap</text>
+</svg>

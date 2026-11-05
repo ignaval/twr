@@ -1,54 +1,67 @@
 #!/bin/sh
-# Regenerates docs/img/tui-stack.svg, docs/img/tui-grid.svg and docs/img/tui-compact.svg from
-# the real TUI.
+# Regenerates docs/img/tui-stack.svg, tui-grid.svg, tui-compact.svg, tui-compact-workspaces.svg
+# and tui-compact-card.svg from the real TUI.
 #
 #   docs/tools/make-screenshots.sh
 #
-# It builds twr and starts a throwaway hub (TWR_HOME under /tmp) with the scripted test
-# runtime (`fake`, TWR_ENABLE_FAKE=1) for the worker threads, and a scripted orchestrator: a
-# small ACP agent written below (orch.py) that answers the messages in script.json and sums
-# up each hub notice in a sentence. It makes five small git repositories, says hello to the
-# orchestrator through the TUI, and drives eight threads into different states: waiting on a
-# permission, asking a question, failed, running, done and parked. The orchestrator hears
-# about them from the hub, and then the TUI asks it what needs the user. It makes a second
-# workspace, left stopped, for the workspace sidebar to list. Then it runs `twr` in
-# a private tmux server, captures the stack view (160x42), the grid view (160x25) and the
-# compact layout's Threads screen (40x20, a phone) with their colors, and turns the captures
-# into SVG with docs/tools/ansi2svg.py. No real agent
-# runs: the hub and the TUI get a PATH without claude, codex or grok, and HOME is the
+# It builds twr (or uses TWR_BIN=<path>, a twr binary you already have) and starts a throwaway
+# hub (TWR_HOME under /tmp) with the scripted test runtime (`fake`, TWR_ENABLE_FAKE=1) for the
+# worker threads, and a scripted orchestrator: a small ACP agent written below (orch.py) that
+# answers the messages in script.json and sums up each hub notice in a sentence. It makes six
+# small git repositories, says hello to the orchestrator through the TUI, and drives eight
+# threads into different states: waiting on a permission, asking a question longer than a
+# phone's screen, failed, running, done and parked. The orchestrator hears about them from the
+# hub, and then the TUI asks it what needs the user. A second workspace, client-x, gets a hub of
+# its own and three threads, which the sidebar lists under its card, and a third, scratch, stays
+# stopped. Then it runs `twr` in a private tmux server, captures the stack view (160x42), the
+# grid view (160x25), and at 40x20 (a phone) the compact layout's Threads screen twice (its
+# cards, then scrolled to the other workspaces) and the long question open in its popup on Needs
+# you, with their colors, and turns the captures into SVG with docs/tools/ansi2svg.py. No real
+# agent runs: the hub and the TUI get a PATH without claude, codex or grok, and HOME is the
 # temporary directory. Everything the script started is stopped and removed on exit.
 #
 # Needs git, tmux and python3. Takes a minute or two (it waits for the hub's 30 s git tick).
-# TWR_SHOTS_KEEP=<dir> also copies the raw captures (stack.ans, grid.ans, compact.ans) there.
+# TWR_SHOTS_KEEP=<dir> also copies the raw captures (stack.ans, grid.ans, compact*.ans) there.
 
 set -eu
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-cargo build --quiet -p twr-cli
-twr="$root/target/debug/twr"
+if [ -n "${TWR_BIN:-}" ]; then
+    twr=$TWR_BIN
+else
+    cargo build --quiet -p twr-cli
+    twr="$root/target/debug/twr"
+fi
 
 work=$(mktemp -d /tmp/twr-shots.XXXXXX)
 tmux_name="twrshots-$$"
 hub_pid=""
+hub2_pid=""
+# The workspace the helpers below act in (empty: default; TWR_WORKSPACE is unset below).
+ws=""
+
+# stop_hub PID: stop a hub this shell started.
+stop_hub() {
+    kill "$1" 2> /dev/null || true
+    # The hub stops its runtimes before it exits.
+    i=0
+    while kill -0 "$1" 2> /dev/null && [ "$i" -lt 50 ]; do
+        sleep 0.2
+        i=$((i + 1))
+    done
+    # The hub is this shell's child: until `wait` reaps it, its pid is not reused.
+    if kill -0 "$1" 2> /dev/null; then
+        kill -9 "$1" 2> /dev/null || true
+    fi
+    wait "$1" 2> /dev/null || true
+}
 
 cleanup() {
     tmux -L "$tmux_name" kill-server 2> /dev/null || true
     rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$tmux_name"
-    if [ -n "$hub_pid" ]; then
-        kill "$hub_pid" 2> /dev/null || true
-        # The hub stops its runtimes before it exits.
-        i=0
-        while kill -0 "$hub_pid" 2> /dev/null && [ "$i" -lt 50 ]; do
-            sleep 0.2
-            i=$((i + 1))
-        done
-        # The hub is this shell's child: until `wait` reaps it, its pid is not reused.
-        if kill -0 "$hub_pid" 2> /dev/null; then
-            kill -9 "$hub_pid" 2> /dev/null || true
-        fi
-        wait "$hub_pid" 2> /dev/null || true
-    fi
+    [ -z "$hub2_pid" ] || stop_hub "$hub2_pid"
+    [ -z "$hub_pid" ] || stop_hub "$hub_pid"
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -79,8 +92,10 @@ mkrepo web package.json src/pages/checkout.tsx src/lib/discounts.ts
 mkrepo billing Cargo.toml src/invoice/totals.rs src/ledger/post.rs
 mkrepo docs README.md CHANGELOG.md scripts/check-links.sh
 mkrepo infra main.tf versions.tf .github/workflows/deploy.yml
+mkrepo mobile package.json src/push/retry.ts src/crash/report.ts fastlane/Fastfile
 
 export TWR_HOME="$work/twr"
+unset TWR_WORKSPACE
 mkdir -p "$TWR_HOME" "$work/home"
 cat > "$TWR_HOME/config.toml" << EOF
 default_runtime = "fake"
@@ -102,6 +117,8 @@ repo = "$work/code/billing"
 repo = "$work/code/docs"
 [projects.infra]
 repo = "$work/code/infra"
+[projects.mobile]
+repo = "$work/code/mobile"
 EOF
 
 # The scripted orchestrator: an ACP agent on stdio that plays the steps script.json gives a
@@ -166,7 +183,8 @@ def notice_reply(notice):
             out.append("%s waits for a permission (%s); answer it on its card." % (
                 name, summary))
         elif reason == "question":
-            out.append("%s asks: %s" % (name, summary))
+            # A long question's first sentence: its card has the rest.
+            out.append("%s asks: %s" % (name, summary.split("? ")[0].rstrip("?") + "?"))
         elif reason == "error":
             out.append("%s failed: %s." % (name, summary.split(": ", 1)[-1]))
         elif reason == "review":
@@ -217,6 +235,9 @@ cat > "$work/script.json" << 'EOF'
   "Morning! I'm cutting the 0.5.0 release today. Keep an eye on the threads and tell me when one needs me.": [
     ["text", "Morning. I'll watch the threads as they start and tell you when one needs you."]
   ],
+  "Keep the mobile threads moving; the beta build goes out this afternoon.": [
+    ["text", "Will do. I'll tell you when one of them needs you."]
+  ],
   "What needs me right now?": [
     ["tool", "twr attention_list"],
     ["tool", "twr list_threads"],
@@ -243,7 +264,7 @@ done
 
 # status THREAD: the thread's status column in `twr thread list`.
 status() {
-    "$twr" thread list | awk -v n="$1" '$1 == n { print $2 }'
+    "$twr" ${ws:+-w "$ws"} thread list | awk -v n="$1" '$1 == n { print $2 }'
 }
 
 # wait_for THREAD STATUS
@@ -269,7 +290,7 @@ commit() {
 }
 
 new() {
-    "$twr" thread new "$1" --name "$2" > /dev/null
+    "$twr" ${ws:+-w "$ws"} thread new "$1" --name "$2" > /dev/null
 }
 
 # wait_orchestrator: until the orchestrator has no turn running (it is idle between turns).
@@ -375,7 +396,7 @@ new billing invoice-rounding
 "$twr" send invoice-rounding "Checking how invoice totals round tax.
 !tool Read src/invoice/totals.rs
 !tool Read src/ledger/post.rs
-!ask Round tax per line or once on the invoice total?|per line|on the total" > /dev/null
+!ask Round tax per line or once on the invoice total? Per line matches the PDF invoices; once on the total matches the ledger, which posts one tax amount per invoice (src/ledger/post.rs). They differ by a cent on 214 of last month's 9 880 invoices. Matching the ledger changes those PDFs if they are sent again; matching the PDFs means migrating posted entries. Which should totals.rs do?|per line, as the PDFs|once on the total, as the ledger" > /dev/null
 wait_for invoice-rounding waiting
 
 new api ratelimit
@@ -411,8 +432,43 @@ wait_for ratelimit waiting
 sleep 32
 wait_orchestrator
 tui_say "What needs me right now?"
-# A second workspace, its hub not running: the workspace sidebar lists it under `default`.
+
+# A second workspace with its hub running and three threads, which the sidebar lists a row
+# each under its card, and a third one whose hub isn't running.
 env -i HOME="$work/home" PATH=/usr/bin:/bin TWR_HOME="$TWR_HOME" "$twr" ws new client-x > /dev/null
+env -i HOME="$work/home" PATH=/usr/bin:/bin TWR_HOME="$TWR_HOME" "$twr" ws new scratch > /dev/null
+env -i HOME="$work/home" PATH=/usr/bin:/bin TWR_HOME="$TWR_HOME" TWR_ENABLE_FAKE=1 \
+    TWR_CLAUDE_BIN=/bin/false TWR_CODEX_BIN=/bin/false TWR_GROK_BIN=/bin/false \
+    "$twr" -w client-x hub > "$work/hub2.log" 2>&1 &
+hub2_pid=$!
+i=0
+until "$twr" -w client-x info > /dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -lt 50 ] || {
+        cat "$work/hub2.log" >&2
+        exit 1
+    }
+    sleep 0.2
+done
+ws=client-x
+"$twr" -w client-x say "Keep the mobile threads moving; the beta build goes out this afternoon." > /dev/null
+sleep 1
+wait_orchestrator
+new mobile store-notes
+"$twr" -w client-x send store-notes "!tool Bash git log v2.3.0..HEAD --oneline
+Wrote the App Store notes for 2.4: offline drafts, faster sync and two crash fixes." > /dev/null
+wait_for store-notes "done"
+new mobile push-retry
+"$twr" -w client-x send push-retry "!tool Read src/push/retry.ts
+!write src/push/retry.ts // exponential backoff for failed push registrations
+!sleep 86400000" > /dev/null
+wait_for push-retry running
+new mobile crash-triage
+"$twr" -w client-x send crash-triage "!tool Read src/crash/report.ts
+!perm Bash fastlane run download_dsyms" > /dev/null
+wait_for crash-triage waiting
+wait_orchestrator
+ws=
 
 # capture NAME COLS ROWS KEYS...: run the TUI at COLS x ROWS, press KEYS, capture the screen.
 # The TUI opens with nothing selected; Tab selects the first card (or tile).
@@ -465,12 +521,19 @@ capture grid 160 25 C-g Tab
 # selected; three Downs (past the permission, the question and the failure) select the running
 # one, the cards following it.
 capture compact 40 20 /t Enter Down Down Down
+# The phone's Threads screen scrolled down to the other workspaces with their threads.
+capture compact-threads 40 20 /t Enter Down Down Down Down Down Down Down Down
+# A phone answering a card longer than its screen: Needs you, the question, its popup.
+capture compact-card 40 20 /n Enter Down Enter
 
-[ -z "${TWR_SHOTS_KEEP:-}" ] || cp "$work/stack.ans" "$work/grid.ans" "$work/compact.ans" "$TWR_SHOTS_KEEP/"
+shots="$work/stack.ans $work/grid.ans $work/compact.ans $work/compact-threads.ans $work/compact-card.ans"
+# shellcheck disable=SC2086 # $shots is a list of paths without spaces
+[ -z "${TWR_SHOTS_KEEP:-}" ] || cp $shots "$TWR_SHOTS_KEEP/"
 
 # The fake runtime's directive lines must not show (the permission thread's transcript
 # scrolls its prompt out of view).
-if grep -q '!perm\|!tool\|!write' "$work/stack.ans" "$work/grid.ans" "$work/compact.ans"; then
+# shellcheck disable=SC2086
+if grep -q '!perm\|!tool\|!write\|!sleep' $shots; then
     echo "make-screenshots: a prompt's directive lines are on screen; lengthen the reply" >&2
     exit 1
 fi
@@ -482,4 +545,9 @@ python3 docs/tools/ansi2svg.py "$work/grid.ans" docs/img/tui-grid.svg \
     --title "twr grid view: one tile per worker thread"
 python3 docs/tools/ansi2svg.py "$work/compact.ans" docs/img/tui-compact.svg \
     --title "twr on a phone: the compact layout's tab bar over the Threads screen's cards"
-ls -l docs/img/tui-stack.svg docs/img/tui-grid.svg docs/img/tui-compact.svg
+python3 docs/tools/ansi2svg.py "$work/compact-threads.ans" docs/img/tui-compact-workspaces.svg \
+    --title "twr on a phone: the Threads screen scrolled down to the other workspaces with their threads"
+python3 docs/tools/ansi2svg.py "$work/compact-card.ans" docs/img/tui-compact-card.svg \
+    --title "twr on a phone: a question longer than the screen in its action popup, its options under the first lines of its text"
+ls -l docs/img/tui-stack.svg docs/img/tui-grid.svg docs/img/tui-compact.svg \
+    docs/img/tui-compact-workspaces.svg docs/img/tui-compact-card.svg
