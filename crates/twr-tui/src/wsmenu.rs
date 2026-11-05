@@ -206,7 +206,11 @@ impl AppState {
                 if label != m.id {
                     about.push(format!("-w {} still selects it", m.id));
                 }
-                about
+                if about.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![about.join(" · ")]
+                }
             }
             Step::Rename(name) => {
                 let note = match self.ws_name_error(Some(&m.id), name) {
@@ -580,7 +584,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     let hint = if phone {
         None
     } else {
-        Some(match m.step {
+        Some(match &m.step {
+            Step::Plan(p) if p.refused.is_some() => "Enter or Esc closes",
             Step::Plan(_) => "↑↓ Enter · y deletes · PgUp/PgDn scroll · Esc cancels",
             Step::Rename(_) => "Enter renames · Esc cancels",
             _ => "↑↓ Enter (or o r m d) · Esc closes",
@@ -699,5 +704,380 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
         if x < inner.right() {
             frame.set_cursor_position((x, inner.y));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::key;
+    use crate::sidebar::tests::{cells, in_workspaces, rows, tap};
+
+    const DESK: (u16, u16) = (160, 40);
+
+    fn text(st: &mut AppState, (w, h): (u16, u16)) -> String {
+        rows(st, w, h).join("\n")
+    }
+
+    fn type_in(st: &mut AppState, s: &str) {
+        for c in s.chars() {
+            st.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// A plan as the CLI says it, `n` lines long.
+    fn plan(n: usize, stops_hub: bool) -> RemovalPlan {
+        RemovalPlan {
+            refused: None,
+            lines: (0..n).map(|i| format!("plan line {i}")).collect(),
+            stops_hub,
+        }
+    }
+
+    /// Opens scratch's Delete and gives it `p`, settled.
+    fn delete_with(st: &mut AppState, id: &str, p: RemovalPlan) {
+        let a = st.ws_rm_cmd(id);
+        assert_eq!(a, [Action::WsPlan { id: id.into() }]);
+        let long_ago = Instant::now() - CARD_SETTLE * 2;
+        st.ws_planned(id, Ok(p), long_ago);
+    }
+
+    fn removal(actions: &[Action]) -> Option<(String, bool, Option<String>)> {
+        actions.iter().find_map(|a| match a {
+            Action::WsRemove { id, stop_hub, via } => Some((id.clone(), *stop_hub, via.clone())),
+            _ => None,
+        })
+    }
+
+    /// Every workspace card has a `⋯` at the end of its name row; a tap on it opens that
+    /// workspace's menu (not a switch), whose choices run: Open switches, Esc closes.
+    #[test]
+    fn a_cards_dots_open_its_menu() {
+        let mut st = in_workspaces("default");
+        let r = text(&mut st, DESK);
+        assert!(r.contains(" client-x") && r.contains("⋯"), "{r}");
+        for id in ["default", "client-x", "scratch", "docs"] {
+            let dots = cells(&mut st, DESK.0, DESK.1, &Target::WsMenu(id.into()));
+            assert_eq!(dots.len(), 1, "{id}");
+            assert_eq!(dots[0].width, 3, "{id}");
+        }
+        let a = tap(&mut st, DESK.0, DESK.1, &Target::WsMenu("client-x".into()));
+        assert!(a.is_empty(), "{a:?}");
+        assert_eq!(
+            st.view.ws_menu.as_ref().map(|m| m.id.as_str()),
+            Some("client-x")
+        );
+        let r = text(&mut st, DESK);
+        for want in [
+            "workspace client-x",
+            "Open client-x",
+            "Rename…",
+            "Make default",
+            "Delete…",
+        ] {
+            assert!(r.contains(want), "{want}: {r}");
+        }
+        // Under the menu a card does not switch.
+        let a = tap(
+            &mut st,
+            DESK.0,
+            DESK.1,
+            &Target::Workspace("scratch".into()),
+        );
+        assert!(a.is_empty() && st.view.ws_menu.is_some(), "{a:?}");
+        let a = tap(&mut st, DESK.0, DESK.1, &Target::WsChoice(Choice::Open));
+        assert_eq!(
+            a,
+            [Action::Workspace {
+                name: "client-x".into(),
+                create: false
+            }]
+        );
+        assert!(st.view.ws_menu.is_none());
+        st.switching = None;
+        st.open_ws_menu(Some("scratch"));
+        st.handle_key(key(KeyCode::Esc));
+        assert!(st.view.ws_menu.is_none());
+        assert_eq!(st.view.status.as_deref(), Some("cancelled"));
+        // The current workspace's menu has no Open; the default's no Make default.
+        st.view.status = None;
+        st.tabs[0].default = true;
+        st.open_ws_menu(None);
+        let choices: Vec<Choice> = st.ws_menu_choices().into_iter().map(|(c, _)| c).collect();
+        assert_eq!(choices, [Choice::Rename, Choice::Delete]);
+        assert!(text(&mut st, DESK).contains("the default workspace · open here"));
+    }
+
+    /// Rename asks for the new name with the rules `twr ws rename` has: not another's name
+    /// or original name, and `default` only for the root's; Enter renames, by id.
+    #[test]
+    fn rename_checks_the_name_and_renames_by_id() {
+        let mut st = in_workspaces("default");
+        // client-x was renamed acme: client-x is still its own.
+        st.tabs[1].label = "acme".into();
+        st.open_ws_menu(Some("acme"));
+        assert_eq!(st.view.ws_menu.as_ref().unwrap().id, "client-x");
+        let a = st.handle_key(key(KeyCode::Char('r')));
+        assert!(a.is_empty());
+        assert!(text(&mut st, DESK).contains("name: acme"));
+        for (bad, why) in [
+            ("scratch", "there is a workspace scratch already"),
+            ("Bad", "invalid workspace name"),
+            ("default", "there is a workspace default already"),
+        ] {
+            st.handle_key(crate::app::tests::ctrl('u'));
+            type_in(&mut st, bad);
+            assert!(text(&mut st, DESK).contains(why), "{bad}");
+            let a = st.handle_key(key(KeyCode::Enter));
+            assert!(a.is_empty(), "{bad}");
+            assert!(st.view.ws_menu.is_some(), "{bad}: the menu stays");
+        }
+        // Back to its original name: fine.
+        st.handle_key(crate::app::tests::ctrl('u'));
+        type_in(&mut st, "client-x");
+        let a = st.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            a,
+            [Action::WsRename {
+                id: "client-x".into(),
+                to: "client-x".into()
+            }]
+        );
+        // Another can't take an original name; `/ws rename` goes straight to the field.
+        let a = st.ws_rename_cmd(Some("scratch"), "client-x");
+        assert!(a.is_empty());
+        assert!(text(&mut st, DESK).contains("original name of workspace acme"));
+        st.handle_key(key(KeyCode::Esc));
+        st.ws_rename_cmd(None, "main");
+        let a = st.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            a,
+            [Action::WsRename {
+                id: "default".into(),
+                to: "main".into()
+            }]
+        );
+        // Make default runs at once, by id.
+        st.open_ws_menu(Some("scratch"));
+        let a = st.handle_key(key(KeyCode::Char('m')));
+        assert_eq!(
+            a,
+            [Action::WsDefault {
+                id: "scratch".into()
+            }]
+        );
+    }
+
+    /// Delete says what deleting would remove (the CLI's plan) under a `Delete` and a
+    /// `Cancel` that stay on screen however long it is: it scrolls above them. It opens on
+    /// Cancel; Delete runs on `y` or Enter on it once the plan has been on screen a moment, or
+    /// a second tap on it.
+    #[test]
+    fn delete_shows_the_plan_and_asks() {
+        let mut st = in_workspaces("default");
+        let a = st.ws_rm_cmd("scratch");
+        assert_eq!(
+            a,
+            [Action::WsPlan {
+                id: "scratch".into()
+            }]
+        );
+        assert!(text(&mut st, DESK).contains("finding out what deleting scratch would remove"));
+        // A plan for another workspace, or one that came after Cancel, is not shown.
+        st.ws_planned("docs", Ok(plan(3, false)), Instant::now());
+        assert_eq!(st.view.ws_menu.as_ref().unwrap().step, Step::Checking);
+        st.ws_planned("scratch", Ok(plan(60, true)), Instant::now());
+        let r = text(&mut st, (160, 24));
+        assert!(
+            r.contains("Delete workspace scratch? This cannot be undone."),
+            "{r}"
+        );
+        assert!(r.contains("deleting stops it first"), "{r}");
+        assert!(r.contains("more lines"), "{r}");
+        assert!(!r.contains("plan line 59"), "{r}");
+        for c in [Choice::ConfirmDelete, Choice::Cancel] {
+            let at = cells(&mut st, 160, 24, &Target::WsChoice(c));
+            assert_eq!(at.len(), 1, "{c:?}");
+            assert!(at[0].bottom() <= 24, "{c:?}");
+        }
+        // Just came: not yet.
+        let a = st.handle_key(key(KeyCode::Char('y')));
+        assert!(removal(&a).is_none());
+        assert!(st.view.status.as_deref().unwrap().contains("it just came"));
+        // Scrolled to its end, the choices still there.
+        for _ in 0..20 {
+            st.handle_key(key(KeyCode::PageDown));
+        }
+        let r = text(&mut st, (160, 24));
+        assert!(
+            r.contains("plan line 59") && r.contains("lines above"),
+            "{r}"
+        );
+        assert!(r.contains("Delete scratch") && r.contains("Cancel"), "{r}");
+        // Enter alone cancels.
+        let a = st.handle_key(key(KeyCode::Enter));
+        assert!(a.is_empty() && st.view.ws_menu.is_none());
+        delete_with(&mut st, "scratch", plan(4, false));
+        let a = st.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(removal(&a), Some(("scratch".into(), false, None)));
+        assert!(st.view.ws_menu.is_none());
+        // A tap highlights Delete; a second one deletes.
+        delete_with(&mut st, "docs", plan(4, true));
+        let a = tap(
+            &mut st,
+            DESK.0,
+            DESK.1,
+            &Target::WsChoice(Choice::ConfirmDelete),
+        );
+        assert!(a.is_empty());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("tap Delete again"));
+        let a = tap(
+            &mut st,
+            DESK.0,
+            DESK.1,
+            &Target::WsChoice(Choice::ConfirmDelete),
+        );
+        assert_eq!(removal(&a), Some(("docs".into(), true, None)));
+    }
+
+    /// A plan that refuses says why and what to do, with Close only; the only workspace
+    /// there is is refused here at once; a TUI an agent runs opens no menu.
+    #[test]
+    fn refusals() {
+        let mut st = in_workspaces("default");
+        let a = st.ws_rm_cmd("client-x");
+        assert_eq!(a.len(), 1);
+        st.ws_planned(
+            "client-x",
+            Ok(RemovalPlan {
+                refused: Some("workspace client-x still has 2 threads (api, web)".into()),
+                ..RemovalPlan::default()
+            }),
+            Instant::now() - CARD_SETTLE * 2,
+        );
+        let r = text(&mut st, DESK);
+        assert!(r.contains("client-x can't be deleted now:"), "{r}");
+        assert!(r.contains("still has 2"), "{r}");
+        let choices: Vec<Choice> = st.ws_menu_choices().into_iter().map(|(c, _)| c).collect();
+        assert_eq!(choices, [Choice::Cancel]);
+        assert!(removal(&st.handle_key(key(KeyCode::Char('y')))).is_none());
+        st.handle_key(key(KeyCode::Esc));
+        // An error finding out is a refusal too.
+        st.ws_rm_cmd("docs");
+        st.ws_planned(
+            "docs",
+            Err(anyhow::anyhow!("its hub did not answer")),
+            Instant::now(),
+        );
+        assert!(text(&mut st, DESK).contains("its hub did not answer"));
+        st.handle_key(key(KeyCode::Esc));
+
+        let mut alone = in_workspaces("default");
+        let only = alone.tabs[0].clone();
+        alone.set_tabs(vec![only]);
+        let a = alone.ws_rm_cmd("default");
+        assert!(a.is_empty(), "{a:?}");
+        assert!(text(&mut alone, DESK).contains("it is the only workspace"));
+
+        let mut agent = in_workspaces("default");
+        agent.agent = Some("thread api".into());
+        let a = tap(
+            &mut agent,
+            DESK.0,
+            DESK.1,
+            &Target::WsMenu("scratch".into()),
+        );
+        assert!(a.is_empty());
+        assert!(agent.view.ws_menu.is_none());
+        assert!(agent
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("agents cannot rename, delete"));
+        assert!(agent.ws_rm_cmd("scratch").is_empty() && agent.view.ws_menu.is_none());
+    }
+
+    /// Deleting the workspace shown goes to the default first (else the next one), and says
+    /// so before it asks.
+    #[test]
+    fn deleting_the_current_workspace_switches_away_first() {
+        let mut st = in_workspaces("client-x");
+        st.tabs[2].default = true;
+        delete_with(&mut st, "client-x", plan(2, true));
+        assert!(text(&mut st, DESK).contains("You are in it: the TUI switches to scratch first."));
+        let a = st.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(
+            removal(&a),
+            Some(("client-x".into(), true, Some("scratch".into())))
+        );
+        let mut st = in_workspaces("default");
+        delete_with(&mut st, "default", plan(2, false));
+        let a = st.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(
+            removal(&a),
+            Some(("default".into(), false, Some("client-x".into())))
+        );
+    }
+
+    /// On a phone the cards' `⋯` and the menu's choices are menu choices, two rows tall, and a
+    /// long plan scrolls above Delete and Cancel, which stay whole on screen at every size;
+    /// the wheel scrolls it.
+    #[test]
+    fn on_a_phone() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut st = in_workspaces("default");
+        st.show_pane(crate::app::CompactPane::Threads);
+        for (w, h) in [(40, 20), (50, 14), (40, 12), (50, 30)] {
+            let dots = cells(&mut st, w, h, &Target::WsMenu("client-x".into()));
+            assert!(st.compact(), "{w}x{h}");
+            if let Some(d) = dots.first() {
+                assert!(d.height >= 2, "{w}x{h}: {d:?}");
+            }
+        }
+        let a = tap(&mut st, 40, 20, &Target::WsMenu("default".into()));
+        assert!(a.is_empty());
+        for c in [Choice::Rename, Choice::MakeDefault, Choice::Delete] {
+            let at = cells(&mut st, 40, 20, &Target::WsChoice(c));
+            assert_eq!(at.len(), 1, "{c:?}");
+            assert!(at[0].height >= 2, "{c:?}: {at:?}");
+        }
+        st.view.ws_menu = None;
+        delete_with(&mut st, "scratch", plan(40, true));
+        for (w, h) in [(40, 20), (40, 12), (60, 10), (40, 9)] {
+            let r = rows(&mut st, w, h).join("\n");
+            let mut seen = Vec::new();
+            for c in [Choice::ConfirmDelete, Choice::Cancel] {
+                let at = cells(&mut st, w, h, &Target::WsChoice(c));
+                assert_eq!(at.len(), 1, "{c:?} at {w}x{h}: {r}");
+                assert!(at[0].height >= 2 && at[0].bottom() <= h, "{c:?} at {w}x{h}");
+                seen.push(at[0]);
+            }
+            assert!(!seen[0].intersects(seen[1]), "{w}x{h}");
+            assert!(r.contains("more lines"), "{w}x{h}: {r}");
+        }
+        let first = |st: &mut AppState| rows(st, 40, 20).join("\n");
+        let before = first(&mut st);
+        let screen = crate::app::tests::draw(&mut st, 40, 20);
+        let at = cells(&mut st, 40, 20, &Target::WsChoice(Choice::Cancel))[0];
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: at.x + 1,
+            row: at.y.saturating_sub(3),
+            modifiers: KeyModifiers::NONE,
+        };
+        for _ in 0..3 {
+            st.handle_mouse(wheel, &screen);
+        }
+        assert_ne!(first(&mut st), before);
+        // A tap on Cancel's second row cancels.
+        let at = cells(&mut st, 40, 20, &Target::WsChoice(Choice::Cancel))[0];
+        let a = crate::sidebar::tests::tap_at(&mut st, 40, 20, at.x + 1, at.y + 1);
+        assert!(a.is_empty() && st.view.ws_menu.is_none());
     }
 }

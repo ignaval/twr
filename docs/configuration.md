@@ -8,7 +8,7 @@ You can also ask the orchestrator to change a key, as in "turn off suggestions".
 
 ## Workspaces
 
-[Workspaces](workspaces.md) (`twr ws new <name>`, then `twr -w <name>` or `TWR_WORKSPACE`) are separate hubs on one machine that share this file. A named workspace ignores what belongs to the `default` workspace's hub: `hub.socket` (it has its own socket), `hub.listen` and `hub.tls` (runners connect to `default`), and `[orchestrator] cwd` (its orchestrator works in the workspace's own directory, so a Claude Code orchestrator keeps its own memories). The default workspace refuses a `hub.socket` in the directory of the workspaces' sockets (`<socket dir>/ws/`), where it could be one of theirs; `--socket` still works. Restart a workspace's hub (`twr -w <name> hub stop`, then `twr -w <name>`) after a change, like any hub.
+[Workspaces](workspaces.md) (`twr ws new <name>`, then `twr -w <name>` or `TWR_WORKSPACE`) are separate hubs on one machine that share this file. A workspace you create ignores what belongs to the hub of the one in twr's own data directory (`default`, whatever it is renamed to): `hub.socket` (it has its own socket), `hub.listen` and `hub.tls` (runners connect to that hub), and `[orchestrator] cwd` (its orchestrator works in the workspace's own directory, so a Claude Code orchestrator keeps its own memories). That workspace refuses a `hub.socket` in the directory of the workspaces' sockets (`<socket dir>/ws/`), where it could be one of theirs; `--socket` still works. Restart a workspace's hub (`twr -w <name> hub stop`, then `twr -w <name>`) after a change, like any hub.
 
 ## A second instance
 

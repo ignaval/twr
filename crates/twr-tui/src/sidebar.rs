@@ -1544,7 +1544,13 @@ pub(crate) mod tests {
 
     /// The cell `x`, `y` of the last frame was a tap on: down and up there, a frame drawn
     /// before each, as the IO loop draws. Returns the actions.
-    fn tap_at(st: &mut AppState, w: u16, h: u16, x: u16, y: u16) -> Vec<crate::app::Action> {
+    pub(crate) fn tap_at(
+        st: &mut AppState,
+        w: u16,
+        h: u16,
+        x: u16,
+        y: u16,
+    ) -> Vec<crate::app::Action> {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         let ev = |kind| MouseEvent {
             kind,
@@ -1560,7 +1566,7 @@ pub(crate) mod tests {
     }
 
     /// Every cell of control `t` as a `w` x `h` frame draws it.
-    fn cells(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<Rect> {
+    pub(crate) fn cells(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<Rect> {
         crate::app::tests::draw(st, w, h);
         st.view
             .panes
@@ -1572,7 +1578,7 @@ pub(crate) mod tests {
     }
 
     /// A tap on control `t` (at its last cell) as a `w` x `h` frame draws it.
-    fn tap(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<crate::app::Action> {
+    pub(crate) fn tap(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<crate::app::Action> {
         let r = *cells(st, w, h, t)
             .last()
             .unwrap_or_else(|| panic!("no {t:?} in {:?}", st.view.panes.targets));

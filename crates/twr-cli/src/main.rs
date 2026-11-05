@@ -4129,12 +4129,18 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Default plus the same named directories as `twr ws`. Each stop has its own deadline
-/// and task, so even a hub that never answers cannot delay shutdown of the others.
+/// The same workspaces as `twr ws`, by id: the root slot's unless it was removed (stopped
+/// even when the named ones can't be listed), then the named directories. Each stop has its
+/// own deadline and task, so even a hub that never answers cannot delay shutdown of the
+/// others.
 async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
     let config = Config::load_from(root);
     let mut failed = 0;
-    let mut names = vec![DEFAULT_WORKSPACE.to_string()];
+    // By id: the root slot's first, unless it was removed (no hub starts there then).
+    let mut names = Vec::new();
+    if !root.root_removed() {
+        names.push(DEFAULT_WORKSPACE.to_string());
+    }
     match root
         .named_workspaces()
         .with_context(|| format!("listing {}", root.workspaces_dir().display()))
@@ -4160,6 +4166,8 @@ async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
         } else {
             ws.socket.clone()
         };
+        // Said by its name, checked by its id.
+        let label = ws.display_name();
         stops.spawn(async move {
             let result = async {
                 check_socket_path(&socket)?;
@@ -4169,7 +4177,7 @@ async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
                 hub_stop_result(&socket, &ws, timeout, Some(&name), true).await
             }
             .await;
-            (name, result)
+            (label, result)
         });
     }
     while let Some(result) = stops.join_next().await {
@@ -6500,12 +6508,8 @@ async fn log_cmd(socket: &Path, cmd: LogCmd) -> anyhow::Result<()> {
 async fn log_checkpoint(paths: &Paths, all: bool, json: bool) -> anyhow::Result<()> {
     let root = paths.root();
     let names = if all {
-        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
-        names.extend(
-            root.named_workspaces()
-                .with_context(|| format!("listing {}", root.workspaces_dir().display()))?,
-        );
-        names
+        root.workspace_ids()
+            .with_context(|| format!("listing {}", root.workspaces_dir().display()))?
     } else {
         vec![paths.workspace_id().to_string()]
     };
@@ -8547,9 +8551,7 @@ fn created_line(name: &str, made: &twr_core::workspaces::Created) -> String {
         format!("created workspace {name}; open it with `twr -w {name}`")
     };
     if made.made_default {
-        line.push_str(&format!(
-            "; it is the default workspace (there was none): `twr` opens it"
-        ));
+        line.push_str("; it is the default workspace (there was none): `twr` opens it");
     }
     line
 }
@@ -8949,10 +8951,9 @@ fn removal_notes(
 ) -> (String, Vec<String>, Vec<String>) {
     let id = ws.workspace_id();
     let name = ws.display_name();
-    let mut removed = format!(
-        "its log, its orchestrator's conversation, its input history and its worktrees \
-         directory"
-    );
+    let mut removed = "its log, its orchestrator's conversation, its input history and its \
+                       worktrees directory"
+        .to_string();
     if notes > 0 {
         removed.push_str(&format!(
             ", with its orchestrator's {notes} memory note{}",

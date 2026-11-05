@@ -9065,6 +9065,12 @@ impl AppState {
                         return self.switch_workspace(&name);
                     }
                 }
+                // The workspace menu takes the wheel wherever it is: it scrolls its plan.
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if self.view.ws_menu.is_some() =>
+                {
+                    return self.ws_menu_wheel(ev.kind == MouseEventKind::ScrollUp);
+                }
                 // Over the docked workspace list, the wheel scrolls it; elsewhere it picks.
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
                     if self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Workspaces) =>
@@ -9086,9 +9092,6 @@ impl AppState {
                     }
                     if self.view.settings.is_some() {
                         return self.settings_key(arrow);
-                    }
-                    if self.view.ws_menu.is_some() {
-                        return self.ws_menu_wheel(ev.kind == MouseEventKind::ScrollUp);
                     }
                 }
                 _ => {}
@@ -25955,6 +25958,8 @@ pub(crate) mod tests {
                     | Target::Yes
                     | Target::No
                     | Target::Workspace(_)
+                    | Target::WsMenu(_)
+                    | Target::WsChoice(_)
             )
         }
 
@@ -25982,8 +25987,13 @@ pub(crate) mod tests {
                     assert_eq!(a.height, 1, "{what}: {ta:?} {a:?} on {rows:?}");
                 }
                 for (b, tb) in &targets[k + 1..] {
+                    // A workspace card's `⋯` is drawn over its card's end.
+                    let menu_on_card = matches!(
+                        (ta, tb),
+                        (Target::Workspace(x), Target::WsMenu(y)) if x == y
+                    );
                     assert!(
-                        ta == tb || !a.intersects(*b),
+                        ta == tb || menu_on_card || !a.intersects(*b),
                         "{what}: {ta:?} {a:?} {tb:?} {b:?}"
                     );
                 }
