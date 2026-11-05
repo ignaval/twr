@@ -53,6 +53,7 @@ pub mod summary;
 pub mod terminal_setup;
 pub mod ui;
 pub mod workspace;
+pub mod wsmenu;
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -514,6 +515,10 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         | Action::Copy { .. }
         | Action::Mouse(_)
         | Action::Workspace { .. }
+        | Action::WsRename { .. }
+        | Action::WsDefault { .. }
+        | Action::WsPlan { .. }
+        | Action::WsRemove { .. }
         | Action::WsSidebar(_)
         | Action::Setting(_)
         | Action::SettingsFile
@@ -1132,6 +1137,17 @@ async fn connect(socket: &Path) -> anyhow::Result<Client> {
     .await
 }
 
+/// The id of the workspace `twr` without `-w` selects in this TUI's shell
+/// ([`twr_core::paths::bare_selection`]): commands it shows name another with `-w`.
+fn bare_workspace() -> Option<String> {
+    let root =
+        twr_core::paths::Paths::from_env_in(Some(twr_core::paths::DEFAULT_WORKSPACE)).ok()?;
+    twr_core::paths::bare_selection(
+        &root,
+        std::env::var_os(twr_core::paths::WORKSPACE_ENV).as_deref(),
+    )
+}
+
 /// The workspace the hub on each socket must serve, by socket ([`expect_workspace`]).
 static EXPECTED: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, String>>> =
     std::sync::Mutex::new(None);
@@ -1656,23 +1672,87 @@ impl TypedAhead {
     }
 }
 
+/// A workspace as [`Workspaces::list`] lists it ([`twr_core::workspaces`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsEntry {
+    /// Its id, which a rename leaves: what the TUI knows it by.
+    pub id: String,
+    /// Its name.
+    pub name: String,
+    /// Commands without `-w` (and a bare `twr`) select it.
+    pub default: bool,
+}
+
+/// What removing a workspace would do, as the TUI's Delete shows it before asking
+/// ([`Workspaces::plan_removal`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemovalPlan {
+    /// Why it can't be removed now, and what to do first; `None`: it can.
+    pub refused: Option<String>,
+    /// What it removes, keeps and changes, a line each.
+    pub lines: Vec<String>,
+    /// Its hub runs (with nothing in it the removal would lose): removing it stops it first.
+    pub stops_hub: bool,
+}
+
 /// The workspaces a TUI can switch between (`twr ws`): the CLI provides them, as it knows
-/// where they are and how to start their hubs.
+/// where they are and how to start their hubs. Workspaces are named by id
+/// ([`twr_core::workspaces`]) but in [`Workspaces::create`].
 pub trait Workspaces: Send + Sync {
-    /// Their names, in the tab strip's order (`default` first).
+    /// Their ids, in the tab strip's order (the default first).
     fn names(&self) -> anyhow::Result<Vec<String>>;
-    /// The socket of workspace `name`'s hub, whether it runs or not.
-    fn socket(&self, name: &str) -> anyhow::Result<PathBuf>;
-    /// Makes sure workspace `name`'s hub answers, starting it when none runs; its socket.
-    fn open(&self, name: &str) -> futures::future::BoxFuture<'static, anyhow::Result<PathBuf>>;
-    /// Creates workspace `name`.
+    /// The socket of workspace `id`'s hub, whether it runs or not.
+    fn socket(&self, id: &str) -> anyhow::Result<PathBuf>;
+    /// Makes sure workspace `id`'s hub answers, starting it when none runs; its socket.
+    fn open(&self, id: &str) -> futures::future::BoxFuture<'static, anyhow::Result<PathBuf>>;
+    /// Creates workspace `name` (its id: a new workspace's id is its name).
     fn create(&self, name: &str) -> anyhow::Result<()>;
+    /// Them, with their names, in the tab strip's order; by default each named as its id, the
+    /// first the default.
+    fn list(&self) -> anyhow::Result<Vec<WsEntry>> {
+        Ok(self
+            .names()?
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| WsEntry {
+                name: id.clone(),
+                id,
+                default: i == 0,
+            })
+            .collect())
+    }
+    /// Renames workspace `id` to `to`; what to say it did.
+    fn rename(&self, _id: &str, _to: &str) -> anyhow::Result<String> {
+        anyhow::bail!("workspaces can't be renamed here")
+    }
+    /// Makes workspace `id` the default; what to say it did.
+    fn set_default(&self, _id: &str) -> anyhow::Result<String> {
+        anyhow::bail!("the default workspace can't be changed here")
+    }
+    /// What removing workspace `id` would do, or why it can't be removed now.
+    fn plan_removal(
+        &self,
+        _id: &str,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<RemovalPlan>> {
+        Box::pin(async { anyhow::bail!("workspaces can't be removed here") })
+    }
+    /// Removes workspace `id`, stopping its hub first when `stop_hub` (once
+    /// [`Workspaces::plan_removal`] said it can); what to say it did.
+    fn remove(
+        &self,
+        _id: &str,
+        _stop_hub: bool,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> {
+        Box::pin(async { anyhow::bail!("workspaces can't be removed here") })
+    }
 }
 
 /// The workspace a TUI opens on, and the ones it can switch to.
 pub struct Switching {
-    /// The workspace of the socket the TUI opens on.
+    /// The id of the workspace of the socket the TUI opens on.
     pub current: String,
+    /// What to say as it opens (that it opened this one for want of a default).
+    pub note: Option<String>,
     /// All of them.
     pub workspaces: std::sync::Arc<dyn Workspaces>,
 }
@@ -1913,6 +1993,33 @@ fn accounts_failure(e: &anyhow::Error) -> Value {
         true => Value::Null,
         false => json!({"failed": true}),
     }
+}
+
+/// Deletes workspace `id` off the loop ([`Workspaces::remove`]); what it did, and the
+/// workspaces as listed after, go to `done`.
+fn spawn_removal(
+    ws: std::sync::Arc<dyn Workspaces>,
+    id: String,
+    stop_hub: bool,
+    done: mpsc::UnboundedSender<(String, Option<Vec<WsEntry>>)>,
+) {
+    tokio::spawn(async move {
+        let msg = match ws.remove(&id, stop_hub).await {
+            // What went and what changes (what stays was in the plan).
+            Ok(lines) => lines
+                .iter()
+                .filter(|l| !l.starts_with(' '))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; "),
+            Err(e) => format!("workspace {id} not deleted: {e:#}"),
+        };
+        let listed = tokio::task::spawn_blocking(move || ws.list().ok())
+            .await
+            .ok()
+            .flatten();
+        let _ = done.send((msg, listed));
+    });
 }
 
 /// Creates workspace `name` when asked, opens its hub and connects to it.
@@ -2605,6 +2712,14 @@ struct Shared {
     /// Errors of calls a workspace left asked for, once another one shows ([`serve_calls`]).
     late_tx: mpsc::UnboundedSender<StatusMsg>,
     late_rx: mpsc::UnboundedReceiver<StatusMsg>,
+    /// A workspace being deleted from the workspace menu ([`Action::WsRemove`]): the one the
+    /// TUI showed, deleted once the switch away from it is done; whether to stop its hub.
+    pending_removal: Option<(String, bool)>,
+    /// What to say on the first view ([`Switching::note`]).
+    note: Option<String>,
+    /// What a workspace change from the menu did, and the workspaces as listed after it.
+    ws_done_tx: mpsc::UnboundedSender<(String, Option<Vec<WsEntry>>)>,
+    ws_done_rx: mpsc::UnboundedReceiver<(String, Option<Vec<WsEntry>>)>,
     /// Each workspace left by a switch: its followed results' channel ([`ResultsOut`]).
     followed: std::collections::HashMap<String, (ResultTx, ResultRx)>,
     tui: twr_core::config::TuiConfig,
@@ -2807,6 +2922,7 @@ pub async fn run_with(
         .context("enabling focus reporting")?;
     let mut input = Input::terminal()?;
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
+    let (ws_done_tx, ws_done_rx) = mpsc::unbounded_channel();
     let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
     let (saves, settings_writer) = spawn_settings_writer(saved_tx);
     let own = speaker::Place {
@@ -2820,6 +2936,10 @@ pub async fn run_with(
         all_callers: Vec::new(),
         late_tx,
         late_rx,
+        pending_removal: None,
+        note: None,
+        ws_done_tx,
+        ws_done_rx,
         followed: std::collections::HashMap::new(),
         tui,
         // The working icon's clock: every icon's frame comes from the time since this instant.
@@ -2843,16 +2963,17 @@ pub async fn run_with(
         speaker,
         signals,
     };
+    ctx.note = switching.as_ref().and_then(|s| s.note.clone());
     let current = switching.map(|s| s.current);
     // The tabs are known from the start (their hubs are asked at the first poll), so `/ws`
     // never takes an existing workspace for a new one.
     let tabs = ctx
         .workspaces
         .as_ref()
-        .and_then(|ws| ws.names().ok())
+        .and_then(|ws| ws.list().ok())
         .unwrap_or_default()
-        .into_iter()
-        .map(workspace::Tab::new)
+        .iter()
+        .map(workspace::Tab::of)
         .collect();
     let carried = Carried {
         mouse: ctx.tui.mouse,
@@ -2934,6 +3055,18 @@ where
                 flush_history(writer);
                 if let Some(left) = current.replace(to.clone()) {
                     saved.insert(left, *view);
+                }
+                // A workspace no longer listed (deleted, here or elsewhere) leaves no view: one
+                // made later with its id starts afresh.
+                saved.retain(|id, _| tabs.iter().any(|t| &t.name == id));
+                // The workspace left, to delete now that it is not shown.
+                if let Some((id, stop_hub)) = ctx.pending_removal.take() {
+                    if id != to {
+                        saved.remove(&id);
+                        if let Some(ws) = ctx.workspaces.clone() {
+                            spawn_removal(ws, id, stop_hub, ctx.ws_done_tx.clone());
+                        }
+                    }
                 }
                 carried = Carried {
                     mouse,
@@ -3051,7 +3184,7 @@ where
     let selection = workspace::attach_via(
         ctx.workspaces.is_none().then_some(socket.as_path()),
         info["workspace"].as_str(),
-        std::env::var_os(twr_core::paths::WORKSPACE_ENV).as_deref(),
+        bare_workspace().as_deref(),
     );
     let status = StatusOut {
         tx: err_tx,
@@ -3111,6 +3244,10 @@ where
     state.view.picker = Picker::from_show(&show, &state.accounts);
     state.workspace = current;
     state.set_tabs(carried.tabs);
+    // What the CLI said as it opened (no default workspace, so it opened this one).
+    if let Some(note) = ctx.note.take() {
+        state.view.status = Some(note);
+    }
     if let Some(view) = carried.view {
         state.restore_view(view);
     }
@@ -3186,13 +3323,15 @@ where
     // A poll's answers: the workspaces listed (`None`: they could not be), how the hubs
     // asked were, and when they were asked.
     let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<(
-        Option<Vec<String>>,
+        Option<Vec<WsEntry>>,
         Vec<workspace::Polled>,
         std::time::Instant,
     )>();
     // The workspaces as listed for a poll (`None`: they could not be), read off the loop: a
     // directory on a slow mount never holds up the view.
-    let (names_tx, mut names_rx) = mpsc::unbounded_channel::<Option<Vec<String>>>();
+    let (names_tx, mut names_rx) = mpsc::unbounded_channel::<Option<Vec<WsEntry>>>();
+    // What deleting a workspace would do, for the workspace menu ([`Action::WsPlan`]).
+    let (plan_tx, mut plan_rx) = mpsc::unbounded_channel::<(String, anyhow::Result<RemovalPlan>)>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
     type Opened = (String, anyhow::Result<Session>);
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<Opened>();
@@ -3549,6 +3688,62 @@ where
                                 }
                                 continue;
                             }
+                            // The workspace menu's changes ([`wsmenu`]): the CLI makes them,
+                            // and the tabs are listed again at once.
+                            Action::WsRename { id, to } => {
+                                if let Some(ws) = &ctx.workspaces {
+                                    let msg = match ws.rename(&id, &to) {
+                                        Ok(msg) => msg,
+                                        Err(e) => format!("rename: {e:#}"),
+                                    };
+                                    let _ = ctx.ws_done_tx.send((msg, ws.list().ok()));
+                                }
+                                continue;
+                            }
+                            Action::WsDefault { id } => {
+                                if let Some(ws) = &ctx.workspaces {
+                                    let msg = match ws.set_default(&id) {
+                                        Ok(msg) => msg,
+                                        Err(e) => format!("make default: {e:#}"),
+                                    };
+                                    let _ = ctx.ws_done_tx.send((msg, ws.list().ok()));
+                                }
+                                continue;
+                            }
+                            Action::WsPlan { id } => {
+                                if let Some(ws) = ctx.workspaces.clone() {
+                                    let tx = plan_tx.clone();
+                                    tokio::spawn(async move {
+                                        let r = ws.plan_removal(&id).await;
+                                        let _ = tx.send((id, r));
+                                    });
+                                }
+                                continue;
+                            }
+                            // The workspace shown is deleted once the switch away from it is
+                            // done ([`Shared::pending_removal`]); another one at once.
+                            Action::WsRemove { id, stop_hub, via } => {
+                                let Some(ws) = ctx.workspaces.clone() else {
+                                    continue;
+                                };
+                                match via {
+                                    Some(to) => {
+                                        if !state.begin_switch(&to) {
+                                            continue;
+                                        }
+                                        ctx.pending_removal = Some((id, stop_hub));
+                                        let tx = open_tx.clone();
+                                        tokio::spawn(async move {
+                                            let r = open_workspace(ws.as_ref(), &to, false).await;
+                                            let _ = tx.send((to, r));
+                                        });
+                                    }
+                                    None => {
+                                        spawn_removal(ws, id, stop_hub, ctx.ws_done_tx.clone());
+                                    }
+                                }
+                                continue;
+                            }
                             // The workspace's hub is opened (started when needed) and
                             // connected to off the loop; this one stays until it is.
                             Action::Workspace { name, create } => {
@@ -3800,7 +3995,7 @@ where
                         tabs_pending = true;
                         let tx = names_tx.clone();
                         tokio::spawn(async move {
-                            let names = tokio::task::spawn_blocking(move || ws.names().ok())
+                            let names = tokio::task::spawn_blocking(move || ws.list().ok())
                                 .await
                                 .ok()
                                 .flatten();
@@ -3813,7 +4008,7 @@ where
                     match ctx.workspaces.clone() {
                         Some(ws) => {
                             let listed: Vec<String> = match &names {
-                                Some(n) => n.clone(),
+                                Some(n) => n.iter().map(|e| e.id.clone()).collect(),
                                 None => state.tabs.iter().map(|t| t.name.clone()).collect(),
                             };
                             let now = std::time::Instant::now();
@@ -3832,7 +4027,7 @@ where
                     for p in &polled {
                         ctx.poll_clock.answered(&p.name, &p.hub, asked);
                     }
-                    state.merge_poll(names, polled);
+                    state.merge_listing(names, polled);
                     let alerts = workspace::waiting_alerts(
                         &mut ctx.waiting_seen,
                         &state.tabs,
@@ -3865,6 +4060,15 @@ where
                 Some((msg, transient)) = ctx.late_rx.recv() => {
                     state.set_status(msg, transient, std::time::Instant::now());
                 }
+                Some((msg, listed)) = ctx.ws_done_rx.recv() => {
+                    state.set_status(msg, false, std::time::Instant::now());
+                    if listed.is_some() {
+                        state.merge_listing(listed, Vec::new());
+                    }
+                }
+                Some((id, plan)) = plan_rx.recv() => {
+                    state.ws_planned(&id, plan, std::time::Instant::now());
+                }
                 Some((name, r)) = open_rx.recv() => match r {
                     Ok(next) => {
                         // What the user saw of this workspace's waiting items: no alert for
@@ -3890,7 +4094,14 @@ where
                     }
                     Err(e) => {
                         state.switching = None;
-                        state.view.status = Some(format!("workspace {name}: {e:#}"));
+                        let label = state.ws_label(&name);
+                        state.view.status = Some(match ctx.pending_removal.take() {
+                            Some((id, _)) => format!(
+                                "workspace {} not deleted: the switch to {label} failed: {e:#}",
+                                state.ws_label(&id)
+                            ),
+                            None => format!("workspace {label}: {e:#}"),
+                        });
                     }
                 },
                 Some((t, generation, r)) = sub_rx.recv() => {

@@ -214,7 +214,7 @@ async fn run_call(
             return Ok(json!({"ok":true}));
         }
         if call.method == "desktop.paths" {
-            return Ok(json!({"config":paths.config_file,"data":paths.data_dir,"socket":socket,"workspace":paths.workspace_name(),"version":twr_core::version(),"fold":FOLD}));
+            return Ok(json!({"config":paths.config_file,"data":paths.data_dir,"socket":socket,"workspace":paths.workspace_id(),"workspace_name":paths.display_name(),"version":twr_core::version(),"fold":FOLD}));
         }
         if call.method == "desktop.runner.use" || call.method == "desktop.runner.cancel" || call.method == "desktop.runner.status" {
             anyhow::ensure!(tokio::task::spawn_blocking(||twr_hub::local_agent(std::process::id()).is_none()).await?,"Runner controls are user-only");

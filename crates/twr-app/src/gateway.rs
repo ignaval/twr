@@ -1135,8 +1135,8 @@ impl Session {
             "This device does not have read access"
         );
         let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
-        let mut workspaces = vec!["default".to_owned()];
-        workspaces.extend(paths.named_workspaces()?);
+        // By id, the root slot's unless it was removed.
+        let workspaces = paths.workspace_ids()?;
         anyhow::ensure!(
             workspaces.len() <= 256,
             "Too many workspaces to summarize at once"

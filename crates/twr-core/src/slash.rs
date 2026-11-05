@@ -244,6 +244,13 @@ pub enum Slash {
     /// `/ws new [name]`: create a workspace and switch to it; without a name, ask for it
     /// (the new-workspace dialog, `the client`).
     WsNew(Option<String>),
+    /// `/ws menu [name]`: the workspace menu of one (the current one without a name): open,
+    /// rename, make default, delete (`the client`).
+    WsMenu(Option<String>),
+    /// `/ws rename [name] <new>`: rename one (the current one without a name), asking first.
+    WsRename(Option<String>, String),
+    /// `/ws rm <name>` (or `delete`): what deleting it would remove, and Delete to do it.
+    WsRm(String),
     /// `/spaces [on|off]`: the same as `/sidebar` (Ctrl-T); `None` toggles.
     Spaces(Option<bool>),
     /// `/settings`: the settings overlay (`the client`).
@@ -1128,9 +1135,10 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     ),
     (
         "/ws",
-        "/ws [name] | /ws new [name]",
+        "/ws [name] | /ws new [name] | /ws menu [name] | /ws rename [name] <new> | /ws rm <name>",
         "list the workspaces, or switch to one (Alt-1..9, Ctrl-PgUp/PgDn); a new name asks to \
-         create it; /ws new creates one; alias /workspace",
+         create it; /ws new creates one; /ws menu (the ⋯ on a workspace's card) renames, \
+         deletes or makes one the default; alias /workspace",
         &[ArgKind::Workspace],
     ),
     (
@@ -1507,6 +1515,15 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         "/ws" => match args {
             [new] if new == "new" => Ok(Slash::WsNew(None)),
             [new, name] if new == "new" => Ok(Slash::WsNew(Some(name.clone()))),
+            [menu] if menu == "menu" => Ok(Slash::WsMenu(None)),
+            [menu, name] if menu == "menu" => Ok(Slash::WsMenu(Some(name.clone()))),
+            [rename, to] if rename == "rename" => Ok(Slash::WsRename(None, to.clone())),
+            [rename, name, to] if rename == "rename" => {
+                Ok(Slash::WsRename(Some(name.clone()), to.clone()))
+            }
+            [rm, name] if rm == "rm" || rm == "delete" => Ok(Slash::WsRm(name.clone())),
+            [rm] if rm == "rm" || rm == "delete" => Err("usage: /ws rm <name>".into()),
+            [rename] if rename == "rename" => Err("usage: /ws rename [name] <new name>".into()),
             _ => one(args).map(Slash::Ws),
         },
         "/parked" | "/sidebar" | "/spaces" | "/focus" | "/mouse" | "/compact" | "/suggest"
@@ -3020,6 +3037,19 @@ mod tests {
         assert_eq!(parse("/ws new"), Ok(Slash::WsNew(None)));
         assert_eq!(parse("/ws new api"), Ok(Slash::WsNew(Some("api".into()))));
         assert_eq!(parse("/ws api"), Ok(Slash::Ws(Some("api".into()))));
+        assert_eq!(parse("/ws menu"), Ok(Slash::WsMenu(None)));
+        assert_eq!(parse("/ws menu api"), Ok(Slash::WsMenu(Some("api".into()))));
+        assert_eq!(
+            parse("/ws rename main"),
+            Ok(Slash::WsRename(None, "main".into()))
+        );
+        assert_eq!(
+            parse("/ws rename default main"),
+            Ok(Slash::WsRename(Some("default".into()), "main".into()))
+        );
+        assert_eq!(parse("/ws rm api"), Ok(Slash::WsRm("api".into())));
+        assert_eq!(parse("/ws delete api"), Ok(Slash::WsRm("api".into())));
+        assert!(parse("/ws rm").is_err());
         assert_eq!(parse("/w"), Ok(Slash::Pane(CompactPane::Threads)));
         assert_eq!(parse("/sidebar on"), Ok(Slash::Sidebar(Some(true))));
         assert_eq!(parse("/sidebar off"), Ok(Slash::Sidebar(Some(false))));

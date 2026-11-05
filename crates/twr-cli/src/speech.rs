@@ -76,13 +76,20 @@ pub fn workspace_sockets(
 ) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let root = paths.root();
     let mut wanted: Vec<String> = if all {
-        let mut v = vec![DEFAULT_WORKSPACE.to_string()];
-        v.extend(root.named_workspaces().context("listing the workspaces")?);
-        v
+        root.workspace_ids().context("listing the workspaces")?
     } else if names.is_empty() {
-        vec![paths.workspace_name().to_string()]
+        vec![paths.workspace_id().to_string()]
     } else {
-        names.to_vec()
+        // Each by its id, whichever name it was given by.
+        let mut ids = Vec::new();
+        for name in names {
+            let ws = root.find_workspace(name)?;
+            if !ws.exists() {
+                anyhow::bail!("there is no workspace {name} (`twr ws` lists them)");
+            }
+            ids.push(ws.workspace_id().to_string());
+        }
+        ids
     };
     wanted.dedup();
     let config = Config::load_from(&root).unwrap_or_default();
@@ -671,16 +678,17 @@ fn speak_link(args: &Speak, paths: &Paths) -> anyhow::Result<LinkSpec> {
         // keep this device's other speakers from the rest (one speaks for a machine's hubs).
         None => match &args.workspace {
             Some(ws) => {
-                let one = paths.root().workspace(ws)?;
+                let one = paths.root().find_workspace(ws)?;
                 if !one.exists() {
                     anyhow::bail!(
                         "there is no workspace {ws}: create it with `twr ws new {ws}` (`twr ws` \
                          lists them)"
                     );
                 }
+                // By its id, which a rename leaves as it is.
                 LinkSpec::Local {
                     paths: paths.root(),
-                    workspaces: Workspaces::One(ws.clone()),
+                    workspaces: Workspaces::One(one.workspace_id().to_string()),
                 }
             }
             None => LinkSpec::Local {

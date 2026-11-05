@@ -101,17 +101,20 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
         binary.is_absolute() && binary.file_name().is_some_and(|s| s == "twr"),
         "A stable absolute twr executable is required"
     );
-    if paths.workspace.is_some() {
-        anyhow::ensure!(
-            paths.data_dir.is_dir(),
-            "Workspace does not exist; create it before connecting"
-        );
+    // A workspace that was removed (the root slot's too) is not made again here: only `twr ws
+    // new` makes one, and the hub checks again under its lock.
+    anyhow::ensure!(
+        paths.exists(),
+        "Workspace does not exist; create it before connecting"
+    );
+    match paths.workspace {
+        None => twr_core::paths::ensure_private_dir(&paths.data_dir)?,
+        Some(_) => twr_core::paths::check_private_dir(&paths.data_dir)?,
     }
-    twr_core::paths::ensure_private_dir(&paths.data_dir)?;
     let log = twr_core::paths::open_private_append(&paths.hub_log())?;
     let mut command = std::process::Command::new(binary);
     command
-        .args(["--workspace", paths.workspace_name(), "--socket"])
+        .args(["--workspace", paths.workspace_id(), "--socket"])
         .arg(socket)
         .arg("hub")
         .stdin(Stdio::null())

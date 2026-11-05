@@ -189,7 +189,7 @@ fn workspaces_are_separate_hubs_in_one_repository() {
         "{e}"
     );
     assert!(fails(home, &["-w", "Bad", "thread", "list"]).contains("invalid workspace name"));
-    assert!(fails(home, &["ws", "new", "default"]).contains("always exists"));
+    assert!(fails(home, &["ws", "new", "default"]).contains("already exists"));
     assert!(fails(home, &["ws", "new", "Bad"]).contains("invalid workspace name"));
 
     assert_eq!(
@@ -325,12 +325,17 @@ fn workspaces_are_separate_hubs_in_one_repository() {
         serde_json::from_str(&ok(home, &["ws", "list", "--json", "--detail"])).unwrap();
     assert_eq!(
         detailed[1],
-        serde_json::json!({"hub": "stopped", "name": "a", "current": false})
+        serde_json::json!({
+            "hub": "stopped", "name": "a", "id": "a", "default": false, "current": false
+        })
     );
     let e = fails(home, &["ws", "rm", "a"]);
     assert!(e.contains("still has 2 threads (api, x)"), "{e}");
     assert!(a.data_dir.is_dir());
-    assert!(fails(home, &["ws", "rm", "default"]).contains("cannot be removed"));
+    // `default` is removed like the others: not while its hub runs.
+    assert!(
+        fails(home, &["ws", "rm", "default"]).contains("the hub of workspace default is running")
+    );
     assert!(fails(home, &["ws", "rm", "nope"]).contains("there is no workspace nope"));
 }
 
@@ -367,9 +372,11 @@ fn ws_rm_removes_an_empty_workspace_and_keeps_a_trash() {
         "{e}"
     );
     assert!(b.db_file().exists());
-    assert_eq!(
-        ok(home, &["ws", "rm", "b", "--yes"]).trim(),
-        "removed workspace b, with its orchestrator's 1 memory note"
+    let said = ok(home, &["ws", "rm", "b", "--yes"]);
+    assert!(said.starts_with("removed workspace b: "), "{said}");
+    assert!(
+        said.contains("with its orchestrator's 1 memory note"),
+        "{said}"
     );
     assert!(!b.data_dir.exists());
     let names: Vec<Value> = workspaces(home).iter().map(|r| r["name"].clone()).collect();
@@ -460,7 +467,8 @@ fn an_attached_cli_gets_its_workspace() {
             String::from_utf8_lossy(&attached.stderr)
         );
         let seen = std::fs::read_to_string(&out).unwrap();
-        let want = if w[1] == "a" { "a" } else { "unset" };
+        // By id, `default` too: a change of the default never sends it elsewhere.
+        let want = if w[1] == "a" { "a" } else { "default" };
         assert_eq!(seen, want, "attached in {}", w[1]);
     }
 }
@@ -660,10 +668,7 @@ fn ws_rm_refuses_a_hub_on_another_socket() {
     assert!(b.db_file().exists());
     let _ = hub.0.kill();
     let _ = hub.0.wait();
-    assert_eq!(
-        ok(home, &["ws", "rm", "b", "-y"]).trim(),
-        "removed workspace b"
-    );
+    assert!(ok(home, &["ws", "rm", "b", "-y"]).starts_with("removed workspace b: "));
 }
 
 /// A `hub.socket` among the workspaces' sockets is refused where the default workspace uses
@@ -1710,4 +1715,369 @@ fn a_thread_cannot_work_in_another_workspaces_worktree() {
         ],
     );
     assert!(e.contains("worktree twr manages for thread api"), "{e}");
+}
+
+// --- rename, default, removal of any workspace -------------------------------------------
+
+/// The `ws list --json` row of the workspace named `name`.
+fn listed(home: &Path, name: &str) -> Value {
+    workspaces(home)
+        .into_iter()
+        .find(|r| r["name"] == name)
+        .unwrap_or_else(|| panic!("no workspace {name} listed"))
+}
+
+/// A workspace renamed while its hub runs keeps that hub, its threads, its socket and its
+/// branches' namespace: the hub says its new name at once, and both names select it. Its
+/// original name stays its own (no other workspace can take it) until it goes back to it.
+#[test]
+fn a_workspace_renamed_while_its_hub_runs_keeps_everything() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let repo = home.join("repo");
+    init_repo(&repo);
+    ok(home, &["ws", "new", "a"]);
+    let a = Paths::with_home(home).workspace("a").unwrap();
+    let _hub = start_hub(home, Some("a"));
+    new_thread(home, &["-w", "a"], &repo, "api", "fake");
+    let id = thread_id(home, &["-w", "a"], "api");
+    let pid = |w: &str| {
+        let info: Value = serde_json::from_str(&ok(home, &["-w", w, "info", "--json"])).unwrap();
+        (
+            info["pid"].as_u64().unwrap(),
+            info["workspace"].clone(),
+            info["workspace_name"].clone(),
+        )
+    };
+    let before = pid("a");
+
+    let said = ok(home, &["ws", "rename", "a", "acme"]);
+    assert!(said.contains("renamed workspace a to acme"), "{said}");
+    // The same hub, by either name, saying its new name; its id unchanged.
+    let after = pid("acme");
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, "a");
+    assert_eq!(after.2, "acme");
+    assert_eq!(pid("a").0, before.0);
+    assert_eq!(thread_id(home, &["-w", "acme"], "api"), id);
+    // Nothing moved: its directory, its socket, its new threads' branches.
+    assert!(a.data_dir.is_dir());
+    assert!(a.socket.exists());
+    new_thread(home, &["-w", "acme"], &repo, "web", "fake");
+    let ns = Paths::with_home(home)
+        .workspace("a")
+        .unwrap()
+        .worktree_namespace()
+        .unwrap();
+    assert!(ns.ends_with("@a"), "{ns}");
+    let row = listed(home, "acme");
+    assert_eq!(row["id"], "a");
+    assert_eq!(row["hub"], "running");
+    assert_eq!(row["threads"], 2);
+    let table = ok(home, &["ws"]);
+    assert!(table.contains("acme (was a)"), "{table}");
+    // Its original name is its own; it may go back to it.
+    assert!(fails(home, &["ws", "new", "a"]).contains("original name of workspace acme"));
+    assert!(fails(home, &["ws", "rename", "default", "a"]).contains("original name"));
+    assert!(fails(home, &["ws", "rename", "default", "acme"]).contains("already"));
+    assert!(
+        fails(home, &["ws", "rename", "acme", "default"]).contains("a workspace default already")
+    );
+    assert!(fails(home, &["ws", "rename", "acme", "Bad"]).contains("invalid workspace name"));
+    assert!(fails(home, &["ws", "rename", "nope", "x"]).contains("there is no workspace nope"));
+    ok(home, &["ws", "rename", "acme", "a"]);
+    assert_eq!(pid("a").2, "a");
+    assert!(!a.data_dir.join("workspace-name").exists());
+}
+
+/// `default` can be renamed, stop being the default and be removed like any other: its
+/// shared directory stays with what every workspace shares and what is not twr's, its hub
+/// refuses to start once it is gone, and `twr ws new default` makes it again.
+#[test]
+fn the_default_workspace_is_renamed_removed_and_made_again() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let root = Paths::with_home(home);
+    {
+        let _hub = start_hub(home, None);
+        ok(home, &["ws", "rename", "default", "main"]);
+        let info: Value = serde_json::from_str(&ok(home, &["info", "--json"])).unwrap();
+        assert_eq!(info["workspace"], "default");
+        assert_eq!(info["workspace_name"], "main");
+        // Both names, and none, select it.
+        ok(home, &["-w", "main", "thread", "list"]);
+        ok(home, &["-w", "default", "thread", "list"]);
+        assert!(fails(home, &["ws", "rm", "main"]).contains("the hub of workspace main is running"));
+    }
+    assert!(root.db_file().exists());
+    ok(home, &["ws", "new", "b"]);
+    assert!(ok(home, &["ws", "default"]).contains("the default workspace is main"));
+    ok(home, &["ws", "default", "b"]);
+    assert!(ok(home, &["ws", "default"]).contains("the default workspace is b"));
+    assert_eq!(workspaces(home)[0]["name"], "b");
+    assert_eq!(listed(home, "b")["default"], true);
+    assert_eq!(listed(home, "main")["default"], false);
+    // Commands without -w go to b now; `-w default` still to the root's.
+    let b = Paths::with_home(home).workspace("b").unwrap();
+    {
+        let _b_hub = start_hub(home, Some("b"));
+        let info: Value = serde_json::from_str(&ok(home, &["info", "--json"])).unwrap();
+        assert_eq!(info["workspace"], "b");
+        assert!(fails(home, &["-w", "default", "info"]).contains("no hub is running"));
+    }
+    // What the root's directory holds besides the workspace's own stays.
+    std::fs::create_dir_all(root.data_dir.join("accounts/claude-code/work")).unwrap();
+    std::fs::write(root.data_dir.join("twr.db.bak-mine"), "mine").unwrap();
+    std::fs::create_dir_all(root.data_dir.join("memory")).unwrap();
+    std::fs::write(root.data_dir.join("memory/notes.md"), "n").unwrap();
+    let said = ok(home, &["ws", "rm", "main", "--yes"]);
+    assert!(said.starts_with("removed workspace main: "), "{said}");
+    assert!(said.contains("1 memory note"), "{said}");
+    assert!(
+        said.contains("its names, main and default (its original name), are free again"),
+        "{said}"
+    );
+    assert!(!root.db_file().exists());
+    assert!(!root.data_dir.join("memory").exists());
+    assert!(root.data_dir.join("workspace-removed").exists());
+    assert!(root.data_dir.join("accounts/claude-code/work").is_dir());
+    assert_eq!(
+        std::fs::read_to_string(root.data_dir.join("twr.db.bak-mine")).unwrap(),
+        "mine"
+    );
+    assert!(b.data_dir.is_dir());
+    let names: Vec<Value> = workspaces(home).iter().map(|r| r["name"].clone()).collect();
+    assert_eq!(names, ["b"]);
+    // Gone: not listed, not selected, no hub there.
+    assert!(
+        fails(home, &["-w", "default", "thread", "list"]).contains("there is no workspace default")
+    );
+    assert!(fails(home, &["-w", "main", "thread", "list"]).contains("there is no workspace main"));
+    let e = fails(home, &["-w", "default", "hub"]);
+    assert!(e.contains("there is no workspace default"), "{e}");
+    assert!(!root.db_file().exists());
+    assert!(fails(home, &["ws", "rm", "default"]).contains("there is no workspace default"));
+    // b is still the default.
+    assert!(ok(home, &["ws", "default"]).contains("the default workspace is b"));
+    // Made again: empty, in the root, not the default (b is).
+    let said = ok(home, &["ws", "new", "default"]);
+    assert!(
+        said.contains("again, in twr's own data directory"),
+        "{said}"
+    );
+    assert!(!said.contains("it is the default"), "{said}");
+    assert!(!root.data_dir.join("workspace-removed").exists());
+    assert_eq!(listed(home, "default")["default"], false);
+    let _hub = start_hub(home, Some("default"));
+    assert!(ok(home, &["-w", "default", "thread", "list"]).contains("no threads"));
+}
+
+/// Removing the default workspace leaves none: commands without -w say what to do, and a
+/// bare `twr` opens the first workspace there is. Removing the last one leaves none at all:
+/// commands say how to make one, and the first one made is the default.
+#[test]
+fn removing_the_default_and_the_last_workspace() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    ok(home, &["ws", "new", "z"]);
+    let said = ok(home, &["ws", "rm", "default", "--yes"]);
+    assert!(said.contains("no workspace is the default then"), "{said}");
+    let e = fails(home, &["thread", "list"]);
+    assert!(
+        e.contains("there is no default workspace (it was removed)"),
+        "{e}"
+    );
+    assert!(
+        e.contains("twr ws default <name>") && e.contains("workspaces: z"),
+        "{e}"
+    );
+    let listing = twr(home, &["ws", "list"]);
+    assert!(listing.status.success());
+    assert!(String::from_utf8_lossy(&listing.stderr).contains("there is no default workspace"));
+    assert!(ok(home, &["ws", "default"]).contains("there is no default workspace"));
+    // A bare `twr` (the TUI) opens z, the first one there is: its hub starts (the TUI then
+    // fails, with no terminal). No hub of the root slot is ever started.
+    command(home, &[])
+        .env("TWR_ENABLE_FAKE", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    let info: Value = serde_json::from_str(&ok(home, &["-w", "z", "info", "--json"])).unwrap();
+    assert_eq!(info["workspace"], "z");
+    let pid = info["pid"].as_u64().unwrap().to_string();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap()
+        .success());
+    poll("z's hub to stop", || {
+        (!twr(home, &["-w", "z", "info"]).status.success()).then_some(())
+    });
+    assert!(!Paths::with_home(home).db_file().exists());
+
+    // The last one.
+    let said = ok(home, &["ws", "rm", "z", "--yes"]);
+    assert!(said.starts_with("removed workspace z: "), "{said}");
+    assert_eq!(workspaces(home).len(), 0);
+    let e = fails(home, &["thread", "list"]);
+    assert!(
+        e.contains("there are no workspaces: create one with `twr ws new <name>`"),
+        "{e}"
+    );
+    // Without a terminal a bare `twr` can't ask for a name: it says the same.
+    let out = command(home, &[]).stdin(Stdio::null()).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("there are no workspaces"));
+    let said = ok(home, &["ws", "new", "fresh"]);
+    assert!(
+        said.contains("it is the default workspace (there was none)"),
+        "{said}"
+    );
+    assert!(ok(home, &["ws", "default"]).contains("the default workspace is fresh"));
+    let _hub = start_hub(home, None);
+    let info: Value = serde_json::from_str(&ok(home, &["info", "--json"])).unwrap();
+    assert_eq!(info["workspace"], "fresh");
+}
+
+/// A removal waits for nothing to be lost: refused while the hub runs, while threads are
+/// left and while the trash holds any, for `default` as for the others; and an old name freed
+/// by the removal can be taken again, by a new workspace that starts afresh.
+#[test]
+fn removing_default_refuses_while_anything_would_be_lost() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let repo = home.join("repo");
+    init_repo(&repo);
+    let root = Paths::with_home(home);
+    {
+        let _hub = start_hub(home, None);
+        new_thread(home, &[], &repo, "api", "fake");
+        assert!(fails(home, &["ws", "rm", "default"])
+            .contains("the hub of workspace default is running"));
+    }
+    let e = fails(home, &["ws", "rm", "default"]);
+    assert!(e.contains("still has 1 thread (api)"), "{e}");
+    assert!(root.db_file().exists() && !root.removed_marker().exists());
+    std::fs::create_dir_all(root.data_dir.join("trash/item")).unwrap();
+    {
+        let _hub = start_hub(home, None);
+        ok(home, &["delete", "api", "--yes"]);
+    }
+    std::fs::create_dir_all(root.data_dir.join("trash/item")).unwrap();
+    let e = fails(home, &["ws", "rm", "default"]);
+    assert!(e.contains("trash empty --all"), "{e}");
+    std::fs::remove_dir_all(root.data_dir.join("trash")).unwrap();
+    ok(home, &["ws", "rm", "default", "--yes"]);
+    assert!(root.removed_marker().exists());
+}
+
+/// Two removals, renames or creations at once never both pass their checks: of four that
+/// race to take one name, exactly one does.
+#[test]
+fn concurrent_workspace_changes_take_turns() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    for w in ["p", "q", "r", "s"] {
+        ok(home, &["ws", "new", w]);
+    }
+    let renames: Vec<Child> = ["p", "q", "r", "s"]
+        .iter()
+        .map(|w| {
+            command(home, &["ws", "rename", w, "same"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let won = renames
+        .into_iter()
+        .map(|mut c| c.wait().unwrap().success())
+        .filter(|ok| *ok)
+        .count();
+    assert_eq!(won, 1);
+    let named: Vec<Value> = workspaces(home)
+        .into_iter()
+        .filter(|r| r["name"] == "same")
+        .collect();
+    assert_eq!(named.len(), 1);
+    let news: Vec<Child> = (0..4)
+        .map(|_| {
+            command(home, &["ws", "new", "t"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let made = news
+        .into_iter()
+        .map(|mut c| c.wait().unwrap().success())
+        .filter(|ok| *ok)
+        .count();
+    assert_eq!(made, 1);
+}
+
+/// An agent's `twr` reaches its own workspace whatever the user does meanwhile: its root
+/// slot renamed, another workspace made the default. Agents can't rename, remove or choose
+/// the default themselves.
+#[test]
+fn an_agents_twr_keeps_its_workspace_through_a_rename_and_a_new_default() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let project = home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    ok(home, &["ws", "new", "a"]);
+    let _default_hub = start_hub(home, None);
+    let _a_hub = start_hub(home, Some("a"));
+    new_thread(home, &["-w", "a"], &project, "in-a", "fake");
+    let d = home.display();
+    let script = home.join("agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "printf '> '\n\
+             read l\n\
+             {TWR} thread list > {d}/list.out 2>&1\n\
+             printf '%s' \"$TWR_WORKSPACE\" > {d}/var.out\n\
+             {TWR} ws rename a b > {d}/rename.out 2>&1\n\
+             {TWR} ws default a > {d}/default.out 2>&1\n\
+             {TWR} ws rm a > {d}/rm.out 2>&1\n\
+             touch {d}/done\n\
+             while read l; do printf '> '; done\n"
+        ),
+    )
+    .unwrap();
+    let runtime = format!("pty:sh {}", script.display());
+    new_thread(home, &[], &project, "agent", &runtime);
+    ok(home, &["ws", "rename", "default", "main"]);
+    ok(home, &["ws", "default", "a"]);
+    ok(home, &["-w", "main", "send", "agent", "hello"]);
+    poll("the agent's commands", || {
+        home.join("done").exists().then_some(())
+    });
+    assert_eq!(
+        std::fs::read_to_string(home.join("var.out")).unwrap(),
+        "default"
+    );
+    let listed = std::fs::read_to_string(home.join("list.out")).unwrap();
+    assert!(listed.lines().any(|l| l.starts_with("agent ")), "{listed}");
+    assert!(!listed.contains("in-a"), "{listed}");
+    for f in ["rename.out", "default.out", "rm.out"] {
+        let said = std::fs::read_to_string(home.join(f)).unwrap();
+        assert!(said.contains("agents cannot"), "{f}: {said}");
+    }
+    assert!(ok(home, &["ws", "default"]).contains("the default workspace is a"));
+    assert_eq!(listed_name(home, "a"), "a");
+}
+
+/// The name of the workspace whose id is `id`.
+fn listed_name(home: &Path, id: &str) -> String {
+    workspaces(home)
+        .into_iter()
+        .find(|r| r["id"] == id)
+        .map(|r| r["name"].as_str().unwrap().to_string())
+        .unwrap()
 }

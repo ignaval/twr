@@ -387,6 +387,8 @@ pub struct ViewState {
     pub ws_wheeled: bool,
     /// The new-workspace dialog, while open: the name typed so far.
     pub new_ws: Option<String>,
+    /// The workspace menu, open ([`crate::wsmenu`]).
+    pub ws_menu: Option<crate::wsmenu::WsMenu>,
     /// The settings overlay, while open ([`crate::settings`]).
     pub settings: Option<crate::settings::Settings>,
     /// The loop settings editor, while open ([`crate::loops`]): over the settings overlay
@@ -1542,6 +1544,28 @@ pub enum Action {
         name: String,
         /// Create it first (`/ws` with a new name, once confirmed).
         create: bool,
+    },
+    /// Rename workspace `id` to `to` (the workspace menu, [`crate::wsmenu`]).
+    WsRename {
+        id: String,
+        to: String,
+    },
+    /// Make workspace `id` the default (the workspace menu).
+    WsDefault {
+        id: String,
+    },
+    /// Find out what deleting workspace `id` would do ([`crate::RemovalPlan`]), for the
+    /// workspace menu to show before it asks.
+    WsPlan {
+        id: String,
+    },
+    /// Delete workspace `id`, once the user confirmed what the plan said: stopping its hub
+    /// first when `stop_hub`; with `via`, the TUI switches to that workspace first (it is
+    /// deleting the one it shows).
+    WsRemove {
+        id: String,
+        stop_hub: bool,
+        via: Option<String>,
     },
 }
 
@@ -5874,6 +5898,9 @@ impl AppState {
             Slash::Ws(None) => self.view.status = Some(self.workspaces_line()),
             Slash::Ws(Some(name)) => return (self.switch_workspace(&name), true),
             Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
+            Slash::WsMenu(name) => return (self.open_ws_menu(name.as_deref()), true),
+            Slash::WsRename(name, to) => return (self.ws_rename_cmd(name.as_deref(), &to), true),
+            Slash::WsRm(name) => return (self.ws_rm_cmd(&name), true),
             Slash::Settings => return (self.open_settings(), true),
             Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
             Slash::Review {
@@ -6443,6 +6470,9 @@ impl AppState {
         // [`crate::settings`]).
         if self.view.new_ws.is_some() {
             return self.new_ws_key(key);
+        }
+        if self.view.ws_menu.is_some() {
+            return self.ws_menu_key(key);
         }
         // The loop settings editor, over the settings when their Loops row opened it.
         if self.view.loop_editor.is_some() {
@@ -8991,6 +9021,7 @@ impl AppState {
             || self.view.settings.is_some()
             || self.view.loop_editor.is_some()
             || self.view.new_ws.is_some()
+            || self.view.ws_menu.is_some()
         {
             match ev.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -9008,10 +9039,20 @@ impl AppState {
                     match (click, target) {
                         // A workspace's card in the docked sidebar, which it does not cover,
                         // switches as a tab does; the sidebar's other controls wait.
-                        (_, Some(Target::Workspace(name))) => {
+                        // (Not under the workspace menu, which is about one of them.)
+                        (_, Some(Target::Workspace(name))) if self.view.ws_menu.is_none() => {
                             return self.ws_activate(WsRow::Workspace(name));
                         }
-                        (_, Some(Target::NewWorkspace | Target::Settings | Target::WsSidebar)) => {}
+                        (
+                            _,
+                            Some(
+                                Target::Workspace(_)
+                                | Target::WsMenu(_)
+                                | Target::NewWorkspace
+                                | Target::Settings
+                                | Target::WsSidebar,
+                            ),
+                        ) => {}
                         (_, Some(t)) => return self.tap(t),
                         (_, None) => {}
                     }
@@ -9045,6 +9086,9 @@ impl AppState {
                     }
                     if self.view.settings.is_some() {
                         return self.settings_key(arrow);
+                    }
+                    if self.view.ws_menu.is_some() {
+                        return self.ws_menu_wheel(ev.kind == MouseEventKind::ScrollUp);
                     }
                 }
                 _ => {}
@@ -9287,6 +9331,8 @@ impl AppState {
                 }
                 self.view.ws_sel = Some(WsRow::Workspace(name));
             }
+            Target::WsMenu(id) => return self.open_ws_menu(Some(&id)),
+            Target::WsChoice(choice) => return self.tap_ws_choice(choice),
             Target::NewWorkspace => return self.ws_activate(WsRow::New),
             Target::Settings => return self.ws_activate(WsRow::Settings),
             Target::WsSidebar => return self.toggle_workspaces(),
@@ -9386,6 +9432,7 @@ impl AppState {
         if self.view.loop_editor.take().is_some()
             || self.view.new_ws.take().is_some()
             || self.view.settings.take().is_some()
+            || self.view.ws_menu.take().is_some()
         {
             return Vec::new();
         }
@@ -9958,6 +10005,10 @@ impl AppState {
         }
         self.view.selection = None;
         // The new-workspace dialog takes it as typed (its first line), never the input line.
+        if self.view.ws_menu.is_some() {
+            self.ws_menu_paste(text);
+            return;
+        }
         if self.view.new_ws.is_some() {
             self.paste_new_ws(text);
             return;

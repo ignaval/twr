@@ -44,6 +44,17 @@ impl Hub {
     /// The daemon claims its data before binding, so workspace operations can see a
     /// startup even before its socket appears. In-process callers use `open` as before.
     pub(crate) async fn open_locked(mut opts: HubOptions, lock: File) -> anyhow::Result<Hub> {
+        // Under the lock, which `twr ws rm` holds as it marks the workspace removed: one that
+        // was is not opened (and so not made again).
+        if let Some(marker) = &opts.removed_marker {
+            if std::fs::symlink_metadata(marker).is_ok() {
+                anyhow::bail!(
+                    "workspace {} was removed: `twr ws new {}` makes it again",
+                    twr_core::paths::DEFAULT_WORKSPACE,
+                    twr_core::paths::DEFAULT_WORKSPACE
+                );
+            }
+        }
         checked_config(&mut opts.config)?;
         // MCP config files of orchestrators that outlived a previous hub (dead tokens).
         orch::remove_stale_mcp_files(&data_dir_of(&opts.db_path));
@@ -186,6 +197,7 @@ impl Hub {
             db_path: opts.db_path,
             instance_name: opts.instance_name,
             workspace: opts.workspace,
+            workspace_name_file: opts.workspace_name_file,
             workspaces_root: opts.workspaces_root,
             stop_timeout: opts.stop_timeout,
             hello_timeout: opts.hello_timeout,
@@ -1369,6 +1381,35 @@ fn locks_path(file: &File, path: &Path) -> bool {
 mod tests {
     use super::super::STOP_TIMEOUT;
     use super::*;
+
+    /// A hub does not open the root slot once `twr ws rm` marked it removed (checked under
+    /// its lock, which the removal holds as it marks it): nothing of it is made again. Its
+    /// name is read as it is asked, so a rename shows without a restart.
+    #[tokio::test]
+    async fn a_removed_workspace_is_not_opened_and_a_rename_shows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("twr.db");
+        let marker = tmp.path().join(twr_core::workspaces::REMOVED_FILE);
+        std::fs::write(&marker, "removed\n").unwrap();
+        let mut opts = HubOptions::new(&db, twr_core::config::Config::default());
+        opts.removed_marker = Some(marker.clone());
+        let e = Hub::open(opts).await.err().expect("refused").to_string();
+        assert!(e.contains("was removed"), "{e}");
+        assert!(!db.exists());
+        std::fs::remove_file(&marker).unwrap();
+        let name = tmp.path().join(twr_core::workspaces::NAME_FILE);
+        let mut opts = HubOptions::new(&db, twr_core::config::Config::default());
+        opts.removed_marker = Some(marker);
+        opts.workspace_name_file = Some(name.clone());
+        let hub = Hub::open(opts).await.unwrap();
+        assert_eq!(hub.workspace(), "default");
+        assert_eq!(hub.workspace_name(), "default");
+        std::fs::write(&name, "main\n").unwrap();
+        assert_eq!(hub.workspace(), "default");
+        assert_eq!(hub.workspace_name(), "main");
+        assert_eq!(hub.info()["workspace_name"], "main");
+        hub.shutdown().await;
+    }
 
     /// A lock on a data directory's lock file that was moved away (by `twr ws rm`) after it
     /// was opened guards nothing: it does not count.

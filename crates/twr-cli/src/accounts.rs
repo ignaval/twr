@@ -2133,12 +2133,10 @@ const OTHER_HUB_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// between the question and the deletion.)
 async fn refuse_other_workspaces(paths: &Paths, dir: &Path, doing: &str) -> anyhow::Result<()> {
     let root = paths.root();
-    let here = paths.workspace_name();
-    let mut names = vec![super::DEFAULT_WORKSPACE.to_string()];
-    names.extend(
-        root.named_workspaces()
-            .with_context(|| format!("{doing}: listing {}", root.workspaces_dir().display()))?,
-    );
+    let here = paths.workspace_id();
+    let mut names = root
+        .workspace_ids()
+        .with_context(|| format!("{doing}: listing {}", root.workspaces_dir().display()))?;
     names.retain(|w| w != here);
     if names.is_empty() {
         return Ok(());

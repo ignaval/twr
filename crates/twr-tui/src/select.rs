@@ -100,6 +100,12 @@ pub enum Target {
     /// A workspace's card in the sidebar, its drawer or the compact layout's Threads screen
     /// (every row of the card, its threads' rows included): switches to it, as its tab does.
     Workspace(String),
+    /// The `⋯` on a workspace's card, by its id (its name row's end; on a phone the entry's
+    /// two rows there): opens its workspace menu ([`crate::wsmenu`]).
+    WsMenu(String),
+    /// A choice of the workspace menu ([`crate::wsmenu`]): a tap runs it (Delete only once a
+    /// tap highlighted it).
+    WsChoice(crate::wsmenu::Choice),
     /// `↑ more` or `↓ more` where the sidebar or the compact Threads screen cut workspaces
     /// (the whole row): brings this one, the nearest cut, into view.
     WsMore(String),
@@ -319,6 +325,8 @@ pub struct Panes {
     /// The workspace list's furthest scroll as drawn (its rows past its height), and the row
     /// it showed first ([`crate::sidebar::render_list`]): the wheel scrolls from there.
     pub ws_max: usize,
+    /// The most the workspace menu's text scrolls, as drawn ([`crate::wsmenu`]).
+    pub ws_menu_scroll: usize,
     pub ws_start: usize,
     /// The cards (or the grid's tiles) as drawn ([`ListWindow`]).
     pub list: Option<ListWindow>,

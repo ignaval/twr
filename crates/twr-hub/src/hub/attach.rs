@@ -339,13 +339,16 @@ impl Core {
         grant
             .env
             .insert(AGENT_ENV.to_string(), json!(format!("{id}:attach.{lease}")));
-        // An agent's own `twr` calls from the attached CLI reach this hub's workspace (`null`
-        // removes a `TWR_WORKSPACE` the client has for `default`). A remote box's CLI runs
-        // there, not under the local `ssh`.
+        // An agent's own `twr` calls from the attached CLI reach this hub's workspace, by its
+        // id (`default` for the root slot too): whatever it is renamed to, and whichever
+        // workspace is the default. A remote box's CLI runs there, not under the local `ssh`.
         if grant.box_name.is_none() {
             grant.env.insert(
                 twr_core::paths::WORKSPACE_ENV.to_string(),
-                json!(hub.workspace),
+                json!(hub
+                    .workspace
+                    .as_deref()
+                    .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE)),
             );
         }
         self.rt(id).attach = Some(AttachLease {

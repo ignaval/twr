@@ -316,9 +316,18 @@ pub struct HubOptions {
     pub config: Config,
     /// Instance label reported to clients (the CLI uses the `TWR_HOME` directory name).
     pub instance_name: String,
-    /// The named workspace this hub serves (`None`: `default`): reports name it in their
-    /// `twr -w <workspace> attach` command, and an attached CLI gets it as `TWR_WORKSPACE`.
+    /// The id of the named workspace this hub serves (`None`: the root slot, `default`):
+    /// reports name it in their `twr -w <workspace> attach` command, and an attached CLI gets
+    /// it as `TWR_WORKSPACE`. A rename leaves it ([`twr_core::workspaces`]).
     pub workspace: Option<String>,
+    /// The file that holds the workspace's name once it was renamed
+    /// ([`twr_core::workspaces::NAME_FILE`]): read each time the hub says its name, so a
+    /// rename shows without a restart. `None`: its name is its id.
+    pub workspace_name_file: Option<PathBuf>,
+    /// The file that says the root slot's workspace was removed
+    /// ([`twr_core::workspaces::REMOVED_FILE`]): a hub refuses to open there once it has its
+    /// lock, so one that started as `twr ws rm` removed it does not make it again.
+    pub removed_marker: Option<PathBuf>,
     /// The data directory of the root the hub's workspace is in (the `default` workspace's):
     /// a local thread is never started in another workspace's worktrees
     /// (`<root>/worktrees`, `<root>/workspaces/<name>/worktrees`), which that workspace's hub
@@ -574,6 +583,8 @@ impl HubOptions {
             config,
             instance_name: "default".into(),
             workspace: None,
+            workspace_name_file: None,
+            removed_marker: None,
             workspaces_root: None,
             worktree_namespace: None,
             broadcast_capacity: 1024,
@@ -883,6 +894,8 @@ struct Inner {
     instance_name: String,
     /// [`HubOptions::workspace`].
     workspace: Option<String>,
+    /// [`HubOptions::workspace_name_file`].
+    workspace_name_file: Option<PathBuf>,
     /// [`HubOptions::workspaces_root`].
     workspaces_root: Option<PathBuf>,
     stop_timeout: Duration,
@@ -1001,6 +1014,20 @@ struct Inner {
 }
 
 impl Inner {
+    /// [`Hub::workspace_name`].
+    fn workspace_name(&self) -> String {
+        let id = self
+            .workspace
+            .as_deref()
+            .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE);
+        self.workspace_name_file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
+            .filter(|n| twr_core::paths::workspace_name_error(n).is_none())
+            .unwrap_or_else(|| id.to_string())
+    }
+
     fn core(&self) -> MutexGuard<'_, Core> {
         self.core.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -2993,12 +3020,19 @@ impl Hub {
         view
     }
 
-    /// The workspace this hub serves ([`HubOptions::workspace`]; `default` for none).
+    /// The id of the workspace this hub serves ([`HubOptions::workspace`]; `default` for
+    /// none).
     pub fn workspace(&self) -> &str {
         self.inner
             .workspace
             .as_deref()
             .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE)
+    }
+
+    /// The name of the workspace this hub serves, as it is now
+    /// ([`HubOptions::workspace_name_file`]), else its id.
+    pub fn workspace_name(&self) -> String {
+        self.inner.workspace_name()
     }
 
     /// `hub.info` as a user sees it ([`Hub::info_for`]).
@@ -3041,6 +3075,7 @@ impl Hub {
             "db": self.inner.db_path,
             "instance": self.inner.instance_name,
             "workspace": self.workspace(),
+            "workspace_name": self.workspace_name(),
             "started_at": self.inner.started_at,
             "threads": core.registry.len(),
             "control_head": core.gseq,

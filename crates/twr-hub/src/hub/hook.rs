@@ -280,10 +280,8 @@ pub(super) fn message(
 /// `cancelled` (the hub stops); its process group is ended in every case ([`run`]).
 async fn deliver(hub: Arc<Inner>, due: Vec<Candidate>, cancelled: watch::Receiver<bool>) {
     let cfg = &hub.config.notify;
-    let workspace = hub
-        .workspace
-        .clone()
-        .unwrap_or_else(|| twr_core::paths::DEFAULT_WORKSPACE.to_string());
+    // As the user sees it now: a rename shows without a restart.
+    let workspace = hub.workspace_name();
     let Some((title, body, input)) = message(due, cfg.detail, &workspace) else {
         return;
     };

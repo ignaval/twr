@@ -61,6 +61,7 @@ pub mod trace;
 pub mod upload;
 pub mod usage;
 pub mod work;
+pub mod workspaces;
 
 /// twr's version: the package version, plus `+dev.<build>` for a build made from a checkout by
 /// `docs/tools/dev-install.sh`, which sets `TWR_BUILD` (the commit, `.dirty` with uncommitted

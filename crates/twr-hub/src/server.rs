@@ -2723,7 +2723,7 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
         conn.client = format!("device:{}", device.id);
         conn.device = Some(device);
         return Ok(
-            json!({"client":conn.client,"identity":format!("user:{}",conn.client),"workspace":hub.workspace()}),
+            json!({"client":conn.client,"identity":format!("user:{}",conn.client),"workspace":hub.workspace(),"workspace_name":hub.workspace_name()}),
         );
     }
     if conn.device.is_some() {
@@ -2788,7 +2788,7 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = Some(token);
             Ok(
-                json!({ "client": conn.client, "identity": "orchestrator", "workspace": hub.workspace() }),
+                json!({ "client": conn.client, "identity": "orchestrator", "workspace": hub.workspace(), "workspace_name": hub.workspace_name() }),
             )
         }
         // Once a connection presented a token it stays the orchestrator's (or nobody's, when
@@ -2812,7 +2812,12 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = None;
             let identity = conn.identity(&Caller::user(conn.client.clone()));
-            let mut out = json!({ "client": conn.client, "identity": identity, "workspace": hub.workspace() });
+            let mut out = json!({
+                "client": conn.client,
+                "identity": identity,
+                "workspace": hub.workspace(),
+                "workspace_name": hub.workspace_name(),
+            });
             if let Some(why) = conn.why() {
                 out["why"] = json!(why);
             }

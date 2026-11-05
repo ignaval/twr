@@ -403,7 +403,7 @@ pub async fn open(
         &mut stream,
         &crate::service::Request::Open {
             name: name.into(),
-            workspace: paths.workspace_name().into(),
+            workspace: paths.workspace_id().into(),
             executable: executable.into(),
             replace,
         },

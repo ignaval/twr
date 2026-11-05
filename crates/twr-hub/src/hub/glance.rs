@@ -33,6 +33,7 @@ impl Hub {
     /// workspace's card.
     pub fn glance(&self) -> Result<Value, RpcError> {
         let workspace = self.workspace().to_string();
+        let workspace_name = self.workspace_name();
         let core = self.inner.core();
         let orch = core.orch.thread.as_deref();
         let views = core.registry.list();
@@ -81,6 +82,7 @@ impl Hub {
         };
         Ok(json!({
             "workspace": workspace,
+            "workspace_name": workspace_name,
             "threads": workers.len(),
             "running": running,
             "permissions": of(AttentionReason::Permission),
