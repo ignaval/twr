@@ -1906,6 +1906,9 @@ fn removing_the_default_and_the_last_workspace() {
         .unwrap();
     let info: Value = serde_json::from_str(&ok(home, &["-w", "z", "info", "--json"])).unwrap();
     assert_eq!(info["workspace"], "z");
+    // A socket given explicitly needs no default workspace.
+    let z_sock = Paths::with_home(home).workspace("z").unwrap().socket;
+    ok(home, &["--socket", z_sock.to_str().unwrap(), "info"]);
     let pid = info["pid"].as_u64().unwrap().to_string();
     assert!(Command::new("kill")
         .args(["-TERM", &pid])

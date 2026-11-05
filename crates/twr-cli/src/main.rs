@@ -2204,7 +2204,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         cmd => Cli { cmd, ..cli },
     };
-    if !paths.exists() {
+    // (A socket given explicitly is that hub's, whichever workspace: none need be the
+    // default.)
+    if !paths.exists() && !(cli.socket.is_some() && !selected) {
         if !selected {
             bail!("{}", no_default_why(&paths.root()));
         }
@@ -9117,9 +9119,12 @@ async fn remove_workspace(
     if generation.is_some_and(|g| workspace_generation(&ws).as_deref() != Some(g)) {
         bail!(replaced_why(&name));
     }
-    let (threads, conversation) = ws_threads(&ws)?;
+    let (threads, conversation, unfinished) = ws_threads(&ws)?;
     if let Some(why) = removal_refusal(&name, &threads, trash_items(&ws)?) {
         bail!(why);
+    }
+    if unfinished {
+        bail!(unfinished_why(&name));
     }
     let notes = memory_notes(&ws);
     let (removed, kept, after) = removal_notes(&root, &ws, notes, config.as_ref());
@@ -9240,27 +9245,44 @@ fn stop_workspace_lock(ws: &Paths) -> anyhow::Result<StopWorkspaceLock> {
 }
 
 /// The names of the worker threads in the stopped workspace's log (deleted ones are gone; the
-/// orchestrator does not count), and the orchestrator threads' conversation: how many there
-/// are (one per runtime it ran on) and their turns in all.
-fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64))> {
+/// orchestrator does not count), the orchestrator threads' conversation: how many there are
+/// (one per runtime it ran on) and their turns in all, and whether it shows orchestrator work
+/// that never ended: a turn left open, or a task, a job or a `!` command still recorded
+/// running. Its hub stopped without ending it (a crash, say), so its processes may still run:
+/// the next hub of the workspace finds and ends them.
+fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64), bool)> {
     let db = ws.db_file();
     if !db.exists() {
-        return Ok((Vec::new(), (0, 0)));
+        return Ok((Vec::new(), (0, 0), false));
     }
     let store = twr_hub::store::Store::open(&db)?;
     let events = store.load_all()?;
     let registry = twr_core::reduce::Registry::from_events(&events);
-    let (orchestrators, workers): (Vec<_>, Vec<_>) = registry
-        .list()
-        .into_iter()
-        .partition(|t| t.is_orchestrator());
+    let views = registry.list();
+    let unfinished = views.iter().any(|t| {
+        t.is_orchestrator() && (t.current_turn.is_some() || !t.background_tasks.is_empty())
+    });
+    let (orchestrators, workers): (Vec<_>, Vec<_>) =
+        views.into_iter().partition(|t| t.is_orchestrator());
     Ok((
         workers.into_iter().map(|t| t.name.clone()).collect(),
         (
             orchestrators.len(),
             orchestrators.iter().map(|t| t.turns).sum(),
         ),
+        unfinished,
     ))
+}
+
+/// Why workspace `name` can't be removed while its log shows orchestrator work that never
+/// ended ([`ws_threads`]), and how to end it.
+fn unfinished_why(name: &str) -> String {
+    format!(
+        "the log of workspace {name} shows its orchestrator's work that never ended (its hub \
+         stopped without ending it, a crash say), whose processes may still run: start its hub \
+         (`twr -w {name} thread list`), which finds and ends them, then stop it (`twr -w {name} \
+         hub stop`) and remove the workspace"
+    )
 }
 
 /// What `twr ws rm` removes with a workspace's data directory, for its question.
@@ -9663,6 +9685,15 @@ async fn removal_plan(
     config: &Config,
 ) -> anyhow::Result<twr_tui::RemovalPlan> {
     refuse_agent()?;
+    plan_removal_of(root, id, config).await
+}
+
+/// [`removal_plan`], for whoever asks.
+async fn plan_removal_of(
+    root: &Paths,
+    id: &str,
+    config: &Config,
+) -> anyhow::Result<twr_tui::RemovalPlan> {
     let ws = root.workspace(id)?;
     if !ws.exists() {
         bail!("there is no workspace {id} any more");
@@ -9730,11 +9761,15 @@ async fn removal_plan(
             (workers, items, true)
         }
         Probe::Absent => {
-            let ws = ws.clone();
-            tokio::task::spawn_blocking(move || {
-                anyhow::Ok((ws_threads(&ws)?.0, trash_items(&ws)?, false))
+            let ws2 = ws.clone();
+            let ((threads, _, unfinished), trash) = tokio::task::spawn_blocking(move || {
+                anyhow::Ok((ws_threads(&ws2)?, trash_items(&ws2)?))
             })
-            .await??
+            .await??;
+            if unfinished && threads.is_empty() && trash == 0 {
+                return refused(unfinished_why(&name));
+            }
+            (threads, trash, false)
         }
     };
     if let Some(why) = removal_refusal(&name, &threads, trash) {
@@ -10233,6 +10268,64 @@ mod tests {
         let mut yes = |_: &str| Ok("Y\n".to_string());
         ws_rm(&paths, "a", Consent::Ask(&mut yes)).await.unwrap();
         assert!(!ws.data_dir.exists());
+    }
+
+    /// A stopped workspace whose log shows its orchestrator's work that never ended (its hub
+    /// went without ending it, as a crash leaves it) is kept: its processes may still run,
+    /// and its next hub ends them. Ended, it is removed.
+    #[tokio::test]
+    async fn a_stopped_workspace_with_unfinished_orchestrator_work_is_kept() {
+        use twr_core::event::{EventBody, Source, TaskUpdated, ThreadCreated};
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        let mut ext = serde_json::Map::new();
+        ext.insert("twr".into(), serde_json::json!({"role": "orchestrator"}));
+        let task = |running| {
+            EventBody::TaskUpdated(TaskUpdated {
+                task_id: "sh1".into(),
+                running,
+                description: "cargo test".into(),
+                ..Default::default()
+            })
+        };
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            let created = EventBody::ThreadCreated(ThreadCreated {
+                name: "orchestrator".into(),
+                box_name: "local".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ext: Some(ext),
+                ..Default::default()
+            });
+            hub.append("o", None, Source::User("t".into()), created, None)
+                .unwrap();
+            hub.append("o", None, Source::Adapter("fake".into()), task(true), None)
+                .unwrap();
+        }
+        let e = remove_workspace(&root, "a", None, Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("never ended"), "{e:#}");
+        assert!(a.data_dir.is_dir());
+        let plan = plan_removal_of(&root, "a", &Config::default())
+            .await
+            .unwrap();
+        assert!(plan.refused.unwrap().contains("never ended"));
+        {
+            let hub = twr_hub::Hub::open(twr_hub::HubOptions::new(a.db_file(), Config::default()))
+                .await
+                .unwrap();
+            hub.append("o", None, Source::Adapter("fake".into()), task(false), None)
+                .unwrap();
+        }
+        remove_workspace(&root, "a", None, Consent::Yes)
+            .await
+            .unwrap();
+        assert!(!a.data_dir.exists());
     }
 
     /// A plan's generation names the workspace it saw: one removed and made again with the
