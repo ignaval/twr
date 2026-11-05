@@ -1,9 +1,10 @@
-"""A scripted ACP worker for docs/tools/make-demo.sh.
+"""A scripted ACP worker for docs/tools/make-demo.sh and make-conversation.sh.
 
 It speaks the Agent Client Protocol on stdio and plays the script whose keyword is in the
 prompt: replies, tool calls, files it really writes and commits in its working directory,
 and permission requests that twr turns into cards. A `gate` step waits until the demo driver
 creates a file of that name in the gate directory (argv[1]), so the driver sets the pace.
+With --no-push after it, the invoice thread runs its tests where it would ask to push.
 """
 
 import json
@@ -13,8 +14,22 @@ import sys
 import time
 
 GATES = sys.argv[1]
+PUSH = sys.argv[2:3] != ["--no-push"]
 
 SCRIPTS = {
+    # The follow-up that make-conversation.sh has the orchestrator send to ratelimit.
+    "signup": [
+        ["text", "Reusing LoginLimiter for POST /signup."],
+        ["tool", "Read src/routes/signup.rs", "read"],
+        ["write", "src/routes/signup.rs", "// LoginLimiter guards POST /signup too\n"],
+        ["tool", "Edit src/routes/signup.rs", "edit"],
+        ["write", "tests/signup_rate_limit.rs", "// the sixth signup from one IP in a minute gets 429\n"],
+        ["commit", "Rate limit POST /signup per client IP"],
+        ["tool", "cargo test -p api", "execute"],
+        ["sleep", 1.0],
+        ["text", "POST /signup now shares the login limiter: 5 attempts a minute per IP, then 429. "
+                 "All 33 api tests pass."],
+    ],
     "rate limit": [
         ["text", "Adding a per-IP limit to POST /login. First, how a request reaches the handler."],
         ["tool", "Read src/routes/login.rs", "read"],
@@ -40,11 +55,17 @@ SCRIPTS = {
         ["tool", "Edit src/invoice/totals.rs", "edit"],
         ["commit", "Round tax once on the invoice total"],
         ["gate", "rounding-perm"],
+    ] + ([
         ["perm", "git push -u origin twr/invoice-rounding", "execute"],
         ["sleep", 0.6],
         ["text", "Tax is now rounded once on the invoice total instead of per line. "
                  "The 12 invoice tests pass and the branch is pushed."],
-    ],
+    ] if PUSH else [
+        ["tool", "cargo test -p billing invoice", "execute"],
+        ["sleep", 0.6],
+        ["text", "Tax is now rounded once on the invoice total instead of per line. "
+                 "The 12 invoice tests pass."],
+    ]),
     "changelog": [
         ["tool", "git log v0.4.0..HEAD --oneline", "execute"],
         ["write", "CHANGELOG.md", "## 0.5.0\n"],

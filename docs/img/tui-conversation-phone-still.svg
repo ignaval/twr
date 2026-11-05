@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="414.4" height="676" viewBox="0 0 414.4 676" role="img" aria-label="The same conversation in twr&#x27;s compact phone layout, 46 columns wide">
+<title>The same conversation in twr&#x27;s compact phone layout, 46 columns wide</title>
+<style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<rect x="14" y="14" width="117.6" height="18" fill="#c9d1d9"/>
+<rect x="140" y="14" width="126" height="18" fill="#444444"/>
+<rect x="274.4" y="14" width="92.4" height="18" fill="#444444"/>
+<rect x="14" y="32" width="117.6" height="18" fill="#c9d1d9"/>
+<rect x="140" y="32" width="126" height="18" fill="#444444"/>
+<rect x="14" y="50" width="344.4" height="18" fill="#5fd7d7"/>
+<rect x="14" y="104" width="142.8" height="18" fill="#3a3a3a"/>
+<rect x="14" y="374" width="352.8" height="18" fill="#3a3a3a"/>
+<rect x="14" y="392" width="92.4" height="18" fill="#3a3a3a"/>
+<rect x="22.4" y="590" width="134.4" height="18" fill="#5fd7d7"/>
+<path d="M18.2 599H22.4M266 599H396.2M18.2 635H396.2M18.2 599V635M396.2 599V635" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<text x="56" y="27.5" fill="#0d1117" class="b" textLength="33.6">Chat</text>
+<text x="165.2" y="27.5" fill="#d0d0d0" textLength="75.6">Needs you</text>
+<text x="308" y="27.5" fill="#d0d0d0" textLength="58.8">Threads</text>
+<text x="22.4" y="63.5" fill="#000000" class="b" textLength="184.8">[default] ORCHESTRATOR</text>
+<text x="224" y="63.5" fill="#000000" textLength="134.4">acp · scripted-1</text>
+<text x="30.8" y="81.5" fill="#6e7681" textLength="92.4">test -p api</text>
+<text x="14" y="117.5" fill="#949494">❯</text>
+<text x="30.8" y="117.5" fill="#ffffff" textLength="126">allow ratelimit</text>
+<text x="14" y="153.5" fill="#6e7681" textLength="84">· Applied:</text>
+<text x="106.4" y="153.5" fill="#0087af" textLength="75.6">ratelimit</text>
+<text x="182" y="153.5" fill="#6e7681" textLength="67.2">: allow.</text>
+<text x="14" y="189.5" fill="#3fb950">●</text>
+<text x="30.8" y="189.5" fill="#0087af" class="b" textLength="75.6">ratelimit</text>
+<text x="114.8" y="189.5" fill="#6e7681" textLength="151.2">finished · success</text>
+<text x="30.8" y="207.5" fill="#c9d1d9" textLength="336">Added a per-IP limiter to POST /login: 5</text>
+<text x="30.8" y="225.5" fill="#c9d1d9" textLength="268.8">attempts a minute, then 429 with</text>
+<text x="30.8" y="243.5" fill="#c9d1d9" textLength="294">Retry-After. All 31 api tests pass,</text>
+<text x="30.8" y="261.5" fill="#c9d1d9" textLength="184.8">including the new one.</text>
+<text x="14" y="297.5" fill="#3fb950">●</text>
+<text x="30.8" y="297.5" fill="#ff00ff" class="b" textLength="134.4">invoice-rounding</text>
+<text x="173.6" y="297.5" fill="#6e7681" textLength="151.2">finished · success</text>
+<text x="30.8" y="315.5" fill="#c9d1d9" textLength="369.6">Tax is now rounded once on the invoice total</text>
+<text x="30.8" y="333.5" fill="#c9d1d9" textLength="344.4">instead of per line. The 12 invoice tests</text>
+<text x="30.8" y="351.5" fill="#c9d1d9" textLength="42">pass.</text>
+<text x="14" y="387.5" fill="#949494">❯</text>
+<text x="30.8" y="387.5" fill="#ffffff" textLength="336">Tell ratelimit to cover POST /signup the</text>
+<text x="30.8" y="405.5" fill="#ffffff" textLength="75.6">same way.</text>
+<text x="30.8" y="441.5" fill="#949494" textLength="50.4">Called</text>
+<text x="89.6" y="441.5" fill="#949494" class="b">1</text>
+<text x="106.4" y="441.5" fill="#949494" textLength="33.6">tool</text>
+<text x="148.4" y="441.5" fill="#6e7681" textLength="151.2">(ctrl+o to expand)</text>
+<text x="14" y="477.5" fill="#c9d1d9" textLength="369.6">● Sent to ratelimit. I'll tell you when it's</text>
+<text x="30.8" y="495.5" fill="#c9d1d9" textLength="42">done.</text>
+<text x="14" y="531.5" fill="#3fb950">●</text>
+<text x="30.8" y="531.5" fill="#0087af" class="b" textLength="75.6">ratelimit</text>
+<text x="114.8" y="531.5" fill="#6e7681" textLength="151.2">finished · success</text>
+<text x="30.8" y="549.5" fill="#c9d1d9" textLength="369.6">POST /signup now shares the login limiter: 5</text>
+<text x="30.8" y="567.5" fill="#c9d1d9" textLength="352.8">attempts a minute per IP, then 429. All 33</text>
+<text x="30.8" y="585.5" fill="#c9d1d9" textLength="126">api tests pass.</text>
+<text x="30.8" y="603.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
+<text x="165.2" y="603.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
+<text x="22.4" y="621.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
+<text x="14" y="657.5" fill="#6e7681" textLength="386.4">Enter send · Ctrl-J new line · Enter on an emp</text>
+</svg>
