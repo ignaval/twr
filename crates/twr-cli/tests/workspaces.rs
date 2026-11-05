@@ -2081,3 +2081,34 @@ fn listed_name(home: &Path, id: &str) -> String {
         .map(|r| r["name"].as_str().unwrap().to_string())
         .unwrap()
 }
+
+/// A hub that was starting as its workspace was removed (held at the start gate, after its
+/// checks, before it locks the data) does not make the workspace again: it fails, and the
+/// directory stays gone.
+#[test]
+fn a_hub_starting_as_its_workspace_is_removed_does_not_make_it_again() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    ok(home, &["ws", "new", "a"]);
+    let a = Paths::with_home(home).workspace("a").unwrap();
+    let gate = home.join("gate");
+    std::fs::write(&gate, "").unwrap();
+    let mut hub = HubProc(
+        command(home, &["-w", "a", "hub"])
+            .env("TWR_TEST_HUB_START_GATE", &gate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    poll("the hub at its start gate", || {
+        home.join("gate.reached").exists().then_some(())
+    });
+    assert!(ok(home, &["ws", "rm", "a", "--yes"]).starts_with("removed workspace a: "));
+    std::fs::remove_file(&gate).unwrap();
+    let status = poll("the hub to give up", || hub.0.try_wait().unwrap());
+    assert!(!status.success());
+    assert!(!a.data_dir.exists());
+    assert!(fails(home, &["-w", "a", "thread", "list"]).contains("there is no workspace a"));
+}

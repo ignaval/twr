@@ -328,6 +328,10 @@ pub struct HubOptions {
     /// ([`twr_core::workspaces::REMOVED_FILE`]): a hub refuses to open there once it has its
     /// lock, so one that started as `twr ws rm` removed it does not make it again.
     pub removed_marker: Option<PathBuf>,
+    /// The data directory must exist already (a named workspace's, which only `twr ws new`
+    /// makes): the hub never makes it, so one that starts as `twr ws rm` removes it does not
+    /// make it again. `false`: made when missing (the root's, on first use).
+    pub data_dir_must_exist: bool,
     /// The data directory of the root the hub's workspace is in (the `default` workspace's):
     /// a local thread is never started in another workspace's worktrees
     /// (`<root>/worktrees`, `<root>/workspaces/<name>/worktrees`), which that workspace's hub
@@ -585,6 +589,7 @@ impl HubOptions {
             workspace: None,
             workspace_name_file: None,
             removed_marker: None,
+            data_dir_must_exist: false,
             workspaces_root: None,
             worktree_namespace: None,
             broadcast_capacity: 1024,
@@ -3027,6 +3032,58 @@ impl Hub {
             .workspace
             .as_deref()
             .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE)
+    }
+
+    /// `hub.shutdown` with `if_idle` (the TUI's Delete of a workspace whose hub runs): starts
+    /// the shutdown only while nothing would be lost, checked and decided under the core
+    /// lock: no worker threads, an empty trash, an orchestrator that is not at work or waiting
+    /// on the user. From then on the hub refuses new work, as any shutting-down hub does, so
+    /// nothing can start between the check and the stop. `conflict` with why otherwise.
+    pub fn shutdown_if_idle(&self) -> Result<(), RpcError> {
+        use twr_core::proto::codes;
+        let trash = lifecycle::data_dir_of(&self.inner.db_path).join("trash");
+        let mut core = self.inner.core();
+        let views = core.registry.list();
+        let workers: Vec<&str> = views
+            .iter()
+            .filter(|v| !v.is_orchestrator())
+            .map(|v| v.name.as_str())
+            .collect();
+        if !workers.is_empty() {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                format!(
+                    "the workspace has threads now ({}): delete them first",
+                    workers.join(", ")
+                ),
+            ));
+        }
+        let busy = views.iter().any(|v| {
+            v.is_orchestrator()
+                && !v.retired
+                && matches!(
+                    v.status(),
+                    twr_core::reduce::ThreadStatus::Running
+                        | twr_core::reduce::ThreadStatus::Background
+                        | twr_core::reduce::ThreadStatus::Waiting
+                        | twr_core::reduce::ThreadStatus::Attached
+                )
+        });
+        if busy {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "its orchestrator is at work now: wait until it is done",
+            ));
+        }
+        let items = std::fs::read_dir(&trash).map_or(0, |d| d.count());
+        if items > 0 {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "its trash holds deleted threads: empty it first",
+            ));
+        }
+        core.shutting_down = true;
+        Ok(())
     }
 
     /// The name of the workspace this hub serves, as it is now

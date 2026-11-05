@@ -53,7 +53,7 @@ pub async fn run(mut opts: HubOptions, socket: PathBuf) -> anyhow::Result<()> {
             twr_core::build_id();
         });
     let boxes_lock = opts.boxes_lock.take();
-    let lock = hub::lock_data_dir(&opts.db_path, Some(&socket)).await?;
+    let lock = hub::lock_data_dir(&opts.db_path, Some(&socket), opts.data_dir_must_exist).await?;
     twr_core::trace::mark("hub: data directory locked");
     let runners = listener::RunnerListener::bind(&opts.config.hub).await?;
     let listener = server::bind(&socket).await?;

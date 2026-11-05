@@ -3116,7 +3116,23 @@ fn call(
             }
             Ok(info)
         }
-        "hub.shutdown" => Ok(json!({ "ok": true })),
+        "hub.shutdown" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ShutdownParams {
+                #[serde(default)]
+                if_idle: bool,
+            }
+            let p: ShutdownParams = if p.is_null() {
+                ShutdownParams::default()
+            } else {
+                params(p)?
+            };
+            if p.if_idle {
+                hub.shutdown_if_idle()?;
+            }
+            Ok(json!({ "ok": true, "if_idle": p.if_idle }))
+        }
         "config.show" => Ok(hub.config_show()),
         "thread.spawn" => {
             #[derive(Default, Deserialize)]

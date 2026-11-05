@@ -37,7 +37,7 @@ impl Hub {
     /// previous hub, and dispatches queued prompts. Must run inside a tokio runtime.
     pub async fn open(mut opts: HubOptions) -> anyhow::Result<Hub> {
         checked_config(&mut opts.config)?;
-        let lock = lock_data_dir(&opts.db_path, None).await?;
+        let lock = lock_data_dir(&opts.db_path, None, opts.data_dir_must_exist).await?;
         Self::open_locked(opts, lock).await
     }
 
@@ -1256,10 +1256,14 @@ impl Core {
 
 /// Takes the exclusive lock on `<data_dir>/twr.lock` (the directory of `db_path`), retrying a
 /// busy lock for up to [`LOCK_RETRY`].
-pub(crate) async fn lock_data_dir(db_path: &Path, socket: Option<&Path>) -> anyhow::Result<File> {
+pub(crate) async fn lock_data_dir(
+    db_path: &Path,
+    socket: Option<&Path>,
+    must_exist: bool,
+) -> anyhow::Result<File> {
     let deadline = tokio::time::Instant::now() + LOCK_RETRY;
     loop {
-        match try_lock_data_dir(db_path)? {
+        match try_lock_data_dir(db_path, must_exist)? {
             Some(f) => return Ok(f),
             None => {
                 // Preserve the immediate same-socket refusal while claiming the data
@@ -1337,10 +1341,18 @@ pub(super) fn data_dir_of(db_path: &Path) -> PathBuf {
 }
 
 /// One attempt at the data-directory lock: `None` when another open file holds it.
-fn try_lock_data_dir(db_path: &Path) -> anyhow::Result<Option<File>> {
+fn try_lock_data_dir(db_path: &Path, must_exist: bool) -> anyhow::Result<Option<File>> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = data_dir_of(db_path);
-    twr_core::paths::ensure_private_dir(&dir)?;
+    // A named workspace's directory is never made here ([`HubOptions::data_dir_must_exist`]):
+    // `twr ws rm` may have removed it since the hub was started.
+    if must_exist {
+        twr_core::paths::check_private_dir(&dir).map_err(|e| {
+            anyhow::anyhow!("{e:#}: the workspace was removed (`twr ws` lists them)")
+        })?;
+    } else {
+        twr_core::paths::ensure_private_dir(&dir)?;
+    }
     let path = dir.join(LOCK_FILE);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -1381,6 +1393,51 @@ fn locks_path(file: &File, path: &Path) -> bool {
 mod tests {
     use super::super::STOP_TIMEOUT;
     use super::*;
+
+    /// `hub.shutdown` with `if_idle` starts the shutdown only while nothing would be lost
+    /// (the TUI's Delete): refused with a worker thread or a trash item, and once it is idle
+    /// the hub refuses new work from then on, so nothing starts between the check and the
+    /// stop.
+    #[tokio::test]
+    async fn an_idle_shutdown_refuses_while_anything_would_be_lost() {
+        use twr_core::event::{EventBody, Source, ThreadCreated};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("twr.db");
+        let hub = Hub::open(HubOptions::new(&db, twr_core::config::Config::default()))
+            .await
+            .unwrap();
+        std::fs::create_dir_all(tmp.path().join("trash/item")).unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("trash"), "{}", e.message);
+        std::fs::remove_dir_all(tmp.path().join("trash")).unwrap();
+        hub.append(
+            "t1",
+            None,
+            Source::User("test".into()),
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "api".into(),
+                box_name: "local".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("threads now (api)"), "{}", e.message);
+        assert!(!hub.inner.core().shutting_down);
+        drop(hub);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("twr.db");
+        let hub = Hub::open(HubOptions::new(&db, twr_core::config::Config::default()))
+            .await
+            .unwrap();
+        hub.shutdown_if_idle().unwrap();
+        assert!(hub.inner.core().shutting_down);
+        hub.shutdown().await;
+    }
 
     /// A hub does not open the root slot once `twr ws rm` marked it removed (checked under
     /// its lock, which the removal holds as it marks it): nothing of it is made again. Its
@@ -1430,7 +1487,7 @@ mod tests {
         assert!(lock_opened(file, &path).unwrap().is_none());
         // The real thing takes the new one.
         let db = data.join("twr.db");
-        let lock = try_lock_data_dir(&db).unwrap().unwrap();
+        let lock = try_lock_data_dir(&db, false).unwrap().unwrap();
         assert!(locks_path(&lock, &path));
     }
 

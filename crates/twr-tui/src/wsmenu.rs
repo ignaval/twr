@@ -568,10 +568,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
             text.push(Line::default());
             continue;
         }
-        text.extend(crate::ui::wrap_line(
-            Line::from(Span::styled(format!(" {t}"), style)),
-            inner_w,
-        ));
+        // Every row of it a column in, wrapped ones too.
+        for mut l in crate::ui::wrap_line(
+            Line::from(Span::styled(t, style)),
+            inner_w.saturating_sub(1).max(1),
+        ) {
+            l.spans.insert(0, Span::raw(" "));
+            text.push(l);
+        }
     }
     // Its choices: a row each, a band on a phone.
     let tall = if phone {

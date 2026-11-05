@@ -3539,6 +3539,8 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     if paths.workspace.is_none() {
         opts.removed_marker = Some(paths.removed_marker());
     }
+    // A named workspace's directory is never made by its hub, `twr ws rm` may be removing it.
+    opts.data_dir_must_exist = paths.workspace.is_some();
     opts.workspaces_root = Some(paths.root().data_dir);
     // One pool of job slots for every workspace of this home.
     opts.job_slots_dir = Some(paths.root().data_dir.join("job-slots"));
@@ -9658,13 +9660,16 @@ async fn removal_plan(
                 check_workspace_name(&hello, &socket, id)?;
                 let threads = c.call("thread.list", Value::Null).await?;
                 let trash = c.call("trash.list", Value::Null).await?;
-                anyhow::Ok((threads, trash))
+                anyhow::Ok((hello, threads, trash))
             })
             .await;
-            let (threads, trash) = match asked {
+            let (hello, threads, trash) = match asked {
                 Ok(r) => r?,
                 Err(_) => return refused("its hub did not answer: try again in a moment".into()),
             };
+            if !stops_if_idle(&hello) {
+                return refused(older_hub_why(&name));
+            }
             let all = threads.as_array().cloned().unwrap_or_default();
             let busy = all.iter().any(|t| {
                 t["role"] == "orchestrator"
@@ -9716,18 +9721,41 @@ async fn removal_plan(
     })
 }
 
+/// Whether the hub that said `hello` stops only while nothing would be lost
+/// (`hub.shutdown` with `if_idle`): one that says its `workspace_name` does. An older one
+/// would take the parameter and stop whatever runs.
+fn stops_if_idle(hello: &Value) -> bool {
+    hello["workspace_name"].is_string()
+}
+
+/// Why the TUI can't stop workspace `name`'s hub for its removal: it is older than this twr.
+fn older_hub_why(name: &str) -> String {
+    format!(
+        "its hub is older than this twr and can't be stopped safely from here: stop it with \
+         `twr -w {name} hub stop`, then delete it"
+    )
+}
+
 /// Stops workspace `ws`'s hub on `socket` for its removal, quietly (no checkpoint for a log
-/// about to go, nothing printed over the TUI): asks it to shut down, then waits until no hub
-/// holds the workspace's lock. The removal checks again that none runs and nothing in it is
-/// lost.
+/// about to go, nothing printed over the TUI): asks it to shut down only while nothing would
+/// be lost ([`twr_hub::Hub::shutdown_if_idle`], which refuses new work from then on), then
+/// waits until no hub holds the workspace's lock. The removal checks threads and trash again
+/// under that lock.
 async fn stop_hub_for_removal(socket: &Path, ws: &Paths) -> anyhow::Result<()> {
     let id = ws.workspace_id().to_string();
     match Client::connect(socket).await {
         Ok(mut c) => {
             let hello = c.hello(json!({ "client": "cli" })).await?;
             check_workspace_name(&hello, socket, &id)?;
-            // It may close the connection as it goes.
-            let _ = c.call("hub.shutdown", Value::Null).await;
+            if !stops_if_idle(&hello) {
+                bail!(older_hub_why(&ws.display_name()));
+            }
+            match c.call("hub.shutdown", json!({ "if_idle": true })).await {
+                Ok(_) => {}
+                // It may close the connection as it goes; a refusal says why.
+                Err(e) if stop_connection_lost(&e) => {}
+                Err(e) => return Err(e.context("its hub did not stop")),
+            }
         }
         Err(e) if nothing_listens(&e) => {}
         Err(e) => return Err(e),
