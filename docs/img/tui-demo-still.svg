@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1103.2" height="604" viewBox="0 0 1103.2 604" role="img" aria-label="twr in use: the user asks the orchestrator for two threads, answers one permission in its card&#x27;s popup and one in the conversation, and opens a thread&#x27;s transcript">
+<title>twr in use: the user asks the orchestrator for two threads, answers one permission in its card&#x27;s popup and one in the conversation, and opens a thread&#x27;s transcript</title>
+<style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<rect x="358.4" y="14" width="260.4" height="18" fill="#5fd7d7"/>
+<rect x="30.8" y="32" width="260.4" height="18" fill="#c9d1d9"/>
+<rect x="291.2" y="32" width="25.2" height="18" fill="#d29922"/>
+<rect x="316.4" y="32" width="33.6" height="18" fill="#c9d1d9"/>
+<rect x="358.4" y="32" width="663.6" height="18" fill="#3a3a3a"/>
+<rect x="358.4" y="104" width="680.4" height="18" fill="#3a3a3a"/>
+<rect x="358.4" y="122" width="134.4" height="18" fill="#3a3a3a"/>
+<rect x="39.2" y="140" width="100.8" height="18" fill="#ff7b72"/>
+<rect x="375.2" y="284" width="100.8" height="18" fill="#ff7b72"/>
+<rect x="366.8" y="428" width="714" height="18" fill="#c9d1d9"/>
+<rect x="366.8" y="518" width="134.4" height="18" fill="#5fd7d7"/>
+<rect x="22.4" y="47.8" width="8.4" height="2.2" fill="#d7875f"/>
+<rect x="39.2" y="245.8" width="8.4" height="2.2" fill="#d7875f"/>
+<path d="M35 293H39.2M131.6 293H182M282.8 293H291.2M341.6 293H345.8M35 383H345.8M35 293V383M345.8 293V383" stroke="#0087af" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M362.6 275H366.8M518 275H1055.6M1080.8 275H1085M362.6 509H870.8M1080.8 509H1085M362.6 527H366.8M610.4 527H1085M362.6 563H1085M362.6 275V509M362.6 527V563M1085 275V509M1085 527V563" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M366.8 383H1080.8M354.2 14V590" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M35 221H39.2M131.6 221H182M282.8 221H291.2M341.6 221H345.8M35 275H345.8M35 221V275M345.8 221V275" stroke="#87af00" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M35 113H39.2M190.4 113H198.8M282.8 113H291.2M341.6 113H345.8M35 203H345.8M35 113V203M345.8 113V203" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
+<path d="M35 401H39.2M140 401H182M282.8 401H291.2M341.6 401H345.8M35 509H345.8M35 401V509M345.8 401V509" stroke="#ff00ff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M362.6 257H375.2M635.6 257H1085M362.6 257V266M1085 257V266" stroke="#ff87af" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<text x="22.4" y="27.5" fill="#6e7681" class="b" textLength="58.8">THREADS</text>
+<text x="333.2" y="27.5" fill="#6e7681">‹</text>
+<text x="366.8" y="27.5" fill="#000000" class="b" textLength="100.8">ORCHESTRATOR</text>
+<text x="484.4" y="27.5" fill="#000000" textLength="134.4">acp · scripted-1</text>
+<text x="14" y="45.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="45.5" fill="#0d1117" class="b" textLength="58.8">default</text>
+<text x="299.6" y="45.5" fill="#0d1117" class="b" textLength="42">⚠1 ●1</text>
+<text x="358.4" y="45.5" fill="#949494">❯</text>
+<text x="375.2" y="45.5" fill="#ffffff" textLength="646.8">Morning! I'm cutting the 0.5.0 release today. Tell me when a thread needs me.</text>
+<text x="14" y="63.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="63.5" fill="#d29922" class="b" textLength="201.6">working · waiting on you</text>
+<text x="14" y="81.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="81.5" fill="#6e7681" textLength="235.2">Started ratelimit on api and</text>
+<text x="358.4" y="81.5" fill="#c9d1d9" textLength="554.4">● Morning. I'll watch the threads and tell you when one needs you.</text>
+<text x="14" y="99.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="99.5" fill="#6e7681" textLength="285.6">invoice-rounding on billing. I'll…</text>
+<text x="14" y="117.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="117.5" fill="#ff87af" class="b" textLength="134.4">invoice-rounding</text>
+<text x="207.2" y="117.5" fill="#6e7681" textLength="67.2">scripte…</text>
+<text x="299.6" y="117.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="358.4" y="117.5" fill="#949494">❯</text>
+<text x="375.2" y="117.5" fill="#ffffff" textLength="663.6">Two things. On api, rate limit logins per IP. On billing, round tax once on the</text>
+<text x="14" y="135.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="135.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
+<text x="375.2" y="135.5" fill="#ffffff" textLength="117.6">invoice total.</text>
+<text x="14" y="153.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="153.5" fill="#1b1f24" class="b" textLength="84">PERMISSION</text>
+<text x="148.4" y="153.5" fill="#c9d1d9" textLength="193.2">Allow execute: git push</text>
+<text x="14" y="171.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="171.5" fill="#c9d1d9" textLength="252">-u origin twr/invoice-rounding</text>
+<text x="375.2" y="171.5" fill="#949494" textLength="50.4">Called</text>
+<text x="434" y="171.5" fill="#949494" class="b">2</text>
+<text x="450.8" y="171.5" fill="#949494" textLength="42">tools</text>
+<text x="501.2" y="171.5" fill="#6e7681" textLength="151.2">(ctrl+o to expand)</text>
+<text x="14" y="189.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="189.5" fill="#d29922" class="b">1</text>
+<text x="56" y="189.5" fill="#c9d1d9" textLength="42">allow</text>
+<text x="114.8" y="189.5" fill="#d29922" class="b">2</text>
+<text x="131.6" y="189.5" fill="#c9d1d9" textLength="33.6">deny</text>
+<text x="14" y="207.5" fill="#39c5cf">▌</text>
+<text x="358.4" y="207.5" fill="#c9d1d9" textLength="697.2">● Started ratelimit on api and invoice-rounding on billing. I'll tell you when they</text>
+<text x="14" y="225.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="225.5" fill="#87af00" class="b" textLength="75.6">ratelimit</text>
+<text x="190.4" y="225.5" fill="#6e7681" textLength="84">scripted-1</text>
+<text x="299.6" y="225.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="375.2" y="225.5" fill="#c9d1d9" textLength="75.6">need you.</text>
+<text x="14" y="243.5" fill="#39c5cf">▌</text>
+<text x="56" y="243.5" fill="#3fb950" class="b" textLength="58.8">running</text>
+<text x="123.2" y="243.5" fill="#6e7681">·</text>
+<text x="140" y="243.5" fill="#b1bac4" class="i" textLength="58.8">editing</text>
+<text x="14" y="261.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="261.5" fill="#b1bac4" class="i" textLength="159.6">login_rate_limit.rs</text>
+<text x="383.6" y="261.5" fill="#ff87af" class="b" textLength="243.6">invoice-rounding · permission</text>
+<text x="14" y="279.5" fill="#39c5cf">▌</text>
+<text x="375.2" y="279.5" fill="#39c5cf" class="b" textLength="134.4">invoice-rounding</text>
+<text x="1064" y="279.5" fill="#39c5cf">✕</text>
+<text x="14" y="297.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="297.5" fill="#0087af" class="b" textLength="75.6">changelog</text>
+<text x="190.4" y="297.5" fill="#6e7681" textLength="84">scripted-1</text>
+<text x="299.6" y="297.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="383.6" y="297.5" fill="#1b1f24" class="b" textLength="84">PERMISSION</text>
+<text x="14" y="315.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="315.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
+<text x="98" y="315.5" fill="#6e7681" textLength="243.6">· Drafted the 0.5.0 changelog</text>
+<text x="375.2" y="315.5" fill="#c9d1d9" textLength="453.6">Allow execute: git push -u origin twr/invoice-rounding</text>
+<text x="14" y="333.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="333.5" fill="#6e7681" textLength="285.6">from 37 commits, with one breaking</text>
+<text x="14" y="351.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="351.5" fill="#6e7681" textLength="58.8">change.</text>
+<text x="375.2" y="351.5" fill="#6e7681" textLength="42">task:</text>
+<text x="425.6" y="351.5" fill="#b1bac4" textLength="470.4">Round tax once on the invoice total instead of per line.</text>
+<text x="14" y="369.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="369.5" fill="#39c5cf" textLength="302.4">twr/3cd7f04bccee3481/c… · +1 vs main</text>
+<text x="375.2" y="369.5" fill="#6e7681" textLength="42">said:</text>
+<text x="425.6" y="369.5" fill="#b1bac4" textLength="310.8">Looking at how tax is computed today.</text>
+<text x="14" y="387.5" fill="#39c5cf">▌</text>
+<text x="14" y="405.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="405.5" fill="#ff00ff" class="b" textLength="84">a11y-audit</text>
+<text x="190.4" y="405.5" fill="#6e7681" textLength="84">scripted-1</text>
+<text x="299.6" y="405.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="375.2" y="405.5" fill="#d29922" class="b">1</text>
+<text x="392" y="405.5" fill="#c9d1d9" textLength="42">allow</text>
+<text x="14" y="423.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="423.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
+<text x="98" y="423.5" fill="#6e7681" textLength="176.4">· Found 6 problems on</text>
+<text x="375.2" y="423.5" fill="#d29922" class="b">2</text>
+<text x="392" y="423.5" fill="#c9d1d9" textLength="33.6">deny</text>
+<text x="14" y="441.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="441.5" fill="#6e7681" textLength="210">checkout and fixed 5. The</text>
+<text x="375.2" y="441.5" fill="#0d1117" class="b" textLength="201.6">talk to invoice-rounding</text>
+<text x="14" y="459.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="459.5" fill="#6e7681" textLength="268.8">low-contrast coupon hint needs a</text>
+<text x="375.2" y="459.5" fill="#c9d1d9" textLength="25.2">pin</text>
+<text x="14" y="477.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="477.5" fill="#6e7681" textLength="100.8">design call.</text>
+<text x="375.2" y="477.5" fill="#c9d1d9" textLength="33.6">stop</text>
+<text x="14" y="495.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="495.5" fill="#39c5cf" textLength="302.4">twr/3cd7f04bccee3481/a… · +1 vs main</text>
+<text x="375.2" y="495.5" fill="#c9d1d9" textLength="33.6">park</text>
+<text x="14" y="513.5" fill="#39c5cf">▌</text>
+<text x="879.2" y="513.5" fill="#39c5cf" textLength="193.2">Enter runs · Esc closes</text>
+<text x="375.2" y="531.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
+<text x="509.6" y="531.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
+<text x="366.8" y="549.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
+<text x="22.4" y="567.5" fill="#39c5cf" textLength="126">+ New workspace</text>
+<text x="22.4" y="585.5" fill="#39c5cf" textLength="84">⚙ Settings</text>
+<text x="358.4" y="585.5" fill="#6e7681" textLength="730.8">1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Tab/Shift-↑↓ other ca</text>
+</svg>

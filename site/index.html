@@ -4,189 +4,644 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>twr: one conversation for all your coding agents</title>
-<meta name="description" content="Talk to one orchestrator and it runs Claude Code, Codex, Grok Build and any ACP agent in parallel. Their reports, questions and permission prompts come back into the same conversation. One local binary for Linux and macOS.">
+<meta name="description" content="Talk to one orchestrator and it runs Claude Code, Codex, Grok Build and any ACP agent in parallel, each in its own git worktree, on this machine or on remote boxes. Reports, questions and permission prompts come back into the same conversation, on a desktop terminal or a phone. One local binary for Linux and macOS.">
 <link rel="canonical" href="https://twr.tools/">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f7f5f0" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#101113" media="(prefers-color-scheme: dark)">
+<meta property="og:title" content="twr: one conversation for all your coding agents">
+<meta property="og:description" content="One orchestrator runs Claude Code, Codex, Grok Build and ACP agents in parallel, each in its own git worktree. What needs you comes back to one conversation.">
+<meta property="og:url" content="https://twr.tools/">
+<meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23141413'/%3E%3Cpath d='M8 23h16' stroke='%23e88a4f' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preload" as="image" href="tui-demo.svg" type="image/svg+xml" media="(prefers-reduced-motion: no-preference)">
 <style>
   :root {
-    --bg: #fbfaf7;
-    --fg: #1d1c1a;
-    --muted: #66635c;
-    --rule: #e4e1da;
-    --code-bg: #f1eee7;
-    --accent: #b4541f;
+    --bg: #f7f5f0;
+    --fg: #1b1a18;
+    --muted: #5b574f;
+    --rule: #dcd7cc;
+    --panel: #eeeae1;
+    --accent: #a5441a;
+    --accent-fg: #fff;
+    --cyan: #0b6a73;
+    --yellow: #7a5a00;
+    --term: #0d1117;
+    --term-rule: #2b313b;
+    --term-fg: #c9d1d9;
+    --term-muted: #8b949e;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --wide: 1180px;
+    --text: 680px;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #141413;
+      --bg: #101113;
       --fg: #ecebe6;
-      --muted: #a09d95;
-      --rule: #2c2b28;
-      --code-bg: #1f1e1c;
-      --accent: #e88a4f;
+      --muted: #a8a59c;
+      --rule: #2b2c30;
+      --panel: #18191c;
+      --accent: #f0935a;
+      --accent-fg: #141413;
+      --cyan: #5fd0d8;
+      --yellow: #e6c35c;
+      --term-rule: #30363d;
     }
   }
   * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
   body {
     margin: 0;
     background: var(--bg);
     color: var(--fg);
-    font: 17px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 17px/1.6 var(--sans);
+    overflow-wrap: break-word;
   }
-  main { max-width: 760px; margin: 0 auto; padding: 64px 16px 48px; }
-  h1 {
-    font: 700 44px/1.1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    margin: 0 0 12px;
-    letter-spacing: -0.02em;
+  a { color: var(--accent); text-underline-offset: 0.18em; }
+  a:hover { text-decoration-thickness: 2px; }
+  :focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; border-radius: 3px; }
+  code, kbd, .mono { font-family: var(--mono); font-size: 0.88em; }
+  code { background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; padding: 0.05em 0.35em; }
+  kbd {
+    display: inline-block;
+    border: 1px solid var(--rule);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 0 0.35em;
+    background: var(--panel);
+    line-height: 1.45;
+    white-space: nowrap;
   }
-  h1 span { color: var(--accent); }
+  p { margin: 0 0 16px; }
+  ul { margin: 0 0 16px; padding-left: 1.2em; }
+  li { margin-bottom: 6px; }
+  li::marker { color: var(--muted); }
+  .wrap { max-width: var(--wide); margin: 0 auto; padding: 0 20px; }
+  .muted { color: var(--muted); }
+  .skip {
+    position: absolute; left: 12px; top: -48px; z-index: 10;
+    background: var(--fg); color: var(--bg); padding: 8px 12px; border-radius: 6px;
+  }
+  .skip:focus { top: 12px; }
+
+  /* Header: the wordmark and a short nav, like a terminal's status line. */
+  header.top { border-bottom: 1px solid var(--rule); }
+  header.top .wrap { display: flex; align-items: center; gap: 16px; min-height: 56px; flex-wrap: wrap; }
+  .brand {
+    font: 700 22px/1 var(--mono); color: var(--fg); text-decoration: none; letter-spacing: -0.02em;
+    padding: 6px 0;
+  }
+  .brand span { color: var(--accent); }
   /* The cursor breathes, like the TUI's working icon; still for reduced motion. */
   @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
-  @media (prefers-reduced-motion: no-preference) {
-    h1 span { animation: breathe 1.5s ease-in-out infinite; }
+  /* A few breaths only: nothing on the page blinks for more than five seconds. */
+  @media (prefers-reduced-motion: no-preference) { .brand span, .wordmark span { animation: breathe 1.5s ease-in-out 3; } }
+  nav.links { margin-left: auto; }
+  nav.links ul { display: flex; flex-wrap: wrap; gap: 4px 18px; list-style: none; margin: 0; padding: 0; }
+  nav.links li { margin: 0; }
+  nav.links a { color: var(--fg); text-decoration: none; font: 500 15px/1 var(--mono); display: inline-block; padding: 8px 0; }
+  nav.links a:hover { color: var(--accent); }
+  @media (max-width: 620px) { nav.links .opt { display: none; } }
+
+  /* Hero. */
+  .hero { padding-top: 56px; padding-bottom: 24px; }
+  .eyebrow { font: 600 14px/1.4 var(--mono); color: var(--muted); margin: 0 0 14px; letter-spacing: 0.02em; }
+  .eyebrow b { color: var(--accent); font-weight: 600; }
+  h1 {
+    font: 700 clamp(34px, 6vw, 60px)/1.05 var(--mono);
+    letter-spacing: -0.035em;
+    margin: 0 0 18px;
+    max-width: 16ch;
   }
-  .tagline { font-size: 28px; line-height: 1.25; font-weight: 600; margin: 0 0 12px; letter-spacing: -0.01em; }
-  .lede { font-size: 19px; margin: 0 0 32px; }
-  h2 {
-    font: 700 22px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    margin: 48px 0 12px;
-  }
-  .convo {
-    background: var(--code-bg);
-    border: 1px solid var(--rule);
-    border-radius: 8px;
-    padding: 16px;
-    margin: 0 0 16px;
-    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  }
-  .convo p { margin: 0; white-space: pre-wrap; }
-  .convo .you { font-weight: 700; margin-top: 12px; }
-  .convo .you:first-child { margin-top: 0; }
-  .convo .you::before { content: "> "; color: var(--accent); }
-  .convo .orch { padding-left: 2ch; }
-  .convo .hub { padding-left: 2ch; color: var(--muted); margin-top: 8px; }
-  p { margin: 0 0 16px; }
-  .muted { color: var(--muted); }
+  .lede { font-size: clamp(18px, 2.1vw, 21px); line-height: 1.5; max-width: 40em; margin: 0 0 28px; }
+  .lede b { font-weight: 600; }
+  .cta { display: flex; flex-wrap: wrap; gap: 14px 22px; align-items: center; margin: 0 0 8px; }
   .install {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: var(--code-bg);
-    border: 1px solid var(--rule);
-    border-radius: 8px;
-    padding: 12px 12px 12px 16px;
-    margin: 0 0 12px;
+    display: flex; align-items: center; gap: 8px;
+    background: var(--term); color: var(--term-fg);
+    border: 1px solid var(--term-rule); border-radius: 10px;
+    padding: 8px 8px 8px 16px;
+    max-width: 100%;
+    flex: 0 1 560px;
   }
   .install code {
-    flex: 1;
-    min-width: 0;
-    overflow-x: auto;
-    white-space: nowrap;
-    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap;
+    background: none; border: 0; padding: 6px 0; color: var(--term-fg);
+    font-size: 15px; scrollbar-width: thin;
   }
-  .install code::before { content: "$ "; color: var(--muted); }
-  button {
-    font: inherit;
-    font-size: 14px;
-    color: var(--fg);
-    background: transparent;
-    border: 1px solid var(--rule);
-    border-radius: 6px;
-    padding: 4px 10px;
-    cursor: pointer;
+  .install code::before { content: "$ "; color: var(--term-muted); }
+  /* On a phone the whole command shows, wrapped, rather than scrolled out of sight. */
+  @media (max-width: 480px) { .install code { white-space: normal; overflow-wrap: anywhere; } }
+  .copy {
+    font: 600 14px/1 var(--mono);
+    color: #141413; background: #f0935a;
+    border: 0; border-radius: 7px;
+    padding: 10px 14px; min-height: 40px; min-width: 76px;
+    cursor: pointer; flex: none;
   }
-  button:hover { border-color: var(--muted); }
-  figure { margin: 40px 0; }
-  /* The recording is wider than the text column, so it breaks out of it on wide screens. */
-  figure.hero {
-    width: min(1104px, calc(100vw - 32px));
-    position: relative;
-    left: 50%;
-    transform: translateX(-50%);
+  .copy:hover { background: #f5a877; }
+  .copy:focus-visible { outline-color: #5fd0d8; }
+  .links-row { display: flex; flex-wrap: wrap; gap: 8px 20px; font: 500 15px/1.4 var(--mono); }
+  .links-row a { padding: 6px 0; display: inline-block; }
+  .fine { font-size: 14px; color: var(--muted); margin: 8px 0 0; }
+  .copy-status { min-height: 1.4em; font-size: 14px; color: var(--muted); margin: 6px 0 0; }
+
+  /* Terminal frames around the real captures. */
+  .term {
+    margin: 0;
+    background: var(--term);
+    border: 1px solid var(--term-rule);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 18px 50px -24px rgba(0,0,0,.45);
   }
-  figure img {
-    display: block;
-    width: 100%;
-    height: auto;
-    border-radius: 8px;
-    border: 1px solid var(--rule);
+  .term-bar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 8px 12px 8px 14px;
+    border-bottom: 1px solid var(--term-rule);
+    color: var(--term-muted);
+    font: 13px/1.4 var(--mono);
   }
-  figcaption { font-size: 14px; color: var(--muted); margin-top: 8px; }
-  ul { padding-left: 20px; margin: 0 0 16px; }
-  li { margin-bottom: 6px; }
-  a { color: var(--accent); }
-  footer {
-    border-top: 1px solid var(--rule);
-    margin-top: 48px;
-    padding-top: 16px;
-    font-size: 14px;
-    color: var(--muted);
+  .term-bar .label { color: var(--term-fg); }
+  .term-bar .size { margin-left: auto; }
+  @media (max-width: 620px) { .term-bar .aside { display: none; } }
+  .term-bar button {
+    font: 600 13px/1 var(--mono);
+    color: var(--term-fg); background: transparent;
+    border: 1px solid var(--term-rule); border-radius: 6px;
+    padding: 7px 10px; min-height: 32px; cursor: pointer;
   }
+  .term-bar button:hover { border-color: var(--term-muted); }
+  .term-bar button:focus-visible { outline-color: #5fd0d8; }
+  .pan { overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: thin; scrollbar-color: var(--term-rule) transparent; }
+  .pan img { display: block; width: 100%; height: auto; }
+  /* A wide capture stays readable on a narrow screen: it keeps a minimum width and pans. */
+  @media (max-width: 760px) {
+    .pan.wide img { width: 760px; max-width: none; }
+    .pan-hint { display: block; }
+  }
+  .pan-hint { display: none; font: 13px/1.4 var(--mono); color: var(--muted); margin: 8px 0 0; }
+  figcaption { font-size: 15px; color: var(--muted); margin-top: 12px; max-width: 62em; }
+  figure { margin: 0; }
+  .hero-shot { margin: 36px 0 0; }
+
+  /* Sections. */
+  section { padding: 72px 0 8px; scroll-margin-top: 8px; }
+  .kicker { font: 600 14px/1.4 var(--mono); color: var(--accent); margin: 0 0 10px; }
+  .kicker::before { content: "## "; color: var(--muted); }
+  h2 { font: 700 clamp(26px, 3.4vw, 36px)/1.15 var(--mono); letter-spacing: -0.025em; margin: 0 0 16px; max-width: 24ch; }
+  h3 { font: 700 18px/1.3 var(--mono); margin: 0 0 10px; letter-spacing: -0.01em; }
+  .intro { max-width: var(--text); }
+
+  /* How it works: three steps on a rule, numbered like turns. */
+  .steps { list-style: none; padding: 0; margin: 28px 0 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border-top: 2px solid var(--fg); }
+  .steps li { margin: 0; padding: 18px 22px 8px 0; }
+  .steps li + li { padding-left: 22px; border-left: 1px solid var(--rule); }
+  .steps .n { font: 700 14px/1 var(--mono); color: var(--accent); display: block; margin-bottom: 10px; }
+  .steps p { margin-bottom: 8px; }
+  @media (max-width: 820px) {
+    .steps { grid-template-columns: minmax(0, 1fr); }
+    .steps li, .steps li + li { padding: 16px 0 6px; border-left: 0; border-bottom: 1px solid var(--rule); }
+  }
+
+  /* A capture with its notes under it, in columns. */
+  .split { margin-top: 28px; }
+  .notes { list-style: none; padding: 0; margin: 28px 0 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 0 28px; }
+  .notes li { padding: 14px 0 6px; border-top: 2px solid var(--fg); margin: 0 0 12px; font-size: 16px; }
+  .notes b { font-family: var(--mono); font-size: 15px; display: block; margin-bottom: 4px; }
+
+  /* The phone. */
+  /* The phone captures show at their own size (40 columns) or larger, never shrunk below it
+     while the screen has the room. */
+  .phones { display: grid; grid-template-columns: repeat(2, minmax(0, 384px)); gap: 28px; margin-top: 28px; }
+  .phones .term { border-radius: 22px; padding: 10px; }
+  .phones .term img { display: block; width: 100%; height: auto; border-radius: 10px; }
+  .phone-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 40px; align-items: start; margin-top: 8px; }
+  .phone-row .phones { margin-top: 20px; }
+  .phone-row ul { margin-top: 20px; max-width: var(--text); }
+  @media (max-width: 1220px) { .phone-row { grid-template-columns: minmax(0, 1fr); } .phone-row ul { margin-top: 8px; } }
+  @media (max-width: 700px) { .phones { grid-template-columns: minmax(0, 400px); } }
+
+  /* Feature groups: a terminal-ish index, not cards. */
+  .groups { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 48px; margin-top: 28px; }
+  .group { border-top: 2px solid var(--fg); padding: 18px 0 12px; }
+  .group h3 .tag { color: var(--accent); }
+  .group ul { padding-left: 1.1em; }
+  .more { font: 500 14px/1.4 var(--mono); }
+  .more a { display: inline-block; padding: 4px 0; }
+  @media (max-width: 820px) { .groups { grid-template-columns: minmax(0, 1fr); } }
+
+  /* What runs where. */
+  .ledger { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; margin-top: 28px; border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; }
+  .ledger > div { padding: 20px 22px 8px; background: var(--panel); }
+  .ledger > div + div { border-left: 1px solid var(--rule); }
+  .ledger h3 { font-size: 16px; }
+  .ledger .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+  @media (max-width: 900px) {
+    .ledger { grid-template-columns: minmax(0, 1fr); }
+    .ledger > div + div { border-left: 0; border-top: 1px solid var(--rule); }
+  }
+
+  /* Install. */
+  .install-steps { counter-reset: s; list-style: none; padding: 0; margin: 24px 0 0; max-width: 760px; }
+  .install-steps > li { counter-increment: s; position: relative; padding: 0 0 18px 44px; margin: 0; }
+  .install-steps > li::before {
+    content: counter(s); position: absolute; left: 0; top: 0;
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 1px solid var(--rule); background: var(--panel);
+    font: 700 14px/26px var(--mono); text-align: center; color: var(--accent);
+  }
+  pre.cmd {
+    background: var(--term); color: var(--term-fg);
+    border: 1px solid var(--term-rule); border-radius: 8px;
+    padding: 12px 14px; margin: 8px 0 0; overflow-x: auto;
+    font: 14px/1.6 var(--mono);
+  }
+  pre.cmd .c { color: var(--term-muted); }
+
+  footer { border-top: 1px solid var(--rule); margin-top: 80px; padding: 28px 0 40px; font-size: 14px; color: var(--muted); }
+  footer .wrap { display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: baseline; }
+  footer nav ul { display: flex; flex-wrap: wrap; gap: 6px 18px; list-style: none; margin: 0; padding: 0; }
+  footer nav li { margin: 0; }
+  footer nav a { display: inline-block; padding: 4px 0; }
+  footer .legal { flex-basis: 100%; margin: 8px 0 0; }
+  .wordmark { font: 700 16px/1 var(--mono); color: var(--fg); }
+  .wordmark span { color: var(--accent); }
 </style>
 </head>
 <body>
-<main>
-  <h1>twr<span>_</span></h1>
-  <p class="tagline">One conversation for all your coding agents.</p>
-  <p class="lede">You talk to one orchestrator. It starts and messages Claude Code, Codex, Grok Build or any Agent Client Protocol agent, each in its own git worktree. When a thread finishes, asks a question or wants a permission, it comes back to that same conversation, summed up in a sentence or two.</p>
-
-  <div class="install">
-    <code id="cmd">curl -fsSL https://twr.tools/install.sh | sh</code>
-    <button type="button" id="copy">Copy</button>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/" aria-label="twr home">twr<span aria-hidden="true">_</span></a>
+    <nav class="links" aria-label="Main">
+      <ul>
+        <li class="opt"><a href="#how">How it works</a></li>
+        <li class="opt"><a href="#phone">Phone</a></li>
+        <li><a href="#features">Features</a></li>
+        <li><a href="#install">Install</a></li>
+        <li><a href="https://github.com/ignaval/twr/blob/main/docs/README.md">Docs</a></li>
+        <li><a href="https://github.com/ignaval/twr">GitHub</a></li>
+      </ul>
+    </nav>
   </div>
-  <p class="muted">Linux and macOS, x86_64 and arm64.</p>
+</header>
 
-  <figure class="hero">
-    <img src="tui-demo.svg" alt="An animated recording of twr: the user asks the orchestrator for two threads, the threads appear as cards, one permission is answered on its card and another by typing allow ratelimit, each report comes back into the conversation, and the user opens a thread's transcript" width="1103" height="604">
-    <figcaption>A recorded twr session. The user asks the orchestrator for two threads, allows one push on its card and a test run from the conversation, then opens a thread&#39;s transcript. The agents are scripted stand-ins; the hub, the orchestrator&#39;s tools and the TUI are the real thing.</figcaption>
-  </figure>
+<main id="main">
+  <div class="wrap hero">
+    <p class="eyebrow"><b>v0.3.0</b> · Linux and macOS · Apache-2.0</p>
+    <h1>One conversation for all your coding agents.</h1>
+    <p class="lede">You talk to <b>one orchestrator</b>. It starts Claude Code, Codex, Grok Build or any Agent Client Protocol agent, each in its own git worktree, here or on another machine. When a thread finishes, asks a question or wants a permission, it comes back to that same conversation, and you answer there or on its card.</p>
+    <div class="cta">
+      <div class="install">
+        <code id="cmd">curl -fsSL https://twr.tools/install.sh | sh</code>
+        <button type="button" class="copy" id="copy" aria-describedby="copy-status">Copy</button>
+      </div>
+      <div class="links-row">
+        <a href="#install">Install steps</a>
+        <a href="https://github.com/ignaval/twr/blob/main/docs/usage.md">Read the docs</a>
+        <a href="https://github.com/ignaval/twr">Source on GitHub</a>
+      </div>
+    </div>
+    <p class="copy-status" id="copy-status" role="status" aria-live="polite"></p>
 
-  <h2>No sidebar of chats</h2>
-  <p>Most multi-agent tools give you a list of sessions to click through, and each agent waits in its own tab until you notice it. In twr you stay in one place. Say what you want and the orchestrator routes it.</p>
-  <div class="convo" role="img" aria-label="An example conversation: the user asks for a health check on api, allows its git push, and hears that it's done, without leaving the conversation">
-    <p class="you">on api, add a health check and push it</p>
-    <p class="orch">Started api on Claude Code, in its own worktree on branch twr/api.</p>
-    <p class="hub">· hub update</p>
-    <p class="orch">api wants to run git push origin twr/api. Allow it?</p>
-    <p class="you">allow api</p>
-    <p class="orch">Allowed. api is pushing.</p>
-    <p class="hub">· hub update</p>
-    <p class="orch">api is done. It added GET /healthz with a test and pushed twr/api.</p>
+    <figure class="term hero-shot" id="demo">
+      <div class="term-bar">
+        <span class="label">twr · a recorded session</span>
+        <span class="aside">scripted agents, real hub and TUI</span>
+        <span class="size">128×32</span>
+        <button type="button" id="demo-toggle" aria-label="Pause the recording" hidden>Pause</button>
+      </div>
+      <div class="pan wide" tabindex="0" role="region" aria-label="Recorded twr session, scrolls sideways on a narrow screen">
+        <picture>
+        <source media="(prefers-reduced-motion: reduce)" srcset="tui-demo-still.svg" type="image/svg+xml">
+        <img id="demo-img" src="tui-demo.svg" data-still="tui-demo-still.svg" width="1103" height="604" fetchpriority="high" decoding="async"
+          alt="A recording of the twr terminal UI. The Threads sidebar on the left holds the default workspace with its thread cards; the conversation with the orchestrator fills the right. The user asks for two threads, ratelimit and invoice-rounding, which appear as cards. invoice-rounding's git push permission is allowed from its card's action popup, ratelimit's test run by typing allow ratelimit in the conversation, each report comes back into the conversation, and the user opens ratelimit's transcript and returns.">
+        </picture>
+      </div>
+    </figure>
+    <p class="pan-hint" aria-hidden="true">← swipe the recording sideways →</p>
+    <p class="fine">Recorded from the real hub, MCP tools and TUI by <code>docs/tools/make-demo.sh</code>. The orchestrator and the two workers are small scripted ACP agents, so the threads show <code>scripted-1</code> as their model; nothing here is a mock-up.</p>
   </div>
-  <p>Press Enter twice on a card when you want that agent's full transcript, and Esc to come back. You never have to.</p>
 
-  <h2>It relays, it never decides</h2>
-  <p>The orchestrator can pass on an answer you gave. It can't make one up. A short command such as "allow both" or "deny the webapp one" applies at once. Anything longer goes on a card that only you can confirm, and every answer names the exact version of the question you saw.</p>
+  <section id="how" aria-labelledby="how-h">
+    <div class="wrap">
+      <p class="kicker">how it works</p>
+      <h2 id="how-h">Say what you want. Hear back when it matters.</h2>
+      <p class="intro">Most multi-agent setups give you a tab per agent and leave you to notice which one is waiting. In twr you stay in one conversation, and the hub keeps track of every thread for you.</p>
+      <ol class="steps">
+        <li>
+          <span class="n">01 · you</span>
+          <h3>Ask the orchestrator</h3>
+          <p>Type <code>on api, rate limit logins per IP</code>. The orchestrator picks or starts a thread, on the runtime you choose, in a worktree on its own branch.</p>
+        </li>
+        <li>
+          <span class="n">02 · the threads</span>
+          <h3>Agents work in parallel</h3>
+          <p>Each thread runs its agent's own CLI under your login. Tests and builds queue on the machine's job slots, and a thread's background work wakes it when it ends.</p>
+        </li>
+        <li>
+          <span class="n">03 · the hub</span>
+          <h3>What needs you comes back</h3>
+          <p>Reports, questions and permission prompts land in the conversation and on the thread's card. Open the card with <kbd>Enter</kbd> and press a digit, or just type <code>allow ratelimit</code>.</p>
+        </li>
+      </ol>
+    </div>
+  </section>
 
-  <h2>Also</h2>
-  <ul>
-    <li>One Rust binary. No account, no cloud service, no telemetry.</li>
-    <li>Move the orchestrator to another agent mid-conversation. The new one starts from a handoff summary.</li>
-    <li>Park a thread to free its worktree, and resume it later on the same session.</li>
-    <li><code>twr attach</code> opens the agent's own CLI on the thread's session.</li>
-    <li>Threads can run on other machines through <code>twr runner</code>.</li>
-  </ul>
+  <section id="threads" aria-labelledby="threads-h">
+    <div class="wrap">
+      <p class="kicker">the desktop</p>
+      <h2 id="threads-h">Every workspace and thread in one sidebar.</h2>
+      <p class="intro">Threads, on the left, lists your workspaces with the current one's thread cards nested under it. The big pane stays your conversation with the orchestrator, and what you type always goes there until you dive into a thread.</p>
+      <div class="split">
+        <figure>
+          <div class="term">
+            <div class="term-bar"><span class="label">stack view</span><span class="size">160×42</span></div>
+            <div class="pan wide" tabindex="0" role="region" aria-label="Stack view capture, scrolls sideways on a narrow screen">
+              <img src="tui-stack.svg" width="1372" height="784" loading="lazy" decoding="async"
+                alt="The twr stack view at 160 by 42. The Threads sidebar shows the default workspace, working and waiting on you, with two nested cards: ratelimit waiting on a Bash permission with 1 allow and 2 deny, and invoice-rounding asking whether to round tax per line or on the invoice total. Below it the client-x workspace lists crash-triage waiting on you, push-retry running and store-notes done, then scratch, whose hub isn't running, and the New workspace and Settings buttons. The conversation on the right shows the hub's update that deploy-fix failed, the question and permission boxes, and the orchestrator's answer to What needs me right now?">
+            </div>
+          </div>
+          <p class="pan-hint" aria-hidden="true">← swipe the capture sideways →</p>
+          <figcaption>Two workspaces and a stopped third, with worker threads on twr's scripted test runtime, <code>fake</code>. Captured by <code>docs/tools/make-screenshots.sh</code>.</figcaption>
+        </figure>
+        <ul class="notes">
+          <li><b>Workspaces</b>Each is its own hub, orchestrator and threads, for a client or a side project. Its card counts what waits on you, <span class="mono">⚠2</span>, and what runs, <span class="mono">●1</span>. A click or <kbd>Alt-1</kbd>…<kbd>9</kbd> switches.</li>
+          <li><b>Cards that say where a thread stands</b>State, what it's doing or what it reported, who runs it and its git line, <span class="mono">3 ahead of dev · 2 behind</span>. The waiting item's options are on the card.</li>
+          <li><b>A color per thread</b>Its card, name and conversation boxes share one of 30 distinct colors, kept across restarts.</li>
+          <li><b><kbd>Ctrl-B</kbd> hides it whole</b>The view takes every column, with a strip of tabs once you have two workspaces. <kbd>Ctrl-G</kbd> switches to the grid, <kbd>Ctrl-F</kbd> to focus mode.</li>
+          <li><b><kbd>Enter</kbd> <kbd>Enter</kbd> dives in</b>On a card, the pane shows that thread's transcript and what you type goes straight to it. <kbd>Esc</kbd> brings you back.</li>
+        </ul>
+      </div>
 
-  <figure>
-    <img src="tui-grid.svg" alt="The twr grid view: one tile per thread with its status, git state and last report" width="1372" height="424" loading="lazy">
-    <figcaption>The grid view (<code>g</code>). One tile per thread with its status, git state and last report.</figcaption>
-  </figure>
+      <figure class="term" style="margin-top:36px">
+        <div class="term-bar"><span class="label">grid view · Ctrl-G</span><span class="size">160×25</span></div>
+        <div class="pan wide" tabindex="0" role="region" aria-label="Grid view capture, scrolls sideways on a narrow screen">
+          <img src="tui-grid.svg" width="1372" height="478" loading="lazy" decoding="async"
+            alt="The twr grid view at 160 by 25, the Threads sidebar with the default, client-x and scratch workspaces at its left: one tile per worker thread, each in its own color, with its state, its waiting item or last report and its git line. ratelimit waits on a permission, invoice-rounding asks a question, deploy-fix failed on a Terraform state lock, checkout-ui is running, and changelog and a11y-audit are done.">
+        </div>
+      </figure>
+      <p class="pan-hint" aria-hidden="true">← swipe the capture sideways →</p>
+    </div>
+  </section>
 
-  <footer>
-    Apache-2.0 · <a href="https://github.com/ignaval/twr">github.com/ignaval/twr</a>
-  </footer>
+  <section id="phone" aria-labelledby="phone-h">
+    <div class="wrap">
+      <p class="kicker">on a phone</p>
+      <h2 id="phone-h">Answer from your phone, however long the card.</h2>
+      <p class="intro">Below 60 columns the TUI turns compact: one screen at a time under a tab bar of <b>Chat</b>, <b>Needs you</b> and <b>Threads</b>, every tab and menu choice two rows tall for a finger. Run it in any phone terminal over SSH or mosh. There is no app to install and no server in between.</p>
+      <div class="phone-row">
+      <div>
+        <ul>
+          <li><b>Threads</b> scrolls through the same workspaces and cards as the desktop sidebar.</li>
+          <li>A card longer than the screen opens with its options under the first lines of text. Tap an option to pick it and again to send it, or press its digit. The rest of the text scrolls above the options, and a tap on <span class="mono">↓ 10 more lines · tap</span> turns a page.</li>
+          <li><kbd>/c</kbd>, <kbd>/n</kbd> and <kbd>/t</kbd> switch screens where Tab is awkward. A <a href="https://github.com/ignaval/twr/blob/main/docs/notifications.md">notification command</a> can push to your phone when something needs you.</li>
+        </ul>
+        <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/tui.md#on-a-phone">More on the phone layout</a></p>
+      </div>
+      <div class="phones">
+        <figure>
+          <div class="term">
+            <img src="tui-compact-card.svg" width="364" height="388" loading="lazy" decoding="async"
+              alt="twr at 40 by 20, a phone's size, on the Needs you tab. invoice-rounding's question is open in its action popup: the first lines of the question about rounding tax per line or on the invoice total, then a line saying 10 more lines below with tap to page, the two options per line, as the PDFs and once on the total, as the ledger, and talk to invoice-rounding, with 3 more rows below.">
+          </div>
+          <figcaption>A long question, answerable without scrolling to its end.</figcaption>
+        </figure>
+        <figure>
+          <div class="term">
+            <img src="tui-compact-workspaces.svg" width="364" height="388" loading="lazy" decoding="async"
+              alt="twr at 40 by 20 on the Threads tab, scrolled down: the client-x workspace, working and waiting on you, with its threads crash-triage waiting on you, push-retry running and store-notes done; the scratch workspace selected, its hub not running; and the New workspace and Settings buttons.">
+          </div>
+          <figcaption>The Threads screen, scrolled to the other workspaces.</figcaption>
+        </figure>
+      </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="answers" aria-labelledby="answers-h">
+    <div class="wrap">
+      <p class="kicker">permissions</p>
+      <h2 id="answers-h">It relays your answers. It never makes one up.</h2>
+      <div class="groups" style="margin-top:8px">
+        <div>
+          <p>The orchestrator can pass on an answer you gave. A short command such as <code>allow both</code> or <code>deny the webapp one</code> answers a permission at once. Anything else, and every answer to a question, goes on a card that only you can confirm, and every answer names the exact revision of the item you saw.</p>
+          <p>The agents twr runs can read the hub and run jobs for their own thread. They can't answer a permission or a question, change a mode, delete a thread or send prompts. twr is not a sandbox, and <a href="https://github.com/ignaval/twr/blob/main/docs/security-model.md">the security model</a> says what this guard covers and what it doesn't.</p>
+        </div>
+        <div>
+          <p>Some runtimes decide a few things themselves. A Codex thread in <code>auto</code> mode has, by default, <b>Codex's own reviewer agent</b> approve or deny a command its sandbox refused; each decision shows in the transcript as an <code>auto_review</code> call. Set <code>[codex] auto = "ask"</code> to get a card instead.</p>
+          <p>A card's popup answers only what it drew in full and you had time to read, so a key pressed as an item changed answers nothing. <kbd>Enter</kbd> on an empty line opens it; <kbd>1</kbd>-<kbd>9</kbd> answer.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" aria-labelledby="features-h">
+    <div class="wrap">
+      <p class="kicker">features</p>
+      <h2 id="features-h">What else is in the binary.</h2>
+      <div class="groups">
+        <div class="group">
+          <h3><span class="tag">runtimes</span> · any agent you already use</h3>
+          <ul>
+            <li>Claude Code, Codex and Grok Build run through their headless modes. Any Agent Client Protocol agent works too, <code>--runtime 'acp:gemini --experimental-acp'</code> for example, and other CLIs get a clearly marked PTY fallback.</li>
+            <li>Move the orchestrator to another runtime mid-conversation, with a handoff. Move a thread to Codex and back to Claude Code and its earlier Claude Code session resumes.</li>
+            <li>Several logins of one runtime, a work and a personal Claude subscription for example, chosen per thread. twr never reads or stores a token. Accounts on remote boxes, balancing and failover aren't supported yet.</li>
+            <li><code>twr attach</code> opens the agent's own CLI on a thread's session.</li>
+          </ul>
+          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/runtimes.md">runtimes.md</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/accounts.md">accounts.md</a></p>
+        </div>
+        <div class="group">
+          <h3><span class="tag">isolation</span> · worktrees and background work</h3>
+          <ul>
+            <li>Each thread works in its own git worktree, on branch <code>twr/&lt;name&gt;</code>, or in your checkout if you ask.</li>
+            <li>Park a thread to free its worktree and resume it later on the same session. Deleted threads go to a trash you can restore from.</li>
+            <li>Jobs queue on the machine's slots; <code>send --after</code> holds a prompt until another thread finishes. Messages waiting for a thread list above the input box, to edit, delete or send now.</li>
+            <li>A card tells a hung turn from one waiting on its own tests, by what it has in flight.</li>
+          </ul>
+          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/worktrees.md">worktrees.md</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/usage.md#jobs">jobs</a></p>
+        </div>
+        <div class="group">
+          <h3><span class="tag">remote boxes</span> · SSH, containers, dial-in</h3>
+          <ul>
+            <li>After <code>twr box add gpu me@gpu-box</code> the hub installs its own build over SSH (<code>twr box install</code> for a box of another OS or CPU) and starts a box daemon there. Threads keep running across disconnects, hub restarts and laptop sleep, with no token, listener or tunnel to set up.</li>
+            <li>Container boxes through <code>docker exec</code>, podman or <code>kubectl exec</code>, for repositories you don't trust.</li>
+            <li>Dial-in boxes, for a machine the hub can't reach, connect out over <code>wss://</code> with a token.</li>
+            <li>Linux and Mac boxes; on a Mac the daemon starts where Claude Code can read its keychain login. <code>twr box doctor</code> says what's wrong and how to fix it.</li>
+          </ul>
+          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/runners.md">runners.md</a></p>
+        </div>
+        <div class="group">
+          <h3><span class="tag">memory &amp; context</span> · long-running work</h3>
+          <ul>
+            <li>The orchestrator keeps notes on your preferences and setup, one memory per workspace, across sessions, restarts and runtime switches. Notes are information, never authority. <code>twr memory</code> manages them.</li>
+            <li>Context compactions show as a line in the conversation. <code>/compact-context</code> compacts a thread between turns, and before a message goes to a Claude Code thread with a large context whose prompt cache has expired, twr asks whether to compact first.</li>
+            <li>A hub with weeks of history starts from a checkpoint instead of replaying its whole log, and old turns' detail moves to an archive.</li>
+          </ul>
+          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/orchestrator.md#memory">memory</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/runtimes.md#context-compaction">compaction</a></p>
+        </div>
+        <div class="group">
+          <h3><span class="tag">in the terminal</span> · the input box</h3>
+          <ul>
+            <li>A line starting with <code>!</code> runs a shell command of yours, in the thread's worktree when you're in a dive. <code>!!</code> also hands the output to the thread.</li>
+            <li>Ghost-text suggestions for your next message: <kbd>Tab</kbd> takes one, nothing is sent until you press <kbd>Enter</kbd>.</li>
+            <li><kbd>Shift-Enter</kbd> for a new line, over mosh and SSH too, after <code>twr terminal-setup</code>. <code>/settings</code> changes the common options and writes back only that line of your config.</li>
+          </ul>
+          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/tui.md">tui.md</a></p>
+        </div>
+        <div class="group">
+          <h3><span class="tag">read aloud</span> · and keeping track</h3>
+          <ul>
+            <li><code>/read on</code> reads the orchestrator's replies as they come. On a server over SSH or mosh, <code>twr speak --ssh &lt;server&gt;</code> plays them on your laptop, with nothing on the server's audio.</li>
+            <li><code>twr usage</code> shows each subscription's 5-hour and weekly windows, and what each thread's turns spent.</li>
+            <li><code>/decisions</code> opens an audit table of the hub's routing and grading decisions, with the provider that made each one.</li>
+          </ul>
+          <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/read-aloud.md">read-aloud.md</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/tui.md#decision-audit-view">decisions</a></p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="local" aria-labelledby="local-h">
+    <div class="wrap">
+      <p class="kicker">what runs where</p>
+      <h2 id="local-h">twr is local. Your agents are not.</h2>
+      <p class="intro">twr itself has no account, no cloud service and no telemetry. The agents it runs call their providers under your own logins, so their terms and quotas apply. The hub also asks a small model, with the same logins, for suggestions and summaries until you turn them off.</p>
+      <div class="ledger">
+        <div>
+          <h3><span class="dot" style="background:#3fb950" aria-hidden="true"></span>On machines you run</h3>
+          <ul>
+            <li>The hub, its append-only SQLite log and the TUI: one Rust binary.</li>
+            <li>Worktrees and jobs, here or on your boxes; cards, the orchestrator's memory and checkpoints.</li>
+            <li>Boxes you add, reached over SSH, a container command or a connection they open.</li>
+          </ul>
+        </div>
+        <div>
+          <h3><span class="dot" style="background:#f0935a" aria-hidden="true"></span>Model calls, with your logins</h3>
+          <ul>
+            <li>The orchestrator and every worker: each runtime's CLI, signed in by you.</li>
+            <li>Next-message suggestions and one-line thread summaries, both on by default: the hub asks a small model through Claude Code or Codex. Turn them off in <code>/settings</code> or with <code>[tui] suggest = false</code> and <code>summaries = false</code>.</li>
+            <li>Codex's reviewer, for Codex threads in <code>auto</code> unless you set <code>ask</code>.</li>
+          </ul>
+        </div>
+        <div>
+          <h3><span class="dot" style="background:#5fd0d8" aria-hidden="true"></span>What you bring</h3>
+          <ul>
+            <li>git, and at least one of <code>claude</code>, <code>codex</code> or <code>grok</code>, signed in with its own CLI.</li>
+            <li>For heavy automation, an API key rather than a personal subscription is the safe choice.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="install" aria-labelledby="install-h">
+    <div class="wrap">
+      <p class="kicker">install</p>
+      <h2 id="install-h">Three steps to the first thread.</h2>
+      <ol class="install-steps">
+        <li>
+          <b>Install twr.</b> The script puts the release build for your machine in <code>~/.local/bin</code>, without sudo, after checking it against the release's checksums, and their signature where your <code>openssl</code> can verify it.
+          <pre class="cmd">curl -fsSL https://twr.tools/install.sh | sh</pre>
+          <p class="fine">Linux x86_64 and aarch64, macOS on Apple silicon and Intel. Or download an archive from <a href="https://github.com/ignaval/twr/releases/latest">the releases page</a>, or build it with Rust 1.89 or newer: <code>cargo install --locked --git https://github.com/ignaval/twr twr-cli</code>.</p>
+        </li>
+        <li>
+          <b>Sign in to an agent.</b> twr runs <code>claude</code> (Claude Code 2.1.110 or newer), <code>codex</code> or <code>grok</code> as you; log in with each one's own CLI first.
+        </li>
+        <li>
+          <b>Open it.</b> The first run asks which agent runs your orchestrator.
+          <pre class="cmd">twr                                  <span class="c"># the TUI; starts the hub</span>
+twr thread new ~/code/api --name api <span class="c"># or let the orchestrator start threads</span>
+twr update                           <span class="c"># later: the latest release</span></pre>
+        </li>
+      </ol>
+      <p class="fine" style="max-width:760px">twr is before 1.0 and has one maintainer: commands, config keys and the socket API may still change between releases. macOS is built and tested in CI but has had less hands-on use than Linux. Windows is unsupported. <a href="https://github.com/ignaval/twr/blob/main/docs/install.md">install.md</a> covers versions, signatures and the installer's options; <a href="https://github.com/ignaval/twr/blob/main/CHANGELOG.md">the changelog</a> lists what each release changed.</p>
+    </div>
+  </section>
 </main>
+
+<footer>
+  <div class="wrap">
+    <span class="wordmark">twr<span aria-hidden="true">_</span></span>
+    <nav aria-label="Footer">
+      <ul>
+        <li><a href="https://github.com/ignaval/twr">GitHub</a></li>
+        <li><a href="https://github.com/ignaval/twr/blob/main/docs/README.md">Docs</a></li>
+        <li><a href="https://github.com/ignaval/twr/blob/main/CHANGELOG.md">Changelog</a></li>
+        <li><a href="https://github.com/ignaval/twr/blob/main/SECURITY.md">Security</a></li>
+        <li><a href="https://github.com/ignaval/twr/blob/main/LICENSE">Apache-2.0</a></li>
+      </ul>
+    </nav>
+    <p class="legal">twr is not affiliated with Anthropic, OpenAI or xAI. Claude Code, Codex and Grok are trademarks of their owners.</p>
+  </div>
+</footer>
+
 <script>
-  document.getElementById("copy").addEventListener("click", async (e) => {
-    const text = document.getElementById("cmd").textContent;
-    try {
-      await navigator.clipboard.writeText(text);
-      e.target.textContent = "Copied";
-    } catch {
-      e.target.textContent = "Select and copy";
+  // Copy the install command; where the clipboard is refused, select it for the user to copy.
+  (function () {
+    var button = document.getElementById("copy");
+    var cmd = document.getElementById("cmd");
+    var status = document.getElementById("copy-status");
+    var timer;
+    function say(label, message) {
+      button.textContent = label;
+      status.textContent = message;
+      clearTimeout(timer);
+      timer = setTimeout(function () { button.textContent = "Copy"; status.textContent = ""; }, 4000);
     }
-    setTimeout(() => { e.target.textContent = "Copy"; }, 1500);
-  });
+    function selectCommand() {
+      var range = document.createRange();
+      range.selectNodeContents(cmd);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+    button.addEventListener("click", function () {
+      var text = cmd.textContent;
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(function () {
+          say("Copied", "Install command copied to the clipboard.");
+        }, function () {
+          selectCommand();
+          say("Selected", "The command is selected: press Ctrl-C or ⌘C to copy it.");
+        });
+      } else {
+        selectCommand();
+        say("Selected", "The command is selected: press Ctrl-C or ⌘C to copy it.");
+      }
+    });
+  })();
+
+  // A pause for the recording: it swaps in the recording's own still frame. Viewers who ask
+  // for reduced motion get that still frame from the <picture> source, and no control.
+  (function () {
+    var img = document.getElementById("demo-img");
+    var toggle = document.getElementById("demo-toggle");
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
+    var moving = img.getAttribute("src");
+    var still = img.getAttribute("data-still");
+    function sync() {
+      if (reduce && reduce.matches) {
+        toggle.hidden = true;
+        setPaused(false);
+        return;
+      }
+      toggle.hidden = false;
+    }
+    var paused = false;
+    function setPaused(on) {
+      paused = on;
+      img.src = on ? still : moving;
+      toggle.textContent = on ? "Play" : "Pause";
+      toggle.setAttribute("aria-label", on ? "Play the recording" : "Pause the recording");
+    }
+    toggle.addEventListener("click", function () { setPaused(!paused); });
+    sync();
+    if (reduce && reduce.addEventListener) reduce.addEventListener("change", sync);
+  })();
 </script>
 </body>
 </html>

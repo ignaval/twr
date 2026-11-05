@@ -54,7 +54,7 @@ jobs:
         shell: bash
         run: |
           shopt -s nullglob
-          shellcheck install.sh docs/tools/*.sh .github/scripts/*.sh
+          shellcheck install.sh site/build.sh docs/tools/*.sh .github/scripts/*.sh
       - name: Check the docs' relative links
         run: python3 -I docs/tools/check-links.py
 
