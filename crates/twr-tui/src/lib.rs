@@ -934,11 +934,13 @@ pub const HISTORY_ENTRY_MAX: usize = 16 * 1024;
 /// Appends `entries` to the history file at `path`, kept to the newest
 /// [`app::HISTORY_MAX`] entries (rewritten when it grows past twice that). Several TUIs share
 /// the file: each save holds an exclusive lock on `<path>.lock` for its append and rewrite,
-/// and a rewrite goes through a temporary file of its own.
+/// and a rewrite goes through a temporary file of its own. Its directory is the workspace's,
+/// which its hub made: never made here, so a save left over once the workspace was removed
+/// (`twr ws rm`) does not make it again.
 pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
-        twr_core::paths::ensure_private_dir(dir).map_err(std::io::Error::other)?;
+        twr_core::paths::check_private_dir(dir).map_err(std::io::Error::other)?;
     }
     let lock = twr_core::paths::open_private_append(&path.with_extension("lock"))?;
     lock.lock()?;
@@ -1693,6 +1695,9 @@ pub struct RemovalPlan {
     pub lines: Vec<String>,
     /// Its hub runs (with nothing in it the removal would lose): removing it stops it first.
     pub stops_hub: bool,
+    /// Which workspace with that id the plan is about (its data's identity on disk): the
+    /// removal refuses one made since with the same id.
+    pub generation: Option<String>,
 }
 
 /// The workspaces a TUI can switch between (`twr ws`): the CLI provides them, as it knows
@@ -1737,11 +1742,13 @@ pub trait Workspaces: Send + Sync {
         Box::pin(async { anyhow::bail!("workspaces can't be removed here") })
     }
     /// Removes workspace `id`, stopping its hub first when `stop_hub` (once
-    /// [`Workspaces::plan_removal`] said it can); what to say it did.
+    /// [`Workspaces::plan_removal`] said it can), only while it is the one the plan's
+    /// `generation` names; what to say it did.
     fn remove(
         &self,
         _id: &str,
         _stop_hub: bool,
+        _generation: Option<String>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> {
         Box::pin(async { anyhow::bail!("workspaces can't be removed here") })
     }
@@ -2001,10 +2008,11 @@ fn spawn_removal(
     ws: std::sync::Arc<dyn Workspaces>,
     id: String,
     stop_hub: bool,
+    generation: Option<String>,
     done: mpsc::UnboundedSender<(String, Option<Vec<WsEntry>>)>,
 ) {
     tokio::spawn(async move {
-        let msg = match ws.remove(&id, stop_hub).await {
+        let msg = match ws.remove(&id, stop_hub, generation).await {
             // What went and what changes (what stays was in the plan).
             Ok(lines) => lines
                 .iter()
@@ -2713,8 +2721,9 @@ struct Shared {
     late_tx: mpsc::UnboundedSender<StatusMsg>,
     late_rx: mpsc::UnboundedReceiver<StatusMsg>,
     /// A workspace being deleted from the workspace menu ([`Action::WsRemove`]): the one the
-    /// TUI showed, deleted once the switch away from it is done; whether to stop its hub.
-    pending_removal: Option<(String, bool)>,
+    /// TUI showed, deleted once the switch away from it is done; whether to stop its hub, and
+    /// the plan's generation.
+    pending_removal: Option<(String, bool, Option<String>)>,
     /// What to say on the first view ([`Switching::note`]).
     note: Option<String>,
     /// What a workspace change from the menu did, and the workspaces as listed after it.
@@ -3060,11 +3069,11 @@ where
                 // made later with its id starts afresh.
                 saved.retain(|id, _| tabs.iter().any(|t| &t.name == id));
                 // The workspace left, to delete now that it is not shown.
-                if let Some((id, stop_hub)) = ctx.pending_removal.take() {
+                if let Some((id, stop_hub, generation)) = ctx.pending_removal.take() {
                     if id != to {
                         saved.remove(&id);
                         if let Some(ws) = ctx.workspaces.clone() {
-                            spawn_removal(ws, id, stop_hub, ctx.ws_done_tx.clone());
+                            spawn_removal(ws, id, stop_hub, generation, ctx.ws_done_tx.clone());
                         }
                     }
                 }
@@ -3729,7 +3738,7 @@ where
                             }
                             // The workspace shown is deleted once the switch away from it is
                             // done ([`Shared::pending_removal`]); another one at once.
-                            Action::WsRemove { id, stop_hub, via } => {
+                            Action::WsRemove { id, stop_hub, via, generation } => {
                                 let Some(ws) = ctx.workspaces.clone() else {
                                     continue;
                                 };
@@ -3738,7 +3747,7 @@ where
                                         if !state.begin_switch(&to) {
                                             continue;
                                         }
-                                        ctx.pending_removal = Some((id, stop_hub));
+                                        ctx.pending_removal = Some((id, stop_hub, generation));
                                         let tx = open_tx.clone();
                                         tokio::spawn(async move {
                                             let r = open_workspace(ws.as_ref(), &to, false).await;
@@ -3746,7 +3755,13 @@ where
                                         });
                                     }
                                     None => {
-                                        spawn_removal(ws, id, stop_hub, ctx.ws_done_tx.clone());
+                                        spawn_removal(
+                                            ws,
+                                            id,
+                                            stop_hub,
+                                            generation,
+                                            ctx.ws_done_tx.clone(),
+                                        );
                                     }
                                 }
                                 continue;
@@ -4103,7 +4118,7 @@ where
                         state.switching = None;
                         let label = state.ws_label(&name);
                         state.view.status = Some(match ctx.pending_removal.take() {
-                            Some((id, _)) => format!(
+                            Some((id, ..)) => format!(
                                 "workspace {} not deleted: the switch to {label} failed: {e:#}",
                                 state.ws_label(&id)
                             ),
@@ -6186,6 +6201,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("tui-history");
         assert!(load_history(&path).is_empty());
+        // A directory that is gone (its workspace removed) is not made again.
+        assert!(save_history(&path, &["lost".into()]).is_err());
+        assert!(!dir.path().join("sub").exists());
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
         save_history(&path, &["a \"quoted\" line".into(), "/help".into()]).unwrap();
         assert_eq!(load_history(&path), ["a \"quoted\" line", "/help"]);
         let many: Vec<String> = (0..2 * app::HISTORY_MAX).map(|i| i.to_string()).collect();

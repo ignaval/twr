@@ -1566,6 +1566,8 @@ pub enum Action {
         id: String,
         stop_hub: bool,
         via: Option<String>,
+        /// The plan's [`crate::RemovalPlan::generation`].
+        generation: Option<String>,
     },
 }
 

@@ -37,6 +37,10 @@ use crate::paths::{workspace_name_error, Paths, DEFAULT_WORKSPACE};
 /// The file in a workspace's data directory that holds its name, when it was renamed.
 pub const NAME_FILE: &str = "workspace-name";
 
+/// The file in a workspace's data directory that holds a token of its own, made with it: a
+/// workspace removed and made again with the same id has another ([`generation`]).
+pub const GENERATION_FILE: &str = "workspace-generation";
+
 /// The file in the root's data directory that holds the default workspace's id, once one
 /// other than the root slot was made the default (`twr ws default`).
 pub const DEFAULT_FILE: &str = "default-workspace";
@@ -73,6 +77,7 @@ pub const ROOT_OWNED: &[&str] = &[
     // Its identity to the runner service (`twr-link`): one made again is another workspace.
     "link-identity",
     NAME_FILE,
+    GENERATION_FILE,
 ];
 
 /// Prefixes of the root slot's own files in the root's data directory: its orchestrator's
@@ -293,6 +298,30 @@ pub fn name_conflict(all: &[Entry], own: Option<&str>, name: &str) -> Option<Str
     None
 }
 
+/// Which workspace with its id `ws` is: the token it was made with ([`GENERATION_FILE`]);
+/// for one made before twr kept one, its directory's device, inode and birth time (one made
+/// again since has a token, so never the same). `None` when neither can be read.
+pub fn generation(ws: &Paths) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(t) = std::fs::read_to_string(ws.data_dir.join(GENERATION_FILE)) {
+        return Some(t.trim().to_string());
+    }
+    let dir = std::fs::metadata(&ws.data_dir).ok()?;
+    let born = dir
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    Some(format!("before:{}:{}:{born}", dir.dev(), dir.ino()))
+}
+
+/// Writes a new token in `ws`'s data directory ([`GENERATION_FILE`]).
+fn new_generation(ws: &Paths) -> anyhow::Result<()> {
+    let file = ws.data_dir.join(GENERATION_FILE);
+    write_atomic(&file, &format!("{}\n", ulid::Ulid::generate()))
+        .with_context(|| format!("writing {}", file.display()))
+}
+
 /// What [`create`] made.
 #[derive(Debug)]
 pub struct Created {
@@ -328,6 +357,7 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
         }
         crate::paths::check_socket_path(&root.socket)?;
         clear_root_leftovers(&root)?;
+        new_generation(&root)?;
         let had_default = root.default_id().is_some();
         std::fs::remove_file(root.removed_marker())
             .with_context(|| format!("removing {}", root.removed_marker().display()))?;
@@ -353,6 +383,7 @@ pub fn create(root: &Paths, name: &str) -> anyhow::Result<Created> {
         }
         Err(e) => return Err(e).with_context(|| format!("creating {}", ws.data_dir.display())),
     }
+    new_generation(&ws)?;
     let made_default = root.default_id().is_none();
     if made_default {
         write_atomic(&root.data_dir.join(DEFAULT_FILE), &format!("{name}\n"))

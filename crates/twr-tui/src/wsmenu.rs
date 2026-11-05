@@ -400,6 +400,7 @@ impl AppState {
                     id: m.id,
                     stop_hub: plan.stops_hub,
                     via,
+                    generation: plan.generation.clone(),
                 }]
             }
         }
@@ -735,6 +736,7 @@ mod tests {
             refused: None,
             lines: (0..n).map(|i| format!("plan line {i}")).collect(),
             stops_hub,
+            generation: Some("g1".into()),
         }
     }
 
@@ -748,7 +750,9 @@ mod tests {
 
     fn removal(actions: &[Action]) -> Option<(String, bool, Option<String>)> {
         actions.iter().find_map(|a| match a {
-            Action::WsRemove { id, stop_hub, via } => Some((id.clone(), *stop_hub, via.clone())),
+            Action::WsRemove {
+                id, stop_hub, via, ..
+            } => Some((id.clone(), *stop_hub, via.clone())),
             _ => None,
         })
     }
@@ -924,6 +928,8 @@ mod tests {
         delete_with(&mut st, "scratch", plan(4, false));
         let a = st.handle_key(key(KeyCode::Char('y')));
         assert_eq!(removal(&a), Some(("scratch".into(), false, None)));
+        // With the plan's generation: the removal refuses another workspace made since.
+        assert!(matches!(&a[..], [Action::WsRemove { generation: Some(g), .. }] if g == "g1"));
         assert!(st.view.ws_menu.is_none());
         // A tap highlights Delete; a second one deletes.
         delete_with(&mut st, "docs", plan(4, true));

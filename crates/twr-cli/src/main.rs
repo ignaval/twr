@@ -8936,7 +8936,7 @@ fn tui_without_default(root: &Paths) -> anyhow::Result<Option<(Paths, String)>> 
 /// `twr ws rm`: removes a workspace ([`remove_workspace`]) once `consent` allows it, and says
 /// what went and what stayed.
 async fn ws_rm(paths: &Paths, selector: &str, consent: Consent<'_>) -> anyhow::Result<()> {
-    for line in remove_workspace(&paths.root(), selector, consent).await? {
+    for line in remove_workspace(&paths.root(), selector, None, consent).await? {
         outln!("{line}");
     }
     Ok(())
@@ -9073,9 +9073,13 @@ fn removal_refusal(name: &str, threads: &[String], trash: usize) -> Option<Strin
 /// ([`ws_rm_question`]), is listed and asked about first unless `consent` is `--yes` (the
 /// TUI's Delete, which showed it): both locks are held from the checks through the removal, so
 /// nothing changes while the question waits. The lines saying what it did.
+///
+/// With `generation` ([`workspace_generation`], as a plan the user confirmed saw it), only
+/// while the workspace is still that one: not one made since with the same id.
 async fn remove_workspace(
     root: &Paths,
     selector: &str,
+    generation: Option<&str>,
     consent: Consent<'_>,
 ) -> anyhow::Result<Vec<String>> {
     let root = root.root();
@@ -9110,6 +9114,9 @@ async fn remove_workspace(
         Some(lock) => lock,
         None => return Err(running()),
     };
+    if generation.is_some_and(|g| workspace_generation(&ws).as_deref() != Some(g)) {
+        bail!(replaced_why(&name));
+    }
     let (threads, conversation) = ws_threads(&ws)?;
     if let Some(why) = removal_refusal(&name, &threads, trash_items(&ws)?) {
         bail!(why);
@@ -9612,18 +9619,37 @@ impl twr_tui::Workspaces for TuiWorkspaces {
         &self,
         id: &str,
         stop_hub: bool,
+        generation: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<String>>> + Send>>
     {
         let (root, config, id) = (self.root.clone(), self.config.clone(), id.to_string());
         Box::pin(async move {
             refuse_agent()?;
             let ws = root.workspace(&id)?;
+            // Not even its hub stopped when it is another workspace than the plan's.
+            if generation.is_some() && workspace_generation(&ws) != generation {
+                bail!(replaced_why(&ws.display_name()));
+            }
             if stop_hub {
                 stop_hub_for_removal(&config.socket_path(&ws), &ws).await?;
             }
-            remove_workspace(&root, &id, Consent::Yes).await
+            remove_workspace(&root, &id, generation.as_deref(), Consent::Yes).await
         })
     }
+}
+
+/// Which workspace with its id `ws` is ([`twr_core::workspaces::generation`]).
+fn workspace_generation(ws: &Paths) -> Option<String> {
+    twr_core::workspaces::generation(ws)
+}
+
+/// Why a removal the user confirmed was refused: the workspace it was about went, and
+/// another was made with its id meanwhile.
+fn replaced_why(name: &str) -> String {
+    format!(
+        "workspace {name} is not the one you were shown any more (it was removed and made \
+         again meanwhile): nothing was deleted; look again before deleting it"
+    )
 }
 
 /// What removing workspace `id` of `root` would do, for the TUI's Delete to show before it
@@ -9642,6 +9668,7 @@ async fn removal_plan(
         bail!("there is no workspace {id} any more");
     }
     let name = ws.display_name();
+    let generation = workspace_generation(&ws);
     let socket = config.socket_path(&ws);
     let refused = |why: String| {
         Ok(twr_tui::RemovalPlan {
@@ -9726,6 +9753,7 @@ async fn removal_plan(
         refused: None,
         lines,
         stops_hub,
+        generation,
     })
 }
 
@@ -10205,6 +10233,38 @@ mod tests {
         let mut yes = |_: &str| Ok("Y\n".to_string());
         ws_rm(&paths, "a", Consent::Ask(&mut yes)).await.unwrap();
         assert!(!ws.data_dir.exists());
+    }
+
+    /// A plan's generation names the workspace it saw: one removed and made again with the
+    /// same id (named, or `default` in place) has another, and a removal confirmed on the old
+    /// plan deletes nothing.
+    #[tokio::test]
+    async fn a_removal_confirmed_on_a_replaced_workspace_deletes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Paths::with_home(home.path());
+        let a = twr_core::workspaces::create(&root, "a").unwrap().paths;
+        let seen = workspace_generation(&a).unwrap();
+        assert_eq!(workspace_generation(&a).as_deref(), Some(seen.as_str()));
+        std::fs::remove_dir_all(&a.data_dir).unwrap();
+        twr_core::workspaces::create(&root, "a").unwrap();
+        std::fs::write(a.data_dir.join("keep"), "new").unwrap();
+        assert_ne!(workspace_generation(&a).as_deref(), Some(seen.as_str()));
+        let e = remove_workspace(&root, "a", Some(&seen), Consent::Yes)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("nothing was deleted"), "{e:#}");
+        assert!(a.data_dir.join("keep").exists());
+        // `default`, made again in place: a new token.
+        std::fs::create_dir_all(&root.data_dir).unwrap();
+        let seen = workspace_generation(&root).unwrap();
+        twr_core::workspaces::write_atomic(&root.removed_marker(), "").unwrap();
+        twr_core::workspaces::create(&root, "default").unwrap();
+        assert_ne!(workspace_generation(&root).unwrap(), seen);
+        let fresh = workspace_generation(&a).unwrap();
+        assert!(remove_workspace(&root, "a", Some(&fresh), Consent::Yes)
+            .await
+            .is_ok());
+        assert!(!a.data_dir.exists());
     }
 
     /// A workspace that was present during discovery can be moved aside by ws rm before
