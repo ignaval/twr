@@ -546,9 +546,12 @@ select {
 [data-fold="vertical"] .app {
   padding-bottom: 0;
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
   grid-template-columns: var(--fold-left) var(--hinge-width) minmax(0, 1fr);
 }
 [data-fold="vertical"] .sidebar {
+  min-height: 0;
+  overflow-y: auto;
   padding-bottom: env(safe-area-inset-bottom);
   display: flex !important;
   position: static !important;
@@ -560,6 +563,8 @@ select {
   box-shadow: none;
 }
 [data-fold="vertical"] .main-shell {
+  min-height: 0;
+  overflow: hidden;
   padding-bottom: var(--mobile-bottom);
   grid-column: 3;
   margin: 0;

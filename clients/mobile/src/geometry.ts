@@ -7,6 +7,7 @@ export interface Posture {
   width?: number;
   height?: number;
   occlusionTop?: number;
+  safeAreaInsets?: { top: number; left: number; right: number; bottom: number };
   occlusions?: { left: number; top: number; width: number; height: number }[];
 }
 
@@ -51,11 +52,16 @@ export function topOcclusionInset(
     )
   )
     return fallback;
+  if (regions.length === 0) return 0;
+  const safeTop = posture.safeAreaInsets?.top;
+  if (safeTop === undefined || !Number.isFinite(safeTop) || safeTop < 0)
+    return fallback;
   return Math.max(
     0,
     ...regions
       .filter(
         (region) =>
+          region.top <= safeTop + 1 &&
           region.width > 0 &&
           region.height > 0 &&
           region.left < right &&

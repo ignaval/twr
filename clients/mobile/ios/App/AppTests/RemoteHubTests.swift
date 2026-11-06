@@ -49,7 +49,48 @@ final class RemoteHubTests: XCTestCase {
         try await Task.sleep(nanoseconds: 350_000_000)
     }
 
+    private func assertViewportCoordinates(_ stage: String) async throws {
+        let deadline = Date().addingTimeInterval(10)
+        var latest: Any?
+        while Date() < deadline {
+            latest = try await js("""
+              const view=window.visualViewport,root=document.getElementById('root').getBoundingClientRect();
+              return {pass:!!view && view.scale===1 && view.offsetTop===0 && view.offsetLeft===0 && Math.abs(innerWidth-nativeWidth)<=1 && root.width>=44 && root.height>=160,viewport:{width:innerWidth,height:innerHeight,visualWidth:view?.width,visualHeight:view?.height,scale:view?.scale,offsetLeft:view?.offsetLeft,offsetTop:view?.offsetTop},nativeWidth,nativeHeight,root:root.toJSON()};
+              """, ["nativeWidth": Double(web.bounds.width), "nativeHeight": Double(web.bounds.height)])
+            if (latest as? [String: Any])?["pass"] as? Bool == true {
+                print("VIEWPORT_COORDINATES pass stage=\(stage) " + String(describing: latest))
+                return
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTFail("Native CGRect and CSS coordinates are not comparable, or the content root collapsed: \(stage): \(String(describing: latest))")
+        throw NSError(domain: "twr.qa.coordinates", code: 1)
+    }
+
+    private func assertComposerReachable(_ stage: String) async throws {
+        try await assertViewportCoordinates(stage)
+        let check = """
+          const button=document.querySelector('button[aria-label="Send message"]'),box=button?.getBoundingClientRect();
+          const viewport=window.visualViewport,tabs=document.querySelector('.mobile-tabs');
+          const limit=Math.min(innerHeight,viewport?.height||innerHeight,tabs?.getClientRects().length?tabs.getBoundingClientRect().top:Infinity);
+          return !!box && box.width>=44 && box.height>=44 && box.left>=0 && box.top>=0 && box.right<=innerWidth+1 && box.bottom<=limit+1 && button.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2));
+          """
+        do {
+            try await until(check, seconds: 10, reportFailure: false)
+        } catch {
+            print("POSE_COMPOSER failure stage=\(stage) " + String(describing: try? await js("""
+              const button=document.querySelector('button[aria-label="Send message"]'),box=button?.getBoundingClientRect();
+              const hit=box?document.elementFromPoint(box.x+box.width/2,box.y+box.height/2):null;
+              return JSON.stringify({viewport:{width:innerWidth,height:innerHeight,visualHeight:visualViewport?.height},root:document.getElementById('root').getBoundingClientRect().toJSON(),send:box?.toJSON(),tabs:document.querySelector('.mobile-tabs')?.getBoundingClientRect().toJSON(),hit:hit?{tag:hit.tagName,aria:hit.getAttribute('aria-label')}:null,layout:await window.Capacitor.Plugins.TwrLayout.current()});
+              """)))
+            XCTFail("Send must be a visible, unobstructed 44-point target after fold pose: " + stage)
+            throw error
+        }
+        print("POSE_COMPOSER pass stage=" + stage)
+    }
+
     private func assertContentClearOfOcclusions(_ stage: String, requireOcclusions: Bool = false) async throws {
+        try await assertViewportCoordinates(stage)
         let check = """
           const layout=await window.Capacitor.Plugins.TwrLayout.current();
           const root=document.getElementById('root').getBoundingClientRect();
@@ -142,8 +183,20 @@ final class RemoteHubTests: XCTestCase {
     }
 
     private func capture(_ name: String) async throws {
+        web.layoutIfNeeded()
+        let bounds = try await js("""
+          await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);
+          const finite=document.getAnimations().filter(animation=>animation.playState==='running' && animation.effect && Number.isFinite(animation.effect.getComputedTiming().endTime));
+          let timer;
+          try {await Promise.race([Promise.all(finite.map(animation=>animation.finished.catch(()=>{}))),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Finite UI animation did not settle before capture')),5000)})])}finally{clearTimeout(timer)}
+          await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);
+          const box=selector=>document.querySelector(selector)?.getBoundingClientRect().toJSON();
+          return JSON.stringify({name,viewport:{width:innerWidth,height:innerHeight,visualHeight:visualViewport?.height,offsetTop:visualViewport?.offsetTop,offsetLeft:visualViewport?.offsetLeft,scale:visualViewport?.scale},root:box('#root'),send:box('button[aria-label="Send message"]'),tabs:box('.mobile-tabs'),bodyPadding:getComputedStyle(document.body).padding,keyboard:document.documentElement.dataset.keyboard,fold:document.documentElement.dataset.fold});
+          """, ["name":name])
+        let configuration = WKSnapshotConfiguration()
+        configuration.afterScreenUpdates = true
         let image: UIImage = try await withCheckedThrowingContinuation { continuation in
-            web.takeSnapshot(with: nil) { image, error in
+            web.takeSnapshot(with: configuration) { image, error in
                 if let error { continuation.resume(throwing: error) }
                 else if let image { continuation.resume(returning: image) }
                 else { continuation.resume(throwing: NSError(domain: "twr.qa.snapshot", code: 1)) }
@@ -155,10 +208,6 @@ final class RemoteHubTests: XCTestCase {
         attachment.name = "twr-" + name
         attachment.lifetime = .keepAlways
         add(attachment)
-        let bounds = try? await js("""
-          const box=selector=>document.querySelector(selector)?.getBoundingClientRect().toJSON();
-          return JSON.stringify({name,viewport:{width:innerWidth,height:innerHeight,visualHeight:visualViewport?.height},root:box('#root'),send:box('button[aria-label="Send message"]'),tabs:box('.mobile-tabs'),bodyPadding:getComputedStyle(document.body).padding,keyboard:document.documentElement.dataset.keyboard,fold:document.documentElement.dataset.fold});
-          """, ["name":name])
         print("UI_BOUNDS " + String(describing: bounds))
         var request = URLRequest(url: URL(string: "http://127.0.0.1:47323/screenshot?name=" + name)!, timeoutInterval: 15)
         request.httpMethod = "POST"
@@ -332,14 +381,17 @@ final class RemoteHubTests: XCTestCase {
               """)
             let closedWidth = try await js("return innerWidth") as? Int ?? 0
             try await assertContentClearOfOcclusions("cover", requireOcclusions: true)
+            try await assertComposerReachable("cover")
             try await capture("cover")
             try await pose("open")
             try await until("return innerWidth !== \(closedWidth)")
             try await assertContentClearOfOcclusions("open")
+            try await assertComposerReachable("open")
             try await capture("open")
             try await pose("half-open")
             try await until("return (await window.Capacitor.Plugins.TwrLayout.current()).orientation !== 'none'")
             try await assertContentClearOfOcclusions("half-open")
+            try await assertComposerReachable("half-open")
             try await capture("half-open")
             try await until("""
               const summary=document.querySelector('.conversation-menu>summary'),box=summary?.getBoundingClientRect();
@@ -367,6 +419,8 @@ final class RemoteHubTests: XCTestCase {
             try await pose("closed")
             try await until("return innerWidth === \(closedWidth)")
             try await assertContentClearOfOcclusions("reclosed", requireOcclusions: true)
+            try await assertComposerReachable("reclosed")
+            try await capture("reclosed")
             let restoredDraft = try await js("return document.querySelector('.composer textarea').value") as? String
             XCTAssertEqual(restoredDraft, "FOLD_TRANSITION_DRAFT")
         }
@@ -495,6 +549,7 @@ final class RemoteHubTests: XCTestCase {
         XCTAssertEqual(errorCount, 0)
         XCTAssertFalse(repo.isEmpty)
         try await assertContentClearOfOcclusions("final-full-viewport", requireOcclusions: fixture["foldable"] as? Bool == true)
+        try await assertComposerReachable("final-full-viewport")
         // Capture the app while it is visible, before XCTest returns to SpringBoard.
         try await capture("screen")
     }

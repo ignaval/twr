@@ -5,6 +5,7 @@
   "description": "One conversation for all your coding agents",
   "author": "twr contributors",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/ignaval/twr",
   "main": "dist-host/main.cjs",
   "scripts": {
     "dev": "node scripts/dev.mjs",
@@ -80,6 +81,7 @@
   "build": {
     "appId": "tools.twr.desktop",
     "productName": "twr",
+    "afterPack": "./scripts/linux-abi.mjs",
     "directories": {
       "output": "release"
     },
@@ -112,6 +114,7 @@
     },
     "linux": {
       "category": "Development",
+      "maintainer": "twr contributors",
       "target": [
         {
           "target": "dir",
@@ -121,6 +124,12 @@
         },
         {
           "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
           "arch": [
             "x64"
           ]

@@ -1,10 +1,24 @@
 name: Desktop
 on:
   pull_request:
-    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/desktop.yml"]
+    paths:
+      [
+        "clients/**",
+        "crates/**",
+        "Cargo.*",
+        "rust-toolchain.toml",
+        ".github/workflows/desktop.yml",
+      ]
   push:
     branches: [dev]
-    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/desktop.yml"]
+    paths:
+      [
+        "clients/**",
+        "crates/**",
+        "Cargo.*",
+        "rust-toolchain.toml",
+        ".github/workflows/desktop.yml",
+      ]
   workflow_dispatch:
 
 permissions:
@@ -61,8 +75,62 @@ jobs:
           name: twr-desktop-macos-arm64
           path: clients/release/*.dmg
 
+  linux:
+    # Build the *same* native-addon/Rust bundle used by AppImage and Arch on
+    # the oldest supported userspace. Building node-pty on rolling Arch raises
+    # cfsetispeed/cfsetospeed to GLIBC_2.42 and breaks Ubuntu 22.04/24.04.
+    name: Portable Linux x86_64 (Ubuntu 22.04 ABI)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build, sandbox, and X11 runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 pkg-config libssl-dev libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libx11-xcb1 libfuse2 xvfb
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build and check the portable distribution
+        working-directory: clients
+        run: |
+          npm ci
+          npm test
+          npm run package:linux
+          node scripts/arch.mjs
+          node scripts/linux-abi.mjs release/linux-unpacked release/linux-abi.json
+          # Integration fixtures use debug engines; the app contains release engines.
+          cargo build --manifest-path ../Cargo.toml --locked -p twr-cli -p twr-app
+      - name: Exercise the actual portable bundle on its baseline distro
+        working-directory: clients
+        run: |
+          # Install the conventional package and exercise its real terminal and
+          # login flows with Chromium's sandbox/fuses enabled.
+          sudo apt-get install -y ./release/*.deb
+          dpkg-query -W twr-desktop
+          test "$(stat -c %u /opt/twr/chrome-sandbox)" = 0
+          node scripts/linux-abi.mjs /opt/twr
+          TWR_DESKTOP_EXECUTABLE=/usr/bin/twr-desktop xvfb-run -a dbus-run-session -- npm run test:integration
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: twr-desktop-linux-portable-x86_64
+          path: |
+            clients/release/*.AppImage
+            clients/release/*.deb
+            clients/release/linux-abi.json
+            clients/release/arch/PKGBUILD
+            clients/release/arch/*-linux-x64.tar.gz
+
   arch:
-    name: Arch Linux, native Wayland, and package
+    name: Arch Linux package and native Wayland (portable bundle)
+    needs: linux
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     timeout-minutes: 75
@@ -74,6 +142,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: twr-desktop-linux-portable-x86_64
+          path: clients/release
       - name: Prepare non-root build
         run: |
           chown -R builder:builder "$GITHUB_WORKSPACE"
@@ -81,28 +153,23 @@ jobs:
           runuser -u builder -- cargo build --locked -p twr-cli -p twr-app
           runuser -u builder -- npm --prefix clients run build
           runuser -u builder -- npm --prefix clients test
-          # Materialize Electron before assigning its sandbox helper's package permissions.
-          runuser -u builder -- node clients/node_modules/electron/install.js
-          chown root:root clients/node_modules/electron/dist/chrome-sandbox
-          chmod 4755 clients/node_modules/electron/dist/chrome-sandbox
-      - name: Exercise Electron on a native Wayland compositor
-        working-directory: clients
-        run: |
-          install -dm700 -o builder -g builder /tmp/twr-wayland
-          runuser -u builder -- env XDG_RUNTIME_DIR=/tmp/twr-wayland WLR_BACKENDS=headless WLR_RENDERER=pixman TWR_DESKTOP_WAYLAND_TEST=1 dbus-run-session -- cage -- npm run test:integration
       - name: Build and validate Arch package
         working-directory: clients
         run: |
-          runuser -u builder -- npm run package:arch
+          # Never rebuild the production native module here. The source archive
+          # and its checked PKGBUILD came from the Ubuntu 22.04 producer above.
           cd release/arch
           runuser -u builder -- makepkg --noconfirm --nodeps
           pacman -Qip ./*.pkg.tar.zst
           pacman -U --noconfirm ./*.pkg.tar.zst
           test "$(stat -c %a /opt/twr-desktop/chrome-sandbox)" = 4755
           test "$(stat -c %u /opt/twr-desktop/chrome-sandbox)" = 0
+          pacman -Qkk twr-desktop
+          runuser -u builder -- node ../../scripts/linux-abi.mjs /opt/twr-desktop
       - name: Exercise the installed Arch package on Wayland
         working-directory: clients
         run: |
+          install -dm700 -o builder -g builder /tmp/twr-wayland
           runuser -u builder -- env XDG_RUNTIME_DIR=/tmp/twr-wayland WLR_BACKENDS=headless WLR_RENDERER=pixman TWR_DESKTOP_WAYLAND_TEST=1 TWR_DESKTOP_EXECUTABLE=/usr/bin/twr-desktop dbus-run-session -- cage -- npm run test:integration
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -30,7 +30,9 @@ export async function observeLayout() {
     root.style.setProperty("--viewport-height", `${viewportHeight}px`);
     const horizontal = getComputedStyle(document.body);
     const usableLeft = parseFloat(horizontal.paddingLeft) || 0;
-    const usableRight = innerWidth - (parseFloat(horizontal.paddingRight) || 0);
+    const usableRight =
+      document.documentElement.getBoundingClientRect().width -
+      (parseFloat(horizontal.paddingRight) || 0);
     root.style.setProperty(
       "--occlusion-top",
       `${topOcclusionInset(posture, usableLeft, usableRight)}px`,

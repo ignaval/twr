@@ -1,10 +1,20 @@
-import { mkdirSync, cpSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  cpSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { checkLinuxBundle } from "./linux-abi.mjs";
 if (process.platform !== "linux" || process.arch !== "x64")
   throw new Error("Create the Arch package on x86_64 Linux.");
 const { version } = JSON.parse(readFileSync("package.json", "utf8"));
+const abi = checkLinuxBundle("release/linux-unpacked");
+writeFileSync("release/linux-abi.json", JSON.stringify(abi, null, 2) + "\n");
 const stage = "release/arch-stage/twr-desktop";
+rmSync(stage, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
 cpSync("release/linux-unpacked", stage, { recursive: true });
 mkdirSync(stage + "/packaging", { recursive: true });

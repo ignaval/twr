@@ -39,6 +39,7 @@ describe("camera occlusions and horizontal safe areas", () => {
   const posture = {
     orientation: "none" as const,
     occlusionTop: 174,
+    safeAreaInsets: { top: 0, left: 0, right: 84, bottom: 0 },
     occlusions: [corner],
   };
   it("does not reserve a corner twice when the horizontal safe area already excludes it", () => {
@@ -69,7 +70,7 @@ describe("camera occlusions and horizontal safe areas", () => {
       topOcclusionInset(
         {
           ...posture,
-          occlusions: [corner, { left: 100, top: 10, width: 50, height: 70 }],
+          occlusions: [corner, { left: 100, top: 0, width: 50, height: 80 }],
         },
         0,
         382,
@@ -87,6 +88,34 @@ describe("camera occlusions and horizontal safe areas", () => {
         0,
         382,
       ),
+    ).toBe(174);
+  });
+  it("does not turn a landscape bottom camera into a full-height top inset", () => {
+    expect(
+      topOcclusionInset(
+        {
+          ...posture,
+          occlusions: [{ left: 50, top: 550, width: 84, height: 100 }],
+        },
+        0,
+        466,
+      ),
+    ).toBe(0);
+  });
+  it("recognizes top regions relative to the native safe area", () => {
+    expect(
+      topOcclusionInset(
+        {
+          ...posture,
+          safeAreaInsets: { top: 62, left: 0, right: 0, bottom: 0 },
+          occlusions: [{ left: 100, top: 50, width: 84, height: 100 }],
+        },
+        0,
+        466,
+      ),
+    ).toBe(150);
+    expect(
+      topOcclusionInset({ ...posture, safeAreaInsets: undefined }, 0, 382),
     ).toBe(174);
   });
   it("uses no extra margin when the native bridge reports no occlusion", () => {

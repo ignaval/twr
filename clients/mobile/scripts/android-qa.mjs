@@ -537,6 +537,109 @@ try {
     page.on("pageerror", (e) => errors.push(e.message));
   }
   if (serial === "emulator-5556") {
+    const assertFoldComposer = async (stage) => {
+      await page.evaluate(async () => {
+        await new Promise(requestAnimationFrame);
+        await new Promise(requestAnimationFrame);
+        const finite = document
+          .getAnimations()
+          .filter(
+            (animation) =>
+              animation.playState === "running" &&
+              animation.effect &&
+              Number.isFinite(animation.effect.getComputedTiming().endTime),
+          );
+        let timer;
+        try {
+          await Promise.race([
+            Promise.all(
+              finite.map((animation) => animation.finished.catch(() => {})),
+            ),
+            new Promise((_, reject) => {
+              timer = setTimeout(
+                () =>
+                  reject(new Error("Finite fold UI animation did not settle")),
+                5000,
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+        await new Promise(requestAnimationFrame);
+        await new Promise(requestAnimationFrame);
+      });
+      let proof;
+      await expect
+        .poll(
+          async () => {
+            proof = await page.evaluate(() => {
+              const viewport = visualViewport,
+                root = document.getElementById("root").getBoundingClientRect(),
+                button = document.querySelector(
+                  'button[aria-label="Send message"]',
+                ),
+                send = button.getBoundingClientRect(),
+                tabs = document.querySelector(".mobile-tabs");
+              const limit = Math.min(
+                innerHeight,
+                viewport?.height || innerHeight,
+                tabs?.getClientRects().length
+                  ? tabs.getBoundingClientRect().top
+                  : Infinity,
+              );
+              const hit = document.elementFromPoint(
+                send.x + send.width / 2,
+                send.y + send.height / 2,
+              );
+              const checks = {
+                unitScale: viewport?.scale === 1,
+                zeroOffsets:
+                  viewport?.offsetLeft === 0 && viewport?.offsetTop === 0,
+                rootPositive: root.width >= 44 && root.height >= 160,
+                width44: send.width >= 44,
+                height44: send.height >= 44,
+                insideViewport:
+                  send.left >= 0 &&
+                  send.top >= 0 &&
+                  send.right <= innerWidth + 1 &&
+                  send.bottom <= limit + 1,
+                ownsHit: button.contains(hit),
+              };
+              return {
+                pass: Object.values(checks).every(Boolean),
+                checks,
+                viewport: {
+                  width: innerWidth,
+                  height: innerHeight,
+                  visualHeight: viewport?.height,
+                  scale: viewport?.scale,
+                  offsetLeft: viewport?.offsetLeft,
+                  offsetTop: viewport?.offsetTop,
+                },
+                root: root.toJSON(),
+                send: send.toJSON(),
+                tabs: tabs?.getBoundingClientRect().toJSON(),
+                limit,
+                hit: hit
+                  ? { tag: hit.tagName, aria: hit.getAttribute("aria-label") }
+                  : null,
+                fold: document.documentElement.dataset.fold,
+              };
+            });
+            return proof.pass;
+          },
+          {
+            timeout: 15000,
+            message: `Send must remain reachable after ${stage}`,
+          },
+        )
+        .toBe(true);
+      console.log(`PASS: fold composer ${stage}`, JSON.stringify(proof));
+      await page.screenshot({
+        path: `test-results/android-fold-${stage}-webview.png`,
+      });
+    };
     await input.fill("FOLD_TRANSITION_DRAFT");
     await page.evaluate(() => window.Capacitor.Plugins.Keyboard.hide());
     const width = await page.evaluate(() => innerWidth);
@@ -545,11 +648,13 @@ try {
       .poll(() => page.evaluate(() => innerWidth), { timeout: 15000 })
       .not.toBe(width);
     assert.equal(await input.inputValue(), "FOLD_TRANSITION_DRAFT");
+    await assertFoldComposer("cover");
     adbRun(["shell", "cmd", "device_state", "state", "2"]);
     await expect
       .poll(() => page.evaluate(() => innerWidth), { timeout: 15000 })
       .toBe(width);
     assert.equal(await input.inputValue(), "FOLD_TRANSITION_DRAFT");
+    await assertFoldComposer("flat");
     adbRun(["shell", "cmd", "device_state", "state", "1"]);
     await expect
       .poll(
@@ -564,6 +669,7 @@ try {
       .poll(() => page.evaluate(() => document.documentElement.dataset.fold))
       .toBe("vertical");
     assert.equal(await input.inputValue(), "FOLD_TRANSITION_DRAFT");
+    await assertFoldComposer("book");
     const foldDialog = async (orientation) => {
       const newThread = page.locator(".topbar-new-thread");
       if (await newThread.isVisible()) await newThread.click();
@@ -676,6 +782,7 @@ try {
       foldGeometry.composerTop >= foldGeometry.foldBottom - 2,
       JSON.stringify(foldGeometry),
     );
+    await assertFoldComposer("tabletop");
     await foldDialog("horizontal");
     await page.getByRole("button", { name: "Open shell", exact: true }).click();
     await page
@@ -764,6 +871,7 @@ try {
     await expect
       .poll(() => page.evaluate(() => innerWidth), { timeout: 15000 })
       .toBe(width);
+    await assertFoldComposer("restored-flat");
     await input.fill("");
     console.log(
       "PASS: flat landscape display retains all usable height while the keyboard is open",

@@ -218,7 +218,17 @@ function findBinaries() {
         loginEnv.XDG_CONFIG_HOME
           ? [join(loginEnv.XDG_CONFIG_HOME, "systemd/user")]
           : [],
-      ).catch(() => {}),
+      ).catch((error: unknown) => {
+        const detail = error as { code?: unknown; syscall?: unknown };
+        const safe = (value: unknown) =>
+          typeof value === "string" && /^[A-Za-z0-9_]{1,32}$/.test(value)
+            ? value
+            : "unknown";
+        console.warn("Engine cleanup retained cached versions", {
+          code: safe(detail?.code),
+          syscall: safe(detail?.syscall),
+        });
+      }),
     30000,
   ).unref();
   return {
