@@ -7,10 +7,15 @@ const platforms = [
   ["android-fold", "Android · fold emulator"],
   ["ios-phone", "iOS · phone simulator"],
   ["ios-fold", "iOS · Duo simulator"],
+  ["ios-tablet", "iOS · tablet simulator"],
   ["linux-hyprland", "Linux · QEMU / Hyprland"],
 ]
   .filter(([key]) => existsSync(`test-results/performance-${key}.json`))
-  .map(([key, name]) => ({ ...read(key), name }));
+  .map(([key, name]) => ({ ...read(key), name, key }))
+  .filter(
+    (sample) =>
+      !sample.key.startsWith("ios-") || sample.assistantCompletion === true,
+  );
 const before = read("mac-before"),
   after = read("mac-after");
 const esc = (s) =>

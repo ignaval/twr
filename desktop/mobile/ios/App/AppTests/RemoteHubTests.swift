@@ -64,7 +64,6 @@ final class RemoteHubTests: XCTestCase {
           await window.twr.rpc('thread.new',{project:'demo',name:'ios-worker',runtime:'fake'});
           await window.twr.rpc('thread.send',{thread:'ios-worker',prompt:'IOS_REMOTE_STREAM_OK'});return true;
           """)
-        try await until("return window.__qaEvents.some(e=>e.type==='thread' && e.event?.kind==='agent.text' && e.event?.data?.text?.includes('IOS_REMOTE_STREAM_OK'))")
         _ = try await js("""
           const visible=e=>e.getClientRects().length>0;
           const nav=[...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
@@ -74,7 +73,7 @@ final class RemoteHubTests: XCTestCase {
         _ = try await js("[...document.querySelectorAll('.thread-grid .thread-card')].find(e=>e.textContent.includes('ios-worker')).click();return true")
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent.includes('Talk to this thread'))")
         _ = try await js("[...document.querySelectorAll('button')].find(e=>e.textContent.includes('Talk to this thread')).click();return true")
-        try await until("return document.body.innerText.includes('IOS_REMOTE_STREAM_OK') && !!document.querySelector('.composer textarea')")
+        try await until("return [...document.querySelectorAll('.block-assistant .markdown')].some(e=>e.textContent.includes('IOS_REMOTE_STREAM_OK')) && !!document.querySelector('.composer textarea')")
         _ = try await js("""
           const path=await window.twr.uploadFile(new File(['IOS_UPLOAD_OK'],'ios-qa.txt',{type:'text/plain'}),'ios-worker');
           window.__qaUpload=path.path;return true;

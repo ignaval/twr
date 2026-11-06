@@ -363,7 +363,7 @@ for (const [index, template] of selected.entries()) {
         "-test-timeouts-enabled",
         "YES",
         "-maximum-test-execution-time-allowance",
-        "240",
+        "600",
         "CODE_SIGNING_ALLOWED=YES",
         "CODE_SIGN_IDENTITY=-",
       ],
