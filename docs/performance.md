@@ -15,6 +15,14 @@ the original mutation ID and the gateway's durable receipt rather than creating 
 operation. Bounded, separate terminal/control event lanes prevent terminal output from
 forcing a complete state reconnect.
 
+The gateway retains live conversation bursts within a per-device limit of 4,096
+events and normally 4 MiB of encoded JSON. A single valid event up to the existing
+16 MiB socket limit can be retained alone. Slow sockets that fall behind the
+retained history receive an explicit resync. Events are encoded once and readers
+share their immutable bytes. The byte and event-count limits bound retained
+payloads and bookkeeping separately.
+History is released when the last socket disconnects. Terminal output has its own lane.
+
 Large remote replies are split at UTF-8 boundaries into 32 KiB parts, with a bounded
 assembler and ordered control/terminal lanes. Heartbeats share that scheduler without
 waiting for a whole large reply. The foreground watchdog measures incoming frame progress,

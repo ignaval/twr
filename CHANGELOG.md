@@ -16,6 +16,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 ### Fixed
 
 - Finished jobs release their slots immediately, even while a child process briefly retains an inherited file descriptor before exec.
+- Remote clients retain short bursts of live conversation events within byte and event-count limits, avoiding unnecessary resyncs during heavy tool output.
 
 ## [0.3.0] - 2026-10-30
 

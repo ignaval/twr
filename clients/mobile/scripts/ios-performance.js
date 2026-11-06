@@ -40,7 +40,21 @@ const measurementErrors = [];
 const transitions = [];
 let duplicateEvents = 0;
 let workloadStart;
+const stateEncoding = {
+  events: 0,
+  totalBytes: 0,
+  maxBytes: 0,
+  measurementMs: 0,
+};
 const stopMeasuring = window.twr.onEvent((message) => {
+  if (workloadStart !== undefined && message.type === "state") {
+    const at = performance.now();
+    const bytes = new TextEncoder().encode(JSON.stringify(message)).byteLength;
+    stateEncoding.events++;
+    stateEncoding.totalBytes += bytes;
+    stateEncoding.maxBytes = Math.max(stateEncoding.maxBytes, bytes);
+    stateEncoding.measurementMs += performance.now() - at;
+  }
   if (message.type === "resync" || message.type === "connection") {
     if (transitions.length < 32)
       transitions.push({
@@ -215,6 +229,7 @@ try {
           measurementErrors,
           readiness,
           transitions,
+          stateEncoding,
         }),
     );
 } catch (error) {
@@ -290,6 +305,7 @@ const report = {
   duplicateStreamEvents: duplicateEvents,
   readiness,
   streamTransitions: transitions,
+  stateEncoding,
   streamEventTimings: streamEvents,
   rpcMedianMs: pct(rpcTimes, 0.5),
   rpcP95Ms: pct(rpcTimes, 0.95),
