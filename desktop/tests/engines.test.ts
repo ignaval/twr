@@ -134,11 +134,26 @@ it("keeps engines referenced by stopped service units, including binary-plist st
       join(units, "tools.twr.runner.lab.plist"),
       Buffer.from("/different/engines/" + b + "/twr", "utf16le"),
     );
+    const c = "c".repeat(64),
+      d = "d".repeat(64);
+    writeFileSync(
+      join(units, "twr-speak.service"),
+      "ExecStart=/engines/" + c + "/twr",
+    );
+    writeFileSync(
+      join(units, "tools.twr.speak.plist"),
+      "/engines/" + d + "/twr",
+    );
     const retained = await referencedEngines(root, [
       units,
       join(root, "missing"),
     ]);
-    expect([...retained].sort()).toEqual([join(root, a), join(root, b)]);
+    expect([...retained].sort()).toEqual([
+      join(root, a),
+      join(root, b),
+      join(root, c),
+      join(root, d),
+    ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

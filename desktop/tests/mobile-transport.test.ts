@@ -35,6 +35,67 @@ beforeEach(() => {
   });
 });
 describe("mobile reconnect", () => {
+  it("clears partial replies and signals transcript recovery after a failed resume probe", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((e) => events.push(e));
+      fake.listener({
+        message: {
+          type: "frame-part",
+          transfer: "old",
+          index: 0,
+          count: 2,
+          data: "{",
+        },
+      });
+      const original = fake.send.getMockImplementation()!;
+      fake.send.mockImplementation(async (payload) => {
+        if (JSON.parse(payload.message).method !== "heartbeat")
+          await original(payload);
+      });
+      await vi.advanceTimersByTimeAsync(16000);
+      const resumed = host.resume();
+      await vi.advanceTimersByTimeAsync(16000);
+      await resumed;
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "connection", connected: false }),
+      );
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      // Reusing a transfer ID on the replacement socket must start fresh.
+      fake.listener({
+        message: {
+          type: "frame-part",
+          transfer: "old",
+          index: 0,
+          count: 2,
+          data: '{"type":',
+        },
+      });
+      fake.listener({
+        message: {
+          type: "frame-part",
+          transfer: "old",
+          index: 1,
+          count: 2,
+          data: '"state"}',
+        },
+      });
+      expect(events).toContainEqual({ type: "state" });
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers when a fresh native socket silently closes before foregrounding", async () => {
     vi.useFakeTimers();
     const host = new RemoteHost(
@@ -46,7 +107,7 @@ describe("mobile reconnect", () => {
       await host.start();
       await host.api().connect("default");
       fake.send.mockRejectedValueOnce(new Error("Hub connection is closed"));
-      await expect(host.resume()).rejects.toThrow("Hub connection is closed");
+      await expect(host.resume()).resolves.toBeUndefined();
       await vi.advanceTimersByTimeAsync(1100);
       expect(fake.disconnect).toHaveBeenCalledTimes(1);
       expect(fake.connect).toHaveBeenCalledTimes(2);

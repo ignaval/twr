@@ -290,9 +290,9 @@ export class RemoteHost {
             // A response may be behind already-buffered TCP data. Receiving
             // fragments while probing proves progress on the existing link.
             if (!this.nativeConnected || this.lastFrameAt < probingSince) {
-              this.nativeConnected = false;
-              this.bridgeReady = false;
-              this.rejectPending(true);
+              this.transportFailed(
+                "Remote hub stopped responding; reconnecting…",
+              );
             }
           }
         }
@@ -312,7 +312,7 @@ export class RemoteHost {
             });
           } catch (error) {
             this.transportFailed(String(error));
-            throw error;
+            await this.connectWorkspace(this.workspace);
           }
         }
       }).finally(() => {

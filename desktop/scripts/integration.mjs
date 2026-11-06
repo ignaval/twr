@@ -308,6 +308,61 @@ try {
     .locator(".conversation-scroll")
     .getByText("Finished safely", { exact: true })
     .waitFor();
+  const fullViewport = await page.evaluate(() => ({
+    width: innerWidth,
+    height: innerHeight,
+  }));
+  await page.setViewportSize({ width: 420, height: 480 });
+  await page.evaluate(() =>
+    window.twr.rpc("thread.send", {
+      thread: "api",
+      prompt:
+        "!perm Bash UI_LAYOUT_BOUNDARY " +
+        "Review this command carefully. ".repeat(300),
+    }),
+  );
+  const longRequest = page
+    .locator(".conversation-attention .attention-card")
+    .filter({ hasText: "UI_LAYOUT_BOUNDARY" });
+  await longRequest.waitFor({ timeout: 15000 });
+  const layout = await page.evaluate(() => {
+    const requests = document.querySelector(".conversation-attention");
+    return {
+      bottom: document
+        .querySelector('button[aria-label="Send message"]')
+        .getBoundingClientRect().bottom,
+      height: innerHeight,
+      scrollable: requests.scrollHeight > requests.clientHeight,
+    };
+  });
+  assert(
+    layout.scrollable,
+    "Long inline requests must scroll within their own region",
+  );
+  assert(
+    layout.bottom <= layout.height + 1,
+    "Inline requests must leave the composer visible",
+  );
+  await page.evaluate(async () => {
+    const item = (await window.twr.rpc("attention.list", { all: true })).find(
+      (a) => a.reason === "permission",
+    );
+    await window.twr.rpc("attention.respond", {
+      attn_id: item.attn_id,
+      revision: item.revision,
+      answer: "deny",
+    });
+  });
+  await longRequest.waitFor({ state: "hidden" });
+  await page.setViewportSize(fullViewport);
+  const showSidebar = page.getByRole("button", {
+    name: "Show sidebar",
+    exact: true,
+  });
+  if (await showSidebar.isVisible()) await showSidebar.click();
+  console.log(
+    "PASS: long inline requests preserve a visible composer in narrow windows",
+  );
   await page
     .getByRole("textbox", { name: "Message api directly" })
     .fill("Second desktop turn");

@@ -1739,20 +1739,25 @@ export default function App({
                     </button>
                   </div>
                 </header>
-                {view.attention
-                  .filter((a) => a.thread === "hub" || a.thread === target?.id)
-                  .map((item) => (
-                    <AttentionCard
-                      key={item.attn_id + ":" + item.revision}
-                      item={item}
-                      thread={view.threads.find((t) => t.id === item.thread)}
-                      readOnly={!permitted("operate")}
-                      onRespond={respond}
-                      rpc={rpc}
-                      fail={fail}
-                    />
-                  ))}
+                <div className="conversation-attention">
+                  {view.attention
+                    .filter(
+                      (a) => a.thread === "hub" || a.thread === target?.id,
+                    )
+                    .map((item) => (
+                      <AttentionCard
+                        key={item.attn_id + ":" + item.revision}
+                        item={item}
+                        thread={view.threads.find((t) => t.id === item.thread)}
+                        readOnly={!permitted("operate")}
+                        onRespond={respond}
+                        rpc={rpc}
+                        fail={fail}
+                      />
+                    ))}
+                </div>
                 <Conversation
+                  key={target?.id || "orchestrator"}
                   events={presentedEvents}
                   showTools={showTools}
                   showThinking={showThinking}
@@ -3174,6 +3179,7 @@ function Conversation({
     overscan: 8,
     getItemKey: (index) => blocks[index].id,
   });
+  const totalSize = virtual.getTotalSize();
   const visibleRoutineKey = [
     ...new Set(
       virtual
@@ -3213,7 +3219,7 @@ function Conversation({
         if (parent.current)
           parent.current.scrollTop = parent.current.scrollHeight;
       });
-  }, [blocks.length, last?.text]);
+  }, [blocks.length, last?.text, totalSize]);
   return (
     <div
       className="conversation-scroll"
@@ -3279,7 +3285,7 @@ function Conversation({
       )}
       <div
         className="transcript-virtual"
-        style={{ height: virtual.getTotalSize(), position: "relative" }}
+        style={{ height: totalSize, position: "relative" }}
       >
         {virtual.getVirtualItems().map((row) => {
           const block = blocks[row.index];

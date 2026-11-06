@@ -1528,6 +1528,16 @@ meter::-webkit-meter-optimum-value {
 .editor-form > button {
   align-self: flex-start;
 }
+.conversation-attention {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 35%;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+.conversation-attention:empty {
+  display: none;
+}
 .attention-card {
   margin: 0 28px 14px;
   border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));

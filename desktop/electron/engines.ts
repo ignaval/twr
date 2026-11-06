@@ -117,8 +117,8 @@ export async function referencedEngines(
     }
     for (const name of entries) {
       if (
-        !(name.startsWith("tools.twr.runner.") && name.endsWith(".plist")) &&
-        !(name.startsWith("twr-runner-") && name.endsWith(".service"))
+        !(name.startsWith("tools.twr.") && name.endsWith(".plist")) &&
+        !(name.startsWith("twr-") && name.endsWith(".service"))
       )
         continue;
       const path = join(directory, name);

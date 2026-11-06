@@ -3,16 +3,7 @@ import {
   registerPlugin,
   type PluginListenerHandle,
 } from "@capacitor/core";
-interface Posture {
-  orientation: "none" | "vertical" | "horizontal";
-  state?: string;
-  separating?: boolean;
-  left?: number;
-  top?: number;
-  width?: number;
-  height?: number;
-  occlusionTop?: number;
-}
+import { usableViewportHeight, type Posture } from "./geometry";
 const Layout = registerPlugin<{
   current(): Promise<Posture>;
   addListener(
@@ -23,23 +14,20 @@ const Layout = registerPlugin<{
 export async function observeLayout() {
   const root = document.documentElement;
   let lastPosture: Posture = { orientation: "none" };
-  const updateViewport = () => {
-    root.style.setProperty(
-      "--viewport-height",
-      `${window.visualViewport?.height ?? window.innerHeight}px`,
-    );
-    apply(lastPosture);
-  };
+  const updateViewport = () => apply(lastPosture);
   const apply = (posture: Posture) => {
     lastPosture = posture;
+    const viewportHeight = usableViewportHeight(
+      posture,
+      window.visualViewport?.height ?? window.innerHeight,
+    );
+    root.style.setProperty("--viewport-height", `${viewportHeight}px`);
     root.style.setProperty("--occlusion-top", `${posture.occlusionTop || 0}px`);
     const style = getComputedStyle(document.body);
     const left = parseFloat(style.paddingLeft) || 0;
     const top = parseFloat(style.paddingTop) || 0;
     const availableHeight =
-      (window.visualViewport?.height || innerHeight) -
-      top -
-      (parseFloat(style.paddingBottom) || 0);
+      viewportHeight - top - (parseFloat(style.paddingBottom) || 0);
     const availableWidth =
       innerWidth - left - (parseFloat(style.paddingRight) || 0);
     const visible =

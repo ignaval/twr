@@ -231,6 +231,18 @@ try {
     });
   });
   await new Promise((resolve) => proxy.listen(port, "127.0.0.1", resolve));
+  if (serial === "emulator-5556") {
+    adbRun([
+      "shell",
+      "settings",
+      "put",
+      "system",
+      "accelerometer_rotation",
+      "0",
+    ]);
+    adbRun(["shell", "settings", "put", "system", "user_rotation", "0"]);
+    adbRun(["shell", "cmd", "device_state", "state", "2"]);
+  }
   adbRun([
     "install",
     "-r",
@@ -1187,12 +1199,29 @@ try {
     await expect(page.getByLabel("Upload files", { exact: true })).toHaveCount(
       0,
     );
+    await expect(page.locator(".connection-status")).toContainText(
+      "Hub connected",
+      { timeout: 30000 },
+    );
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => window.twr.rpc("hub.info").then((r) => r.pid)),
+        { timeout: 30000 },
+      )
+      .toBe(hubPid);
     console.log("PASS: read-only grants disable message and upload controls");
     const stopped = new Promise((resolve) => fixtureHub.once("exit", resolve));
     fixtureHub.kill("SIGTERM");
     await stopped;
     const oldPid = hubPid;
-    fixtureHub = spawn(join(bin, "twr"), ["hub"], { env, stdio: "ignore" });
+    fixtureHub = spawn(join(bin, "twr"), ["hub"], {
+      env,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    fixtureHub.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
     await expect
       .poll(
         () => {
@@ -1210,7 +1239,7 @@ try {
         },
         { timeout: 30000 },
       )
-      .not.toBe(oldPid);
+      .toBe(fixtureHub.pid);
     hubPid = fixtureHub.pid;
     await expect
       .poll(
@@ -1218,7 +1247,8 @@ try {
           page.evaluate(async () => {
             try {
               return (await window.twr.rpc("hub.info")).pid;
-            } catch {
+            } catch (error) {
+              window.__qaRestartError = String(error);
               return 0;
             }
           }),
@@ -1246,12 +1276,43 @@ try {
   writeFileSync("test-results/android-gateway.log", stderr);
   if (page) {
     console.error(await page?.locator("body").innerText());
+    console.error(
+      "Hub restart diagnostic:",
+      await page?.evaluate(() => window.__qaRestartError),
+      "child",
+      fixtureHub?.pid,
+      fixtureHub?.exitCode,
+    );
+    console.error(
+      "Layout diagnostic:",
+      await page?.evaluate(async () => ({
+        width: innerWidth,
+        height: innerHeight,
+        visualHeight: visualViewport?.height,
+        root: document.documentElement.style.cssText,
+        fold: await window.Capacitor.Plugins.TwrLayout.current(),
+        dock: document
+          .querySelector(".terminal-dock")
+          ?.getBoundingClientRect()
+          .toJSON(),
+      })),
+    );
+    console.error("Gateway:", stderr.slice(-5000));
+    const hubLog = join(fixture, "hub.log");
+    if (existsSync(hubLog))
+      console.error(readFileSync(hubLog, "utf8").slice(-5000));
     await page
       ?.screenshot({ path: "test-results/android-failure.png" })
       .catch(() => {});
   }
   throw error;
 } finally {
+  if (serial === "emulator-5556") {
+    try {
+      adbRun(["shell", "settings", "put", "system", "user_rotation", "0"]);
+      adbRun(["shell", "cmd", "device_state", "state", "2"]);
+    } catch {}
+  }
   for (const socket of proxySockets) socket.destroy();
   await new Promise((resolve) => (proxy ? proxy.close(resolve) : resolve()));
   await Promise.all(devices.map((d) => d.close().catch(() => {})));
