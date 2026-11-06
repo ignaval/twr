@@ -15,6 +15,7 @@ export function usableViewportHeight(posture: Posture, viewportHeight: number) {
   const top = posture.top || 0;
   const bottom = top + (posture.height || 0);
   return posture.orientation === "horizontal" &&
+    (posture.separating || posture.state === "half-opened") &&
     top >= 180 &&
     viewportHeight - bottom < 160
     ? Math.min(viewportHeight, top)

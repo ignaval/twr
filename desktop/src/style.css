@@ -1572,6 +1572,10 @@ meter::-webkit-meter-optimum-value {
   max-height: 40vh;
   overflow: auto;
 }
+.conversation-attention .attention-body {
+  max-height: none;
+  overflow: visible;
+}
 .attention-body .markdown {
   font-size: 12px;
   line-height: 1.8;

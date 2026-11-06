@@ -343,16 +343,15 @@ try {
     layout.bottom <= layout.height + 1,
     "Inline requests must leave the composer visible",
   );
-  await page.evaluate(async () => {
-    const item = (await window.twr.rpc("attention.list", { all: true })).find(
-      (a) => a.reason === "permission",
-    );
-    await window.twr.rpc("attention.respond", {
-      attn_id: item.attn_id,
-      revision: item.revision,
-      answer: "deny",
-    });
-  });
+  const deny = longRequest
+    .locator(".attention-options button")
+    .filter({ hasText: "deny" });
+  await deny.scrollIntoViewIfNeeded();
+  assert(
+    await deny.isVisible(),
+    "The full request and Deny action must share one reachable scroll area",
+  );
+  await deny.click();
   await longRequest.waitFor({ state: "hidden" });
   await page.setViewportSize(fullViewport);
   const showSidebar = page.getByRole("button", {
