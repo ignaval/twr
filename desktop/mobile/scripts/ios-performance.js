@@ -60,10 +60,11 @@ await rpc("thread.send", {
       "\n",
     ) + "\nPERFORMANCE_STREAM_FINISHED",
 });
+const sendAckMs = Math.round(performance.now() - start);
 await wait(() =>
-  document
-    .querySelector(".conversation-scroll")
-    ?.textContent.includes("PERFORMANCE_STREAM_FINISHED"),
+  [...document.querySelectorAll(".block-assistant .markdown")].some(
+    (node) => node.textContent.trim() === "PERFORMANCE_STREAM_FINISHED",
+  ),
 );
 const streamToVisibleMs = Math.round(performance.now() - start);
 const input = document.querySelector(".composer textarea");
@@ -97,6 +98,8 @@ const pct = (values, p) =>
 const report = {
   date: new Date().toISOString(),
   toolCalls: 1000,
+  assistantCompletion: true,
+  sendAckMs,
   streamToVisibleMs,
   rpcMedianMs: pct(rpcTimes, 0.5),
   rpcP95Ms: pct(rpcTimes, 0.95),

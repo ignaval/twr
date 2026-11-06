@@ -64,7 +64,7 @@ final class RemoteHubTests: XCTestCase {
           await window.twr.rpc('thread.new',{project:'demo',name:'ios-worker',runtime:'fake'});
           await window.twr.rpc('thread.send',{thread:'ios-worker',prompt:'IOS_REMOTE_STREAM_OK'});return true;
           """)
-        try await until("return JSON.stringify(window.__qaEvents).includes('IOS_REMOTE_STREAM_OK')")
+        try await until("return window.__qaEvents.some(e=>e.type==='thread' && e.event?.kind==='agent.text' && e.event?.data?.text?.includes('IOS_REMOTE_STREAM_OK'))")
         _ = try await js("""
           const visible=e=>e.getClientRects().length>0;
           const nav=[...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
@@ -94,7 +94,7 @@ final class RemoteHubTests: XCTestCase {
           """)
         try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed'))")
         _ = try await js("[...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')).click();return true")
-        try await until("return JSON.stringify(window.__qaEvents).includes('IOS_ANSWERED')")
+        try await until("return window.__qaEvents.some(e=>e.type==='thread' && e.event?.kind==='agent.text' && e.event?.data?.text?.includes('IOS_ANSWERED'))")
         let commandCount = try await js("return (await window.twr.catalog()).length") as? Int
         XCTAssertEqual(commandCount, 71)
         let sizeGuard = try await js("""
@@ -145,8 +145,8 @@ final class RemoteHubTests: XCTestCase {
               const style=getComputedStyle(document.documentElement);
               const axis=document.documentElement.dataset.fold;
               return axis==='vertical'
-                ? box.left>=parseFloat(style.getPropertyValue('--fold-left'))+parseFloat(style.getPropertyValue('--hinge-width'))-1
-                : box.top>=parseFloat(style.getPropertyValue('--fold-top'))+parseFloat(style.getPropertyValue('--hinge-height'))-1;
+                ? box.left>=parseFloat(style.getPropertyValue('--hinge-left'))+parseFloat(style.getPropertyValue('--hinge-width'))-1
+                : box.top>=parseFloat(style.getPropertyValue('--hinge-top'))+parseFloat(style.getPropertyValue('--hinge-height'))-1;
               """) as? Bool
             XCTAssertEqual(safeDialog,true,"Dialog controls must stay clear of the fold")
             _ = try await js("document.querySelector('[aria-label=\"Close dialog\"]').click();return true")
