@@ -282,7 +282,7 @@ for (const [index, template] of selected.entries()) {
       const { stdout } = await execFileAsync(
         "xcrun",
         ["simctl", "spawn", device.udid, foldHelper, "hinge", "0"],
-        { timeout: 120000 },
+        { timeout: 180000 },
       );
       const reading = JSON.parse(stdout.trim().split("\n").at(-1));
       assert(

@@ -92,7 +92,7 @@ final class RemoteHubTests: XCTestCase {
         _ = try await js("""
           window.__qaLocalNotification=null;
           window.__qaLocalNotificationListener=await window.Capacitor.Plugins.LocalNotifications.addListener('localNotificationReceived',notification=>{window.__qaLocalNotification=notification});
-          document.querySelector('button[aria-label="Remote hub settings"]').click();return true;
+          document.querySelector('button[aria-label^="Remote hub settings:"]').click();return true;
           """)
         try await until("return [...document.querySelectorAll('[role=dialog] button')].some(button=>button.textContent.trim()==='Test notification')")
         _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(button=>button.textContent.trim()==='Test notification').click();return true")
@@ -447,7 +447,7 @@ final class RemoteHubTests: XCTestCase {
         _ = try await js("document.querySelector('button[aria-label=\"Send message\"]').click();return true")
         try await until("return [...document.querySelectorAll('.block-assistant .markdown')].some(e=>e.textContent.trim()==='COMPACT_VIEWPORT_SEND_QA')")
         _ = try await js("document.documentElement.style.setProperty('--viewport-height',window.__qaAvailableHeight);window.dispatchEvent(new Event('resize'));await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);return true")
-        try await until("return document.querySelector('button[aria-label=\"Remote hub settings\"]').getClientRects().length>0")
+        try await until("return document.querySelector('button[aria-label^=\"Remote hub settings:\"]').getClientRects().length>0")
         try await verifyLocalNotificationDelivery()
         let layout = try await js("return await window.Capacitor.Plugins.TwrLayout.current()")
         XCTAssertNotNil(layout)

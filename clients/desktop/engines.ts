@@ -19,6 +19,12 @@ import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+export const ENGINE_BINARIES = [
+  "twr",
+  "twr-desktop-bridge",
+  "twr-mobile-gateway",
+] as const;
+
 /** Hash engines without retaining whole executable buffers in Electron's heap. */
 export function fileDigest(path: string, aggregate?: Hash): string {
   const digest = createHash("sha256");
@@ -135,6 +141,38 @@ export async function referencedEngines(
   }
   return retained;
 }
+/** Inspect the user's executable paths, including restricted Linux session processes. */
+export async function linuxEngineProcesses(root: string, procRoot = "/proc") {
+  const inUse = new Set<string>();
+  const engineNames = new Set(ENGINE_BINARIES.map((name) => name.slice(0, 15)));
+  for (const pid of await fs.readdir(procRoot)) {
+    if (!/^\d+$/.test(pid)) continue;
+    const processRoot = join(procRoot, pid);
+    try {
+      if ((await fs.stat(processRoot)).uid !== process.getuid!()) continue;
+      let executable: string;
+      try {
+        executable = await fs.readlink(join(processRoot, "exe"));
+      } catch (error: any) {
+        if (error.code !== "EACCES" && error.code !== "EPERM") throw error;
+        // systemd's same-UID (sd-pam) process is deliberately nondumpable.
+        // comm remains readable. Preserve every engine if an inaccessible
+        // process could be one of our binaries, or cannot be identified.
+        // Linux truncates executable names in comm to 15 bytes.
+        const name = (
+          await fs.readFile(join(processRoot, "comm"), "utf8")
+        ).trim();
+        if (!name || engineNames.has(name)) throw error;
+        continue;
+      }
+      if (executable.startsWith(root + "/")) inUse.add(dirname(executable));
+    } catch (error: any) {
+      if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error;
+    }
+  }
+  return inUse;
+}
+
 export async function cleanupEngines(
   root: string,
   current: string,
@@ -162,16 +200,7 @@ export async function cleanupEngines(
     for (const line of stdout.split("\n"))
       if (line.startsWith("n" + root + "/")) inUse.add(dirname(line.slice(1)));
   } else if (process.platform === "linux") {
-    for (const pid of await fs.readdir("/proc")) {
-      if (!/^\d+$/.test(pid)) continue;
-      try {
-        if ((await fs.stat(`/proc/${pid}`)).uid !== process.getuid!()) continue;
-        const executable = await fs.readlink(`/proc/${pid}/exe`);
-        if (executable.startsWith(root + "/")) inUse.add(dirname(executable));
-      } catch (error: any) {
-        if (error.code !== "ENOENT" && error.code !== "ESRCH") throw error;
-      }
-    }
+    for (const engine of await linuxEngineProcesses(root)) inUse.add(engine);
   } else return;
   // If process enumeration fails, the caller retains every engine. Never remove
   // a running hub's executable merely because it came from an older app build.

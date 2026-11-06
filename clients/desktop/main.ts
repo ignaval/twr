@@ -36,7 +36,7 @@ import {
   workspaceSchema,
 } from "./validation";
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
-import { EngineDigests, cleanupEngines } from "./engines";
+import { ENGINE_BINARIES, EngineDigests, cleanupEngines } from "./engines";
 import { discoverCatalog } from "./catalog";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
@@ -176,11 +176,8 @@ function findBinaries() {
         resolve(__dirname, "../../target/debug"),
         resolve(__dirname, "../../target/release"),
       ].filter(Boolean) as string[]);
-  const dir = dirs.find(
-    (d) =>
-      existsSync(join(d, "twr")) &&
-      existsSync(join(d, "twr-desktop-bridge")) &&
-      existsSync(join(d, "twr-mobile-gateway")),
+  const dir = dirs.find((d) =>
+    ENGINE_BINARIES.every((name) => existsSync(join(d, name))),
   );
   if (!dir)
     throw new Error(
@@ -191,17 +188,14 @@ function findBinaries() {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const cache = new EngineDigests(join(root, "digests.json"));
   const sourceHashes = new Map(
-    ["twr", "twr-desktop-bridge", "twr-mobile-gateway"].map((name) => [
-      name,
-      cache.digest(join(dir, name)),
-    ]),
+    ENGINE_BINARIES.map((name) => [name, cache.digest(join(dir, name))]),
   );
   const digest = createHash("sha256")
     .update(JSON.stringify([...sourceHashes]))
     .digest("hex");
   const stable = join(app.getPath("userData"), "engines", digest);
   mkdirSync(stable, { recursive: true, mode: 0o700 });
-  for (const name of ["twr", "twr-desktop-bridge", "twr-mobile-gateway"]) {
+  for (const name of ENGINE_BINARIES) {
     const target = join(stable, name);
     const source = join(dir, name);
     if (

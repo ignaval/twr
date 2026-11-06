@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { it, expect } from "vitest";
+import { it, expect, vi } from "vitest";
 import {
   mkdtempSync,
   writeFileSync,
@@ -11,6 +11,8 @@ import {
   existsSync,
   copyFileSync,
   chmodSync,
+  symlinkSync,
+  promises as fs,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -21,6 +23,8 @@ import {
   pruneEngines,
   cleanupEngines,
   referencedEngines,
+  linuxEngineProcesses,
+  ENGINE_BINARIES,
 } from "../desktop/engines";
 it("preserves the engine identity across chunk boundaries and detects cache tampering", () => {
   const dir = mkdtempSync(join(tmpdir(), "twr-engine-hash-"));
@@ -158,3 +162,49 @@ it("keeps engines referenced by stopped service units, including binary-plist st
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+it.each(["(sd-pam)", ...ENGINE_BINARIES])(
+  "handles inaccessible Linux executable %s without losing live engines",
+  async (name) => {
+    const root = mkdtempSync(join(tmpdir(), "twr-proc-inspection-"));
+    const procRoot = join(root, "proc");
+    const denied = join(procRoot, "101");
+    const live = join(procRoot, "202");
+    const engine = join(root, "engines", "a".repeat(64));
+    mkdirSync(denied, { recursive: true });
+    mkdirSync(live);
+    writeFileSync(join(denied, "comm"), name.slice(0, 15) + "\n");
+    symlinkSync(join(engine, "twr"), join(live, "exe"));
+    const original = fs.readlink.bind(fs);
+    const blocked = Object.assign(new Error("nondumpable process"), {
+      code: "EACCES",
+      syscall: "readlink",
+      path: join(denied, "exe"),
+    });
+    const spy = vi.spyOn(fs, "readlink").mockImplementation((async (
+      path: any,
+      ...args: any[]
+    ) => {
+      if (String(path) === blocked.path) throw blocked;
+      return (original as any)(path, ...args);
+    }) as typeof fs.readlink);
+    try {
+      if (name === "(sd-pam)")
+        expect([
+          ...(await linuxEngineProcesses(join(root, "engines"), procRoot)),
+        ]).toEqual([engine]);
+      else
+        await expect(
+          linuxEngineProcesses(join(root, "engines"), procRoot),
+        ).rejects.toBe(blocked);
+      // Unidentifiable processes still prevent cleanup.
+      writeFileSync(join(denied, "comm"), "\n");
+      await expect(
+        linuxEngineProcesses(join(root, "engines"), procRoot),
+      ).rejects.toBe(blocked);
+    } finally {
+      spy.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
