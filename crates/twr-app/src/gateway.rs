@@ -84,6 +84,21 @@ struct Server {
     receipt_waiters: Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Value>>>>,
 }
 type OrderedInput = (Call, mpsc::Sender<Value>, u64);
+fn stamp(mut event: Value, generation: u64) -> Value {
+    event["_bridge_generation"] = json!(generation);
+    event
+}
+fn event_generation(event: &Value) -> Option<u64> {
+    event["_bridge_generation"].as_u64()
+}
+fn outbound(mut event: Value, fragmented: bool) -> remote::wire::Outbound {
+    let generation = event
+        .as_object_mut()
+        .and_then(|o| o.remove("_bridge_generation"))
+        .and_then(|v| v.as_u64());
+    remote::wire::Outbound::new(socket_message(&event), generation, fragmented)
+}
+
 fn authorize_mutation(device: &Device, call: &Call) -> Result<()> {
     let allowed = match call.method.as_str() {
         "rpc" => device.allows_params(
@@ -187,29 +202,61 @@ mod socket_tests {
     }
 }
 async fn owner_client() -> Result<twr_core::client::Client> {
-    let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
-    let config = twr_core::config::Config::load_from(&paths)?;
-    let mut client = twr_core::client::Client::connect(&config.socket_path(&paths)).await?;
-    let hello = client.hello(json!({"client":"mobile-gateway"})).await?;
-    anyhow::ensure!(
-        hello["identity"]
-            .as_str()
-            .is_some_and(|id| id.starts_with("user:")),
-        "Launch the gateway from your terminal or desktop launcher"
-    );
-    Ok(client)
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
+        let config = twr_core::config::Config::load_from(&paths)?;
+        let mut client = twr_core::client::Client::connect(&config.socket_path(&paths)).await?;
+        let hello = client.hello(json!({"client":"mobile-gateway"})).await?;
+        anyhow::ensure!(
+            hello["identity"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("user:")),
+            "Launch the gateway from your terminal or desktop launcher"
+        );
+        Ok(client)
+    })
+    .await
+    .context("The hub did not authenticate the gateway within 30 seconds")?
 }
 impl Server {
     async fn owner_call(&self, method: &str, params: Value) -> Result<Value> {
-        let mut owner = self.owner.lock().await;
-        if owner.is_none() {
-            *owner = Some(owner_client().await?);
+        let mut owner = self
+            .owner
+            .try_lock()
+            .context("The hub is busy with another device operation; try again")?;
+        for attempt in 0..2 {
+            if owner.is_none() {
+                *owner = Some(owner_client().await?);
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                owner.as_mut().unwrap().call(method, params.clone()),
+            )
+            .await;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    *owner = None;
+                    anyhow::bail!("The hub did not answer within 30 seconds; the operation may have completed")
+                }
+            };
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    let retry = error
+                        .downcast_ref::<twr_core::client::HubClosed>()
+                        .is_some_and(twr_core::client::HubClosed::resendable);
+                    if error.downcast_ref::<twr_core::proto::RpcError>().is_none() {
+                        *owner = None;
+                    }
+                    if attempt == 0 && retry {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
         }
-        let result = owner.as_mut().unwrap().call(method, params).await;
-        if result.is_err() {
-            *owner = None;
-        }
-        result
+        unreachable!()
     }
 }
 struct DeviceSession {
@@ -256,9 +303,19 @@ async fn pair(State(server): State<Shared>, Json(p): Json<Pair>) -> impl IntoRes
             value["gateway_id"] = json!(server.push.gateway_id);
             (StatusCode::OK, Json(value))
         }
+        Err(error)
+            if error
+                .downcast_ref::<twr_core::proto::RpcError>()
+                .is_some_and(|e| e.code == twr_core::proto::codes::UNAUTHORIZED) =>
+        {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":"Pairing code invalid or expired"})),
+            )
+        }
         Err(_) => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"Pairing code invalid or expired"})),
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"The hub is unavailable or busy. Try again when it reconnects."})),
         ),
     }
 }
@@ -291,6 +348,7 @@ async fn upgrade(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let token = token.to_owned();
+    let fragmented = headers.get("x-twr-framing").and_then(|v| v.to_str().ok()) == Some("1");
     let Ok(slot) = server.slots.clone().try_acquire_owned() else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
@@ -298,7 +356,7 @@ async fn upgrade(
         .max_frame_size(2 * 1024 * 1024)
         .on_upgrade(move |ws| async move {
             let _slot = slot;
-            let _ = serve_socket(server, ws, device, token).await;
+            let _ = serve_socket(server, ws, device, token, fragmented).await;
         })
 }
 #[derive(Deserialize)]
@@ -368,7 +426,11 @@ impl Session {
                         let paths = bridge.call("desktop.paths", json!({})).await?;
                         let cached = self.latest_state.lock().unwrap().clone();
                         if let Some(state) = cached {
-                            let _ = self.events.send(state).await;
+                            if event_generation(&state)
+                                == Some(self.bridge_generation.load(Ordering::SeqCst))
+                            {
+                                let _ = self.events.send(state).await;
+                            }
                         }
                         let _ = self
                             .events
@@ -418,14 +480,14 @@ impl Session {
                         .chain(initial_other)
                     {
                         if current.load(Ordering::SeqCst) == generation
-                            && output.send(event).await.is_err()
+                            && output.send(stamp(event, generation)).await.is_err()
                         {
                             return;
                         }
                     }
                     while let Some(event) = received.recv().await {
                         if current.load(Ordering::SeqCst) == generation
-                            && output.send(event).await.is_err()
+                            && output.send(stamp(event, generation)).await.is_err()
                         {
                             break;
                         }
@@ -442,8 +504,8 @@ impl Session {
                 let paths = bridge.call("desktop.paths", json!({})).await?;
                 // Prove device identity before presenting the connection as usable.
                 bridge.call("hub.info", json!({})).await?;
-                self.latest_state.lock().unwrap().take();
                 self.bridge_generation.store(generation, Ordering::SeqCst);
+                self.latest_state.lock().unwrap().take();
                 *self.connection.write().await = WorkspaceConnection {
                     workspace: workspace.into(),
                     bridge: Some(Arc::new(bridge)),
@@ -808,10 +870,11 @@ async fn serve_socket(
     mut socket: WebSocket,
     device: Device,
     token: String,
+    fragmented: bool,
 ) -> Result<()> {
     socket
         .send(Message::Text(
-            json!({"type":"authenticated","device":device.id,"scopes":device.scopes})
+            json!({"type":"authenticated","device":device.id,"scopes":device.scopes,"framing":fragmented})
                 .to_string()
                 .into(),
         ))
@@ -833,11 +896,23 @@ async fn serve_socket(
             });
             let latest_state = Arc::new(std::sync::Mutex::new(None));
             let state_cache = latest_state.clone();
+            let bridge_generation = Arc::new(AtomicU64::new(0));
+            let current_generation = bridge_generation.clone();
             let forward = events.clone();
             tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
+                    if event_generation(&event)
+                        .is_some_and(|g| g != current_generation.load(Ordering::SeqCst))
+                    {
+                        continue;
+                    }
                     if event["type"] == "state" {
-                        *state_cache.lock().unwrap() = Some(event.clone());
+                        let mut cache = state_cache.lock().unwrap();
+                        if event_generation(&event)
+                            == Some(current_generation.load(Ordering::SeqCst))
+                        {
+                            *cache = Some(event.clone());
+                        }
                     }
                     let _ = forward.send(event);
                 }
@@ -854,7 +929,7 @@ async fn serve_socket(
                         bridge: None,
                     }),
                     connecting: Mutex::new(()),
-                    bridge_generation: Arc::new(AtomicU64::new(0)),
+                    bridge_generation,
                     terminals: Mutex::new(HashMap::new()),
                     events: tx,
                     terminal_events: terminal_tx,
@@ -903,24 +978,94 @@ async fn serve_socket(
     let (replies, mut response_rx) = mpsc::channel::<Value>(32);
     let alive = Arc::new(AtomicBool::new(true));
     let connected = alive.clone();
+    let (heartbeat_tx, mut heartbeat_rx) = mpsc::channel::<Value>(16);
+    let bridge_epoch = slot.session.bridge_generation.clone();
     let writer = tokio::spawn(async move {
+        use remote::wire::Outbound;
+        // Two independent RPC replies, one ordered control stream and one
+        // ordered PTY stream. Keepalives always pass between bounded frames.
+        let mut lanes: [Option<Outbound>; 4] = [None, None, None, None];
+        let mut cursor = 0;
+        enum Ready {
+            Heartbeat(Option<Value>),
+            Reply(Option<Value>),
+            Control(Result<Value, broadcast::error::RecvError>),
+            Terminal(Result<Value, broadcast::error::RecvError>),
+            Send,
+        }
         loop {
-            // Independent PTY lane: terminal bursts cannot evict attention or state.
-            let event = tokio::select! {biased;
-                reply=response_rx.recv()=>match reply{Some(e)=>e,None=>break},
-                event=rx.recv()=>match event{Ok(e)=>e,Err(broadcast::error::RecvError::Lagged(_))=>{
-                    let snapshot=state_cache.lock().unwrap().clone();
-                    if let Some(snapshot)=snapshot {let frame=socket_message(&snapshot);if !matches!(tokio::time::timeout(send_budget(&frame),sink.send(frame)).await,Ok(Ok(()))){break;}}
-                    json!({"type":"resync"})
-                },Err(_)=>break},
-                event=terminal_rx.recv()=>match event{Ok(e)=>e,Err(broadcast::error::RecvError::Lagged(_))=>json!({"type":"terminal-resync"}),Err(_)=>break}
+            let ready = tokio::select! {biased;
+                beat=heartbeat_rx.recv()=>Ready::Heartbeat(beat),
+                reply=response_rx.recv(),if lanes[0].is_none()||lanes[1].is_none()=>Ready::Reply(reply),
+                event=rx.recv(),if lanes[2].is_none()=>Ready::Control(event),
+                event=terminal_rx.recv(),if lanes[3].is_none()=>Ready::Terminal(event),
+                _=std::future::ready(()),if lanes.iter().any(Option::is_some)=>Ready::Send,
             };
-            let frame = socket_message(&event);
-            if !matches!(
-                tokio::time::timeout(send_budget(&frame), sink.send(frame)).await,
-                Ok(Ok(()))
-            ) {
-                break;
+            let immediate = match ready {
+                Ready::Heartbeat(Some(event)) => Some(socket_message(&event)),
+                Ready::Heartbeat(None) | Ready::Reply(None) => break,
+                Ready::Reply(Some(event)) => {
+                    let index = if lanes[0].is_none() { 0 } else { 1 };
+                    lanes[index] = Some(outbound(event, fragmented));
+                    None
+                }
+                Ready::Control(Ok(event)) => {
+                    lanes[2] = Some(outbound(event, fragmented));
+                    None
+                }
+                Ready::Control(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    let snapshot = state_cache.lock().unwrap().clone().filter(|e| {
+                        event_generation(e) == Some(bridge_epoch.load(Ordering::SeqCst))
+                    });
+                    let mut message = outbound(
+                        snapshot.unwrap_or_else(|| json!({"type":"resync"})),
+                        fragmented,
+                    );
+                    message
+                        .frames
+                        .push_back(socket_message(&json!({"type":"resync"})));
+                    lanes[2] = Some(message);
+                    None
+                }
+                Ready::Terminal(Ok(event)) => {
+                    lanes[3] = Some(outbound(event, fragmented));
+                    None
+                }
+                Ready::Terminal(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    lanes[3] = Some(outbound(json!({"type":"terminal-resync"}), fragmented));
+                    None
+                }
+                Ready::Control(Err(_)) | Ready::Terminal(Err(_)) => break,
+                Ready::Send => {
+                    let index = (0..4)
+                        .map(|offset| (cursor + offset) % 4)
+                        .find(|i| lanes[*i].is_some())
+                        .unwrap();
+                    cursor = (index + 1) % 4;
+                    let current = lanes[index].as_mut().unwrap();
+                    if current
+                        .generation
+                        .is_some_and(|g| g != bridge_epoch.load(Ordering::SeqCst))
+                    {
+                        let cancellation = current.cancel();
+                        lanes[index] = None;
+                        cancellation
+                    } else {
+                        let frame = current.frames.pop_front();
+                        if current.frames.is_empty() {
+                            lanes[index] = None;
+                        }
+                        frame
+                    }
+                }
+            };
+            if let Some(frame) = immediate {
+                if !matches!(
+                    tokio::time::timeout(send_budget(&frame), sink.send(frame)).await,
+                    Ok(Ok(()))
+                ) {
+                    break;
+                }
             }
         }
         connected.store(false, Ordering::SeqCst);
@@ -936,27 +1081,28 @@ async fn serve_socket(
                   _=tick.tick()=>{
                     if !alive.load(Ordering::SeqCst)||!server.auth.current(&device)||slot.generation.load(Ordering::SeqCst)!=generation||last_activity.elapsed()>Duration::from_secs(45){break}
                     slot.last_seen.store(remote::auth::now(),Ordering::SeqCst);
-                    if heartbeat.elapsed()>Duration::from_secs(15){if replies.send(json!({"type":"heartbeat"})).await.is_err(){break}heartbeat=tokio::time::Instant::now();}
+                    if heartbeat.elapsed()>Duration::from_secs(15){if heartbeat_tx.is_closed(){break}let _=heartbeat_tx.try_send(json!({"type":"heartbeat"}));heartbeat=tokio::time::Instant::now();}
                   }
                   message=incoming.next()=>{
                     let Some(Ok(message))=message else{break};
                     last_activity=tokio::time::Instant::now();
                     if !server.auth.current(&device)||slot.generation.load(Ordering::SeqCst)!=generation{break}
                     let Message::Text(text)=message else{continue};
-                    let Ok(call)=serde_json::from_str::<Call>(&text)else{let _=replies.send(json!({"type":"error","error":"Invalid request"})).await;continue};
-                    if call.method=="heartbeat"{let _=replies.send(json!({"id":call.id,"result":null})).await;continue}
-                    if uuid::Uuid::parse_str(&call.id).is_err()||call.method.len()>80 {let _=replies.send(json!({"id":call.id,"error":"Invalid request ID or method"})).await;continue}
+                    let Ok(call)=serde_json::from_str::<Call>(&text)else{let _=replies.try_send(json!({"type":"error","error":"Invalid request"}));continue};
+                    if uuid::Uuid::parse_str(&call.id).is_err()||call.method.len()>80 {let _=replies.try_send(json!({"type":"error","error":"Invalid request ID or method"}));continue}
                     if window.elapsed()>Duration::from_secs(60){window=std::time::Instant::now();count=0}
                     count+=1;
-                    if count>1200{let _=replies.send(json!({"id":call.id,"error":"Too many requests. Wait a moment before trying again."})).await;continue}
+                    if count>1200{let _=replies.try_send(json!({"id":call.id,"error":"Too many requests. Wait a moment before trying again."}));continue}
+                    if call.method=="heartbeat"{let _=heartbeat_tx.try_send(json!({"id":call.id,"result":null}));continue}
+
                     // One bounded ordered input lane. A blocked PTY cannot stall RPCs,
             // heartbeats or revocation on the WebSocket read loop.
             if matches!(call.method.as_str(),"terminal-write"|"terminal-resize") {
                 let id=call.id.clone();
-                if slot.input.try_send((call,replies.clone(),generation)).is_err() {let _=replies.send(json!({"id":id,"error":"Terminal input queue is full"})).await;}
+                if slot.input.try_send((call,replies.clone(),generation)).is_err() {let _=replies.try_send(json!({"id":id,"error":"Terminal input queue is full"}));}
                 continue;
             }
-            let Ok(permit)=calls.clone().try_acquire_owned()else{let _=replies.send(json!({"id":call.id,"error":"Too many pending operations"})).await;continue};
+            let Ok(permit)=calls.clone().try_acquire_owned()else{let _=replies.try_send(json!({"id":call.id,"error":"Too many pending operations"}));continue};
                     let task_server=server.clone();let task_slot=slot.clone();let task_device=device.clone();let task_replies=replies.clone();
                     tokio::spawn(async move{
                       let _permit=permit;
@@ -999,6 +1145,7 @@ async fn serve_socket(
     }
     slot.last_seen.store(remote::auth::now(), Ordering::SeqCst);
     drop(replies);
+    drop(heartbeat_tx);
     writer.abort();
     Ok(())
 }

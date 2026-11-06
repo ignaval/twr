@@ -1,7 +1,8 @@
 // Real Electron + real Rust hub + twr's deterministic test adapter. No provider account,
 // user's config, network agent, or existing workspace is touched.
 import { performanceAudit } from "./performance.mjs";
-import { _electron as electron } from "@playwright/test";
+import { _electron as electron, chromium } from "@playwright/test";
+import { createServer } from "node:net";
 import { spawn, execFileSync } from "node:child_process";
 import {
   mkdtempSync,
@@ -99,6 +100,8 @@ writeFileSync(env.ENV, "PS1='DESKTOP_TEST> '\n");
 // Prevent Electron from taking Node-only launch flags inherited from an editor.
 delete env.ELECTRON_RUN_AS_NODE;
 let application;
+let packagedProcess;
+let packagedLog = "";
 let hub;
 const errors = [];
 try {
@@ -120,18 +123,67 @@ try {
       await new Promise((r) => setTimeout(r, 100));
     }
   }
-  application = await electron.launch({
-    executablePath: process.env.TWR_DESKTOP_EXECUTABLE || undefined,
-    args: [
-      ...(process.env.TWR_DESKTOP_EXECUTABLE ? [] : ["."]),
-      ...(process.env.TWR_DESKTOP_WAYLAND_TEST
-        ? ["--ozone-platform=wayland"]
-        : []),
-    ],
-    cwd: resolve("."),
-    env,
-    timeout: 60000,
-  });
+  if (process.env.TWR_DESKTOP_EXECUTABLE) {
+    const port = await new Promise((resolve, reject) => {
+      const server = createServer();
+      server.on("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const port = server.address().port;
+        server.close(() => resolve(port));
+      });
+    });
+    packagedProcess = spawn(
+      process.env.TWR_DESKTOP_EXECUTABLE,
+      [
+        `--remote-debugging-port=${port}`,
+        `--user-data-dir=${env.TWR_DESKTOP_TEST_USER_DATA}`,
+        ...(process.env.TWR_DESKTOP_WAYLAND_TEST
+          ? ["--ozone-platform=wayland"]
+          : []),
+      ],
+      { cwd: resolve("."), env, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    packagedProcess.stdout.on("data", (chunk) => (packagedLog += chunk));
+    packagedProcess.stderr.on("data", (chunk) => (packagedLog += chunk));
+    packagedProcess.on("error", (error) => (packagedLog += String(error)));
+    let browser;
+    for (let attempt = 0; attempt < 120; attempt++) {
+      try {
+        browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, {
+          timeout: 500,
+        });
+        break;
+      } catch {
+        if (packagedProcess.exitCode !== null) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    assert(
+      browser,
+      "Packaged app must expose its test Chromium port: " + packagedLog,
+    );
+    const page = browser.contexts()[0].pages()[0];
+    application = {
+      firstWindow: async () => page,
+      close: async () => {
+        await page.evaluate(() => window.twr.quit()).catch(() => {});
+        await browser.close();
+        const deadline = Date.now() + 10000;
+        while (packagedProcess.exitCode === null && Date.now() < deadline)
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        assert(
+          packagedProcess.exitCode !== null,
+          "Packaged app must quit through its normal IPC",
+        );
+      },
+    };
+  } else
+    application = await electron.launch({
+      args: ["."],
+      cwd: resolve("."),
+      env,
+      timeout: 60000,
+    });
   const page = await application.firstWindow();
   page.on("pageerror", (error) => errors.push(error.message));
   await page
@@ -649,7 +701,7 @@ try {
     await performanceAudit(
       page,
       process.env.TWR_PERF_LABEL || process.platform,
-      application,
+      packagedProcess ? undefined : application,
     );
   await application.close();
   application = undefined;
@@ -685,7 +737,8 @@ try {
   // Failed tests may leave a native confirmation open. Force only this test's process
   // to exit so the runner and its temporary hub always reach cleanup.
   if (application) {
-    await application.evaluate(({ app }) => app.exit(0)).catch(() => {});
+    if (packagedProcess) packagedProcess.kill("SIGTERM");
+    else await application.evaluate(({ app }) => app.exit(0)).catch(() => {});
     await application.close().catch(() => {});
   }
   try {

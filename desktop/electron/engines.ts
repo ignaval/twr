@@ -4,6 +4,7 @@ import {
   readSync,
   closeSync,
   statSync,
+  realpathSync,
   readFileSync,
   writeFileSync,
   renameSync,
@@ -13,6 +14,7 @@ import {
   promises as fs,
 } from "node:fs";
 import { join, dirname } from "node:path";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -100,8 +102,57 @@ export function pruneEngines(
       rmSync(entry.path, { recursive: true, force: true });
 }
 
-export async function cleanupEngines(root: string, current: string) {
-  const inUse = new Set<string>();
+export async function referencedEngines(
+  root: string,
+  serviceDirectories: string[],
+): Promise<Set<string>> {
+  const retained = new Set<string>();
+  for (const directory of serviceDirectories) {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(directory);
+    } catch (error: any) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
+    for (const name of entries) {
+      if (
+        !(name.startsWith("tools.twr.runner.") && name.endsWith(".plist")) &&
+        !(name.startsWith("twr-runner-") && name.endsWith(".service"))
+      )
+        continue;
+      const path = join(directory, name);
+      if ((await fs.stat(path)).size > 1024 * 1024)
+        throw new Error("Service definition is too large to check safely");
+      // Covers UTF-16 strings in binary launchd plists as well as ordinary
+      // XML/systemd files without interpreting or printing their contents.
+      const text = (await fs.readFile(path))
+        .toString("utf8")
+        .replaceAll("\0", "");
+      for (const digest of text.match(/[a-f0-9]{64}/g) || [])
+        retained.add(join(root, digest));
+    }
+  }
+  return retained;
+}
+export async function cleanupEngines(
+  root: string,
+  current: string,
+  extraServiceDirectories: string[] = [],
+) {
+  root = realpathSync(root);
+  current = realpathSync(current);
+  const inUse = await referencedEngines(root, [
+    join(homedir(), "Library/LaunchAgents"),
+    "/Library/LaunchDaemons",
+    join(
+      process.env.XDG_CONFIG_HOME || join(homedir(), ".config"),
+      "systemd/user",
+    ),
+    "/etc/systemd/user",
+    "/etc/systemd/system",
+    ...extraServiceDirectories,
+  ]);
   if (process.platform === "darwin") {
     const { stdout } = await promisify(execFile)(
       "/usr/sbin/lsof",

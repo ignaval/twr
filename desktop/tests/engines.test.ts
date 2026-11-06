@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { it, expect } from "vitest";
 import {
   mkdtempSync,
@@ -7,11 +9,19 @@ import {
   utimesSync,
   mkdirSync,
   existsSync,
+  copyFileSync,
+  chmodSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { fileDigest, EngineDigests, pruneEngines } from "../electron/engines";
+import {
+  fileDigest,
+  EngineDigests,
+  pruneEngines,
+  cleanupEngines,
+  referencedEngines,
+} from "../electron/engines";
 it("preserves the engine identity across chunk boundaries and detects cache tampering", () => {
   const dir = mkdtempSync(join(tmpdir(), "twr-engine-hash-"));
   try {
@@ -70,6 +80,65 @@ it("engine cleanup retains running hubs and two recent versions", () => {
       true,
       true,
     ]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it("retains an engine used by a live OS process and prunes it after exit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "twr-active-engine-"));
+  let process;
+  try {
+    const dirs = Array.from({ length: 4 }, (_, i) =>
+      join(root, String(i).repeat(64)),
+    );
+    dirs.forEach((dir, i) => {
+      mkdirSync(dir);
+      utimesSync(dir, new Date(i * 1000), new Date(i * 1000));
+    });
+    const executable = join(dirs[0], "twr");
+    copyFileSync("/bin/sleep", executable);
+    chmodSync(executable, 0o755);
+    utimesSync(dirs[0], new Date(0), new Date(0));
+    process = spawn(executable, ["60"], { stdio: "ignore" });
+    const exited = once(process, "exit");
+    await once(process, "spawn");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(process.exitCode).toBeNull();
+    expect(process.signalCode).toBeNull();
+    await cleanupEngines(root, dirs[3]);
+    expect(existsSync(dirs[0])).toBe(true);
+    if (process.exitCode === null && process.signalCode === null)
+      process.kill("SIGKILL");
+    await exited;
+    await cleanupEngines(root, dirs[3]);
+    expect(existsSync(dirs[0])).toBe(false);
+  } finally {
+    if (process?.exitCode === null) process.kill("SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30000);
+
+it("keeps engines referenced by stopped service units, including binary-plist strings", async () => {
+  const root = mkdtempSync(join(tmpdir(), "twr-service-engines-"));
+  try {
+    const units = join(root, "units");
+    mkdirSync(units);
+    const a = "a".repeat(64),
+      b = "b".repeat(64);
+    writeFileSync(
+      join(units, "twr-runner-lab.service"),
+      "ExecStart=/old/symlink/engines/" + a + "/twr",
+    );
+    writeFileSync(
+      join(units, "tools.twr.runner.lab.plist"),
+      Buffer.from("/different/engines/" + b + "/twr", "utf16le"),
+    );
+    const retained = await referencedEngines(root, [
+      units,
+      join(root, "missing"),
+    ]);
+    expect([...retained].sort()).toEqual([join(root, a), join(root, b)]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

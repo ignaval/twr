@@ -82,12 +82,18 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                 let url = try endpoint(call.getString("url") ?? "")
                 let (healthData, healthResponse) = try await network.data(from:url.appendingPathComponent("health"))
                 guard (healthResponse as? HTTPURLResponse)?.statusCode == 200,
-                      let health=try JSONSerialization.jsonObject(with:healthData) as? [String:Any],
-                      let gateway=health["gateway_id"] as? String, !gateway.isEmpty else {throw Failure("Could not identify the hub")}
-                guard !(try vault().values.contains(where:{$0["gateway_id"] as? String == gateway})) else {throw Failure("This hub is already paired. Use Revoke this device in its settings before pairing again.")}
+                      let health=try JSONSerialization.jsonObject(with:healthData) as? [String:Any] else {throw Failure("Could not identify the hub")}
+                if let gateway=health["gateway_id"] as? String, !gateway.isEmpty,
+                   try vault().values.contains(where:{$0["gateway_id"] as? String == gateway}) {
+                    throw Failure("This hub is already paired. Use Revoke this device in its settings, or Forget this hub under Device access if it cannot connect, then pair again.")
+                }
                 var request = URLRequest(url: url.appendingPathComponent("v1/pair")); request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.httpBody = try JSONSerialization.data(withJSONObject: ["code": call.getString("code") ?? "", "name": call.getString("name") ?? ""])
                 let (data, response) = try await network.data(for: request)
+                if (response as? HTTPURLResponse)?.statusCode != 200 {
+                    let detail=(try? JSONSerialization.jsonObject(with:data) as? [String:Any])?["error"] as? String
+                    throw Failure(String((detail ?? "Pairing failed. Check the code and hub URL.").prefix(240)))
+                }
                 guard (response as? HTTPURLResponse)?.statusCode == 200, var record = try JSONSerialization.jsonObject(with: data) as? [String: Any], let token = record["token"] as? String, token.count == 64 else { throw Failure("Pairing failed. Check the code and hub URL.") }
                 let id = UUID().uuidString; record["url"] = url.absoluteString; record["name"] = call.getString("hubName") ?? "My hub"
                 var hubs = try vault(); hubs[id] = record; try save(hubs)
@@ -103,7 +109,7 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
             var components = URLComponents(url: base.appendingPathComponent("v1/socket"), resolvingAgainstBaseURL: false)!
             components.scheme = base.scheme == "https" ? "wss" : "ws"
             socket?.cancel(with: .normalClosure, reason: nil)
-            var request=URLRequest(url:components.url!);request.setValue("Bearer \(token)",forHTTPHeaderField:"Authorization")
+            var request=URLRequest(url:components.url!);request.setValue("Bearer \(token)",forHTTPHeaderField:"Authorization");request.setValue("1",forHTTPHeaderField:"X-Twr-Framing")
             let task = socketNetwork.webSocketTask(with: request); task.maximumMessageSize=16*1024*1024; socket = task; activeHub = id; task.resume()
             Task {
                 var authenticated = false

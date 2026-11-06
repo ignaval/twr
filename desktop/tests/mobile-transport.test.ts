@@ -35,6 +35,40 @@ beforeEach(() => {
   });
 });
 describe("mobile reconnect", () => {
+  it("detects a silent socket without waiting for a long RPC timeout", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((event) => events.push(event));
+      const original = fake.send.getMockImplementation()!;
+      fake.send.mockImplementation(async (payload) => {
+        const call = JSON.parse(payload.message);
+        if (call.method !== "heartbeat" && call.method !== "config-read")
+          await original(payload);
+      });
+      const pending = host
+        .request("config-read", {}, 660000)
+        .catch((error) => error);
+      await vi.advanceTimersByTimeAsync(61000);
+      expect(
+        events.some((event) => event.type === "connection" && !event.connected),
+      ).toBe(true);
+      expect(fake.disconnect).toHaveBeenCalled();
+      expect(await pending).toBeInstanceOf(Error);
+      expect(fake.connect.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("sends independent heartbeats while a large read reply is pending", async () => {
     vi.useFakeTimers();
     const host = new RemoteHost(

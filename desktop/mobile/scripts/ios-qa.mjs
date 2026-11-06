@@ -81,6 +81,7 @@ for (const [index, template] of selected.entries()) {
       const { stdout } = await command(["hinge", "0"]);
       const reading = JSON.parse(stdout.trim().split("\n").at(-1));
       const angle = reading.angleDegrees;
+      console.log("HINGE", JSON.stringify({ pose, ...reading }));
       assert(
         reading.angleValid && Number.isFinite(angle),
         "Simulator hinge reading must be valid",
@@ -251,9 +252,36 @@ for (const [index, template] of selected.entries()) {
     execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
       stdio: "inherit",
     });
-    if (device.name.includes("Duo")) {
-      await fold("closed");
+    const developer =
+      process.env.DEVELOPER_DIR ||
+      execFileSync("xcode-select", ["-p"], { encoding: "utf8" }).trim();
+    const applications = join(developer, "Applications");
+    if (existsSync(applications)) {
+      console.log(
+        "Simulator UI applications",
+        readdirSync(applications).filter((name) => name.endsWith(".app")),
+      );
+      const ui = ["Simulator.app", "DeviceHub.app"]
+        .map((name) => join(applications, name))
+        .find(existsSync);
+      if (ui)
+        try {
+          execFileSync(
+            "open",
+            [
+              "-a",
+              ui,
+              ...(ui.endsWith("/Simulator.app")
+                ? ["--args", "-CurrentDeviceUDID", device.udid]
+                : []),
+            ],
+            { timeout: 30000 },
+          );
+        } catch (error) {
+          console.log("Simulator UI could not open:", error.message);
+        }
     }
+
     server = createServer(async (req, res) => {
       res.setHeader("content-type", "application/json");
       if (req.url === "/fixture") {

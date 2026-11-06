@@ -1,3 +1,4 @@
+import { FrameAssembler } from "./framing";
 import { requestId, fileDigest } from "./crypto";
 import { registerPlugin } from "@capacitor/core";
 import type { PluginListenerHandle } from "@capacitor/core";
@@ -40,14 +41,34 @@ export class RemoteHost {
   private stopped = false;
   private retryTimer?: ReturnType<typeof setTimeout>;
   private retryCount = 0;
+  private assembler = new FrameAssembler();
+  private lastFrameAt = Date.now();
+  private closing: Promise<void> = Promise.resolve();
+  private transportFailed(error: string) {
+    if (this.stopped) return;
+    this.nativeConnected = false;
+    this.bridgeReady = false;
+    this.assembler.clear();
+    this.rejectPending(true);
+    this.listeners.forEach((listener) =>
+      listener({ type: "connection", connected: false, error }),
+    );
+    this.closing = Transport.disconnect().catch(() => {});
+    void this.closing.then(() => this.scheduleReconnect());
+  }
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private startHeartbeat() {
     if (this.heartbeatTimer) return;
     this.heartbeatTimer = setInterval(() => {
-      if (this.nativeConnected && !this.stopped && this.foreground)
+      if (this.nativeConnected && !this.stopped && this.foreground) {
+        if (Date.now() - this.lastFrameAt > 45000) {
+          this.transportFailed("Remote hub stopped responding; reconnecting…");
+          return;
+        }
         void this.send(
           JSON.stringify({ id: requestId(), method: "heartbeat" }),
         ).catch(() => {});
+      }
     }, 15000);
   }
   setForeground(value: boolean) {
@@ -95,6 +116,8 @@ export class RemoteHost {
     return sent;
   }
   private async openSocket() {
+    await this.closing;
+    if (this.stopped) throw new Error("This hub connection was closed");
     let timer: ReturnType<typeof setTimeout>;
     try {
       await Promise.race([
@@ -118,56 +141,71 @@ export class RemoteHost {
     private chooseDirectory: () => Promise<string | null>,
   ) {}
   async start() {
-    this.listener = await Transport.addListener("message", ({ message }) => {
-      if (message.type === "heartbeat") {
-        void this.send(
-          JSON.stringify({ id: requestId(), method: "heartbeat" }),
-        ).catch(() => {});
-        return;
-      }
-      if (message.type === "resync" || message.type === "terminal-resync") {
-        this.listeners.forEach((listener) =>
-          listener({
-            type: "resync",
-            scope: message.type === "terminal-resync" ? "terminal" : "control",
-          }),
-        );
-        return;
-      }
-      if (message.type === "companion-closed") {
-        this.bridgeReady = false;
-        this.listeners.forEach((listener) =>
-          listener({
-            type: "connection",
-            connected: false,
-            error: "Hub companion stopped; reconnecting…",
-          }),
-        );
-        this.scheduleReconnect();
-        return;
-      }
-      if (message.id && this.pending.has(message.id)) {
-        const request = this.pending.get(message.id)!;
-        this.pending.delete(message.id);
-        clearTimeout(request.timer);
-        if (message.error) request.reject(new Error(message.error));
-        else request.resolve(message.result);
-      } else {
-        if (message.type === "authenticated") this.nativeConnected = true;
-        if (message.type === "transport-closed") {
-          this.nativeConnected = false;
-          this.rejectPending(true);
-          this.scheduleReconnect();
+    this.listener = await Transport.addListener(
+      "message",
+      ({ message: frame }) => {
+        if (this.stopped) return;
+        this.lastFrameAt = Date.now();
+        let message: Json | undefined;
+        try {
+          message = this.assembler.accept(frame);
+        } catch (error) {
+          this.transportFailed(String(error));
+          return;
         }
-        this.listeners.forEach((listener) =>
-          listener(
-            message.type === "transport-closed"
-              ? { ...message, type: "connection" }
-              : message,
-          ),
-        );
-      }
-    });
+        if (!message) return;
+        if (message.type === "heartbeat") {
+          void this.send(
+            JSON.stringify({ id: requestId(), method: "heartbeat" }),
+          ).catch(() => {});
+          return;
+        }
+        if (message.type === "resync" || message.type === "terminal-resync") {
+          this.listeners.forEach((listener) =>
+            listener({
+              type: "resync",
+              scope:
+                message.type === "terminal-resync" ? "terminal" : "control",
+            }),
+          );
+          return;
+        }
+        if (message.type === "companion-closed") {
+          this.bridgeReady = false;
+          this.listeners.forEach((listener) =>
+            listener({
+              type: "connection",
+              connected: false,
+              error: "Hub companion stopped; reconnecting…",
+            }),
+          );
+          this.scheduleReconnect();
+          return;
+        }
+        if (message.id && this.pending.has(message.id)) {
+          const request = this.pending.get(message.id)!;
+          this.pending.delete(message.id);
+          clearTimeout(request.timer);
+          if (message.error) request.reject(new Error(message.error));
+          else request.resolve(message.result);
+        } else {
+          if (message.type === "authenticated") this.nativeConnected = true;
+          if (message.type === "transport-closed") {
+            this.assembler.clear();
+            this.nativeConnected = false;
+            this.rejectPending(true);
+            this.scheduleReconnect();
+          }
+          this.listeners.forEach((listener) =>
+            listener(
+              message.type === "transport-closed"
+                ? { ...message, type: "connection" }
+                : message,
+            ),
+          );
+        }
+      },
+    );
     try {
       await this.openSocket();
       this.nativeConnected = true;
@@ -195,10 +233,12 @@ export class RemoteHost {
   async stop() {
     this.stopped = true;
     clearInterval(this.heartbeatTimer);
+    this.assembler.clear();
     clearTimeout(this.retryTimer);
     this.nativeConnected = false;
     this.rejectPending();
     await this.listener?.remove();
+    await this.closing;
     await Transport.disconnect();
   }
   private queueConnection<T>(job: () => Promise<T>): Promise<T> {
@@ -240,7 +280,7 @@ export class RemoteHost {
         if (!this.confirmedWorkspace) return;
         if (this.nativeConnected) {
           try {
-            await this.request("heartbeat", {}, 3000);
+            await this.request("heartbeat", {}, 15000);
           } catch {
             this.nativeConnected = false;
             this.bridgeReady = false;

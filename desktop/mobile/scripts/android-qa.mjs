@@ -75,6 +75,7 @@ const port = 47321;
 const gatewayPort = 47325;
 let proxy;
 let downstreamRate = 0;
+let dropDownstream = false;
 const proxySockets = new Set();
 async function nativeConfirm() {
   const xmlPath = "/sdcard/twr-confirm-qa.xml";
@@ -178,6 +179,10 @@ try {
     const upstream = connectTCP(gatewayPort, "127.0.0.1");
     const throttle = new Transform({
       transform(chunk, _encoding, callback) {
+        if (dropDownstream) {
+          callback();
+          return;
+        }
         if (downstreamRate)
           setTimeout(
             () => callback(null, chunk),
@@ -928,17 +933,46 @@ try {
     downstreamRate = 64 * 1024;
     const started = Date.now();
     try {
-      const result = await page.evaluate(async () => {
-        const transcript = await window.twr.rpc("thread.transcript", {
-          thread: "slow-link",
-          limit: 500,
-        });
-        return {
-          length: transcript.events.find((event) => event.kind === "agent.text")
-            ?.data?.text?.length,
-          drops: window.__qaSlowDrops,
-        };
+      await page.evaluate(() => {
+        window.__qaSlowResult = undefined;
+        void window.twr
+          .rpc("thread.transcript", {
+            thread: "slow-link",
+            limit: 500,
+            since_seq: window.__qaSlowSince,
+          })
+          .then(
+            (transcript) =>
+              (window.__qaSlowResult = {
+                length: transcript.events.find(
+                  (event) => event.kind === "agent.text",
+                )?.data?.text?.length,
+                drops: window.__qaSlowDrops,
+              }),
+            (error) =>
+              (window.__qaSlowResult = {
+                error: String(error),
+                drops: window.__qaSlowDrops,
+              }),
+          );
       });
+      await page.waitForTimeout(3000);
+      adbRun(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+      await page.waitForTimeout(4000);
+      adbRun([
+        "shell",
+        "am",
+        "start",
+        "-n",
+        "tools.twr.mobile.dev/.MainActivity",
+      ]);
+      await expect
+        .poll(() => page.evaluate(() => window.__qaSlowResult), {
+          timeout: 180000,
+        })
+        .not.toBeUndefined();
+      const result = await page.evaluate(() => window.__qaSlowResult);
+      assert.equal(result.error, undefined);
       assert.equal(result.length, 4194304);
       assert.equal(result.drops, 0, "Slow transfer must not reconnect");
       assert(
@@ -950,7 +984,42 @@ try {
       await page.evaluate(() => window.__qaSlowWatch());
     }
     console.log(
-      "PASS: a 4 MiB transcript crosses a 64 KiB/s link without a timeout or reconnect",
+      "PASS: a 4 MiB transcript crosses a 64 KiB/s link and foreground resume without reconnecting",
+    );
+    await page.evaluate(() => {
+      window.__qaNatDrops = 0;
+      window.__qaNatWatch = window.twr.onEvent((event) => {
+        if (event.type === "connection" && !event.connected)
+          window.__qaNatDrops++;
+      });
+    });
+    dropDownstream = true;
+    try {
+      await expect
+        .poll(() => page.evaluate(() => window.__qaNatDrops), {
+          timeout: 75000,
+          intervals: [1000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      dropDownstream = false;
+    }
+    await expect
+      .poll(
+        () =>
+          page.evaluate(async () => {
+            try {
+              return (await window.twr.rpc("hub.info")).identity;
+            } catch {
+              return "";
+            }
+          }),
+        { timeout: 60000 },
+      )
+      .toMatch(/^user:device:/);
+    await page.evaluate(() => window.__qaNatWatch());
+    console.log(
+      "PASS: a silent downstream blackhole is detected and the client reconnects after recovery",
     );
   }
   if (process.env.TWR_PERF === "1")
@@ -1081,6 +1150,54 @@ try {
       0,
     );
     console.log("PASS: read-only grants disable message and upload controls");
+    const stopped = new Promise((resolve) => fixtureHub.once("exit", resolve));
+    fixtureHub.kill("SIGTERM");
+    await stopped;
+    const oldPid = hubPid;
+    fixtureHub = spawn(join(bin, "twr"), ["hub"], { env, stdio: "ignore" });
+    await expect
+      .poll(
+        () => {
+          try {
+            return JSON.parse(
+              execFileSync(join(bin, "twr"), ["info", "--json"], {
+                env,
+                encoding: "utf8",
+                timeout: 5000,
+              }),
+            ).pid;
+          } catch {
+            return oldPid;
+          }
+        },
+        { timeout: 30000 },
+      )
+      .not.toBe(oldPid);
+    hubPid = fixtureHub.pid;
+    await expect
+      .poll(
+        () =>
+          page.evaluate(async () => {
+            try {
+              return (await window.twr.rpc("hub.info")).pid;
+            } catch {
+              return 0;
+            }
+          }),
+        { timeout: 30000 },
+      )
+      .toBe(hubPid);
+    await page
+      .getByRole("button", { name: "Remote hub settings", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Revoke this device", exact: true })
+      .click();
+    await nativeConfirm();
+    await expect(page.locator(".mobile-onboarding")).toBeVisible();
+    console.log(
+      "PASS: the persistent gateway owner reconnects safely after a hub restart and revokes the device",
+    );
   }
   assert.deepEqual(errors, []);
   console.log(

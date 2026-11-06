@@ -171,7 +171,14 @@ function findBinaries() {
   }
   cache.save();
   setTimeout(
-    () => void cleanupEngines(root, stable).catch(() => {}),
+    () =>
+      void cleanupEngines(
+        root,
+        stable,
+        loginEnv.XDG_CONFIG_HOME
+          ? [join(loginEnv.XDG_CONFIG_HOME, "systemd/user")]
+          : [],
+      ).catch(() => {}),
     30000,
   ).unref();
   return {

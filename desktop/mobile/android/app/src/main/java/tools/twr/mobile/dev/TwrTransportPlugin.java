@@ -60,14 +60,20 @@ public class TwrTransportPlugin extends Plugin {
         String url=endpoint(call.getString("url",""));JSONObject body=new JSONObject();body.put("code",call.getString("code",""));body.put("name",call.getString("name",""));
         try(Response health=http.newCall(new Request.Builder().url(url+"/health").build()).execute()) {
             if(!health.isSuccessful()||health.body()==null)throw new Exception("Could not identify the hub");
-            String gateway=new JSONObject(health.body().string()).getString("gateway_id");
+            String gateway=new JSONObject(health.body().string()).optString("gateway_id","");
             JSONObject existing=vault();java.util.Iterator<String> keys=existing.keys();
-            while(keys.hasNext())if(gateway.equals(existing.getJSONObject(keys.next()).optString("gateway_id")))throw new Exception("This hub is already paired. Use Revoke this device in its settings before pairing again.");
+            while(keys.hasNext())if(!gateway.isEmpty()&&gateway.equals(existing.getJSONObject(keys.next()).optString("gateway_id")))throw new Exception("This hub is already paired. Use Revoke this device in its settings, or Forget this hub under Device access if it cannot connect, then pair again.");
         }
         Request request=new Request.Builder().url(url+"/v1/pair").post(RequestBody.create(body.toString(),MediaType.get("application/json"))).build();
         try(Response response=http.newCall(request).execute()){
-            if(!response.isSuccessful()||response.body()==null)throw new Exception("Pairing failed. Check the code and hub URL.");
-            JSONObject record=new JSONObject(response.body().string());String id=java.util.UUID.randomUUID().toString();record.put("url",url);record.put("name",call.getString("hubName","My hub"));
+            if(response.body()==null)throw new Exception("Pairing failed. Check the code and hub URL.");
+            String responseText=response.body().string();
+            if(!response.isSuccessful()) {
+                String detail="Pairing failed. Check the code and hub URL.";
+                try {detail=new JSONObject(responseText).optString("error",detail);}catch(JSONException ignored){}
+                throw new Exception(detail.substring(0,Math.min(detail.length(),240)));
+            }
+            JSONObject record=new JSONObject(responseText);String id=java.util.UUID.randomUUID().toString();record.put("url",url);record.put("name",call.getString("hubName","My hub"));
             if(record.getString("token").length()!=64)throw new Exception("Invalid hub credentials");
             JSONObject all=vault();all.put(id,record);save(all);call.resolve(metadata(id,record));
         }
@@ -77,7 +83,7 @@ public class TwrTransportPlugin extends Plugin {
         if(socket!=null)socket.close(1000,"Switching hub");
         String id=call.getString("id","");JSONObject hub=vault().getJSONObject(id);String url=endpoint(hub.getString("url")).replaceFirst("^http","ws")+"/v1/socket";
         activeHub=id;
-        WebSocket opened=http.newWebSocket(new Request.Builder().url(url).header("Authorization","Bearer "+hub.getString("token")).build(),new WebSocketListener(){
+        WebSocket opened=http.newWebSocket(new Request.Builder().url(url).header("Authorization","Bearer "+hub.getString("token")).header("X-Twr-Framing","1").build(),new WebSocketListener(){
             private boolean authenticated=false;
             @Override public void onOpen(WebSocket ws,Response response){}
             @Override public void onMessage(WebSocket ws,String text){if(generation!=connectionGeneration.get())return;try{if(text.length()>16*1024*1024)throw new Exception("Hub response too large");JSObject message=new JSObject(text);if("authenticated".equals(message.optString("type"))){authenticated=true;call.resolve();}JSObject value=new JSObject();value.put("message",message);notifyListeners("message",value);}catch(Exception e){ws.cancel();}}

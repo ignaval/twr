@@ -26,6 +26,11 @@ final class RemoteHubTests: XCTestCase {
         throw NSError(domain: "twr.qa", code: 1)
     }
 
+    private func pose(_ name:String) async throws {
+        let request=URLRequest(url:URL(string:"http://127.0.0.1:47323/pose/"+name)!,timeoutInterval:240)
+        let (data,response)=try await URLSession.shared.data(for:request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode,200,String(data:data,encoding:.utf8) ?? "Pose failed")
+    }
     func testRemoteHubEndToEnd() async throws {
         continueAfterFailure = false
         for _ in 0..<100 {
@@ -41,6 +46,8 @@ final class RemoteHubTests: XCTestCase {
         let code = try XCTUnwrap(fixture["code"] as? String)
         let hubURL = try XCTUnwrap(fixture["url"] as? String)
         let repo = try XCTUnwrap(fixture["repo"] as? String)
+        if fixture["foldable"] as? Bool == true {try await pose("closed")}
+
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub')")
         _ = try await js("""
           window.__qaErrors=[];window.addEventListener('error',e=>window.__qaErrors.push(e.message));
@@ -133,9 +140,9 @@ final class RemoteHubTests: XCTestCase {
               input.dispatchEvent(new Event('input',{bubbles:true}));return true;
               """)
             let closedWidth = try await js("return innerWidth") as? Int ?? 0
-            _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/open")!)
+            try await pose("open")
             try await until("return innerWidth !== \(closedWidth)")
-            _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/half-open")!)
+            try await pose("half-open")
             try await until("return (await window.Capacitor.Plugins.TwrLayout.current()).orientation !== 'none'")
             _ = try await js("[...document.querySelectorAll('.topbar button')].find(e=>e.getAttribute('aria-label')==='New thread'||e.textContent.includes('New thread')).click();return true")
             try await until("return !!document.querySelector('[role=dialog]')")
@@ -151,7 +158,7 @@ final class RemoteHubTests: XCTestCase {
             _ = try await js("document.querySelector('[aria-label=\"Close dialog\"]').click();return true")
             let draft = try await js("return document.querySelector('.composer textarea').value") as? String
             XCTAssertEqual(draft, "FOLD_TRANSITION_DRAFT")
-            _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/closed")!)
+            try await pose("closed")
             try await until("return innerWidth === \(closedWidth)")
             let restoredDraft = try await js("return document.querySelector('.composer textarea').value") as? String
             XCTAssertEqual(restoredDraft, "FOLD_TRANSITION_DRAFT")
