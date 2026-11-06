@@ -336,6 +336,113 @@ impl Push {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apns_jwt_signatures_verify_with_ring() {
+        use base64::{engine::general_purpose, Engine as _};
+        use ring::signature::KeyPair as _;
+
+        let random = ring::rand::SystemRandom::new();
+        let private = ring::signature::EcdsaKeyPair::generate_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            &random,
+        )
+        .unwrap();
+        let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            private.as_ref(),
+            &random,
+        )
+        .unwrap();
+        let pem = format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            general_purpose::STANDARD.encode(private.as_ref())
+        );
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some("local-apns-key".into());
+        let claims = json!({"iss":"local-team","iat":auth::now()});
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let (message, signature) = token.rsplit_once('.').unwrap();
+        let signature = general_purpose::URL_SAFE_NO_PAD.decode(signature).unwrap();
+        ring::signature::UnparsedPublicKey::new(
+            &ring::signature::ECDSA_P256_SHA256_FIXED,
+            pair.public_key().as_ref(),
+        )
+        .verify(message.as_bytes(), &signature)
+        .unwrap();
+        assert_eq!(jsonwebtoken::decode_header(&token).unwrap().kid, header.kid);
+    }
+
+    #[test]
+    fn fcm_jwt_signatures_verify_with_openssl() {
+        use base64::{engine::general_purpose, Engine as _};
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private.pem");
+        let public = dir.path().join("public.pem");
+        let generated = Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+                "-out",
+            ])
+            .arg(&private)
+            .output()
+            .expect("OpenSSL CLI is required for the push-signing interoperability test");
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let exported = Command::new("openssl")
+            .args(["pkey", "-in"])
+            .arg(&private)
+            .args(["-pubout", "-out"])
+            .arg(&public)
+            .output()
+            .unwrap();
+        assert!(exported.status.success());
+        let claims = json!({"iss":"local-test@example.invalid","aud":"https://oauth2.googleapis.com/token","iat":auth::now(),"exp":auth::now()+3600});
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(&std::fs::read(&private).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let (message, signature) = token.rsplit_once('.').unwrap();
+        let signature = general_purpose::URL_SAFE_NO_PAD.decode(signature).unwrap();
+        let input = dir.path().join("message");
+        let signed = dir.path().join("signature");
+        std::fs::write(&input, message).unwrap();
+        std::fs::write(&signed, signature).unwrap();
+        let verified = Command::new("openssl")
+            .args(["dgst", "-sha256", "-verify"])
+            .arg(&public)
+            .arg("-signature")
+            .arg(&signed)
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert_eq!(
+            jsonwebtoken::decode_header(&token).unwrap().alg,
+            jsonwebtoken::Algorithm::RS256
+        );
+    }
+
     #[tokio::test]
     async fn disabling_push_removes_all_workspaces_only_for_that_device() {
         let dir = tempfile::tempdir().unwrap();
