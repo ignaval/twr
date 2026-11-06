@@ -2,6 +2,25 @@ import { describe, it, expect, vi } from "vitest";
 import { webcrypto } from "node:crypto";
 import { fileDigest, requestId } from "../mobile/src/crypto";
 describe("mobile custom-scheme crypto", () => {
+  it("yields while hashing a large attachment and matches native SHA-256", async () => {
+    const data = new Uint8Array(5 * 1024 * 1024 + 17);
+    data.fill(37);
+    const expected = Buffer.from(
+      await webcrypto.subtle.digest("SHA-256", data),
+    ).toString("hex");
+    vi.stubGlobal("crypto", {});
+    let ticked = false;
+    const timer = setTimeout(() => {
+      ticked = true;
+    }, 0);
+    try {
+      expect(await fileDigest(data.buffer)).toBe(expected);
+      expect(ticked).toBe(true);
+    } finally {
+      clearTimeout(timer);
+      vi.unstubAllGlobals();
+    }
+  });
   it("uses OS entropy and SHA-256 without secure-context methods", async () => {
     vi.stubGlobal("crypto", {
       getRandomValues: webcrypto.getRandomValues.bind(webcrypto),

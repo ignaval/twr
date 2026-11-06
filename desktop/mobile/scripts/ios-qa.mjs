@@ -1,4 +1,5 @@
-import { spawn, execFileSync } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { createServer } from "node:http";
 import { createServer as createProxy, connect as connectTCP } from "node:net";
 import {
@@ -35,7 +36,7 @@ assert(
   "Install iPhone and iOS 27.1 iPhone Duo Simulator runtimes",
 );
 const bin = resolve("../target/debug");
-const foldHelper = resolve("node_modules/agent-device/bin/agent-device.mjs");
+const execFileAsync = promisify(execFile);
 mkdirSync("test-results/ios", { recursive: true });
 const kind = process.env.TWR_IOS_KIND;
 const selected = targets.filter(
@@ -64,6 +65,44 @@ for (const [index, template] of selected.entries()) {
   };
   const fixture = mkdtempSync(join(tmpdir(), "twr-ios-"));
   const screenshot = `test-results/ios/${kind || "all"}-${index}-screen.png`;
+  const foldHelper = join(fixture, "fold-helper");
+  async function fold(pose) {
+    const command = (args) =>
+      execFileAsync(
+        "xcrun",
+        ["simctl", "spawn", device.udid, foldHelper, ...args],
+        { timeout: 20000 },
+      );
+    await command(["set", pose]);
+    const deadline = Date.now() + 60000;
+    let previous;
+    while (Date.now() < deadline) {
+      const { stdout } = await command(["hinge", "0"]);
+      const reading = JSON.parse(stdout.trim().split("\n").at(-1));
+      const angle = reading.angleDegrees;
+      assert(
+        reading.angleValid && Number.isFinite(angle),
+        "Simulator hinge reading must be valid",
+      );
+      const matches =
+        pose === "closed"
+          ? angle < 0.5
+          : pose === "open"
+            ? angle > 179.5
+            : angle > 0.5 && angle < 179.5;
+      if (
+        matches &&
+        previous !== undefined &&
+        Math.abs(previous - angle) < 0.5
+      ) {
+        console.log("FOLD", JSON.stringify({ pose, angle }));
+        return;
+      }
+      previous = angle;
+      await delay(1000);
+    }
+    throw new Error(`Simulator did not settle in the ${pose} pose`);
+  }
   rmSync(screenshot, { force: true });
   const repo = join(fixture, "repo");
   mkdirSync(repo);
@@ -135,47 +174,41 @@ for (const [index, template] of selected.entries()) {
       stdio: "inherit",
     });
     if (device.name.includes("Duo")) {
+      const developer =
+        process.env.DEVELOPER_DIR ||
+        execFileSync("xcode-select", ["-p"], { encoding: "utf8" }).trim();
       execFileSync(
-        "xcrun",
+        "open",
         [
-          "simctl",
-          "install",
+          "-a",
+          join(developer, "Applications/Simulator.app"),
+          "--args",
+          "-CurrentDeviceUDID",
           device.udid,
-          resolve(
-            "mobile/ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app",
-          ),
         ],
         { stdio: "inherit" },
       );
       execFileSync(
-        process.execPath,
+        "xcrun",
         [
+          "--sdk",
+          "iphonesimulator",
+          "clang",
+          "-mios-simulator-version-min=15.0",
+          "-fobjc-arc",
+          "-Wall",
+          "-Wextra",
+          "-framework",
+          "Foundation",
+          "-framework",
+          "IOKit",
+          resolve("node_modules/agent-device/apple/fold-helper/Fold.m"),
+          "-o",
           foldHelper,
-          "open",
-          "tools.twr.mobile.dev",
-          "--platform",
-          "ios",
-          "--udid",
-          device.udid,
-          "--no-record",
-          "--timeout",
-          "180000",
         ],
-        { stdio: "inherit", timeout: 240000 },
+        { stdio: "inherit", timeout: 60000 },
       );
-      execFileSync(
-        process.execPath,
-        [
-          foldHelper,
-          "fold",
-          "closed",
-          "--platform",
-          "ios",
-          "--udid",
-          device.udid,
-        ],
-        { stdio: "inherit", timeout: 180000 },
-      );
+      await fold("closed");
     }
     gateway = spawn(
       join(bin, "twr-mobile-gateway"),
@@ -269,26 +302,12 @@ for (const [index, template] of selected.entries()) {
           res.end();
           return;
         }
-        try {
-          const result = execFileSync(
-            process.execPath,
-            [
-              foldHelper,
-              "fold",
-              pose,
-              "--platform",
-              "ios",
-              "--udid",
-              device.udid,
-            ],
-            { encoding: "utf8", timeout: 120000 },
-          );
-          console.log("FOLD", result);
-          res.end("ok");
-        } catch (error) {
-          res.statusCode = 500;
-          res.end(String(error));
-        }
+        void fold(pose)
+          .then(() => res.end("ok"))
+          .catch((error) => {
+            res.statusCode = 500;
+            res.end(String(error));
+          });
       } else if (req.url === "/verify-upload") {
         const files = readdirSync(fixture, {
           recursive: true,

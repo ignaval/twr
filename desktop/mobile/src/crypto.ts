@@ -13,8 +13,23 @@ export function requestId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 export async function fileDigest(bytes: ArrayBuffer): Promise<string> {
-  const digest = globalThis.crypto.subtle
-    ? new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes))
-    : sha256(new Uint8Array(bytes));
+  let digest: Uint8Array;
+  if (globalThis.crypto.subtle)
+    digest = new Uint8Array(
+      await globalThis.crypto.subtle.digest("SHA-256", bytes),
+    );
+  else {
+    const hash = sha256.create();
+    const data = new Uint8Array(bytes);
+    const chunk = 1024 * 1024;
+    for (let offset = 0; offset < data.length; offset += chunk) {
+      hash.update(data.subarray(offset, offset + chunk));
+      // WKWebView's custom scheme may require the JS fallback. Let input and
+      // rendering run between chunks of a large attachment.
+      if (offset + chunk < data.length)
+        await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    digest = hash.digest();
+  }
   return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
 }
