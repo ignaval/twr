@@ -72,7 +72,7 @@ for (const [index, template] of selected.entries()) {
       execFileAsync(
         "xcrun",
         ["simctl", "spawn", device.udid, foldHelper, ...args],
-        { timeout: 20000 },
+        { timeout: 120000 },
       );
     await command(["set", pose]);
     const deadline = Date.now() + 60000;
@@ -251,22 +251,37 @@ for (const [index, template] of selected.entries()) {
     execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
       stdio: "inherit",
     });
-    if (device.name.includes("Duo")) await fold("closed");
-    const { code } = await ownerCall("device.pair_begin", {
-      scopes: ["read", "operate", "admin", "terminal"],
-    });
-    server = createServer((req, res) => {
+    if (device.name.includes("Duo")) {
+      // The first guest process can still be warming dyld/services after bootstatus.
+      await execFileAsync(
+        "xcrun",
+        ["simctl", "spawn", device.udid, "/bin/launchctl", "list"],
+        { timeout: 180000 },
+      );
+      await fold("closed");
+    }
+    server = createServer(async (req, res) => {
       res.setHeader("content-type", "application/json");
-      if (req.url === "/fixture")
-        res.end(
-          JSON.stringify({
-            repo,
-            code,
-            url: "http://127.0.0.1:47324",
-            foldable: device.name.includes("Duo"),
-          }),
-        );
-      else if (req.url === "/screenshot") {
+      if (req.url === "/fixture") {
+        try {
+          // Xcode's test build/launch can exceed five minutes on a cold runner.
+          // Issue the code only when the running app requests its fixture.
+          const { code } = await ownerCall("device.pair_begin", {
+            scopes: ["read", "operate", "admin", "terminal"],
+          });
+          res.end(
+            JSON.stringify({
+              repo,
+              code,
+              url: "http://127.0.0.1:47324",
+              foldable: device.name.includes("Duo"),
+            }),
+          );
+        } catch (error) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: String(error) }));
+        }
+      } else if (req.url === "/screenshot") {
         try {
           execFileSync(
             "xcrun",

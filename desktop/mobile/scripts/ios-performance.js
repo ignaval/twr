@@ -52,6 +52,14 @@ const frame = (now) => {
   if (running) requestAnimationFrame(frame);
 };
 requestAnimationFrame(frame);
+const streamEvents = [];
+const stopMeasuring = window.twr.onEvent((message) => {
+  if (message.type === "thread" && message.event?.ts)
+    streamEvents.push({
+      server: Date.parse(message.event.ts),
+      received: performance.now(),
+    });
+});
 const start = performance.now();
 await rpc("thread.send", {
   thread: "performance-audit",
@@ -67,6 +75,15 @@ await wait(() =>
   ),
 );
 const streamToVisibleMs = Math.round(performance.now() - start);
+stopMeasuring();
+const firstEvent = streamEvents[0],
+  lastEvent = streamEvents.at(-1);
+const serverStreamSpanMs =
+  firstEvent && lastEvent ? lastEvent.server - firstEvent.server : null;
+const receivedStreamSpanMs =
+  firstEvent && lastEvent
+    ? Math.round(lastEvent.received - firstEvent.received)
+    : null;
 const input = document.querySelector(".composer textarea");
 for (let i = 0; i < 12; i++) {
   const at = performance.now();
@@ -101,6 +118,9 @@ const report = {
   assistantCompletion: true,
   sendAckMs,
   streamToVisibleMs,
+  serverStreamSpanMs,
+  receivedStreamSpanMs,
+  streamMessageCount: streamEvents.length,
   rpcMedianMs: pct(rpcTimes, 0.5),
   rpcP95Ms: pct(rpcTimes, 0.95),
   inputPaintP95Ms: pct(inputPaint, 0.95),
