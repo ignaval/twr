@@ -871,17 +871,14 @@ async fn main() -> Result<()> {
     let (tx, mut rx) = mpsc::channel(128);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let local = Companion::start(&companion, "default", "gateway", "", tx).await?;
-    // Reuse the authenticated RPC path when the hub is already running. A
-    // separate readiness connection only adds another peer-identity lookup.
-    let info = match local.call("hub.info", json!({})).await {
-        Ok(info) => info,
-        Err(_) => {
-            local
-                .call("desktop.ensure_hub", json!({"binary":binary}))
-                .await?;
-            local.call("hub.info", json!({})).await?
-        }
-    };
+    // ensure_hub returns the authenticated hub.info proof. Reuse it instead of
+    // creating another readiness or RPC connection at startup.
+    let info = tokio::time::timeout(
+        Duration::from_secs(75),
+        local.call("desktop.ensure_hub", json!({"binary":binary})),
+    )
+    .await
+    .context("Gateway startup did not receive an authenticated hub response within 75 seconds")??;
     anyhow::ensure!(
         info["identity"]
             .as_str()

@@ -37,7 +37,7 @@ try {
             "-destination",
             "generic/platform=iOS",
           ]
-        : ["CODE_SIGNING_ALLOWED=NO"]),
+        : ["CODE_SIGNING_ALLOWED=YES", "CODE_SIGN_IDENTITY=-"]),
       "build",
     ],
     { stdio: "inherit" },

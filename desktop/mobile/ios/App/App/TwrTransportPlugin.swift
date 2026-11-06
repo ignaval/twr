@@ -49,6 +49,9 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
         var result: CFTypeRef?
         let status = SecItemCopyMatching(q as CFDictionary, &result)
         if status == errSecItemNotFound { return [:] }
+        #if DEBUG
+        if status != errSecSuccess { NSLog("twr Keychain read status: %d", status) }
+        #endif
         guard status == errSecSuccess, let data = result as? Data, let hubs = try JSONSerialization.jsonObject(with: data) as? [String: [String: Any]] else { throw Failure("Could not read paired hubs from Keychain") }
         return hubs
     }

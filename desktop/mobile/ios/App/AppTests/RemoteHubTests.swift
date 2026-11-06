@@ -39,6 +39,7 @@ final class RemoteHubTests: XCTestCase {
         let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/fixture")!)
         let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let code = try XCTUnwrap(fixture["code"] as? String)
+        let hubURL = try XCTUnwrap(fixture["url"] as? String)
         let repo = try XCTUnwrap(fixture["repo"] as? String)
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub')")
         _ = try await js("""
@@ -47,14 +48,14 @@ final class RemoteHubTests: XCTestCase {
           """)
         try await until("return !!document.querySelector('input[name=code]')")
         _ = try await js("""
-          const values={hubName:'Simulator QA',url:'http://127.0.0.1:47321',code,name:'iOS Simulator'};
+          const values={hubName:'Simulator QA',url:hubURL,code,name:'iOS Simulator'};
           for(const [key,value] of Object.entries(values)){
             const input=document.querySelector('input[name="'+key+'"]');
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(input,value);
             input.dispatchEvent(new Event('input',{bubbles:true}));
           }
           document.querySelector('.pair-form').requestSubmit();return true;
-          """, ["code": code])
+          """, ["code": code,"hubURL": hubURL])
         try await until("try{return (await window.twr.rpc('hub.info')).identity.startsWith('user:device:')}catch{return false}")
         let noToken = try await js("return !JSON.stringify(await window.Capacitor.Plugins.TwrTransport.listHubs()).includes('\"token\"')")
         XCTAssertEqual(noToken as? Bool, true, "Keychain credentials must stay native")
@@ -102,7 +103,8 @@ final class RemoteHubTests: XCTestCase {
           for(const char of command)window.twr.terminalWrite(window.__qaTerminal.id,char);return true;
           """)
         try await until("return (await window.twr.terminalRead(window.__qaTerminal.id)).data.includes('ORDER_0123456789abcdefghijklmnopqrstuvwxyz')")
-        _ = try await js("await window.Capacitor.Plugins.TwrTransport.disconnect();return true")
+        // Reset the real TCP connection, keeping the gateway and its PTY alive.
+        _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/drop-socket")!)
         try await until("try{return (await window.twr.terminalRead(window.__qaTerminal.id)).data.includes('ORDER_0123456789abcdefghijklmnopqrstuvwxyz')}catch{return false}", seconds: 45)
         _ = try await js("await window.twr.terminalClose(window.__qaTerminal.id);return true")
         // Keep the socket active beyond the former 40 second resource timeout.
@@ -131,6 +133,18 @@ final class RemoteHubTests: XCTestCase {
             try await until("return innerWidth !== \(closedWidth)")
             _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/half-open")!)
             try await until("return (await window.Capacitor.Plugins.TwrLayout.current()).orientation !== 'none'")
+            _ = try await js("[...document.querySelectorAll('.topbar button')].find(e=>e.getAttribute('aria-label')==='New thread'||e.textContent.includes('New thread')).click();return true")
+            try await until("return !!document.querySelector('[role=dialog]')")
+            let safeDialog = try await js("""
+              const box=document.querySelector('[role=dialog]').getBoundingClientRect();
+              const style=getComputedStyle(document.documentElement);
+              const axis=document.documentElement.dataset.fold;
+              return axis==='vertical'
+                ? box.left>=parseFloat(style.getPropertyValue('--fold-left'))+parseFloat(style.getPropertyValue('--hinge-width'))-1
+                : box.top>=parseFloat(style.getPropertyValue('--fold-top'))+parseFloat(style.getPropertyValue('--hinge-height'))-1;
+              """) as? Bool
+            XCTAssertEqual(safeDialog,true,"Dialog controls must stay clear of the fold")
+            _ = try await js("document.querySelector('[aria-label=\"Close dialog\"]').click();return true")
             let draft = try await js("return document.querySelector('.composer textarea').value") as? String
             XCTAssertEqual(draft, "FOLD_TRANSITION_DRAFT")
             _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/closed")!)

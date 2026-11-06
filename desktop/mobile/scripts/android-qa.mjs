@@ -260,6 +260,43 @@ try {
       .poll(() => page.evaluate(() => document.documentElement.dataset.fold))
       .toBe("vertical");
     assert.equal(await input.inputValue(), "FOLD_TRANSITION_DRAFT");
+    const foldDialog = async (orientation) => {
+      await page
+        .locator(".topbar")
+        .getByRole("button", { name: "New thread", exact: true })
+        .click();
+      const dialog = page.getByRole("dialog", {
+        name: "New thread",
+        exact: true,
+      });
+      await dialog.waitFor();
+      const geometry = await dialog.evaluate((element) => {
+        const box = element.getBoundingClientRect();
+        const style = getComputedStyle(document.documentElement);
+        return {
+          x: box.x,
+          y: box.y,
+          left: parseFloat(style.getPropertyValue("--fold-left")),
+          top: parseFloat(style.getPropertyValue("--fold-top")),
+          width: parseFloat(style.getPropertyValue("--hinge-width")),
+          height: parseFloat(style.getPropertyValue("--hinge-height")),
+        };
+      });
+      if (orientation === "vertical")
+        assert(
+          geometry.x >= geometry.left + geometry.width - 1,
+          JSON.stringify(geometry),
+        );
+      else
+        assert(
+          geometry.y >= geometry.top + geometry.height - 1,
+          JSON.stringify(geometry),
+        );
+      await dialog
+        .getByRole("button", { name: "Close dialog", exact: true })
+        .click();
+    };
+    await foldDialog("vertical");
     adbRun([
       "shell",
       "settings",
@@ -298,6 +335,52 @@ try {
     assert(
       foldGeometry.composerTop >= foldGeometry.foldBottom - 2,
       JSON.stringify(foldGeometry),
+    );
+    await foldDialog("horizontal");
+    await page.getByRole("button", { name: "Open shell", exact: true }).click();
+    await page
+      .locator(".terminal-session")
+      .filter({ visible: true })
+      .locator(".xterm-helper-textarea")
+      .waitFor({ state: "attached" });
+    await page.evaluate(() => window.Capacitor.Plugins.Keyboard.hide());
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.dataset.fold))
+      .toBe("horizontal");
+    const terminalGeometry = await page
+      .locator(".terminal-dock")
+      .evaluate((element) => {
+        const box = element.getBoundingClientRect();
+        const style = getComputedStyle(document.documentElement);
+        return {
+          top: box.top,
+          foldBottom:
+            parseFloat(style.getPropertyValue("--fold-top")) +
+            parseFloat(style.getPropertyValue("--hinge-height")),
+          keysBottom: element
+            .querySelector(".terminal-accessory")
+            .getBoundingClientRect().bottom,
+          viewport: visualViewport?.height || innerHeight,
+        };
+      });
+    assert(
+      terminalGeometry.top >= terminalGeometry.foldBottom - 1,
+      JSON.stringify(terminalGeometry),
+    );
+    assert(
+      terminalGeometry.keysBottom <= terminalGeometry.viewport + 1,
+      JSON.stringify(terminalGeometry),
+    );
+    await page
+      .locator('.terminal-tab.active button[aria-label^="Close "]')
+      .click();
+    await page
+      .getByRole("dialog", { name: "Close terminal?", exact: true })
+      .getByRole("button", { name: "Continue", exact: true })
+      .click();
+    await expect(page.locator(".terminal-session")).toHaveCount(0);
+    console.log(
+      "PASS: book/tabletop dialogs and terminal controls stay clear of the fold",
     );
     adbRun(["shell", "settings", "put", "system", "user_rotation", "0"]);
     adbRun(["shell", "cmd", "device_state", "state", "2"]);

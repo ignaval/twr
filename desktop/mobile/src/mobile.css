@@ -119,8 +119,9 @@ select {
   min-height: 54px;
   max-height: 160px;
 }
-[data-mobile="true"] .terminal-surface {
-  min-height: 160px;
+[data-mobile="true"] .terminal-tabs {
+  height: 44px;
+  min-height: 44px;
 }
 [data-mobile="true"] button {
   min-height: 44px;
@@ -372,4 +373,21 @@ select {
   [data-mobile="true"] .toast {
     bottom: calc(var(--mobile-bottom) + 12px);
   }
+}
+
+/* Keep the modal backdrop over both panes, with its controls clear of the fold. */
+:root[data-mobile="true"][data-fold="vertical"] .scrim {
+  padding-left: calc(var(--fold-left) + var(--hinge-width) + 12px);
+  padding-right: 12px;
+}
+:root[data-mobile="true"][data-fold="horizontal"] .scrim {
+  padding-top: calc(var(--fold-top) + var(--hinge-height) + 12px);
+  padding-bottom: 12px;
+}
+:root[data-mobile="true"][data-fold="horizontal"]
+  .terminal-dock:not(.collapsed) {
+  flex: 0 1 auto;
+  margin-top: auto;
+  min-height: 0;
+  max-height: calc(100% - var(--fold-top) - var(--hinge-height) - 12px);
 }

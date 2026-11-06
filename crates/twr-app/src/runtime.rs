@@ -10,7 +10,7 @@ enum Probe {
     Absent,
     Busy,
 }
-async fn probe_inner(socket: &Path) -> Result<Probe> {
+async fn probe_inner(socket: &Path, connected: &mut bool) -> Result<Probe> {
     twr_core::trace::mark("desktop: hub probe connecting");
     let mut c = match Client::connect(socket).await {
         Ok(c) => c,
@@ -36,10 +36,11 @@ async fn probe_inner(socket: &Path) -> Result<Probe> {
         }
         Err(e) => return Err(e),
     };
+    *connected = true;
     twr_core::trace::mark("desktop: hub probe connected");
-    // macOS peer-identity lookup can take several seconds under system load.
-    // Repeated short probes can keep a healthy hub classified as busy forever.
-    match tokio::time::timeout(Duration::from_secs(10), async {
+    // Keep one connection while the hub performs its peer-identity check. Starting
+    // fresh probes during that work compounds process-table load on macOS.
+    let result = async {
         let hello = c.hello(json!({"client":"desktop"})).await?;
         twr_core::trace::mark("desktop: hub probe authenticated");
         anyhow::ensure!(
@@ -49,25 +50,26 @@ async fn probe_inner(socket: &Path) -> Result<Probe> {
             "Open twr from your desktop launcher; this process is not recognized as your user"
         );
         c.call("hub.info", json!({})).await
-    })
-    .await
-    {
-        Ok(Ok(info)) => Ok(Probe::Ready(info)),
-        Ok(Err(e))
+    }
+    .await;
+    match result {
+        Ok(info) => Ok(Probe::Ready(info)),
+        Err(e)
             if e.downcast_ref::<twr_core::proto::RpcError>()
                 .is_some_and(|r| r.code == twr_core::proto::codes::STOPPING) =>
         {
             Ok(Probe::Busy)
         }
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok(Probe::Busy),
+        Err(e) => Err(e),
     }
 }
 
-async fn probe(socket: &Path) -> Result<Probe> {
-    match tokio::time::timeout(Duration::from_secs(12), probe_inner(socket)).await {
+async fn probe(socket: &Path, deadline: tokio::time::Instant) -> Result<Probe> {
+    let mut connected = false;
+    match tokio::time::timeout_at(deadline, probe_inner(socket, &mut connected)).await {
         Ok(result) => result,
-        Err(_) => Ok(Probe::Busy),
+        Err(_) if connected => anyhow::bail!("The hub accepts connections but did not answer the startup handshake. Check hub.log in the workspace data directory."),
+        Err(_) => anyhow::bail!("The hub socket did not respond before the startup deadline. Check hub.log in the workspace data directory."),
     }
 }
 
@@ -117,7 +119,7 @@ pub async fn ensure_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<V
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let mut started = false;
     loop {
-        match probe(socket).await? {
+        match probe(socket, deadline).await? {
             Probe::Ready(info) => return Ok(info),
             Probe::Absent if !started => {
                 spawn_hub(paths, socket, binary)?;
@@ -150,7 +152,7 @@ mod tests {
             let mut read = BufReader::new(read);
             let hello: Request = read_frame(&mut read).await.unwrap().unwrap();
             assert_eq!(hello.method, "hello");
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_secs(11)).await;
             write_frame(
                 &mut write,
                 &Response::ok(hello.id, json!({"identity":"user:test"})),
@@ -163,7 +165,12 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = probe(&socket).await.unwrap();
+        let result = probe(
+            &socket,
+            tokio::time::Instant::now() + Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
         assert!(matches!(result, Probe::Ready(info) if info["pid"] == 123));
         server.await.unwrap();
     }

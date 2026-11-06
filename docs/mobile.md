@@ -14,7 +14,7 @@ npm --prefix desktop run mobile:build
 
 Android requires Java 21 and the SDK versions in `desktop/mobile/android/variables.gradle`. Set `ANDROID_HOME` or create the ignored `desktop/mobile/android/local.properties`. Then run `npm --prefix desktop run mobile:android`. The debug APK is `desktop/mobile/android/app/build/outputs/apk/debug/app-debug.apk`.
 
-For iOS, install Xcode 27.1 or newer, open it to accept its license and install an iOS Simulator runtime. Run `npm --prefix desktop run mobile:ios`, or open `desktop/mobile/ios/App/App.xcodeproj`. Simulator builds need no paid signing team. The deployment minimum is iOS 17.4, matching the explicit Safari build target. Android requires a system WebView based on Chromium 119 or newer; the native shell checks this before loading the UI. Building with the 27.1 SDK enables iPhone Duo reserved-region handling. The UIKit bridge observes native fold and camera regions; no experimental Safari flags are required.
+For iOS, install Xcode 27.1 or newer, open it to accept its license and install an iOS Simulator runtime. Run `npm --prefix desktop run mobile:ios`, or open `desktop/mobile/ios/App/App.xcodeproj`. Simulator builds use local ad hoc signing and a Simulator-only Keychain identity; they need no Apple account or paid signing team. Device builds use the actual team’s provisioning identity. The deployment minimum is iOS 17.4, matching the explicit Safari build target. Android requires a system WebView based on Chromium 119 or newer; the native shell checks this before loading the UI. Building with the 27.1 SDK enables iPhone Duo reserved-region handling. The UIKit bridge observes native fold and camera regions; no experimental Safari flags are required.
 
 Start a debug gateway from your own terminal:
 
