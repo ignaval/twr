@@ -15,7 +15,10 @@ final class RemoteHubTests: XCTestCase {
     private func until(_ body: String, seconds: Double = 30) async throws {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
-            if (try? await js(body)) as? Bool == true { return }
+            let check = """
+              return await Promise.race([(async()=>{\(body)})(),new Promise(resolve=>setTimeout(()=>resolve(false),3000))]);
+              """
+            if (try? await js(check)) as? Bool == true { return }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         let html = (try? await js("return document.body.innerText")) as? String ?? "No document"
@@ -68,8 +71,8 @@ final class RemoteHubTests: XCTestCase {
           """)
         try await until("return !![...document.querySelectorAll('.thread-grid .thread-card')].find(e=>e.textContent.includes('ios-worker'))")
         _ = try await js("[...document.querySelectorAll('.thread-grid .thread-card')].find(e=>e.textContent.includes('ios-worker')).click();return true")
-        try await until("return !!document.querySelector('[aria-label=\"Talk to this thread\"]')")
-        _ = try await js("document.querySelector('[aria-label=\"Talk to this thread\"]').click();return true")
+        try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent.includes('Talk to this thread'))")
+        _ = try await js("[...document.querySelectorAll('button')].find(e=>e.textContent.includes('Talk to this thread')).click();return true")
         try await until("return document.body.innerText.includes('IOS_REMOTE_STREAM_OK') && !!document.querySelector('.composer textarea')")
         _ = try await js("""
           const path=await window.twr.uploadFile(new File(['IOS_UPLOAD_OK'],'ios-qa.txt',{type:'text/plain'}),'ios-worker');
@@ -107,6 +110,40 @@ final class RemoteHubTests: XCTestCase {
         try await Task.sleep(nanoseconds: 45_000_000_000)
         let drops = try await js("window.__qaWatch();return window.__qaDisconnects") as? Int
         XCTAssertEqual(drops, 0, "Long-lived native WebSocket must remain connected")
+        // Drive actual simulator hinge events, then inspect the app's native region bridge.
+        if fixture["foldable"] as? Bool == true {
+            _ = try await js("""
+              [...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
+               .find(e=>e.getClientRects().length&&(e.textContent==='Threads'||e.textContent.includes('Thread grid'))).click();return true;
+              """)
+            try await until("return !![...document.querySelectorAll('.thread-grid .thread-card')].find(e=>e.textContent.includes('ios-worker'))")
+            _ = try await js("[...document.querySelectorAll('.thread-grid .thread-card')].find(e=>e.textContent.includes('ios-worker')).click();return true")
+            try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent.includes('Talk to this thread'))")
+            _ = try await js("[...document.querySelectorAll('button')].find(e=>e.textContent.includes('Talk to this thread')).click();return true")
+            try await until("return !!document.querySelector('.composer textarea')")
+            _ = try await js("""
+              const input=document.querySelector('.composer textarea');
+              Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,'FOLD_TRANSITION_DRAFT');
+              input.dispatchEvent(new Event('input',{bubbles:true}));return true;
+              """)
+            let closedWidth = try await js("return innerWidth") as? Int ?? 0
+            _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/open")!)
+            try await until("return innerWidth !== \(closedWidth)")
+            _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/half-open")!)
+            try await until("return (await window.Capacitor.Plugins.TwrLayout.current()).orientation !== 'none'")
+            let draft = try await js("return document.querySelector('.composer textarea').value") as? String
+            XCTAssertEqual(draft, "FOLD_TRANSITION_DRAFT")
+            _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/pose/closed")!)
+            try await until("return innerWidth === \(closedWidth)")
+            let restoredDraft = try await js("return document.querySelector('.composer textarea').value") as? String
+            XCTAssertEqual(restoredDraft, "FOLD_TRANSITION_DRAFT")
+        }
+        let (scriptData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/performance-script")!)
+        let performanceResult = try await js(try XCTUnwrap(String(data: scriptData, encoding: .utf8)))
+        var performanceRequest = URLRequest(url: URL(string: "http://127.0.0.1:47323/performance")!)
+        performanceRequest.httpMethod = "POST"
+        performanceRequest.httpBody = try JSONSerialization.data(withJSONObject: try XCTUnwrap(performanceResult))
+        _ = try await URLSession.shared.data(for: performanceRequest)
         let layout = try await js("return await window.Capacitor.Plugins.TwrLayout.current()")
         XCTAssertNotNil(layout)
         let result = try await js("return {errors:window.__qaErrors,width:innerWidth,height:innerHeight,layout:await window.Capacitor.Plugins.TwrLayout.current(),identity:(await window.twr.rpc('hub.info')).identity}")

@@ -19,18 +19,37 @@ const devices = JSON.parse(
     encoding: "utf8",
   }),
 );
-const available = Object.values(devices.devices).flat();
+const available = Object.entries(devices.devices).flatMap(([runtime, list]) =>
+  list.map((device) => ({ ...device, runtime })),
+);
+
 const targets = [
   available.find((d) => d.name.includes("iPhone") && !d.name.includes("Duo")),
   available.find((d) => d.name.includes("Duo")),
+  available.find((d) => d.name.includes("iPad")),
 ].filter(Boolean);
 assert(
-  targets.some((d) => d.name.includes("Duo")),
-  "Install the iOS 27.1 iPhone Duo Simulator runtime",
+  targets.some((d) => d.name.includes("Duo")) &&
+    targets.some((d) => d.name.includes("iPhone") && !d.name.includes("Duo")),
+  "Install iPhone and iOS 27.1 iPhone Duo Simulator runtimes",
 );
 const bin = resolve("../target/debug");
 mkdirSync("test-results/ios", { recursive: true });
-for (const [index, device] of targets.entries()) {
+for (const [index, template] of targets.entries()) {
+  const device = {
+    ...template,
+    udid: execFileSync(
+      "xcrun",
+      [
+        "simctl",
+        "create",
+        `twr QA ${template.name}`,
+        template.deviceTypeIdentifier,
+        template.runtime,
+      ],
+      { encoding: "utf8" },
+    ).trim(),
+  };
   const fixture = mkdtempSync(join(tmpdir(), "twr-ios-"));
   const repo = join(fixture, "repo");
   mkdirSync(repo);
@@ -68,6 +87,25 @@ for (const [index, device] of targets.entries()) {
   };
   let gateway, hub, server;
   try {
+    execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
+    execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
+      stdio: "inherit",
+    });
+    if (device.name.includes("Duo"))
+      execFileSync(
+        "npx",
+        [
+          "--yes",
+          "agent-device@0.21.36",
+          "fold",
+          "closed",
+          "--platform",
+          "ios",
+          "--udid",
+          device.udid,
+        ],
+        { stdio: "inherit", timeout: 180000 },
+      );
     hub = spawn(join(bin, "twr"), ["hub"], { env, stdio: "ignore" });
     for (let i = 0; i < 150 && !existsSync(join(fixture, "hub.sock")); i++)
       await delay(100);
@@ -98,8 +136,63 @@ for (const [index, device] of targets.entries()) {
     assert(code, stderr);
     server = createServer((req, res) => {
       res.setHeader("content-type", "application/json");
-      if (req.url === "/fixture") res.end(JSON.stringify({ repo, code }));
-      else if (req.url === "/verify-upload") {
+      if (req.url === "/fixture")
+        res.end(
+          JSON.stringify({ repo, code, foldable: device.name.includes("Duo") }),
+        );
+      else if (req.url === "/performance-script") {
+        res.end(readFileSync(new URL("./ios-performance.js", import.meta.url)));
+      } else if (req.url === "/performance" && req.method === "POST") {
+        let body = "";
+        req.on("data", (chunk) => {
+          body += chunk;
+          if (body.length > 1000000) req.destroy();
+        });
+        req.on("end", () => {
+          const report = {
+            ...JSON.parse(body),
+            label: device.name.includes("Duo")
+              ? "ios-fold"
+              : device.name.includes("iPad")
+                ? "ios-tablet"
+                : "ios-phone",
+          };
+          writeFileSync(
+            `test-results/performance-${report.label}.json`,
+            JSON.stringify(report, null, 2) + "\n",
+          );
+          console.log("PERFORMANCE", JSON.stringify(report));
+          res.end("ok");
+        });
+      } else if (req.url?.startsWith("/pose/") && device.name.includes("Duo")) {
+        const pose = req.url.slice(6);
+        if (!["closed", "open", "half-open"].includes(pose)) {
+          res.statusCode = 400;
+          res.end();
+          return;
+        }
+        try {
+          const result = execFileSync(
+            "npx",
+            [
+              "--yes",
+              "agent-device@0.21.36",
+              "fold",
+              pose,
+              "--platform",
+              "ios",
+              "--udid",
+              device.udid,
+            ],
+            { encoding: "utf8", timeout: 120000 },
+          );
+          console.log("FOLD", result);
+          res.end("ok");
+        } catch (error) {
+          res.statusCode = 500;
+          res.end(String(error));
+        }
+      } else if (req.url === "/verify-upload") {
         const files = readdirSync(fixture, {
           recursive: true,
           withFileTypes: true,
@@ -115,10 +208,6 @@ for (const [index, device] of targets.entries()) {
       }
     });
     await new Promise((r) => server.listen(47323, "127.0.0.1", r));
-    execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
-    execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
-      stdio: "inherit",
-    });
     const result = `test-results/ios/${index}-${device.name.replaceAll(" ", "-")}.xcresult`;
     const test = spawn(
       "xcodebuild",
@@ -136,6 +225,10 @@ for (const [index, device] of targets.entries()) {
         "mobile/ios/App/DerivedData",
         "-resultBundlePath",
         result,
+        "-test-timeouts-enabled",
+        "YES",
+        "-maximum-test-execution-time-allowance",
+        "240",
         "CODE_SIGNING_ALLOWED=NO",
       ],
       { stdio: "inherit" },
@@ -165,6 +258,9 @@ for (const [index, device] of targets.entries()) {
         stdio: "ignore",
       });
     } catch {}
+    execFileSync("xcrun", ["simctl", "delete", device.udid], {
+      stdio: "ignore",
+    });
     await delay(250);
     rmSync(fixture, { recursive: true, force: true });
   }

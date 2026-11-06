@@ -691,7 +691,9 @@ try {
     );
   }
   assert.deepEqual(errors, []);
-  console.log("PASS: Android phone QA");
+  console.log(
+    `PASS: Android ${serial === "emulator-5556" ? "foldable" : "phone"} QA`,
+  );
 } catch (error) {
   mkdirSync("test-results", { recursive: true });
   writeFileSync("test-results/android-gateway.log", stderr);

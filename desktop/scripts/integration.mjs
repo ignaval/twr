@@ -639,6 +639,11 @@ try {
   console.log(
     "PASS: a failed workspace connection cannot run CLI mutations in the previous workspace",
   );
+  const dismissError = page.getByRole("button", {
+    name: "Dismiss error",
+    exact: true,
+  });
+  if (await dismissError.isVisible()) await dismissError.click();
   if (errors.length) throw new Error(errors.join("\n"));
   if (process.env.TWR_PERF === "1")
     await performanceAudit(

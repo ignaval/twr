@@ -154,6 +154,9 @@ Report a vulnerability privately, as [SECURITY.md](SECURITY.md) describes, not i
 - [Install](docs/install.md): installer, releases, platforms, building from source
 - [Usage](docs/usage.md): threads, answering cards, reports, attach, standing context
 - [TUI](docs/tui.md): views, keys and slash commands
+- [Desktop](docs/desktop.md): macOS and Linux graphical hub client
+- [Mobile](docs/mobile.md): iOS, Android, remote hubs and device access
+- [Application QA](docs/desktop-qa.md) and [performance audit](docs/performance.md)
 - [Configuration](docs/configuration.md): every key in `config.toml`
 - [Notifications](docs/notifications.md): a command the hub runs when something needs you: phone, desktop, Slack
 - [Runtimes](docs/runtimes.md): Claude Code, Codex, Grok Build, ACP agents, PTY

@@ -22,8 +22,16 @@ export async function systemPickerQA({
   const ratio = await page.evaluate(() => devicePixelRatio);
   if (!target) throw new Error("Upload control must be visible");
   const dump = () => {
-    adbRun(["shell", "uiautomator", "dump", "/sdcard/twr-qa-ui.xml"]);
-    return adbRun(["shell", "cat", "/sdcard/twr-qa-ui.xml"]);
+    adbRun(["shell", "rm", "-f", "/sdcard/twr-qa-ui.xml"]);
+    try {
+      adbRun(["shell", "uiautomator", "dump", "/sdcard/twr-qa-ui.xml"]);
+    } catch (error) {
+      // Some emulator images kill the dumper after successfully writing its XML.
+      if (!String(error.stdout).includes("dumped to:")) throw error;
+    }
+    const xml = adbRun(["shell", "cat", "/sdcard/twr-qa-ui.xml"]);
+    if (!xml.includes("<hierarchy")) throw new Error("Invalid native UI dump");
+    return xml;
   };
   const bounds = (node) =>
     node
