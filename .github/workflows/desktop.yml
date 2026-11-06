@@ -66,12 +66,15 @@ jobs:
         working-directory: clients
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-          # package:mac forces identity '-' and never uses a private signing
-          # identity. Permit that credential-free signature in PR builds too.
+          # package:mac selects identity '-'; this job provides no private
+          # signing credentials. Verify the resulting ad hoc identity below.
           CSC_FOR_PULL_REQUEST: "true"
         run: |
           npm run package:mac
           codesign --verify --deep --strict release/mac-arm64/twr.app
+          codesign --display --verbose=2 release/mac-arm64/twr.app 2> release/mac-signature.txt
+          grep -qx 'Signature=adhoc' release/mac-signature.txt
+          grep -qx 'TeamIdentifier=not set' release/mac-signature.txt
       - name: Packaged Mac workflow QA
         working-directory: clients
         run: npm run test:qa:mac
