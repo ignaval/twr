@@ -252,12 +252,6 @@ for (const [index, template] of selected.entries()) {
       stdio: "inherit",
     });
     if (device.name.includes("Duo")) {
-      // The first guest process can still be warming dyld/services after bootstatus.
-      await execFileAsync(
-        "xcrun",
-        ["simctl", "spawn", device.udid, "/bin/launchctl", "list"],
-        { timeout: 180000 },
-      );
       await fold("closed");
     }
     server = createServer(async (req, res) => {

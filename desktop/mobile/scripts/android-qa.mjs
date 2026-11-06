@@ -1,5 +1,7 @@
 import { _android, expect } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
+import { createServer, connect as connectTCP } from "node:net";
+import { Transform } from "node:stream";
 import {
   mkdtempSync,
   mkdirSync,
@@ -70,6 +72,73 @@ let page;
 let hubPid;
 let hubPaused = false;
 const port = 47321;
+const gatewayPort = 47325;
+let proxy;
+let downstreamRate = 0;
+const proxySockets = new Set();
+async function nativeConfirm() {
+  const xmlPath = "/sdcard/twr-confirm-qa.xml";
+  try {
+    adbRun(["shell", "uiautomator", "dump", xmlPath]);
+  } catch (error) {
+    if (!String(error.stdout).includes("dumped to:")) throw error;
+  }
+  const xml = adbRun(["shell", "cat", xmlPath]);
+  const positive = [...xml.matchAll(/<node\b[^>]*>/g)]
+    .map((match) => match[0])
+    .find((node) => node.includes('resource-id="android:id/button1"'));
+  const bounds = positive
+    ?.match(/bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/)
+    ?.slice(1)
+    .map(Number);
+  assert(bounds, "Native confirmation must offer its positive button");
+  adbRun([
+    "shell",
+    "input",
+    "tap",
+    String(Math.round((bounds[0] + bounds[2]) / 2)),
+    String(Math.round((bounds[1] + bounds[3]) / 2)),
+  ]);
+  adbRun(["shell", "rm", "-f", xmlPath]);
+}
+async function ownerCall(method, params) {
+  const child = spawn(join(bin, "twr-desktop-bridge"), ["default"], {
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let buffer = "",
+    error = "";
+  let timer;
+  try {
+    return await new Promise((resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("Fixture owner call timed out: " + error)),
+        30000,
+      );
+      child.stderr.on("data", (chunk) => (error += chunk));
+      child.stdout.on("data", (chunk) => {
+        buffer += chunk;
+        let newline;
+        while ((newline = buffer.indexOf("\n")) >= 0) {
+          const response = JSON.parse(buffer.slice(0, newline));
+          buffer = buffer.slice(newline + 1);
+          if (response.id === 1) {
+            if (response.error) reject(new Error(response.error));
+            else resolve(response.result);
+          }
+        }
+      });
+      child.on("exit", () =>
+        reject(new Error("Fixture owner exited: " + error)),
+      );
+      child.stdin.write(JSON.stringify({ id: 1, method, params }) + "\n");
+    });
+  } finally {
+    clearTimeout(timer);
+    child.kill();
+  }
+}
+
 const cdp = 47322;
 let stderr = "";
 let stdout = "";
@@ -93,7 +162,7 @@ try {
       "--binary-dir",
       bin,
       "--listen",
-      `127.0.0.1:${port}`,
+      `127.0.0.1:${gatewayPort}`,
     ],
     { env, stdio: ["ignore", "pipe", "pipe"] },
   );
@@ -105,6 +174,36 @@ try {
   }
   const code = stdout.match(/Pairing code[^:]+: (\w+)/)?.[1];
   assert(code, "Gateway should provide a one-use pairing code: " + stderr);
+  proxy = createServer((socket) => {
+    const upstream = connectTCP(gatewayPort, "127.0.0.1");
+    const throttle = new Transform({
+      transform(chunk, _encoding, callback) {
+        if (downstreamRate)
+          setTimeout(
+            () => callback(null, chunk),
+            Math.ceil((chunk.length * 1000) / downstreamRate),
+          );
+        else callback(null, chunk);
+      },
+    });
+    for (const current of [socket, upstream]) {
+      proxySockets.add(current);
+      current.on("error", () => {
+        socket.destroy();
+        upstream.destroy();
+        throttle.destroy();
+      });
+      current.on("close", () => {
+        proxySockets.delete(current);
+        socket.destroy();
+        upstream.destroy();
+        throttle.destroy();
+      });
+    }
+    socket.pipe(upstream);
+    upstream.pipe(throttle).pipe(socket);
+  });
+  await new Promise((resolve) => proxy.listen(port, "127.0.0.1", resolve));
   adbRun([
     "install",
     "-r",
@@ -779,6 +878,81 @@ try {
       "PASS: real Android system notification delivery and tap routing to Needs you",
     );
   }
+  if (process.env.TWR_SLOW_LINK_QA === "1") {
+    await page.evaluate(async () => {
+      await window.twr.rpc("thread.new", {
+        project: "demo",
+        name: "slow-link",
+        runtime: "fake",
+      });
+      await window.twr.rpc("thread.send", {
+        thread: "slow-link",
+        prompt: "!long 4194304",
+      });
+    });
+    await expect
+      .poll(
+        () =>
+          page.evaluate(async () => {
+            let since;
+            for (let page = 0; page < 10; page++) {
+              const transcript = await window.twr.rpc("thread.transcript", {
+                thread: "slow-link",
+                limit: 500,
+                ...(since !== undefined ? { since_seq: since } : {}),
+              });
+              const text = transcript.events.find(
+                (event) =>
+                  event.kind === "agent.text" &&
+                  event.data?.text?.length === 4194304,
+              );
+              if (text) {
+                window.__qaSlowSince = text.seq - 1;
+                return true;
+              }
+              if (!transcript.more) return false;
+              since = transcript.next;
+            }
+            return false;
+          }),
+        { timeout: 30000 },
+      )
+      .toBe(true);
+    await page.evaluate(() => {
+      window.__qaSlowDrops = 0;
+      window.__qaSlowWatch = window.twr.onEvent((event) => {
+        if (event.type === "connection" && !event.connected)
+          window.__qaSlowDrops++;
+      });
+    });
+    downstreamRate = 64 * 1024;
+    const started = Date.now();
+    try {
+      const result = await page.evaluate(async () => {
+        const transcript = await window.twr.rpc("thread.transcript", {
+          thread: "slow-link",
+          limit: 500,
+        });
+        return {
+          length: transcript.events.find((event) => event.kind === "agent.text")
+            ?.data?.text?.length,
+          drops: window.__qaSlowDrops,
+        };
+      });
+      assert.equal(result.length, 4194304);
+      assert.equal(result.drops, 0, "Slow transfer must not reconnect");
+      assert(
+        Date.now() - started > 45000,
+        "Fixture must exceed the old idle deadline",
+      );
+    } finally {
+      downstreamRate = 0;
+      await page.evaluate(() => window.__qaSlowWatch());
+    }
+    console.log(
+      "PASS: a 4 MiB transcript crosses a 64 KiB/s link without a timeout or reconnect",
+    );
+  }
   if (process.env.TWR_PERF === "1")
     await performanceAudit(
       page,
@@ -814,10 +988,42 @@ try {
     );
     const limitedCode = pairOutput.match(/Pairing code[^:]+: (\w+)/)?.[1];
     assert(limitedCode);
+    const duplicate = await page.evaluate(
+      async ({ port, code }) => {
+        try {
+          await window.Capacitor.Plugins.TwrTransport.pair({
+            url: `http://127.0.0.1:${port}`,
+            code,
+            name: "duplicate",
+            hubName: "duplicate",
+          });
+          return "unexpected pairing";
+        } catch (error) {
+          return String(error);
+        }
+      },
+      { port, code: limitedCode },
+    );
+    assert.match(duplicate, /already paired/);
+    assert.equal(
+      (
+        await page.evaluate(() =>
+          window.Capacitor.Plugins.TwrTransport.listHubs(),
+        )
+      ).hubs.length,
+      2,
+    );
+    console.log(
+      "PASS: duplicate pairing is rejected without consuming its code or storing another credential",
+    );
     await page
       .getByRole("button", { name: "Remote hub settings", exact: true })
       .click();
-    await page.getByRole("button", { name: "Switch hub", exact: true }).click();
+    await page
+      .getByRole("button", { name: "Revoke this device", exact: true })
+      .click();
+    await nativeConfirm();
+    await expect(page.locator(".mobile-onboarding")).toBeVisible();
     await page.getByRole("button", { name: /Pair.*hub/i }).click();
     await page
       .getByLabel("Hub name", { exact: true })
@@ -846,6 +1052,35 @@ try {
     console.log(
       "PASS: default device scopes disable terminals and hide admin sections",
     );
+    const readOnlyCode = (
+      await ownerCall("device.pair_begin", { scopes: ["read"] })
+    ).code;
+    await page
+      .getByRole("button", { name: "Remote hub settings", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Revoke this device", exact: true })
+      .click();
+    await nativeConfirm();
+    await expect(page.locator(".mobile-onboarding")).toBeVisible();
+    await page.getByRole("button", { name: /Pair.*hub/i }).click();
+    await page.getByLabel("Hub name", { exact: true }).fill("Read only QA");
+    await page
+      .getByLabel("Hub URL", { exact: true })
+      .fill(`http://127.0.0.1:${port}`);
+    await page.getByLabel("Pairing code", { exact: true }).fill(readOnlyCode);
+    await page.getByLabel("This device", { exact: true }).fill("Read only QA");
+    await page
+      .getByRole("button", { name: "Pair and connect", exact: true })
+      .click();
+    await expect(page.locator(".composer textarea")).toBeDisabled();
+    await expect(
+      page.getByRole("button", { name: "Send message", exact: true }),
+    ).toBeDisabled();
+    await expect(page.getByLabel("Upload files", { exact: true })).toHaveCount(
+      0,
+    );
+    console.log("PASS: read-only grants disable message and upload controls");
   }
   assert.deepEqual(errors, []);
   console.log(
@@ -862,6 +1097,8 @@ try {
   }
   throw error;
 } finally {
+  for (const socket of proxySockets) socket.destroy();
+  await new Promise((resolve) => (proxy ? proxy.close(resolve) : resolve()));
   await Promise.all(devices.map((d) => d.close().catch(() => {})));
   try {
     adbRun(["shell", "am", "force-stop", "tools.twr.mobile.dev"]);

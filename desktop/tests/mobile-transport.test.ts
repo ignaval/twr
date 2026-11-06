@@ -35,6 +35,36 @@ beforeEach(() => {
   });
 });
 describe("mobile reconnect", () => {
+  it("sends independent heartbeats while a large read reply is pending", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      let readID = "";
+      const original = fake.send.getMockImplementation()!;
+      fake.send.mockImplementation(async (payload) => {
+        const call = JSON.parse(payload.message);
+        if (call.method === "config-read") readID = call.id;
+        else await original(payload);
+      });
+      const pending = host.request("config-read", {}, 100000);
+      await vi.advanceTimersByTimeAsync(46000);
+      const heartbeats = fake.send.mock.calls
+        .map(([call]) => JSON.parse(call.message))
+        .filter((call) => call.method === "heartbeat");
+      expect(heartbeats.length).toBeGreaterThanOrEqual(3);
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      reply(readID, { content: "large reply arrived" });
+      expect(await pending).toEqual({ content: "large reply arrived" });
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
   it.each(["x".repeat(2 * 1024 * 1024), "界".repeat(750000)])(
     "rejects oversized UTF-8 mutations without reconnecting",
     async (prompt) => {

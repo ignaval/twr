@@ -135,7 +135,14 @@
       "executableName": "twr-desktop",
       "syncDesktopName": true
     },
-    "icon": "packaging/icon.png"
+    "icon": "packaging/icon.png",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    }
   },
   "type": "module",
   "overrides": {

@@ -324,11 +324,24 @@ async fn run_call(
         // Hydrate historical transcript/event payloads as well as live subscriptions.
         if matches!(call.method.as_str(), "thread.events" | "thread.transcript") {
             if let Some(events) = result["events"].as_array_mut() {
-                for ev in events {
+                let original=std::mem::take(events);
+                let total=original.len();
+                let mut bytes=0;
+                for mut ev in original {
                     if twr_core::blob::has_capped(&ev["data"]) {
                         let _ = tokio::time::timeout(Duration::from_secs(5), twr_core::blob::hydrate_deep(&mut ev["data"], &mut c)).await;
                     }
-                    twr_app::present_event(ev);
+                    twr_app::present_event(&mut ev);
+                    let size=serde_json::to_vec(&ev)?.len();
+                    if !events.is_empty() && bytes+size>1024*1024 {break;}
+                    bytes+=size;
+                    events.push(ev);
+                }
+                if events.len()<total {
+                    let next=events.last().and_then(|e|e["seq"].as_u64()).context("Transcript event sequence missing")?;
+                    result["more"]=json!(true);
+                    result["next"]=json!(next);
+                    result["last_seq"]=json!(next);
                 }
             }
         }

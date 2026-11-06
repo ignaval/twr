@@ -73,6 +73,7 @@ struct Server {
     terminal_slots: Arc<Semaphore>,
     binary: PathBuf,
     companion: PathBuf,
+    owner: Mutex<Option<twr_core::client::Client>>,
     auth: Auth,
     slots: Arc<Semaphore>,
     development: bool,
@@ -83,9 +84,35 @@ struct Server {
     receipt_waiters: Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Value>>>>,
 }
 type OrderedInput = (Call, mpsc::Sender<Value>, u64);
+fn authorize_mutation(device: &Device, call: &Call) -> Result<()> {
+    let allowed = match call.method.as_str() {
+        "rpc" => device.allows_params(
+            call.params["method"].as_str().unwrap_or(""),
+            &call.params["params"],
+        ),
+        "config-save" | "config-set" => device.scopes.iter().any(|s| s == "admin"),
+        "terminal-open" => device.scopes.iter().any(|s| s == "terminal"),
+        "cli" => device.allows("thread.new"),
+        _ => false,
+    };
+    anyhow::ensure!(
+        allowed,
+        "This device does not have permission for this operation"
+    );
+    Ok(())
+}
+
 const MAX_SOCKET_REPLY: usize = 16 * 1024 * 1024;
 
 /// Keep a large transcript or state event from tearing down a healthy native socket.
+fn send_budget(message: &Message) -> Duration {
+    let bytes = match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(data) => data.len(),
+        _ => 0,
+    };
+    Duration::from_secs(20 + (bytes as u64).div_ceil(32 * 1024))
+}
 fn socket_message(event: &Value) -> Message {
     let text = event.to_string();
     let text = if text.len() > MAX_SOCKET_REPLY {
@@ -103,6 +130,39 @@ fn socket_message(event: &Value) -> Message {
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+    #[test]
+    fn denied_and_unknown_rpc_calls_cannot_claim_receipts() {
+        let mut device = Device {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "read only".into(),
+            created: 0,
+            token_hash: String::new(),
+            scopes: vec!["read".into()],
+        };
+        let call = Call {
+            id: uuid::Uuid::new_v4().to_string(),
+            method: "rpc".into(),
+            params: json!({"method":"thread.send","params":{}}),
+            workspace: None,
+        };
+        assert!(authorize_mutation(&device, &call).is_err());
+        device.scopes.push("operate".into());
+        assert!(authorize_mutation(&device, &call).is_ok());
+        let unknown = Call {
+            params: json!({"method":"unknown"}),
+            ..call
+        };
+        assert!(authorize_mutation(&device, &unknown).is_err());
+    }
+    #[test]
+    fn large_frames_get_a_slow_link_transfer_budget() {
+        let frame = socket_message(&json!({"id":"large","result":"x".repeat(4*1024*1024)}));
+        assert!(send_budget(&frame) >= Duration::from_secs(148));
+        assert!(
+            send_budget(&socket_message(&json!({"id":"small","result":true})))
+                <= Duration::from_secs(21)
+        );
+    }
     #[test]
     fn oversized_replies_and_events_become_bounded_errors() {
         for value in [
@@ -126,12 +186,30 @@ mod socket_tests {
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), small);
     }
 }
+async fn owner_client() -> Result<twr_core::client::Client> {
+    let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
+    let config = twr_core::config::Config::load_from(&paths)?;
+    let mut client = twr_core::client::Client::connect(&config.socket_path(&paths)).await?;
+    let hello = client.hello(json!({"client":"mobile-gateway"})).await?;
+    anyhow::ensure!(
+        hello["identity"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("user:")),
+        "Launch the gateway from your terminal or desktop launcher"
+    );
+    Ok(client)
+}
 impl Server {
     async fn owner_call(&self, method: &str, params: Value) -> Result<Value> {
-        let (events, mut received) = mpsc::channel(128);
-        tokio::spawn(async move { while received.recv().await.is_some() {} });
-        let companion = Companion::start(&self.companion, "default", "gateway", "", events).await?;
-        companion.call(method, params).await
+        let mut owner = self.owner.lock().await;
+        if owner.is_none() {
+            *owner = Some(owner_client().await?);
+        }
+        let result = owner.as_mut().unwrap().call(method, params).await;
+        if result.is_err() {
+            *owner = None;
+        }
+        result
     }
 }
 struct DeviceSession {
@@ -247,6 +325,7 @@ struct Session {
     terminal_events: mpsc::Sender<Value>,
     uploads: Mutex<HashMap<String, remote::upload::Upload>>,
     upload_quota: std::sync::Mutex<remote::upload::Quota>,
+    latest_state: Arc<std::sync::Mutex<Option<Value>>>,
 }
 impl Session {
     async fn call(&self, server: &Server, call: &Call) -> Result<Value> {
@@ -278,16 +357,36 @@ impl Session {
                 if let Some(error) = twr_core::paths::workspace_name_error(workspace) {
                     anyhow::bail!(error);
                 }
+                let existing = {
+                    let connection = self.connection.read().await;
+                    (connection.workspace == workspace)
+                        .then(|| connection.bridge.clone())
+                        .flatten()
+                };
+                if let Some(bridge) = existing.filter(|bridge| bridge.is_alive()) {
+                    if bridge.call("hub.info", json!({})).await.is_ok() {
+                        let paths = bridge.call("desktop.paths", json!({})).await?;
+                        let cached = self.latest_state.lock().unwrap().clone();
+                        if let Some(state) = cached {
+                            let _ = self.events.send(state).await;
+                        }
+                        let _ = self
+                            .events
+                            .send(json!({"type":"connection","connected":true}))
+                            .await;
+                        return Ok(paths);
+                    }
+                }
                 let generation = self.bridge_generation.load(Ordering::SeqCst) + 1;
                 if self.device.scopes.iter().any(|s| s == "operate") {
-                    let (discard, mut received) = mpsc::channel(128);
-                    tokio::spawn(async move { while received.recv().await.is_some() {} });
-                    let admin =
-                        Companion::start(&server.companion, workspace, "gateway", "", discard)
-                            .await?;
-                    admin
-                        .call("desktop.ensure_hub", json!({"binary":server.binary}))
-                        .await?;
+                    let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+                    let config = twr_core::config::Config::load_from(&paths)?;
+                    twr_app::runtime::ensure_hub(
+                        &paths,
+                        &config.socket_path(&paths),
+                        &server.binary,
+                    )
+                    .await?;
                 }
                 let (events, mut received) = mpsc::channel::<Value>(256);
                 let output = self.events.clone();
@@ -343,6 +442,7 @@ impl Session {
                 let paths = bridge.call("desktop.paths", json!({})).await?;
                 // Prove device identity before presenting the connection as usable.
                 bridge.call("hub.info", json!({})).await?;
+                self.latest_state.lock().unwrap().take();
                 self.bridge_generation.store(generation, Ordering::SeqCst);
                 *self.connection.write().await = WorkspaceConnection {
                     workspace: workspace.into(),
@@ -760,6 +860,7 @@ async fn serve_socket(
                     terminal_events: terminal_tx,
                     uploads: Mutex::new(HashMap::new()),
                     upload_quota: std::sync::Mutex::new(remote::upload::Quota::default()),
+                    latest_state: latest_state.clone(),
                 },
                 events,
                 terminal_events,
@@ -809,14 +910,14 @@ async fn serve_socket(
                 reply=response_rx.recv()=>match reply{Some(e)=>e,None=>break},
                 event=rx.recv()=>match event{Ok(e)=>e,Err(broadcast::error::RecvError::Lagged(_))=>{
                     let snapshot=state_cache.lock().unwrap().clone();
-                    if let Some(snapshot)=snapshot {if !matches!(tokio::time::timeout(Duration::from_secs(20),sink.send(socket_message(&snapshot))).await,Ok(Ok(()))){break;}}
+                    if let Some(snapshot)=snapshot {let frame=socket_message(&snapshot);if !matches!(tokio::time::timeout(send_budget(&frame),sink.send(frame)).await,Ok(Ok(()))){break;}}
                     json!({"type":"resync"})
                 },Err(_)=>break},
                 event=terminal_rx.recv()=>match event{Ok(e)=>e,Err(broadcast::error::RecvError::Lagged(_))=>json!({"type":"terminal-resync"}),Err(_)=>break}
             };
+            let frame = socket_message(&event);
             if !matches!(
-                tokio::time::timeout(Duration::from_secs(20), sink.send(socket_message(&event)))
-                    .await,
+                tokio::time::timeout(send_budget(&frame), sink.send(frame)).await,
                 Ok(Ok(()))
             ) {
                 break;
@@ -865,6 +966,7 @@ async fn serve_socket(
                       let receipt_key=format!("{}:{}",task_device.id,call.id);
                       let mut completion=None;
                       if mutation {
+                        if let Err(error)=authorize_mutation(&task_device,&call) {let _=task_replies.send(json!({"id":call.id,"error":error.to_string()})).await;return;}
                         let mut waiters=task_server.receipt_waiters.lock().await;
                         match task_server.receipts.begin(&task_device.id,&call.id,&workspace,&call.method,&call.params){Ok(Some(reply))=>{
                           if let Some(mut receiver)=waiters.get(&receipt_key).cloned() {
@@ -923,23 +1025,9 @@ async fn main() -> Result<()> {
     let companion = dir.join("twr-desktop-bridge");
     let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
     let auth = Auth::open(&paths.config_file.with_file_name("mobile"))?;
-    let (tx, mut rx) = mpsc::channel(128);
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let local = Companion::start(&companion, "default", "gateway", "", tx).await?;
-    // ensure_hub returns the authenticated hub.info proof. Reuse it instead of
-    // creating another readiness or RPC connection at startup.
-    let info = tokio::time::timeout(
-        Duration::from_secs(75),
-        local.call("desktop.ensure_hub", json!({"binary":binary})),
-    )
-    .await
-    .context("Gateway startup did not receive an authenticated hub response within 75 seconds")??;
-    anyhow::ensure!(
-        info["identity"]
-            .as_str()
-            .is_some_and(|i| i.starts_with("user:")),
-        "Launch the gateway from your terminal or desktop launcher"
-    );
+    let config = twr_core::config::Config::load_from(&paths)?;
+    twr_app::runtime::ensure_hub(&paths, &config.socket_path(&paths), &binary).await?;
+    let mut local = owner_client().await?;
     if let Some(id) = args.revoke {
         local.call("device.revoke", json!({"id":id})).await?;
         return Ok(());
@@ -973,12 +1061,12 @@ async fn main() -> Result<()> {
         args.push_test_log,
     )?;
     let receipts = remote::receipts::Receipts::new(&paths.root().data_dir.join("mobile"))?;
-    drop(local);
     let server = Arc::new(Server {
         pairing_window: std::sync::Mutex::new((std::time::Instant::now(), 0)),
         terminal_slots: Arc::new(Semaphore::new(8)),
         binary,
         companion,
+        owner: Mutex::new(Some(local)),
         auth,
         slots: Arc::new(Semaphore::new(32)),
         development: args.development,
@@ -1030,7 +1118,7 @@ async fn main() -> Result<()> {
         .route("/v1/socket", get(upgrade))
         .route(
             "/health",
-            get(|| async { Json(json!({"service":"twr-mobile","protocol":1})) }),
+            get(|State(server):State<Shared>| async move { Json(json!({"service":"twr-mobile","protocol":1,"gateway_id":server.push.gateway_id})) }),
         )
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .with_state(server);

@@ -80,6 +80,11 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
         Task {
             do {
                 let url = try endpoint(call.getString("url") ?? "")
+                let (healthData, healthResponse) = try await network.data(from:url.appendingPathComponent("health"))
+                guard (healthResponse as? HTTPURLResponse)?.statusCode == 200,
+                      let health=try JSONSerialization.jsonObject(with:healthData) as? [String:Any],
+                      let gateway=health["gateway_id"] as? String, !gateway.isEmpty else {throw Failure("Could not identify the hub")}
+                guard !(try vault().values.contains(where:{$0["gateway_id"] as? String == gateway})) else {throw Failure("This hub is already paired. Use Revoke this device in its settings before pairing again.")}
                 var request = URLRequest(url: url.appendingPathComponent("v1/pair")); request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.httpBody = try JSONSerialization.data(withJSONObject: ["code": call.getString("code") ?? "", "name": call.getString("name") ?? ""])
                 let (data, response) = try await network.data(for: request)

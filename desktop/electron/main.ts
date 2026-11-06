@@ -35,7 +35,7 @@ import {
   workspaceSchema,
 } from "./validation";
 import type { DesktopEvent } from "../src/types";
-import { fileDigest } from "./engines";
+import { EngineDigests, cleanupEngines } from "./engines";
 import { discoverCatalog } from "./catalog";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
@@ -141,26 +141,39 @@ function findBinaries() {
       "Bundled twr binaries are missing. In a development checkout run npm run build:rust.",
     );
   // Persistent hubs must never depend on an AppImage mount or macOS app translocation.
-  const aggregate = createHash("sha256");
+  const root = join(app.getPath("userData"), "engines");
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const cache = new EngineDigests(join(root, "digests.json"));
   const sourceHashes = new Map(
     ["twr", "twr-desktop-bridge", "twr-mobile-gateway"].map((name) => [
       name,
-      fileDigest(join(dir, name), aggregate),
+      cache.digest(join(dir, name)),
     ]),
   );
-  const digest = aggregate.digest("hex");
+  const digest = createHash("sha256")
+    .update(JSON.stringify([...sourceHashes]))
+    .digest("hex");
   const stable = join(app.getPath("userData"), "engines", digest);
   mkdirSync(stable, { recursive: true, mode: 0o700 });
   for (const name of ["twr", "twr-desktop-bridge", "twr-mobile-gateway"]) {
     const target = join(stable, name);
     const source = join(dir, name);
-    if (!existsSync(target) || fileDigest(target) !== sourceHashes.get(name)) {
+    if (
+      !existsSync(target) ||
+      cache.digest(target) !== sourceHashes.get(name)
+    ) {
       const scratch = join(stable, `.${name}-${randomUUID()}`);
       copyFileSync(source, scratch);
       chmodSync(scratch, 0o755);
       renameSync(scratch, target);
+      cache.digest(target);
     }
   }
+  cache.save();
+  setTimeout(
+    () => void cleanupEngines(root, stable).catch(() => {}),
+    30000,
+  ).unref();
   return {
     twr: join(stable, "twr"),
     bridge: join(stable, "twr-desktop-bridge"),
@@ -421,6 +434,8 @@ function register() {
   handle("terminal-open", async (request) => {
     if (!workspaceReady)
       throw new Error("Connect to the workspace before starting a terminal");
+    const terminalWorkspace = workspace;
+    const terminalBridge = companion();
     const value = terminalSchema.parse(request);
     if (
       [...terminals.values()].filter((session) => !session.exited).length >= 8
@@ -435,8 +450,10 @@ function register() {
     const words = value.args?.length ? cliArgs(value.args) : [];
     const args = value.shell
       ? ["-l"]
-      : await companion().call("desktop.cli_plan", { args: words, workspace });
-    const terminalWorkspace = workspace;
+      : await terminalBridge.call("desktop.cli_plan", {
+          args: words,
+          workspace: terminalWorkspace,
+        });
     if (!value.shell) {
       try {
         await exec(binaries.twr, ["--desktop-validate", ...args], {

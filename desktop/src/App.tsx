@@ -294,7 +294,7 @@ export default function App({
   }, [events, view.went_on]);
   const assistance = useAssistance({
     workspace,
-    connected,
+    connected: connected && permitted("operate"),
     visible: section === "chat",
     target,
     events: presentedEvents,
@@ -826,7 +826,7 @@ export default function App({
   };
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
-    if (!draft.trim() || sending || !connected) return;
+    if (!permitted("operate") || !draft.trim() || sending || !connected) return;
     if (draft.startsWith("/") && !draft.startsWith("//")) {
       await submitSlash(draft);
       return;
@@ -1286,6 +1286,7 @@ export default function App({
   const attentionFor = (id: string) =>
     view.attention.filter((a) => a.thread === id);
   const respond = async (item: Attention, answer: string, message?: string) => {
+    if (!permitted("operate")) return;
     try {
       await rpc("attention.respond", {
         attn_id: item.attn_id,
@@ -1478,6 +1479,7 @@ export default function App({
             <button
               className="icon-button"
               aria-label="New thread"
+              disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
               <Plus size={16} />
@@ -1511,7 +1513,11 @@ export default function App({
                 : "Threads appear here as your agents start working."}
             </p>
           )}
-          <button className="new-thread" onClick={() => action("new")}>
+          <button
+            className="new-thread"
+            disabled={!permitted("operate")}
+            onClick={() => action("new")}
+          >
             <Plus size={14} />
             New thread
           </button>
@@ -1631,7 +1637,10 @@ export default function App({
             >
               <CommandIcon size={17} />
             </button>
-            <button onClick={() => action("new")}>
+            <button
+              disabled={!permitted("operate")}
+              onClick={() => action("new")}
+            >
               <Plus size={14} />
               New thread
             </button>
@@ -1737,6 +1746,7 @@ export default function App({
                       key={item.attn_id + ":" + item.revision}
                       item={item}
                       thread={view.threads.find((t) => t.id === item.thread)}
+                      readOnly={!permitted("operate")}
                       onRespond={respond}
                       rpc={rpc}
                       fail={fail}
@@ -1939,7 +1949,7 @@ export default function App({
                         : "Ask your orchestrator to build something…"
                     }
                     rows={Math.min(6, Math.max(2, draft.split("\n").length))}
-                    disabled={!connected}
+                    disabled={!connected || !permitted("operate")}
                     onKeyDown={(e) => {
                       if (e.key === "Tab" && !draft && assistance.suggestion) {
                         e.preventDefault();
@@ -1998,7 +2008,7 @@ export default function App({
                     }}
                   />
                   <div className="composer-bottom">
-                    {hostApi.uploadFile && (
+                    {hostApi.uploadFile && permitted("operate") && (
                       <label
                         className="attachment-button"
                         title="Upload files to this thread"
@@ -2057,6 +2067,7 @@ export default function App({
                       className="send-button"
                       type="submit"
                       disabled={
+                        !permitted("operate") ||
                         !draft.trim() ||
                         !connected ||
                         (!target && !draft.startsWith("/")) ||
@@ -2115,7 +2126,11 @@ export default function App({
                       Live work, clear outcomes, and the things waiting on you.
                     </p>
                   </div>
-                  <button className="primary" onClick={() => action("new")}>
+                  <button
+                    className="primary"
+                    disabled={!permitted("operate")}
+                    onClick={() => action("new")}
+                  >
                     <Plus size={16} />
                     New thread
                   </button>
@@ -2180,6 +2195,7 @@ export default function App({
                     key={item.attn_id + ":" + item.revision}
                     item={item}
                     thread={view.threads.find((t) => t.id === item.thread)}
+                    readOnly={!permitted("operate")}
                     onRespond={respond}
                     rpc={rpc}
                     fail={fail}
@@ -2303,6 +2319,7 @@ export default function App({
                     key={item.attn_id + ":" + item.revision}
                     item={item}
                     thread={selectedThread}
+                    readOnly={!permitted("operate")}
                     onRespond={respond}
                     rpc={rpc}
                     fail={fail}
@@ -2920,12 +2937,14 @@ function ThreadCard({
 }
 function AttentionCard({
   item,
+  readOnly = false,
   thread,
   onRespond,
   rpc,
   fail,
 }: {
   item: Attention;
+  readOnly?: boolean;
   thread?: Thread;
   onRespond: (
     item: Attention,
@@ -2941,7 +2960,7 @@ function AttentionCard({
   const [requestError, setRequestError] = useState("");
   const options = item.options || [];
   const respond = async (value: string) => {
-    if (!canRespond(item, busy)) return;
+    if (readOnly || !canRespond(item, busy)) return;
     setBusy(true);
     setRequestError("");
     try {
@@ -2964,6 +2983,7 @@ function AttentionCard({
       onKeyDown={(event) => {
         if (
           event.target !== event.currentTarget ||
+          readOnly ||
           busy ||
           item.incomplete ||
           !item.revision ||
@@ -3029,18 +3049,19 @@ function AttentionCard({
         )}
         {item.note && <p className="attention-note">{item.note}</p>}
       </div>
+      {readOnly && <p className="muted">This device has read-only access.</p>}
       <div className="attention-response">
         <input
           aria-label="Optional message with your decision"
           placeholder="Add a note (optional)…"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          disabled={busy}
+          disabled={readOnly || busy}
         />
         <div className="attention-options">
           {options.map((option, i) => (
             <button
-              disabled={busy || !item.revision || item.incomplete}
+              disabled={readOnly || busy || !item.revision || item.incomplete}
               key={option + ":" + i}
               onClick={() => void respond(option)}
             >
@@ -3061,11 +3082,15 @@ function AttentionCard({
                   value={answer}
                   onChange={(e) => setAnswer(e.target.value)}
                   placeholder="Your answer…"
-                  disabled={busy}
+                  disabled={readOnly || busy}
                 />
                 <button
                   disabled={
-                    busy || !answer.trim() || !item.revision || item.incomplete
+                    readOnly ||
+                    busy ||
+                    !answer.trim() ||
+                    !item.revision ||
+                    item.incomplete
                   }
                 >
                   Answer
@@ -3074,7 +3099,7 @@ function AttentionCard({
             )}
           {!["permission", "question"].includes(item.reason) && (
             <button
-              disabled={busy || !item.revision || item.incomplete}
+              disabled={readOnly || busy || !item.revision || item.incomplete}
               onClick={() => {
                 setBusy(true);
                 void rpc("attention.dismiss", {

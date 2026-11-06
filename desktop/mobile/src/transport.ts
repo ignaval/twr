@@ -40,6 +40,16 @@ export class RemoteHost {
   private stopped = false;
   private retryTimer?: ReturnType<typeof setTimeout>;
   private retryCount = 0;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+  private startHeartbeat() {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.nativeConnected && !this.stopped && this.foreground)
+        void this.send(
+          JSON.stringify({ id: requestId(), method: "heartbeat" }),
+        ).catch(() => {});
+    }, 15000);
+  }
   setForeground(value: boolean) {
     this.foreground = value;
     if (!value) {
@@ -161,6 +171,7 @@ export class RemoteHost {
     try {
       await this.openSocket();
       this.nativeConnected = true;
+      this.startHeartbeat();
       const capabilities = await this.request("bootstrap");
       this.readMethods = new Set(capabilities.read_methods || []);
       this.workspace = capabilities.workspace || "default";
@@ -183,6 +194,7 @@ export class RemoteHost {
   }
   async stop() {
     this.stopped = true;
+    clearInterval(this.heartbeatTimer);
     clearTimeout(this.retryTimer);
     this.nativeConnected = false;
     this.rejectPending();
@@ -258,9 +270,7 @@ export class RemoteHost {
       return Promise.reject(new Error("This hub connection was closed"));
     const id = requestId();
     const durable =
-      ["config-save", "config-set", "terminal-open", "push-register"].includes(
-        method,
-      ) ||
+      ["config-save", "config-set", "terminal-open"].includes(method) ||
       (method === "cli" &&
         params.args?.[0] === "ws" &&
         params.args?.[1] === "new") ||

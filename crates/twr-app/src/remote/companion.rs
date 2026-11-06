@@ -21,6 +21,7 @@ pub struct Companion {
     input: Mutex<ChildStdin>,
     replies: Replies,
     next: AtomicU64,
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Companion {
     pub async fn start(
@@ -57,6 +58,8 @@ impl Companion {
         let stdout = child.stdout.take().context("Companion output")?;
         let replies: Replies = Arc::new(Mutex::new(HashMap::new()));
         let pending = replies.clone();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let running = alive.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -75,6 +78,7 @@ impl Companion {
                     break;
                 }
             }
+            running.store(false, Ordering::SeqCst);
             pending.lock().await.clear();
             let _=events.send(json!({"type":"companion-closed","connected":false,"error":"Shared hub companion closed. Reconnect to resume."})).await;
         });
@@ -83,7 +87,11 @@ impl Companion {
             input: Mutex::new(input),
             replies,
             next: AtomicU64::new(0),
+            alive,
         })
+    }
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;

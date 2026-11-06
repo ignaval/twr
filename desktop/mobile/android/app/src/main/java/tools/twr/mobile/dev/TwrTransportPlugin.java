@@ -23,6 +23,7 @@ public class TwrTransportPlugin extends Plugin {
     private static final String KEY="tools.twr.mobile.credentials";
     private final OkHttpClient http=new OkHttpClient.Builder().followRedirects(false).followSslRedirects(false).connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).pingInterval(20,TimeUnit.SECONDS).build();
     private volatile WebSocket socket;
+    private final java.util.concurrent.atomic.AtomicLong connectionGeneration=new java.util.concurrent.atomic.AtomicLong();
     private String activeHub;
     private final java.util.concurrent.ExecutorService worker=java.util.concurrent.Executors.newSingleThreadExecutor();
     private SecretKey key() throws Exception {
@@ -57,6 +58,12 @@ public class TwrTransportPlugin extends Plugin {
     @PluginMethod public void listHubs(PluginCall call){try{JSONObject data=vault();JSArray hubs=new JSArray();java.util.Iterator<String> keys=data.keys();while(keys.hasNext()){String id=keys.next();hubs.put(metadata(id,data.getJSONObject(id)));}JSObject value=new JSObject();value.put("hubs",hubs);call.resolve(value);}catch(Exception e){call.reject("Could not read paired hubs",e);}}
     @PluginMethod public void pair(PluginCall call){worker.execute(()->{try{
         String url=endpoint(call.getString("url",""));JSONObject body=new JSONObject();body.put("code",call.getString("code",""));body.put("name",call.getString("name",""));
+        try(Response health=http.newCall(new Request.Builder().url(url+"/health").build()).execute()) {
+            if(!health.isSuccessful()||health.body()==null)throw new Exception("Could not identify the hub");
+            String gateway=new JSONObject(health.body().string()).getString("gateway_id");
+            JSONObject existing=vault();java.util.Iterator<String> keys=existing.keys();
+            while(keys.hasNext())if(gateway.equals(existing.getJSONObject(keys.next()).optString("gateway_id")))throw new Exception("This hub is already paired. Use Revoke this device in its settings before pairing again.");
+        }
         Request request=new Request.Builder().url(url+"/v1/pair").post(RequestBody.create(body.toString(),MediaType.get("application/json"))).build();
         try(Response response=http.newCall(request).execute()){
             if(!response.isSuccessful()||response.body()==null)throw new Exception("Pairing failed. Check the code and hub URL.");
@@ -66,20 +73,22 @@ public class TwrTransportPlugin extends Plugin {
         }
     }catch(Exception e){call.reject(e.getMessage(),e);}});}
     @PluginMethod public void connect(PluginCall call){try{
+        final long generation=connectionGeneration.incrementAndGet();
         if(socket!=null)socket.close(1000,"Switching hub");
         String id=call.getString("id","");JSONObject hub=vault().getJSONObject(id);String url=endpoint(hub.getString("url")).replaceFirst("^http","ws")+"/v1/socket";
         activeHub=id;
-        socket=http.newWebSocket(new Request.Builder().url(url).header("Authorization","Bearer "+hub.getString("token")).build(),new WebSocketListener(){
+        WebSocket opened=http.newWebSocket(new Request.Builder().url(url).header("Authorization","Bearer "+hub.getString("token")).build(),new WebSocketListener(){
             private boolean authenticated=false;
             @Override public void onOpen(WebSocket ws,Response response){}
-            @Override public void onMessage(WebSocket ws,String text){if(ws!=socket)return;try{if(text.length()>16*1024*1024)throw new Exception("Hub response too large");JSObject message=new JSObject(text);if("authenticated".equals(message.optString("type"))){authenticated=true;call.resolve();}JSObject value=new JSObject();value.put("message",message);notifyListeners("message",value);}catch(Exception e){ws.cancel();}}
+            @Override public void onMessage(WebSocket ws,String text){if(generation!=connectionGeneration.get())return;try{if(text.length()>16*1024*1024)throw new Exception("Hub response too large");JSObject message=new JSObject(text);if("authenticated".equals(message.optString("type"))){authenticated=true;call.resolve();}JSObject value=new JSObject();value.put("message",message);notifyListeners("message",value);}catch(Exception e){ws.cancel();}}
             @Override public void onClosed(WebSocket ws,int code,String reason){if(!authenticated)call.reject("Hub authentication failed");closed(ws);}
             @Override public void onFailure(WebSocket ws,Throwable error,Response response){if(!authenticated)call.reject("Could not connect to the hub");closed(ws);}
-            private void closed(WebSocket ws){if(ws!=socket)return;JSObject value=new JSObject();value.put("message",new JSObject().put("type","transport-closed").put("connected",false).put("error","Remote hub connection closed"));notifyListeners("message",value);}
+            private void closed(WebSocket ws){if(generation!=connectionGeneration.get())return;JSObject value=new JSObject();value.put("message",new JSObject().put("type","transport-closed").put("connected",false).put("error","Remote hub connection closed"));notifyListeners("message",value);}
         });
+        if(generation==connectionGeneration.get())socket=opened;else opened.cancel();
     }catch(Exception e){call.reject("Could not connect to the paired hub",e);}}
     @PluginMethod public void send(PluginCall call){String message=call.getString("message","");if(message.getBytes(java.nio.charset.StandardCharsets.UTF_8).length>2*1024*1024){call.reject("Request exceeds 2 MiB","REQUEST_TOO_LARGE");return;}if(socket==null||!socket.send(message)){call.reject("Hub connection is closed");}else call.resolve();}
-    @PluginMethod public void disconnect(PluginCall call){if(socket!=null){socket.close(1000,"App disconnected");socket=null;}call.resolve();}
-    @PluginMethod public void removeHub(PluginCall call){try{String id=call.getString("id","");JSONObject all=vault();all.remove(id);save(all);if(id.equals(activeHub)&&socket!=null)socket.cancel();call.resolve();}catch(Exception e){call.reject("Could not remove hub",e);}}
+    @PluginMethod public void disconnect(PluginCall call){connectionGeneration.incrementAndGet();if(socket!=null){socket.close(1000,"App disconnected");socket=null;}call.resolve();}
+    @PluginMethod public void removeHub(PluginCall call){try{String id=call.getString("id","");JSONObject all=vault();all.remove(id);save(all);if(id.equals(activeHub)){connectionGeneration.incrementAndGet();if(socket!=null)socket.cancel();socket=null;}call.resolve();}catch(Exception e){call.reject("Could not remove hub",e);}}
     @Override protected void handleOnDestroy(){if(socket!=null)socket.cancel();worker.shutdown();http.dispatcher().executorService().shutdown();}
 }

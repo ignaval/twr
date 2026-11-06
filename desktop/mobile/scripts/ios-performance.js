@@ -54,7 +54,14 @@ const frame = (now) => {
 requestAnimationFrame(frame);
 const streamEvents = [];
 const stopMeasuring = window.twr.onEvent((message) => {
-  if (message.type === "thread" && message.event?.ts)
+  if (
+    message.type === "thread" &&
+    message.event?.ts &&
+    (message.event.kind === "agent.tool_call" ||
+      message.event.kind === "agent.tool_result" ||
+      (message.event.kind === "agent.text" &&
+        message.event.data?.text === "PERFORMANCE_STREAM_FINISHED"))
+  )
     streamEvents.push({
       server: Date.parse(message.event.ts),
       received: performance.now(),

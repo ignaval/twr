@@ -15,17 +15,27 @@ struct Receipt {
 }
 pub struct Receipts {
     dir: PathBuf,
-    count: std::sync::atomic::AtomicUsize,
+    counts: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 impl Receipts {
     pub fn new(dir: &Path) -> Result<Self> {
         let dir = dir.join("requests");
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        let count = std::fs::read_dir(&dir)?.filter_map(Result::ok).count();
+        let mut counts = std::collections::HashMap::new();
+        for file in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
+            let name = file.file_name();
+            if let Some(device) = name
+                .to_str()
+                .and_then(|name| name.get(..36))
+                .filter(|id| uuid::Uuid::parse_str(id).is_ok())
+            {
+                *counts.entry(device.to_string()).or_default() += 1;
+            }
+        }
         Ok(Self {
             dir,
-            count: std::sync::atomic::AtomicUsize::new(count),
+            counts: std::sync::Mutex::new(counts),
         })
     }
     fn path(&self, device: &str, id: &str) -> Result<PathBuf> {
@@ -61,19 +71,11 @@ impl Receipts {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        // Bound durable receipts across all devices. Reject before executing when
-        // full; never evict a recent receipt and accidentally repeat a mutation.
-        self.count
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |n| (n < 8192).then_some(n + 1),
-            )
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Daily operation receipt limit reached. Try again after older receipts expire."
-                )
-            })?;
+        // A device must never consume another device's replay budget. Keep
+        // recent receipts rather than evicting them and risking duplicate work.
+        let mut counts = self.counts.lock().unwrap();
+        let count = counts.entry(device.to_string()).or_default();
+        anyhow::ensure!(*count<8192,"This device's daily operation receipt limit was reached. Try again after older receipts expire.");
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -87,6 +89,7 @@ impl Receipts {
             reply: None,
         })?)?;
         file.sync_all()?;
+        *count += 1;
         Ok(None)
     }
     pub fn finish(&self, device: &str, id: &str, reply: &Value) -> Result<()> {
@@ -122,28 +125,56 @@ impl Receipts {
                 && meta.modified()?.elapsed().unwrap_or_default().as_secs() > 86400
                 && std::fs::remove_file(file.path()).is_ok()
             {
-                let _ = self.count.fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |n| Some(n.saturating_sub(1)),
-                );
+                let name = file.file_name();
+                if let Some(device) = name.to_str().and_then(|name| name.get(..36)) {
+                    if let Some(count) = self.counts.lock().unwrap().get_mut(device) {
+                        *count = count.saturating_sub(1);
+                    }
+                }
             }
         }
         Ok(())
     }
 }
 pub fn mutation(method: &str, params: &Value) -> bool {
-    matches!(
-        method,
-        "config-save" | "config-set" | "terminal-open" | "push-register"
-    ) || (method == "cli" && params["args"][0] == "ws" && params["args"][1] == "new")
+    matches!(method, "config-save" | "config-set" | "terminal-open")
+        || (method == "cli" && params["args"][0] == "ws" && params["args"][1] == "new")
         || (method == "rpc"
             && twr_core::devices::method_scope(params["method"].as_str().unwrap_or(""))
-                != Some("read"))
+                .is_some_and(|scope| scope != "read"))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn one_device_cannot_exhaust_another_devices_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipts = Receipts::new(dir.path()).unwrap();
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        receipts.counts.lock().unwrap().insert(a.clone(), 8192);
+        assert!(receipts
+            .begin(
+                &a,
+                &uuid::Uuid::new_v4().to_string(),
+                "default",
+                "rpc",
+                &json!({"method":"thread.send"})
+            )
+            .is_err());
+        assert!(receipts
+            .begin(
+                &b,
+                &uuid::Uuid::new_v4().to_string(),
+                "default",
+                "rpc",
+                &json!({"method":"thread.send"})
+            )
+            .unwrap()
+            .is_none());
+        assert!(!mutation("rpc", &json!({"method":"unknown"})));
+        assert!(!mutation("push-register", &json!({})));
+    }
     #[test]
     fn mutation_is_claimed_before_execution_and_returns_the_same_reply() {
         let dir = tempfile::tempdir().unwrap();
