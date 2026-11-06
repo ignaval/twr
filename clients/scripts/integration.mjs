@@ -376,7 +376,7 @@ try {
   await create.getByLabel(/Project or repository/).fill("demo");
   await create.getByLabel("Name", { exact: true }).fill("ui-first");
   await create.getByLabel("Runtime", { exact: true }).fill("fake");
-  await create.getByRole("button", { name: "Run", exact: true }).click();
+  await create.locator('button[type="submit"]').click();
   const firstComposer = page.getByRole("textbox", {
     name: "Message ui-first directly",
   });
@@ -700,6 +700,9 @@ try {
     .locator(".compact-nav")
     .getByRole("button", { name: "More" })
     .click();
+  await page
+    .locator(".manage-nav")
+    .evaluate((element) => (element.open = true));
   await page
     .locator(".sidebar-secondary")
     .getByRole("button", { name: "Accounts", exact: true })

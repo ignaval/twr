@@ -13,10 +13,15 @@ export async function runMacQA(page, { fixture, hubPids }) {
       params,
     });
   const nav = async (name) => {
-    await page
-      .locator(".utility-nav")
-      .getByRole("button", { name, exact: true })
-      .click();
+    if (name === "Settings")
+      return page
+        .locator(".sidebar-footer")
+        .getByRole("button", { name, exact: true })
+        .click();
+    const manage = page.locator(".manage-nav");
+    if ((await manage.getAttribute("open")) === null)
+      await manage.locator("summary").click();
+    await manage.getByRole("button", { name, exact: true }).click();
   };
   const open = async (title, values = {}) => {
     await page
@@ -42,7 +47,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   };
   const run = async (title, values = {}, confirm = false) => {
     const dialog = await open(title, values);
-    await dialog.getByRole("button", { name: "Run", exact: true }).click();
+    await dialog.locator('button[type="submit"]').click();
     if (confirm)
       await page
         .getByRole("dialog")
@@ -103,7 +108,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
     name: "relative-path-qa",
     runtime: "fake",
   });
-  await relative.getByRole("button", { name: "Run", exact: true }).click();
+  await relative.locator('button[type="submit"]').click();
   await relative.waitFor({ state: "hidden" });
   assert.equal(
     (await rpc("thread.get", { thread: "relative-path-qa" })).repo,
@@ -283,7 +288,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   );
   console.log("QA: memory creation, editing and draft retention");
   const context = await open("Read standing context", { project: "demo" });
-  await context.getByRole("button", { name: "Run", exact: true }).click();
+  await context.locator('button[type="submit"]').click();
   await context
     .locator(".editor-form textarea")
     .fill("Standing context saved by packaged Mac QA");
@@ -355,7 +360,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   console.log("QA: park/resume and workspace switching with drafts");
 
   const deletion = await open("Move thread to trash", { threads: "qa-agent" });
-  await deletion.getByRole("button", { name: "Run", exact: true }).click();
+  await deletion.locator('button[type="submit"]').click();
   const deleteCard = page
     .locator(".manager .attention-card")
     .filter({ hasText: "qa-agent" });
@@ -368,7 +373,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   const trashRow = page.getByRole("row").filter({ hasText: "qa-agent" });
   await trashRow.getByRole("button", { name: "Restore", exact: true }).click();
   const restoration = page.getByRole("dialog").last();
-  await restoration.getByRole("button", { name: "Run", exact: true }).click();
+  await restoration.locator('button[type="submit"]').click();
   await restoration.locator(".operation-result").waitFor();
   await restoration.getByRole("button", { name: "Close", exact: true }).click();
   await run("Resume thread", { thread: "qa-agent" });

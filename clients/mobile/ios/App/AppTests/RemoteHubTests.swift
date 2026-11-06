@@ -12,7 +12,7 @@ final class RemoteHubTests: XCTestCase {
         try await web.callAsyncJavaScript(body, arguments: arguments, in: nil, contentWorld: .page)
     }
 
-    private func until(_ body: String, seconds: Double = 30) async throws {
+    private func until(_ body: String, seconds: Double = 30, reportFailure: Bool = true) async throws {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             let check = """
@@ -22,8 +22,47 @@ final class RemoteHubTests: XCTestCase {
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         let html = (try? await js("return document.body.innerText")) as? String ?? "No document"
-        XCTFail("Timed out: \(body)\n\(html.prefix(3000))")
-        throw NSError(domain: "twr.qa", code: 1)
+        if reportFailure { XCTFail("Timed out: \(body)\n\(html.prefix(3000))") }
+        throw NSError(domain: "twr.qa", code: 1, userInfo: [NSLocalizedDescriptionKey: "Timed out: \(body)"])
+    }
+
+    private func dismissKeyboard() async throws {
+        let control = try await js("""
+          const button=document.querySelector('button[aria-label="Dismiss keyboard"]');
+          if(button?.getClientRects().length){
+            const box=button.getBoundingClientRect();
+            return box.width>=44 && box.height>=44 && button.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2));
+          }
+          return null;
+          """) as? Bool
+        if let control {
+            XCTAssertTrue(control, "Dismiss keyboard must be a reachable 44-point control")
+            _ = try await js("document.querySelector('button[aria-label=\"Dismiss keyboard\"]').click();return true")
+        } else {
+            // Pairing and terminal screens may have no composer control.
+            _ = try await js("document.activeElement?.blur();await window.Capacitor.Plugins.Keyboard.hide();return true")
+        }
+        // Native didHide schedules a final viewport read after 250 ms. Wait for
+        // that event first, then let its settled layout update complete.
+        try await until("return document.documentElement.dataset.keyboard !== 'true'")
+        try await Task.sleep(nanoseconds: 350_000_000)
+    }
+
+    private func statusBar(_ expected: UIStatusBarStyle) async throws {
+        let controller = try XCTUnwrap(web.window?.rootViewController as? TwrViewController)
+        let backgroundValue = try await js("return getComputedStyle(document.documentElement).getPropertyValue('--bg').trim().slice(1)") as? String
+        let background = try XCTUnwrap(backgroundValue)
+        let rgb = try XCTUnwrap(UInt32(background, radix: 16))
+        let expectedColor = UIColor(red: CGFloat((rgb >> 16) & 255) / 255,
+                                    green: CGFloat((rgb >> 8) & 255) / 255,
+                                    blue: CGFloat(rgb & 255) / 255, alpha: 1)
+        for _ in 0..<100 {
+            if controller.preferredStatusBarStyle == expected && controller.view.backgroundColor == expectedColor && web.backgroundColor == expectedColor { return }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(controller.preferredStatusBarStyle, expected, "Native status-bar contrast must match the rendered theme")
+        XCTAssertEqual(controller.view.backgroundColor, expectedColor, "Native background must match the rendered theme")
+        XCTAssertEqual(web.backgroundColor, expectedColor, "WebView background must match the rendered theme")
     }
 
     private func capture(_ name: String) async throws {
@@ -34,11 +73,30 @@ final class RemoteHubTests: XCTestCase {
                 else { continuation.resume(throwing: NSError(domain: "twr.qa.snapshot", code: 1)) }
             }
         }
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:47323/screenshot?name=" + name)!)
+        // Preserve the native snapshot in the test result before exporting a
+        // convenient PNG. A stalled local artifact upload must not skip UI QA.
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "twr-" + name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let bounds = try? await js("""
+          const box=selector=>document.querySelector(selector)?.getBoundingClientRect().toJSON();
+          return JSON.stringify({name,viewport:{width:innerWidth,height:innerHeight,visualHeight:visualViewport?.height},root:box('#root'),send:box('button[aria-label="Send message"]'),tabs:box('.mobile-tabs'),bodyPadding:getComputedStyle(document.body).padding,keyboard:document.documentElement.dataset.keyboard,fold:document.documentElement.dataset.fold});
+          """, ["name":name])
+        print("UI_BOUNDS " + String(describing: bounds))
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:47323/screenshot?name=" + name)!, timeoutInterval: 15)
         request.httpMethod = "POST"
         request.httpBody = try XCTUnwrap(image.pngData())
-        let (_, response) = try await URLSession.shared.data(for: request)
-        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        request.setValue("image/png", forHTTPHeaderField: "Content-Type")
+        request.setValue("close", forHTTPHeaderField: "Connection")
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if (response as? HTTPURLResponse)?.statusCode != 200 {
+                print("Snapshot PNG export failed; native image remains in XCTest attachments: " + name)
+            }
+        } catch {
+            print("Snapshot PNG export failed; native image remains in XCTest attachments: \(name): \(error)")
+        }
     }
 
     private func pose(_ name:String) async throws {
@@ -64,6 +122,23 @@ final class RemoteHubTests: XCTestCase {
         if fixture["foldable"] as? Bool == true {try await pose("closed")}
 
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub')")
+        // Verify native contrast independently of the OS's current appearance.
+        let controller = try XCTUnwrap(web.window?.rootViewController as? TwrViewController)
+        controller.overrideUserInterfaceStyle = .light
+        try await until("return document.documentElement.dataset.theme === 'dark'")
+        try await statusBar(.lightContent)
+        _ = try await js("document.documentElement.dataset.theme='light';return true")
+        try await statusBar(.darkContent)
+        _ = try await js("document.documentElement.dataset.theme='system';return true")
+        try await until("return getComputedStyle(document.documentElement).colorScheme === 'light'")
+        try await statusBar(.darkContent)
+        controller.overrideUserInterfaceStyle = .dark
+        try await until("return getComputedStyle(document.documentElement).colorScheme === 'dark'")
+        try await statusBar(.lightContent)
+        controller.overrideUserInterfaceStyle = .unspecified
+        _ = try await js("document.documentElement.dataset.theme='dark';return true")
+        try await statusBar(.lightContent)
+        print("PASS: native status-bar contrast follows Dark, Light, System and native trait changes")
         _ = try await js("""
           window.__qaErrors=[];window.addEventListener('error',e=>window.__qaErrors.push(e.message));
           [...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub').click();return true;
@@ -86,6 +161,7 @@ final class RemoteHubTests: XCTestCase {
           await window.twr.rpc('thread.new',{project:'demo',name:'ios-worker',runtime:'fake'});
           await window.twr.rpc('thread.send',{thread:'ios-worker',prompt:'IOS_REMOTE_STREAM_OK'});return true;
           """)
+        try await dismissKeyboard()
         _ = try await js("""
           const visible=e=>e.getClientRects().length>0;
           const nav=[...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
@@ -148,6 +224,7 @@ final class RemoteHubTests: XCTestCase {
         XCTAssertEqual(drops, 0, "Long-lived native WebSocket must remain connected")
         // Drive actual simulator hinge events, then inspect the app's native region bridge.
         if fixture["foldable"] as? Bool == true {
+            try await dismissKeyboard()
             _ = try await js("""
               [...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
                .find(e=>e.getClientRects().length&&(e.textContent==='Threads'||e.textContent.includes('Thread grid'))).click();return true;
@@ -170,7 +247,16 @@ final class RemoteHubTests: XCTestCase {
             try await pose("half-open")
             try await until("return (await window.Capacitor.Plugins.TwrLayout.current()).orientation !== 'none'")
             try await capture("half-open")
-            _ = try await js("[...document.querySelectorAll('.topbar button')].find(e=>e.getAttribute('aria-label')==='New thread'||e.textContent.includes('New thread')).click();return true")
+            try await until("""
+              const summary=document.querySelector('.conversation-menu>summary'),box=summary?.getBoundingClientRect();
+              return !!box && box.width>=44 && box.height>=44 && summary.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2));
+              """)
+            _ = try await js("document.querySelector('.conversation-menu>summary').click();return true")
+            try await until("""
+              const button=[...document.querySelectorAll('.conversation-menu button')].find(e=>e.textContent.trim()==='New thread'),box=button?.getBoundingClientRect();
+              return !!box && !button.disabled && box.width>=44 && box.height>=44 && button.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2));
+              """)
+            _ = try await js("[...document.querySelectorAll('.conversation-menu button')].find(e=>e.textContent.trim()==='New thread').click();return true")
             try await until("return !!document.querySelector('[role=dialog]')")
             let safeDialog = try await js("""
               const box=document.querySelector('[role=dialog]').getBoundingClientRect();
@@ -189,6 +275,7 @@ final class RemoteHubTests: XCTestCase {
             let restoredDraft = try await js("return document.querySelector('.composer textarea').value") as? String
             XCTAssertEqual(restoredDraft, "FOLD_TRANSITION_DRAFT")
         }
+        try await dismissKeyboard()
         let (scriptData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/performance-script")!)
         let performanceResult: Any?
         do {
@@ -226,8 +313,7 @@ final class RemoteHubTests: XCTestCase {
             }
         }
         // Exercise the same available-height contract as keyboard resizing in native WKWebView.
-        _ = try await js("document.activeElement?.blur();await window.Capacitor.Plugins.Keyboard.hide();return true")
-        try await Task.sleep(nanoseconds: 350_000_000)
+        try await dismissKeyboard()
         _ = try await js("""
           const root=document.documentElement,style=getComputedStyle(document.body);
           window.__qaAvailableHeight=root.style.getPropertyValue('--viewport-height');
@@ -242,10 +328,11 @@ final class RemoteHubTests: XCTestCase {
           const button=document.querySelector('button[aria-label="Send message"]'),box=button.getBoundingClientRect();
           const tabs=document.querySelector('.mobile-tabs'),limit=tabs?.getClientRects().length?tabs.getBoundingClientRect().top:window.__qaCompactHeight;
           return document.getElementById('root').getBoundingClientRect().height<=window.__qaCompactHeight+1 && !button.disabled && box.width>=44 && box.height>=44 && box.bottom<=limit+1 && button.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2));
-          """)
+          """, reportFailure: false)
         } catch {
             print("COMPACT " + String(describing: try? await js("return {classes:document.documentElement.className,height:window.__qaCompactHeight,root:document.getElementById('root').getBoundingClientRect().toJSON(),send:document.querySelector('button[aria-label=\"Send message\"]').getBoundingClientRect().toJSON(),tabs:document.querySelector('.mobile-tabs')?.getBoundingClientRect().toJSON(),body:getComputedStyle(document.body).padding,active:document.activeElement?.tagName}")))
             try? await capture("compact-failure")
+            XCTFail("Compact composer is not reachable: \(error.localizedDescription)")
             throw error
         }
         try await capture("compact")

@@ -62,7 +62,7 @@ export async function terminalUIQA(page) {
         () =>
           page
             .evaluate((id) => window.twr.terminalRead(id), id)
-            .then((r) => r.data),
+            .then((r) => r.data.replace(/\s+/g, " ")),
         { timeout: 15000 },
       )
       .toContain(expected);

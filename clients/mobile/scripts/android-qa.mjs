@@ -145,6 +145,28 @@ async function ownerCall(method, params) {
 const cdp = 47322;
 let stderr = "";
 let stdout = "";
+async function dismissKeyboard() {
+  const dismiss = page.getByRole("button", {
+    name: "Dismiss keyboard",
+    exact: true,
+  });
+  if (await dismiss.isVisible()) await dismiss.click();
+  else
+    await page.evaluate(async () => {
+      document.activeElement?.blur();
+      await window.Capacitor.Plugins.Keyboard.hide();
+    });
+  await expect
+    .poll(
+      () =>
+        page.evaluate(
+          () => document.documentElement.dataset.keyboard !== "true",
+        ),
+      { timeout: 10000 },
+    )
+    .toBe(true);
+}
+
 try {
   fixtureHub = spawn(join(bin, "twr"), ["hub"], { env, stdio: "ignore" });
   for (
@@ -306,6 +328,7 @@ try {
       runtime: "fake",
     }),
   );
+  await dismissKeyboard();
   const threadsTab = page
     .locator(".mobile-tabs")
     .getByRole("button", { name: "Threads", exact: true });
@@ -327,6 +350,44 @@ try {
     exact: true,
   });
   await input.fill("ANDROID_REMOTE_STREAM_OK");
+  await page.evaluate(() => window.Capacitor.Plugins.Keyboard.show());
+  await expect
+    .poll(
+      () => page.evaluate(() => document.documentElement.dataset.keyboard),
+      { timeout: 15000 },
+    )
+    .toBe("true");
+  await expect
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const bottom = document
+            .querySelector(".composer")
+            .getBoundingClientRect().bottom;
+          return Math.round((visualViewport?.height || innerHeight) - bottom);
+        }),
+      { timeout: 15000 },
+    )
+    .toBeLessThanOrEqual(24);
+  const dock = await page.evaluate(() => ({
+    viewport: visualViewport.height,
+    composer: document.querySelector(".composer").getBoundingClientRect()
+      .bottom,
+    tabs: getComputedStyle(document.querySelector(".mobile-tabs")).display,
+  }));
+  assert(
+    dock.composer <= dock.viewport + 1 && dock.tabs === "none",
+    JSON.stringify(dock),
+  );
+  mkdirSync("test-results", { recursive: true });
+  writeFileSync(
+    `test-results/${serial === "emulator-5556" ? "android-fold" : "android-phone"}-keyboard.png`,
+    execFileSync(adb, ["-s", serial, "exec-out", "screencap", "-p"]),
+  );
+  console.log(
+    "PASS: keyboard hides tabs and composer docks above native IME without an empty band",
+    dock,
+  );
   await page.getByRole("button", { name: "Send message", exact: true }).click();
   await page
     .locator(".block-assistant")
@@ -432,10 +493,15 @@ try {
       .toBe("vertical");
     assert.equal(await input.inputValue(), "FOLD_TRANSITION_DRAFT");
     const foldDialog = async (orientation) => {
-      await page
-        .locator(".topbar")
-        .getByRole("button", { name: "New thread", exact: true })
-        .click();
+      const newThread = page.locator(".topbar-new-thread");
+      if (await newThread.isVisible()) await newThread.click();
+      else {
+        await page.locator(".conversation-menu > summary").click();
+        await page
+          .locator(".conversation-menu")
+          .getByRole("button", { name: "New thread", exact: true })
+          .click();
+      }
       const dialog = page.getByRole("dialog", {
         name: "New thread",
         exact: true,
@@ -638,6 +704,7 @@ try {
         "!ask Continue Android QA?|Proceed|Wait\nANDROID_QUESTION_ANSWERED",
     }),
   );
+  await dismissKeyboard();
   const needsTab = page
     .locator(".mobile-tabs")
     .getByRole("button", { name: /Needs you/ });
@@ -1137,10 +1204,7 @@ try {
       page,
       serial === "emulator-5556" ? "android-fold" : "android-phone",
     );
-    await page.evaluate(async () => {
-      document.activeElement?.blur();
-      await window.Capacitor.Plugins.Keyboard.hide();
-    });
+    await dismissKeyboard();
     await page.waitForTimeout(350);
     const compact = await page.evaluate(async () => {
       const root = document.documentElement,
@@ -1316,6 +1380,11 @@ try {
     const readOnlyCode = (
       await ownerCall("device.pair_begin", { scopes: ["read"] })
     ).code;
+    const drawerClose = page.getByRole("button", {
+      name: "Hide sidebar",
+      exact: true,
+    });
+    if (await drawerClose.isVisible()) await drawerClose.click();
     await page
       .getByRole("button", { name: "Remote hub settings", exact: true })
       .click();

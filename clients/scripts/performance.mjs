@@ -1,6 +1,29 @@
 import { expect } from "@playwright/test";
 import { mkdirSync, writeFileSync } from "node:fs";
 export async function performanceAudit(page, label, application) {
+  if (
+    await page.evaluate(
+      () => document.documentElement.dataset.mobile === "true",
+    )
+  ) {
+    const dismiss = page.getByRole("button", {
+      name: "Dismiss keyboard",
+      exact: true,
+    });
+    if (await dismiss.isVisible()) await dismiss.click();
+    else
+      await page.evaluate(async () => {
+        document.activeElement?.blur();
+        await window.Capacitor.Plugins.Keyboard.hide();
+      });
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => document.documentElement.dataset.keyboard !== "true",
+        ),
+      )
+      .toBe(true);
+  }
   const count = 1000;
   const rpc = (method, params = {}) =>
     page.evaluate(({ method, params }) => window.twr.rpc(method, params), {

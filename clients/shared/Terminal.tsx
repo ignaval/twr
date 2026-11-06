@@ -37,10 +37,10 @@ export function Terminal({
           void hostApi.openExternal(uri).catch(() => {}),
       },
       theme: {
-        background: "#101214",
-        foreground: "#d7dedc",
-        cursor: "#82ddc5",
-        selectionBackground: "#344b48",
+        background: "#0b0d0f",
+        foreground: "#e6e9ec",
+        cursor: "#62c7d4",
+        selectionBackground: "#29434a",
       },
     });
     const addon = new FitAddon();
@@ -66,10 +66,10 @@ export function Terminal({
         return colorContext.fillStyle as string;
       };
       const theme = {
-        background: resolve(read("--bg")),
-        foreground: resolve(read("--text")),
-        cursor: resolve(read("--accent")),
-        selectionBackground: resolve(read("--accent-soft")),
+        background: resolve(read("--terminal-bg")),
+        foreground: resolve(read("--terminal-text")),
+        cursor: resolve(read("--terminal-accent")),
+        selectionBackground: resolve(read("--terminal-selection")),
       };
       const signature = JSON.stringify(theme);
       if (signature === previousTheme) return;

@@ -1,3 +1,4 @@
+import { savedAppearance, type Appearance } from "./appearance";
 import { useHostAPI } from "./host";
 import { useCallback, useEffect, useState, useRef } from "react";
 import {
@@ -139,7 +140,7 @@ export function Manager(props: ManagerProps) {
     <div className="manager">
       <header className="section-heading">
         <div>
-          <span className="eyebrow">WORKSPACE</span>
+          <span className="eyebrow">Workspace</span>
           <h1>{info.title}</h1>
           <p>{info.description}</p>
         </div>
@@ -786,9 +787,7 @@ function Settings({
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState<Json>();
-  const [theme, setTheme] = useState(
-    localStorage.getItem("twr.theme") || "system",
-  );
+  const [theme, setTheme] = useState<Appearance>(savedAppearance);
   useEffect(() => {
     void hostApi
       .configRead()
@@ -812,7 +811,7 @@ function Settings({
     <div className="manager">
       <header className="section-heading">
         <div>
-          <span className="eyebrow">PREFERENCES</span>
+          <span className="eyebrow">Preferences</span>
           <h1>Settings</h1>
           <p>Make twr feel at home.</p>
         </div>
@@ -824,10 +823,11 @@ function Settings({
           when available.
         </p>
         <div className="segmented">
-          {["system", "dark", "light"].map((t) => (
+          {(["dark", "light", "system"] as const).map((t) => (
             <button
               key={t}
               className={theme === t ? "active" : ""}
+              aria-pressed={theme === t}
               onClick={() => {
                 localStorage.setItem("twr.theme", t);
                 setTheme(t);

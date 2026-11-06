@@ -1,7 +1,9 @@
+import { KeyboardResize } from "@capacitor/keyboard";
 import type { CapacitorConfig } from "@capacitor/cli";
 const config: CapacitorConfig = {
   appId: "tools.twr.mobile.dev",
   appName: "twr",
+  backgroundColor: "#0e1013",
   loggingBehavior: "none",
   webDir: "mobile/www",
   android: {
@@ -15,7 +17,8 @@ const config: CapacitorConfig = {
     preferredContentMode: "mobile",
   },
   plugins: {
-    Keyboard: { resize: "native", resizeOnFullScreen: true },
+    SystemBars: { style: "DARK" },
+    Keyboard: { resize: KeyboardResize.Native },
     PushNotifications: { presentationOptions: ["badge", "sound", "alert"] },
   },
 };

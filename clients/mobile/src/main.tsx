@@ -1,3 +1,6 @@
+import { Keyboard } from "@capacitor/keyboard";
+import { initializeAppearance } from "../../shared/appearance";
+import { observeNativeAppearance } from "./appearance";
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Dialog as NativeDialog } from "@capacitor/dialog";
@@ -281,6 +284,21 @@ function Mobile() {
       <App
         key={active.id}
         deviceScopes={active.scopes}
+        onDismissKeyboard={() => {
+          document.activeElement instanceof HTMLElement &&
+            document.activeElement.blur();
+          void Keyboard.hide();
+        }}
+        headerAccessory={
+          <button
+            className="mobile-hub-switch"
+            onClick={() => setHubSheet(true)}
+            aria-label="Remote hub settings"
+          >
+            <span className="status-dot online" aria-hidden="true" />
+            {active.name}
+          </button>
+        }
         onReady={() => {
           setReadyHubId(active.id);
           const remote = host.current;
@@ -290,13 +308,7 @@ function Mobile() {
             );
         }}
       />
-      <button
-        className="mobile-hub-switch"
-        onClick={() => setHubSheet(true)}
-        aria-label="Remote hub settings"
-      >
-        {active.name}
-      </button>
+
       {hubSheet && (
         <Dialog
           title={active.name}
@@ -573,6 +585,9 @@ function Mobile() {
   );
 }
 document.documentElement.dataset.mobile = "true";
+initializeAppearance();
+const stopAppearance = observeNativeAppearance();
+import.meta.hot?.dispose(stopAppearance);
 createRoot(document.getElementById("root")!).render(
   <EditorSessionsProvider>
     <Mobile />

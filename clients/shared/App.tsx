@@ -1,3 +1,4 @@
+import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
   useCallback,
@@ -10,9 +11,14 @@ import {
   Suspense,
   type CSSProperties,
   type FormEvent,
+  type ReactNode,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  Asterisk,
+  Wrench,
+  Database,
+  ListTodo,
   ArrowUp,
   ArrowLeft,
   ArrowDown,
@@ -88,12 +94,12 @@ const initial: ViewState = {
 const nav: { id: Section; label: string; icon: typeof Activity }[] = [
   { id: "accounts", label: "Accounts", icon: KeyRound },
   { id: "boxes", label: "Boxes", icon: Server },
-  { id: "jobs", label: "Jobs", icon: TerminalSquare },
+  { id: "jobs", label: "Jobs", icon: ListTodo },
   { id: "usage", label: "Usage", icon: Activity },
   { id: "memory", label: "Context & memory", icon: FileText },
   { id: "speech", label: "Read aloud", icon: Volume2 },
   { id: "trash", label: "Trash", icon: Trash2 },
-  { id: "maintenance", label: "Hub & storage", icon: Server },
+  { id: "maintenance", label: "Hub & storage", icon: Database },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
 const statusIcon = (status: string) =>
@@ -106,6 +112,60 @@ const statusIcon = (status: string) =>
   ) : (
     <Circle size={10} />
   );
+
+function errorMessage(error: unknown) {
+  return (error instanceof Error ? error.message : String(error))
+    .replace(/^Error invoking remote method '[^']+':\s*/i, "")
+    .replace(/^Error:\s*/i, "");
+}
+function operationAction(command: Command, again: boolean) {
+  const labels: Record<string, string> = {
+    new: "Create thread",
+    delete: "Delete thread",
+    restore: "Restore",
+    rename: "Rename",
+    mode: "Change mode",
+    model: "Change model",
+    park: "Park thread",
+    resume: "Resume thread",
+    stop: "Stop thread",
+  };
+  const label = labels[command.id] || command.title.replace(/…$/, "");
+  return again ? `${label} again` : label;
+}
+function MessageBody({
+  text,
+  mono = false,
+  clamp = true,
+}: {
+  text: string;
+  mono?: boolean;
+  clamp?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const lines = text.split("\n").length;
+  const long = clamp && (lines > 16 || text.length > 1600);
+  return (
+    <>
+      <div className={`message-body ${long && !expanded ? "clamped" : ""}`}>
+        {mono ? <pre>{text}</pre> : <Markdown text={text} />}
+      </div>
+      {long && (
+        <button
+          className="message-expand"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded
+            ? "Show less"
+            : lines > 16
+              ? `Show ${lines - 12} more lines`
+              : "Show full message"}
+        </button>
+      )}
+    </>
+  );
+}
 
 function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
   const root = document.documentElement;
@@ -136,7 +196,14 @@ function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
 export default function App({
   deviceScopes,
   onReady,
-}: { deviceScopes?: string[]; onReady?: () => void } = {}) {
+  headerAccessory,
+  onDismissKeyboard,
+}: {
+  deviceScopes?: string[];
+  onReady?: () => void;
+  headerAccessory?: ReactNode;
+  onDismissKeyboard?: () => void;
+} = {}) {
   const hostApi = useHostAPI();
   const [allowedMethods, setAllowedMethods] = useState<string[]>();
   const permitted = (scope: string) =>
@@ -268,10 +335,7 @@ export default function App({
   );
   const connectionRef = useRef(false);
   const input = useRef<HTMLTextAreaElement>(null);
-  const fail = useCallback(
-    (e: unknown) => setError(e instanceof Error ? e.message : String(e)),
-    [],
-  );
+  const fail = useCallback((e: unknown) => setError(errorMessage(e)), []);
   const rpc = useCallback(
     (method: string, params: Json = {}) => hostApi.rpc(method, params),
     [],
@@ -547,8 +611,7 @@ export default function App({
         document.documentElement.dataset.platform = boot.platform;
         setTerminals(boot.terminals || []);
         setActiveTerminal(boot.terminals?.at(-1)?.id);
-        document.documentElement.dataset.theme =
-          localStorage.getItem("twr.theme") || "system";
+        document.documentElement.dataset.theme = savedAppearance();
         applyOmarchyTheme(boot.theme);
         setHomePath(boot.home);
         return connect(boot.workspace).then(() => onReady?.());
@@ -818,7 +881,7 @@ export default function App({
           }
         }
       } catch (e) {
-        setOperationError(e instanceof Error ? e.message : String(e));
+        setOperationError(errorMessage(e));
       } finally {
         setOperationBusy(false);
       }
@@ -1389,7 +1452,7 @@ export default function App({
           if (
             window.innerWidth <= 800 &&
             (event.target as HTMLElement).closest(
-              ".primary-nav button,.thread-card,.sidebar-secondary button,.new-thread,.sidebar-footer button",
+              ".primary-nav button,.thread-card,.sidebar-secondary button,.sidebar-footer button",
             )
           )
             setSidebar(false);
@@ -1399,7 +1462,7 @@ export default function App({
           <span className="wordmark">
             twr<span>_</span>
           </span>
-          <span className="brand-caption">AGENT WORKSPACE</span>
+          <span className="brand-caption">Hub client</span>
           <button
             className="icon-button no-drag"
             aria-label="Hide sidebar"
@@ -1409,7 +1472,7 @@ export default function App({
           </button>
         </div>
         <div className="workspace-picker">
-          <label htmlFor="workspace-select">WORKSPACE</label>
+          <label htmlFor="workspace-select">Workspace</label>
           <div>
             <select
               id="workspace-select"
@@ -1473,7 +1536,7 @@ export default function App({
           </button>
         </nav>
         <div className="threads-heading">
-          <span>THREADS</span>
+          <span>Threads</span>
           <div>
             <button
               className={`icon-button ${focus ? "on" : ""}`}
@@ -1503,6 +1566,7 @@ export default function App({
               key={thread.id}
               thread={thread}
               items={attentionFor(thread.id)}
+              dived={destination === thread.id}
               selected={selected === thread.id}
               pinned={pins.includes(thread.id)}
               onSelect={() => setSelected(thread.id)}
@@ -1520,14 +1584,6 @@ export default function App({
                 : "Threads appear here as your agents start working."}
             </p>
           )}
-          <button
-            className="new-thread"
-            disabled={!permitted("operate")}
-            onClick={() => action("new")}
-          >
-            <Plus size={14} />
-            New thread
-          </button>
         </div>
         {workers.some((t) => t.status === "parked") && (
           <button
@@ -1539,18 +1595,23 @@ export default function App({
               : `${workers.filter((t) => t.status === "parked").length} parked threads hidden`}
           </button>
         )}
-        <nav className="sidebar-secondary">
-          {visibleNav.map((n) => (
-            <button key={n.id} onClick={() => setSection(n.id)}>
-              <n.icon size={15} />
-              {n.label}
+        <details className="sidebar-secondary manage-nav">
+          <summary>Manage</summary>
+          <nav>
+            {visibleNav
+              .filter((n) => n.id !== "settings")
+              .map((n) => (
+                <button key={n.id} onClick={() => setSection(n.id)}>
+                  <n.icon size={15} />
+                  {n.label}
+                </button>
+              ))}
+            <button onClick={() => setSection("decisions")}>
+              <CheckCircle2 size={15} />
+              Decisions
             </button>
-          ))}
-          <button onClick={() => setSection("decisions")}>
-            <CheckCircle2 size={15} />
-            Decisions
-          </button>
-        </nav>
+          </nav>
+        </details>
         <div className="sidebar-footer">
           <button
             onClick={() => {
@@ -1596,9 +1657,18 @@ export default function App({
                 <PanelLeftOpen size={18} />
               </button>
             )}
+            {destination && section === "chat" && (
+              <button
+                className="icon-button mobile-back-button"
+                aria-label="Return to orchestrator"
+                onClick={() => setDestination(undefined)}
+              >
+                <ArrowLeft size={18} />
+              </button>
+            )}
             <span className="workspace-breadcrumb">{workspace}</span>
             <ChevronRight size={13} />
-            <span>
+            <span className="topbar-title">
               {destination
                 ? target?.name
                 : section === "chat"
@@ -1610,11 +1680,18 @@ export default function App({
                       : nav.find((n) => n.id === section)?.label || "Decisions"}
             </span>
             {connected && (
-              <span className="live-indicator">
-                <span /> LIVE
+              <span
+                className="live-indicator"
+                title="Hub connected"
+                aria-label="Live connection"
+              >
+                <span />
               </span>
             )}
           </div>
+          {headerAccessory && (
+            <div className="topbar-accessory no-drag">{headerAccessory}</div>
+          )}
           <div className="topbar-actions no-drag">
             <button
               className="icon-button"
@@ -1644,7 +1721,70 @@ export default function App({
             >
               <CommandIcon size={17} />
             </button>
+            {section === "chat" && (
+              <details className="conversation-menu">
+                <summary aria-label="Thread actions">
+                  <MoreHorizontal size={18} />
+                </summary>
+                <div
+                  onClick={(event) =>
+                    (
+                      event.currentTarget.parentElement as HTMLDetailsElement
+                    ).removeAttribute("open")
+                  }
+                >
+                  <button
+                    disabled={!permitted("operate")}
+                    onClick={() => action("new")}
+                  >
+                    <Plus size={16} />
+                    New thread
+                  </button>
+                  <button
+                    aria-pressed={showTools}
+                    onClick={() => setShowTools((v) => !v)}
+                  >
+                    <Wrench size={16} />
+                    Tool calls
+                  </button>
+                  <button
+                    aria-pressed={showThinking}
+                    onClick={() => setShowThinking((v) => !v)}
+                  >
+                    <Eye size={16} />
+                    Reasoning
+                  </button>
+                  {target && (
+                    <button onClick={() => void exportConversation()}>
+                      <Download size={16} />
+                      Export conversation
+                    </button>
+                  )}
+                  <button
+                    onClick={() =>
+                      action(
+                        destination ? "model" : "orch",
+                        destination ? { thread: destination } : {},
+                      )
+                    }
+                  >
+                    <Settings2 size={16} />
+                    {destination ? "Thread settings" : "Orchestrator settings"}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setPalette(true);
+                      setQuery("");
+                    }}
+                  >
+                    <CommandIcon size={16} />
+                    Commands
+                  </button>
+                </div>
+              </details>
+            )}
             <button
+              className="topbar-new-thread"
               disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
@@ -1695,7 +1835,11 @@ export default function App({
                     <span
                       className={`destination-symbol ${destination ? "worker" : ""}`}
                     >
-                      {destination ? "↗" : "✳"}
+                      {destination ? (
+                        <ArrowUpRight size={18} />
+                      ) : (
+                        <Asterisk size={20} />
+                      )}
                     </span>
                     <div>
                       <h1>{destination ? target?.name : "Orchestrator"}</h1>
@@ -1713,7 +1857,7 @@ export default function App({
                       title="Show tool calls"
                       onClick={() => setShowTools((v) => !v)}
                     >
-                      <TerminalSquare size={16} />
+                      <Wrench size={16} />
                     </button>
                     <button
                       className={`icon-button ${showThinking ? "on" : ""}`}
@@ -1905,7 +2049,7 @@ export default function App({
                   onSubmit={(event) => void send(event)}
                 >
                   <div className="composer-label">
-                    <span>
+                    <span className="destination-chip">
                       <span className="destination-dot" />
                       To:{" "}
                       <b>
@@ -1929,6 +2073,16 @@ export default function App({
                         </button>
                       )}
                     </span>
+                    {onDismissKeyboard && (
+                      <button
+                        type="button"
+                        className="keyboard-dismiss"
+                        aria-label="Dismiss keyboard"
+                        onClick={onDismissKeyboard}
+                      >
+                        <ChevronDown size={18} />
+                      </button>
+                    )}
                     <span>
                       {!connected
                         ? "Disconnected"
@@ -1960,7 +2114,15 @@ export default function App({
                         ? `Message ${target?.name} directly…`
                         : "Ask your orchestrator to build something…"
                     }
-                    rows={Math.min(6, Math.max(2, draft.split("\n").length))}
+                    rows={Math.min(
+                      6,
+                      Math.max(
+                        document.documentElement.dataset.mobile === "true"
+                          ? 1
+                          : 2,
+                        draft.split("\n").length,
+                      ),
+                    )}
                     disabled={!connected || !permitted("operate")}
                     onKeyDown={(e) => {
                       if (e.key === "Tab" && !draft && assistance.suggestion) {
@@ -2132,7 +2294,7 @@ export default function App({
               <div className="manager">
                 <header className="section-heading">
                   <div>
-                    <span className="eyebrow">YOUR AGENTS</span>
+                    <span className="eyebrow">Your agents</span>
                     <h1>Threads</h1>
                     <p>
                       Live work, clear outcomes, and the things waiting on you.
@@ -2165,6 +2327,7 @@ export default function App({
                       key={t.id}
                       thread={t}
                       items={attentionFor(t.id)}
+                      dived={destination === t.id}
                       selected={selected === t.id}
                       pinned={pins.includes(t.id)}
                       onSelect={() => setSelected(t.id)}
@@ -2189,7 +2352,7 @@ export default function App({
               <div className="manager">
                 <header className="section-heading">
                   <div>
-                    <span className="eyebrow">YOUR ATTENTION</span>
+                    <span className="eyebrow">Your attention</span>
                     <h1>
                       Needs you{" "}
                       <span className="heading-count">
@@ -2256,7 +2419,7 @@ export default function App({
           {selectedThread && (
             <aside className="inspector">
               <header>
-                <span className="eyebrow">THREAD DETAILS</span>
+                <span className="eyebrow">Thread details</span>
                 <button
                   className="icon-button"
                   aria-label="Close thread details"
@@ -2405,26 +2568,7 @@ export default function App({
             More
           </button>
         </nav>
-        <nav className="utility-nav">
-          {visibleNav.map((n) => (
-            <button
-              key={n.id}
-              className={section === n.id ? "active" : ""}
-              onClick={() => setSection(n.id)}
-              title={n.label}
-            >
-              <n.icon size={14} />
-              <span>{n.label}</span>
-            </button>
-          ))}
-          <button
-            className={section === "decisions" ? "active" : ""}
-            onClick={() => setSection("decisions")}
-          >
-            <CheckCircle2 size={14} />
-            <span>Decisions</span>
-          </button>
-        </nav>
+
         {terminals.length > 0 && (
           <section
             className={`terminal-dock ${terminalVisible ? "" : "collapsed"}`}
@@ -2562,6 +2706,7 @@ export default function App({
           <div className="palette-list">
             {matching.map((command, index) => (
               <button
+                data-cli={command.cli ? "true" : undefined}
                 data-palette-active={index === paletteIndex}
                 className={index === paletteIndex ? "active" : ""}
                 key={command.id}
@@ -2704,7 +2849,7 @@ export default function App({
               )}
             </div>
             <footer className="dialog-footer">
-              <span>{workspace}</span>
+              <span>In {workspace}</span>
               <div>
                 <button
                   type="button"
@@ -2727,9 +2872,7 @@ export default function App({
                   )}{" "}
                   {operation.cli
                     ? "Open terminal"
-                    : result === undefined
-                      ? "Run"
-                      : "Run again"}
+                    : operationAction(operation, result !== undefined)}
                 </button>
               </div>
             </footer>
@@ -2870,6 +3013,7 @@ function ThreadCard({
   thread,
   items,
   selected,
+  dived = false,
   pinned,
   onSelect,
   onOpen,
@@ -2878,6 +3022,7 @@ function ThreadCard({
   thread: Thread;
   items: Attention[];
   selected: boolean;
+  dived?: boolean;
   pinned: boolean;
   onSelect: () => void;
   onOpen: () => void;
@@ -2887,7 +3032,8 @@ function ThreadCard({
   const report = thread.last_report;
   return (
     <button
-      className={`thread-card ${selected ? "selected" : ""} ${large ? "large" : ""}`}
+      className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
+      aria-current={dived ? "location" : undefined}
       style={{ "--thread-color": thread.accent } as CSSProperties}
       onClick={onSelect}
       onDoubleClick={onOpen}
@@ -2901,17 +3047,20 @@ function ThreadCard({
       <div className="thread-card-title">
         <span className="thread-color-dot" />
         <b>{thread.name}</b>
+        {dived && (
+          <ArrowUpRight
+            size={13}
+            className="dive-marker"
+            aria-label="Current destination"
+          />
+        )}
         {pinned && <Pin size={11} />}
         <span className={`thread-status status-${thread.status}`}>
           {statusIcon(thread.status)}
           {thread.status_label || thread.status}
         </span>
       </div>
-      <span className="thread-card-runtime">
-        {thread.runtime}
-        {thread.box_name !== "local" ? " @" + thread.box_name : ""} ·{" "}
-        {thread.model_actual || thread.model || "default model"}
-      </span>
+
       {items[0] ? (
         <span className="thread-card-request">
           <AlertCircle size={12} />
@@ -2930,15 +3079,21 @@ function ThreadCard({
             "Ready for a task"}
         </span>
       )}
-      {git && (
-        <span className="git-line">
-          <GitBranch size={11} />
-          {git.branch || "detached"}
-          {git.dirty_files ? " · changes made" : ""}
-          {git.ahead ? ` · +${git.ahead}` : ""}
-          {git.behind ? ` / −${git.behind}` : ""}
-        </span>
-      )}
+      <span className="thread-card-runtime">
+        {thread.runtime}
+        {thread.box_name !== "local" ? " @" + thread.box_name : ""} ·{" "}
+        {thread.model_actual || thread.model || "default model"}
+        {git && (
+          <>
+            {" "}
+            · <GitBranch size={11} />
+            {git.branch || "detached"}
+            {git.dirty_files ? " *" : ""}
+            {git.ahead ? ` +${git.ahead}` : ""}
+            {git.behind ? ` −${git.behind}` : ""}
+          </>
+        )}
+      </span>
       {large && (
         <span className="thread-open-hint">
           Select to inspect <ArrowUpRight size={12} />
@@ -2983,7 +3138,7 @@ function AttentionCard({
         ...(message ? { message } : {}),
       });
     } catch (e) {
-      setRequestError(String(e));
+      setRequestError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -3259,12 +3414,16 @@ function Conversation({
         <Empty
           title={
             target
-              ? "What are we building?"
+              ? target.is_orchestrator
+                ? "What are we building?"
+                : target.name
               : "One conversation. All your agents."
           }
           description={
             target
-              ? "Describe the outcome you want. Your orchestrator can coordinate the work, and bring decisions back to you."
+              ? target.is_orchestrator
+                ? "Describe the outcome you want. Your orchestrator can coordinate the work, and bring decisions back to you."
+                : "Send a task to this thread. Replies and requests will appear here."
               : "Choose the agent that will coordinate your workspace. Your existing subscriptions do the work."
           }
         >
@@ -3312,13 +3471,15 @@ function Conversation({
             >
               <div className="message-meta">
                 <span className="message-avatar">
-                  {block.kind === "user"
-                    ? "◦"
-                    : block.kind === "tool"
-                      ? "⌘"
-                      : block.kind === "thinking"
-                        ? "◌"
-                        : "✳"}
+                  {block.kind === "user" ? (
+                    <span aria-hidden="true">›</span>
+                  ) : block.kind === "tool" ? (
+                    <Wrench size={15} />
+                  ) : block.kind === "thinking" ? (
+                    <Circle size={14} />
+                  ) : (
+                    <Asterisk size={16} />
+                  )}
                 </span>
                 <b>
                   {block.kind === "user"
@@ -3387,10 +3548,13 @@ function Conversation({
                   <summary>
                     {block.detail?.split("\n")[0] || "Tool call"}
                   </summary>
-                  <pre>{block.detail}</pre>
+                  <MessageBody text={block.detail || ""} mono />
                 </details>
               ) : (
-                <Markdown text={block.text} />
+                <MessageBody
+                  text={block.text}
+                  clamp={block.kind === "user" || block.kind === "notice"}
+                />
               )}
             </article>
           );

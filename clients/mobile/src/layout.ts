@@ -1,3 +1,4 @@
+import { Keyboard } from "@capacitor/keyboard";
 import {
   Capacitor,
   registerPlugin,
@@ -71,12 +72,41 @@ export async function observeLayout() {
   window.visualViewport?.addEventListener("resize", updateViewport);
   window.addEventListener("resize", updateViewport);
   let listener: PluginListenerHandle | undefined;
+  const keyboardListeners: PluginListenerHandle[] = [];
+  let viewportFrame = 0;
+  let settledViewport: ReturnType<typeof setTimeout> | undefined;
+  const keyboardChanged = (visible: boolean) => {
+    root.dataset.keyboard = String(visible);
+    cancelAnimationFrame(viewportFrame);
+    if (settledViewport) clearTimeout(settledViewport);
+    // Native WebView resizing and visualViewport notifications need not arrive
+    // in the same frame. Re-read after layout and once the IME animation settles.
+    updateViewport();
+    viewportFrame = requestAnimationFrame(() => {
+      viewportFrame = requestAnimationFrame(updateViewport);
+    });
+    settledViewport = setTimeout(updateViewport, 250);
+  };
   if (["android", "ios"].includes(Capacitor.getPlatform())) {
     apply(await Layout.current());
     listener = await Layout.addListener("change", apply);
+    keyboardListeners.push(
+      await Keyboard.addListener("keyboardDidShow", () =>
+        keyboardChanged(true),
+      ),
+    );
+    keyboardListeners.push(
+      await Keyboard.addListener("keyboardDidHide", () =>
+        keyboardChanged(false),
+      ),
+    );
   }
   return () => {
     contentSize.disconnect();
+    cancelAnimationFrame(viewportFrame);
+    if (settledViewport) clearTimeout(settledViewport);
+    delete root.dataset.keyboard;
+    for (const handle of keyboardListeners) void handle.remove();
     root.classList.remove("short-content", "tiny-content");
     window.visualViewport?.removeEventListener("resize", updateViewport);
     window.removeEventListener("resize", updateViewport);

@@ -50,7 +50,10 @@ private final class RegionObserver: UIView {
 final class TwrLayoutPlugin: CAPPlugin, CAPBridgedPlugin {
     let identifier = "TwrLayoutPlugin"
     let jsName = "TwrLayout"
-    let pluginMethods: [CAPPluginMethod] = [CAPPluginMethod(name: "current", returnType: CAPPluginReturnPromise)]
+    let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "current", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setAppearance", returnType: CAPPluginReturnPromise)
+    ]
     private var observer: RegionObserver?
     private var layout: [String: Any] = ["orientation": "none"]
     override func load() {
@@ -68,6 +71,27 @@ final class TwrLayoutPlugin: CAPPlugin, CAPBridgedPlugin {
             self.observer = observer
             webView.addSubview(observer)
             observer.setNeedsUpdateConstraints()
+        }
+    }
+    @objc func setAppearance(_ call: CAPPluginCall) {
+        guard let background = call.getString("background"),
+              background.range(of: "^#[0-9a-fA-F]{6}$", options: .regularExpression) != nil,
+              let rgb = UInt32(background.dropFirst(), radix: 16) else {
+            call.reject("An opaque six-digit hexadecimal background color is required")
+            return
+        }
+        let color = UIColor(red: CGFloat((rgb >> 16) & 255) / 255,
+                            green: CGFloat((rgb >> 8) & 255) / 255,
+                            blue: CGFloat(rgb & 255) / 255, alpha: 1)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let web = self.bridge?.webView else {
+                call.reject("The app view is not available")
+                return
+            }
+            self.bridge?.viewController?.view.backgroundColor = color
+            web.backgroundColor = color
+            web.scrollView.backgroundColor = color
+            call.resolve()
         }
     }
     @objc func current(_ call: CAPPluginCall) {

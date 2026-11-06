@@ -442,12 +442,31 @@ for (const [index, template] of selected.entries()) {
       { stdio: "inherit" },
     );
     const exit = await new Promise((r) => test.on("exit", r));
-    if (!existsSync(screenshot))
-      execFileSync(
-        "xcrun",
-        ["simctl", "io", device.udid, "screenshot", screenshot],
-        { stdio: "inherit" },
+    if (!existsSync(screenshot)) {
+      console.warn(
+        "Friendly PNG export missing; native app snapshots are retained in the XCTest result bundle.",
       );
+      if (exit !== 0) {
+        try {
+          execFileSync(
+            "xcrun",
+            [
+              "simctl",
+              "io",
+              device.udid,
+              "screenshot",
+              screenshot.replace(/screen\.png$/, "failure-display.png"),
+            ],
+            { stdio: "inherit", timeout: 15000 },
+          );
+        } catch (error) {
+          console.warn(
+            "Could not capture the final Simulator display:",
+            error.message,
+          );
+        }
+      }
+    }
     assert.equal(exit, 0, `${device.name} native integration tests must pass`);
     console.log(
       `PASS: ${device.name} native pairing, Keychain, streaming, answers, uploads, ordered PTY, reconnect and long-lived socket`,

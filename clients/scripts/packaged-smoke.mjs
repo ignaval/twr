@@ -216,6 +216,10 @@ try {
   if (process.env.TWR_PERF === "1")
     await performanceAudit(page, "mac-packaged");
   await page.screenshot({ path: "test-results/packaged-macos.png" });
+  if (process.env.TWR_UI_CAPTURES === "1") {
+    const { captureUI } = await import("./ui-captures.mjs");
+    await captureUI(page, { hubPids });
+  }
   await page.evaluate(() => window.twr.quit()).catch(() => {});
   process.kill(hubPid, 0);
   console.log(

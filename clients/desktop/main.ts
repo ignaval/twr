@@ -651,7 +651,7 @@ async function createWindow() {
     minWidth: 420,
     minHeight: 480,
     title: "twr",
-    backgroundColor: "#101214",
+    backgroundColor: "#0e1013",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
       preload: join(__dirname, "preload.cjs"),
