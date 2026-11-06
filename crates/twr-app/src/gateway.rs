@@ -532,8 +532,11 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             }
             "upload-cancel" => {
                 let id = p["id"].as_str().unwrap_or("");
-                self.uploads.lock().await.remove(id);
-                self.upload_quota.lock().unwrap().release(id);
+                remote::upload::cancel(
+                    &mut *self.uploads.lock().await,
+                    &mut self.upload_quota.lock().unwrap(),
+                    id,
+                );
                 Ok(Value::Null)
             }
             "cli" => {

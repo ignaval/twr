@@ -528,7 +528,7 @@ function register() {
     }
     session.outstanding = 0;
     if (!session.exited) session.process.resume();
-    return { data, sequence: session.sequence };
+    return { data, sequence: session.sequence, exited: session.exited };
   });
   handle("terminal-close", async (id) => {
     const key = z.string().uuid().parse(id);

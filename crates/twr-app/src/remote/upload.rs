@@ -29,6 +29,15 @@ impl Quota {
         self.charges.remove(id);
     }
 }
+pub fn cancel(
+    pending: &mut std::collections::HashMap<String, Upload>,
+    quota: &mut Quota,
+    id: &str,
+) {
+    if pending.remove(id).is_some() {
+        quota.release(id);
+    }
+}
 pub struct Upload {
     base: File,
     directory: String,
@@ -168,6 +177,29 @@ impl Drop for Upload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelling_a_committed_file_does_not_refund_its_quota() {
+        let root = tempfile::tempdir().unwrap();
+        let mut quota = Quota::default();
+        let now = std::time::Instant::now();
+        let mut file = Upload::begin(
+            root.path(),
+            "committed.txt",
+            5,
+            &hex::encode(Sha256::digest(b"hello")),
+        )
+        .unwrap();
+        file.chunk(b"hello").unwrap();
+        let mut pending = std::collections::HashMap::from([("committed".into(), file)]);
+        quota.reserve("committed", 5, now).unwrap();
+        let path = pending.remove("committed").unwrap().commit().unwrap();
+        cancel(&mut pending, &mut quota, "committed");
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+        quota
+            .reserve("remaining", 128 * 1024 * 1024 - 5, now)
+            .unwrap();
+        assert!(quota.reserve("overflow", 1, now).is_err());
+    }
     #[test]
     fn cancelled_and_expired_uploads_do_not_exhaust_the_quota() {
         let mut quota = Quota::default();
