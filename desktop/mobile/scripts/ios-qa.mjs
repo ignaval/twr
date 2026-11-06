@@ -1,5 +1,6 @@
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
+import { createInterface } from "node:readline";
 import { createServer } from "node:http";
 import { createServer as createProxy, connect as connectTCP } from "node:net";
 import {
@@ -139,7 +140,7 @@ for (const [index, template] of selected.entries()) {
     TWR_TRACE_STARTUP: join(fixture, "startup.trace"),
     SHELL: "/bin/sh",
   };
-  let gateway, hub, server, proxy;
+  let gateway, hub, server, proxy, owner;
   const proxySockets = new Set();
   let hubLog = "";
   try {
@@ -169,10 +170,6 @@ for (const [index, template] of selected.entries()) {
     console.log(
       `CLI hub ready after ${Date.now() - probeStarted} ms; identity ${info.identity}`,
     );
-    execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
-    execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
-      stdio: "inherit",
-    });
     if (device.name.includes("Duo")) {
       execFileSync(
         "xcrun",
@@ -192,42 +189,72 @@ for (const [index, template] of selected.entries()) {
           "-o",
           foldHelper,
         ],
-        { stdio: "inherit", timeout: 60000 },
+        { stdio: "inherit", timeout: 120000 },
       );
-      await fold("closed");
     }
     gateway = spawn(
       join(bin, "twr-mobile-gateway"),
-      [
-        "--development",
-        "--pair",
-        "--allow-admin",
-        "--allow-terminal",
-        "--binary-dir",
-        bin,
-        "--listen",
-        "127.0.0.1:47321",
-      ],
+      ["--development", "--binary-dir", bin, "--listen", "127.0.0.1:47321"],
       { env, stdio: ["ignore", "pipe", "pipe"] },
     );
-    let stdout = "",
-      stderr = "";
-    gateway.stdout.on("data", (d) => (stdout += d));
+    let stderr = "";
+    gateway.stdout.resume();
     gateway.stderr.on("data", (d) => (stderr += d));
     const started = Date.now();
-    while (!stdout.includes("Pairing code") && Date.now() - started < 120000) {
+    while (
+      !stderr.includes("gateway listening on") &&
+      Date.now() - started < 120000
+    ) {
       assert(gateway.exitCode === null, stderr);
       await delay(200);
     }
-    const code = stdout.match(/Pairing code[^:]+: (\w+)/)?.[1];
     assert(
-      code,
-      "Gateway did not finish owner authentication and pairing initialization: " +
+      stderr.includes("gateway listening on"),
+      "Gateway did not finish owner authentication: " +
         stderr +
         "\nHub: " +
         hubLog,
     );
     console.log(`Gateway ready after ${Date.now() - started} ms`);
+    // Authenticate the fixture owner before Simulator's cold boot overloads ps.
+    // Keep this socket open and create a fresh five-minute code after boot.
+    owner = connectTCP({ path: join(fixture, "hub.sock") });
+    const replies = new Map();
+    let nextID = 0;
+    const lines = createInterface({ input: owner });
+    lines.on("line", (line) => {
+      const response = JSON.parse(line);
+      replies.get(response.id)?.(response);
+    });
+    const ownerCall = (method, params) =>
+      new Promise((resolve, reject) => {
+        const id = ++nextID;
+        const timer = setTimeout(() => {
+          replies.delete(id);
+          reject(new Error(`Fixture owner timed out: ${method}`));
+        }, 120000);
+        replies.set(id, (response) => {
+          clearTimeout(timer);
+          replies.delete(id);
+          if (response.error) reject(new Error(JSON.stringify(response.error)));
+          else resolve(response.result);
+        });
+        owner.write(JSON.stringify({ id, method, params }) + "\n");
+      });
+    const hello = await ownerCall("hello", {
+      client: "ios-qa-owner",
+      protocol: 1,
+      user_token: readFileSync(token, "utf8").trim(),
+    });
+    assert(hello.identity.startsWith("user:"));
+    execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
+    execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
+      stdio: "inherit",
+    });
+    if (device.name.includes("Duo")) await fold("closed");
+    const { code } = await ownerCall("device.pair_begin", {
+      scopes: ["read", "operate", "admin", "terminal"],
+    });
     server = createServer((req, res) => {
       res.setHeader("content-type", "application/json");
       if (req.url === "/fixture")
@@ -346,6 +373,8 @@ for (const [index, template] of selected.entries()) {
         "mobile/ios/App/DerivedData",
         "-resultBundlePath",
         result,
+        "-parallel-testing-enabled",
+        "NO",
         "-test-timeouts-enabled",
         "YES",
         "-maximum-test-execution-time-allowance",
@@ -382,6 +411,7 @@ for (const [index, template] of selected.entries()) {
     for (const socket of proxySockets) socket.destroy();
     await new Promise((r) => (proxy ? proxy.close(r) : r()));
     await new Promise((r) => (server ? server.close(r) : r()));
+    owner?.destroy();
     gateway?.kill("SIGTERM");
     hub?.kill("SIGTERM");
     try {
