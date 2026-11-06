@@ -522,6 +522,11 @@ export async function runMacQA(page, { fixture, hubPids }) {
     "Slash commands must work before choosing an orchestrator",
   );
   await page.locator(".composer textarea").fill("/workspace default");
+  // Hub-connected arrives before the first slash command finishes refreshing
+  // workspace data. Text stays editable while Send indicates the pending work.
+  await expect(
+    page.getByRole("button", { name: "Send message", exact: true }),
+  ).toBeEnabled({ timeout: 30000 });
   await page.locator(".composer textarea").press("Enter");
   await expect
     .poll(
