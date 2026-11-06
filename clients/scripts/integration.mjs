@@ -17,6 +17,19 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+async function within(promise, ms, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 const home = mkdtempSync(join(tmpdir(), "twr-desktop-"));
 const repo = join(home, "repo");
 mkdirSync(repo);
@@ -101,6 +114,7 @@ writeFileSync(env.ENV, "PS1='DESKTOP_TEST> '\n");
 delete env.ELECTRON_RUN_AS_NODE;
 let application;
 let packagedProcess;
+let applicationProcess;
 let packagedLog = "";
 let hub;
 const errors = [];
@@ -188,6 +202,7 @@ try {
       env,
       timeout: 60000,
     });
+  applicationProcess = packagedProcess || application.process();
   const page = await application.firstWindow();
   page.on("pageerror", (error) => errors.push(error.message));
   await page
@@ -766,7 +781,24 @@ try {
       process.env.TWR_PERF_LABEL || process.platform,
       packagedProcess ? undefined : application,
     );
-  await application.close();
+  // Account-login and other interactive fixtures can retain a terminal even
+  // after its output assertion. Close our sessions before requesting a normal
+  // quit, so a native terminal-confirmation sheet cannot stall this test.
+  const remainingTerminals = await page.evaluate(async () => {
+    const { terminals } = await window.twr.bootstrap();
+    for (const terminal of terminals)
+      await window.twr.terminalClose(terminal.id);
+    return terminals.map((terminal) => terminal.id);
+  });
+  console.log(
+    "Closing integration app; fixture terminals:",
+    remainingTerminals,
+  );
+  await within(
+    application.close(),
+    15000,
+    "Desktop application did not quit normally after its test terminals closed",
+  );
   application = undefined;
   // Closing Electron leaves the hub serving the same workspace.
   const info = JSON.parse(
@@ -800,9 +832,22 @@ try {
   // Failed tests may leave a native confirmation open. Force only this test's process
   // to exit so the runner and its temporary hub always reach cleanup.
   if (application) {
-    if (packagedProcess) packagedProcess.kill("SIGTERM");
-    else await application.evaluate(({ app }) => app.exit(0)).catch(() => {});
-    await application.close().catch(() => {});
+    if (!packagedProcess)
+      await within(
+        application.evaluate(({ app }) => app.exit(0)),
+        3000,
+        "Test application did not acknowledge forced cleanup",
+      ).catch(() => {});
+  }
+  const fixtureProcess = applicationProcess || packagedProcess;
+  if (fixtureProcess?.exitCode === null && fixtureProcess.signalCode === null)
+    fixtureProcess.kill("SIGKILL");
+  if (application) {
+    await within(
+      application.close(),
+      3000,
+      "Test application cleanup timed out",
+    ).catch(() => {});
   }
   try {
     execFileSync(join(bin, "twr"), ["hub", "stop"], {
