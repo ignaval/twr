@@ -162,7 +162,11 @@ try {
       browser,
       "Packaged app must expose its test Chromium port: " + packagedLog,
     );
-    const page = browser.contexts()[0].pages()[0];
+    const context = browser.contexts()[0];
+    assert(context, "Packaged application must expose its browser context");
+    const page =
+      context.pages()[0] ??
+      (await context.waitForEvent("page", { timeout: 60000 }));
     application = {
       firstWindow: async () => page,
       close: async () => {

@@ -107,7 +107,11 @@ try {
     browser,
     "Packaged application did not expose its test debugging port",
   );
-  const page = browser.contexts()[0].pages()[0];
+  const context = browser.contexts()[0];
+  assert(context, "Packaged application must expose its browser context");
+  const page =
+    context.pages()[0] ??
+    (await context.waitForEvent("page", { timeout: 60000 }));
   await page
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
