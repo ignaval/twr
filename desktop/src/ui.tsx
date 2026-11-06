@@ -1,3 +1,4 @@
+import { useHostAPI } from "./host";
 import { memo, useEffect, useRef, type ReactNode } from "react";
 import { X, LoaderCircle, FolderOpen, Copy, Check } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -98,6 +99,7 @@ export function FieldInput({
   value: any;
   onChange: (v: any) => void;
 }) {
+  const hostApi = useHostAPI();
   const id = `field-${field.key}`;
   return (
     <label
@@ -159,7 +161,7 @@ export function FieldInput({
               type="button"
               aria-label="Choose folder"
               onClick={() =>
-                void window.twr.pickDirectory().then((path) => {
+                void hostApi.pickDirectory().then((path) => {
                   if (path) onChange(path);
                 })
               }
@@ -174,6 +176,7 @@ export function FieldInput({
   );
 }
 export const Markdown = memo(function Markdown({ text }: { text: string }) {
+  const hostApi = useHostAPI();
   return (
     <div className="markdown">
       <ReactMarkdown
@@ -184,7 +187,7 @@ export const Markdown = memo(function Markdown({ text }: { text: string }) {
               href={href}
               onClick={(e) => {
                 e.preventDefault();
-                if (href) void window.twr.openExternal(href).catch(() => {});
+                if (href) void hostApi.openExternal(href).catch(() => {});
               }}
             >
               {children}
@@ -200,7 +203,7 @@ export const Markdown = memo(function Markdown({ text }: { text: string }) {
                 className="copy-code"
                 aria-label="Copy code"
                 onClick={(e) =>
-                  void window.twr.copyText(
+                  void hostApi.copyText(
                     e.currentTarget.parentElement?.querySelector("pre")
                       ?.textContent || "",
                   )

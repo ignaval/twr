@@ -104,24 +104,6 @@ for (const [index, template] of selected.entries()) {
   const proxySockets = new Set();
   let hubLog = "";
   try {
-    execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
-    execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
-      stdio: "inherit",
-    });
-    if (device.name.includes("Duo"))
-      execFileSync(
-        process.execPath,
-        [
-          foldHelper,
-          "fold",
-          "closed",
-          "--platform",
-          "ios",
-          "--udid",
-          device.udid,
-        ],
-        { stdio: "inherit", timeout: 180000 },
-      );
     hub = spawn(join(bin, "twr"), ["hub"], {
       env,
       stdio: ["ignore", "ignore", "pipe"],
@@ -148,6 +130,53 @@ for (const [index, template] of selected.entries()) {
     console.log(
       `CLI hub ready after ${Date.now() - probeStarted} ms; identity ${info.identity}`,
     );
+    execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
+    execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
+      stdio: "inherit",
+    });
+    if (device.name.includes("Duo")) {
+      execFileSync(
+        "xcrun",
+        [
+          "simctl",
+          "install",
+          device.udid,
+          resolve(
+            "mobile/ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app",
+          ),
+        ],
+        { stdio: "inherit" },
+      );
+      execFileSync(
+        process.execPath,
+        [
+          foldHelper,
+          "open",
+          "tools.twr.mobile.dev",
+          "--platform",
+          "ios",
+          "--udid",
+          device.udid,
+          "--no-record",
+          "--timeout",
+          "180000",
+        ],
+        { stdio: "inherit", timeout: 240000 },
+      );
+      execFileSync(
+        process.execPath,
+        [
+          foldHelper,
+          "fold",
+          "closed",
+          "--platform",
+          "ios",
+          "--udid",
+          device.udid,
+        ],
+        { stdio: "inherit", timeout: 180000 },
+      );
+    }
     gateway = spawn(
       join(bin, "twr-mobile-gateway"),
       [

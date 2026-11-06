@@ -118,7 +118,8 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
         } catch { call.reject(error.localizedDescription) }
     }
     @objc public func send(_ call: CAPPluginCall) {
-        guard let task = socket, let message = call.getString("message"), message.utf8.count <= 2 * 1024 * 1024 else { call.reject("Hub connection is closed"); return }
+        guard let task = socket, let message = call.getString("message") else { call.reject("Hub connection is closed"); return }
+        guard message.utf8.count <= 2 * 1024 * 1024 else { call.reject("Request exceeds 2 MiB", "REQUEST_TOO_LARGE"); return }
         sendQueue.async {
             let finished = DispatchSemaphore(value: 0)
             let completion = SocketSendCompletion(call)

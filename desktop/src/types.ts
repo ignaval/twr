@@ -103,7 +103,9 @@ export interface DesktopAPI {
   terminalWrite(id: string, data: string): void;
   terminalResize(id: string, cols: number, rows: number): void;
   terminalClose(id: string): Promise<void>;
-  terminalRead(id: string): Promise<{ data: string; sequence: number }>;
+  terminalRead(
+    id: string,
+  ): Promise<{ data: string; sequence: number; exited?: boolean }>;
   pickDirectory(): Promise<string | null>;
   openExternal(url: string): Promise<void>;
   reveal(path: string): Promise<void>;

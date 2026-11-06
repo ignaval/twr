@@ -1,3 +1,4 @@
+import { useHostAPI } from "./host";
 import { useCallback, useEffect, useState, useRef } from "react";
 import {
   Plus,
@@ -96,6 +97,7 @@ const meta: Record<
   },
 };
 export function Manager(props: ManagerProps) {
+  const hostApi = useHostAPI();
   const { section, rpc, action, cliAction, fail } = props;
   const info = meta[section];
   const [data, setData] = useState<Json>();
@@ -578,9 +580,7 @@ export function Manager(props: ManagerProps) {
             <article className="resource-card">
               <h3>Storage</h3>
               <p className="path">{data.db}</p>
-              <button
-                onClick={() => void window.twr.reveal(data.db).catch(fail)}
-              >
+              <button onClick={() => void hostApi.reveal(data.db).catch(fail)}>
                 Show database folder <FolderOpen size={13} />
               </button>
             </article>
@@ -774,6 +774,7 @@ function Settings({
   rpc: ManagerProps["rpc"];
   action: ManagerProps["action"];
 }) {
+  const hostApi = useHostAPI();
   const editors = useEditorSessions();
   const [config, setConfig] = useState<{
     content: string;
@@ -789,7 +790,7 @@ function Settings({
     localStorage.getItem("twr.theme") || "system",
   );
   useEffect(() => {
-    void window.twr
+    void hostApi
       .configRead()
       .then((c) => {
         setConfig(c);
@@ -860,7 +861,7 @@ function Settings({
             loaded={config?.settings || loaded}
             fail={fail}
             saved={() => {
-              void window.twr
+              void hostApi
                 .configRead()
                 .then((c) => {
                   setConfig(c);
@@ -884,7 +885,7 @@ function Settings({
               <button
                 className="icon-button"
                 aria-label="Show configuration file"
-                onClick={() => void window.twr.reveal(config.path)}
+                onClick={() => void hostApi.reveal(config.path)}
               >
                 <FolderOpen size={16} />
               </button>
@@ -910,12 +911,12 @@ function Settings({
                 disabled={busy || text === config.content}
                 onClick={() => {
                   setBusy(true);
-                  void window.twr
+                  void hostApi
                     .configSave(
                       text,
                       editors.get("config")?.hash ?? config.hash,
                     )
-                    .then(() => window.twr.configRead())
+                    .then(() => hostApi.configRead())
                     .then((c) => {
                       editors.clear("config");
                       setConfig(c);
@@ -935,7 +936,7 @@ function Settings({
                     !window.confirm("Discard your unsaved configuration edits?")
                   )
                     return;
-                  void window.twr
+                  void hostApi
                     .configRead()
                     .then((c) => {
                       editors.clear("config");
@@ -980,6 +981,7 @@ export function JobLog({
   job: string;
   rpc: ManagerProps["rpc"];
 }) {
+  const hostApi = useHostAPI();
   const [text, setText] = useState("");
   const [error, setError] = useState("");
   const output = useRef<HTMLPreElement>(null);
@@ -1015,7 +1017,7 @@ export function JobLog({
         <button
           type="button"
           onClick={() =>
-            void window.twr.exportText(`job-${job.slice(-8)}.log`, text)
+            void hostApi.exportText(`job-${job.slice(-8)}.log`, text)
           }
         >
           Export log
@@ -1177,6 +1179,7 @@ function ScalarSetting({
   fail: ManagerProps["fail"];
   saved: () => void;
 }) {
+  const hostApi = useHostAPI();
   const [value, setValue] = useState(
     initial ?? (setting.kind === "boolean" ? false : ""),
   );
@@ -1204,7 +1207,7 @@ function ScalarSetting({
         )
           return;
         setBusy(true);
-        void window.twr
+        void hostApi
           .configSet(setting.table, setting.key, next)
           .then(() => {
             setDone(true);

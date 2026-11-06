@@ -1,3 +1,4 @@
+import { useHostAPI } from "./host";
 import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -12,6 +13,7 @@ export function Terminal({
   session: TerminalSession;
   visible: boolean;
 }) {
+  const hostApi = useHostAPI();
   const node = useRef<HTMLDivElement>(null);
   const fit = useRef<FitAddon>(null);
   const terminal = useRef<XTerm>(null);
@@ -43,7 +45,7 @@ export function Terminal({
     term.loadAddon(finder);
     term.loadAddon(
       new WebLinksAddon(
-        (_event, url) => void window.twr.openExternal(url).catch(() => {}),
+        (_event, url) => void hostApi.openExternal(url).catch(() => {}),
       ),
     );
     term.open(node.current!);
@@ -77,8 +79,8 @@ export function Terminal({
     let ready = false;
     let sequence = 0;
     const queued: { data: string; sequence: number }[] = [];
-    const unsubscribe = window.twr.onEvent((event) => {
-      if (event.type === "resync") {
+    const unsubscribe = hostApi.onEvent((event) => {
+      if (event.type === "resync" && event.scope !== "control") {
         snapshot(true);
         return;
       }
@@ -94,7 +96,7 @@ export function Terminal({
           if (chunk.sequence > sequence) {
             sequence = chunk.sequence;
             term.write(chunk.data, () =>
-              window.twr.terminalAck(session.id, chunk.data.length),
+              hostApi.terminalAck(session.id, chunk.data.length),
             );
           }
         } else queued.push(chunk);
@@ -110,17 +112,19 @@ export function Terminal({
       ready = false;
       snapshotLoading = true;
       if (reset) term.reset();
-      void window.twr
+      void hostApi
         .terminalRead(session.id)
         .then((snapshot) => {
           if (!terminal.current) return;
           term.write(snapshot.data);
+          if (snapshot.exited)
+            term.write("\r\n\x1b[90mProcess exited.\x1b[0m\r\n");
           sequence = snapshot.sequence;
           ready = true;
           for (const chunk of queued)
             if (chunk.sequence > sequence) {
               term.write(chunk.data, () =>
-                window.twr.terminalAck(session.id, chunk.data.length),
+                hostApi.terminalAck(session.id, chunk.data.length),
               );
               sequence = chunk.sequence;
             }
@@ -130,7 +134,7 @@ export function Terminal({
           ready = true;
           for (const chunk of queued)
             term.write(chunk.data, () =>
-              window.twr.terminalAck(session.id, chunk.data.length),
+              hostApi.terminalAck(session.id, chunk.data.length),
             );
         })
         .finally(() => {
@@ -145,12 +149,12 @@ export function Terminal({
         control.current = false;
         setControlPressed(false);
       }
-      window.twr.terminalWrite(session.id, data);
+      hostApi.terminalWrite(session.id, data);
     });
     const observer = new ResizeObserver(() => {
       if (node.current?.offsetWidth) {
         addon.fit();
-        window.twr.terminalResize(session.id, term.cols, term.rows);
+        hostApi.terminalResize(session.id, term.cols, term.rows);
       }
     });
     observer.observe(node.current!);
@@ -160,7 +164,7 @@ export function Terminal({
         event.shiftKey &&
         event.key.toLowerCase() === "c"
       ) {
-        void window.twr.copyText(term.getSelection());
+        void hostApi.copyText(term.getSelection());
         return false;
       }
       return true;
@@ -171,7 +175,7 @@ export function Terminal({
       observer.disconnect();
       themeObserver.disconnect();
       scheme.removeEventListener("change", updateTheme);
-      window.twr.terminalFocus(false);
+      hostApi.terminalFocus(false);
       terminal.current = null;
       term.dispose();
     };
@@ -182,7 +186,7 @@ export function Terminal({
         fit.current?.fit();
         const term = terminal.current;
         if (term) {
-          window.twr.terminalResize(session.id, term.cols, term.rows);
+          hostApi.terminalResize(session.id, term.cols, term.rows);
           term.focus();
         }
       });
@@ -193,7 +197,7 @@ export function Terminal({
       className="terminal-session"
       data-session-id={session.id}
       style={{ display: visible ? "flex" : "none" }}
-      aria-label={session.title}
+      aria-label={`${session.title}${session.exited ? " (exited)" : ""}`}
     >
       <div className="terminal-search">
         <span>
@@ -215,8 +219,8 @@ export function Terminal({
       <div
         className="terminal-surface"
         ref={node}
-        onFocus={() => window.twr.terminalFocus(true)}
-        onBlur={() => window.twr.terminalFocus(false)}
+        onFocus={() => hostApi.terminalFocus(true)}
+        onBlur={() => hostApi.terminalFocus(false)}
       />
       {document.documentElement.dataset.mobile === "true" && (
         <div className="terminal-accessory" aria-label="Terminal keys">
@@ -243,7 +247,7 @@ export function Terminal({
               key={label}
               onPointerDown={(e) => e.preventDefault()}
               onClick={() => {
-                window.twr.terminalWrite(session.id, value);
+                hostApi.terminalWrite(session.id, value);
                 terminal.current?.focus();
               }}
             >

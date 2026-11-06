@@ -311,6 +311,48 @@ pub fn args(pid: u32) -> Option<Vec<String>> {
     Some(args)
 }
 
+/// Read several processes' program names and arguments in two bounded listings.
+/// Keeping `comm` separate preserves spaces in argv[0], as in [`args`].
+pub fn args_many(pids: &[u32]) -> HashMap<u32, Vec<String>> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let Some(programs) = rows(&["-ww", "-o", "pid=,comm=", "-p", &list]) else {
+        return HashMap::new();
+    };
+    let Some(arguments) = rows(&["-ww", "-o", "pid=,args=", "-p", &list]) else {
+        return HashMap::new();
+    };
+    let programs: HashMap<u32, &str> = programs
+        .lines()
+        .filter_map(|line| {
+            let ([pid], program) = fields::<1>(line)?;
+            (!program.is_empty()).then_some((pid.parse().ok()?, program))
+        })
+        .collect();
+    arguments
+        .lines()
+        .filter_map(|line| {
+            let ([pid], line) = fields::<1>(line)?;
+            let pid = pid.parse().ok()?;
+            let program = programs.get(&pid)?;
+            let mut args = vec![(*program).to_owned()];
+            args.extend(
+                line.strip_prefix(program)
+                    .unwrap_or(line)
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+            Some((pid, args))
+        })
+        .collect()
+}
+
 /// Every process of group `pgid` with its status (environment or not), from one listing.
 /// `None` when the listing failed (the process table is unknown).
 pub fn group(pgid: i64) -> Option<Vec<(u32, ProcStat)>> {
@@ -519,6 +561,29 @@ pub fn parse_lstart([_weekday, month, day, time, year]: [&str; 5]) -> Option<u64
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    #[test]
+    fn batched_arguments_preserve_program_spaces_and_missing_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_ps(
+            dir.path(),
+            "arguments",
+            r#"
+case "$*" in
+  *pid=,comm=*) printf '%s\n' '7 /Applications/My App/twr' '8 sh' ;;
+  *pid=,args=*) printf '%s\n' '7 /Applications/My App/twr attach api' '8 sh -c test' ;;
+  *) exit 2 ;;
+esac
+"#,
+        );
+        let found = with_fake_ps(&script, Duration::from_secs(5), || args_many(&[7, 8, 9]));
+        assert_eq!(
+            found.get(&7).unwrap(),
+            &["/Applications/My App/twr", "attach", "api"]
+        );
+        assert_eq!(found.get(&8).unwrap(), &["sh", "-c", "test"]);
+        assert!(!found.contains_key(&9));
+        assert!(args_many(&[]).is_empty());
+    }
 
     /// macOS's format for `TZ=UTC0 LC_ALL=C ps -o stat=,ppid=,pgid=,lstart= -p <pid>` (its
     /// ps(1) pads columns and prints `lstart` as `%a %b %e %T %Y`).

@@ -1,3 +1,4 @@
+import { useHostAPI } from "./host";
 import {
   useCallback,
   useEffect,
@@ -136,6 +137,7 @@ export default function App({
   deviceScopes,
   onReady,
 }: { deviceScopes?: string[]; onReady?: () => void } = {}) {
+  const hostApi = useHostAPI();
   const [allowedMethods, setAllowedMethods] = useState<string[]>();
   const permitted = (scope: string) =>
     !deviceScopes || deviceScopes.includes(scope);
@@ -179,7 +181,9 @@ export default function App({
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
   const observedDestination = useRef<string | undefined>(undefined);
-  const mobileDraftKey = `twr.mobile.drafts.${document.documentElement.dataset.hub || ""}`;
+  const mobileDraftKey = useRef(
+    `twr.mobile.drafts.${document.documentElement.dataset.hub || ""}`,
+  ).current;
   const [drafts, setDrafts] = useState<Record<string, string>>(() => {
     if (document.documentElement.dataset.mobile !== "true") return {};
     try {
@@ -221,7 +225,7 @@ export default function App({
   >([]);
   useEffect(() => {
     if (connected)
-      void window.twr
+      void hostApi
         .rpc("desktop.slash_commands")
         .then(setSlashCommands)
         .catch(() => {});
@@ -269,7 +273,7 @@ export default function App({
     [],
   );
   const rpc = useCallback(
-    (method: string, params: Json = {}) => window.twr.rpc(method, params),
+    (method: string, params: Json = {}) => hostApi.rpc(method, params),
     [],
   );
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
@@ -311,7 +315,7 @@ export default function App({
   }
   async function setAssistance(key: "suggest" | "summaries", value: boolean) {
     try {
-      await window.twr.configSet(["tui"], key, value);
+      await hostApi.configSet(["tui"], key, value);
       setRefresh((n) => n + 1);
     } catch (error) {
       fail(error);
@@ -358,7 +362,7 @@ export default function App({
       const command = cliCommands.find((c) => c.cli?.join(" ") === path);
       if (command) openOperation(command, initialValues);
       else
-        void window.twr
+        void hostApi
           .catalog()
           .then((list) => {
             setCliCommands(list);
@@ -375,18 +379,18 @@ export default function App({
     setInfo(value);
   }, [rpc]);
   const refreshWorkspaces = useCallback(async () => {
-    const value = await window.twr.cli(["ws", "list", "--json"]);
+    const value = await hostApi.cli(["ws", "list", "--json"]);
     if (value.code !== 0) throw new Error(value.stderr || value.stdout);
     const parsed = JSON.parse(value.stdout);
     setWorkspaces(Array.isArray(parsed) ? parsed : parsed.workspaces || []);
   }, []);
   const openTerminal = useCallback(
     async (
-      request: Parameters<typeof window.twr.terminalOpen>[0],
+      request: Parameters<typeof hostApi.terminalOpen>[0],
       throwOnFailure = false,
     ) => {
       try {
-        const session = await window.twr.terminalOpen(request);
+        const session = await hostApi.terminalOpen(request);
         setTerminals((old) => [...old, session]);
         setActiveTerminal(session.id);
         setTerminalVisible(true);
@@ -420,7 +424,7 @@ export default function App({
       setSection("chat");
       if (window.innerWidth <= 800) setSidebar(false);
       try {
-        const value = await window.twr.connect(name);
+        const value = await hostApi.connect(name);
         if (generation !== connectGeneration.current) return;
         setPaths(value);
         await refreshInfo();
@@ -450,7 +454,30 @@ export default function App({
     return () => window.removeEventListener("twr:open-attention", open);
   }, [connect, workspace]);
   useEffect(() => {
-    const unsubscribe = window.twr.onEvent((event) => {
+    let refreshingTerminals = false;
+    const api = hostApi;
+    const refreshTerminals = () => {
+      if (refreshingTerminals) return;
+      refreshingTerminals = true;
+      void api
+        .bootstrap()
+        .then((boot) => {
+          const sessions = boot.terminals || [];
+          setTerminals(sessions);
+          setActiveTerminal((id) =>
+            sessions.some((session) => session.id === id)
+              ? id
+              : sessions.at(-1)?.id,
+          );
+        })
+        .catch(() => {})
+        .finally(() => {
+          refreshingTerminals = false;
+        });
+    };
+    const unsubscribe = hostApi.onEvent((event) => {
+      if (event.type === "resync" && event.scope !== "control")
+        refreshTerminals();
       if (event.type === "resync" && event.scope !== "terminal")
         setTranscriptRefresh((n) => n + 1);
       if (event.type === "state" && event.state) setView(event.state);
@@ -460,6 +487,7 @@ export default function App({
         setConnected(!!event.connected);
         setConnectionError(event.error || "");
         if (restored) {
+          refreshTerminals();
           setRefresh((n) => n + 1);
           setTranscriptRefresh((n) => n + 1);
         }
@@ -512,7 +540,7 @@ export default function App({
         setQuery("");
       }
     });
-    void window.twr
+    void hostApi
       .bootstrap()
       .then((boot) => {
         setAllowedMethods(boot.allowed_methods);
@@ -526,7 +554,7 @@ export default function App({
         return connect(boot.workspace).then(() => onReady?.());
       })
       .catch(fail);
-    void window.twr.catalog().then(setCliCommands).catch(fail);
+    void hostApi.catalog().then(setCliCommands).catch(fail);
     return unsubscribe;
   }, []);
   useEffect(() => {
@@ -949,7 +977,7 @@ export default function App({
         case "WsNew": {
           if (!args) setWorkspaceModal(true);
           else {
-            const made = await window.twr.cli(["ws", "new", args]);
+            const made = await hostApi.cli(["ws", "new", args]);
             if (made.code) throw new Error(made.stderr || made.stdout);
             await refreshWorkspaces();
             await connect(args);
@@ -1152,7 +1180,7 @@ export default function App({
           break;
         }
         case "Quit":
-          await window.twr.quit();
+          await hostApi.quit();
           break;
         case "Help":
           setQuery("");
@@ -1190,7 +1218,7 @@ export default function App({
         });
         all.push(...page.events);
       }
-      await window.twr.exportText(
+      await hostApi.exportText(
         `${target.name}-conversation.md`,
         blocksOf(all)
           .map((b) => `## ${b.kind} · ${b.ts}\n\n${b.text}\n${b.detail || ""}`)
@@ -1821,8 +1849,8 @@ export default function App({
                     acknowledge={assistance.acknowledge}
                     disable={() => {
                       void Promise.all([
-                        window.twr.configSet(["tui"], "suggest", false),
-                        window.twr.configSet(["tui"], "summaries", false),
+                        hostApi.configSet(["tui"], "suggest", false),
+                        hostApi.configSet(["tui"], "summaries", false),
                       ])
                         .then(() => setRefresh((n) => n + 1))
                         .catch(fail);
@@ -1970,7 +1998,7 @@ export default function App({
                     }}
                   />
                   <div className="composer-bottom">
-                    {window.twr.uploadFile && (
+                    {hostApi.uploadFile && (
                       <label
                         className="attachment-button"
                         title="Upload files to this thread"
@@ -1991,7 +2019,7 @@ export default function App({
                             setSending(true);
                             try {
                               for (const file of files) {
-                                const uploaded = await window.twr.uploadFile!(
+                                const uploaded = await hostApi.uploadFile!(
                                   file,
                                   thread,
                                 );
@@ -2260,7 +2288,7 @@ export default function App({
                   <button
                     className="text-button path"
                     onClick={() =>
-                      void window.twr
+                      void hostApi
                         .reveal(
                           selectedThread.worktree || selectedThread.repo || "",
                         )
@@ -2409,7 +2437,7 @@ export default function App({
                           ? "Remove this terminal tab?"
                           : "Its interactive program will exit. The hub and other agents keep running.",
                         run: () => {
-                          void window.twr
+                          void hostApi
                             .terminalClose(t.id)
                             .then(() => {
                               setTerminals((old) =>
@@ -2526,7 +2554,7 @@ export default function App({
             {!cliCommands.length && (
               <button
                 onClick={() =>
-                  void window.twr.catalog().then(setCliCommands).catch(fail)
+                  void hostApi.catalog().then(setCliCommands).catch(fail)
                 }
               >
                 Reload CLI workflows
@@ -2624,7 +2652,7 @@ export default function App({
                       <DataView value={result} />
                       <button
                         onClick={() =>
-                          void window.twr
+                          void hostApi
                             .openExternal(result.release_page)
                             .catch(fail)
                         }
@@ -2736,7 +2764,7 @@ export default function App({
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                void window.twr
+                void hostApi
                   .cli(["ws", "new", newWorkspace])
                   .then((r) => {
                     if (r.code) throw new Error(r.stderr || r.stdout);
@@ -3100,6 +3128,7 @@ function Conversation({
   onSetup: () => void;
   connected: boolean;
 }) {
+  const hostApi = useHostAPI();
   const parent = useRef<HTMLDivElement>(null);
   const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
   const follow = useRef(true);
@@ -3277,7 +3306,7 @@ function Conversation({
                     aria-label="Read message aloud"
                     title="Read this message aloud"
                     onClick={() =>
-                      void window.twr
+                      void hostApi
                         .rpc("speech.request", {
                           thread: target.id,
                           seq: block.seq,
@@ -3292,7 +3321,7 @@ function Conversation({
                   className="icon-button copy-message"
                   aria-label="Copy message"
                   onClick={() =>
-                    void window.twr.copyText(block.detail || block.text)
+                    void hostApi.copyText(block.detail || block.text)
                   }
                 >
                   <Copy size={13} />

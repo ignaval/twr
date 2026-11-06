@@ -1,3 +1,4 @@
+import { useHostAPI } from "./host";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { HubEvent, Json, Thread } from "./types";
 import { routineRuns } from "./transcript";
@@ -70,6 +71,7 @@ export function useAssistance({
   visibleRoutines: string[];
   threads: Thread[];
 }) {
+  const hostApi = useHostAPI();
   const [settings, setSettings] = useState<Json>();
   const [settingsReady, setSettingsReady] = useState(false);
   const [acknowledged, setAcknowledged] = useState(
@@ -118,7 +120,7 @@ export function useAssistance({
     setSettingsReady(false);
     if (!connected) setSettings(undefined);
     if (connected)
-      void window.twr
+      void hostApi
         .configRead()
         .then((value) => {
           if (live)
@@ -187,7 +189,7 @@ export function useAssistance({
     const timer = setTimeout(() => {
       let request = asked.current.get(key);
       if (!request) {
-        request = window.twr.rpc("suggest.next", {
+        request = hostApi.rpc("suggest.next", {
           thread: target.id,
           turn,
           models: settings.suggest_model,
@@ -285,7 +287,7 @@ export function useAssistance({
         try {
           const retry = retrySummary.current;
           retrySummary.current = false;
-          const answer = await window.twr.rpc("summary.thread", {
+          const answer = await hostApi.rpc("summary.thread", {
             thread: run.thread,
             models: settings.suggest_model,
             every_secs: every,

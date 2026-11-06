@@ -56,7 +56,7 @@ final class RemoteHubTests: XCTestCase {
           }
           document.querySelector('.pair-form').requestSubmit();return true;
           """, ["code": code,"hubURL": hubURL])
-        try await until("try{return (await window.twr.rpc('hub.info')).identity.startsWith('user:device:')}catch{return false}")
+        try await until("try{return (await window.twr.rpc('hub.info')).identity.startsWith('user:device:')}catch{return false}", seconds: 120)
         let noToken = try await js("return !JSON.stringify(await window.Capacitor.Plugins.TwrTransport.listHubs()).includes('\"token\"')")
         XCTAssertEqual(noToken as? Bool, true, "Keychain credentials must stay native")
         _ = try await js("""
@@ -97,6 +97,11 @@ final class RemoteHubTests: XCTestCase {
         try await until("return JSON.stringify(window.__qaEvents).includes('IOS_ANSWERED')")
         let commandCount = try await js("return (await window.twr.catalog()).length") as? Int
         XCTAssertEqual(commandCount, 71)
+        let sizeGuard = try await js("""
+          try { await window.Capacitor.Plugins.TwrTransport.send({message:'界'.repeat(750000)}); return false }
+          catch(error) { return error.code==='REQUEST_TOO_LARGE' }
+          """) as? Bool
+        XCTAssertEqual(sizeGuard, true, "Native requests must be bounded by UTF-8 bytes without closing the socket")
         _ = try await js("""
           window.__qaTerminal=await window.twr.terminalOpen({shell:true,title:'iOS QA'});
           const command="printf 'ORDER_%s\\\\n' '0123456789abcdefghijklmnopqrstuvwxyz'\\r";

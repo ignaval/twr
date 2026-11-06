@@ -47,7 +47,9 @@ export function EditorSessionsProvider({ children }: { children: ReactNode }) {
 }
 export function useEditorSessions() {
   const sessions = useContext(Context);
-  const namespace = document.documentElement.dataset.hub || "desktop";
+  const namespace = useRef(
+    document.documentElement.dataset.hub || "desktop",
+  ).current;
   return useMemo<EditorSessions>(
     () => ({
       get: (key) => sessions.get(`${namespace}:${key}`),

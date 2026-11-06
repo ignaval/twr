@@ -35,6 +35,40 @@ beforeEach(() => {
   });
 });
 describe("mobile reconnect", () => {
+  it.each(["x".repeat(2 * 1024 * 1024), "界".repeat(750000)])(
+    "rejects oversized UTF-8 mutations without reconnecting",
+    async (prompt) => {
+      const host = new RemoteHost(
+        hub,
+        () => {},
+        async () => null,
+      );
+      await host.start();
+      const sent = fake.send.mock.calls.length;
+      await expect(
+        host.api().rpc("thread.send", { thread: "worker", prompt }),
+      ).rejects.toThrow("2 MiB");
+      expect(fake.send).toHaveBeenCalledTimes(sent);
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      expect(await host.api().rpc("hub.info")).toEqual({});
+      await host.stop();
+    },
+  );
+  it("resyncs terminal views when the socket returns, even with no further output", async () => {
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    await host.api().connect("default");
+    const events: any[] = [];
+    host.api().onEvent((event) => events.push(event));
+    fake.listener({ message: { type: "transport-closed" } });
+    await host.resume();
+    expect(events).toContainEqual({ type: "resync", scope: "terminal" });
+    await host.stop();
+  });
   it("reuses the original durable ID after a lost reply", async () => {
     const host = new RemoteHost(
       hub,

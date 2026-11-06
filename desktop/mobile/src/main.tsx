@@ -11,6 +11,7 @@ import {
   notificationListeners,
   testNotification,
   enablePush,
+  disablePush,
   refreshPush,
   pushEnabled,
   pushPreferenceKey,
@@ -37,6 +38,12 @@ function Mobile() {
   }>();
   const folderGeneration = useRef(0);
   const host = useRef<RemoteHost>(null);
+  const switchTail = useRef<Promise<unknown>>(Promise.resolve());
+  function queueSwitch<T>(job: () => Promise<T>): Promise<T> {
+    const pending = switchTail.current.catch(() => {}).then(job);
+    switchTail.current = pending;
+    return pending;
+  }
   const activeHub = useRef<Hub>(undefined);
   const [readyHubId, setReadyHubId] = useState<string>();
   const [pendingNotification, setPendingNotification] =
@@ -137,10 +144,58 @@ function Mobile() {
     };
   }, []);
   async function disconnect() {
-    await host.current?.stop();
+    return queueSwitch(disconnectNow);
+  }
+  async function disconnectNow() {
+    const previous = host.current;
     host.current = null;
     activeHub.current = undefined;
     setActive(undefined);
+    setReadyHubId(undefined);
+    setPendingNotification(undefined);
+    setHubSheet(false);
+    folderGeneration.current++;
+    setFolder((old) => {
+      old?.resolve(null);
+      return undefined;
+    });
+    Reflect.deleteProperty(window, "twr");
+    await previous?.stop();
+  }
+  async function forgetLocal(hub: Hub) {
+    await Transport.removeHub({ id: hub.id });
+    editors.forget(hub.id);
+    localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
+    localStorage.removeItem(pushPreferenceKey(hub.id));
+  }
+  async function forget(hub: Hub) {
+    return queueSwitch(() => forgetNow(hub));
+  }
+  async function forgetNow(hub: Hub) {
+    setBusy(true);
+    const remote = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await remote.start();
+      await disablePush(remote, hub.id);
+    } catch {
+      setError(
+        "The hub could not be reached to disable push. Revoke this device on that hub to stop any remaining notifications.",
+      );
+    } finally {
+      await remote.stop().catch(() => {});
+    }
+    try {
+      await forgetLocal(hub);
+      await load();
+    } catch (error) {
+      setError(String(error));
+    } finally {
+      setBusy(false);
+    }
   }
   async function browse(path: string) {
     const generation = ++folderGeneration.current;
@@ -155,12 +210,16 @@ function Mobile() {
     }
   }
   async function connect(hub: Hub) {
+    return queueSwitch(() => connectNow(hub));
+  }
+  async function connectNow(hub: Hub) {
     setReadyHubId(undefined);
     setBusy(true);
     setError("");
+    let remote: RemoteHost | undefined;
     try {
-      await host.current?.stop();
-      const remote = new RemoteHost(
+      await disconnectNow();
+      remote = new RemoteHost(
         hub,
         () => {
           void disconnect();
@@ -180,6 +239,7 @@ function Mobile() {
       setActive(hub);
       return true;
     } catch (e) {
+      await remote?.stop().catch(() => {});
       setError(String(e));
       return false;
     } finally {
@@ -264,6 +324,21 @@ function Mobile() {
             >
               Enable remote push
             </button>
+            {pushEnabled(active.id) && (
+              <button
+                disabled={busy}
+                onClick={() => {
+                  if (!host.current) return;
+                  setBusy(true);
+                  void disablePush(host.current, active.id)
+                    .then(() => setNotice("Remote push disabled for this hub."))
+                    .catch((error) => setNotice(String(error)))
+                    .finally(() => setBusy(false));
+                }}
+              >
+                Disable remote push
+              </button>
+            )}
             <button
               onClick={() => {
                 setHubSheet(false);
@@ -286,12 +361,16 @@ function Mobile() {
                     ).value
                   )
                     return;
-                  await host.current?.request("unpair");
-                  await Transport.removeHub({ id: active.id });
-                  localStorage.removeItem(pushPreferenceKey(active.id));
-                  await disconnect();
-                  await load();
-                  setHubSheet(false);
+                  await queueSwitch(async () => {
+                    if (activeHub.current?.id !== active.id || !host.current)
+                      throw new Error(
+                        "Select this hub again before revoking its device.",
+                      );
+                    await host.current.request("unpair");
+                    await forgetLocal(active);
+                    await disconnectNow();
+                    await load();
+                  });
                 })().catch((error) => setNotice(String(error)))
               }
             >
@@ -405,16 +484,7 @@ function Mobile() {
           <details>
             <summary>Device access</summary>
             <p>{hub.scopes.join(" · ")}</p>
-            <button
-              disabled={busy}
-              onClick={async () => {
-                await Transport.removeHub({ id: hub.id });
-                editors.forget(hub.id);
-                localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
-                localStorage.removeItem(pushPreferenceKey(hub.id));
-                await load();
-              }}
-            >
+            <button disabled={busy} onClick={() => void forget(hub)}>
               Forget this hub
             </button>
             <small>

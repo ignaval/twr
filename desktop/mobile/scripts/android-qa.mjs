@@ -27,6 +27,8 @@ const adbRun = (args, options = {}) =>
 const fixture = mkdtempSync(join(tmpdir(), "twr-mobile-"));
 const repo = join(fixture, "repo");
 mkdirSync(repo);
+const plain = join(fixture, "plain");
+mkdirSync(plain);
 execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
 execFileSync(
   "git",
@@ -48,7 +50,7 @@ const token = join(fixture, "test-user-token");
 writeFileSync(token, randomUUID(), { mode: 0o600 });
 writeFileSync(
   join(fixture, "config.toml"),
-  `default_runtime = "fake"\n[projects.demo]\nrepo = ${JSON.stringify(repo)}\n[orchestrator]\nruntime = "fake"\nautostart = false\n[tui]\nsuggest = false\nsummaries = false\n`,
+  `default_runtime = "fake"\n[projects.demo]\nrepo = ${JSON.stringify(repo)}\n[projects.plain]\nrepo = ${JSON.stringify(plain)}\n[orchestrator]\nruntime = "fake"\nautostart = false\n[tui]\nsuggest = false\nsummaries = false\n`,
   { mode: 0o600 },
 );
 const env = {
@@ -213,6 +215,31 @@ try {
   await input.fill("");
   console.log(
     "PASS: native file picker upload, checksum, working-directory placement and git exclusion",
+  );
+  const plainUpload = await page.evaluate(async () => {
+    await window.twr.rpc("thread.new", {
+      project: "plain",
+      name: "plain-worker",
+      runtime: "fake",
+    });
+    const uploaded = await window.twr.uploadFile(
+      new File(["PLAIN_UPLOAD_OK"], "plain.txt"),
+      "plain-worker",
+    );
+    try {
+      await window.Capacitor.Plugins.TwrTransport.send({
+        message: "界".repeat(750000),
+      });
+      throw new Error("Oversized native request was accepted");
+    } catch (error) {
+      if (error.code !== "REQUEST_TOO_LARGE") throw error;
+    }
+    await window.twr.rpc("hub.info");
+    return uploaded.path;
+  });
+  assert.equal(readFileSync(plainUpload, "utf8"), "PLAIN_UPLOAD_OK");
+  console.log(
+    "PASS: non-git uploads and native UTF-8 size errors preserve the connection",
   );
   if (process.env.TWR_SYSTEM_PICKER_QA === "1") {
     const next = await systemPickerQA({
@@ -445,9 +472,32 @@ try {
   await page.evaluate((id) => {
     window.__qaTerminal = id;
   }, terminal.id);
+  await page.getByRole("button", { name: "Open shell", exact: true }).click();
+  const offlineTerminal = page
+    .locator(".terminal-session")
+    .filter({ visible: true });
+  const offlineId = await offlineTerminal.getAttribute("data-session-id");
+  await page.evaluate(
+    (id) =>
+      window.twr.terminalWrite(
+        id,
+        "printf '\\nOFFLINE_%s\\n' STARTED; sleep 3; printf '\\nOFFLINE_%s\\n' FINAL_OUTPUT; exit\r",
+      ),
+    offlineId,
+  );
+  await expect
+    .poll(
+      () =>
+        page
+          .evaluate((id) => window.twr.terminalRead(id), offlineId)
+          .then((r) => r.data),
+      { timeout: 10000 },
+    )
+    .toContain("OFFLINE_STARTED");
   // A lost socket must reconnect on foregrounding without losing its PTY.
   await page.evaluate(() => window.Capacitor.Plugins.TwrTransport.disconnect());
   adbRun(["shell", "input", "keyevent", "KEYCODE_HOME"]);
+  await new Promise((resolve) => setTimeout(resolve, 4000));
   adbRun(["shell", "am", "start", "-n", "tools.twr.mobile.dev/.MainActivity"]);
   await expect
     .poll(
@@ -465,6 +515,24 @@ try {
   console.log(
     "PASS: foreground reconnect retains the remote terminal and history",
   );
+  const restoredTerminal = page.locator(
+    `.terminal-session[data-session-id="${offlineId}"]`,
+  );
+  await expect(restoredTerminal.locator(".xterm-rows")).toContainText(
+    "OFFLINE_FINAL_OUTPUT",
+    { timeout: 15000 },
+  );
+  await expect(restoredTerminal).toHaveAttribute("aria-label", /exited/);
+  console.log(
+    "PASS: terminal UI restores final output and exit status produced offline",
+  );
+  await page
+    .locator('.terminal-tab.active button[aria-label^="Close "]')
+    .click();
+  await page
+    .getByRole("dialog", { name: "Close terminal?", exact: true })
+    .getByRole("button", { name: "Continue", exact: true })
+    .click();
   await page.evaluate((id) => {
     const command =
       "printf 'ORDER_%s\\n' '0123456789abcdefghijklmnopqrstuvwxyz'\r";
@@ -516,7 +584,13 @@ try {
   console.log(
     "PASS: ordered keystrokes and 3 MiB terminal output without a full reconnect",
   );
-  await page.evaluate((id) => window.twr.terminalClose(id), terminal.id);
+  await page
+    .locator('.terminal-tab.active button[aria-label^="Close "]')
+    .click();
+  await page
+    .getByRole("dialog", { name: "Close terminal?", exact: true })
+    .getByRole("button", { name: "Continue", exact: true })
+    .click();
   console.log("PASS: Android to remote native PTY input and output");
   await terminalUIQA(page);
   const pickedDirectory = page.evaluate(() => window.twr.pickDirectory());

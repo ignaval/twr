@@ -250,6 +250,26 @@ export async function multiHubQA({
     console.log(
       "PASS: a real notification switches between two remote hubs and binds the new UI subscriptions",
     );
+    gateway.kill();
+    await new Promise((resolve) => gateway.once("exit", resolve));
+    await notification(secondGateway, "work", "twr · offline hub QA");
+    await expect(page.locator(".mobile-onboarding")).toBeVisible({
+      timeout: 40000,
+    });
+    await expect(page.locator(".mobile-onboarding [role=alert]")).toContainText(
+      /connect|authenticate/i,
+    );
+    assert.equal(await page.locator(".live-mark").count(), 0);
+    await page
+      .locator(".hub-connect")
+      .filter({ hasText: "QA workstation" })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "Remote hub settings", exact: true }),
+    ).toHaveText("QA workstation");
+    console.log(
+      "PASS: a failed notification hub switch returns to the hub list and reconnects cleanly",
+    );
   } finally {
     gateway?.kill();
     hub?.kill();

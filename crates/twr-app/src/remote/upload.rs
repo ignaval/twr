@@ -9,6 +9,26 @@ use std::{
     path::{Path, PathBuf},
 };
 pub const MAX_FILE: usize = 25 * 1024 * 1024;
+#[derive(Default)]
+pub struct Quota {
+    charges: std::collections::HashMap<String, (std::time::Instant, usize)>,
+}
+impl Quota {
+    pub fn reserve(&mut self, id: &str, size: usize, now: std::time::Instant) -> Result<()> {
+        self.charges
+            .retain(|_, (at, _)| now.duration_since(*at) < std::time::Duration::from_secs(600));
+        let used: usize = self.charges.values().map(|(_, size)| size).sum();
+        anyhow::ensure!(
+            used.saturating_add(size) <= 128 * 1024 * 1024,
+            "Upload limit reached (128 MiB per 10 minutes). Try again later."
+        );
+        self.charges.insert(id.into(), (now, size));
+        Ok(())
+    }
+    pub fn release(&mut self, id: &str) {
+        self.charges.remove(id);
+    }
+}
 pub struct Upload {
     base: File,
     directory: String,
@@ -148,6 +168,21 @@ impl Drop for Upload {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_and_expired_uploads_do_not_exhaust_the_quota() {
+        let mut quota = Quota::default();
+        let now = std::time::Instant::now();
+        for i in 0..5 {
+            quota.reserve(&i.to_string(), MAX_FILE, now).unwrap();
+        }
+        assert!(quota.reserve("sixth", MAX_FILE, now).is_err());
+        quota.release("0");
+        quota.reserve("replacement", MAX_FILE, now).unwrap();
+        assert!(quota.reserve("still-full", MAX_FILE, now).is_err());
+        quota
+            .reserve("later", MAX_FILE, now + std::time::Duration::from_secs(601))
+            .unwrap();
+    }
     #[test]
     fn complete_file_checks_size_hash_and_traversal() {
         let root = tempfile::tempdir().unwrap();

@@ -31,6 +31,7 @@ vi.mock("@capacitor/local-notifications", () => ({
 }));
 import {
   enablePush,
+  disablePush,
   refreshPush,
   pushEnabled,
   notificationListeners,
@@ -61,6 +62,31 @@ beforeEach(() => {
   sdk.register.mockImplementation(async () => emit("initial-token"));
 });
 describe("push token lifecycle", () => {
+  it("disables push after an in-flight registration and leaves opt-in cleared", async () => {
+    const remote = host();
+    let finish: (() => void) | undefined;
+    vi.mocked(remote.request).mockImplementation(async (method) => {
+      if (method === "push-status") return { fcm: true };
+      if (method === "push-register")
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+      return {};
+    });
+    const enabling = enablePush(remote, "hub-a");
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    const disabling = disablePush(remote, "hub-a");
+    finish!();
+    await Promise.all([enabling, disabling]);
+    expect(pushEnabled("hub-a")).toBe(false);
+    expect(remote.request).toHaveBeenLastCalledWith(
+      "push-unregister",
+      {},
+      10000,
+    );
+    await refreshPush(remote, "hub-a");
+    expect(sdk.register).toHaveBeenCalledTimes(1);
+  });
   it("restores registration only for opted-in hubs and never prompts during passive refresh", async () => {
     const remote = host();
     await refreshPush(remote, "hub-a");

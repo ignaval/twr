@@ -152,7 +152,7 @@ impl Terminal {
     }
     pub fn read(&self) -> Value {
         let h = self.history.lock().unwrap();
-        json!({"data":*h,"sequence":self.sequence.load(Ordering::SeqCst)})
+        json!({"data":*h,"sequence":self.sequence.load(Ordering::SeqCst),"exited":self.exited.load(Ordering::SeqCst)})
     }
     pub async fn write(&mut self, text: &str) -> Result<()> {
         anyhow::ensure!(text.len() <= 65536, "Terminal input too large");

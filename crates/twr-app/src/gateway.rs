@@ -26,7 +26,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -83,6 +83,49 @@ struct Server {
     receipt_waiters: Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<Value>>>>,
 }
 type OrderedInput = (Call, mpsc::Sender<Value>, u64);
+const MAX_SOCKET_REPLY: usize = 16 * 1024 * 1024;
+
+/// Keep a large transcript or state event from tearing down a healthy native socket.
+fn socket_message(event: &Value) -> Message {
+    let text = event.to_string();
+    let text = if text.len() > MAX_SOCKET_REPLY {
+        let error =
+            "Hub response exceeds 16 MiB. Load a smaller transcript page or open it on desktop.";
+        match event.get("id") {
+            Some(id) => json!({"id":id,"error":error}).to_string(),
+            None => json!({"type":"error","error":error}).to_string(),
+        }
+    } else {
+        text
+    };
+    Message::Text(text.into())
+}
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    #[test]
+    fn oversized_replies_and_events_become_bounded_errors() {
+        for value in [
+            json!({"id":"request-id","result":"界".repeat(MAX_SOCKET_REPLY / 3 + 1)}),
+            json!({"type":"state","state":"x".repeat(MAX_SOCKET_REPLY)}),
+        ] {
+            let Message::Text(text) = socket_message(&value) else {
+                panic!("text frame required")
+            };
+            assert!(text.len() < MAX_SOCKET_REPLY);
+            let result: Value = serde_json::from_str(&text).unwrap();
+            assert!(result["error"].as_str().unwrap().contains("16 MiB"));
+            if value.get("id").is_some() {
+                assert_eq!(result["id"], value["id"]);
+            }
+        }
+        let small = json!({"id":"next","result":{"ok":true}});
+        let Message::Text(text) = socket_message(&small) else {
+            panic!("text frame required")
+        };
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), small);
+    }
+}
 impl Server {
     async fn owner_call(&self, method: &str, params: Value) -> Result<Value> {
         let (events, mut received) = mpsc::channel(128);
@@ -203,7 +246,7 @@ struct Session {
     events: mpsc::Sender<Value>,
     terminal_events: mpsc::Sender<Value>,
     uploads: Mutex<HashMap<String, remote::upload::Upload>>,
-    uploaded: AtomicUsize,
+    upload_quota: std::sync::Mutex<remote::upload::Quota>,
 }
 impl Session {
     async fn call(&self, server: &Server, call: &Call) -> Result<Value> {
@@ -349,6 +392,10 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                     .await
             }
             "push-status" => Ok(server.push.status()),
+            "push-unregister" => {
+                server.push.unregister(&self.device.id).await?;
+                Ok(json!({"ok":true}))
+            }
             "push-register" => {
                 server
                     .push
@@ -381,10 +428,6 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                     size <= remote::upload::MAX_FILE,
                     "Files can be at most 25 MiB"
                 );
-                anyhow::ensure!(
-                    self.uploaded.load(Ordering::SeqCst).saturating_add(size) <= 128 * 1024 * 1024,
-                    "Upload quota reached for this session"
-                );
                 let thread = bridge()?
                     .call("thread.get", json!({"thread":p["thread"]}))
                     .await?;
@@ -407,48 +450,54 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                         "-C",
                         root,
                         "rev-parse",
+                        "--is-inside-work-tree",
                         "--git-path",
                         "info/exclude",
                     ])
+                    .env("LC_ALL", "C")
                     .output()
                     .await?;
+                let not_git = !out.status.success()
+                    && String::from_utf8_lossy(&out.stderr).contains("not a git repository");
                 anyhow::ensure!(
-                    out.status.success(),
-                    "Could not exclude uploaded files from git"
+                    out.status.success() || not_git,
+                    "Could not check the upload directory's git status"
                 );
-                let exclude = PathBuf::from(String::from_utf8(out.stdout)?.trim());
-                let exclude = if exclude.is_absolute() {
-                    exclude
-                } else {
-                    Path::new(root).join(exclude)
-                };
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                if let Some(parent) = exclude.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .append(true)
-                    .create(true)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(exclude)?;
-                use std::io::Read;
-                let mut contents = String::new();
-                (&mut file).take(65536).read_to_string(&mut contents)?;
-                if !contents.lines().any(|line| line == ".twr-uploads/") {
-                    file.write_all(b"\n.twr-uploads/\n")?;
+                let output = String::from_utf8(out.stdout)?;
+                if out.status.success() && output.lines().next() == Some("true") {
+                    let exclude =
+                        PathBuf::from(output.lines().nth(1).context("Git exclude path missing")?);
+                    let exclude = if exclude.is_absolute() {
+                        exclude
+                    } else {
+                        Path::new(root).join(exclude)
+                    };
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    if let Some(parent) = exclude.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .append(true)
+                        .create(true)
+                        .mode(0o600)
+                        .custom_flags(libc::O_NOFOLLOW)
+                        .open(exclude)?;
+                    use std::io::Read;
+                    let mut contents = String::new();
+                    (&mut file).take(65536).read_to_string(&mut contents)?;
+                    if !contents.lines().any(|line| line == ".twr-uploads/") {
+                        file.write_all(b"\n.twr-uploads/\n")?;
+                    }
                 }
                 let id = uuid::Uuid::new_v4().to_string();
                 let mut uploads = self.uploads.lock().await;
                 anyhow::ensure!(uploads.len() < 4, "Finish an existing upload first");
-                self.uploaded
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                        used.checked_add(size)
-                            .filter(|total| *total <= 128 * 1024 * 1024)
-                    })
-                    .map_err(|_| anyhow::anyhow!("Upload quota reached for this session"))?;
+                self.upload_quota
+                    .lock()
+                    .unwrap()
+                    .reserve(&id, size, std::time::Instant::now())?;
                 uploads.insert(id.clone(), upload);
                 Ok(json!({"id":id,"chunk_size":262144}))
             }
@@ -466,19 +515,25 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 Ok(json!({"received":count}))
             }
             "upload-commit" => {
+                let id = p["id"].as_str().unwrap_or("");
                 let upload = self
                     .uploads
                     .lock()
                     .await
-                    .remove(p["id"].as_str().unwrap_or(""))
+                    .remove(id)
                     .context("Upload not found")?;
-                Ok(json!({"path":upload.commit()?}))
+                match upload.commit() {
+                    Ok(path) => Ok(json!({"path":path})),
+                    Err(error) => {
+                        self.upload_quota.lock().unwrap().release(id);
+                        Err(error)
+                    }
+                }
             }
             "upload-cancel" => {
-                self.uploads
-                    .lock()
-                    .await
-                    .remove(p["id"].as_str().unwrap_or(""));
+                let id = p["id"].as_str().unwrap_or("");
+                self.uploads.lock().await.remove(id);
+                self.upload_quota.lock().unwrap().release(id);
                 Ok(Value::Null)
             }
             "cli" => {
@@ -701,7 +756,7 @@ async fn serve_socket(
                     events: tx,
                     terminal_events: terminal_tx,
                     uploads: Mutex::new(HashMap::new()),
-                    uploaded: AtomicUsize::new(0),
+                    upload_quota: std::sync::Mutex::new(remote::upload::Quota::default()),
                 },
                 events,
                 terminal_events,
@@ -751,17 +806,14 @@ async fn serve_socket(
                 reply=response_rx.recv()=>match reply{Some(e)=>e,None=>break},
                 event=rx.recv()=>match event{Ok(e)=>e,Err(broadcast::error::RecvError::Lagged(_))=>{
                     let snapshot=state_cache.lock().unwrap().clone();
-                    if let Some(snapshot)=snapshot {if !matches!(tokio::time::timeout(Duration::from_secs(20),sink.send(Message::Text(snapshot.to_string().into()))).await,Ok(Ok(()))){break;}}
+                    if let Some(snapshot)=snapshot {if !matches!(tokio::time::timeout(Duration::from_secs(20),sink.send(socket_message(&snapshot))).await,Ok(Ok(()))){break;}}
                     json!({"type":"resync"})
                 },Err(_)=>break},
                 event=terminal_rx.recv()=>match event{Ok(e)=>e,Err(broadcast::error::RecvError::Lagged(_))=>json!({"type":"terminal-resync"}),Err(_)=>break}
             };
             if !matches!(
-                tokio::time::timeout(
-                    Duration::from_secs(20),
-                    sink.send(Message::Text(event.to_string().into()))
-                )
-                .await,
+                tokio::time::timeout(Duration::from_secs(20), sink.send(socket_message(&event)))
+                    .await,
                 Ok(Ok(()))
             ) {
                 break;
@@ -945,11 +997,13 @@ async fn main() -> Result<()> {
             let _ = cleanup.receipts.prune();
             let active: Vec<_> = cleanup.sessions.lock().await.values().cloned().collect();
             for slot in active {
-                slot.session
-                    .uploads
-                    .lock()
-                    .await
-                    .retain(|_, upload| upload.created.elapsed() < Duration::from_secs(900));
+                slot.session.uploads.lock().await.retain(|id, upload| {
+                    let keep = upload.created.elapsed() < Duration::from_secs(900);
+                    if !keep {
+                        slot.session.upload_quota.lock().unwrap().release(id);
+                    }
+                    keep
+                });
             }
             let mut sessions = cleanup.sessions.lock().await;
             sessions.retain(|id, slot| {

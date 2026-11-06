@@ -78,7 +78,7 @@ public class TwrTransportPlugin extends Plugin {
             private void closed(WebSocket ws){if(ws!=socket)return;JSObject value=new JSObject();value.put("message",new JSObject().put("type","transport-closed").put("connected",false).put("error","Remote hub connection closed"));notifyListeners("message",value);}
         });
     }catch(Exception e){call.reject("Could not connect to the paired hub",e);}}
-    @PluginMethod public void send(PluginCall call){String message=call.getString("message","");if(message.length()>2*1024*1024||socket==null||!socket.send(message)){call.reject("Hub connection is closed");}else call.resolve();}
+    @PluginMethod public void send(PluginCall call){String message=call.getString("message","");if(message.getBytes(java.nio.charset.StandardCharsets.UTF_8).length>2*1024*1024){call.reject("Request exceeds 2 MiB","REQUEST_TOO_LARGE");return;}if(socket==null||!socket.send(message)){call.reject("Hub connection is closed");}else call.resolve();}
     @PluginMethod public void disconnect(PluginCall call){if(socket!=null){socket.close(1000,"App disconnected");socket=null;}call.resolve();}
     @PluginMethod public void removeHub(PluginCall call){try{String id=call.getString("id","");JSONObject all=vault();all.remove(id);save(all);if(id.equals(activeHub)&&socket!=null)socket.cancel();call.resolve();}catch(Exception e){call.reject("Could not remove hub",e);}}
     @Override protected void handleOnDestroy(){if(socket!=null)socket.cancel();worker.shutdown();http.dispatcher().executorService().shutdown();}

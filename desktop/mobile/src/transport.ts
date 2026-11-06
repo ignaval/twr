@@ -204,7 +204,7 @@ export class RemoteHost {
       await this.openSocket();
       this.nativeConnected = true;
     }
-    const result = await this.request("connect", { workspace }, 30000);
+    const result = await this.request("connect", { workspace }, 75000);
     this.workspace = workspace;
     this.confirmedWorkspace = true;
     this.bridgeReady = true;
@@ -214,6 +214,9 @@ export class RemoteHost {
       method: "notify.looking",
       params: { looking: this.foreground },
     });
+    this.listeners.forEach((listener) =>
+      listener({ type: "resync", scope: "terminal" }),
+    );
     return result;
   }
   async resume() {
@@ -268,6 +271,12 @@ export class RemoteHost {
       params,
       workspace: this.workspace,
     });
+    if (new TextEncoder().encode(wire).byteLength > 2 * 1024 * 1024)
+      return Promise.reject(
+        new Error(
+          "Request exceeds 2 MiB. Attach large files instead of pasting them.",
+        ),
+      );
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -277,7 +286,7 @@ export class RemoteHost {
       }, timeout);
       this.pending.set(id, { resolve, reject, timer, wire, durable });
       void this.send(wire).catch((error) => {
-        if (durable && !this.stopped) {
+        if (durable && !this.stopped && error?.code !== "REQUEST_TOO_LARGE") {
           this.nativeConnected = false;
           this.scheduleReconnect();
           return;
@@ -292,9 +301,11 @@ export class RemoteHost {
     const request = this.request.bind(this);
     const fire = (method: string, params: Json) =>
       void request(method, params).catch((error) =>
-        this.listeners.forEach((listener) =>
-          listener({ type: "error", error: String(error) }),
-        ),
+        ["terminal-resize", "terminal-focus", "terminal-ack"].includes(method)
+          ? undefined
+          : this.listeners.forEach((listener) =>
+              listener({ type: "error", error: String(error) }),
+            ),
       );
     return {
       uploadFile: async (file, thread) => {
@@ -336,7 +347,9 @@ export class RemoteHost {
           throw error;
         }
       },
-      quit: async () => this.showHubs(),
+      quit: async () => {
+        if (!this.stopped) this.showHubs();
+      },
       copyText: async (text) => {
         await Clipboard.write({ string: text });
       },
@@ -384,7 +397,8 @@ export class RemoteHost {
         fire("terminal-resize", { id, cols, rows }),
       terminalClose: (id) => request("terminal-close", { id }),
       terminalRead: (id) => request("terminal-read", { id }),
-      pickDirectory: this.chooseDirectory,
+      pickDirectory: () =>
+        this.stopped ? Promise.resolve(null) : this.chooseDirectory(),
       openExternal: async (url) => {
         const parsed = new URL(url);
         if (!["https:", "http:", "mailto:"].includes(parsed.protocol))

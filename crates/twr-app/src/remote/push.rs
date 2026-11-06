@@ -114,6 +114,14 @@ impl Push {
     async fn remove(&self, recipient: &Recipient) -> Result<()> {
         let mut records = self.recipients.lock().await;
         records.retain(|r| r.device != recipient.device || r.token != recipient.token);
+        self.save_recipients(&records)
+    }
+    pub async fn unregister(&self, device: &str) -> Result<()> {
+        let mut records = self.recipients.lock().await;
+        records.retain(|r| r.device != device);
+        self.save_recipients(&records)
+    }
+    fn save_recipients(&self, records: &[Recipient]) -> Result<()> {
         let temp = self.path.with_extension(format!("{}.tmp", auth::secret()));
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
@@ -121,7 +129,7 @@ impl Push {
             .create_new(true)
             .mode(0o600)
             .open(&temp)?;
-        file.write_all(&serde_json::to_vec(&*records)?)?;
+        file.write_all(&serde_json::to_vec(records)?)?;
         file.sync_all()?;
         std::fs::rename(temp, &self.path)?;
         Ok(())
@@ -147,17 +155,7 @@ impl Push {
         let mut recipients = self.recipients.lock().await;
         recipients.retain(|r| r.device != recipient.device || r.workspace != recipient.workspace);
         recipients.push(recipient);
-        let temp = self.path.with_extension(format!("{}.tmp", auth::secret()));
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        file.write_all(&serde_json::to_vec(&*recipients)?)?;
-        file.sync_all()?;
-        std::fs::rename(temp, &self.path)?;
-        Ok(())
+        self.save_recipients(&recipients)
     }
     pub async fn deliver(
         &self,
@@ -338,6 +336,27 @@ impl Push {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn disabling_push_removes_all_workspaces_only_for_that_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("push-log.jsonl");
+        let push = Push::new(dir.path(), None, Some(log.clone())).unwrap();
+        for (device, workspace) in [("a", "default"), ("a", "other"), ("b", "default")] {
+            push.register(Recipient {
+                device: device.into(),
+                workspace: workspace.into(),
+                platform: "test".into(),
+                token: format!("token-{device}"),
+            })
+            .await
+            .unwrap();
+        }
+        push.unregister("a").await.unwrap();
+        let restored = Push::new(dir.path(), None, Some(log)).unwrap();
+        let records = restored.recipients.lock().await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].device, "b");
+    }
     #[tokio::test]
     async fn simultaneous_items_form_one_content_free_digest() {
         let _ = rustls::crypto::ring::default_provider().install_default();
