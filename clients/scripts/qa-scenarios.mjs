@@ -402,20 +402,36 @@ export async function runMacQA(page, { fixture, hubPids }) {
       limit: 500,
     })
   ).events.length;
-  await page
-    .locator(".thread-list .thread-card")
-    .filter({ hasText: "qa-agent" })
-    .click();
-  assert(
-    await orchestrator.isVisible(),
-    "Selecting a thread must keep the orchestrator destination",
-  );
-  await orchestrator.fill("QA_STILL_TO_ORCHESTRATOR");
-  await page.getByRole("button", { name: "Send message", exact: true }).click();
-  await page
-    .locator(".block-assistant")
-    .getByText("QA_STILL_TO_ORCHESTRATOR", { exact: true })
-    .waitFor();
+  const viewport = await page.evaluate(() => ({
+    width: innerWidth,
+    height: innerHeight,
+  }));
+  for (const width of [1000, 1360]) {
+    await page.setViewportSize({ width, height: 800 });
+    await page
+      .locator(".thread-list .thread-card")
+      .filter({ hasText: "qa-agent" })
+      .click();
+    assert(
+      await orchestrator.isVisible(),
+      "Selecting a thread must keep the orchestrator destination",
+    );
+    // On smaller displays details overlay the composer. Dismiss them through
+    // the same control a user uses before returning to the conversation.
+    await page
+      .getByRole("button", { name: "Close thread details", exact: true })
+      .click();
+    const message = `QA_STILL_TO_ORCHESTRATOR_${width}`;
+    await orchestrator.fill(message);
+    await page
+      .getByRole("button", { name: "Send message", exact: true })
+      .click();
+    await page
+      .locator(".block-assistant")
+      .getByText(message, { exact: true })
+      .waitFor();
+  }
+  await page.setViewportSize(viewport);
   assert.equal(
     (
       await rpc("thread.transcript", {
@@ -426,7 +442,9 @@ export async function runMacQA(page, { fixture, hubPids }) {
     ).events.length,
     workerBefore,
   );
-  console.log("QA: orchestrator sending and destination isolation");
+  console.log(
+    "QA: orchestrator sending and destination isolation at 1000px and 1360px",
+  );
 
   const speakerForm = await open("twr speak", {
     name: "qa-speaker",
@@ -447,20 +465,24 @@ export async function runMacQA(page, { fixture, hubPids }) {
     .toBeGreaterThan(0);
   await page
     .locator(".block-assistant")
-    .filter({ hasText: "QA_STILL_TO_ORCHESTRATOR" })
+    .filter({ hasText: "QA_STILL_TO_ORCHESTRATOR_1360" })
     .getByRole("button", { name: "Read message aloud", exact: true })
     .click();
   const spoken = join(fixture, "spoken.txt");
   for (let attempt = 0; attempt < 100; attempt++) {
     if (
       existsSync(spoken) &&
-      readFileSync(spoken, "utf8").includes("QA_STILL_TO_ORCHESTRATOR")
+      readFileSync(spoken, "utf8").includes("QA_STILL_TO_ORCHESTRATOR_1360")
     )
       break;
     if (attempt === 99)
       throw new Error("Selected message did not reach the speaker command");
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
+  assert(
+    !readFileSync(spoken, "utf8").includes("QA_STILL_TO_ORCHESTRATOR_1000"),
+    "Reading one selected message must not read the other viewport's message",
+  );
   await page
     .getByRole("button", { name: "Close twr speak", exact: true })
     .click();
