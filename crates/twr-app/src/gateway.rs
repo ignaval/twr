@@ -118,6 +118,8 @@ fn authorize_mutation(device: &Device, call: &Call) -> Result<()> {
 }
 
 const MAX_SOCKET_REPLY: usize = 16 * 1024 * 1024;
+const OVERSIZED_REPLY_ERROR: &str =
+    "Hub response exceeds 16 MiB. Load a smaller transcript page or open it on desktop.";
 
 /// Keep a large transcript or state event from tearing down a healthy native socket.
 fn send_budget(message: &Message) -> Duration {
@@ -131,11 +133,9 @@ fn send_budget(message: &Message) -> Duration {
 fn socket_message(event: &Value) -> Message {
     let text = event.to_string();
     let text = if text.len() > MAX_SOCKET_REPLY {
-        let error =
-            "Hub response exceeds 16 MiB. Load a smaller transcript page or open it on desktop.";
         match event.get("id") {
-            Some(id) => json!({"id":id,"error":error}).to_string(),
-            None => json!({"type":"error","error":error}).to_string(),
+            Some(id) => json!({"id":id,"error":OVERSIZED_REPLY_ERROR}).to_string(),
+            None => json!({"type":"error","error":OVERSIZED_REPLY_ERROR}).to_string(),
         }
     } else {
         text
@@ -262,7 +262,7 @@ impl Server {
 struct DeviceSession {
     input: mpsc::Sender<OrderedInput>,
     session: Session,
-    events: broadcast::Sender<Value>,
+    events: remote::events::Sender,
     terminal_events: broadcast::Sender<Value>,
     latest_state: Arc<std::sync::Mutex<Option<Value>>>,
     generation: AtomicU64,
@@ -885,7 +885,7 @@ async fn serve_socket(
             slot.clone()
         } else {
             let (tx, mut rx) = mpsc::channel::<Value>(128);
-            let (events, _) = broadcast::channel(256);
+            let events = remote::events::Sender::new();
             let (terminal_tx, mut terminal_rx) = mpsc::channel::<Value>(128);
             let (terminal_events, _) = broadcast::channel(256);
             let terminal_forward = terminal_events.clone();
@@ -914,7 +914,7 @@ async fn serve_socket(
                             *cache = Some(event.clone());
                         }
                     }
-                    let _ = forward.send(event);
+                    forward.send(event);
                 }
             });
             let (input, mut input_rx) = mpsc::channel::<OrderedInput>(64);
@@ -989,7 +989,7 @@ async fn serve_socket(
         enum Ready {
             Heartbeat(Option<Value>),
             Reply(Option<Value>),
-            Control(Result<Value, broadcast::error::RecvError>),
+            Control(Result<remote::events::Event, broadcast::error::RecvError>),
             Terminal(Result<Value, broadcast::error::RecvError>),
             Send,
         }
@@ -1010,7 +1010,7 @@ async fn serve_socket(
                     None
                 }
                 Ready::Control(Ok(event)) => {
-                    lanes[2] = Some(outbound(event, fragmented));
+                    lanes[2] = Some(event.outbound(fragmented));
                     None
                 }
                 Ready::Control(Err(broadcast::error::RecvError::Lagged(_))) => {

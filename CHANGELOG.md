@@ -13,6 +13,11 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 - Graphical clients and the TUI share command parsing, card ordering, configuration editing and routine-update handling. Hub RPC pooling, bounded message previews and executable hashing reduce startup allocation and streaming work. See [performance.md](docs/performance.md).
 
+### Fixed
+
+- Finished jobs release their slots immediately, even while a child process briefly retains an inherited file descriptor before exec.
+- Remote clients retain short bursts of live conversation events within byte and event-count limits, avoiding unnecessary resyncs during heavy tool output.
+
 ## [0.3.0] - 2026-10-30
 
 Remote boxes over SSH, in a container or dialling in; several accounts per runtime; the orchestrator's memory on every runtime; reading aloud; context and log compaction, and faster starts on a long history; what each thread has in flight, with hung-turn cards judged by it; one Threads sidebar; and cards answered on a phone however long they are.
