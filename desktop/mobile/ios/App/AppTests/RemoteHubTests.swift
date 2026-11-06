@@ -123,8 +123,10 @@ final class RemoteHubTests: XCTestCase {
           catch(error) { return error.code==='REQUEST_TOO_LARGE' }
           """) as? Bool
         XCTAssertEqual(sizeGuard, true, "Native requests must be bounded by UTF-8 bytes without closing the socket")
+        _ = try await js("document.querySelector('button[aria-label=\"Open shell\"]').click();return true")
+        try await until("return !!document.querySelector('.terminal-session .xterm-helper-textarea') && !!document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]')")
         _ = try await js("""
-          window.__qaTerminal=await window.twr.terminalOpen({shell:true,title:'iOS QA'});
+          window.__qaTerminal={id:document.querySelector('.terminal-session').dataset.sessionId};
           const command="printf 'ORDER_%s\\\\n' '0123456789abcdefghijklmnopqrstuvwxyz'\\r";
           for(const char of command)window.twr.terminalWrite(window.__qaTerminal.id,char);return true;
           """)
