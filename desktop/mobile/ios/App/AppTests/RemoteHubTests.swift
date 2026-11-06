@@ -203,7 +203,47 @@ final class RemoteHubTests: XCTestCase {
         performanceRequest.httpMethod = "POST"
         performanceRequest.httpBody = try JSONSerialization.data(withJSONObject: try XCTUnwrap(performanceResult))
         _ = try await URLSession.shared.data(for: performanceRequest)
-        try await until("const layout=await window.Capacitor.Plugins.TwrLayout.current();return document.querySelector('.mobile-hub-switch').getBoundingClientRect().top >= (layout.occlusionTop || 0)")
+        try await until("const top=parseFloat(getComputedStyle(document.body).paddingTop)||0;return Math.abs(document.querySelector('.mobile-hub-switch').getBoundingClientRect().top-top-8)<=1")
+        // Verify landscape safe areas through UIKit, rather than changing CSS dimensions.
+        if fixture["foldable"] as? Bool != true && UIDevice.current.userInterfaceIdiom == .phone,
+           let scene = web.window?.windowScene {
+            let orientations: [UIInterfaceOrientationMask] = [.landscapeRight, .landscapeLeft, .portrait]
+            for orientation in orientations {
+                scene.requestGeometryUpdate(UIWindowScene.GeometryPreferences.iOS(interfaceOrientations: orientation)) { error in
+                    XCTFail("Orientation change failed: \(error)")
+                }
+                let expected: UIInterfaceOrientation = orientation == .portrait ? .portrait : (orientation == .landscapeRight ? .landscapeRight : .landscapeLeft)
+                for _ in 0..<100 {
+                    if scene.interfaceOrientation == expected { break }
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                }
+                XCTAssertEqual(scene.interfaceOrientation, expected)
+                try await until(orientation == .portrait ? "return innerHeight > innerWidth" : "return innerWidth > innerHeight")
+                try await until("""
+                  const style=getComputedStyle(document.body),box=document.querySelector('.mobile-hub-switch').getBoundingClientRect();
+                  return box.left >= (parseFloat(style.paddingLeft)||0) && box.right <= innerWidth-(parseFloat(style.paddingRight)||0)+1;
+                  """)
+            }
+        }
+        // Exercise the same available-height contract as keyboard resizing in native WKWebView.
+        _ = try await js("""
+          const root=document.documentElement,style=getComputedStyle(document.body);
+          window.__qaAvailableHeight=root.style.getPropertyValue('--viewport-height');
+          window.__qaCompactHeight=Math.max(320,(parseFloat(root.style.getPropertyValue('--occlusion-top'))||0)+230+(parseFloat(style.paddingBottom)||0));
+          root.style.setProperty('--viewport-height',window.__qaCompactHeight+'px');
+          const input=document.querySelector('.composer textarea');
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,'COMPACT_VIEWPORT_SEND_QA');
+          input.dispatchEvent(new Event('input',{bubbles:true}));return true;
+          """)
+        try await until("""
+          const button=document.querySelector('button[aria-label="Send message"]'),box=button.getBoundingClientRect();
+          const tabs=document.querySelector('.mobile-tabs'),limit=tabs?.getClientRects().length?tabs.getBoundingClientRect().top:window.__qaCompactHeight;
+          return !button.disabled && box.width>=44 && box.height>=44 && box.bottom<=limit+1 && button.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2));
+          """)
+        try await capture("compact")
+        _ = try await js("document.querySelector('button[aria-label=\"Send message\"]').click();return true")
+        try await until("return [...document.querySelectorAll('.block-assistant .markdown')].some(e=>e.textContent.trim()==='COMPACT_VIEWPORT_SEND_QA')")
+        _ = try await js("document.documentElement.style.setProperty('--viewport-height',window.__qaAvailableHeight);window.dispatchEvent(new Event('resize'));await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);return true")
         let layout = try await js("return await window.Capacitor.Plugins.TwrLayout.current()")
         XCTAssertNotNil(layout)
         let result = try await js("return {errors:window.__qaErrors,width:innerWidth,height:innerHeight,layout:await window.Capacitor.Plugins.TwrLayout.current(),identity:(await window.twr.rpc('hub.info')).identity}")

@@ -70,6 +70,7 @@ const stopMeasuring = window.twr.onEvent((message) => {
     streamEvents.push({
       server: Date.parse(message.event.ts),
       received: performance.now(),
+      final: message.event.kind === "agent.text",
     });
 });
 const start = performance.now();
@@ -97,15 +98,29 @@ const receivedStreamSpanMs =
     ? Math.round(lastEvent.received - firstEvent.received)
     : null;
 const input = document.querySelector(".composer textarea");
-for (let i = 0; i < 12; i++) {
+const storageTimes = [];
+const originalStorageWrite = Storage.prototype.setItem;
+Storage.prototype.setItem = function (key, value) {
   const at = performance.now();
-  Object.getOwnPropertyDescriptor(
-    HTMLTextAreaElement.prototype,
-    "value",
-  ).set.call(input, "Responsive draft " + i);
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  await new Promise(requestAnimationFrame);
-  inputPaint.push(performance.now() - at);
+  try {
+    return originalStorageWrite.call(this, key, value);
+  } finally {
+    storageTimes.push(performance.now() - at);
+  }
+};
+try {
+  for (let i = 0; i < 12; i++) {
+    const at = performance.now();
+    Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    ).set.call(input, "Responsive draft " + i);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise(requestAnimationFrame);
+    inputPaint.push(performance.now() - at);
+  }
+} finally {
+  Storage.prototype.setItem = originalStorageWrite;
 }
 for (let i = 0; i < 20; i++) {
   const at = performance.now();
@@ -136,6 +151,14 @@ const report = {
   rpcMedianMs: pct(rpcTimes, 0.5),
   rpcP95Ms: pct(rpcTimes, 0.95),
   inputPaintP95Ms: pct(inputPaint, 0.95),
+  inputPaintMedianMs: pct(inputPaint, 0.5),
+  inputPaintSamplesMs: inputPaint.map(Math.round),
+  storageWriteMaxMs: Math.round(Math.max(0, ...storageTimes) * 10) / 10,
+  finalEventToRenderMs: streamEvents.find((e) => e.final)
+    ? Math.round(
+        start + streamToVisibleMs - streamEvents.find((e) => e.final).received,
+      )
+    : null,
   frameP95Ms: pct(frames, 0.95),
   heapMiB: null,
   domNodes: document.getElementsByTagName("*").length,

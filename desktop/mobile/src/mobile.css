@@ -86,7 +86,7 @@ select {
 }
 .mobile-hub-switch {
   position: fixed;
-  right: 16px;
+  right: calc(16px + env(safe-area-inset-right));
   top: calc(8px + max(env(safe-area-inset-top), var(--occlusion-top, 0px)));
   z-index: 35;
   font-size: 11px;
@@ -125,6 +125,9 @@ select {
 }
 [data-mobile="true"] button {
   min-height: 44px;
+}
+[data-mobile="true"] .send-button {
+  min-width: 44px;
 }
 [data-mobile="true"] .icon-button {
   min-width: 44px;
@@ -256,7 +259,7 @@ select {
 }
 /* The right pane needs its own compact header even on a wide unfolded display. */
 [data-fold="vertical"] .mobile-hub-switch {
-  right: 10px;
+  right: calc(10px + env(safe-area-inset-right));
   max-width: 100px;
 }
 [data-fold="vertical"] .topbar {
@@ -329,7 +332,7 @@ select {
   }
   .mobile-hub-switch {
     font-size: 10px;
-    right: 10px;
+    right: calc(10px + env(safe-area-inset-right));
     max-width: 100px;
   }
   [data-mobile="true"] .topbar {
@@ -356,8 +359,8 @@ select {
 .mobile-error {
   position: fixed;
   top: calc(60px + max(env(safe-area-inset-top), var(--occlusion-top, 0px)));
-  left: 12px;
-  right: 12px;
+  left: calc(12px + env(safe-area-inset-left));
+  right: calc(12px + env(safe-area-inset-right));
   z-index: 120;
   background: var(--panel);
   border: 1px solid var(--danger);
@@ -425,4 +428,53 @@ select {
   margin-top: auto;
   min-height: 0;
   max-height: calc(100% - var(--fold-top) - var(--hinge-height) - 12px);
+}
+
+/* Follow the content height after insets without containing viewport-fixed controls. */
+:root[data-mobile="true"].short-content .conversation-heading {
+  display: none;
+}
+:root[data-mobile="true"].short-content .conversation-scroll {
+  min-height: 0;
+}
+:root[data-mobile="true"].short-content .queue,
+:root[data-mobile="true"].short-content .shell-runs,
+:root[data-mobile="true"].short-content .reports,
+:root[data-mobile="true"].short-content .assistance-notice,
+:root[data-mobile="true"].short-content .assistance-status,
+:root[data-mobile="true"].short-content .suggested-message {
+  min-height: 0;
+  max-height: 25%;
+  overflow: auto;
+  flex-shrink: 1;
+}
+:root[data-mobile="true"].tiny-content .topbar {
+  display: none;
+}
+:root[data-mobile="true"].tiny-content .composer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+:root[data-mobile="true"].tiny-content .composer-label {
+  grid-column: 1 / -1;
+}
+:root[data-mobile="true"].tiny-content .composer > textarea {
+  grid-column: 1;
+  grid-row: 2;
+  height: 44px;
+  min-height: 44px;
+  max-height: 64px;
+}
+:root[data-mobile="true"].tiny-content .composer-bottom {
+  grid-column: 2;
+  grid-row: 2;
+  align-self: end;
+  padding: 0 6px 6px;
+}
+:root[data-mobile="true"].tiny-content .sidebar {
+  overflow-y: auto;
+}
+:root[data-mobile="true"].tiny-content .thread-list {
+  flex: none;
+  overflow: visible;
 }

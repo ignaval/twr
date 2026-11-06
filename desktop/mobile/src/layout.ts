@@ -53,6 +53,20 @@ export async function observeLayout() {
         `${Math.max(0, posture[key] || 0)}px`,
       );
   };
+  // Observe the actual content box after safe-area/camera padding. Query containers
+  // themselves alter fixed positioning in older supported WebKit (bug 284945).
+  const content = document.getElementById("root");
+  const setContentHeight = (height: number) => {
+    root.classList.toggle("short-content", height <= 400);
+    root.classList.toggle("tiny-content", height <= 300);
+  };
+  const contentSize = new ResizeObserver((entries) => {
+    if (entries[0]) setContentHeight(entries[0].contentRect.height);
+  });
+  if (content) {
+    contentSize.observe(content);
+    setContentHeight(content.clientHeight);
+  }
   updateViewport();
   window.visualViewport?.addEventListener("resize", updateViewport);
   window.addEventListener("resize", updateViewport);
@@ -62,6 +76,8 @@ export async function observeLayout() {
     listener = await Layout.addListener("change", apply);
   }
   return () => {
+    contentSize.disconnect();
+    root.classList.remove("short-content", "tiny-content");
     window.visualViewport?.removeEventListener("resize", updateViewport);
     window.removeEventListener("resize", updateViewport);
     void listener?.remove();

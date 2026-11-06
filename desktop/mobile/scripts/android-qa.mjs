@@ -468,6 +468,7 @@ try {
       await dialog
         .getByRole("button", { name: "Close dialog", exact: true })
         .click();
+      await page.evaluate(() => window.Capacitor.Plugins.Keyboard.hide());
     };
     await foldDialog("vertical");
     const header = await page.locator(".topbar").evaluate((element) => {
@@ -1131,11 +1132,74 @@ try {
       "PASS: a silent downstream blackhole is detected and the client reconnects after recovery",
     );
   }
-  if (process.env.TWR_PERF === "1")
+  if (process.env.TWR_PERF === "1") {
     await performanceAudit(
       page,
       serial === "emulator-5556" ? "android-fold" : "android-phone",
     );
+    const compact = await page.evaluate(async () => {
+      const root = document.documentElement,
+        saved = root.style.getPropertyValue("--viewport-height");
+      try {
+        root.style.setProperty("--viewport-height", "250px");
+        const input = document.querySelector(".composer textarea");
+        Object.getOwnPropertyDescriptor(
+          HTMLTextAreaElement.prototype,
+          "value",
+        ).set.call(input, "COMPACT_VIEWPORT_SEND_QA");
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        await new Promise(requestAnimationFrame);
+        await new Promise(requestAnimationFrame);
+        const button = document.querySelector(
+            'button[aria-label="Send message"]',
+          ),
+          box = button.getBoundingClientRect();
+        const tabs = document.querySelector(".mobile-tabs"),
+          limit = tabs.getClientRects().length
+            ? tabs.getBoundingClientRect().top
+            : 250;
+        const result = {
+          box: box.toJSON(),
+          limit,
+          hit: button.contains(
+            document.elementFromPoint(
+              box.x + box.width / 2,
+              box.y + box.height / 2,
+            ),
+          ),
+        };
+        if (
+          button.disabled ||
+          box.width < 44 ||
+          box.height < 44 ||
+          box.bottom > limit + 1 ||
+          !result.hit
+        )
+          throw new Error(
+            "Compact composer unreachable: " + JSON.stringify(result),
+          );
+        button.click();
+        const deadline = performance.now() + 20000;
+        while (performance.now() < deadline) {
+          if (
+            [...document.querySelectorAll(".block-assistant .markdown")].some(
+              (e) => e.textContent.trim() === "COMPACT_VIEWPORT_SEND_QA",
+            )
+          )
+            return result;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        throw new Error("Compact composer did not send its message");
+      } finally {
+        root.style.setProperty("--viewport-height", saved);
+        window.dispatchEvent(new Event("resize"));
+      }
+    });
+    console.log(
+      "PASS: compact composer stays above navigation and sends through a 44-point touch target",
+      JSON.stringify(compact),
+    );
+  }
   mkdirSync("test-results", { recursive: true });
   writeFileSync(
     serial === "emulator-5556"
