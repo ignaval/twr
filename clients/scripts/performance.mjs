@@ -1,4 +1,5 @@
 import { expect } from "@playwright/test";
+import { qaSource } from "./qa-source.mjs";
 import { mkdirSync, writeFileSync } from "node:fs";
 export async function performanceAudit(page, label, application) {
   if (
@@ -192,6 +193,7 @@ export async function performanceAudit(page, label, application) {
       Math.min(values.length - 1, Math.floor(values.length * p))
     ] || 0;
   const report = {
+    ...qaSource(),
     label,
     date: new Date().toISOString(),
     toolCalls: count,

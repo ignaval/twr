@@ -16,7 +16,44 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
+import { qaSource } from "../../scripts/qa-source.mjs";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const requestedRuntime = process.env.TWR_IOS_RUNTIME?.trim() || "27.1";
+const { runtimes } = JSON.parse(
+  execFileSync("xcrun", ["simctl", "list", "runtimes", "--json"], {
+    encoding: "utf8",
+  }),
+);
+const iosRuntimes = runtimes.filter((runtime) =>
+  runtime.identifier.startsWith("com.apple.CoreSimulator.SimRuntime.iOS-"),
+);
+const runtimeDescription = (runtime) => ({
+  name: runtime.name,
+  version: runtime.version,
+  build: runtime.buildversion,
+  identifier: runtime.identifier,
+  available: runtime.isAvailable === true,
+});
+console.log(
+  "IOS_SIMULATOR_RUNTIMES",
+  JSON.stringify(iosRuntimes.map(runtimeDescription)),
+);
+const matchingRuntimes = iosRuntimes.filter(
+  (runtime) =>
+    runtime.isAvailable === true &&
+    (runtime.identifier === requestedRuntime ||
+      runtime.version === requestedRuntime),
+);
+assert.equal(
+  matchingRuntimes.length,
+  1,
+  `Requested iOS Simulator runtime '${requestedRuntime}' must identify exactly one installed, available runtime. Install it in Xcode Settings > Components, or explicitly set TWR_IOS_RUNTIME to an installed iOS runtime identifier/version. Inspect: xcrun simctl list runtimes --json. No alternate runtime will be selected.`,
+);
+const selectedRuntime = matchingRuntimes[0];
+console.log(
+  "IOS_SIMULATOR_RUNTIME_SELECTED",
+  JSON.stringify(runtimeDescription(selectedRuntime)),
+);
 const devices = JSON.parse(
   execFileSync("xcrun", ["simctl", "list", "devices", "available", "--json"], {
     encoding: "utf8",
@@ -26,15 +63,25 @@ const available = Object.entries(devices.devices).flatMap(([runtime, list]) =>
   list.map((device) => ({ ...device, runtime })),
 );
 
+// Prefer templates already on the requested runtime, but a device type from
+// another installed runtime can seed a disposable device on this exact runtime.
+const templates = [
+  ...available.filter(
+    (device) => device.runtime === selectedRuntime.identifier,
+  ),
+  ...available.filter(
+    (device) => device.runtime !== selectedRuntime.identifier,
+  ),
+];
 const targets = [
-  available.find((d) => d.name.includes("iPhone") && !d.name.includes("Duo")),
-  available.find((d) => d.name.includes("Duo")),
-  available.find((d) => d.name.includes("iPad")),
+  templates.find((d) => d.name.includes("iPhone") && !d.name.includes("Duo")),
+  templates.find((d) => d.name.includes("Duo")),
+  templates.find((d) => d.name.includes("iPad")),
 ].filter(Boolean);
 assert(
   targets.some((d) => d.name.includes("Duo")) &&
     targets.some((d) => d.name.includes("iPhone") && !d.name.includes("Duo")),
-  "Install iPhone and iOS 27.1 iPhone Duo Simulator runtimes",
+  "Install Simulator device templates for iPhone and iPhone Duo; their requested runtime is configured separately by TWR_IOS_RUNTIME",
 );
 const bin = resolve("../target/debug");
 const execFileAsync = promisify(execFile);
@@ -49,9 +96,14 @@ const selected = targets.filter(
         ? "tablet"
         : "phone") === kind,
 );
+assert(
+  selected.length > 0,
+  `No Simulator device template matches TWR_IOS_KIND=${kind || "all"}`,
+);
 for (const [index, template] of selected.entries()) {
   const device = {
     ...template,
+    runtime: selectedRuntime.identifier,
     udid: execFileSync(
       "xcrun",
       [
@@ -59,11 +111,21 @@ for (const [index, template] of selected.entries()) {
         "create",
         `twr QA ${template.name}`,
         template.deviceTypeIdentifier,
-        template.runtime,
+        selectedRuntime.identifier,
       ],
       { encoding: "utf8" },
     ).trim(),
   };
+  console.log(
+    "IOS_SIMULATOR_DEVICE",
+    JSON.stringify({
+      name: device.name,
+      udid: device.udid,
+      deviceTypeIdentifier: device.deviceTypeIdentifier,
+      templateRuntime: template.runtime,
+      runtime: runtimeDescription(selectedRuntime),
+    }),
+  );
   const fixture = mkdtempSync(join(tmpdir(), "twr-ios-"));
   const screenshot = `test-results/ios/${kind || "all"}-${index}-screen.png`;
   const performanceLabel = device.name.includes("Duo")
@@ -83,11 +145,33 @@ for (const [index, template] of selected.entries()) {
       const started = Date.now();
       const remaining = deadline - started;
       assert(remaining > 0, `Simulator ${pose} pose exceeded its time budget`);
-      const result = await execFileAsync(
-        "xcrun",
-        ["simctl", "spawn", device.udid, foldHelper, ...args],
-        { timeout: Math.min(120000, remaining) },
-      );
+      const timeoutMs = Math.min(120000, remaining);
+      let result;
+      try {
+        result = await execFileAsync(
+          "xcrun",
+          ["simctl", "spawn", device.udid, foldHelper, ...args],
+          { timeout: timeoutMs },
+        );
+      } catch (error) {
+        // This helper prints only Simulator angle/pose diagnostics, never hub
+        // requests or credentials. Bound output while preserving failure details.
+        console.error(
+          "FOLD_HELPER_FAILED",
+          JSON.stringify({
+            pose,
+            command: args[0],
+            elapsedMs: Date.now() - started,
+            timeoutMs,
+            code: error.code ?? null,
+            signal: error.signal ?? null,
+            killed: error.killed ?? null,
+            stdout: String(error.stdout || "").slice(-4096),
+            stderr: String(error.stderr || "").slice(-4096),
+          }),
+        );
+        throw error;
+      }
       console.log(
         "FOLD_HELPER",
         JSON.stringify({
@@ -394,6 +478,7 @@ for (const [index, template] of selected.entries()) {
         req.on("end", () => {
           const report = {
             ...JSON.parse(body),
+            ...qaSource(),
             label: performanceLabel,
             simulatorDevice: device.name,
             simulatorRuntime: device.runtime,

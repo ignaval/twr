@@ -439,6 +439,8 @@ try {
     0,
     "Ctrl-K must remain a terminal editing key",
   );
+  // dash may retain Ctrl-K literally; clear the line with the POSIX kill key.
+  await keyboard.press("Control+u");
   await keyboard.pressSequentially("printf 'ELECTRON_TERMINAL_UI_OK\\n'", {
     delay: 1,
   });
