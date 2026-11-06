@@ -180,3 +180,7 @@ bundled engine and native terminal. `package:mac` produces an ad hoc signed loca
 installer. For Developer ID signing and notarization, use `npm run package -- --mac --arm64`
 with the release environment’s signing credentials; that path retains hardened runtime. The CI workflow uploads review
 artifacts and does not publish or install them automatically.
+Review builds select the ad hoc identity in pull-request CI. Before uploading the
+installer, CI verifies the complete app signature and checks that it is ad hoc,
+with no signing team. These signatures require no Apple account; Developer ID
+signing and notarization remain the distribution path for public releases.
