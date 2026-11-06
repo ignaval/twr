@@ -1,0 +1,72 @@
+import { describe, expect, it, vi } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { MessageBody } from "../shared/MessageBody";
+
+vi.mock("../shared/host", () => ({
+  useHostAPI: () => ({
+    openExternal: async () => {},
+    copyText: async () => {},
+  }),
+}));
+const render = (
+  text: string,
+  options: { clamp?: boolean; mono?: boolean } = {},
+) => renderToStaticMarkup(createElement(MessageBody, { text, ...options }));
+
+describe("long message rendering", () => {
+  it("does not parse or mount a large hidden Markdown checklist while collapsed", () => {
+    const source = Array.from(
+      { length: 4000 },
+      (_, n) =>
+        `- Case ${n + 1}: Verify **pagination** and stable keyboard focus.`,
+    ).join("\n");
+    const html = render(source);
+    expect(html.match(/<li>/g)).toHaveLength(12);
+    expect(html.length).toBeLessThan(5000);
+    expect(html).toContain("Case 1:");
+    expect(html).not.toContain("Case 4000:");
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain("Show full message");
+  });
+  it("leaves complete non-collapsible assistant Markdown intact", () => {
+    const source =
+      Array.from(
+        { length: 40 },
+        (_, n) => `- Item ${n + 1}: **complete**`,
+      ).join("\n") + "\n\nFinal paragraph 😀";
+    const html = render(source, { clamp: false });
+    expect(html.match(/<li>/g)).toHaveLength(40);
+    expect(html).toContain("Item 40:");
+    expect(html).toContain("Final paragraph 😀");
+    expect(html).not.toContain("message-expand");
+  });
+  it("does not split a Unicode character at the preview boundary", () => {
+    const source = "a".repeat(1599) + "😀" + "z".repeat(2000);
+    const html = render(source);
+    expect(html).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(html).not.toContain("\uFFFD");
+    expect(html).toContain("Show full message");
+    expect(render(source, { clamp: false })).toContain("😀");
+  });
+  it("bounds long tool text and escapes its markup", () => {
+    const html = render("<script>not executable</script>".repeat(500), {
+      mono: true,
+    });
+    expect(html.length).toBeLessThan(5000);
+    expect(html).toContain("&lt;script&gt;");
+    expect(html).not.toContain("<script>");
+    expect(html).toContain('aria-expanded="false"');
+  });
+  it("renders an unfinished preview code fence as a complete safe code block", () => {
+    const source =
+      "```ts\n" +
+      Array.from({ length: 40 }, () => 'const value = "<script>";').join("\n") +
+      "\n```";
+    const html = render(source);
+    expect(html).toContain('class="language-ts"');
+    expect(html).toContain("&lt;script&gt;");
+    expect(html).toContain("</code></pre>");
+    expect(html).not.toContain("<script>");
+  });
+});

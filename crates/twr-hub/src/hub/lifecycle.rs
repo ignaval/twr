@@ -986,6 +986,9 @@ impl Core {
         self.settle_attaches(inner, running_attaches)?;
         self.react_to_failures_at_open(inner)?;
         mark("failures reacted to");
+        // Older versions paused queues on a compaction question. Retire every such card,
+        // including cards of blocked/parked threads, before the recovered queues continue.
+        self.retire_idle_offers(inner, None);
         for thread in self.store.threads_with_pending()? {
             self.try_dispatch(inner, &thread)?;
         }

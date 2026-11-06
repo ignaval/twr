@@ -1,6 +1,6 @@
 //! A worker whose prompt cache expired with a large context (`[threads] idle_compaction`,
-//! `hub::idle_compact`): the offer on the hub's thread before a message of the user's or the
-//! orchestrator's goes to it, its answers, the cases it is not made in, and the compaction the
+//! `hub::idle_compact`): automatic compaction before a user/orchestrator message, the cases
+//! it does not apply, old offer cards recovered without a question, and the compaction the
 //! hub starts itself before the cache expires under `before_expiry`. The fake runtime stands
 //! in for Claude Code: `!context n` reports a context of `n` tokens, `!cache <ttl> <ago>` a
 //! prompt cache written `ago` seconds ago that lives `ttl` seconds, and
@@ -13,9 +13,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::time::timeout;
 use twr_adapters::fake::FakeAdapter;
-use twr_core::adapter::{
-    Adapter, AdapterCmd, AdapterHandle, AdapterInfo, Answer, SpawnConfig, Tier,
-};
+use twr_core::adapter::{Adapter, AdapterCmd, AdapterHandle, AdapterInfo, SpawnConfig, Tier};
 use twr_core::config::{Config, IdleCompaction};
 use twr_core::event::*;
 use twr_core::proto::codes;
@@ -28,8 +26,7 @@ const WAIT: Duration = Duration::from_secs(10);
 const EXPIRED: &str = "!context 250000\n!cache 3600 3700\nwarm up";
 
 /// Runtimes: `fakec` (compacts on request), `fake` (cannot), `failc` (its compactions fail;
-/// each prompt's turn reports a large context and an hour-long cache that expires in 200 s),
-/// `fresh` (a new session at every start, each turn a large context whose cache expired).
+/// each prompt's turn reports a large context and an hour-long cache that expires in 200 s).
 fn opts(dir: &Path, mode: IdleCompaction) -> HubOptions {
     let mut config = Config::default();
     config.threads.idle_compaction = mode;
@@ -39,7 +36,7 @@ fn opts(dir: &Path, mode: IdleCompaction) -> HubOptions {
             "fake" => Some(Arc::new(FakeAdapter::new())),
             "fakec" => Some(Arc::new(FakeAdapter::new().with_compaction())),
             "failc" => Some(Arc::new(FailingCompaction)),
-            "fresh" => Some(Arc::new(FreshSessions)),
+            "crashc" => Some(Arc::new(CrashingCompaction)),
             _ => None,
         }
     });
@@ -117,43 +114,6 @@ fn offers(hub: &Hub) -> Vec<Value> {
         .collect()
 }
 
-/// Waits for the one open offer card; returns it.
-async fn offer(hub: &Hub) -> Value {
-    timeout(WAIT, async {
-        loop {
-            if let [card] = offers(hub).as_slice() {
-                return card.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("an offer card")
-}
-
-/// Waits until no offer card is open.
-async fn no_offer(hub: &Hub) {
-    timeout(WAIT, async {
-        while !offers(hub).is_empty() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the offer card closed");
-}
-
-/// The `attention.raised` of `attn_id`.
-fn raised(hub: &Hub, attn_id: &str) -> AttentionRaised {
-    let (items, _) = hub.control_read(0, 100_000).unwrap();
-    items
-        .iter()
-        .find_map(|(_, e)| match &e.body {
-            EventBody::AttentionRaised(p) if p.attn_id == attn_id => Some(p.clone()),
-            _ => None,
-        })
-        .expect("the card's event")
-}
-
 /// The `attention.resolved` events of `attn_id`, with their source.
 fn resolutions(hub: &Hub, attn_id: &str) -> Vec<(Source, AttentionResolved)> {
     let (items, _) = hub.control_read(0, 100_000).unwrap();
@@ -166,15 +126,6 @@ fn resolutions(hub: &Hub, attn_id: &str) -> Vec<(Source, AttentionResolved)> {
             _ => None,
         })
         .collect()
-}
-
-fn attn(card: &Value) -> String {
-    card["attn_id"].as_str().unwrap().to_string()
-}
-
-fn answer(hub: &Hub, card: &Value, decision: &str, caller: &Caller) -> Result<Event, String> {
-    hub.respond_by(&attn(card), Answer::new(decision), caller)
-        .map_err(|e| format!("{}: {}", e.code, e.message))
 }
 
 /// The `turn.started` of `thread`'s turn `n`, with its source.
@@ -210,144 +161,72 @@ async fn warmed(
     (t, sub)
 }
 
-/// A message of the user's to a worker whose hour-long cache of a 250k-token context expired
-/// waits on a card on the hub's thread, which says what it is about and quotes nothing of the
-/// worker's. The thread says when its cache expires. The orchestrator's answer is refused, an
-/// answer that is no option too; the user's `Compact first` runs a compaction (the user's,
-/// `compact_by: offer`) before the held message, which then goes.
+/// Both user and orchestrator messages resume without a question, with maintenance first.
+/// `before_expiry` has the same behavior when the cache has already expired.
 #[tokio::test]
-async fn compact_first_runs_a_compaction_before_the_held_message() {
-    let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
-    let j = hub.get_thread(&t).unwrap();
-    assert_eq!(j["cache_ttl_s"], 3600);
-    let expires: chrono::DateTime<chrono::Utc> =
-        serde_json::from_value(j["cache_expires_at"].clone()).unwrap();
-    assert!(expires < chrono::Utc::now());
-    assert!(j.get("idle_compaction_off").is_none());
-    send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    assert_eq!(
-        card["options"],
-        serde_json::json!([COMPACT_FIRST, SEND_AS_IS, "Don't ask for api"])
-    );
-    let summary = card["summary"].as_str().unwrap();
-    assert!(
-        summary.starts_with("api: its context (250k tokens) is no longer cached (idle 1h 1m; the cache expired 1m ago)"),
-        "{summary}"
-    );
-    assert!(!summary.contains("warm up"), "{summary}");
-    let p = raised(&hub, &attn(&card));
-    let o = &p.ext.as_ref().unwrap()["twr"]["idle_offer"];
-    assert_eq!(o["thread"], t.as_str());
-    assert_eq!(o["tokens"], 250_000);
-    assert!(
-        o["session"].is_string() && o["expires_at"].is_string(),
-        "{o}"
-    );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(hub.thread_view(&t).unwrap().turns, 1, "held");
-    let e = answer(&hub, &card, COMPACT_FIRST, &Caller::Orchestrator).unwrap_err();
-    assert!(e.starts_with(codes::RELAY_FORBIDDEN), "{e}");
-    let e = answer(&hub, &card, "maybe", &user()).unwrap_err();
-    assert!(
-        e.starts_with(codes::BAD_REQUEST) && e.contains(SEND_AS_IS),
-        "{e}"
-    );
-    assert_eq!(offers(&hub).len(), 1, "still open");
-    answer(&hub, &card, COMPACT_FIRST, &user()).unwrap();
-    until(&mut sub, ended_turn(3)).await;
-    let (source, two) = started(&hub, &t, 2);
-    assert!(is_compact_turn(&two), "{two:?}");
-    assert_eq!(source, Source::User("test".into()));
-    assert_eq!(compact_by(&two).as_deref(), Some("offer"));
-    assert_eq!(started(&hub, &t, 3).1.prompt, "next");
-    let r = resolutions(&hub, &attn(&card));
-    assert_eq!(r.len(), 1);
-    assert_eq!(r[0].1.by, ResolvedBy::User);
-    assert!(offers(&hub).is_empty());
-    // Compacted: a small context, the cache forgotten; the next message goes.
-    send(&hub, &t, "after");
-    until(&mut sub, ended_turn(4)).await;
-    assert!(offers(&hub).is_empty());
-    hub.shutdown().await;
+async fn expired_cache_compacts_and_continues_without_asking() {
+    for mode in [IdleCompaction::AfterExpiry, IdleCompaction::BeforeExpiry] {
+        for caller in [user(), Caller::Orchestrator] {
+            let dir = tempfile::tempdir().unwrap();
+            let hub = open(dir.path(), mode).await;
+            let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
+            hub.send_by(&t, "next", &caller).unwrap();
+            send(&hub, &t, "then this");
+            until(&mut sub, ended_turn(4)).await;
+            let (source, two) = started(&hub, &t, 2);
+            assert!(is_compact_turn(&two));
+            assert_eq!(source, Source::Hub);
+            assert_eq!(compact_by(&two).as_deref(), Some("expired"));
+            assert_eq!(started(&hub, &t, 3).1.prompt, "next");
+            assert_eq!(started(&hub, &t, 3).0, caller.source());
+            assert_eq!(started(&hub, &t, 4).1.prompt, "then this");
+            assert!(offers(&hub).is_empty());
+            let (events, _) = hub.control_read(0, 100_000).unwrap();
+            assert!(!events.iter().any(|(_, e)| matches!(&e.body,
+                EventBody::AttentionRaised(a) if a.ext.as_ref().is_some_and(|x| x["twr"].get("idle_offer").is_some()))));
+            hub.shutdown().await;
+        }
+    }
 }
 
-/// The orchestrator's message is held too; `Send as is` lets it go, and a later message to the
-/// same cache gets no second card.
+/// Existing per-thread opt-outs still work, and can be re-enabled without compacting now.
 #[tokio::test]
-async fn send_as_is_lets_the_held_message_go_and_offers_no_more() {
+async fn per_thread_compaction_can_be_disabled_and_enabled() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
+    let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
     let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
-    hub.send_by(&t, "from the orchestrator", &Caller::Orchestrator)
-        .unwrap();
-    let card = offer(&hub).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(hub.thread_view(&t).unwrap().turns, 1, "held");
-    answer(&hub, &card, SEND_AS_IS, &user()).unwrap();
-    until(&mut sub, ended_turn(2)).await;
-    let (_, two) = started(&hub, &t, 2);
-    assert_eq!(two.prompt, "from the orchestrator");
-    send(&hub, &t, "again");
-    until(&mut sub, ended_turn(3)).await;
-    assert!(offers(&hub).is_empty(), "not asked again");
-    hub.shutdown().await;
-}
-
-/// `Don't ask for <name>` lets the message go and turns the thread's offers off (recorded,
-/// the user's): later messages to an expired cache are not held. `thread.compact {offers:
-/// "on"}` (the user's only) turns them back on.
-#[tokio::test]
-async fn dont_ask_turns_the_threads_offers_off_until_turned_on() {
-    let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
+    hub.compact_offers(&t, "off", &user()).unwrap();
     send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    answer(&hub, &card, "don't ask for API", &user()).unwrap();
     until(&mut sub, ended_turn(2)).await;
+    assert!(!is_compact_turn(&started(&hub, &t, 2).1));
     assert!(hub.thread_view(&t).unwrap().idle_compaction_off);
-    assert_eq!(hub.get_thread(&t).unwrap()["idle_compaction_off"], true);
-    let (_, evs) = hub.thread_events(&t, 0, 100_000).unwrap();
-    let update = evs
-        .iter()
-        .find(|e| {
-            matches!(&e.body, EventBody::ConversationUpdate(p)
-            if p.ext.as_ref().is_some_and(|x| x["twr"]["idle_compaction"] == "off"))
-        })
-        .expect("the offers turned off");
-    assert_eq!(update.source, Source::User("test".into()));
-    // Another expired cache: not held.
-    send(&hub, &t, "!context 250000\n!cache 3600 4000\nmore");
-    until(&mut sub, ended_turn(3)).await;
+    assert_eq!(
+        hub.compact_offers(&t, "on", &Caller::Orchestrator)
+            .unwrap_err()
+            .code,
+        codes::UNAUTHORIZED
+    );
+    assert_eq!(
+        hub.compact_offers(&t, "maybe", &user()).unwrap_err().code,
+        codes::BAD_REQUEST
+    );
+    hub.compact_offers(&t, "on", &user()).unwrap();
+    assert_eq!(hub.thread_view(&t).unwrap().turns, 2);
     send(&hub, &t, "again");
     until(&mut sub, ended_turn(4)).await;
+    assert!(is_compact_turn(&started(&hub, &t, 3).1));
+    assert_eq!(started(&hub, &t, 4).1.prompt, "again");
     assert!(offers(&hub).is_empty());
-    let e = hub
-        .compact_offers(&t, "on", &Caller::Orchestrator)
-        .unwrap_err();
-    assert_eq!(e.code, codes::UNAUTHORIZED);
-    let e = hub.compact_offers(&t, "maybe", &user()).unwrap_err();
-    assert_eq!(e.code, codes::BAD_REQUEST);
-    let r = hub.compact_offers(&t, "on", &user()).unwrap();
-    assert_eq!(r["offers"], "on");
-    assert_eq!(r["thread_name"], "api");
-    assert!(!hub.thread_view(&t).unwrap().idle_compaction_off);
-    assert_eq!(hub.thread_view(&t).unwrap().turns, 4, "nothing compacted");
-    send(&hub, &t, "and again");
-    offer(&hub).await;
     hub.shutdown().await;
 }
 
-/// No offer: for a prompt of the hub's, a context under 200k tokens, a cache not expired, a
+/// No automatic compaction: for a prompt of the hub's, a context under 200k tokens, a cache not expired, a
 /// context not known, a runtime that cannot compact, mode `off`, and a thread whose offers
 /// are off. Each message goes at once.
 #[tokio::test]
 async fn no_offer_where_it_does_not_apply() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
+    let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
     let cases = [
         ("hubsent", "fakec", EXPIRED),
         (
@@ -377,6 +256,7 @@ async fn no_offer_where_it_does_not_apply() {
         }
         until(&mut sub, ended_turn(2)).await;
         assert!(offers(&hub).is_empty(), "{name}");
+        assert!(!is_compact_turn(&started(&hub, &t, 2).1), "{name}");
     }
     hub.shutdown().await;
     // Mode `off`: none for anyone.
@@ -389,210 +269,302 @@ async fn no_offer_where_it_does_not_apply() {
     hub.shutdown().await;
 }
 
-/// An open card outlives a hub restart: it is still tracked (answering it works) and the
-/// message is still held.
+/// The orchestrator's own conversation is excluded even when it reports an expired cache.
 #[tokio::test]
-async fn an_open_offer_and_its_held_message_survive_a_restart() {
+async fn the_orchestrator_thread_never_auto_compacts_after_expiry() {
     let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
-    send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    hub.shutdown().await;
-    drop((sub, hub));
-    let hub = timeout(WAIT, async {
-        loop {
-            match Hub::open(opts(dir.path(), IdleCompaction::Ask)).await {
-                Ok(h) => return h,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
+    let mut o = opts(dir.path(), IdleCompaction::AfterExpiry);
+    o.config.orchestrator.runtime = Some("claude-code".into());
+    o.config.orchestrator.cwd = Some(dir.path().to_path_buf());
+    let fallback = o.adapters.clone();
+    o.adapters = Arc::new(move |name: &str| -> Option<Arc<dyn Adapter>> {
+        if name == "claude-code" {
+            Some(Arc::new(FakeAdapter::new().with_compaction()))
+        } else {
+            fallback(name)
         }
-    })
-    .await
-    .expect("reopening the hub");
+    });
+    o.claude_policy = twr_adapters::claude_code::guard::PolicySources {
+        managed_dir: Some(dir.path().join("managed")),
+        config_dir: Some(dir.path().join("claude-config")),
+    };
+    let hub = Hub::open(o).await.unwrap();
+    hub.say_to_orchestrator(EXPIRED, None, &user()).unwrap();
+    let t = hub.orchestrator_thread().unwrap();
     let mut sub = hub.subscribe_thread(&t, 0).unwrap();
-    assert_eq!(offers(&hub), vec![card.clone()]);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(hub.thread_view(&t).unwrap().turns, 1, "still held");
-    let e = answer(&hub, &card, SEND_AS_IS, &Caller::Orchestrator).unwrap_err();
-    assert!(e.starts_with(codes::RELAY_FORBIDDEN), "tracked: {e}");
-    answer(&hub, &card, SEND_AS_IS, &user()).unwrap();
+    until(&mut sub, ended_turn(1)).await;
+    assert!(hub.thread_view(&t).unwrap().is_orchestrator());
+    hub.say_to_orchestrator("next", None, &user()).unwrap();
     until(&mut sub, ended_turn(2)).await;
-    assert_eq!(started(&hub, &t, 2).1.prompt, "next");
-    hub.shutdown().await;
-}
-
-/// A card that stops applying while no runtime runs (after a hub restart, a move to another
-/// runtime) is closed when the move is recorded, and the held message goes to the new runtime.
-#[tokio::test]
-async fn a_move_with_no_runtime_closes_an_open_offer() {
-    let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
-    send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    hub.shutdown().await;
-    drop((sub, hub));
-    let hub = timeout(WAIT, async {
-        loop {
-            match Hub::open(opts(dir.path(), IdleCompaction::Ask)).await {
-                Ok(h) => return h,
-                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-            }
-        }
-    })
-    .await
-    .expect("reopening the hub");
-    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
-    assert_eq!(offers(&hub), vec![card.clone()]);
-    hub.set_runtime_model(&t, Some("fake"), None, None, &user())
-        .unwrap();
-    until(&mut sub, ended_turn(2)).await;
+    assert!(!is_compact_turn(&started(&hub, &t, 2).1));
     assert!(started(&hub, &t, 2).1.prompt.ends_with("next"));
-    no_offer(&hub).await;
-    let res = resolutions(&hub, &attn(&card));
-    assert_eq!(res.len(), 1);
-    assert_eq!(res[0].1.answer, None);
-    hub.shutdown().await;
-}
-
-/// The user's own `thread.compact` while a card holds a message answers it `Compact first`
-/// (recorded as theirs): the compaction (the user's ask, no `compact_by`) runs before the held
-/// message, not after it.
-#[tokio::test]
-async fn the_users_compact_answers_an_open_offer_and_runs_first() {
-    let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
-    send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    let r = hub.compact_thread(&t, &user()).unwrap();
-    assert_eq!(
-        (&r["state"], &r["turn"]),
-        (&Value::from("started"), &Value::from(2)),
-        "{r}"
-    );
-    until(&mut sub, ended_turn(3)).await;
-    let (source, two) = started(&hub, &t, 2);
-    assert!(is_compact_turn(&two), "{two:?}");
-    assert_eq!(source, Source::User("test".into()));
-    assert_eq!(compact_by(&two), None);
-    assert_eq!(started(&hub, &t, 3).1.prompt, "next");
-    let r = resolutions(&hub, &attn(&card));
-    assert_eq!(r.len(), 1);
-    assert_eq!(
-        (&r[0].0, r[0].1.by),
-        (&Source::User("test".into()), ResolvedBy::User)
-    );
-    assert_eq!(
-        r[0].1.answer.as_ref().map(|a| a.decision.as_str()),
-        Some(COMPACT_FIRST)
-    );
     assert!(offers(&hub).is_empty());
     hub.shutdown().await;
 }
 
-/// The user's `message.send_now` of the held message answers the card `Send as is` (recorded
-/// as theirs) and starts it; the orchestrator may not send now at all.
+/// Simulate an old hub's persisted card and queue. On startup the card closes and the
+/// queued messages continue automatically (or without compaction when disabled/stale).
 #[tokio::test]
-async fn send_now_of_the_held_message_answers_the_offer_send_as_is() {
-    let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
-    let m = send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    let e = hub.send_now(&t, m, &Caller::Orchestrator).unwrap_err();
-    assert_eq!(e.code, codes::UNAUTHORIZED);
-    assert_eq!(offers(&hub).len(), 1, "still open");
-    let r = hub.send_now(&t, m, &user()).unwrap();
-    assert_eq!(
-        (&r["sent_now"], &r["state"], &r["turn"]),
-        (&Value::from(true), &Value::from("started"), &Value::from(2)),
-        "{r}"
-    );
-    until(&mut sub, ended_turn(2)).await;
-    assert_eq!(started(&hub, &t, 2).1.prompt, "next");
-    let r = resolutions(&hub, &attn(&card));
-    assert_eq!(r.len(), 1);
-    assert_eq!(
-        (&r[0].0, r[0].1.by),
-        (&Source::User("test".into()), ResolvedBy::User)
-    );
-    assert_eq!(
-        r[0].1.answer.as_ref().map(|a| a.decision.as_str()),
-        Some(SEND_AS_IS)
-    );
-    assert!(offers(&hub).is_empty());
-    hub.shutdown().await;
-}
-
-/// A runtime restarted with no turn (a settings change) that reports another session: the
-/// card, about the previous session, is closed once that start is recorded, and the held
-/// message goes.
-#[tokio::test]
-async fn a_restart_onto_another_session_closes_an_open_offer() {
-    let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, mut sub) = warmed(&hub, dir.path(), "api", "fresh", "warm up").await;
-    let first = hub.thread_view(&t).unwrap().session_id.unwrap();
-    send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    hub.set_mode(&t, "plan", &user()).unwrap();
-    until(&mut sub, ended_turn(2)).await;
-    assert_eq!(started(&hub, &t, 2).1.prompt, "next");
-    assert_ne!(hub.thread_view(&t).unwrap().session_id.unwrap(), first);
-    no_offer(&hub).await;
-    let r = resolutions(&hub, &attn(&card));
-    assert_eq!(r.len(), 1);
-    assert_eq!(
-        (r[0].1.by, r[0].1.answer.clone()),
-        (ResolvedBy::Timeout, None)
-    );
-    hub.shutdown().await;
-}
-
-/// Taking the held message back closes the card (nothing of the user's is left to hold); so
-/// does deleting the thread.
-#[tokio::test]
-async fn withdrawing_the_message_or_deleting_the_thread_closes_the_offer() {
-    let dir = tempfile::tempdir().unwrap();
-    let hub = open(dir.path(), IdleCompaction::Ask).await;
-    let (t, _sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
-    let r = send(&hub, &t, "next");
-    let card = offer(&hub).await;
-    let w = hub.withdraw_message(&t, r, &user()).unwrap();
-    assert_eq!(w["withdrawn"], true);
-    no_offer(&hub).await;
-    let res = resolutions(&hub, &attn(&card));
-    assert_eq!(res.len(), 1);
-    assert_eq!(res[0].0, Source::Hub);
-    assert_eq!(res[0].1.answer, None);
-    assert_eq!(hub.thread_view(&t).unwrap().turns, 1);
-    // Another message: a card again; then the thread is deleted.
-    send(&hub, &t, "again");
-    let card = offer(&hub).await;
-    let d = hub
-        .delete_threads(std::slice::from_ref(&t), &user())
-        .await
+async fn legacy_offer_and_queue_resume_without_an_answer_after_restart() {
+    for case in ["due", "off", "stale", "empty", "retire_failure"] {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
+        let (t, sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
+        let view = hub.get_thread(&t).unwrap();
+        let card = new_id();
+        hub.append(
+            HUB_THREAD,
+            None,
+            Source::Hub,
+            EventBody::AttentionRaised(AttentionRaised {
+                attn_id: card.clone(),
+                reason: AttentionReason::Question,
+                options: vec![
+                    COMPACT_FIRST.into(),
+                    SEND_AS_IS.into(),
+                    "Don't ask for api".into(),
+                ],
+                ext: Some(
+                    serde_json::from_value(serde_json::json!({"twr": {"idle_offer": {
+                        "thread": t, "session": view["session_id"],
+                        "expires_at": view["cache_expires_at"], "tokens": 250_000
+                    }}}))
+                    .unwrap(),
+                ),
+                ..Default::default()
+            }),
+            None,
+        )
         .unwrap();
-    hub.respond_at(
-        d["attn_id"].as_str().unwrap(),
-        Answer::new("Delete"),
-        d["revision"].as_u64(),
-        &user(),
+        if case == "stale" {
+            hub.append(
+                &t,
+                Some(1),
+                Source::Adapter("fakec".into()),
+                EventBody::TurnEnded(TurnEnded {
+                    prompt_cache: Some(PromptCache {
+                        called_at: chrono::Utc::now(),
+                        ttl_s: Some(3600),
+                    }),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        }
+        hub.shutdown().await;
+        drop((sub, hub));
+        if case != "empty" {
+            let mut store = twr_hub::store::Store::open(&dir.path().join("data/twr.db")).unwrap();
+            let head = store.control_head().unwrap();
+            store
+                .enqueue_prompt(
+                    &t,
+                    "next",
+                    TurnFrom::User,
+                    None,
+                    &Source::User("test".into()),
+                    head,
+                )
+                .unwrap();
+        }
+        let db = rusqlite::Connection::open(dir.path().join("data/twr.db")).unwrap();
+        if case == "retire_failure" {
+            db.execute_batch(
+                "CREATE TRIGGER inject BEFORE INSERT ON events
+                WHEN NEW.kind = 'attention.resolved'
+                BEGIN SELECT RAISE(ABORT, 'injected retire failure'); END;",
+            )
+            .unwrap();
+        }
+        let hub = open(
+            dir.path(),
+            if case == "off" {
+                IdleCompaction::Off
+            } else {
+                IdleCompaction::AfterExpiry
+            },
+        )
+        .await;
+        let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+        if case == "empty" {
+            assert_eq!(hub.thread_view(&t).unwrap().turns, 1);
+        } else {
+            let last = if matches!(case, "due" | "retire_failure") {
+                3
+            } else {
+                2
+            };
+            until(&mut sub, ended_turn(last)).await;
+            assert_eq!(started(&hub, &t, last).1.prompt, "next", "{case}");
+            assert_eq!(
+                is_compact_turn(&started(&hub, &t, 2).1),
+                matches!(case, "due" | "retire_failure"),
+                "{case}"
+            );
+        }
+        if case == "retire_failure" {
+            // Even though the old card could not be closed, it did not hold the message.
+            // Once writes recover the next dispatch retires it normally.
+            db.execute_batch("DROP TRIGGER inject").unwrap();
+            send(&hub, &t, "cleanup");
+            until(&mut sub, ended_turn(4)).await;
+        }
+        assert!(offers(&hub).is_empty(), "{case}");
+        let res = resolutions(&hub, &card);
+        assert_eq!(res.len(), 1, "{case}");
+        assert_eq!(res[0].0, Source::Hub);
+        assert_eq!(res[0].1.by, ResolvedBy::Timeout);
+        assert_eq!(res[0].1.answer, None);
+        hub.shutdown().await;
+    }
+}
+
+/// A failed compaction does not loop on the same cache, and the original message still runs.
+#[tokio::test]
+async fn expired_cache_compaction_failure_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
+    let (t, mut sub) = warmed(&hub, dir.path(), "api", "failc", "go").await;
+    hub.append(
+        &t,
+        Some(1),
+        Source::Adapter("fakec".into()),
+        EventBody::TurnEnded(TurnEnded {
+            prompt_cache: Some(PromptCache {
+                called_at: chrono::Utc::now() - chrono::Duration::seconds(3700),
+                ttl_s: Some(3600),
+            }),
+            ..Default::default()
+        }),
+        None,
     )
     .unwrap();
-    timeout(WAIT, async {
-        while hub.thread_view(&t).is_ok() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    send(&hub, &t, "next");
+    until(&mut sub, ended_turn(3)).await;
+    assert_eq!(
+        compact_by(&started(&hub, &t, 2).1).as_deref(),
+        Some("expired")
+    );
+    assert_eq!(started(&hub, &t, 3).1.prompt, "next");
+    assert!(hub.attention_list(true).iter().any(|a| a["summary"]
+        .as_str()
+        .is_some_and(|s| s.contains("compacting its context failed"))));
+    assert!(offers(&hub).is_empty());
+    hub.shutdown().await;
+}
+
+/// A crash during automatic maintenance must not strand either sender's queued message.
+#[tokio::test]
+async fn a_crash_during_expired_compaction_continues_the_original_message() {
+    for caller in [user(), Caller::Orchestrator] {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
+        let (t, mut sub) = warmed(&hub, dir.path(), "api", "crashc", "warm up").await;
+        hub.send_by(&t, "next", &caller).unwrap();
+        until(&mut sub, ended_turn(3)).await;
+        assert!(is_compact_turn(&started(&hub, &t, 2).1));
+        assert_eq!(started(&hub, &t, 3).1.prompt, "next");
+        assert!(!hub.thread_queue(&t, &user()).unwrap()["held"]
+            .as_bool()
+            .unwrap());
+        assert!(offers(&hub).is_empty());
+        hub.shutdown().await;
+    }
+}
+
+/// An unrecorded automatic compaction belongs to its triggering message. Withdrawing it
+/// must not leave maintenance behind; explicit send-now must still mean send as-is.
+#[tokio::test]
+async fn failed_compaction_start_is_cancelled_on_withdraw_or_bypassed_by_send_now() {
+    for action in ["withdraw", "send_now"] {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
+        let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
+        let c = rusqlite::Connection::open(dir.path().join("data/twr.db")).unwrap();
+        c.execute_batch(
+            "CREATE TRIGGER inject BEFORE INSERT ON events
+            WHEN NEW.kind = 'turn.started' AND NEW.data LIKE '%\"compact\":true%'
+            BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        )
+        .unwrap();
+        let message = send(&hub, &t, "next");
+        assert_eq!(hub.thread_view(&t).unwrap().turns, 1);
+        c.execute_batch("DROP TRIGGER inject").unwrap();
+        if action == "withdraw" {
+            assert_eq!(
+                hub.withdraw_message(&t, message, &user()).unwrap()["withdrawn"],
+                true
+            );
+            assert_eq!(
+                hub.thread_view(&t).unwrap().turns,
+                1,
+                "no orphaned compaction"
+            );
+            // No waiver was recorded for an attempt that never started: a later message
+            // still compacts first.
+            send(&hub, &t, "replacement");
+            until(&mut sub, ended_turn(3)).await;
+            assert!(is_compact_turn(&started(&hub, &t, 2).1));
+            assert_eq!(started(&hub, &t, 3).1.prompt, "replacement");
+        } else {
+            let r = hub.send_now(&t, message, &user()).unwrap();
+            assert_eq!(r["state"], "started", "{r}");
+            until(&mut sub, ended_turn(2)).await;
+            assert_eq!(started(&hub, &t, 2).1.prompt, "next");
+            assert!(!is_compact_turn(&started(&hub, &t, 2).1));
         }
-    })
-    .await
-    .expect("deleted");
-    no_offer(&hub).await;
-    let res = resolutions(&hub, &attn(&card));
-    assert_eq!(res.len(), 1);
-    assert_eq!(res[0].1.by, ResolvedBy::ThreadStopped);
+        assert!(offers(&hub).is_empty());
+        hub.shutdown().await;
+    }
+}
+
+/// Already requested manual maintenance wins over automatic compaction, with no duplicate.
+#[tokio::test]
+async fn a_manual_compaction_already_queued_runs_only_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
+    let (t, mut sub) = warmed(
+        &hub,
+        dir.path(),
+        "api",
+        "fakec",
+        "!context 250000\n!cache 3600 0\nwarm up",
+    )
+    .await;
+    send(
+        &hub,
+        &t,
+        "!context 250000\n!cache 3600 3700\n!sleep 300\nwork",
+    );
+    assert_eq!(hub.compact_thread(&t, &user()).unwrap()["state"], "queued");
+    assert_eq!(hub.compact_thread(&t, &user()).unwrap()["already"], true);
+    send(&hub, &t, "next");
+    until(&mut sub, ended_turn(4)).await;
+    assert!(is_compact_turn(&started(&hub, &t, 3).1));
+    assert_eq!(compact_by(&started(&hub, &t, 3).1), None);
+    assert_eq!(started(&hub, &t, 4).1.prompt, "next");
+    hub.shutdown().await;
+}
+
+/// A hub prompt ahead of a user message refreshes the cache without unnecessary maintenance.
+#[tokio::test]
+async fn a_hub_prompt_refreshes_the_cache_before_a_queued_user_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
+    let (t, mut sub) = warmed(&hub, dir.path(), "api", "fakec", EXPIRED).await;
+    hub.send(
+        &t,
+        "!context 250000\n!cache 3600 0\n!sleep 300\nwake",
+        TurnFrom::Runtime,
+        Source::Hub,
+    )
+    .unwrap();
+    send(&hub, &t, "next");
+    until(&mut sub, ended_turn(3)).await;
+    assert!(!is_compact_turn(&started(&hub, &t, 2).1));
+    assert_eq!(started(&hub, &t, 3).1.prompt, "next");
+    assert!(offers(&hub).is_empty());
     hub.shutdown().await;
 }
 
@@ -654,12 +626,12 @@ async fn before_expiry_compacts_an_idle_worker_once() {
     hub.shutdown().await;
 }
 
-/// Mode `ask` compacts nothing on its own; and under `before_expiry`, a compaction that failed
+/// Mode `after_expiry` does not compact before expiry; and under `before_expiry`, a compaction that failed
 /// is not tried again at every tick.
 #[tokio::test]
-async fn no_compaction_before_expiry_under_ask_nor_again_after_a_failure() {
+async fn no_compaction_before_expiry_under_after_expiry_nor_again_after_a_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let mut o = opts(dir.path(), IdleCompaction::Ask);
+    let mut o = opts(dir.path(), IdleCompaction::AfterExpiry);
     o.idle_compaction_tick = Some(Duration::from_millis(100));
     let hub = Hub::open(o).await.unwrap();
     let soon = "!context 250000\n!cache 3600 3400\nwarm up";
@@ -700,7 +672,7 @@ fn before_expiry_waits_for_the_startup_recovery() {
     let t = {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let t = rt.block_on(async {
-            let hub = open(dir.path(), IdleCompaction::Ask).await;
+            let hub = open(dir.path(), IdleCompaction::AfterExpiry).await;
             warmed(&hub, dir.path(), "api", "fakec", soon).await.0
         });
         // The hub dies without stopping anything.
@@ -810,33 +782,26 @@ impl Adapter for FailingCompaction {
     }
 }
 
-/// Runtime `fresh`: every start is a new session (`fresh-<n>`, whatever it was asked to
-/// resume); each prompt's turn ends at once with a context of 250 000 tokens and an hour-long
-/// prompt cache written 3700 s ago (expired); a compaction ends its turn at once.
-struct FreshSessions;
+/// Reports an expired cache for work, but exits abnormally when asked to compact.
+struct CrashingCompaction;
 
-static FRESH_STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-impl Adapter for FreshSessions {
+impl Adapter for CrashingCompaction {
     fn info(&self) -> AdapterInfo {
         AdapterInfo {
-            name: "fresh",
+            name: "crashc",
             tier: Tier::Headless,
-            description: "a new session at every start",
+            description: "crashes during compaction",
         }
     }
-
     fn compacts(&self) -> bool {
         true
     }
-
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let (h, mut end) = AdapterHandle::pair();
-        let n = FRESH_STARTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             end.emit(
                 EventBody::ThreadStarted(SessionPayload {
-                    session_id: Some(format!("fresh-{n}")),
+                    session_id: Some("s-crash".into()),
                     ..Default::default()
                 }),
                 None,
@@ -862,8 +827,9 @@ impl Adapter for FreshSessions {
                     AdapterCmd::Send { turn, .. } => {
                         end.emit(worked(), Some(turn));
                     }
-                    AdapterCmd::Compact { turn } => {
-                        end.emit(EventBody::TurnEnded(TurnEnded::default()), Some(turn));
+                    AdapterCmd::Compact { .. } => {
+                        end.exited(Some(1), "compaction crash");
+                        return;
                     }
                     AdapterCmd::Stop => break,
                     _ => {}

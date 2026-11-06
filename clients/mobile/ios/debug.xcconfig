@@ -1,0 +1,4 @@
+CAPACITOR_DEBUG = true
+
+// Optional paid-team push configuration; absent in local simulator builds.
+#include? "push.local.xcconfig"

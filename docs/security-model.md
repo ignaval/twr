@@ -12,7 +12,7 @@ For a repository you don't trust, use the runtime's own sandbox, or run the agen
 
 ## Who is the user on the hub's socket
 
-Every client (the TUI, the CLI, the orchestrator's MCP server, a script) talks to the hub over one Unix socket. The socket is mode 0600, so only your user can connect (twr creates a missing parent directory at 0700; a directory you name that already exists keeps its own permissions, within the limits in [The socket and the config file](#the-socket-and-the-config-file)). Within your user, the hub decides for each connection, when it opens, whether it comes from you, from the orchestrator or from an agent.
+Local clients (the TUI, CLI, desktop app, orchestrator's MCP server and scripts) talk to the hub over one Unix socket. Remote mobile clients reach a separate authenticated gateway, described below. The socket is mode 0600, so only your user can connect (twr creates a missing parent directory at 0700; a directory you name that already exists keeps its own permissions, within the limits in [The socket and the config file](#the-socket-and-the-config-file)). Within your user, the hub decides for each connection, when it opens, whether it comes from you, from the orchestrator or from an agent.
 
 ### Agents
 
@@ -42,13 +42,42 @@ A connection may hold at most 16 subscriptions (`control.subscribe`, `thread.sub
 
 The hub gives each orchestrator process a fresh token (32 random bytes), passed to its MCP server in a file only you can read and never on a command line or in the runtime's environment. A connection that presents it is the orchestrator, but only when its process descends from the current orchestrator runtime and is still the process that opened the connection; the hub walks the ancestry again at every request. A token presented by any other process, an agent's included, is refused. The orchestrator may call only its own list of methods, described next.
 
+## Graphical clients and paired devices
+
+The desktop app is another local hub client. Its renderer has no Node access; validated
+main-frame IPC reaches the Rust companion. Untrusted Markdown has no raw HTML or remote
+images. Embedded terminals run commands with your authority. Closing the client leaves
+the hub and its agents running.
+
+The optional mobile gateway adds a network trust boundary. Production connections require
+HTTPS/WSS with a certificate the device trusts. A local owner grants a short-lived,
+one-use pairing code and chooses device capabilities: read and operate, with terminal and
+admin access separately granted. A bearer credential is checked before WebSocket upgrade;
+the hub also validates the paired identity and method scope, so bypassing a hidden UI
+control grants nothing. Unknown methods are refused. Agents and the orchestrator cannot
+use device credentials to gain user authority, and devices cannot pair more devices.
+
+Capabilities are authority over twr, not OS isolation: operate can direct agents using the
+hub's configured modes; terminal permits host commands. Store credentials in the native
+Keychain/Keystore, not the web renderer. The companion receives them over stdin. The host
+keeps token hashes in owner-private device state and checks revocation during connections.
+Same-user processes that can alter this state remain outside the boundary, like other
+processes indistinguishable from you. Use OS isolation for untrusted agents.
+
+Remote approvals retain exact request revisions. Notification actions only open the item;
+push payloads contain routing metadata rather than prompts or request text. Uploads are
+size- and SHA-256-checked, avoid symlinks and commit atomically into private upload folders
+in local worktrees. Pending mutation receipts prevent duplicate execution across socket
+reconnects within their retention period. See [mobile.md](mobile.md) for limits, scopes,
+revocation, gateway lifecycle and the unsupported remote-box upload case.
+
 ## The orchestrator
 
 The orchestrator is the agent most exposed to text that you didn't write: it reads every worker's reports and replies. twr's guarantees about it don't depend on the model behaving. The hub enforces them.
 
 ### What it may do on its own
 
-Through its MCP tools it may start workers (in a configured project, a repository under `project_roots`, or any git repository by absolute path that isn't, and doesn't hold, your home folder, and doesn't hold and isn't inside twr's data directory, `TWR_HOME` or a credentials folder such as `~/.ssh` or `~/.config`), send them prompts, cancel prompts held with `--after`, stop, park, resume and rename them, change a worker's model, move a worker in `plan`, `read-only` or `dontAsk` to another runtime (any other move goes on a confirm card, since runtimes differ in what one mode lets through), write reports, annotate cards, set watches, and read and set a project's standing context (`.twr/context.md`, which goes into every later worker prompt for that project). New workers always start in `[threads] default_mode`, never a mode it picks, and only with a built-in runtime (Claude Code, Codex, Grok Build), a preset you configured, or the project's or default runtime: it never names a command line. It can't attach, stop the hub, switch itself to another runtime, run jobs, empty or restore the trash, trim, or compact a thread's context (`thread.compact`: a compaction loses detail the agent had, so only you ask for one, with `twr compact`, `/compact-context` or `Compact first` on the hub's offer when a worker's prompt cache has expired; agents can't either). It can't answer that offer or turn offers on or off. The hub compacts a context on its own only when you set `[threads] idle_compaction = "before_expiry"`: an idle worker's, just before an hour-long prompt cache expires ([runtimes.md](runtimes.md#the-prompt-cache)). A prompt of its whose first word is `/compact`, which Claude Code and Grok Build would run as the command, is refused too, however it is queued.
+Through its MCP tools it may start workers (in a configured project, a repository under `project_roots`, or any git repository by absolute path that isn't, and doesn't hold, your home folder, and doesn't hold and isn't inside twr's data directory, `TWR_HOME` or a credentials folder such as `~/.ssh` or `~/.config`), send them prompts, cancel prompts held with `--after`, stop, park, resume and rename them, change a worker's model, move a worker in `plan`, `read-only` or `dontAsk` to another runtime (any other move goes on a confirm card, since runtimes differ in what one mode lets through), write reports, annotate cards, set watches, and read and set a project's standing context (`.twr/context.md`, which goes into every later worker prompt for that project). New workers always start in `[threads] default_mode`, never a mode it picks, and only with a built-in runtime (Claude Code, Codex, Grok Build), a preset you configured, or the project's or default runtime: it never names a command line. It can't attach, stop the hub, switch itself to another runtime, run jobs, empty or restore the trash, trim, or compact a thread's context (`thread.compact`: only you request a manual compaction, with `twr compact` or `/compact-context`; agents can't either). It can't change the automatic compaction switch. By default the hub automatically compacts a local worker's large context before your next message or the orchestrator's when its prompt cache expired, then continues without asking. `[threads] idle_compaction = "before_expiry"` also compacts idle workers shortly before an hour-long cache expires; `"off"` or `twr compact <thread> --offers off` disables automatic compaction ([runtimes.md](runtimes.md#the-prompt-cache)). A prompt of its whose first word is `/compact`, which Claude Code and Grok Build would run as the command, is refused too, however it is queued.
 
 ### The relay rule
 

@@ -1,0 +1,4 @@
+# Native iOS QA uses the repository's Xcode 27 runner.
+self-hosted-runner:
+  labels:
+    - xcode-27

@@ -1,0 +1,16 @@
+/www/
+/android/.gradle/
+/android/.idea/
+/android/local.properties
+/android/**/build/
+/ios/App/App/public/
+/ios/App/Pods/
+/ios/App/DerivedData/
+**/google-services.json
+**/GoogleService-Info.plist
+*.keystore
+*.p12
+*.mobileprovision
+
+*.local.xcconfig
+/ios/App/build/

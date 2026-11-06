@@ -75,6 +75,18 @@ twr update                             # install the latest release over this tw
 
 `twr say` never answers a permission or question, because it can't tell which ones you had seen. Use `twr respond`, or the TUI. [docs/usage.md](docs/usage.md) walks through a session.
 
+## Desktop and mobile
+
+The [desktop client](docs/desktop.md) provides a graphical interface for Apple Silicon macOS
+and x86_64 Linux, including Omarchy/Arch packaging. It shares the hub with the CLI and includes
+embedded terminals for agent attach, account login and interactive commands. See its setup
+guide for building and running it from this repository.
+
+The [iOS and Android clients](docs/mobile.md) connect to remote hubs and reuse the same
+interface. The graphical clients live in `clients/`: `desktop/` owns the Electron shell,
+`mobile/` owns the native phone shells, and `shared/` owns the common React interface.
+There is one frontend dependency set and build package. Dark is the default appearance.
+
 ## Keys
 
 The TUI's big pane is your conversation with the orchestrator, and what you type always goes to it. The worker threads are cards beside it. To talk to one agent yourself, select its card and press `Enter` twice (or double-click it, or `/open <thread>`): the pane shows that thread and what you type goes straight to it until `Esc` brings you back. The pane's header and the input box's title say where a line goes, `ORCHESTRATOR` on cyan or `talking to <thread>` on magenta. A line that starts with `/` is a command, and a popup lists the matching ones as you type; a word that starts with `@` gets a popup of worker thread names.
@@ -147,6 +159,9 @@ Report a vulnerability privately, as [SECURITY.md](SECURITY.md) describes, not i
 - [Install](docs/install.md): installer, releases, platforms, building from source
 - [Usage](docs/usage.md): threads, answering cards, reports, attach, standing context
 - [TUI](docs/tui.md): views, keys and slash commands
+- [Desktop](docs/desktop.md): macOS and Linux graphical hub client
+- [Mobile](docs/mobile.md): iOS, Android, remote hubs and device access
+- [Application QA](docs/desktop-qa.md) and [performance audit](docs/performance.md)
 - [Configuration](docs/configuration.md): every key in `config.toml`
 - [Notifications](docs/notifications.md): a command the hub runs when something needs you: phone, desktop, Slack
 - [Runtimes](docs/runtimes.md): Claude Code, Codex, Grok Build, ACP agents, PTY

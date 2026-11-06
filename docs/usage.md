@@ -230,13 +230,13 @@ twr trim api          # delete its build output (target/, ...); it keeps working
 twr park api --keep   # stop it, keep the worktree
 twr resume api        # recreate the worktree at the same path, same session
 twr compact api       # compact its context, as its agent's own /compact does
-twr compact api --offers off   # no more offers to compact it once its prompt cache expired
+twr compact api --offers off   # disable automatic compaction once its prompt cache expired
 twr stop api          # stop the runtime and drop its queued prompts
 ```
 
 `twr compact` runs a compaction of the thread's context as a turn of its own, after the turn that runs and the messages queued before it (`/compact-context` in the TUI). Claude Code, Codex and Grok Build threads on this machine can; [runtimes.md](runtimes.md#context-compaction) says what each does on its own, how to tune it, and what twr shows of it.
 
-When a Claude Code worker's prompt cache has expired and its context is large, the hub holds the next message to it, yours or the orchestrator's, and asks you on a card whether to compact first (`[threads] idle_compaction`, [runtimes.md](runtimes.md#the-prompt-cache)). `twr compact <thread> --offers off` turns those offers off for that thread without compacting anything, as the card's `Don't ask for <thread>` does (with `before_expiry`, the hub's own compaction of it too), and `--offers on` turns them back on: `api: offers to compact its context once its prompt cache expired are off`. Only you can turn them on or off, and only you answer the card.
+When a Claude Code worker's prompt cache has expired and its context is large, the hub automatically compacts before delivering your next message or the orchestrator's, then continues without asking (`[threads] idle_compaction`, [runtimes.md](runtimes.md#the-prompt-cache)). `twr compact <thread> --offers off` disables automatic compaction for that thread without compacting anything (including compaction under `before_expiry`), and `--offers on` enables it again. Only you can change this switch.
 
 `park` refuses while a turn or background work runs, unless you pass `--force`. Prompts sent to a parked thread wait for `resume`. [worktrees.md](worktrees.md) has the rules for what parking removes.
 

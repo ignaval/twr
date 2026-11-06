@@ -95,10 +95,10 @@
 //! idle_trim_disposable = ["target/", "node_modules/"]
 //! worktree = true      # a twr-managed worktree per thread; false = work in the repo checkout
 //! env = { CARGO_INCREMENTAL = "0" }   # added to every worker thread's runtime environment
-//! # A worker's prompt cache expired with a large context: "ask" (default) before a message
-//! # goes to it whether to compact it first; "before_expiry" also compacts an idle one just
+//! # A worker's prompt cache expired with a large context: "after_expiry" (default) compacts
+//! # it automatically before the next message; "before_expiry" also compacts an idle one just
 //! # before an hour-long cache expires; "off": neither.
-//! idle_compaction = "ask"
+//! idle_compaction = "after_expiry"
 //!
 //! [trash]
 //! keep_days = 7        # deleted threads stay in the trash this long (`twr trash empty` sooner)
@@ -1496,7 +1496,7 @@ pub struct ThreadsConfig {
     /// scope: `4G`, `512M`, `20%`). systemd only. `None` (the default): no limit.
     pub memory_high: Option<String>,
     /// What the hub does about a worker whose prompt cache expires while its context is large
-    /// ([`IdleCompaction`]): ask before a message goes to it (the default), also compact it
+    /// ([`IdleCompaction`]): compact before a message goes to it (the default), also compact it
     /// itself just before the cache expires, or neither.
     pub idle_compaction: IdleCompaction,
 }
@@ -1508,12 +1508,13 @@ pub struct ThreadsConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleCompaction {
-    /// Before a message of the user's or the orchestrator's goes to such a worker, a card
-    /// asks the user whether to compact its context first.
+    /// Automatically compact before a message of the user's or the orchestrator's goes to
+    /// such a worker. The former `ask` spelling is accepted for existing configurations.
     #[default]
-    Ask,
-    /// As `Ask`, and the hub compacts an idle worker's context itself shortly before a cache
-    /// of an hour or more expires.
+    #[serde(alias = "ask")]
+    AfterExpiry,
+    /// As `AfterExpiry`, and the hub compacts an idle worker's context itself shortly before
+    /// a cache of an hour or more expires.
     BeforeExpiry,
     /// Neither.
     Off,
@@ -1522,15 +1523,15 @@ pub enum IdleCompaction {
 impl IdleCompaction {
     /// Every value, as `[threads] idle_compaction` spells it.
     pub const ALL: [IdleCompaction; 3] = [
-        IdleCompaction::Ask,
+        IdleCompaction::AfterExpiry,
         IdleCompaction::BeforeExpiry,
         IdleCompaction::Off,
     ];
 
-    /// The config spelling: `ask`, `before_expiry`, `off`.
+    /// The config spelling: `after_expiry`, `before_expiry`, `off`.
     pub fn as_str(self) -> &'static str {
         match self {
-            IdleCompaction::Ask => "ask",
+            IdleCompaction::AfterExpiry => "after_expiry",
             IdleCompaction::BeforeExpiry => "before_expiry",
             IdleCompaction::Off => "off",
         }
@@ -1697,7 +1698,7 @@ impl Default for ThreadsConfig {
             job_slots: 0,
             cpu_weight: None,
             memory_high: None,
-            idle_compaction: IdleCompaction::Ask,
+            idle_compaction: IdleCompaction::AfterExpiry,
         }
     }
 }
@@ -2686,20 +2687,24 @@ mod tests {
         assert!(c.tui.animate);
     }
 
-    /// `[threads] idle_compaction`: `ask` unless set; `before_expiry` and `off` read as such;
+    /// `[threads] idle_compaction`: `after_expiry` unless set (`ask` is a legacy alias);
+    /// `before_expiry` and `off` read as such;
     /// anything else is refused, naming the values it may be.
     #[test]
     fn threads_idle_compaction() {
         assert_eq!(
             Config::default().threads.idle_compaction,
-            IdleCompaction::Ask
+            IdleCompaction::AfterExpiry
         );
         let c = Config::from_toml_str("[threads]\nthinking = true\n").unwrap();
         assert_eq!(
             c.threads.idle_compaction,
-            IdleCompaction::Ask,
+            IdleCompaction::AfterExpiry,
             "the default"
         );
+        let legacy = Config::from_toml_str("[threads]\nidle_compaction = \"ask\"\n").unwrap();
+        assert_eq!(legacy.threads.idle_compaction, IdleCompaction::AfterExpiry);
+        assert_eq!(legacy.threads.idle_compaction.as_str(), "after_expiry");
         for v in IdleCompaction::ALL {
             let c = Config::from_toml_str(&format!(
                 "[threads]\nidle_compaction = \"{}\"\n",

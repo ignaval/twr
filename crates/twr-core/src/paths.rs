@@ -762,9 +762,50 @@ pub fn resolve_lenient(p: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Resolve a client project argument before sending it to a hub with another working directory.
+pub fn project_param_at(project: &str, base: &Path) -> String {
+    let path = Path::new(project);
+    if !path.is_absolute()
+        && !project.starts_with('~')
+        && (project.contains('/') || project == "." || project == "..")
+    {
+        return project_param(&base.join(path).to_string_lossy());
+    }
+    project_param(project)
+}
+
+pub fn project_param(project: &str) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = match (project.strip_prefix('~'), &home) {
+        (Some(rest), Some(h)) if rest.is_empty() || rest.starts_with('/') => {
+            h.join(rest.trim_start_matches('/'))
+        }
+        _ if project.contains('/') || project == "." || project == ".." => PathBuf::from(project),
+        _ => return project.to_string(),
+    };
+    match std::fs::canonicalize(&path) {
+        Ok(abs) => abs.to_string_lossy().into_owned(),
+        Err(_) => path.to_string_lossy().into_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn project_paths_use_the_explicit_base_but_configured_names_do_not() {
+        let base = tempfile::tempdir().unwrap();
+        std::fs::create_dir(base.path().join("repo")).unwrap();
+        let expected = std::fs::canonicalize(base.path().join("repo")).unwrap();
+        assert_eq!(
+            project_param_at("./repo", base.path()),
+            expected.to_string_lossy()
+        );
+        assert_eq!(
+            project_param_at("configured-project", base.path()),
+            "configured-project"
+        );
+    }
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {

@@ -9,6 +9,8 @@ repository.workspace = true
 description = "Core types for twr: events, reducers, attention stack, adapter trait, config and socket protocol"
 
 [dependencies]
+subtle = "2.6.1"
+uuid.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true

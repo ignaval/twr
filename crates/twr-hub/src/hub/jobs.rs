@@ -254,7 +254,17 @@ pub struct SlotPool {
 }
 
 /// Slots a job holds (their files, locked): released when dropped.
-pub struct Slots(#[allow(dead_code)] Vec<std::fs::File>);
+pub struct Slots(Vec<std::fs::File>);
+
+impl Drop for Slots {
+    fn drop(&mut self) {
+        // A child forked before these descriptors close shares their locks until
+        // exec. Release them explicitly so a finished job frees its slots now.
+        for file in &self.0 {
+            let _ = file.unlock();
+        }
+    }
+}
 
 impl SlotPool {
     /// `n` slots (at least 1) in `dir`.
@@ -279,9 +289,9 @@ impl SlotPool {
             twr_core::paths::ensure_private_dir(&self.dir).map_err(std::io::Error::other)?;
             self.private.store(true, Ordering::Relaxed);
         }
-        let mut held = Vec::new();
+        let mut held = Slots(Vec::new());
         for i in 0..self.n {
-            if held.len() == k {
+            if held.0.len() == k {
                 break;
             }
             // Not through a symbolic link, nor blocking on a FIFO, put at its name.
@@ -293,12 +303,12 @@ impl SlotPool {
                 .custom_flags(super::OPEN_NOFOLLOW_NONBLOCK)
                 .open(self.dir.join(format!("slot-{i}")))?;
             match file.try_lock() {
-                Ok(()) => held.push(file),
+                Ok(()) => held.0.push(file),
                 Err(std::fs::TryLockError::WouldBlock) => {}
                 Err(std::fs::TryLockError::Error(e)) => return Err(e),
             }
         }
-        Ok((held.len() == k.max(1)).then_some(Slots(held)))
+        Ok((held.0.len() == k.max(1)).then_some(held))
     }
 }
 
@@ -2022,6 +2032,23 @@ mod tests {
         assert!(pool.try_take(2).unwrap().is_some());
         drop(one);
         assert_eq!(SlotPool::new(dir.path(), 0).size(), 1);
+    }
+
+    #[test]
+    fn dropping_slots_releases_locks_with_inherited_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SlotPool::new(dir.path().join("slots"), 1);
+        let slots = pool.try_take(1).unwrap().expect("one free");
+        // A clone shares the open file description, like a child between fork
+        // and exec. Keep it alive after the job releases its slots.
+        let inherited = slots.0[0].try_clone().unwrap();
+        drop(slots);
+        let next = pool
+            .try_take(1)
+            .unwrap()
+            .expect("a child descriptor must not retain a finished job's slot");
+        drop(next);
+        drop(inherited);
     }
 
     /// A pool makes its directory private on its first take only: a job waiting for slots

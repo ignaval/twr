@@ -6,3 +6,5 @@
 .review/
 # cargo about generate (release builds)
 /THIRD-PARTY-LICENSES.html
+
+/artifacts/
