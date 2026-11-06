@@ -93,9 +93,11 @@ for (const [index, template] of selected.entries()) {
     HOME: fixture,
     TWR_TEST_USER_TOKEN_FILE: token,
     TWR_ENABLE_FAKE: "1",
+    TWR_TRACE_STARTUP: join(fixture, "startup.trace"),
     SHELL: "/bin/sh",
   };
   let gateway, hub, server;
+  let hubLog = "";
   try {
     execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
     execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
@@ -116,7 +118,6 @@ for (const [index, template] of selected.entries()) {
         ],
         { stdio: "inherit", timeout: 180000 },
       );
-    let hubLog = "";
     hub = spawn(join(bin, "twr"), ["hub"], {
       env,
       stdio: ["ignore", "ignore", "pipe"],
@@ -131,6 +132,7 @@ for (const [index, template] of selected.entries()) {
       existsSync(join(fixture, "hub.sock")),
       "Fixture hub must start: " + hubLog,
     );
+    const probeStarted = Date.now();
     const info = JSON.parse(
       execFileSync(join(bin, "twr"), ["info", "--json"], {
         env,
@@ -139,6 +141,9 @@ for (const [index, template] of selected.entries()) {
       }),
     );
     assert(info.pid, "Fixture hub must answer before starting the gateway");
+    console.log(
+      `CLI hub ready after ${Date.now() - probeStarted} ms; identity ${info.identity}`,
+    );
     gateway = spawn(
       join(bin, "twr-mobile-gateway"),
       [
@@ -287,6 +292,18 @@ for (const [index, template] of selected.entries()) {
       `PASS: ${device.name} native pairing, Keychain, streaming, answers, uploads, ordered PTY, reconnect and long-lived socket`,
     );
   } finally {
+    for (const name of ["startup.trace", "data/hub.log"]) {
+      const path = join(fixture, name);
+      if (existsSync(path))
+        writeFileSync(
+          `test-results/ios/${kind || "all"}-${index}-${name.replaceAll("/", "-")}`,
+          readFileSync(path),
+        );
+    }
+    writeFileSync(
+      `test-results/ios/${kind || "all"}-${index}-hub-stderr.log`,
+      hubLog,
+    );
     await new Promise((r) => (server ? server.close(r) : r()));
     gateway?.kill("SIGTERM");
     hub?.kill("SIGTERM");

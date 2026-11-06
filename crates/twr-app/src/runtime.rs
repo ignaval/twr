@@ -11,6 +11,7 @@ enum Probe {
     Busy,
 }
 async fn probe_inner(socket: &Path) -> Result<Probe> {
+    twr_core::trace::mark("desktop: hub probe connecting");
     let mut c = match Client::connect(socket).await {
         Ok(c) => c,
         Err(e)
@@ -35,10 +36,12 @@ async fn probe_inner(socket: &Path) -> Result<Probe> {
         }
         Err(e) => return Err(e),
     };
+    twr_core::trace::mark("desktop: hub probe connected");
     // macOS peer-identity lookup can take several seconds under system load.
     // Repeated short probes can keep a healthy hub classified as busy forever.
     match tokio::time::timeout(Duration::from_secs(10), async {
         let hello = c.hello(json!({"client":"desktop"})).await?;
+        twr_core::trace::mark("desktop: hub probe authenticated");
         anyhow::ensure!(
             hello["identity"]
                 .as_str()
