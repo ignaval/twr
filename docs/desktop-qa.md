@@ -1,6 +1,7 @@
 # Desktop QA and feature parity
 
-QA date: 2026-11-06. Platform: this Apple Silicon Mac. Tests launch the actual packaged
+QA date: 2026-11-06. Platforms: Apple Silicon macOS and x86_64 Ubuntu/Arch
+Linux userspaces in QEMU. Mac tests launch the actual packaged
 Electron application through LaunchServices, with production socket authentication and a
 private temporary `TWR_HOME`. Agents and account login use deterministic local fixtures.
 The tests do not use real provider accounts or the user's existing workspaces.
@@ -59,7 +60,17 @@ npm run test:qa:mac
 Real Anthropic/OpenAI/Grok authentication and paid turns, live SSH/container/dial-in hosts,
 and audible platform speech have not been tested end to end in this pass. Their existing
 CLI implementations are bundled and reachable; the above fixtures validate the desktop
-bridge and UI rather than those external services. An installed x86_64 Arch package passed the same integration suite under Cage/Wayland in a local QEMU VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers use ad hoc signatures for testing. Developer ID signing and notarization remain release steps that require the owner’s Apple credentials.
+bridge and UI rather than those external services. An installed Ubuntu 22.04 Debian package passed all 71 CLI form workflows with the
+default Chromium sandbox enabled. Its native terminal module was built against
+Ubuntu 22.04 headers and verified with baud-rate changes, input, resize and exit.
+The portable bundle passes an ELF symbol-version gate; a clean Ubuntu base with
+only declared runtime dependencies has no unresolved libraries. This Ubuntu
+userspace runs on the Arch VM kernel, so it does not certify an Ubuntu kernel.
+An installed x86_64 Arch package also passed the integration suite under Cage/Wayland in that VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers use ad hoc signatures for testing. Developer ID signing and notarization remain release steps that require the owner’s Apple credentials.
+
+The frontend suite has 70 checks, including engine cleanup with real live processes,
+conservative handling of inaccessible engine identities, normal Linux session processes
+and the portable ELF ABI gate.
 
 Performance measurements and reproduction commands are in [performance.md](performance.md).
 

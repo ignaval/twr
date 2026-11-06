@@ -224,16 +224,24 @@ export async function captureUI(page, { hubPids } = {}) {
       runtime: "fake",
       mode: "manual",
     });
-  await rpc("thread.send", {
-    thread: "search-api",
-    prompt:
-      "Cursor pagination is complete. Empty result sets and stable ordering are covered by the tests.",
-  });
-  await rpc("thread.send", {
-    thread: "release-notes",
-    prompt:
-      "The changelog is ready. It covers cursor pagination, accessibility improvements, and migration notes.",
-  });
+  const summaries = [
+    [
+      "search-api",
+      "Cursor pagination is ready, with stable ordering and empty-state coverage.",
+    ],
+    ["release-notes", "Changelog and migration notes are ready for review."],
+  ];
+  for (const [thread, summary] of summaries) {
+    // The fake adapter echoes injected setup context. A real summary section lets
+    // the hub's normal report extraction choose the useful outcome instead.
+    await rpc("thread.send", { thread, prompt: `## Summary\n\n${summary}` });
+    await expect
+      .poll(
+        async () => (await rpc("thread.get", { thread })).last_report?.summary,
+        { timeout: 30000 },
+      )
+      .toBe(summary);
+  }
   // The fake adapter raises a real revision-bound permission without running this command.
   await rpc("thread.send", {
     thread: "web-ui",
@@ -256,6 +264,13 @@ export async function captureUI(page, { hubPids } = {}) {
 
   await theme("Dark");
   await conversation();
+  for (const [thread, summary] of summaries)
+    await expect(
+      page
+        .locator(".thread-list .thread-card")
+        .filter({ hasText: thread })
+        .locator(".thread-card-summary"),
+    ).toHaveText(summary);
   await snap("dark-conversation");
   // Responsive viewport checks run inside the real native client and Chromium engine.
   for (const width of [1000, 1440]) {

@@ -141,26 +141,36 @@ and context editing, park/resume, workspace switching, deletion/restoration, orc
 routing, and single-message read-aloud through a silent command engine. See
 [the QA and parity record](desktop-qa.md) for the tested scope and limits.
 
-`desktop.yml` adds Apple Silicon builds and an Arch Linux package job. The Arch job exercises
-the app on a headless native Wayland compositor and builds the PKGBUILD. A headless compositor
+`desktop.yml` builds Apple Silicon packages and produces portable Linux bundles on
+Ubuntu 22.04. The Arch job consumes that same bundle, exercises it on a headless
+native Wayland compositor and builds the PKGBUILD. A headless compositor
 cannot certify every GPU, fractional-scaling or Omarchy configuration: run the app on an actual
 Omarchy desktop with your normal input method and monitor scale before publishing a release.
 
 ## Packages
 
-Build on the target platform (Apple Silicon macOS or x86_64 Linux):
+The macOS app requires Apple Silicon and macOS 13 or later. Linux bundles target
+x86_64 with glibc 2.35 or later (Ubuntu 22.04 and current Arch/Omarchy). Release
+packaging rejects ELF dependencies above GLIBC 2.35, GLIBCXX 3.4.30 or CXXABI 1.3.13.
+
+Build macOS packages on an Apple Silicon Mac. Build portable Linux packages on
+Ubuntu 22.04, including the native terminal module; building it on a newer Arch
+system can introduce newer glibc requirements. The CI producer/consumer jobs show
+the complete cross-distribution flow:
 
 ```sh
 cd clients
 npm run package:mac        # release/*.dmg
-npm run package:linux      # release/*.AppImage and linux-unpacked/
-npm run package:arch       # release/arch/PKGBUILD and its checksummed source archive
+npm run package:linux      # on Ubuntu 22.04: release/*.AppImage, *.deb, linux-unpacked/
+node scripts/arch.mjs       # same portable linux-unpacked/ → checksummed Arch source
+# Transfer release/arch to an Arch machine, then:
 cd release/arch
 makepkg                   # twr-desktop-*.pkg.tar.zst
 ```
 
 The Arch package includes its own matching Electron runtime and native terminal module,
-so a system Electron upgrade cannot change the app's ABI. Its launcher uses the stable
+so a system Electron upgrade cannot change the app's ABI. The Arch package reuses
+the portable producer's native terminal module without recompiling it. Its launcher uses the stable
 `tools.twr.desktop` class for Hyprland rules. Chromium's sandbox stays enabled.
 
 macOS packaging supports normal electron-builder signing/notarization credentials when

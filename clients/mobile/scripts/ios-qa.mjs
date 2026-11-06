@@ -18,7 +18,14 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { qaSource } from "../../scripts/qa-source.mjs";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const requestedRuntime = process.env.TWR_IOS_RUNTIME?.trim() || "27.1";
+const kind = process.env.TWR_IOS_KIND?.trim() || "all";
+const defaultRuntimes = { phone: "27.0", fold: "27.1", tablet: "27.0" };
+assert(
+  kind === "all" || Object.hasOwn(defaultRuntimes, kind),
+  `Unsupported TWR_IOS_KIND=${kind}; use phone, fold, tablet, or all`,
+);
+const requestedKinds = kind === "all" ? Object.keys(defaultRuntimes) : [kind];
+const runtimeOverride = process.env.TWR_IOS_RUNTIME?.trim();
 const { runtimes } = JSON.parse(
   execFileSync("xcrun", ["simctl", "list", "runtimes", "--json"], {
     encoding: "utf8",
@@ -38,22 +45,6 @@ console.log(
   "IOS_SIMULATOR_RUNTIMES",
   JSON.stringify(iosRuntimes.map(runtimeDescription)),
 );
-const matchingRuntimes = iosRuntimes.filter(
-  (runtime) =>
-    runtime.isAvailable === true &&
-    (runtime.identifier === requestedRuntime ||
-      runtime.version === requestedRuntime),
-);
-assert.equal(
-  matchingRuntimes.length,
-  1,
-  `Requested iOS Simulator runtime '${requestedRuntime}' must identify exactly one installed, available runtime. Install it in Xcode Settings > Components, or explicitly set TWR_IOS_RUNTIME to an installed iOS runtime identifier/version. Inspect: xcrun simctl list runtimes --json. No alternate runtime will be selected.`,
-);
-const selectedRuntime = matchingRuntimes[0];
-console.log(
-  "IOS_SIMULATOR_RUNTIME_SELECTED",
-  JSON.stringify(runtimeDescription(selectedRuntime)),
-);
 const devices = JSON.parse(
   execFileSync("xcrun", ["simctl", "list", "devices", "available", "--json"], {
     encoding: "utf8",
@@ -63,44 +54,51 @@ const available = Object.entries(devices.devices).flatMap(([runtime, list]) =>
   list.map((device) => ({ ...device, runtime })),
 );
 
-// Prefer templates already on the requested runtime, but a device type from
-// another installed runtime can seed a disposable device on this exact runtime.
-const templates = [
-  ...available.filter(
-    (device) => device.runtime === selectedRuntime.identifier,
-  ),
-  ...available.filter(
-    (device) => device.runtime !== selectedRuntime.identifier,
-  ),
-];
-const targets = [
-  templates.find((d) => d.name.includes("iPhone") && !d.name.includes("Duo")),
-  templates.find((d) => d.name.includes("Duo")),
-  templates.find((d) => d.name.includes("iPad")),
-].filter(Boolean);
-assert(
-  targets.some((d) => d.name.includes("Duo")) &&
-    targets.some((d) => d.name.includes("iPhone") && !d.name.includes("Duo")),
-  "Install Simulator device templates for iPhone and iPhone Duo; their requested runtime is configured separately by TWR_IOS_RUNTIME",
-);
+const deviceKind = (device) =>
+  device.name.includes("Duo")
+    ? "fold"
+    : device.name.includes("iPad")
+      ? "tablet"
+      : device.name.includes("iPhone")
+        ? "phone"
+        : undefined;
+// Runtime/device-type compatibility is not interchangeable: the fold runtime
+// can reject phone and tablet types. Validate every requested family up front.
+const selected = requestedKinds.map((family) => {
+  const requestedRuntime = runtimeOverride || defaultRuntimes[family];
+  const matchingRuntimes = iosRuntimes.filter(
+    (runtime) =>
+      runtime.isAvailable === true &&
+      (runtime.identifier === requestedRuntime ||
+        runtime.version === requestedRuntime),
+  );
+  assert.equal(
+    matchingRuntimes.length,
+    1,
+    `Requested ${family} iOS Simulator runtime '${requestedRuntime}' must identify exactly one installed, available runtime. Install it in Xcode Settings > Components, or explicitly set TWR_IOS_RUNTIME to an installed iOS runtime identifier/version. Inspect: xcrun simctl list runtimes --json. No alternate runtime will be selected.`,
+  );
+  const runtime = matchingRuntimes[0];
+  console.log(
+    "IOS_SIMULATOR_RUNTIME_SELECTED",
+    JSON.stringify({ kind: family, ...runtimeDescription(runtime) }),
+  );
+  const template = available.find(
+    (device) =>
+      device.runtime === runtime.identifier && deviceKind(device) === family,
+  );
+  assert(
+    template,
+    `No ${family} Simulator device template exists under requested runtime '${runtime.identifier}'. Install a compatible ${family} Simulator device in Xcode for this runtime. Inspect: xcrun simctl list devices available --json. A template from another runtime will not be substituted.`,
+  );
+  return { family, template, runtime };
+});
 const bin = resolve("../target/debug");
 const execFileAsync = promisify(execFile);
 mkdirSync("test-results/ios", { recursive: true });
-const kind = process.env.TWR_IOS_KIND;
-const selected = targets.filter(
-  (device) =>
-    !kind ||
-    (device.name.includes("Duo")
-      ? "fold"
-      : device.name.includes("iPad")
-        ? "tablet"
-        : "phone") === kind,
-);
-assert(
-  selected.length > 0,
-  `No Simulator device template matches TWR_IOS_KIND=${kind || "all"}`,
-);
-for (const [index, template] of selected.entries()) {
+for (const [
+  index,
+  { family, template, runtime: selectedRuntime },
+] of selected.entries()) {
   const device = {
     ...template,
     runtime: selectedRuntime.identifier,
@@ -119,6 +117,7 @@ for (const [index, template] of selected.entries()) {
   console.log(
     "IOS_SIMULATOR_DEVICE",
     JSON.stringify({
+      kind: family,
       name: device.name,
       udid: device.udid,
       deviceTypeIdentifier: device.deviceTypeIdentifier,

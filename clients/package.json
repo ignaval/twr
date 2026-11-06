@@ -19,7 +19,7 @@
     "package:linux": "npm run package -- --linux --x64",
     "postinstall": "electron-builder install-app-deps",
     "icon": "node scripts/icon.mjs",
-    "package:arch": "npm run build:rust && npm run build && electron-builder --linux dir --x64 && node scripts/arch.mjs",
+    "package:arch": "node scripts/arch.mjs",
     "format": "prettier --write shared desktop tests scripts mobile/src mobile/scripts mobile/vite.config.ts capacitor.config.ts vite.config.ts tsconfig.json package.json index.html",
     "format:check": "prettier --check shared desktop tests scripts mobile/src mobile/scripts mobile/vite.config.ts capacitor.config.ts vite.config.ts tsconfig.json package.json index.html",
     "test:packaged:mac": "node scripts/packaged-smoke.mjs",
