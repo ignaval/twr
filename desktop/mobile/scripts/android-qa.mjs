@@ -441,6 +441,7 @@ try {
         return {
           x: box.x,
           y: box.y,
+          bottom: box.bottom,
           left: parseFloat(style.getPropertyValue("--fold-left")),
           top: parseFloat(style.getPropertyValue("--fold-top")),
           width: parseFloat(style.getPropertyValue("--hinge-width")),
@@ -454,7 +455,8 @@ try {
         );
       else
         assert(
-          geometry.y >= geometry.top + geometry.height - 1,
+          geometry.y >= geometry.top + geometry.height - 1 ||
+            geometry.bottom <= geometry.top + 1,
           JSON.stringify(geometry),
         );
       await dialog
@@ -576,7 +578,44 @@ try {
     await expect
       .poll(() => page.evaluate(() => document.documentElement.dataset.fold))
       .toBe("none");
+    await page.evaluate(() => window.Capacitor.Plugins.Keyboard.hide());
+    adbRun(["shell", "settings", "put", "system", "user_rotation", "1"]);
+    await expect
+      .poll(() => page.evaluate(() => innerWidth), { timeout: 15000 })
+      .not.toBe(width);
+    const fullHeight = await page.evaluate(() => visualViewport.height);
+    await input.click();
+    await expect
+      .poll(() => page.evaluate(() => visualViewport.height), {
+        timeout: 15000,
+      })
+      .toBeLessThan(fullHeight - 100);
+    const flatLayout = await page.evaluate(async () => ({
+      native: await window.Capacitor.Plugins.TwrLayout.current(),
+      viewport: visualViewport.height,
+      usable: parseFloat(
+        document.documentElement.style.getPropertyValue("--viewport-height"),
+      ),
+    }));
+    assert(
+      flatLayout.native.state !== "half-opened" &&
+        !flatLayout.native.separating,
+      JSON.stringify(flatLayout),
+    );
+    assert(
+      Math.abs(flatLayout.usable - flatLayout.viewport) < 1,
+      "A flat screen must retain its full keyboard-visible height: " +
+        JSON.stringify(flatLayout),
+    );
+    await page.evaluate(() => window.Capacitor.Plugins.Keyboard.hide());
+    adbRun(["shell", "settings", "put", "system", "user_rotation", "0"]);
+    await expect
+      .poll(() => page.evaluate(() => innerWidth), { timeout: 15000 })
+      .toBe(width);
     await input.fill("");
+    console.log(
+      "PASS: flat landscape display retains all usable height while the keyboard is open",
+    );
     console.log(
       "PASS: folded cover screen, unfolded book and half-open hinge transitions preserve drafts",
     );
