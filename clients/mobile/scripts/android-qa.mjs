@@ -18,6 +18,7 @@ import { createHash, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { performanceAudit } from "../../scripts/performance.mjs";
 import { terminalUIQA } from "./terminal-ui-qa.mjs";
+import { captureMobileUI } from "./ui-captures.mjs";
 import { multiHubQA } from "./multi-hub-qa.mjs";
 import { systemPickerQA } from "./system-picker-qa.mjs";
 const adb =
@@ -413,6 +414,11 @@ try {
     .locator(".block-assistant")
     .getByText("ANDROID_REMOTE_STREAM_OK", { exact: true })
     .waitFor();
+  if (process.env.TWR_UI_CAPTURES === "1")
+    await captureMobileUI(page, {
+      label: serial === "emulator-5556" ? "android-fold" : "android-phone",
+      thread: "android-worker",
+    });
   const identity = (await page.evaluate(() => window.twr.rpc("hub.info")))
     .identity;
   assert(identity.startsWith("user:device:"));
@@ -1438,7 +1444,23 @@ try {
         { timeout: 30000 },
       )
       .toBe(hubPid);
-    console.log("PASS: read-only grants disable message and upload controls");
+    await dismissKeyboard();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
+    const localAppearance = page.getByRole("dialog");
+    await localAppearance
+      .getByRole("button", { name: "Light", exact: true })
+      .click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await localAppearance
+      .getByRole("button", { name: "Dark", exact: true })
+      .click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    await localAppearance
+      .getByRole("button", { name: "Done", exact: true })
+      .click();
+    console.log(
+      "PASS: read-only grants disable hub mutations and retain local appearance controls",
+    );
     const stopped = new Promise((resolve) => fixtureHub.once("exit", resolve));
     fixtureHub.kill("SIGTERM");
     await stopped;

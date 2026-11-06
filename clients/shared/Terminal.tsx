@@ -85,6 +85,14 @@ export function Terminal({
     search.current = finder;
     let ready = false;
     let sequence = 0;
+    let pendingExit: number | undefined;
+    let exitShown = false;
+    function showExit(exited = false) {
+      if (exitShown || (!exited && pendingExit === undefined)) return;
+      const suffix = pendingExit === undefined ? "." : ` (${pendingExit}).`;
+      term.write(`\r\n\x1b[90mProcess exited${suffix}\x1b[0m\r\n`);
+      exitShown = true;
+    }
     const queued: { data: string; sequence: number }[] = [];
     const unsubscribe = hostApi.onEvent((event) => {
       if (event.type === "resync" && event.scope !== "control") {
@@ -108,24 +116,25 @@ export function Terminal({
           }
         } else queued.push(chunk);
       }
-      if (event.type === "terminal-exit")
-        term.write(
-          `\r\n\x1b[90mProcess exited (${event.exitCode}).\x1b[0m\r\n`,
-        );
+      if (event.type === "terminal-exit") {
+        pendingExit = event.exitCode ?? 0;
+        if (ready) showExit();
+      }
     });
     let snapshotLoading = false;
     function snapshot(reset = false) {
       if (snapshotLoading) return;
       ready = false;
       snapshotLoading = true;
-      if (reset) term.reset();
+      if (reset) {
+        term.reset();
+        exitShown = false;
+      }
       void hostApi
         .terminalRead(session.id)
         .then((snapshot) => {
           if (terminal.current !== term) return;
           term.write(snapshot.data);
-          if (snapshot.exited)
-            term.write("\r\n\x1b[90mProcess exited.\x1b[0m\r\n");
           sequence = snapshot.sequence;
           ready = true;
           for (const chunk of queued)
@@ -136,6 +145,7 @@ export function Terminal({
               sequence = chunk.sequence;
             }
           queued.length = 0;
+          showExit(snapshot.exited);
         })
         .catch(() => {
           if (terminal.current !== term) return;
@@ -150,6 +160,7 @@ export function Terminal({
               hostApi.terminalAck(session.id, chunk.data.length),
             );
           }
+          showExit(!!session.exited);
         })
         .finally(() => {
           snapshotLoading = false;

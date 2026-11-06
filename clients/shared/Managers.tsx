@@ -1,5 +1,5 @@
 import { errorMessage } from "./errors";
-import { savedAppearance, type Appearance } from "./appearance";
+import { AppearanceOptions } from "./AppearanceOptions";
 import { useHostAPI } from "./host";
 import { useCallback, useEffect, useState, useRef } from "react";
 import {
@@ -788,7 +788,6 @@ function Settings({
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState<Json>();
-  const [theme, setTheme] = useState<Appearance>(savedAppearance);
   useEffect(() => {
     void hostApi
       .configRead()
@@ -820,25 +819,13 @@ function Settings({
       <section className="settings-section">
         <h2>Appearance</h2>
         <p>
-          System follows your desktop. On Omarchy, its current theme is used
-          when available.
+          System follows your{" "}
+          {document.documentElement.dataset.mobile === "true"
+            ? "device"
+            : "desktop"}
+          . On Omarchy, its current theme is used when available.
         </p>
-        <div className="segmented">
-          {(["dark", "light", "system"] as const).map((t) => (
-            <button
-              key={t}
-              className={theme === t ? "active" : ""}
-              aria-pressed={theme === t}
-              onClick={() => {
-                localStorage.setItem("twr.theme", t);
-                setTheme(t);
-                document.documentElement.dataset.theme = t;
-              }}
-            >
-              {t[0].toUpperCase() + t.slice(1)}
-            </button>
-          ))}
-        </div>
+        <AppearanceOptions />
       </section>
       <section className="settings-section">
         <h2>Orchestrator</h2>

@@ -360,20 +360,39 @@ final class RemoteHubTests: XCTestCase {
           root.style.setProperty('--viewport-height',window.__qaCompactHeight+'px');
           const input=document.querySelector('.composer textarea');
           Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,'COMPACT_VIEWPORT_SEND_QA');
-          input.dispatchEvent(new Event('input',{bubbles:true}));return true;
+          input.dispatchEvent(new Event('input',{bubbles:true}));
+          window.__qaCompactProbe=(verbose=false)=>{
+            const button=document.querySelector('button[aria-label="Send message"]'),box=button.getBoundingClientRect();
+            const root=document.getElementById('root'),rootBox=root.getBoundingClientRect();
+            const tabs=document.querySelector('.mobile-tabs'),tabsVisible=!!tabs?.getClientRects().length;
+            const limit=tabsVisible?tabs.getBoundingClientRect().top:window.__qaCompactHeight;
+            const point={x:box.x+box.width/2,y:box.y+box.height/2},hit=document.elementFromPoint(point.x,point.y);
+            const checks={rootWithinAvailableHeight:rootBox.height<=window.__qaCompactHeight+1,enabled:!button.disabled,width44:box.width>=44,height44:box.height>=44,aboveNavigation:box.bottom<=limit+1,ownsHit:button.contains(hit)};
+            const describe=element=>element?{tag:element.tagName,id:element.id,classes:typeof element.className==='string'?element.className:element.className?.baseVal,aria:element.getAttribute('aria-label'),role:element.getAttribute('role')}:null;
+            const result={pass:Object.values(checks).every(Boolean),checks,disabled:button.disabled,inputValue:document.querySelector('.composer textarea').value,classes:document.documentElement.className,height:window.__qaCompactHeight,root:rootBox.toJSON(),send:box.toJSON(),tabs:tabs?.getBoundingClientRect().toJSON(),tabsVisible,limit,point,hit:describe(hit)};
+            if(!verbose)return result;
+            const inspect=element=>{
+              if(!element)return null;
+              const style=getComputedStyle(element);
+              return {...describe(element),bounds:element.getBoundingClientRect().toJSON(),style:{position:style.position,zIndex:style.zIndex,pointerEvents:style.pointerEvents,display:style.display,visibility:style.visibility,opacity:style.opacity,overflow:style.overflow,overflowX:style.overflowX,overflowY:style.overflowY,transform:style.transform,contain:style.contain,isolation:style.isolation,clipPath:style.clipPath},scroll:{left:element.scrollLeft,top:element.scrollTop,width:element.scrollWidth,height:element.scrollHeight,clientWidth:element.clientWidth,clientHeight:element.clientHeight}};
+            };
+            const viewport=window.visualViewport;
+            const offsetPoints=[{name:'center',...point},{name:'plusVisualOffset',x:point.x+(viewport?.offsetLeft||0),y:point.y+(viewport?.offsetTop||0)},{name:'minusVisualOffset',x:point.x-(viewport?.offsetLeft||0),y:point.y-(viewport?.offsetTop||0)},{name:'plusPageScroll',x:point.x+scrollX,y:point.y+scrollY},{name:'minusPageScroll',x:point.x-scrollX,y:point.y-scrollY}];
+            const ancestors=[];for(let element=button;element;element=element.parentElement)ancestors.push(inspect(element));
+            return {...result,active:describe(document.activeElement),bodyPadding:getComputedStyle(document.body).padding,viewportHeightVariable:document.documentElement.style.getPropertyValue('--viewport-height'),keyboard:document.documentElement.dataset.keyboard,visualViewport:viewport?{width:viewport.width,height:viewport.height,offsetTop:viewport.offsetTop,offsetLeft:viewport.offsetLeft,pageTop:viewport.pageTop,pageLeft:viewport.pageLeft,scale:viewport.scale}:null,window:{width:innerWidth,height:innerHeight,scrollX,scrollY},scrollingElement:inspect(document.scrollingElement),hitStack:document.elementsFromPoint(point.x,point.y).map(inspect),offsetHits:offsetPoints.map(p=>({...p,hit:describe(document.elementFromPoint(p.x,p.y))})),ancestors,surfaces:['.composer','.composer-label','.composer-bottom','.conversation-scroll','.transcript-virtual','.transcript-block','.work-area','.main-shell','.app','#root','body','html'].map(selector=>({selector,...inspect(document.querySelector(selector))}))};
+          };return true;
           """)
+        print("COMPACT start " + String(describing: try? await js("return JSON.stringify(window.__qaCompactProbe(true))")))
         do {
-        try await until("""
-          const button=document.querySelector('button[aria-label="Send message"]'),box=button.getBoundingClientRect();
-          const tabs=document.querySelector('.mobile-tabs'),limit=tabs?.getClientRects().length?tabs.getBoundingClientRect().top:window.__qaCompactHeight;
-          return document.getElementById('root').getBoundingClientRect().height<=window.__qaCompactHeight+1 && !button.disabled && box.width>=44 && box.height>=44 && box.bottom<=limit+1 && button.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2));
-          """, reportFailure: false)
+            try await until("return window.__qaCompactProbe().pass", reportFailure: false)
         } catch {
-            print("COMPACT " + String(describing: try? await js("return {classes:document.documentElement.className,height:window.__qaCompactHeight,root:document.getElementById('root').getBoundingClientRect().toJSON(),send:document.querySelector('button[aria-label=\"Send message\"]').getBoundingClientRect().toJSON(),tabs:document.querySelector('.mobile-tabs')?.getBoundingClientRect().toJSON(),body:getComputedStyle(document.body).padding,active:document.activeElement?.tagName}")))
+            print("COMPACT failure " + String(describing: try? await js("return JSON.stringify(window.__qaCompactProbe(true))")))
+            print("COMPACT native bounds=\(web.bounds) frame=\(web.frame) offset=\(web.scrollView.contentOffset) contentSize=\(web.scrollView.contentSize) inset=\(web.scrollView.contentInset) adjustedInset=\(web.scrollView.adjustedContentInset) zoomScale=\(web.scrollView.zoomScale)")
             try? await capture("compact-failure")
             XCTFail("Compact composer is not reachable: \(error.localizedDescription)")
             throw error
         }
+        print("COMPACT pass " + String(describing: try? await js("return JSON.stringify(window.__qaCompactProbe(true))")))
         try await capture("compact")
         _ = try await js("document.querySelector('button[aria-label=\"Send message\"]').click();return true")
         try await until("return [...document.querySelectorAll('.block-assistant .markdown')].some(e=>e.textContent.trim()==='COMPACT_VIEWPORT_SEND_QA')")

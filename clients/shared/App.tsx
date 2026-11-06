@@ -792,7 +792,18 @@ export default function App({
     const keyboard = (event: KeyboardEvent) => {
       if (event.defaultPrevented || document.querySelector("[role=dialog]"))
         return;
-      const mac = document.documentElement.dataset.platform === "darwin";
+      const mac = ["darwin", "ios"].includes(
+        document.documentElement.dataset.platform || "",
+      );
+      const menu = document.querySelector<HTMLDetailsElement>(
+        ".conversation-menu[open]",
+      );
+      if (event.key === "Escape" && menu) {
+        event.preventDefault();
+        menu.removeAttribute("open");
+        menu.querySelector<HTMLElement>("summary")?.focus();
+        return;
+      }
       const mod = mac ? event.metaKey : event.ctrlKey;
       const inTerminal = (event.target as HTMLElement)?.closest(
         ".terminal-surface",
@@ -809,7 +820,6 @@ export default function App({
         setPalette(true);
         return;
       }
-      if (inTerminal) return;
       if (mod && event.key.toLowerCase() === "b") {
         event.preventDefault();
         setSidebar((v) => !v);
@@ -841,8 +851,22 @@ export default function App({
         input.current?.focus();
       }
     };
+    const closeMenu = (event: PointerEvent) => {
+      if (
+        event.target instanceof Element &&
+        event.target.closest(".conversation-menu")
+      )
+        return;
+      document
+        .querySelector(".conversation-menu[open]")
+        ?.removeAttribute("open");
+    };
     window.addEventListener("keydown", keyboard);
-    return () => window.removeEventListener("keydown", keyboard);
+    window.addEventListener("pointerdown", closeMenu);
+    return () => {
+      window.removeEventListener("keydown", keyboard);
+      window.removeEventListener("pointerdown", closeMenu);
+    };
   }, [selected, destination]);
   useEffect(() => {
     if (connected)
@@ -1528,7 +1552,7 @@ export default function App({
             }}
           >
             <MessageSquare size={17} />
-            Orchestrator<span className="key-hint">↵</span>
+            Orchestrator
           </button>
           <button
             className={section === "attention" ? "active" : ""}
@@ -1636,7 +1660,7 @@ export default function App({
           >
             <Search size={15} />
             Commands
-            <span className="key-hint">
+            <span className="key-hint" aria-hidden="true">
               {document.documentElement.dataset.platform === "darwin"
                 ? "⌘K"
                 : "Ctrl K"}
@@ -1802,7 +1826,7 @@ export default function App({
                       setQuery("");
                     }}
                   >
-                    <CommandIcon size={16} />
+                    <Search size={16} />
                     Commands
                   </button>
                 </div>
@@ -2151,6 +2175,8 @@ export default function App({
                     )}
                     disabled={!connected || !permitted("operate")}
                     onKeyDown={(e) => {
+                      if (e.nativeEvent.isComposing || e.keyCode === 229)
+                        return;
                       if (e.key === "Tab" && !draft && assistance.suggestion) {
                         e.preventDefault();
                         acceptSuggestion();
@@ -3371,6 +3397,16 @@ function Conversation({
     getItemKey: (index) => blocks[index].id,
   });
   const totalSize = virtual.getTotalSize();
+  useLayoutEffect(() => {
+    const element = parent.current;
+    if (!element) return;
+    const observer = new ResizeObserver(() => {
+      if (follow.current) element.scrollTop = element.scrollHeight;
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
   const visibleRoutineKey = [
     ...new Set(
       virtual

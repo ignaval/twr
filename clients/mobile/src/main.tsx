@@ -1,3 +1,4 @@
+import { AppearanceOptions } from "../../shared/AppearanceOptions";
 import { errorMessage } from "../../shared/errors";
 import { Keyboard } from "@capacitor/keyboard";
 import { initializeAppearance } from "../../shared/appearance";
@@ -321,6 +322,10 @@ function Mobile() {
             <p className="form-note">
               Device access: {active.scopes.join(" · ")}
             </p>
+            <section className="mobile-appearance">
+              <h3>Appearance</h3>
+              <AppearanceOptions />
+            </section>
             {notice && <p role="status">{notice}</p>}
             <button
               onClick={() =>
@@ -583,6 +588,10 @@ function Mobile() {
           </div>
         </form>
       )}
+      <section className="mobile-appearance">
+        <h3>Appearance</h3>
+        <AppearanceOptions />
+      </section>
     </main>
   );
 }

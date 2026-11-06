@@ -8,3 +8,9 @@ export function savedAppearance(): Appearance {
 export function initializeAppearance() {
   document.documentElement.dataset.theme = savedAppearance();
 }
+
+export function selectAppearance(value: Appearance) {
+  localStorage.setItem("twr.theme", value);
+  document.documentElement.dataset.theme = value;
+  window.dispatchEvent(new Event("twr:appearance"));
+}

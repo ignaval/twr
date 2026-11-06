@@ -2800,3 +2800,8 @@ meter::-webkit-meter-optimum-value {
   text-overflow: ellipsis;
   list-style-position: inside;
 }
+
+.message-body.clamped {
+  -webkit-mask-image: linear-gradient(#000 calc(100% - 40px), transparent);
+  mask-image: linear-gradient(#000 calc(100% - 40px), transparent);
+}
