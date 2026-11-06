@@ -203,6 +203,7 @@ final class RemoteHubTests: XCTestCase {
         performanceRequest.httpMethod = "POST"
         performanceRequest.httpBody = try JSONSerialization.data(withJSONObject: try XCTUnwrap(performanceResult))
         _ = try await URLSession.shared.data(for: performanceRequest)
+        try await until("const layout=await window.Capacitor.Plugins.TwrLayout.current();return document.querySelector('.mobile-hub-switch').getBoundingClientRect().top >= (layout.occlusionTop || 0)")
         let layout = try await js("return await window.Capacitor.Plugins.TwrLayout.current()")
         XCTAssertNotNil(layout)
         let result = try await js("return {errors:window.__qaErrors,width:innerWidth,height:innerHeight,layout:await window.Capacitor.Plugins.TwrLayout.current(),identity:(await window.twr.rpc('hub.info')).identity}")
