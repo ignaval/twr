@@ -121,20 +121,7 @@ pub enum Screen {
     Decisions,
 }
 
-/// A screen of the compact layout (`[tui] compact_width`, `/compact`): on a phone the TUI
-/// shows one at a time, under a line naming them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum CompactPane {
-    /// The conversation alone (the orchestrator's, or the thread dived into) and the input.
-    #[default]
-    Chat,
-    /// What waits on the user, one line per item; Enter opens one in its action popup.
-    Needs,
-    /// The threads' cards; in a TUI opened on a workspace, nested under its card among the
-    /// other workspaces', which list their threads, and the buttons under them
-    /// ([`crate::sidebar::Place::Screen`]).
-    Threads,
-}
+pub use twr_core::slash::CompactPane;
 
 /// A row of the workspace list the keys select (on the compact layout's Threads screen): a workspace's card, by its name, or a button under them.
 #[derive(Debug, Clone, PartialEq, Eq)]

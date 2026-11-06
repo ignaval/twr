@@ -75,6 +75,13 @@ twr update                             # install the latest release over this tw
 
 `twr say` never answers a permission or question, because it can't tell which ones you had seen. Use `twr respond`, or the TUI. [docs/usage.md](docs/usage.md) walks through a session.
 
+## Desktop
+
+The [desktop client](docs/desktop.md) provides a graphical interface for Apple Silicon macOS
+and x86_64 Linux, including Omarchy/Arch packaging. It shares the hub with the CLI and includes
+embedded terminals for agent attach, account login and interactive commands. See its setup
+guide for building and running it from this repository.
+
 ## Keys
 
 The TUI's big pane is your conversation with the orchestrator, and what you type always goes to it. The worker threads are cards beside it. To talk to one agent yourself, select its card and press `Enter` twice (or double-click it, or `/open <thread>`): the pane shows that thread and what you type goes straight to it until `Esc` brings you back. The pane's header and the input box's title say where a line goes, `ORCHESTRATOR` on cyan or `talking to <thread>` on magenta. A line that starts with `/` is a command, and a popup lists the matching ones as you type; a word that starts with `@` gets a popup of worker thread names.

@@ -1,0 +1,53 @@
+name: Mobile
+on:
+  pull_request:
+    paths: ["desktop/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
+  push:
+    branches: [dev, "codex/twr-apps"]
+    paths: ["desktop/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ios:
+    name: iOS native Simulator and iPhone Duo
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build shared engine and mobile UI
+        run: |
+          cargo build --locked -p twr-cli -p twr-app
+          npm --prefix desktop ci
+          npm --prefix desktop run mobile:build
+          npm --prefix desktop test
+      - name: Compile iOS native application
+        working-directory: desktop
+        run: node mobile/scripts/ios-build.mjs
+      - name: Native iOS remote-hub integration
+        working-directory: desktop
+        run: node mobile/scripts/ios-qa.mjs
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: twr-ios-simulator-qa
+          path: |
+            desktop/test-results/ios/
+            desktop/mobile/ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app

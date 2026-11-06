@@ -60,11 +60,12 @@ use crossterm::event::{
 use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use twr_core::blob::{has_capped, hydrate_deep, BlobFetch};
+use twr_core::blob::BlobFetch;
 use twr_core::client::{Client, HubClosed};
 use twr_core::client_state::ClientFold;
-use twr_core::event::EventBody;
 use twr_core::proto::StreamItem;
+#[cfg(test)]
+use twr_core::{blob::has_capped, event::EventBody};
 
 use crate::app::{Action, AppState, Picker};
 
@@ -96,18 +97,7 @@ pub fn submit_request(action: &Action) -> Option<(&'static str, Value)> {
 /// here (the hub resolves paths in its own working directory; `~` is the home directory);
 /// anything else is sent as is (a configured project name).
 pub fn project_param(project: &str) -> String {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let path = match (project.strip_prefix('~'), &home) {
-        (Some(rest), Some(h)) if rest.is_empty() || rest.starts_with('/') => {
-            h.join(rest.trim_start_matches('/'))
-        }
-        _ if project.contains('/') || project == "." || project == ".." => PathBuf::from(project),
-        _ => return project.to_string(),
-    };
-    match std::fs::canonicalize(&path) {
-        Ok(abs) => abs.to_string_lossy().into_owned(),
-        Err(_) => path.to_string_lossy().into_owned(),
-    }
+    twr_core::paths::project_param(project)
 }
 
 /// Whether a `say` or `thread.send` result left the prompt queued (its thread is busy), and
@@ -1119,19 +1109,7 @@ pub async fn hydrate_item<F: BlobFetch>(
     item: &StreamItem,
     fetch: &mut F,
 ) -> anyhow::Result<Option<StreamItem>> {
-    // Most items have nothing moved: told without building their `data` (a replay asks this
-    // of every item).
-    if !item.event.body.maybe_capped() {
-        return Ok(None);
-    }
-    let mut data = item.event.body.data()?;
-    if !has_capped(&data) {
-        return Ok(None);
-    }
-    hydrate_deep(&mut data, fetch).await?;
-    let mut full = item.clone();
-    full.event.body = EventBody::from_kind_data(item.event.kind(), data)?;
-    Ok(Some(full))
+    twr_core::blob::hydrate_item(item, fetch).await
 }
 
 /// `stream` with every item hydrated ([`hydrate_item`]) over `blobs`, in order, each within
