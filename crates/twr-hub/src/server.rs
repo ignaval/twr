@@ -604,6 +604,7 @@ async fn send<T: Serialize>(w: &Writer, msg: &T) -> std::io::Result<()> {
 /// orchestrator token, or its peer is a thread's agent.
 struct Conn {
     client: String,
+    device: Option<twr_core::devices::Device>,
     /// The orchestrator token this connection presented; checked again on every request, with
     /// the peer's ancestry walked again ([`still_orchestrator`]), so a connection from an
     /// earlier orchestrator process loses its identity.
@@ -662,6 +663,10 @@ impl Conn {
 /// try from an agent's and the orchestrator's connections.
 pub const METHODS: &[&str] = &[
     "hello",
+    "device.pair_begin",
+    "device.pair_complete",
+    "device.list",
+    "device.revoke",
     "say",
     "hub.info",
     "hub.glance",
@@ -956,6 +961,7 @@ async fn connection(
     let writer: Writer = Arc::new(Mutex::new(w));
     let mut conn = Conn {
         client: default_client,
+        device: None,
         token: None,
         agent,
         peer,
@@ -967,23 +973,36 @@ async fn connection(
     let mut leases: Leases = Vec::new();
     // The speaker this connection attached (`speech.attach`), which its `speech.state` names.
     let mut speaker: Option<u64> = None;
+    let mut device_tick = tokio::time::interval(Duration::from_secs(2));
     loop {
-        let frame = tokio::select! {
-            f = read_frame::<_, Request>(&mut reader) => f,
-            _ = wait_state(&mut state, |s| *s == HubState::Stopped) => {
-                // A connection for calls is told why it closes (as the reply to request 0): a
-                // client that keeps one open (the TUI, the MCP server) and writes to it later
-                // reads why its call failed, and knows nothing was done. A subscription's
-                // stream ends its connection itself.
-                if subs.is_empty() {
-                    let gone = RpcError::new(codes::STOPPING, "the hub is stopping");
-                    let _ = send(&writer, &Response::err(0, gone)).await;
+        let frame = {
+            let read = read_frame::<_, Request>(&mut reader);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    _ = device_tick.tick() => {
+                        if conn.device.as_ref().is_some_and(|d| !hub.device_auth().is_ok_and(|a|a.current(d))) {break None;}
+                    }
+                    f = &mut read => break Some(f),
+                    _ = wait_state(&mut state, |s| *s == HubState::Stopped) => {
+                        // A connection for calls is told why it closes (as the reply to request 0): a
+                        // client that keeps one open (the TUI, the MCP server) and writes to it later
+                        // reads why its call failed, and knows nothing was done. A subscription's
+                        // stream ends its connection itself.
+                        if subs.is_empty() {
+                            let gone = RpcError::new(codes::STOPPING, "the hub is stopping");
+                            let _ = send(&writer, &Response::err(0, gone)).await;
+                        }
+                        // Subscriptions end on their own once they have flushed. Attach leases are
+                        // left for the next hub to close (`thread.detached` reason `hub_restart`).
+                        while subs.join_next().await.is_some() {}
+                        return;
+                    }
                 }
-                // Subscriptions end on their own once they have flushed. Attach leases are
-                // left for the next hub to close (`thread.detached` reason `hub_restart`).
-                while subs.join_next().await.is_some() {}
-                return;
             }
+        };
+        let Some(frame) = frame else {
+            break;
         };
         let req = match frame {
             Ok(Some(req)) => req,
@@ -998,6 +1017,30 @@ async fn connection(
             Err(_) => break,
         };
         let id = req.id;
+        if let Some(device) = &conn.device {
+            if !hub.device_auth().is_ok_and(|a| a.current(device)) {
+                break;
+            }
+            if !device.allows_params(&req.method, &req.params)
+                || matches!(
+                    req.method.as_str(),
+                    "device.pair_begin" | "device.pair_complete"
+                )
+            {
+                let _ = send(
+                    &writer,
+                    &Response::err(
+                        id,
+                        RpcError::new(
+                            codes::UNAUTHORIZED,
+                            "This device is not allowed to perform this operation",
+                        ),
+                    ),
+                )
+                .await;
+                continue;
+            }
+        }
         // A thread's agent reads, and starts and cancels its own thread's jobs (`call`).
         if let Some(agent) = conn.restricted() {
             if !AGENT_METHODS.contains(&req.method.as_str()) {
@@ -1889,6 +1932,7 @@ struct DeleteParams {
 #[serde(deny_unknown_fields)]
 struct HelloParams {
     client: String,
+    device_token: Option<String>,
     /// The orchestrator token (`TWR_ORCH_TOKEN`), from the orchestrator's MCP server only.
     token: Option<String>,
     /// What the client can decode ([`PROTOCOL_VERSION`]); none from a twr before it.
@@ -2425,6 +2469,29 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
     {
         conn.agent = None;
     }
+    if let Some(token) = p.device_token {
+        if conn.restricted().is_some() || conn.token.is_some() || p.token.is_some() {
+            return Err(RpcError::new(
+                codes::UNAUTHORIZED,
+                "A device token cannot widen this connection's identity",
+            ));
+        }
+        let device = hub
+            .device_auth()
+            .and_then(|a| a.authenticate(&token))
+            .map_err(|_| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
+        conn.client = format!("device:{}", device.id);
+        conn.device = Some(device);
+        return Ok(
+            json!({"client":conn.client,"identity":format!("user:{}",conn.client),"workspace":hub.workspace()}),
+        );
+    }
+    if conn.device.is_some() {
+        return Err(RpcError::new(
+            codes::UNAUTHORIZED,
+            "A device connection cannot become a local user",
+        ));
+    }
     if let Some(token) = &p.token {
         let orchestrator = hub.orchestrator_token_runtime(token);
         let orchestrator_thread = hub.orchestrator_thread();
@@ -2702,6 +2769,45 @@ fn call(
 ) -> Result<Value, RpcError> {
     let client = conn.client.clone();
     match method {
+        "device.pair_begin" => {
+            let auth = hub
+                .device_auth()
+                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+            let scopes: Vec<String> = p
+                .get("scopes")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?
+                .unwrap_or_else(|| vec!["read".into(), "operate".into()]);
+            let code = auth
+                .begin(scopes)
+                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+            Ok(json!({"code":code,"expires_in":300}))
+        }
+        "device.pair_complete" => {
+            let auth = hub
+                .device_auth()
+                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+            let (device, token) = auth
+                .pair(
+                    p["code"].as_str().unwrap_or(""),
+                    p["name"].as_str().unwrap_or(""),
+                )
+                .map_err(|e| RpcError::new(codes::UNAUTHORIZED, e.to_string()))?;
+            tracing::info!(device=%device.id,name=%device.name,"Mobile device paired");
+            Ok(json!({"id":device.id,"name":device.name,"scopes":device.scopes,"token":token}))
+        }
+        "device.list" => hub
+            .device_auth()
+            .and_then(|a| a.devices())
+            .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string())),
+        "device.revoke" => {
+            hub.device_auth()
+                .and_then(|a| a.revoke(p["id"].as_str().unwrap_or("")))
+                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+            Ok(json!({"ok":true}))
+        }
         "hub.info" => {
             // The orchestrator and agents see less of the boxes (`hub::box_agents`).
             let mut info = hub.info_for(box_view(conn, caller));
@@ -3200,6 +3306,7 @@ mod tests {
         let me = std::process::id();
         Conn {
             client: "c".into(),
+            device: None,
             token: Some("t".into()),
             agent: None,
             peer: Some(me),
@@ -3209,6 +3316,50 @@ mod tests {
             }),
             id: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn device_identity_is_scoped_revocable_and_cannot_widen_an_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = HubOptions::new(dir.path().join("twr.db"), Config::default());
+        options.config_file = Some(dir.path().join("config.toml"));
+        let hub = Hub::open(options).await.unwrap();
+        let auth = hub.device_auth().unwrap();
+        let code = auth.begin(vec!["read".into(), "operate".into()]).unwrap();
+        let (device, token) = auth.pair(&code, "Test phone").unwrap();
+        let mut local = conn(None);
+        local.token = None;
+        let result = hello(
+            &hub,
+            &mut local,
+            json!({"client":"mobile-test","protocol":PROTOCOL_VERSION,"device_token":token}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["identity"], format!("user:device:{}", device.id));
+        assert!(local.device.as_ref().unwrap().allows("attention.respond"));
+        assert!(!local.device.as_ref().unwrap().allows("box.token"));
+        assert!(!local.device.as_ref().unwrap().allows("shell.run"));
+        assert!(hello(
+            &hub,
+            &mut local,
+            json!({"client":"cli","protocol":PROTOCOL_VERSION})
+        )
+        .await
+        .is_err());
+        let mut agent = conn(None);
+        agent.token = None;
+        agent.agent = Some(AgentPeer::unidentified());
+        assert!(hello(
+            &hub,
+            &mut agent,
+            json!({"client":"mobile-test","protocol":PROTOCOL_VERSION,"device_token":token})
+        )
+        .await
+        .is_err());
+        auth.revoke(&device.id).unwrap();
+        assert!(!auth.current(local.device.as_ref().unwrap()));
+        assert!(auth.authenticate(&token).is_err());
     }
 
     /// A peer whose credentials cannot be read, or name no pid the hub can see, is no user: it
@@ -3236,6 +3387,7 @@ mod tests {
         .unwrap();
         let c = Conn {
             client: "c".into(),
+            device: None,
             token: None,
             agent: Some(AgentPeer::unidentified()),
             peer: None,

@@ -12,7 +12,7 @@ For a repository you don't trust, use the runtime's own sandbox, or run the agen
 
 ## Who is the user on the hub's socket
 
-Every client (the TUI, the CLI, the orchestrator's MCP server, a script) talks to the hub over one Unix socket. The socket is mode 0600, so only your user can connect (twr creates a missing parent directory at 0700; a directory you name that already exists keeps its own permissions, within the limits in [The socket and the config file](#the-socket-and-the-config-file)). Within your user, the hub decides for each connection, when it opens, whether it comes from you, from the orchestrator or from an agent.
+Local clients (the TUI, CLI, desktop app, orchestrator's MCP server and scripts) talk to the hub over one Unix socket. Remote mobile clients reach a separate authenticated gateway, described below. The socket is mode 0600, so only your user can connect (twr creates a missing parent directory at 0700; a directory you name that already exists keeps its own permissions, within the limits in [The socket and the config file](#the-socket-and-the-config-file)). Within your user, the hub decides for each connection, when it opens, whether it comes from you, from the orchestrator or from an agent.
 
 ### Agents
 
@@ -41,6 +41,35 @@ A connection may hold at most 16 subscriptions (`control.subscribe`, `thread.sub
 ### The orchestrator
 
 The hub gives each orchestrator process a fresh token (32 random bytes), passed to its MCP server in a file only you can read and never on a command line or in the runtime's environment. A connection that presents it is the orchestrator, but only when its process descends from the current orchestrator runtime and is still the process that opened the connection; the hub walks the ancestry again at every request. A token presented by any other process, an agent's included, is refused. The orchestrator may call only its own list of methods, described next.
+
+## Graphical clients and paired devices
+
+The desktop app is another local hub client. Its renderer has no Node access; validated
+main-frame IPC reaches the Rust companion. Untrusted Markdown has no raw HTML or remote
+images. Embedded terminals run commands with your authority. Closing the client leaves
+the hub and its agents running.
+
+The optional mobile gateway adds a network trust boundary. Production connections require
+HTTPS/WSS with a certificate the device trusts. A local owner grants a short-lived,
+one-use pairing code and chooses device capabilities: read and operate, with terminal and
+admin access separately granted. A bearer credential is checked before WebSocket upgrade;
+the hub also validates the paired identity and method scope, so bypassing a hidden UI
+control grants nothing. Unknown methods are refused. Agents and the orchestrator cannot
+use device credentials to gain user authority, and devices cannot pair more devices.
+
+Capabilities are authority over twr, not OS isolation: operate can direct agents using the
+hub's configured modes; terminal permits host commands. Store credentials in the native
+Keychain/Keystore, not the web renderer. The companion receives them over stdin. The host
+keeps token hashes in owner-private device state and checks revocation during connections.
+Same-user processes that can alter this state remain outside the boundary, like other
+processes indistinguishable from you. Use OS isolation for untrusted agents.
+
+Remote approvals retain exact request revisions. Notification actions only open the item;
+push payloads contain routing metadata rather than prompts or request text. Uploads are
+size- and SHA-256-checked, avoid symlinks and commit atomically into private upload folders
+in local worktrees. Pending mutation receipts prevent duplicate execution across socket
+reconnects within their retention period. See [mobile.md](mobile.md) for limits, scopes,
+revocation, gateway lifecycle and the unsupported remote-box upload case.
 
 ## The orchestrator
 

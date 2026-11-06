@@ -7,6 +7,10 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [install.md](install.md) | the install script and its options, release builds and platforms, building from source, static builds, where twr keeps its files |
 | [usage.md](usage.md) | a session from start to end: threads, `say` and `send`, answering cards, reports, attach, park, standing context, the event log |
 | [tui.md](tui.md) | the stack, grid and decision views, keys, slash commands, notifications |
+| [desktop.md](desktop.md) | the macOS and Linux client, CLI workflows, shared architecture and packaging |
+| [mobile.md](mobile.md) | iOS, Android, remote hubs, pairing, uploads and notification configuration |
+| [desktop-qa.md](desktop-qa.md) | tested desktop workflows, visual checks and feature-parity limits |
+| [performance.md](performance.md) | application performance measurements, improvements and reproduction |
 | [read-aloud.md](read-aloud.md) | reading the orchestrator's messages aloud: `/read`, speakers, `twr speak` and `twr remote` over SSH and mosh, engines |
 | [notifications.md](notifications.md) | the hub's notification command: what it's told and when, ntfy, desktop and Slack recipes |
 | [configuration.md](configuration.md) | every key in `config.toml` with its default, and the environment variables |

@@ -36,6 +36,7 @@ CI also runs the tests on macOS, `cargo deny check` and actionlint ([docs/develo
 Notes on the tests:
 
 - They need no agent CLI installed or signed in: they use a scripted fake runtime and recorded Claude Code, Codex and Grok Build sessions (`crates/twr-adapters/tests/fixtures/`).
+- Push-signing interoperability tests use the OpenSSL command-line tool to generate disposable test keys and verify signatures. No provider credentials are needed; application binaries still use rustls and AWS-LC rather than linking OpenSSL.
 - They run inside a twr thread too, as a [job](docs/usage.md#jobs) for example: `twr job run --slots 2 -- cargo test --workspace`. [docs/development.md](docs/development.md#tests-inside-a-twr-thread) explains the test token that makes this work and why only debug builds honour it.
 - On macOS, `$TMPDIR` is under `/var`, a symlink to `/private/var`. git and twr report resolved paths while the tests compare them with the paths they created, so point `TMPDIR` at a directory without symlinks before you run the tests. CI does the same.
 - macOS reads the process table with `ps`, and Linux reads `/proc`. To run the stale-process tests with the `ps` code on Linux: `RUSTFLAGS="--cfg twr_ps" cargo test -p twr-runner`.

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/twr-desktop/twr-desktop --class=tools.twr.desktop "$@"

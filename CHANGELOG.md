@@ -4,6 +4,15 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- Desktop hub clients for Apple Silicon macOS and x86_64 Linux, with embedded terminals, generated CLI forms, shared thread and attention views, and Dark, Light and System appearance. Linux packages include AppImage, Debian and Arch/Omarchy builds. See [desktop.md](docs/desktop.md).
+- iOS and Android hub clients using the same interface, with responsive folding layouts, paired remote hubs, native credential storage, file uploads and optional APNs/FCM push delivery. The separate gateway enforces device scopes and revocation; notifications open requests without answering them. See [mobile.md](docs/mobile.md).
+
+### Changed
+
+- Graphical clients and the TUI share command parsing, card ordering, configuration editing and routine-update handling. Hub RPC pooling, bounded message previews and executable hashing reduce startup allocation and streaming work. See [performance.md](docs/performance.md).
+
 ## [0.3.0] - 2026-10-30
 
 Remote boxes over SSH, in a container or dialling in; several accounts per runtime; the orchestrator's memory on every runtime; reading aloud; context and log compaction, and faster starts on a long history; what each thread has in flight, with hung-turn cards judged by it; one Threads sidebar; and cards answered on a phone however long they are.

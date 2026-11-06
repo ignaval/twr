@@ -1,0 +1,3304 @@
+[
+  {
+    "id": "cli:account add",
+    "title": "twr account add",
+    "description": "Add an account: make its directory (mode 700), link the native account's settings into it (--share config, the default), run the runtime's login in this terminal with the account's variable set (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`), then record it in the hub. An account config.toml declares is set up and logged in the same way, and nothing is recorded",
+    "group": "CLI · account",
+    "fields": [
+      {
+        "key": "runtime",
+        "label": "runtime",
+        "type": "text",
+        "required": true,
+        "description": "`claude-code` (or `claude`), `codex`, `grok-build` (or `grok`)"
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The account's name: letters, digits, `-`, `_`, `.`"
+      },
+      {
+        "key": "login_args",
+        "label": "login args",
+        "type": "words",
+        "required": false,
+        "description": "Arguments for the runtime's login command (after `--`), such as `--console`"
+      },
+      {
+        "key": "dir",
+        "label": "dir",
+        "type": "text",
+        "description": "Its directory (default: `<data>/accounts/<runtime>/<name>`): an empty one, or a config directory that is already logged in",
+        "advanced": false
+      },
+      {
+        "key": "share",
+        "label": "share",
+        "type": "select",
+        "description": "What it shares with the native account: `config` (settings, instructions, skills; never the login or the sessions) or `none` [possible values: none, config]",
+        "advanced": false,
+        "options": [
+          "none",
+          "config"
+        ]
+      },
+      {
+        "key": "native-name",
+        "label": "native name",
+        "type": "text",
+        "description": "Name the runtime's current login (the native account) this, instead of being asked (default: `default`)",
+        "advanced": false
+      },
+      {
+        "key": "device",
+        "label": "device",
+        "type": "boolean",
+        "description": "Log in with a device code (Codex, Grok Build: no browser opens, over ssh)",
+        "advanced": false
+      },
+      {
+        "key": "no-login",
+        "label": "no login",
+        "type": "boolean",
+        "description": "Set the account up without logging in (`twr account login` does it later)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "account",
+      "add"
+    ],
+    "cliFields": [
+      {
+        "key": "runtime",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "login_args",
+        "many": true,
+        "separator": true,
+        "literal": false
+      },
+      {
+        "key": "dir",
+        "flag": "--dir",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "share",
+        "flag": "--share",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "native-name",
+        "flag": "--native-name",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "device",
+        "flag": "--device",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "no-login",
+        "flag": "--no-login",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:account list",
+    "title": "twr account list",
+    "description": "List every runtime's accounts: where each is declared (config.toml, twr's records), its last login check, the threads on it and its directory. A runtime whose only account is its own login, never checked, is left out",
+    "group": "CLI · account",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `account.list` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "account",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:account login",
+    "title": "twr account login",
+    "description": "Sign an account in again (after an expiry or a logout), in this terminal. The native account signs in where the hub's threads on it run: with the hub's `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `GROK_HOME`, or without it when the hub has none",
+    "group": "CLI · account",
+    "fields": [
+      {
+        "key": "runtime",
+        "label": "runtime",
+        "type": "text",
+        "required": true,
+        "description": "The runtime"
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The account's name"
+      },
+      {
+        "key": "login_args",
+        "label": "login args",
+        "type": "words",
+        "required": false,
+        "description": "Arguments for the runtime's login command (after `--`)"
+      },
+      {
+        "key": "device",
+        "label": "device",
+        "type": "boolean",
+        "description": "Log in with a device code (Codex, Grok Build)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "account",
+      "login"
+    ],
+    "cliFields": [
+      {
+        "key": "runtime",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "login_args",
+        "many": true,
+        "separator": true,
+        "literal": false
+      },
+      {
+        "key": "device",
+        "flag": "--device",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:account name-native",
+    "title": "twr account name-native",
+    "description": "Name the runtime's own login (the native account) without adding another",
+    "group": "CLI · account",
+    "fields": [
+      {
+        "key": "runtime",
+        "label": "runtime",
+        "type": "text",
+        "required": true,
+        "description": "The runtime"
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The name"
+      }
+    ],
+    "cli": [
+      "account",
+      "name-native"
+    ],
+    "cliFields": [
+      {
+        "key": "runtime",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:account remove",
+    "title": "twr account remove",
+    "description": "Remove an account. Threads on it need --move-to (each moves, with a handoff) or --force (they keep it and cannot start until moved). Its directory stays unless --purge; `twr account add --dir` can adopt it again",
+    "group": "CLI · account",
+    "fields": [
+      {
+        "key": "runtime",
+        "label": "runtime",
+        "type": "text",
+        "required": true,
+        "description": "The runtime"
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The account's name"
+      },
+      {
+        "key": "move-to",
+        "label": "move to",
+        "type": "text",
+        "description": "Move its threads to this account of the runtime first",
+        "advanced": false
+      },
+      {
+        "key": "force",
+        "label": "force",
+        "type": "boolean",
+        "description": "Remove it although threads run on it",
+        "advanced": false
+      },
+      {
+        "key": "logout",
+        "label": "logout",
+        "type": "boolean",
+        "description": "Run the runtime's logout in the account's directory too, once no thread's runtime runs on it (a moved thread finishes its turn first; waited for up to 10 minutes)",
+        "advanced": false
+      },
+      {
+        "key": "purge",
+        "label": "purge",
+        "type": "boolean",
+        "description": "Delete the account's directory too (only one under twr's accounts directory), after asking y/N (without a terminal, only with --yes), once no thread's runtime runs on it, as --logout waits",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "account",
+      "remove"
+    ],
+    "cliFields": [
+      {
+        "key": "runtime",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "move-to",
+        "flag": "--move-to",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "force",
+        "flag": "--force",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "logout",
+        "flag": "--logout",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "purge",
+        "flag": "--purge",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:account status",
+    "title": "twr account status",
+    "description": "Check the accounts' logins again now (all, a runtime's, or one: `claude-code:work`) and list them, with each named account's links to the native directory and the variables of this environment a named account does not get",
+    "group": "CLI · account",
+    "fields": [
+      {
+        "key": "target",
+        "label": "target",
+        "type": "text",
+        "required": false,
+        "description": "`<runtime>` or `<runtime>:<name>` (`claude` and `grok` work for `claude-code` and `grok-build`)"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `account.status` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "account",
+      "status"
+    ],
+    "cliFields": [
+      {
+        "key": "target",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:attach",
+    "title": "twr attach",
+    "description": "Open the thread's runtime in its own interactive CLI, in this terminal. The thread's headless runtime is stopped first; prompts sent meanwhile wait until you exit",
+    "group": "CLI · attach",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "force",
+        "label": "force",
+        "type": "boolean",
+        "description": "Interrupt a running turn, or stop background tasks, instead of refusing",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "attach"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "force",
+        "flag": "--force",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:attention",
+    "title": "twr attention",
+    "description": "List open attention items (by default the ones blocking a thread: permission, question)",
+    "group": "CLI · attention",
+    "fields": [
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Also list error, review and stalled items",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "attention"
+    ],
+    "cliFields": [
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:attention dismiss",
+    "title": "twr attention dismiss",
+    "description": "Dismiss an item the hub raised (a \"which thread?\" question, a review, an error, a stalled notice): it closes without an answer and a question's message goes nowhere. A runtime's permission or question cannot be dismissed (the runtime waits for it): answer it with `twr respond`, or stop the thread",
+    "group": "CLI · attention",
+    "fields": [
+      {
+        "key": "target",
+        "label": "target",
+        "type": "text",
+        "required": true,
+        "description": "`<attn_id>@<revision>` as `twr attention --all` lists it (or a bare attn_id)"
+      }
+    ],
+    "cli": [
+      "attention",
+      "dismiss"
+    ],
+    "cliFields": [
+      {
+        "key": "target",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box add",
+    "title": "twr box add",
+    "description": "Add a box the hub reaches over SSH, or through a command (--command: a container): no token, listener or tunnel. Probes the box with ssh in this terminal (ssh may ask about its host key or for a passphrase), checks that ssh also works without prompting (the hub's never prompts), says what will happen and asks y/N (without a terminal, only with --yes). A command is probed as the hub runs it: without a terminal, so nothing it runs may prompt, and checked to pass the hub's input to the box (`-i`) without giving it a terminal (no `-t`). Then writes `[boxes.<name>]` to boxes.toml, next to config.toml, and adds the box to the running hub (starting one when none runs). The hub installs its own twr build on the box (same OS and CPU; else run `twr box install <name>`), connects and starts a twr box daemon there, which runs the box's threads. Waits up to 90 s for the box to come online. Boxes belong to the default workspace.",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name: letters, digits, `.`, `_` or `-` (not starting with `.` or `-`; not `local`)"
+      },
+      {
+        "key": "ssh",
+        "label": "ssh",
+        "type": "words",
+        "required": false,
+        "description": "The ssh destination (`me@host`, or a host from `~/.ssh/config`), with any ssh options before it (`-p 2222 me@host`): one argument or several words, joined with spaces. With --command, the command the hub runs to reach the box (`docker exec -i <container>`), its words passed as they are, not through a shell. None with --dial-in"
+      },
+      {
+        "key": "dial-in",
+        "label": "dial in",
+        "type": "boolean",
+        "description": "A dial-in box: its runner connects to the hub (`twr runner install-token` on the box). Given before any other word, with --hub",
+        "advanced": false
+      },
+      {
+        "key": "hub",
+        "label": "hub",
+        "type": "text",
+        "description": "With --dial-in: the URL the box's runner dials to reach this hub's listener: `wss://` (Tailscale serve, or `[hub] tls`), or `ws://` to a loopback address (an ssh tunnel's end on the box)",
+        "advanced": false
+      },
+      {
+        "key": "ca",
+        "label": "ca",
+        "type": "text",
+        "description": "With --dial-in and a wss:// URL: the CA certificate (PEM) the box's runner trusts, by its absolute path on the box",
+        "advanced": false
+      },
+      {
+        "key": "command",
+        "label": "command",
+        "type": "boolean",
+        "description": "The words are the command the hub runs to reach the box (`docker exec -i <container>`, `kubectl exec -i -n <ns> <pod> --`), with `sh -c <what ssh would run>` appended, instead of an ssh destination. Given before the words. For `docker`, `podman` and `nerdctl exec -i` and `kubectl exec -i`, the same command with `-t` becomes its terminal_command (for `twr box login` and `twr box project --clone`)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "box",
+      "add"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "ssh",
+        "many": true,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "dial-in",
+        "flag": "--dial-in",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "hub",
+        "flag": "--hub",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "ca",
+        "flag": "--ca",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "command",
+        "flag": "--command",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box doctor",
+    "title": "twr box doctor",
+    "description": "Check a box and say how to fix what is wrong: the hub's view of it (when a hub runs), ssh without prompting (as the hub runs it) and in this terminal (a command box: its command, and that it passes the hub's input without a terminal), the box's OS, CPU, data directory and twr builds, its box daemon, logind (Linux), its agent CLIs (path, version, login), git, free disk, and the projects configured for it. Works without a hub and with the box offline. The checks on the box run the hub's twr build when it is there, else the box's configured build, else the newest one there, and say which. Never shows account details. Exits 1 when a check failed (✗)",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the checks as JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "box",
+      "doctor"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box install",
+    "title": "twr box install",
+    "description": "Install twr on a box the hub connects to (ssh or command) and have the hub connect to it again. On a box of the hub's OS and CPU the hub installs its own build. On another one: with --binary, that file; with --from-box, a twr already on the box (built there with docs/tools/dev-install.sh, say); otherwise, when the hub runs a release, the release's archive for the box (its signed checksums verified as `twr update` verifies them), unpacked on the box. The build is recorded as the box's `build` in boxes.toml (a box of config.toml: the line to add is printed). Asks y/N before installing (without a terminal, only with --yes). Waits up to 90 s for the box to come online; a box online on another build is switched once it has been quiet for 2 minutes, and that is waited for too (at most about an hour and a half, printing the box's notes meanwhile; about two hours when its daemon speaks an older runner protocol that the hub drains first, letting its running turns finish)",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      },
+      {
+        "key": "binary",
+        "label": "binary",
+        "type": "text",
+        "description": "A twr executable built for the box's OS and CPU, to upload instead of a release's",
+        "advanced": false
+      },
+      {
+        "key": "from-box",
+        "label": "from box",
+        "type": "text",
+        "description": "A twr executable already on the box, by its absolute path there (on the box, `command -v twr` or `echo ~/.local/bin/twr` prints it), copied into the builds directory with its checks",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "box",
+      "install"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "binary",
+        "flag": "--binary",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "from-box",
+        "flag": "--from-box",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box list",
+    "title": "twr box list",
+    "description": "List the hub's remote boxes: name, transport (`ssh` or `command`: the hub connects to it; `token`: its runner connects to the hub), state, the twr version its runner reported, its OS and CPU (boxes the hub connects to), and its agent CLIs as it last reported them (`claude ✓`: logged in, `✗`: logged out, `?`: not known, `-`: not installed)",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the boxes of `hub.info` as JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "box",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box login",
+    "title": "twr box login",
+    "description": "Start an agent CLI's own login on a box, in this terminal: `claude auth login`, `codex login --device-auth` or `grok login --device-auth`, over ssh with a terminal (a command box: its terminal_command), run by the box's twr build (as `twr box doctor` picks it) on the program the box's runner would start. twr never sees what you type. Then says whether the agent is logged in (the box daemon's view through the hub when one runs, else the box's). Needs a terminal",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      },
+      {
+        "key": "agent",
+        "label": "agent",
+        "type": "select",
+        "required": true,
+        "description": "The agent: claude, codex or grok [possible values: claude, claude-code, codex, grok, grok-build]",
+        "options": [
+          "claude",
+          "claude-code",
+          "codex",
+          "grok",
+          "grok-build"
+        ]
+      }
+    ],
+    "cli": [
+      "box",
+      "login"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "agent",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box project",
+    "title": "twr box project",
+    "description": "Find a project's repository on a box, or clone it there, and record where it is (`[boxes.<box>.projects.<project>] repo`, in boxes.toml), so that `twr thread new <project> --box <box>` uses it. The project is a configured one, or a repository folder name under project_roots, as `twr thread new` finds it on this machine. Without options, the box's twr build (as `twr box doctor` picks it) looks at the path the repository has under your home here, under the box's home, then under the box's ~/code, ~/src, ... for a repository of that folder name, and reads each one's origin. When exactly one has the project's origin and the search was complete, it asks y/N (--yes: it doesn't) and records it; otherwise it lists them, and --path picks one. --path records the repository there once the box says it is one (its top level). --clone runs `git clone` of the project's origin on the box, in this terminal, with the box's own git credentials (no agent forwarding), then records the clone; it needs a terminal (and on a command box, its terminal_command). twr never fetches. A running hub takes the change at once",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      },
+      {
+        "key": "project",
+        "label": "project",
+        "type": "text",
+        "required": true,
+        "description": "The project: a configured project, or a repository folder name under project_roots"
+      },
+      {
+        "key": "path",
+        "label": "path",
+        "type": "text",
+        "description": "The repository's absolute path on the box (its top level)",
+        "advanced": false
+      },
+      {
+        "key": "clone",
+        "label": "clone",
+        "type": "boolean",
+        "description": "Clone the project's origin on the box (https://, ssh:// or user@host:path, without credentials), in this terminal, then record the clone",
+        "advanced": false
+      },
+      {
+        "key": "into",
+        "label": "into",
+        "type": "text",
+        "description": "With --clone: the clone's own new directory on the box, as `git clone <url> <dir>` takes it (its parent must exist; its name: letters, digits, `-`, `_` and `.`). Default: where the repository is under your home here, under the box's home; else ~/code/<the repository's folder name>",
+        "advanced": false
+      },
+      {
+        "key": "remove",
+        "label": "remove",
+        "type": "boolean",
+        "description": "Remove the project's entry for the box",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "box",
+      "project"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "project",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "path",
+        "flag": "--path",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "clone",
+        "flag": "--clone",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "into",
+        "flag": "--into",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "remove",
+        "flag": "--remove",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box remove",
+    "title": "twr box remove",
+    "description": "Remove a box from boxes.toml (a box of config.toml: remove it there). The running hub keeps the box until it restarts; the box daemon and the box's worktrees stay on the box (the command that stops the daemon is printed), and a command box's container stays as it is (twr never stops or removes one). A token box's runner is no longer accepted from then on (the hub drops its connection), and how to stop it on the box is printed",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      }
+    ],
+    "cli": [
+      "box",
+      "remove"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box restart",
+    "title": "twr box restart",
+    "description": "Restart the daemon of a box the hub connects to (ssh or command): the hub ends its connection to the box and connects again, having the box stop its daemon (and the agents it runs) and start a new one. On a Mac, after someone logged in at its screen, the new daemon runs in that GUI session, where Claude Code can read its keychain login. Asks y/N first (without a terminal, only with --yes), then waits for the box to come back online (as long as the hub's attempts may take: an hour and twenty minutes at most, when the old daemon has a repository change to finish and a build to upload, printing the box's notes meanwhile) and says how its daemon was started. While the hub drains the box (its daemon speaks an older runner protocol), the restart stops its agents cleanly first, as the drain would: no crash",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      }
+    ],
+    "cli": [
+      "box",
+      "restart"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box status",
+    "title": "twr box status",
+    "description": "Show what the hub knows of a box: its state, a drain (its runner speaks an older runner protocol: how far it is, until when, and what to do), the twr version and build it runs, its OS and CPU, the last error, its latest notes, a connection the hub refused, and its agent CLIs (path, version, login)",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the box's entry of `hub.info` as JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "box",
+      "status"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box token",
+    "title": "twr box token",
+    "description": "Print a token box's token (from boxes.toml, or config.toml for a box configured there), and nothing else on stdout, a pipe included: `ssh me@hub twr box token gpu | twr runner install-token gpu --yes` on a box that can ssh to the hub. --rotate replaces it with a new one (asks y/N first; without a terminal, only with --yes): the running hub stops accepting the old one at once and drops the box's connection, until the new one is installed on the box. --reload has the running hub take the box's token from the files again (after an edit of config.toml)",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The box's name"
+      },
+      {
+        "key": "rotate",
+        "label": "rotate",
+        "type": "boolean",
+        "description": "Replace the token with a new one (boxes.toml boxes only)",
+        "advanced": false
+      },
+      {
+        "key": "reload",
+        "label": "reload",
+        "type": "boolean",
+        "description": "Have the running hub read the box's token from the files again",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "box",
+      "token"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "rotate",
+        "flag": "--rotate",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "reload",
+        "flag": "--reload",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:compact",
+    "title": "twr compact",
+    "description": "Compact a thread's context, as its agent's own /compact does: a turn of its own, now or after its running turn and the messages queued before. Claude Code, Codex and Grok Build threads on this machine; refused for other runtimes and remote boxes",
+    "group": "CLI · compact",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "offers",
+        "label": "offers",
+        "type": "select",
+        "description": "Instead of compacting: turn automatic compaction of this thread's context once its prompt cache expired on or off (`[threads] idle_compaction`). The flag keeps its legacy name for compatibility [possible values: on, off]",
+        "advanced": false,
+        "options": [
+          "on",
+          "off"
+        ]
+      }
+    ],
+    "cli": [
+      "compact"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "offers",
+        "flag": "--offers",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:context edit",
+    "title": "twr context edit",
+    "description": "Edit a copy in `$VISUAL` / `$EDITOR` (else `vi`); the hub records and writes it when the editor exits successfully and the text changed",
+    "group": "CLI · context",
+    "fields": [
+      {
+        "key": "project",
+        "label": "project",
+        "type": "text",
+        "required": true,
+        "description": "A configured project name, or the project of a thread"
+      }
+    ],
+    "cli": [
+      "context",
+      "edit"
+    ],
+    "cliFields": [
+      {
+        "key": "project",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:context show",
+    "title": "twr context show",
+    "description": "Print the standing context",
+    "group": "CLI · context",
+    "fields": [
+      {
+        "key": "project",
+        "label": "project",
+        "type": "text",
+        "required": true,
+        "description": "A configured project name, or the project of a thread"
+      }
+    ],
+    "cli": [
+      "context",
+      "show"
+    ],
+    "cliFields": [
+      {
+        "key": "project",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:control",
+    "title": "twr control",
+    "description": "Print the hub control stream as NDJSON",
+    "group": "CLI · control",
+    "fields": [
+      {
+        "key": "follow",
+        "label": "follow",
+        "type": "boolean",
+        "description": "Keep streaming new items",
+        "advanced": false
+      },
+      {
+        "key": "since",
+        "label": "since",
+        "type": "text",
+        "description": "Only items with gseq greater than N [default: 0]",
+        "advanced": false
+      },
+      {
+        "key": "pretty",
+        "label": "pretty",
+        "type": "boolean",
+        "description": "One human-readable line per item",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "control"
+    ],
+    "cliFields": [
+      {
+        "key": "follow",
+        "flag": "--follow",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "since",
+        "flag": "--since",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "pretty",
+        "flag": "--pretty",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:delete",
+    "title": "twr delete",
+    "description": "Delete threads: stop each one's runtime and move its worktree (uncommitted changes too, or only its record when a park removed it) and its recorded branch (`twr/<its name when the worktree was made>`: a rename does not change it) to the trash of its box (`twr trash`: purged after `[trash] keep_days`, 7 by default; `twr trash restore` brings a thread back); parked and stopped threads too. The hub raises one delete card for them saying what goes, and nothing is deleted until you confirm it: on a terminal this asks y/N (n answers Cancel; an empty reply leaves the card open); without one the card waits for `twr respond` or the TUI unless --yes. Once confirmed, waits until each thread is gone or failed",
+    "group": "CLI · delete",
+    "fields": [
+      {
+        "key": "threads",
+        "label": "threads",
+        "type": "words",
+        "required": true,
+        "description": "Thread ids, names, aliases or unique prefixes (one or more)"
+      }
+    ],
+    "cli": [
+      "delete"
+    ],
+    "cliFields": [
+      {
+        "key": "threads",
+        "many": true,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:events",
+    "title": "twr events",
+    "description": "Print a thread's events as NDJSON",
+    "group": "CLI · events",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "follow",
+        "label": "follow",
+        "type": "boolean",
+        "description": "Keep streaming new events",
+        "advanced": false
+      },
+      {
+        "key": "since",
+        "label": "since",
+        "type": "text",
+        "description": "Only events with seq greater than N [default: 0]",
+        "advanced": false
+      },
+      {
+        "key": "hydrate",
+        "label": "hydrate",
+        "type": "boolean",
+        "description": "Restore payload fields that were moved to the blob store",
+        "advanced": true
+      },
+      {
+        "key": "pretty",
+        "label": "pretty",
+        "type": "boolean",
+        "description": "One human-readable line per event",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "events"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "follow",
+        "flag": "--follow",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "since",
+        "flag": "--since",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "hydrate",
+        "flag": "--hydrate",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "pretty",
+        "flag": "--pretty",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:hub stop",
+    "title": "twr hub stop",
+    "description": "Stop the running hub (`hub.shutdown`) and wait until it has exited. It stops its local runtimes first, so their turns end; threads on remote boxes keep running under their runners. Nothing to do when no hub is running",
+    "group": "CLI · hub",
+    "fields": [
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Stop default and every named workspace in this home, ignoring -w/TWR_WORKSPACE. Uses hub.socket for default and the standard named sockets; a hub on another --socket is reported as failed (stop it separately with --socket). Other TWR_HOME instances are not included. Prints each result; exits non-zero if any failed",
+        "advanced": false
+      },
+      {
+        "key": "timeout",
+        "label": "timeout",
+        "type": "text",
+        "description": "How long to wait for the hub to exit, in seconds (per workspace with --all) [default: 30]",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "hub",
+      "stop"
+    ],
+    "cliFields": [
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "timeout",
+        "flag": "--timeout",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:info",
+    "title": "twr info",
+    "description": "Show what the running hub reports about itself (`hub.info`): version, boxes, orchestrator, and warnings about the config it started with (a short box token, a config file holding secrets that other users can access)",
+    "group": "CLI · info",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `hub.info` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "info"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:job cancel",
+    "title": "twr job cancel",
+    "description": "Cancel a queued or running job (its process group gets SIGTERM, then SIGKILL)",
+    "group": "CLI · job",
+    "fields": [
+      {
+        "key": "job",
+        "label": "job",
+        "type": "text",
+        "required": true,
+        "description": "The job's id, or a unique start of it"
+      }
+    ],
+    "cli": [
+      "job",
+      "cancel"
+    ],
+    "cliFields": [
+      {
+        "key": "job",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:job list",
+    "title": "twr job list",
+    "description": "List the queued and running jobs",
+    "group": "CLI · job",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "description": "Only this thread's",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `job.list` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "job",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "flag": "--thread",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:job log",
+    "title": "twr job log",
+    "description": "Print the end of a job's output",
+    "group": "CLI · job",
+    "fields": [
+      {
+        "key": "job",
+        "label": "job",
+        "type": "text",
+        "required": true,
+        "description": "The job's id (a unique start of a queued or running one's)"
+      },
+      {
+        "key": "lines",
+        "label": "lines",
+        "type": "text",
+        "description": "How many lines (default 40)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "job",
+      "log"
+    ],
+    "cliFields": [
+      {
+        "key": "job",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "lines",
+        "flag": "--lines",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:job run",
+    "title": "twr job run",
+    "description": "Queue a command (no shell: `-- sh -c '...'` for one) to run in the thread's directory. Prints the job's id and returns at once; the thread gets a prompt when it ends",
+    "group": "CLI · job",
+    "fields": [
+      {
+        "key": "argv",
+        "label": "argv",
+        "type": "words",
+        "required": true,
+        "description": "The command and its arguments"
+      },
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "description": "The thread (default: `TWR_THREAD`, the thread an agent runs in)",
+        "advanced": false
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "description": "A short name for people (default: the command's first two words)",
+        "advanced": false
+      },
+      {
+        "key": "slots",
+        "label": "slots",
+        "type": "text",
+        "description": "Job slots it takes while it runs (default 1)",
+        "advanced": false
+      },
+      {
+        "key": "timeout",
+        "label": "timeout",
+        "type": "text",
+        "description": "Cancel it once it ran this long: 90s, 30m, 2h",
+        "advanced": false
+      },
+      {
+        "key": "no-wake",
+        "label": "no wake",
+        "type": "boolean",
+        "description": "Do not prompt the thread when it ends",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "job",
+      "run"
+    ],
+    "cliFields": [
+      {
+        "key": "argv",
+        "many": true,
+        "separator": true,
+        "literal": false
+      },
+      {
+        "key": "thread",
+        "flag": "--thread",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "name",
+        "flag": "--name",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "slots",
+        "flag": "--slots",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "timeout",
+        "flag": "--timeout",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "no-wake",
+        "flag": "--no-wake",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:log checkpoint",
+    "title": "twr log checkpoint",
+    "description": "Write a checkpoint of the hub's folded state for this build of twr, so that its hub's next start folds only what comes after it instead of the whole log. Run it after installing a new build while a hub of the old one still runs (`docs/tools/ dev-install.sh` does): checkpoints are kept per build, and a build uses only its own. Works whether or not the hub runs, never starts one, and leaves a database of another schema alone (the hub's start migrates it)",
+    "group": "CLI · log",
+    "fields": [
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Every workspace of this home, not only this one",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print one JSON object per workspace",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "log",
+      "checkpoint"
+    ],
+    "cliFields": [
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:log compact",
+    "title": "twr log compact",
+    "description": "Move the agent events `[log]` lets go (of turns older than `retention_days` whose reactions are done, and of deleted threads whose trash item is purged) and the blobs only they reach out of twr.db into archive.db now (or delete them, with `archive = false`). The hub does this every hour by itself when 2 000 rows or more can go",
+    "group": "CLI · log",
+    "fields": [
+      {
+        "key": "vacuum",
+        "label": "vacuum",
+        "type": "boolean",
+        "description": "Then rewrite twr.db whole (`VACUUM`), which gives the freed space back to the file system and turns on incremental vacuum for the next runs. The hub waits for it, doing nothing else meanwhile: 3 to 18 seconds for a 475 MB twr.db",
+        "advanced": false
+      },
+      {
+        "key": "drop-checkpoints",
+        "label": "drop checkpoints",
+        "type": "boolean",
+        "description": "Drop the hub's checkpoints of its state first (its next start folds the whole log)",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `log.compact` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "log",
+      "compact"
+    ],
+    "cliFields": [
+      {
+        "key": "vacuum",
+        "flag": "--vacuum",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "drop-checkpoints",
+        "flag": "--drop-checkpoints",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:log stats",
+    "title": "twr log stats",
+    "description": "Sizes of twr.db, its write-ahead log and archive.db, rows and bytes per kind, blobs, checkpoints, the control backlog (whole and compacted), and what the next compaction would move",
+    "group": "CLI · log",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `log.stats` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "log",
+      "stats"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:memory edit",
+    "title": "twr memory edit",
+    "description": "Edit a note (or write a new one) in `$VISUAL` / `$EDITOR` (else `vi`): its `description:` and `type:` lines, then its text. Saved when the editor exits successfully and the text changed; a note changed meanwhile is a conflict, never overwritten",
+    "group": "CLI · memory",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The note's name (lowercase words joined by -)"
+      }
+    ],
+    "cli": [
+      "memory",
+      "edit"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:memory list",
+    "title": "twr memory list",
+    "description": "List the notes: name, type, when saved, description; `!` marks a note the orchestrator saved in a turn you did not start (it may come from a worker's text)",
+    "group": "CLI · memory",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "As JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "memory",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:memory path",
+    "title": "twr memory path",
+    "description": "Print the memory's directory (one Markdown file per note)",
+    "group": "CLI · memory",
+    "fields": [],
+    "cli": [
+      "memory",
+      "path"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:memory rm",
+    "title": "twr memory rm",
+    "description": "Forget notes: their files are removed",
+    "group": "CLI · memory",
+    "fields": [
+      {
+        "key": "names",
+        "label": "names",
+        "type": "words",
+        "required": true,
+        "description": "The notes' names"
+      }
+    ],
+    "cli": [
+      "memory",
+      "rm"
+    ],
+    "cliFields": [
+      {
+        "key": "names",
+        "many": true,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:memory show",
+    "title": "twr memory show",
+    "description": "Print a note",
+    "group": "CLI · memory",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The note's name"
+      }
+    ],
+    "cli": [
+      "memory",
+      "show"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:mode",
+    "title": "twr mode",
+    "description": "Set a thread's permission mode (`auto`, `plan`, `manual`, `acceptEdits`, `read-only`, `dontAsk`, `bypassPermissions`, or the runtime's own). A running runtime finishes its turn first, then restarts on the same session in the new mode; an idle one restarts now; a parked or stopped one starts in it next time. Not for the orchestrator (switch it with `twr orchestrator use`)",
+    "group": "CLI · mode",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "mode",
+        "label": "mode",
+        "type": "text",
+        "required": true,
+        "description": "The permission mode"
+      }
+    ],
+    "cli": [
+      "mode"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "mode",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:model",
+    "title": "twr model",
+    "description": "Show or set a thread's runtime, model and reasoning effort. With only the thread, shows them. The model is the runtime's own id or alias (Claude Code: `fable`, `opus`, `sonnet`, or a full id such as `claude-fable-5-1`); `default` returns the model or the effort to the runtime's default (once the thread has a session, only where a resumed session takes it: Claude Code's effort; the hub refuses the rest, except with `--runtime`). A running runtime finishes its turn first, then restarts on the same session with them; an idle one restarts now; a parked or stopped one starts with them next time. With `--runtime`, the thread moves to that runtime: its current runtime stops (after the turn it runs), and its next turn starts a new session of the new one, given a handoff of what the previous session did; a model or effort left out is the new runtime's default. Moving back to a runtime it left a session of resumes that session instead, told what the thread did since, with the settings it had (`default` starts a new one). Not for the orchestrator (switch it with `twr orchestrator use`); a pty thread can only move to another runtime",
+    "group": "CLI · model",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "model",
+        "label": "model",
+        "type": "text",
+        "required": false,
+        "description": "The model (omit to keep it, or with `--runtime` to take the new runtime's default)"
+      },
+      {
+        "key": "effort",
+        "label": "effort",
+        "type": "text",
+        "description": "The reasoning effort: Claude Code `low`, `medium`, `high`, `xhigh`, `max`; Codex `minimal` to `ultra`; Grok Build `low` to `xhigh`; an ACP agent its own",
+        "advanced": false
+      },
+      {
+        "key": "runtime",
+        "label": "runtime",
+        "type": "text",
+        "description": "Move the thread to this runtime (`claude-code`, `codex`, `grok-build`, a configured `[runtimes.<name>]` preset, or `acp:<command>`; not `pty`): the same thread, worktree and branch, on a new session (or, back on a runtime and account it left, on the session it left there). `<runtime>:<account>` (`codex:team`) picks the account too",
+        "advanced": false
+      },
+      {
+        "key": "account",
+        "label": "account",
+        "type": "text",
+        "description": "Move the thread to this account of its runtime (`twr account list`; a glob or a comma-separated list takes the first usable one): a new session there, given a handoff, keeping the model and effort",
+        "advanced": false
+      },
+      {
+        "key": "outside-pin",
+        "label": "outside pin",
+        "type": "boolean",
+        "description": "Move it although the thread's or its project's pin keeps it off that account (`--account`, or `--runtime <runtime>:<account>`; on a terminal, a refused move asks instead)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "model"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "model",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "effort",
+        "flag": "--effort",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "runtime",
+        "flag": "--runtime",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "account",
+        "flag": "--account",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "outside-pin",
+        "flag": "--outside-pin",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:orchestrator reset",
+    "title": "twr orchestrator reset",
+    "description": "Clear the conversation: a fresh session on the current runtime/model, no handoff. The old conversation stays in the log; workers and their attention are kept",
+    "group": "CLI · orchestrator",
+    "fields": [],
+    "cli": [
+      "orchestrator",
+      "reset"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:orchestrator show",
+    "title": "twr orchestrator show",
+    "description": "Show the orchestrator: its runtime and model, its thread, the configured default and the runtimes that can host it",
+    "group": "CLI · orchestrator",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `orchestrator.show` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "orchestrator",
+      "show"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:orchestrator use",
+    "title": "twr orchestrator use",
+    "description": "Switch the orchestrator to another runtime (and model), now. A conversation cannot move between runtimes: this starts a NEW orchestrator session, which gets a handoff as its first turn: the current orchestrator's own summary (asked for first when it is running; a busy one is waited for up to --wait seconds, then skipped) plus the recent conversation, threads, attention items and reports from the log. The current orchestrator is then stopped (its queued prompts dropped) and retired; the new one takes the names `orchestrator` / `orch`. The choice is kept across hub restarts (the config's `[orchestrator]` only picks the first orchestrator)",
+    "group": "CLI · orchestrator",
+    "fields": [
+      {
+        "key": "runtime",
+        "label": "runtime",
+        "type": "text",
+        "required": true,
+        "description": "A runtime that can host the orchestrator (it must attach the twr MCP tools): `claude-code`, `codex`, `grok-build`, a `[runtimes.<name>]` ACP preset, or `acp:<command line>` for any Agent Client Protocol agent (`twr orchestrator show` lists them)"
+      },
+      {
+        "key": "model",
+        "label": "model",
+        "type": "text",
+        "description": "Model (default: the runtime's default)",
+        "advanced": false
+      },
+      {
+        "key": "no-summary",
+        "label": "no summary",
+        "type": "boolean",
+        "description": "Do not ask the current orchestrator for a handoff summary: the new one gets only what the log shows (recent conversation, threads, attention items, reports)",
+        "advanced": false
+      },
+      {
+        "key": "wait",
+        "label": "wait",
+        "type": "text",
+        "description": "How long to wait for a busy orchestrator to finish its turn before skipping its summary, in seconds (default 60, at most 600). Without it, a terminal asks first when the orchestrator is busy",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "orchestrator",
+      "use"
+    ],
+    "cliFields": [
+      {
+        "key": "runtime",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "model",
+        "flag": "--model",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "no-summary",
+        "flag": "--no-summary",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "wait",
+        "flag": "--wait",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:park",
+    "title": "twr park",
+    "description": "Park a thread: stop its runtime and remove its worktree if it is clean (its branch is kept: the one recorded when its worktree was made, `twr/<its name then>`, which a rename does not change). Prompts sent while parked wait for `twr resume`",
+    "group": "CLI · park",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "keep",
+        "label": "keep",
+        "type": "boolean",
+        "description": "Keep the worktree on disk",
+        "advanced": false
+      },
+      {
+        "key": "force",
+        "label": "force",
+        "type": "boolean",
+        "description": "Interrupt a running turn, or stop background tasks, instead of refusing",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "park"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "keep",
+        "flag": "--keep",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "force",
+        "flag": "--force",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:remote",
+    "title": "twr remote",
+    "description": "`mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's data directory), stopped when the session ends",
+    "group": "CLI · remote",
+    "fields": [
+      {
+        "key": "host",
+        "label": "host",
+        "type": "text",
+        "required": true,
+        "description": "The host, as mosh and ssh take it (`me@box`, a `Host` of your ssh config)"
+      },
+      {
+        "key": "args",
+        "label": "args",
+        "type": "words",
+        "required": false,
+        "description": "The arguments of the remote `twr`, after `--`"
+      },
+      {
+        "key": "ssh",
+        "label": "ssh",
+        "type": "boolean",
+        "description": "Run the session over `ssh -t` rather than mosh",
+        "advanced": false
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "description": "The speaker's name (`twr speak --name`)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "remote"
+    ],
+    "cliFields": [
+      {
+        "key": "host",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "args",
+        "many": true,
+        "separator": true,
+        "literal": false
+      },
+      {
+        "key": "ssh",
+        "flag": "--ssh",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "name",
+        "flag": "--name",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:rename",
+    "title": "twr rename",
+    "description": "Rename a worker thread. The name must be free and work as a git branch name, like `--name`. Its worktree path and branch keep the name they were made with, and its earlier names stay its own: they still reach it, and no other thread can take them. Not for the orchestrator",
+    "group": "CLI · rename",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The new name"
+      }
+    ],
+    "cli": [
+      "rename"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:respond",
+    "title": "twr respond",
+    "description": "Answer an attention item (a thread's top item when given a thread)",
+    "group": "CLI · respond",
+    "fields": [
+      {
+        "key": "target",
+        "label": "target",
+        "type": "text",
+        "required": true,
+        "description": "`<attn_id>@<revision>` as `twr attention` lists it, or a thread (id, name, alias, prefix) to answer its top item: that item is shown first and answered only after you confirm it (y/N on a terminal; without one, only with --yes). A bare attn_id answers only an item that was never raised again (it may ask something else now)"
+      },
+      {
+        "key": "answer",
+        "label": "answer",
+        "type": "text",
+        "required": true,
+        "description": "An option label (e.g. allow, deny) or its 1-based number; free text for questions without options"
+      },
+      {
+        "key": "message",
+        "label": "message",
+        "type": "text",
+        "description": "Message passed along with the answer",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "respond"
+    ],
+    "cliFields": [
+      {
+        "key": "target",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "answer",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "message",
+        "flag": "--message",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:resume",
+    "title": "twr resume",
+    "description": "Resume a parked thread: recreate its worktree if needed (at the same path, on its recorded branch) and run its queued prompts on the same session",
+    "group": "CLI · resume",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      }
+    ],
+    "cli": [
+      "resume"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:runner",
+    "title": "twr runner",
+    "description": "Run this box as a runner: connect to a hub over WebSocket and run its threads here. Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner install-token <box>` stores a dial-in box's token here; `twr runner token` prints a new token for `[boxes.<name>] token`",
+    "group": "CLI · runner",
+    "fields": [
+      {
+        "key": "hub",
+        "label": "hub",
+        "type": "text",
+        "description": "Hub URL: `wss://host:port`, or `ws://` to a loopback host (`localhost`, an address in 127.0.0.0/8, `[::1]` or an IPv4-mapped one such as `[::ffff:127.0.0.1]`: an SSH tunnel's end). Plain `ws://` to any other host is refused unless --allow-insecure is given",
+        "advanced": false
+      },
+      {
+        "key": "token-file",
+        "label": "token file",
+        "type": "text",
+        "description": "File holding the box's token (`[boxes.<name>] token` on the hub, at least 16 characters); it must not be accessible by other users (`chmod 600`). Default: `$TWR_RUNNER_TOKEN`, else the file `twr runner install-token` writes (`~/.config/twr/runner-tokens/<box>.token`). A token from a file is read again after the hub refuses the runner, so a new one there is used without a restart",
+        "advanced": false
+      },
+      {
+        "key": "box",
+        "label": "box",
+        "type": "text",
+        "description": "Box name (as configured on the hub)",
+        "advanced": false
+      },
+      {
+        "key": "data-dir",
+        "label": "data dir",
+        "type": "text",
+        "description": "Data directory for the spool and worktrees (default: the twr data directory)",
+        "advanced": false
+      },
+      {
+        "key": "ca",
+        "label": "ca",
+        "type": "text",
+        "description": "For `wss://`: trust only this CA certificate (PEM) instead of the public roots (a hub with a private or self-signed CA)",
+        "advanced": false
+      },
+      {
+        "key": "allow-insecure",
+        "label": "allow insecure",
+        "type": "boolean",
+        "description": "Allow plain `ws://` to a host that is not loopback: every event and command crosses the network in clear text (the token never does). Only on a network you trust",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "runner"
+    ],
+    "cliFields": [
+      {
+        "key": "hub",
+        "flag": "--hub",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "token-file",
+        "flag": "--token-file",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "box",
+        "flag": "--box",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "data-dir",
+        "flag": "--data-dir",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "ca",
+        "flag": "--ca",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "allow-insecure",
+        "flag": "--allow-insecure",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:runner install-token",
+    "title": "twr runner install-token",
+    "description": "On a dial-in box: store the box's token (`twr box add --dial-in` or `twr box token` on the hub prints it) in `~/.config/twr/runner-tokens/<box>.token` (mode 0600), where `twr runner` finds it. Asks for it at a prompt that does not show it, or reads it from a pipe. With --hub, prints the command that runs the runner and a service to paste that keeps it running (a systemd user unit, or a LaunchAgent on a Mac)",
+    "group": "CLI · runner",
+    "fields": [
+      {
+        "key": "box",
+        "label": "box",
+        "type": "text",
+        "required": true,
+        "description": "The box's name on the hub"
+      },
+      {
+        "key": "hub",
+        "label": "hub",
+        "type": "text",
+        "description": "The hub's runner URL: `wss://host:port`, or `ws://` to a loopback host (an SSH tunnel's end)",
+        "advanced": false
+      },
+      {
+        "key": "ca",
+        "label": "ca",
+        "type": "text",
+        "description": "For `wss://`: trust only this CA certificate (PEM), as `twr runner --ca`",
+        "advanced": false
+      },
+      {
+        "key": "token-file",
+        "label": "token file",
+        "type": "text",
+        "description": "Store the token in this file instead (its directory must exist)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "runner",
+      "install-token"
+    ],
+    "cliFields": [
+      {
+        "key": "box",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "hub",
+        "flag": "--hub",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "ca",
+        "flag": "--ca",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "token-file",
+        "flag": "--token-file",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:runner token",
+    "title": "twr runner token",
+    "description": "Print a new random token (32 bytes from the OS, hex): put it in the hub's `[boxes.<name>] token` and in the runner's `--token-file` (`chmod 600`)",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "token"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:say",
+    "title": "twr say",
+    "description": "Say something: the hub routes it (a thread named with `@thread` / `on thread,`, the only thread, `new <project>: ...`, else the orchestrator, else it asks you which thread). It never answers a permission or question (it cannot tell which ones you had seen): a message that looks like an answer while one is pending is not sent, and the pending items are listed; answer those with `twr respond`",
+    "group": "CLI · say",
+    "fields": [
+      {
+        "key": "message",
+        "label": "message",
+        "type": "textarea",
+        "required": true,
+        "description": "The message (words are joined with spaces)"
+      }
+    ],
+    "cli": [
+      "say"
+    ],
+    "cliFields": [
+      {
+        "key": "message",
+        "many": true,
+        "separator": false,
+        "literal": true
+      }
+    ]
+  },
+  {
+    "id": "cli:send",
+    "title": "twr send",
+    "description": "Send a prompt to a thread (queued if a turn is running)",
+    "group": "CLI · send",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": false,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "prompt",
+        "label": "prompt",
+        "type": "textarea",
+        "required": false,
+        "description": "The prompt (words are joined with spaces). `{report:<thread>}` in it becomes that thread's report, for a thread it waits for (`--after`)"
+      },
+      {
+        "key": "after",
+        "label": "after",
+        "type": "text",
+        "description": "Send it once each of these threads (comma-separated) has finished its next turn, without an orchestrator turn. If one doesn't finish well, a card asks you",
+        "advanced": false
+      },
+      {
+        "key": "cancel",
+        "label": "cancel",
+        "type": "text",
+        "description": "Drop a prompt queued with `--after` (its id, or a unique prefix of 4 or more)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "send"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "prompt",
+        "many": true,
+        "separator": false,
+        "literal": true
+      },
+      {
+        "key": "after",
+        "flag": "--after",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "cancel",
+        "flag": "--cancel",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:speak",
+    "title": "twr speak",
+    "description": "A speaker on this machine: reads aloud the orchestrator's messages that this machine's hubs send, or with `--ssh HOST` those of HOST's hubs, over `ssh HOST twr speech feed`: every workspace unless `-w` names one. Keys in its terminal: `s` stop, `p` pause or resume, `n` skip, `q` quit. What it reads is turned on with `/read on` in the TUI (docs/read-aloud.md)",
+    "group": "CLI · speak",
+    "fields": [
+      {
+        "key": "ssh",
+        "label": "ssh",
+        "type": "text",
+        "description": "Read aloud what HOST's hubs send, over ssh (your ssh config and keys)",
+        "advanced": false
+      },
+      {
+        "key": "all-workspaces",
+        "label": "all workspaces",
+        "type": "boolean",
+        "description": "Every workspace (of this machine, or of HOST): the default; refused with `-w`",
+        "advanced": false
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "description": "The speaker's name in `/read status` and for `/read N --on` (default: this machine's name)",
+        "advanced": false
+      },
+      {
+        "key": "engine",
+        "label": "engine",
+        "type": "select",
+        "description": "The engine, over `[speech] engine`: say, avspeech, spd or command [possible values: say, avspeech, spd, command]",
+        "advanced": false,
+        "options": [
+          "say",
+          "avspeech",
+          "spd",
+          "command"
+        ]
+      },
+      {
+        "key": "voice",
+        "label": "voice",
+        "type": "text",
+        "description": "The engine's voice, over the one kept by `/read voice` and `[speech] voice`",
+        "advanced": false
+      },
+      {
+        "key": "rate",
+        "label": "rate",
+        "type": "text",
+        "description": "Words per minute (80 to 500), over the rate kept by `/read rate` and `[speech] rate`",
+        "advanced": false
+      },
+      {
+        "key": "print-service",
+        "label": "print service",
+        "type": "boolean",
+        "description": "Print a LaunchAgent (macOS) or systemd user unit (Linux) that runs this `twr speak`, and the commands to install it; installs nothing",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "speak"
+    ],
+    "cliFields": [
+      {
+        "key": "ssh",
+        "flag": "--ssh",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "all-workspaces",
+        "flag": "--all-workspaces",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "name",
+        "flag": "--name",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "engine",
+        "flag": "--engine",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "voice",
+        "flag": "--voice",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "rate",
+        "flag": "--rate",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "print-service",
+        "flag": "--print-service",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:speech feed",
+    "title": "twr speech feed",
+    "description": "Stream the orchestrator's new messages: with `--text`, their sentences one per line (for a reader of your own); without it, the line protocol `twr speak --ssh` reads",
+    "group": "CLI · speech",
+    "fields": [
+      {
+        "key": "text",
+        "label": "text",
+        "type": "boolean",
+        "description": "Print each message's sentences, one per line, and nothing else",
+        "advanced": false
+      },
+      {
+        "key": "proto",
+        "label": "proto",
+        "type": "boolean",
+        "description": "The line protocol (the default); for `twr speak --ssh`",
+        "advanced": false
+      },
+      {
+        "key": "all-workspaces",
+        "label": "all workspaces",
+        "type": "boolean",
+        "description": "Every workspace of this machine, not only the current one (`-w`)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "speech",
+      "feed"
+    ],
+    "cliFields": [
+      {
+        "key": "text",
+        "flag": "--text",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "proto",
+        "flag": "--proto",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "all-workspaces",
+        "flag": "--all-workspaces",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:stop",
+    "title": "twr stop",
+    "description": "Stop a thread's runtime and drop its queued prompts",
+    "group": "CLI · stop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      }
+    ],
+    "cli": [
+      "stop"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:terminal-setup",
+    "title": "twr terminal-setup",
+    "description": "Make your terminal send Shift-Enter as Alt-Enter (ESC CR), which the TUI reads as a new line everywhere, over mosh and SSH too, as Claude Code's /terminal-setup does. It edits the terminal's settings file when it can do so safely (backing it up), leaves a Shift-Enter binding already there alone, and otherwise prints the steps. Over SSH or mosh it changes nothing: it prints what to change on the machine the terminal runs on",
+    "group": "CLI · terminal-setup",
+    "fields": [
+      {
+        "key": "terminal",
+        "label": "terminal",
+        "type": "text",
+        "description": "The terminal: terminal.app, iterm2, ghostty, kitty, wezterm, alacritty, vscode, vscode-insiders, cursor, windsurf, vscodium or zed. Default: the one this runs in",
+        "advanced": false
+      },
+      {
+        "key": "print",
+        "label": "print",
+        "type": "boolean",
+        "description": "Print the steps and change nothing (every terminal's when none is named or found)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "terminal-setup"
+    ],
+    "cliFields": [
+      {
+        "key": "terminal",
+        "flag": "--terminal",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "print",
+        "flag": "--print",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:thread list",
+    "title": "twr thread list",
+    "description": "List threads. Parked threads are left out (a footer names them) unless --all",
+    "group": "CLI · thread",
+    "fields": [
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Also list parked threads",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "thread",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:thread new",
+    "title": "twr thread new",
+    "description": "Create a thread on a project (a configured project name or a directory)",
+    "group": "CLI · thread",
+    "fields": [
+      {
+        "key": "project",
+        "label": "project",
+        "type": "text",
+        "required": true,
+        "description": "Project name from the config, or a path"
+      },
+      {
+        "key": "runtime",
+        "label": "runtime",
+        "type": "text",
+        "description": "Runtime (default: the project's, then `default_runtime`): `claude-code`, `codex`, `grok-build`, `fake`, `acp:<command line>` for any Agent Client Protocol agent (e.g. `acp:gemini --experimental-acp`) or a `[runtimes.<name>]` preset naming one, or `pty:<command line>` for any interactive CLI (DEGRADED). Commands are split like a shell would, without expansion",
+        "advanced": false
+      },
+      {
+        "key": "account",
+        "label": "account",
+        "type": "text",
+        "description": "The runtime's account to run on (`twr account list`): a name, a glob (`max-*`) or a comma-separated list, the first usable one taken (default: the project's pin, else `[account_policy.<runtime>] default`, else the runtime's own login). `--runtime claude-code:work` picks one too",
+        "advanced": false
+      },
+      {
+        "key": "outside-pin",
+        "label": "outside pin",
+        "type": "boolean",
+        "description": "Open it on its account (`--account`, or `--runtime <runtime>:<account>`) although the project's pin keeps it off that account",
+        "advanced": false
+      },
+      {
+        "key": "box",
+        "label": "box",
+        "type": "text",
+        "description": "Box to run on: `local`, or a remote box from `[boxes.<name>]` whose runner is connected (default: the project's `box`, else `local`)",
+        "advanced": false
+      },
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "description": "Unique thread name (default: generated)",
+        "advanced": false
+      },
+      {
+        "key": "mode",
+        "label": "mode",
+        "type": "text",
+        "description": "Runtime permission mode",
+        "advanced": false
+      },
+      {
+        "key": "model",
+        "label": "model",
+        "type": "text",
+        "description": "Model (default: `threads.model` from the config, else the runtime's default)",
+        "advanced": false
+      },
+      {
+        "key": "effort",
+        "label": "effort",
+        "type": "text",
+        "description": "Reasoning effort, one the runtime takes (see `twr model`; default: the runtime's)",
+        "advanced": false
+      },
+      {
+        "key": "alias",
+        "label": "alias",
+        "type": "text",
+        "description": "Extra names for the thread (repeatable)",
+        "advanced": false
+      },
+      {
+        "key": "no-worktree",
+        "label": "no worktree",
+        "type": "boolean",
+        "description": "Work in the repository itself instead of a worktree of its own",
+        "advanced": false
+      },
+      {
+        "key": "worktree",
+        "label": "worktree",
+        "type": "boolean",
+        "description": "Give the thread a worktree of its own even when worktrees are off for the project (`[projects.<name>] worktree`, else `[threads] worktree`; on by default)",
+        "advanced": false
+      },
+      {
+        "key": "base",
+        "label": "base",
+        "type": "text",
+        "description": "Start the thread's branch `twr/<name>` from this ref (default: the repository's HEAD)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "thread",
+      "new"
+    ],
+    "cliFields": [
+      {
+        "key": "project",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "runtime",
+        "flag": "--runtime",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "account",
+        "flag": "--account",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "outside-pin",
+        "flag": "--outside-pin",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "box",
+        "flag": "--box",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "name",
+        "flag": "--name",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "mode",
+        "flag": "--mode",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "model",
+        "flag": "--model",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "effort",
+        "flag": "--effort",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "alias",
+        "flag": "--alias",
+        "many": true,
+        "separator": false
+      },
+      {
+        "key": "no-worktree",
+        "flag": "--no-worktree",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "worktree",
+        "flag": "--worktree",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "base",
+        "flag": "--base",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:thread show",
+    "title": "twr thread show",
+    "description": "Show what a thread has in flight now, as the hub reads it (`work` of `thread.get`): its reading (working, waiting on its background work, on a tool call, nothing in flight, unknown), the open turn's tool calls, its tasks (background, foreground, detached: moved to the background after its call returned, nothing waits for them) and jobs, prompts queued behind it, its last progress apart from heartbeats, and its open items",
+    "group": "CLI · thread",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the `work` object as JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "thread",
+      "show"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:trash empty",
+    "title": "twr trash empty",
+    "description": "Purge items from the trash now: their worktree files, record and kept commits go for good. Lists the items it purges and asks y/N on a terminal (without one, only with --yes); then purges exactly those, so an item deleted meanwhile stays",
+    "group": "CLI · trash",
+    "fields": [
+      {
+        "key": "items",
+        "label": "items",
+        "type": "words",
+        "required": false,
+        "description": "Items by id, a unique end of an id (at least 4 characters, as `twr trash list` shows it), or the name of the thread of exactly one item"
+      },
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Purge every item of every box that is online",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "trash",
+      "empty"
+    ],
+    "cliFields": [
+      {
+        "key": "items",
+        "many": true,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:trash list",
+    "title": "twr trash list",
+    "description": "List the trash of every box: each deleted thread's item with its short id, project, box, when it was deleted and when it is purged, its size on disk, what its delete card said it loses, and whether it was restored already. Items of a box that is offline are shown as the hub recorded them",
+    "group": "CLI · trash",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `trash.list` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "trash",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:trash restore",
+    "title": "twr trash restore",
+    "description": "Bring a deleted thread back from the trash, parked, with its history and session (`twr resume` resumes it): its branch is made again from the trash's ref, git adds a fresh worktree on it (at its old path, or a new one when that is taken) and the saved files are copied in. Staged changes come back unstaged, the worktree is on the thread's branch even if its HEAD was elsewhere (the trash keeps that commit), and the item stays in the trash, marked restored, until it is purged or emptied",
+    "group": "CLI · trash",
+    "fields": [
+      {
+        "key": "item",
+        "label": "item",
+        "type": "text",
+        "required": true,
+        "description": "The item: its id, a unique end of one (at least 4 characters), or the thread's name"
+      },
+      {
+        "key": "as",
+        "label": "as",
+        "type": "text",
+        "description": "Restore it under another name (needed when another thread took its name, or its recorded branch exists again)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "trash",
+      "restore"
+    ],
+    "cliFields": [
+      {
+        "key": "item",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "as",
+        "flag": "--as",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:trim",
+    "title": "twr trim",
+    "description": "Delete the build output of threads' worktrees (`target/`, `node_modules/` and the rest of `[threads] park_disposable`, ignored by git and holding no repository), the way deleting a thread deletes it. Each thread must be idle: no turn or background work, not attached, parked or resumed. Its next build makes the output again. Linux and macOS only",
+    "group": "CLI · trim",
+    "fields": [
+      {
+        "key": "threads",
+        "label": "threads",
+        "type": "words",
+        "required": true,
+        "description": "Thread ids, names, aliases or unique prefixes"
+      }
+    ],
+    "cli": [
+      "trim"
+    ],
+    "cliFields": [
+      {
+        "key": "threads",
+        "many": true,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:usage",
+    "title": "twr usage",
+    "description": "Show how much is left in each subscription's usage windows (`usage.get`): Claude's 5-hour and weekly limits, Codex's windows, Grok Build's credit period, as their last sessions reported them. With --threads, what the threads' turns spent instead (`usage.threads`): tokens, and the cost where the runtime reports one",
+    "group": "CLI · usage",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw JSON (`usage.get`, or `usage.threads` with --threads)",
+        "advanced": true
+      },
+      {
+        "key": "threads",
+        "label": "threads",
+        "type": "boolean",
+        "description": "What each thread's turns spent: input and output tokens, and the cost where the runtime reports one (Claude Code: the API price of the tokens, on any plan)",
+        "advanced": false
+      },
+      {
+        "key": "since",
+        "label": "since",
+        "type": "text",
+        "description": "With --threads: only turns that ended in this window, such as 24h, 7d or 30m, or since a date (2026-10-01) or an RFC 3339 time",
+        "advanced": false
+      },
+      {
+        "key": "by",
+        "label": "by",
+        "type": "select",
+        "description": "With --threads: group by thread (the default), project or runtime [possible values: thread, project, runtime]",
+        "advanced": false,
+        "options": [
+          "thread",
+          "project",
+          "runtime"
+        ]
+      }
+    ],
+    "cli": [
+      "usage"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "threads",
+        "flag": "--threads",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "since",
+        "flag": "--since",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "by",
+        "flag": "--by",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:wait",
+    "title": "twr wait",
+    "description": "Wait until threads finish or need you, and print how each ended (its report when it finished). Exit code: 0 finished, 2 waits on you, 3 failed, stopped or parked, 124 timed out. An agent can run it as a job (`twr job run -- twr wait web`)",
+    "group": "CLI · wait",
+    "fields": [
+      {
+        "key": "threads",
+        "label": "threads",
+        "type": "words",
+        "required": true,
+        "description": "Thread ids, names, aliases or unique prefixes"
+      },
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Wait for every one of them, not just the first",
+        "advanced": false
+      },
+      {
+        "key": "timeout",
+        "label": "timeout",
+        "type": "text",
+        "description": "Give up after this long: 90s, 30m, 2h",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "One JSON object per thread",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "wait"
+    ],
+    "cliFields": [
+      {
+        "key": "threads",
+        "many": true,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "timeout",
+        "flag": "--timeout",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:ws",
+    "title": "twr ws",
+    "description": "List, create or remove workspaces: separate hubs on this machine, each with its own orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name> <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual one. Without a subcommand, lists them",
+    "group": "CLI · ws",
+    "fields": [],
+    "cli": [
+      "ws"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:ws list",
+    "title": "twr ws list",
+    "description": "List the workspaces: whether each one's hub runs and, when it does, its threads, how many are running and how many wait on you. `*` marks the one this command is in",
+    "group": "CLI · ws",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "ws",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:ws new",
+    "title": "twr ws new",
+    "description": "Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit). Its hub starts on first use: `twr -w <name>`",
+    "group": "CLI · ws",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The workspace's name"
+      }
+    ],
+    "cli": [
+      "ws",
+      "new"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:ws rm",
+    "title": "twr ws rm",
+    "description": "Remove a workspace's data: its log, orchestrator conversation and history. Refused while its hub runs, while it has threads (delete them first) or while its trash holds deleted threads (`twr -w <name> trash empty --all`). Branches stay in their repositories",
+    "group": "CLI · ws",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": "The workspace's name"
+      }
+    ],
+    "cli": [
+      "ws",
+      "rm"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  }
+]

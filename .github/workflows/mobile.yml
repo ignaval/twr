@@ -1,0 +1,72 @@
+name: Mobile
+on:
+  pull_request:
+    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
+  push:
+    branches: [dev, "codex/twr-apps"]
+    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: mobile-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ios:
+    name: iOS native ${{ matrix.kind }}
+    runs-on: xcode-27
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: phone
+            runtime: com.apple.CoreSimulator.SimRuntime.iOS-27-0
+          - kind: fold
+            runtime: com.apple.CoreSimulator.SimRuntime.iOS-27-1
+          - kind: tablet
+            runtime: com.apple.CoreSimulator.SimRuntime.iOS-27-0
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+      TWR_IOS_RUNTIME: ${{ matrix.runtime }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
+      - name: Build shared engine and mobile UI
+        run: |
+          cargo build --locked -p twr-cli -p twr-app
+          npm --prefix clients ci
+          npm --prefix clients run mobile:build
+          npm --prefix clients test
+      - name: Compile iOS native application
+        working-directory: clients
+        run: node mobile/scripts/ios-build.mjs
+      - name: Verify installed fold-control helper
+        working-directory: clients
+        run: node node_modules/agent-device/bin/agent-device.mjs --version
+      - name: Native remote-hub and layout integration
+        working-directory: clients
+        env:
+          TWR_IOS_KIND: ${{ matrix.kind }}
+        run: node mobile/scripts/ios-qa.mjs
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: twr-ios-${{ matrix.kind }}-qa
+          path: |
+            clients/test-results/ios/
+            clients/test-results/performance-ios-*.json
+            clients/mobile/ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app
