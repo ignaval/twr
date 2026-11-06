@@ -35,7 +35,17 @@ assert(
 );
 const bin = resolve("../target/debug");
 mkdirSync("test-results/ios", { recursive: true });
-for (const [index, template] of targets.entries()) {
+const kind = process.env.TWR_IOS_KIND;
+const selected = targets.filter(
+  (device) =>
+    !kind ||
+    (device.name.includes("Duo")
+      ? "fold"
+      : device.name.includes("iPad")
+        ? "tablet"
+        : "phone") === kind,
+);
+for (const [index, template] of selected.entries()) {
   const device = {
     ...template,
     udid: execFileSync(
@@ -235,7 +245,7 @@ for (const [index, template] of targets.entries()) {
       }
     });
     await new Promise((r) => server.listen(47323, "127.0.0.1", r));
-    const result = `test-results/ios/${index}-${device.name.replaceAll(" ", "-")}.xcresult`;
+    const result = `test-results/ios/${kind || "all"}-${index}-${device.name.replaceAll(" ", "-")}.xcresult`;
     const test = spawn(
       "xcodebuild",
       [
@@ -268,7 +278,7 @@ for (const [index, template] of targets.entries()) {
         "io",
         device.udid,
         "screenshot",
-        `test-results/ios/${index}-screen.png`,
+        `test-results/ios/${kind || "all"}-${index}-screen.png`,
       ],
       { stdio: "inherit" },
     );

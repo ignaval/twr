@@ -4,7 +4,11 @@ const config: CapacitorConfig = {
   appName: "twr",
   loggingBehavior: "none",
   webDir: "mobile/www",
-  android: { path: "mobile/android", allowMixedContent: false },
+  android: {
+    path: "mobile/android",
+    allowMixedContent: false,
+    minWebViewVersion: 119,
+  },
   ios: {
     path: "mobile/ios",
     contentInset: "never",

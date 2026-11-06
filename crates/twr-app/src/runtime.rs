@@ -35,7 +35,9 @@ async fn probe_inner(socket: &Path) -> Result<Probe> {
         }
         Err(e) => return Err(e),
     };
-    match tokio::time::timeout(Duration::from_secs(2), async {
+    // macOS peer-identity lookup can take several seconds under system load.
+    // Repeated short probes can keep a healthy hub classified as busy forever.
+    match tokio::time::timeout(Duration::from_secs(10), async {
         let hello = c.hello(json!({"client":"desktop"})).await?;
         anyhow::ensure!(
             hello["identity"]
@@ -60,7 +62,7 @@ async fn probe_inner(socket: &Path) -> Result<Probe> {
 }
 
 async fn probe(socket: &Path) -> Result<Probe> {
-    match tokio::time::timeout(Duration::from_secs(3), probe_inner(socket)).await {
+    match tokio::time::timeout(Duration::from_secs(12), probe_inner(socket)).await {
         Ok(result) => result,
         Err(_) => Ok(Probe::Busy),
     }
@@ -125,5 +127,41 @@ pub async fn ensure_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<V
             "Hub did not start within 60 seconds. Check hub.log in the workspace data directory."
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{io::BufReader, net::UnixListener};
+    use twr_core::proto::{read_frame, write_frame, Request, Response};
+
+    #[tokio::test]
+    async fn running_hub_with_a_slow_greeting_is_not_mistaken_for_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut read = BufReader::new(read);
+            let hello: Request = read_frame(&mut read).await.unwrap().unwrap();
+            assert_eq!(hello.method, "hello");
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            write_frame(
+                &mut write,
+                &Response::ok(hello.id, json!({"identity":"user:test"})),
+            )
+            .await
+            .unwrap();
+            let info: Request = read_frame(&mut read).await.unwrap().unwrap();
+            assert_eq!(info.method, "hub.info");
+            write_frame(&mut write, &Response::ok(info.id, json!({"pid":123})))
+                .await
+                .unwrap();
+        });
+        let result = probe(&socket).await.unwrap();
+        assert!(matches!(result, Probe::Ready(info) if info["pid"] == 123));
+        server.await.unwrap();
     }
 }

@@ -29,8 +29,8 @@ work and is recorded separately in raw JSON.
 | Current environment | 1,000 events visible | RPC p95 | Input → paint p95 | Frame p95 |
 | --- | ---: | ---: | ---: | ---: |
 | Apple Silicon packaged app | 197 ms | 4 ms | 17 ms | 19 ms |
-| Android ARM64 phone emulator | 480 ms | 13 ms | 16 ms | 33 ms |
-| Android ARM64 Pixel Fold emulator | 545 ms | 18 ms | 20 ms | 33 ms |
+| Android ARM64 phone emulator | 365 ms | 18 ms | 24 ms | 17 ms |
+| Android ARM64 Pixel Fold emulator | 562 ms | 28 ms | 15 ms | 33 ms |
 | Arch x86_64 QEMU, software GPU, Hyprland at 125% | 1,868 ms | 47 ms | 103 ms | 67 ms |
 
 The Linux VM validates behavior and catches layout regressions; its timing does not

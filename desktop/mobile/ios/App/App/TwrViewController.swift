@@ -10,7 +10,7 @@ final class TwrViewController: CAPBridgeViewController {
 
 // Read reserved regions during updateConstraints: UIKit tracks those reads and
 // invalidates this view when the fold or camera changes, even without a resize.
-// Build with the iOS 27.1 SDK; deployment remains iOS 15 and later.
+// Build with the iOS 27.1 SDK; deployment requires iOS 17.4 and later, matching the web UI target.
 private final class RegionObserver: UIView {
     override class var requiresConstraintBasedLayout: Bool { true }
     private var previousBounds = CGRect.null
