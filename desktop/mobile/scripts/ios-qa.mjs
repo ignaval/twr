@@ -174,20 +174,6 @@ for (const [index, template] of selected.entries()) {
       stdio: "inherit",
     });
     if (device.name.includes("Duo")) {
-      const developer =
-        process.env.DEVELOPER_DIR ||
-        execFileSync("xcode-select", ["-p"], { encoding: "utf8" }).trim();
-      execFileSync(
-        "open",
-        [
-          "-a",
-          join(developer, "Applications/Simulator.app"),
-          "--args",
-          "-CurrentDeviceUDID",
-          device.udid,
-        ],
-        { stdio: "inherit" },
-      );
       execFileSync(
         "xcrun",
         [
