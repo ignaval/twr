@@ -254,6 +254,37 @@ select {
   flex: 1;
   min-height: 44px;
 }
+/* The right pane needs its own compact header even on a wide unfolded display. */
+[data-fold="vertical"] .topbar {
+  gap: 6px;
+  padding-left: 12px;
+  padding-right: 112px;
+}
+[data-fold="vertical"] .topbar-left {
+  flex: 1;
+  overflow: hidden;
+}
+[data-fold="vertical"] .topbar-left > .workspace-breadcrumb,
+[data-fold="vertical"] .topbar-left > svg,
+[data-fold="vertical"] .topbar-left > .live-indicator,
+[data-fold="vertical"] .topbar-left > .icon-button,
+[data-fold="vertical"] .topbar-actions > [aria-label="Open command palette"] {
+  display: none;
+}
+[data-fold="vertical"] .topbar-left > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-fold="vertical"] .topbar-actions {
+  flex-shrink: 0;
+  gap: 2px;
+}
+[data-fold="vertical"] .topbar-actions > button:last-child {
+  font-size: 0;
+  padding: 6px;
+  gap: 0;
+}
 [data-fold="vertical"] .mobile-tabs {
   left: calc(var(--hinge-left) + var(--hinge-width));
 }

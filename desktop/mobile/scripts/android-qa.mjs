@@ -462,6 +462,27 @@ try {
         .click();
     };
     await foldDialog("vertical");
+    const header = await page.locator(".topbar").evaluate((element) => {
+      const left = element
+        .querySelector(".topbar-left")
+        .getBoundingClientRect();
+      const actions = element
+        .querySelector(".topbar-actions")
+        .getBoundingClientRect();
+      const header = element.getBoundingClientRect();
+      return {
+        leftRight: left.right,
+        actionsLeft: actions.left,
+        actionsRight: actions.right,
+        headerRight: header.right,
+      };
+    });
+    assert(
+      header.leftRight <= header.actionsLeft + 1 &&
+        header.actionsRight <= header.headerRight + 1,
+      JSON.stringify(header),
+    );
+
     adbRun([
       "shell",
       "settings",
