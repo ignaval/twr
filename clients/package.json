@@ -156,7 +156,7 @@
         "libatspi2.0-0",
         "libuuid1",
         "libsecret-1-0",
-        "libasound2 | libasound2t64",
+        "libasound2t64 | libasound2 (>= 1.0.16)",
         "libgbm1",
         "libudev1",
         "libstdc++6",
