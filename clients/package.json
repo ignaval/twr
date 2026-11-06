@@ -1,0 +1,152 @@
+{
+  "name": "twr-desktop",
+  "version": "0.3.0",
+  "private": true,
+  "description": "One conversation for all your coding agents",
+  "author": "twr contributors",
+  "license": "Apache-2.0",
+  "main": "dist-host/main.cjs",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "tsc --noEmit && node scripts/build-host.mjs && vite build",
+    "build:rust": "node scripts/build-rust.mjs",
+    "start": "electron .",
+    "test": "vitest run",
+    "test:integration": "node scripts/integration.mjs",
+    "package": "npm run build:rust && npm run build && electron-builder",
+    "package:mac": "npm run package -- --mac --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false",
+    "package:linux": "npm run package -- --linux --x64",
+    "postinstall": "electron-builder install-app-deps",
+    "icon": "node scripts/icon.mjs",
+    "package:arch": "npm run build:rust && npm run build && electron-builder --linux dir --x64 && node scripts/arch.mjs",
+    "format": "prettier --write shared desktop tests scripts mobile/src mobile/scripts mobile/vite.config.ts capacitor.config.ts vite.config.ts tsconfig.json package.json index.html",
+    "format:check": "prettier --check shared desktop tests scripts mobile/src mobile/scripts mobile/vite.config.ts capacitor.config.ts vite.config.ts tsconfig.json package.json index.html",
+    "test:packaged:mac": "node scripts/packaged-smoke.mjs",
+    "test:qa:mac": "TWR_DESKTOP_EXTENDED_QA=1 node scripts/packaged-smoke.mjs",
+    "mobile:build": "tsc --noEmit && vite build --config mobile/vite.config.ts && cap sync",
+    "mobile:android": "npm run mobile:build && cd mobile/android && ./gradlew assembleDebug",
+    "mobile:ios": "npm run mobile:build && node mobile/scripts/ios-build.mjs",
+    "mobile:dev": "vite --config mobile/vite.config.ts",
+    "mobile:test:android": "node mobile/scripts/android-qa.mjs",
+    "catalog:update": "node scripts/catalog.mjs",
+    "catalog:check": "node scripts/catalog.mjs --check",
+    "mobile:ios:push": "npm run mobile:build && node mobile/scripts/ios-build.mjs --push",
+    "mobile:test:ios": "node mobile/scripts/ios-qa.mjs"
+  },
+  "dependencies": {
+    "node-pty": "1.1.0"
+  },
+  "devDependencies": {
+    "@capacitor/android": "8.6.0",
+    "@capacitor/app": "8.1.2",
+    "@capacitor/browser": "8.0.5",
+    "@capacitor/cli": "8.6.0",
+    "@capacitor/clipboard": "8.0.1",
+    "@capacitor/core": "8.6.0",
+    "@capacitor/dialog": "8.0.1",
+    "@capacitor/filesystem": "8.1.5",
+    "@capacitor/ios": "8.6.0",
+    "@capacitor/keyboard": "8.0.6",
+    "@capacitor/local-notifications": "8.3.1",
+    "@capacitor/push-notifications": "8.1.3",
+    "@capacitor/share": "8.0.3",
+    "@noble/hashes": "2.4.0",
+    "@playwright/test": "^1.60.0",
+    "@tanstack/react-virtual": "^3.13.0",
+    "@types/node": "^25.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/xterm": "^6.0.0",
+    "agent-device": "0.21.36",
+    "electron": "45.2.3",
+    "electron-builder": "26.18.0",
+    "esbuild": "^0.28.1",
+    "lucide-react": "^0.577.0",
+    "prettier": "^3.9.10",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "sharp": "^0.35.0",
+    "typescript": "^6.0.0",
+    "vite": "8.3.6",
+    "vitest": "^4.0.0",
+    "zod": "^4.3.0"
+  },
+  "build": {
+    "appId": "tools.twr.desktop",
+    "productName": "twr",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "dist-host/**",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/node-pty/**"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "hardenedRuntime": true,
+      "entitlements": "packaging/entitlements.mac.plist"
+    },
+    "linux": {
+      "category": "Development",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "desktop": {
+        "entry": {
+          "StartupWMClass": "tools.twr.desktop",
+          "Keywords": "agents;terminal;development;"
+        }
+      },
+      "executableName": "twr-desktop",
+      "syncDesktopName": true
+    },
+    "icon": "packaging/icon.png",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true
+    }
+  },
+  "type": "module",
+  "overrides": {
+    "minimatch": "^11.0.4"
+  },
+  "desktopName": "tools.twr.desktop"
+}

@@ -8,13 +8,13 @@ From the repository root:
 
 ```sh
 cargo build -p twr-cli -p twr-app
-npm --prefix desktop ci
-npm --prefix desktop run mobile:build
+npm --prefix clients ci
+npm --prefix clients run mobile:build
 ```
 
-Android requires Java 21 and the SDK versions in `desktop/mobile/android/variables.gradle`. Set `ANDROID_HOME` or create the ignored `desktop/mobile/android/local.properties`. Then run `npm --prefix desktop run mobile:android`. The debug APK is `desktop/mobile/android/app/build/outputs/apk/debug/app-debug.apk`.
+Android requires Java 21 and the SDK versions in `clients/mobile/android/variables.gradle`. Set `ANDROID_HOME` or create the ignored `clients/mobile/android/local.properties`. Then run `npm --prefix clients run mobile:android`. The debug APK is `clients/mobile/android/app/build/outputs/apk/debug/app-debug.apk`.
 
-For iOS, install Xcode 27.1 or newer, open it to accept its license and install an iOS Simulator runtime. Run `npm --prefix desktop run mobile:ios`, or open `desktop/mobile/ios/App/App.xcodeproj`. Simulator builds use local ad hoc signing and a Simulator-only Keychain identity; they need no Apple account or paid signing team. Device builds use the actual team’s provisioning identity. The deployment minimum is iOS 17.4, matching the explicit Safari build target. Android requires a system WebView based on Chromium 119 or newer; the native shell checks this before loading the UI. Building with the 27.1 SDK enables iPhone Duo reserved-region handling. The UIKit bridge observes native fold and camera regions; no experimental Safari flags are required.
+For iOS, install Xcode 27.1 or newer, open it to accept its license and install an iOS Simulator runtime. Run `npm --prefix clients run mobile:ios`, or open `clients/mobile/ios/App/App.xcodeproj`. Simulator builds use local ad hoc signing and a Simulator-only Keychain identity; they need no Apple account or paid signing team. Device builds use the actual team’s provisioning identity. The deployment minimum is iOS 17.4, matching the explicit Safari build target. Android requires a system WebView based on Chromium 119 or newer; the native shell checks this before loading the UI. Building with the 27.1 SDK enables iPhone Duo reserved-region handling. The UIKit bridge observes native fold and camera regions; no experimental Safari flags are required.
 
 Start a debug gateway from your own terminal:
 
@@ -46,7 +46,7 @@ Remote terminals survive temporary connection loss. Mobile controls include Esca
 
 **Test notification** in Remote hub settings exercises the native system notification and tap routing without paid credentials. Remote background push requires Apple or Firebase configuration; a local notification test does not prove APNs/FCM delivery.
 
-For Android, add the ignored `desktop/mobile/android/app/google-services.json` from a Firebase Android app matching `tools.twr.mobile.dev`. For iOS, use a push-capable Apple team and a local copy of `desktop/mobile/ios/push.local.example.xcconfig`; add `DEVELOPMENT_TEAM = YOUR_TEAM_ID` there, then run `npm --prefix desktop run mobile:ios:push`. Debug Xcode builds include the local file when present. This opt-in adds `CODE_SIGN_ENTITLEMENTS` and the sandbox `aps-environment`; the default simulator build intentionally omits them. For distribution, set `TWR_APNS_ENVIRONMENT = production` and the gateway APNs `sandbox` value to false, then sign with the corresponding distribution profile. Do not commit signing keys or provisioning files.
+For Android, add the ignored `clients/mobile/android/app/google-services.json` from a Firebase Android app matching `tools.twr.mobile.dev`. For iOS, use a push-capable Apple team and a local copy of `clients/mobile/ios/push.local.example.xcconfig`; add `DEVELOPMENT_TEAM = YOUR_TEAM_ID` there, then run `npm --prefix clients run mobile:ios:push`. Debug Xcode builds include the local file when present. This opt-in adds `CODE_SIGN_ENTITLEMENTS` and the sandbox `aps-environment`; the default simulator build intentionally omits them. For distribution, set `TWR_APNS_ENVIRONMENT = production` and the gateway APNs `sandbox` value to false, then sign with the corresponding distribution profile. Do not commit signing keys or provisioning files.
 
 The gateway accepts `--push-config /absolute/push.json`. That file and any private keys must be owned by you with mode 0600. Example structure:
 
@@ -67,6 +67,10 @@ Omit either provider if unused. Enable remote push in the app after configuring 
 
 ## Verification status
 
-Android API 36 ARM64 phone and Pixel Fold emulator QA passes real native pairing/storage, device identities, direct chat, approvals, uploads, remote PTYs, reconnect/history, request deduplication and actual Android system notification delivery/tap routing. Cover, unfolded, half-open book and horizontal fold transitions preserve drafts. Additional regression QA verifies ordered keystrokes, 3 MiB output without a full reconnect, a lost mutation reply recovering exactly once, scope-aware controls and cross-hub notification routing. `desktop/mobile/scripts/android-qa.mjs` runs against a disposable real Rust hub and fake runtime; use `TWR_ANDROID_SERIAL` to select the emulator and `TWR_SYSTEM_PICKER_QA=1` for the actual document-picker test.
+Remote push can be disabled for a hub from its settings. Forget unregisters this device's push tokens when the hub is reachable; if it is offline, the app warns that host-side revocation is still needed. Forget and Revoke both remove that hub's local drafts and editor sessions.
 
-On this Mac, Xcode installation through the App Store CLI stalled for over an hour and was stopped. Swift syntax, plist and project-file checks passed. The native application subsequently compiled successfully in the Xcode 27.1 GitHub runner. Native Simulator integration QA is still in progress; compilation alone does not verify phone or Duo behavior. Production APNs/FCM delivery and store signing also remain unverified until credentials are configured. The app must not be described as verified on both platforms yet.
+Uploads support ordinary directories as well as Git worktrees. They are limited to 25 MiB per file, four pending uploads and 128 MiB per device over ten minutes. Cancelled uploads, failed commits and expired pending uploads return their reservation; cancelling an already committed file does not. Requests over 2 MiB are rejected locally with a size error, and gateway responses over 16 MiB return a bounded error instead of repeatedly reconnecting.
+
+Android API 36 ARM64 phone and Pixel Fold emulator QA passes real native pairing/storage, device identities, direct chat, approvals, uploads, remote PTYs, reconnect/history, request deduplication and actual Android system notification delivery/tap routing. Cover, unfolded, half-open book and horizontal fold transitions preserve drafts. Additional regression QA verifies ordered keystrokes, 3 MiB output without a full reconnect, a lost mutation reply recovering exactly once, scope-aware controls and cross-hub notification routing. `clients/mobile/scripts/android-qa.mjs` runs against a disposable real Rust hub and fake runtime; use `TWR_ANDROID_SERIAL` to select the emulator and `TWR_SYSTEM_PICKER_QA=1` for the actual document-picker test.
+
+On this Mac, Xcode installation through the App Store CLI stalled for over an hour and was stopped. Native iPhone and iPad integration subsequently passed in the Xcode 27.1 GitHub runner: Keychain pairing, streaming, approvals, uploads, ordered terminal input, a real TCP disconnect/reconnect and a socket surviving beyond 40 seconds. Native Duo integration is still in progress. Its test now dispatches native Simulator hinge events and verifies CoreMotion angles before asserting viewport changes and UIKit reserved-region layout. Production APNs/FCM delivery and store signing remain unverified until credentials are configured. The Duo must not be described as verified yet.

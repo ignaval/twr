@@ -533,7 +533,7 @@ impl Session {
                 bridge()?.call(method, p["params"].clone()).await
             }
             "catalog" => Ok(serde_json::from_str(include_str!(
-                "../../../desktop/mobile/catalog.json"
+                "../../../clients/mobile/catalog.json"
             ))?),
             "directories" => {
                 anyhow::ensure!(

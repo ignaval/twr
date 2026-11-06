@@ -31,7 +31,7 @@ forms preflight through the exact clap grammar of the bundled executable.
 ```sh
 cargo test --locked -p twr-core -p twr-tui -p twr-app
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cd desktop
+cd clients
 npm test
 npm run test:integration
 npm run package:mac
@@ -57,6 +57,6 @@ npm run test:qa:mac
 Real Anthropic/OpenAI/Grok authentication and paid turns, live SSH/container/dial-in hosts,
 and audible platform speech have not been tested end to end in this pass. Their existing
 CLI implementations are bundled and reachable; the above fixtures validate the desktop
-bridge and UI rather than those external services. An installed x86_64 Arch package passed the same integration suite under Cage/Wayland in a local QEMU VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers are unsigned review builds.
+bridge and UI rather than those external services. An installed x86_64 Arch package passed the same integration suite under Cage/Wayland in a local QEMU VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers use ad hoc signatures for testing. Developer ID signing and notarization remain release steps that require the owner’s Apple credentials.
 
 Performance measurements and reproduction commands are in [performance.md](performance.md).

@@ -1,10 +1,10 @@
 name: Desktop
 on:
   pull_request:
-    paths: ["desktop/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/desktop.yml"]
+    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/desktop.yml"]
   push:
     branches: [dev]
-    paths: ["desktop/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/desktop.yml"]
+    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/desktop.yml"]
   workflow_dispatch:
 
 permissions:
@@ -32,34 +32,34 @@ jobs:
         with:
           node-version: "26.13.0"
           cache: npm
-          cache-dependency-path: desktop/package-lock.json
+          cache-dependency-path: clients/package-lock.json
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install desktop dependencies
-        working-directory: desktop
+        working-directory: clients
         run: npm ci
       - name: Check and build
         run: |
           cargo clippy -p twr-app -p twr-core -p twr-tui --all-targets --locked -- -D warnings
           cargo build --locked -p twr-cli -p twr-app
-          npm --prefix desktop run catalog:check
-          npm --prefix desktop run format:check
-          npm --prefix desktop test
-          npm --prefix desktop run build
+          npm --prefix clients run catalog:check
+          npm --prefix clients run format:check
+          npm --prefix clients test
+          npm --prefix clients run build
       - name: Real application integration
-        working-directory: desktop
+        working-directory: clients
         run: npm run test:integration
       - name: Build unsigned review installer
-        working-directory: desktop
+        working-directory: clients
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run package:mac
       - name: Packaged Mac workflow QA
-        working-directory: desktop
+        working-directory: clients
         run: npm run test:qa:mac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-macos-arm64
-          path: desktop/release/*.dmg
+          path: clients/release/*.dmg
 
   arch:
     name: Arch Linux, native Wayland, and package
@@ -77,21 +77,21 @@ jobs:
       - name: Prepare non-root build
         run: |
           chown -R builder:builder "$GITHUB_WORKSPACE"
-          runuser -u builder -- npm --prefix desktop ci
+          runuser -u builder -- npm --prefix clients ci
           runuser -u builder -- cargo build --locked -p twr-cli -p twr-app
-          runuser -u builder -- npm --prefix desktop run build
-          runuser -u builder -- npm --prefix desktop test
+          runuser -u builder -- npm --prefix clients run build
+          runuser -u builder -- npm --prefix clients test
           # Materialize Electron before assigning its sandbox helper's package permissions.
-          runuser -u builder -- node desktop/node_modules/electron/install.js
-          chown root:root desktop/node_modules/electron/dist/chrome-sandbox
-          chmod 4755 desktop/node_modules/electron/dist/chrome-sandbox
+          runuser -u builder -- node clients/node_modules/electron/install.js
+          chown root:root clients/node_modules/electron/dist/chrome-sandbox
+          chmod 4755 clients/node_modules/electron/dist/chrome-sandbox
       - name: Exercise Electron on a native Wayland compositor
-        working-directory: desktop
+        working-directory: clients
         run: |
           install -dm700 -o builder -g builder /tmp/twr-wayland
           runuser -u builder -- env XDG_RUNTIME_DIR=/tmp/twr-wayland WLR_BACKENDS=headless WLR_RENDERER=pixman TWR_DESKTOP_WAYLAND_TEST=1 dbus-run-session -- cage -- npm run test:integration
       - name: Build and validate Arch package
-        working-directory: desktop
+        working-directory: clients
         run: |
           runuser -u builder -- npm run package:arch
           cd release/arch
@@ -101,10 +101,10 @@ jobs:
           test "$(stat -c %a /opt/twr-desktop/chrome-sandbox)" = 4755
           test "$(stat -c %u /opt/twr-desktop/chrome-sandbox)" = 0
       - name: Exercise the installed Arch package on Wayland
-        working-directory: desktop
+        working-directory: clients
         run: |
           runuser -u builder -- env XDG_RUNTIME_DIR=/tmp/twr-wayland WLR_BACKENDS=headless WLR_RENDERER=pixman TWR_DESKTOP_WAYLAND_TEST=1 TWR_DESKTOP_EXECUTABLE=/usr/bin/twr-desktop dbus-run-session -- cage -- npm run test:integration
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-arch-x86_64
-          path: desktop/release/arch/*.pkg.tar.zst
+          path: clients/release/arch/*.pkg.tar.zst

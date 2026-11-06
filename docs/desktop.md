@@ -1,6 +1,6 @@
 # Desktop application
 
-The Electron application lives in `desktop/`. It targets Apple Silicon macOS and x86_64
+The Electron application lives in `clients/`. It targets Apple Silicon macOS and x86_64
 Linux, including an Arch package for Omarchy. It uses the same hub, workspaces, accounts,
 permissions and history as the CLI. You can use both clients at once. Closing the window
 does not stop the hub; active interactive terminal sessions ask before closing.
@@ -12,14 +12,14 @@ normal C/C++ build tools (Xcode command-line tools on macOS; `base-devel` on Arc
 
 ```sh
 cargo build --locked -p twr-cli -p twr-app
-cd desktop
+cd clients
 npm ci
 npm run dev
 ```
 
 `npm start` opens the last production UI build. `npm run build` type-checks TypeScript and
 builds the host, isolated preload and React UI. The development host takes a matched CLI
-and companion from `desktop/bin`, `target/debug`, or `target/release`. An explicit
+and companion from `clients/bin`, `target/debug`, or `target/release`. An explicit
 `TWR_DESKTOP_BINARY_DIR` is accepted only in development. Packaged builds always use the
 three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remains useful for an independent test installation.
 
@@ -99,10 +99,10 @@ required for this release.
   repeatedly breaking the entire stream. A mutation is retried only when the hub protocol proves it was not executed; uncertain outcomes are never blindly replayed.
 - `twr-core::slash`, `routine`, `card_order`, `config_edit`, `blob::hydrate_item` and `paths::project_param`:
   behavior shared by TUI and graphical clients. Rendering is separate from reducers.
-- `desktop/electron`: window lifecycle, isolated and validated IPC, terminal processes,
+- `clients/desktop`: window lifecycle, isolated and validated IPC, terminal processes,
   login environment, packaging and the companion transport. The renderer has no Node API.
   Only the main frame can use the preload API; model Markdown has no raw HTML or remote images.
-- `desktop/src`: React components, typed action catalog and presentation of normalized
+- `clients/shared`: React components, typed action catalog and presentation of normalized
   events. It does not decide permissions or maintain a second thread-state reducer.
 
 The bundled executables are copied to a content-addressed private engine directory before
@@ -119,7 +119,7 @@ See [mobile development, trust model and verification limits](mobile.md).
 ```sh
 cargo test --locked -p twr-app -p twr-core -p twr-tui
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cd desktop
+cd clients
 npm test
 npm run build
 npm run test:integration
@@ -150,7 +150,7 @@ Omarchy desktop with your normal input method and monitor scale before publishin
 Build on the target platform (Apple Silicon macOS or x86_64 Linux):
 
 ```sh
-cd desktop
+cd clients
 npm run package:mac        # release/*.dmg
 npm run package:linux      # release/*.AppImage and linux-unpacked/
 npm run package:arch       # release/arch/PKGBUILD and its checksummed source archive
@@ -165,6 +165,7 @@ so a system Electron upgrade cannot change the app's ABI. Its launcher uses the 
 macOS packaging supports normal electron-builder signing/notarization credentials when
 provided by the release environment. After packaging on macOS, `npm run test:packaged:mac` launches the actual app through
 LaunchServices in a temporary installation to check production user authentication, the
-bundled engine and native terminal. Local and PR installers are unsigned review builds;
-they must be signed/notarized before public distribution. The CI workflow uploads review
+bundled engine and native terminal. `package:mac` produces an ad hoc signed local review
+installer. For Developer ID signing and notarization, use `npm run package -- --mac --arm64`
+with the release environment’s signing credentials; that path retains hardened runtime. The CI workflow uploads review
 artifacts and does not publish or install them automatically.

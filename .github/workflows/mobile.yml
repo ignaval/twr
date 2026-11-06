@@ -1,10 +1,10 @@
 name: Mobile
 on:
   pull_request:
-    paths: ["desktop/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
+    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
   push:
     branches: [dev, "codex/twr-apps"]
-    paths: ["desktop/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
+    paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -34,24 +34,24 @@ jobs:
         with:
           node-version: "26.13.0"
           cache: npm
-          cache-dependency-path: desktop/package-lock.json
+          cache-dependency-path: clients/package-lock.json
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
       - name: Build shared engine and mobile UI
         run: |
           cargo build --locked -p twr-cli -p twr-app
-          npm --prefix desktop ci
-          npm --prefix desktop run mobile:build
-          npm --prefix desktop test
+          npm --prefix clients ci
+          npm --prefix clients run mobile:build
+          npm --prefix clients test
       - name: Compile iOS native application
-        working-directory: desktop
+        working-directory: clients
         run: node mobile/scripts/ios-build.mjs
       - name: Verify installed fold-control helper
-        working-directory: desktop
+        working-directory: clients
         run: node node_modules/agent-device/bin/agent-device.mjs --version
       - name: Native remote-hub and layout integration
-        working-directory: desktop
+        working-directory: clients
         env:
           TWR_IOS_KIND: ${{ matrix.kind }}
         run: node mobile/scripts/ios-qa.mjs
@@ -60,6 +60,6 @@ jobs:
         with:
           name: twr-ios-${{ matrix.kind }}-qa
           path: |
-            desktop/test-results/ios/
-            desktop/test-results/performance-ios-*.json
-            desktop/mobile/ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app
+            clients/test-results/ios/
+            clients/test-results/performance-ios-*.json
+            clients/mobile/ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app
