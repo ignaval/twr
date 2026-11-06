@@ -132,7 +132,13 @@ final class RemoteHubTests: XCTestCase {
         // Reset the real TCP connection, keeping the gateway and its PTY alive.
         _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/drop-socket")!)
         try await until("try{return (await window.twr.terminalRead(window.__qaTerminal.id)).data.includes('ORDER_0123456789abcdefghijklmnopqrstuvwxyz')}catch{return false}", seconds: 45)
-        _ = try await js("await window.twr.terminalClose(window.__qaTerminal.id);return true")
+        // Close through the app so both the remote PTY and its local pane disappear.
+        // Calling the host API alone intentionally leaves the terminal's UI history open.
+        _ = try await js("document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]').click();return true")
+        try await until("return !!document.querySelector('[role=dialog]')")
+        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(e=>e.textContent==='Continue').click();return true")
+        try await until("return !document.querySelector('.terminal-dock')")
+        _ = try await js("await window.Capacitor.Plugins.Keyboard.hide();return true")
         // Keep the socket active beyond the former 40 second resource timeout.
         _ = try await js("window.__qaDisconnects=0;window.__qaWatch=window.twr.onEvent(e=>{if(e.type==='connection'&&!e.connected)window.__qaDisconnects++});return true")
         try await Task.sleep(nanoseconds: 45_000_000_000)
