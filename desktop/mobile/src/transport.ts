@@ -34,6 +34,7 @@ export interface NativeTransport {
 export const Transport = registerPlugin<NativeTransport>("TwrTransport");
 export class RemoteHost {
   private nativeConnected = false;
+  private framing = false;
   private bridgeReady = false;
   private confirmedWorkspace = false;
   private connectionTail: Promise<unknown> = Promise.resolve();
@@ -189,7 +190,10 @@ export class RemoteHost {
           if (message.error) request.reject(new Error(message.error));
           else request.resolve(message.result);
         } else {
-          if (message.type === "authenticated") this.nativeConnected = true;
+          if (message.type === "authenticated") {
+            this.nativeConnected = true;
+            this.framing = message.framing === true;
+          }
           if (message.type === "transport-closed") {
             this.assembler.clear();
             this.nativeConnected = false;
@@ -278,13 +282,18 @@ export class RemoteHost {
         // App bootstrap selects the initial workspace. Foreground/notification
         // callbacks must not start a competing default-workspace connection.
         if (!this.confirmedWorkspace) return;
-        if (this.nativeConnected) {
+        if (this.nativeConnected && Date.now() - this.lastFrameAt >= 15000) {
+          const probingSince = Date.now();
           try {
             await this.request("heartbeat", {}, 15000);
           } catch {
-            this.nativeConnected = false;
-            this.bridgeReady = false;
-            this.rejectPending(true);
+            // A response may be behind already-buffered TCP data. Receiving
+            // fragments while probing proves progress on the existing link.
+            if (!this.nativeConnected || this.lastFrameAt < probingSince) {
+              this.nativeConnected = false;
+              this.bridgeReady = false;
+              this.rejectPending(true);
+            }
           }
         }
         if (!this.nativeConnected || !this.bridgeReady) {
@@ -295,11 +304,17 @@ export class RemoteHost {
             this.scheduleReconnect();
             throw error;
           }
-        } else
-          await this.request("rpc", {
-            method: "notify.looking",
-            params: { looking: this.foreground },
-          });
+        } else {
+          try {
+            await this.request("rpc", {
+              method: "notify.looking",
+              params: { looking: this.foreground },
+            });
+          } catch (error) {
+            this.transportFailed(String(error));
+            throw error;
+          }
+        }
       }).finally(() => {
         this.reconnecting = undefined;
       });
@@ -405,6 +420,7 @@ export class RemoteHost {
       },
       bootstrap: async () => ({
         ...(await request("bootstrap")),
+        transportFraming: this.framing,
         platform: navigator.userAgent.includes("Android") ? "android" : "ios",
       }),
       connect: (workspace) =>

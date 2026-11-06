@@ -35,6 +35,68 @@ beforeEach(() => {
   });
 });
 describe("mobile reconnect", () => {
+  it("recovers when a fresh native socket silently closes before foregrounding", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      fake.send.mockRejectedValueOnce(new Error("Hub connection is closed"));
+      await expect(host.resume()).rejects.toThrow("Hub connection is closed");
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      await expect(host.api().rpc("hub.info")).resolves.toEqual({});
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not discard a progressing transfer when a resume heartbeat is delayed", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const original = fake.send.getMockImplementation()!;
+      fake.send.mockImplementation(async (payload) => {
+        if (JSON.parse(payload.message).method !== "heartbeat")
+          await original(payload);
+      });
+      await vi.advanceTimersByTimeAsync(16000);
+      const resumed = host.resume();
+      setTimeout(
+        () =>
+          fake.listener({
+            message: {
+              type: "frame-part",
+              transfer: "progress",
+              index: 0,
+              count: 2,
+              data: "{",
+            },
+          }),
+        5000,
+      );
+      await vi.advanceTimersByTimeAsync(16000);
+      await resumed;
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      expect(fake.disconnect).not.toHaveBeenCalled();
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+
   it("detects a silent socket without waiting for a long RPC timeout", async () => {
     vi.useFakeTimers();
     const host = new RemoteHost(

@@ -4,7 +4,12 @@ const wait = async (check, limit = 120000) => {
     if (await check()) return;
     await new Promise((r) => setTimeout(r, 30));
   }
-  throw new Error("iOS performance fixture timed out");
+  throw new Error(
+    "iOS performance fixture timed out: " +
+      check.toString() +
+      " | " +
+      document.body.innerText.slice(-2000),
+  );
 };
 const rpc = (method, params = {}) => window.twr.rpc(method, params);
 await rpc("thread.new", {
@@ -143,6 +148,25 @@ if (report.renderedBlocks >= 80)
 const send = document
   .querySelector('button[aria-label="Send message"]')
   .getBoundingClientRect();
-if (send.bottom > (visualViewport?.height || innerHeight) + 1)
-  throw new Error("Composer outside the visible viewport");
+const viewport = window.visualViewport;
+if (
+  send.bottom >
+  (viewport?.height || innerHeight) + (viewport?.offsetTop || 0) + 1
+)
+  throw new Error(
+    "Composer outside the visible viewport: " +
+      JSON.stringify({
+        send: send.toJSON(),
+        width: innerWidth,
+        height: innerHeight,
+        viewport: viewport && {
+          width: viewport.width,
+          height: viewport.height,
+          offsetTop: viewport.offsetTop,
+          scale: viewport.scale,
+        },
+        root: document.documentElement.style.cssText,
+        layout: await window.Capacitor.Plugins.TwrLayout.current(),
+      }),
+  );
 return report;

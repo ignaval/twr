@@ -26,6 +26,21 @@ final class RemoteHubTests: XCTestCase {
         throw NSError(domain: "twr.qa", code: 1)
     }
 
+    private func capture(_ name: String) async throws {
+        let image: UIImage = try await withCheckedThrowingContinuation { continuation in
+            web.takeSnapshot(with: nil) { image, error in
+                if let error { continuation.resume(throwing: error) }
+                else if let image { continuation.resume(returning: image) }
+                else { continuation.resume(throwing: NSError(domain: "twr.qa.snapshot", code: 1)) }
+            }
+        }
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:47323/screenshot?name=" + name)!)
+        request.httpMethod = "POST"
+        request.httpBody = try XCTUnwrap(image.pngData())
+        let (_, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+    }
+
     private func pose(_ name:String) async throws {
         let request=URLRequest(url:URL(string:"http://127.0.0.1:47323/pose/"+name)!,timeoutInterval:240)
         let (data,response)=try await URLSession.shared.data(for:request)
@@ -140,10 +155,13 @@ final class RemoteHubTests: XCTestCase {
               input.dispatchEvent(new Event('input',{bubbles:true}));return true;
               """)
             let closedWidth = try await js("return innerWidth") as? Int ?? 0
+            try await capture("cover")
             try await pose("open")
             try await until("return innerWidth !== \(closedWidth)")
+            try await capture("open")
             try await pose("half-open")
             try await until("return (await window.Capacitor.Plugins.TwrLayout.current()).orientation !== 'none'")
+            try await capture("half-open")
             _ = try await js("[...document.querySelectorAll('.topbar button')].find(e=>e.getAttribute('aria-label')==='New thread'||e.textContent.includes('New thread')).click();return true")
             try await until("return !!document.querySelector('[role=dialog]')")
             let safeDialog = try await js("""
@@ -164,7 +182,15 @@ final class RemoteHubTests: XCTestCase {
             XCTAssertEqual(restoredDraft, "FOLD_TRANSITION_DRAFT")
         }
         let (scriptData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/performance-script")!)
-        let performanceResult = try await js(try XCTUnwrap(String(data: scriptData, encoding: .utf8)))
+        let performanceResult: Any?
+        do {
+            performanceResult = try await js(try XCTUnwrap(String(data: scriptData, encoding: .utf8)))
+        } catch {
+            let diagnostic = try? await js("return {text:document.body.innerText,viewport:{width:innerWidth,height:innerHeight},layout:await window.Capacitor.Plugins.TwrLayout.current()}")
+            print("PERFORMANCE FAILURE", String(describing: diagnostic))
+            try? await capture("performance-failure")
+            throw error
+        }
         var performanceRequest = URLRequest(url: URL(string: "http://127.0.0.1:47323/performance")!)
         performanceRequest.httpMethod = "POST"
         performanceRequest.httpBody = try JSONSerialization.data(withJSONObject: try XCTUnwrap(performanceResult))
@@ -178,7 +204,6 @@ final class RemoteHubTests: XCTestCase {
         XCTAssertEqual(errorCount, 0)
         XCTAssertFalse(repo.isEmpty)
         // Capture the app while it is visible, before XCTest returns to SpringBoard.
-        let (_, screenshotResponse) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/screenshot")!)
-        XCTAssertEqual((screenshotResponse as? HTTPURLResponse)?.statusCode, 200)
+        try await capture("screen")
     }
 }

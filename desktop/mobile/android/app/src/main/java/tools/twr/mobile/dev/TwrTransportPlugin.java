@@ -21,7 +21,9 @@ import org.json.*;
 @CapacitorPlugin(name="TwrTransport")
 public class TwrTransportPlugin extends Plugin {
     private static final String KEY="tools.twr.mobile.credentials";
-    private final OkHttpClient http=new OkHttpClient.Builder().followRedirects(false).followSslRedirects(false).connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).pingInterval(20,TimeUnit.SECONDS).build();
+    // Application heartbeats/watchdog observe frame progress; OkHttp's fixed
+    // pong deadline mistakes TCP-buffered slow transfers for dead links.
+    private final OkHttpClient http=new OkHttpClient.Builder().followRedirects(false).followSslRedirects(false).connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).pingInterval(0,TimeUnit.SECONDS).build();
     private volatile WebSocket socket;
     private final java.util.concurrent.atomic.AtomicLong connectionGeneration=new java.util.concurrent.atomic.AtomicLong();
     private String activeHub;
@@ -62,7 +64,10 @@ public class TwrTransportPlugin extends Plugin {
             if(!health.isSuccessful()||health.body()==null)throw new Exception("Could not identify the hub");
             String gateway=new JSONObject(health.body().string()).optString("gateway_id","");
             JSONObject existing=vault();java.util.Iterator<String> keys=existing.keys();
-            while(keys.hasNext())if(!gateway.isEmpty()&&gateway.equals(existing.getJSONObject(keys.next()).optString("gateway_id")))throw new Exception("This hub is already paired. Use Revoke this device in its settings, or Forget this hub under Device access if it cannot connect, then pair again.");
+            while(keys.hasNext()) {
+                JSONObject saved=existing.getJSONObject(keys.next());
+                if(!gateway.isEmpty()&&gateway.equals(saved.optString("gateway_id")))throw new Exception("This hub is already paired. Use Revoke this device in its settings, or Forget this hub under Device access if it cannot connect, then pair again.");
+            }
         }
         Request request=new Request.Builder().url(url+"/v1/pair").post(RequestBody.create(body.toString(),MediaType.get("application/json"))).build();
         try(Response response=http.newCall(request).execute()){

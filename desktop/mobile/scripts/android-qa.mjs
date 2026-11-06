@@ -76,6 +76,8 @@ const gatewayPort = 47325;
 let proxy;
 let downstreamRate = 0;
 let dropDownstream = false;
+let legacyHealth = false;
+let legacyHealthReplies = 0;
 const proxySockets = new Set();
 async function nativeConfirm() {
   const xmlPath = "/sdcard/twr-confirm-qa.xml";
@@ -175,7 +177,7 @@ try {
   }
   const code = stdout.match(/Pairing code[^:]+: (\w+)/)?.[1];
   assert(code, "Gateway should provide a one-use pairing code: " + stderr);
-  proxy = createServer((socket) => {
+  const forwardSocket = (socket, initial) => {
     const upstream = connectTCP(gatewayPort, "127.0.0.1");
     const throttle = new Transform({
       transform(chunk, _encoding, callback) {
@@ -205,8 +207,28 @@ try {
         throttle.destroy();
       });
     }
+    if (initial) upstream.write(initial);
     socket.pipe(upstream);
     upstream.pipe(throttle).pipe(socket);
+  };
+  proxy = createServer((socket) => {
+    if (!legacyHealth) {
+      forwardSocket(socket);
+      return;
+    }
+    socket.on("error", () => socket.destroy());
+    socket.once("data", (first) => {
+      if (first.toString("utf8").startsWith("GET /health ")) {
+        legacyHealthReplies++;
+        const body = JSON.stringify({ service: "twr-mobile", protocol: 1 });
+        socket.end(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " +
+            Buffer.byteLength(body) +
+            "\r\n\r\n" +
+            body,
+        );
+      } else forwardSocket(socket, first);
+    });
   });
   await new Promise((resolve) => proxy.listen(port, "127.0.0.1", resolve));
   adbRun([
@@ -884,6 +906,11 @@ try {
     );
   }
   if (process.env.TWR_SLOW_LINK_QA === "1") {
+    assert.equal(
+      (await page.evaluate(() => window.twr.bootstrap())).transportFraming,
+      true,
+      "Native socket must negotiate chunked messages",
+    );
     await page.evaluate(async () => {
       await window.twr.rpc("thread.new", {
         project: "demo",
@@ -1093,6 +1120,8 @@ try {
       .click();
     await nativeConfirm();
     await expect(page.locator(".mobile-onboarding")).toBeVisible();
+    legacyHealth = true;
+    for (const socket of proxySockets) socket.destroy();
     await page.getByRole("button", { name: /Pair.*hub/i }).click();
     await page
       .getByLabel("Hub name", { exact: true })
@@ -1121,6 +1150,15 @@ try {
     console.log(
       "PASS: default device scopes disable terminals and hide admin sections",
     );
+    legacyHealth = false;
+    assert(
+      legacyHealthReplies > 0,
+      "Pairing must exercise a health response without gateway_id",
+    );
+    console.log(
+      "PASS: native pairing remains compatible with a legacy gateway health response",
+    );
+
     const readOnlyCode = (
       await ownerCall("device.pair_begin", { scopes: ["read"] })
     ).code;

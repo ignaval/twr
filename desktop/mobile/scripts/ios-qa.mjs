@@ -303,21 +303,41 @@ for (const [index, template] of selected.entries()) {
           res.statusCode = 500;
           res.end(JSON.stringify({ error: String(error) }));
         }
-      } else if (req.url === "/screenshot") {
-        try {
-          execFileSync(
-            "xcrun",
-            ["simctl", "io", device.udid, "screenshot", screenshot],
-            {
-              stdio: "inherit",
-              timeout: 30000,
-            },
-          );
-          res.end("ok");
-        } catch (error) {
-          res.statusCode = 500;
-          res.end(String(error));
+      } else if (req.url.startsWith("/screenshot?") && req.method === "POST") {
+        const name = new URL(req.url, "http://localhost").searchParams.get(
+          "name",
+        );
+        if (!/^[a-z-]{1,40}$/.test(name || "")) {
+          res.statusCode = 400;
+          res.end("Invalid snapshot name");
+          return;
         }
+        const chunks = [];
+        let bytes = 0;
+        for await (const chunk of req) {
+          bytes += chunk.length;
+          if (bytes > 16 * 1024 * 1024) {
+            res.statusCode = 413;
+            res.end("Snapshot too large");
+            return;
+          }
+          chunks.push(chunk);
+        }
+        const png = Buffer.concat(chunks);
+        if (
+          !png
+            .subarray(0, 8)
+            .equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+        ) {
+          res.statusCode = 400;
+          res.end("Invalid PNG");
+          return;
+        }
+        writeFileSync(
+          `test-results/ios/${kind || "all"}-${index}-${name}.png`,
+          png,
+        );
+        res.end("ok");
       } else if (req.url === "/drop-socket") {
         for (const socket of proxySockets) socket.destroy();
         res.end("ok");
