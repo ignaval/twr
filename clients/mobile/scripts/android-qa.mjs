@@ -380,6 +380,24 @@ try {
     dock.composer <= dock.viewport + 1 && dock.tabs === "none",
     JSON.stringify(dock),
   );
+  const placeholderFits = await page
+    .locator(".composer textarea")
+    .evaluate((input) => {
+      const style = getComputedStyle(input),
+        context = document.createElement("canvas").getContext("2d");
+      context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+      return (
+        input.placeholder === "Message…" &&
+        context.measureText(input.placeholder).width <=
+          input.clientWidth -
+            parseFloat(style.paddingLeft) -
+            parseFloat(style.paddingRight)
+      );
+    });
+  assert(
+    placeholderFits,
+    "Mobile placeholder must fit without wrapping; destination remains in chip and accessible name",
+  );
   const adjacentTargets = await page.evaluate(() => {
     const upload = document.querySelector(".attachment-button"),
       send = document.querySelector('button[aria-label="Send message"]');

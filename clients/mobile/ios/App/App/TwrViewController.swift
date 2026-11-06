@@ -17,7 +17,7 @@ private final class RegionObserver: UIView {
     var changed: (([String: Any]) -> Void)?
     override func updateConstraints() {
         super.updateConstraints()
-        var result: [String: Any] = ["orientation": "none", "occlusionTop": 0]
+        var result: [String: Any] = ["orientation": "none", "occlusionTop": 0, "occlusions": []]
         if #available(iOS 27.1, *) {
             if let region = reservedRegions(kind: .division).first {
                 let frame = region.frame
@@ -26,11 +26,19 @@ private final class RegionObserver: UIView {
                           "left": frame.minX, "top": frame.minY,
                           "width": frame.width, "height": frame.height]
             }
-            let top = reservedRegions(kind: .occlusion).map(\.frame)
-                .filter { $0.minY <= safeAreaInsets.top + 1 }
+            let occlusions = reservedRegions(kind: .occlusion).map(\.frame)
+            let top = occlusions.filter { $0.minY <= safeAreaInsets.top + 1 }
                 .map(\.maxY).max() ?? 0
             result["occlusionTop"] = top
+            result["occlusions"] = occlusions.map { frame in
+                ["left": frame.minX, "top": frame.minY,
+                 "width": frame.width, "height": frame.height]
+            }
         }
+        // Include safe-area changes in the event identity even when reserved
+        // rectangles stay the same, so the web UI can re-evaluate CSS env insets.
+        result["safeAreaInsets"] = ["top": safeAreaInsets.top, "left": safeAreaInsets.left,
+                                     "right": safeAreaInsets.right, "bottom": safeAreaInsets.bottom]
         changed?(result)
     }
     override func safeAreaInsetsDidChange() {
@@ -55,7 +63,7 @@ final class TwrLayoutPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "setAppearance", returnType: CAPPluginReturnPromise)
     ]
     private var observer: RegionObserver?
-    private var layout: [String: Any] = ["orientation": "none"]
+    private var layout: [String: Any] = ["orientation": "none", "occlusionTop": 0, "occlusions": []]
     override func load() {
         DispatchQueue.main.async { [weak self] in
             guard let self, let webView = self.bridge?.webView else { return }
@@ -95,6 +103,6 @@ final class TwrLayoutPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
     @objc func current(_ call: CAPPluginCall) {
-        DispatchQueue.main.async { [weak self] in call.resolve(self?.layout ?? ["orientation": "none"]) }
+        DispatchQueue.main.async { [weak self] in call.resolve(self?.layout ?? ["orientation": "none", "occlusionTop": 0, "occlusions": []]) }
     }
 }

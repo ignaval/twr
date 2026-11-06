@@ -4,7 +4,11 @@ import {
   registerPlugin,
   type PluginListenerHandle,
 } from "@capacitor/core";
-import { usableViewportHeight, type Posture } from "./geometry";
+import {
+  topOcclusionInset,
+  usableViewportHeight,
+  type Posture,
+} from "./geometry";
 export const Layout = registerPlugin<{
   current(): Promise<Posture>;
   setAppearance(options: { background: string }): Promise<void>;
@@ -24,7 +28,13 @@ export async function observeLayout() {
       window.visualViewport?.height ?? window.innerHeight,
     );
     root.style.setProperty("--viewport-height", `${viewportHeight}px`);
-    root.style.setProperty("--occlusion-top", `${posture.occlusionTop || 0}px`);
+    const horizontal = getComputedStyle(document.body);
+    const usableLeft = parseFloat(horizontal.paddingLeft) || 0;
+    const usableRight = innerWidth - (parseFloat(horizontal.paddingRight) || 0);
+    root.style.setProperty(
+      "--occlusion-top",
+      `${topOcclusionInset(posture, usableLeft, usableRight)}px`,
+    );
     const style = getComputedStyle(document.body);
     const left = parseFloat(style.paddingLeft) || 0;
     const top = parseFloat(style.paddingTop) || 0;
@@ -76,21 +86,28 @@ export async function observeLayout() {
   const keyboardListeners: PluginListenerHandle[] = [];
   let viewportFrame = 0;
   let settledViewport: ReturnType<typeof setTimeout> | undefined;
-  const keyboardChanged = (visible: boolean) => {
-    root.dataset.keyboard = String(visible);
+  const settleViewport = () => {
     cancelAnimationFrame(viewportFrame);
     if (settledViewport) clearTimeout(settledViewport);
-    // Native WebView resizing and visualViewport notifications need not arrive
-    // in the same frame. Re-read after layout and once the IME animation settles.
+    // Native safe areas, WebView resizing and CSS env values can settle in
+    // different frames. Re-read after layout and once the animation settles.
     updateViewport();
     viewportFrame = requestAnimationFrame(() => {
       viewportFrame = requestAnimationFrame(updateViewport);
     });
     settledViewport = setTimeout(updateViewport, 250);
   };
+  const keyboardChanged = (visible: boolean) => {
+    root.dataset.keyboard = String(visible);
+    settleViewport();
+  };
+  const postureChanged = (posture: Posture) => {
+    lastPosture = posture;
+    settleViewport();
+  };
   if (["android", "ios"].includes(Capacitor.getPlatform())) {
-    apply(await Layout.current());
-    listener = await Layout.addListener("change", apply);
+    postureChanged(await Layout.current());
+    listener = await Layout.addListener("change", postureChanged);
     keyboardListeners.push(
       await Keyboard.addListener("keyboardDidShow", () =>
         keyboardChanged(true),

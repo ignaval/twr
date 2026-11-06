@@ -49,6 +49,32 @@ final class RemoteHubTests: XCTestCase {
         try await Task.sleep(nanoseconds: 350_000_000)
     }
 
+    private func assertContentClearOfOcclusions(_ stage: String, requireOcclusions: Bool = false) async throws {
+        let check = """
+          const layout=await window.Capacitor.Plugins.TwrLayout.current();
+          const root=document.getElementById('root').getBoundingClientRect();
+          const regions=layout.occlusions;
+          if(!Array.isArray(regions) || (\(requireOcclusions ? "true" : "false") && !regions.length))return false;
+          return regions.every(region=>{
+            const width=Math.max(0,Math.min(root.right,region.left+region.width)-Math.max(root.left,region.left));
+            const height=Math.max(0,Math.min(root.bottom,region.top+region.height)-Math.max(root.top,region.top));
+            return width===0 || height===0;
+          });
+          """
+        do {
+            try await until(check, seconds: 10, reportFailure: false)
+        } catch {
+            print("OCCLUSIONS failure stage=\(stage) " + String(describing: try? await js("""
+              return JSON.stringify({layout:await window.Capacitor.Plugins.TwrLayout.current(),root:document.getElementById('root').getBoundingClientRect().toJSON(),bodyPadding:getComputedStyle(document.body).padding,viewport:{width:innerWidth,height:innerHeight,offsetTop:visualViewport?.offsetTop,offsetLeft:visualViewport?.offsetLeft,scale:visualViewport?.scale}});
+              """)))
+            XCTFail("Content overlaps a native reserved occlusion or required regions are missing: " + stage)
+            throw error
+        }
+        print("OCCLUSIONS pass stage=\(stage) " + String(describing: try? await js("""
+          return JSON.stringify({layout:await window.Capacitor.Plugins.TwrLayout.current(),root:document.getElementById('root').getBoundingClientRect().toJSON(),bodyPadding:getComputedStyle(document.body).padding});
+          """)))
+    }
+
     private func appearanceDiagnostics(_ stage: String, controller: TwrViewController) async -> String {
         let state = try? await js("""
           const root=document.documentElement,colors=getComputedStyle(root);
@@ -172,6 +198,7 @@ final class RemoteHubTests: XCTestCase {
         if fixture["foldable"] as? Bool == true {try await pose("closed")}
 
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub')")
+        try await assertContentClearOfOcclusions("initial", requireOcclusions: fixture["foldable"] as? Bool == true)
         // Trace only appearance requests and rendered theme state. Device
         // credentials and ordinary hub calls are deliberately not recorded.
         _ = try await js("""
@@ -304,12 +331,15 @@ final class RemoteHubTests: XCTestCase {
               input.dispatchEvent(new Event('input',{bubbles:true}));return true;
               """)
             let closedWidth = try await js("return innerWidth") as? Int ?? 0
+            try await assertContentClearOfOcclusions("cover", requireOcclusions: true)
             try await capture("cover")
             try await pose("open")
             try await until("return innerWidth !== \(closedWidth)")
+            try await assertContentClearOfOcclusions("open")
             try await capture("open")
             try await pose("half-open")
             try await until("return (await window.Capacitor.Plugins.TwrLayout.current()).orientation !== 'none'")
+            try await assertContentClearOfOcclusions("half-open")
             try await capture("half-open")
             try await until("""
               const summary=document.querySelector('.conversation-menu>summary'),box=summary?.getBoundingClientRect();
@@ -336,6 +366,7 @@ final class RemoteHubTests: XCTestCase {
             XCTAssertEqual(draft, "FOLD_TRANSITION_DRAFT")
             try await pose("closed")
             try await until("return innerWidth === \(closedWidth)")
+            try await assertContentClearOfOcclusions("reclosed", requireOcclusions: true)
             let restoredDraft = try await js("return document.querySelector('.composer textarea').value") as? String
             XCTAssertEqual(restoredDraft, "FOLD_TRANSITION_DRAFT")
         }
@@ -400,6 +431,12 @@ final class RemoteHubTests: XCTestCase {
           const upload=document.querySelector('.attachment-button'),send=document.querySelector('button[aria-label="Send message"]');
           return !send.disabled && [upload,send].every(element=>{const box=element.getBoundingClientRect();return box.width>=44 && box.height>=44 && element.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2))});
           """)
+        let placeholderFits = try await js("""
+          const input=document.querySelector('.composer textarea'),style=getComputedStyle(input),context=document.createElement('canvas').getContext('2d');
+          context.font=style.fontWeight+' '+style.fontSize+' '+style.fontFamily;
+          return input.placeholder==='Message…' && context.measureText(input.placeholder).width<=input.clientWidth-parseFloat(style.paddingLeft)-parseFloat(style.paddingRight);
+          """) as? Bool
+        XCTAssertEqual(placeholderFits, true, "The mobile placeholder must fit on one line; the destination chip and accessible label identify the recipient")
         print("PASS: adjacent Upload and Send have separate reachable 44-point targets in the full viewport")
         // Exercise the same available-height contract as keyboard resizing in native WKWebView.
         _ = try await js("""
@@ -457,6 +494,7 @@ final class RemoteHubTests: XCTestCase {
         let errorCount = try await js("return window.__qaErrors.length") as? Int
         XCTAssertEqual(errorCount, 0)
         XCTAssertFalse(repo.isEmpty)
+        try await assertContentClearOfOcclusions("final-full-viewport", requireOcclusions: fixture["foldable"] as? Bool == true)
         // Capture the app while it is visible, before XCTest returns to SpringBoard.
         try await capture("screen")
     }

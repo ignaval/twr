@@ -2127,9 +2127,11 @@ export default function App({
                       setMentionIndex(0);
                     }}
                     placeholder={
-                      destination
-                        ? `Message ${target?.name} directly…`
-                        : "Ask your orchestrator to build something…"
+                      document.documentElement.dataset.mobile === "true"
+                        ? "Message…"
+                        : destination
+                          ? `Message ${target?.name} directly…`
+                          : "Ask your orchestrator to build something…"
                     }
                     rows={Math.min(
                       6,
