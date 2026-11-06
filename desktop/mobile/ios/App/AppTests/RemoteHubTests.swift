@@ -166,5 +166,8 @@ final class RemoteHubTests: XCTestCase {
         let errorCount = try await js("return window.__qaErrors.length") as? Int
         XCTAssertEqual(errorCount, 0)
         XCTAssertFalse(repo.isEmpty)
+        // Capture the app while it is visible, before XCTest returns to SpringBoard.
+        let (_, screenshotResponse) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/screenshot")!)
+        XCTAssertEqual((screenshotResponse as? HTTPURLResponse)?.statusCode, 200)
     }
 }

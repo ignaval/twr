@@ -35,6 +35,7 @@ assert(
   "Install iPhone and iOS 27.1 iPhone Duo Simulator runtimes",
 );
 const bin = resolve("../target/debug");
+const foldHelper = resolve("node_modules/agent-device/bin/agent-device.mjs");
 mkdirSync("test-results/ios", { recursive: true });
 const kind = process.env.TWR_IOS_KIND;
 const selected = targets.filter(
@@ -62,6 +63,8 @@ for (const [index, template] of selected.entries()) {
     ).trim(),
   };
   const fixture = mkdtempSync(join(tmpdir(), "twr-ios-"));
+  const screenshot = `test-results/ios/${kind || "all"}-${index}-screen.png`;
+  rmSync(screenshot, { force: true });
   const repo = join(fixture, "repo");
   mkdirSync(repo);
   execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
@@ -107,10 +110,9 @@ for (const [index, template] of selected.entries()) {
     });
     if (device.name.includes("Duo"))
       execFileSync(
-        "npx",
+        process.execPath,
         [
-          "--yes",
-          "agent-device@0.21.36",
+          foldHelper,
           "fold",
           "closed",
           "--platform",
@@ -189,7 +191,22 @@ for (const [index, template] of selected.entries()) {
             foldable: device.name.includes("Duo"),
           }),
         );
-      else if (req.url === "/drop-socket") {
+      else if (req.url === "/screenshot") {
+        try {
+          execFileSync(
+            "xcrun",
+            ["simctl", "io", device.udid, "screenshot", screenshot],
+            {
+              stdio: "inherit",
+              timeout: 30000,
+            },
+          );
+          res.end("ok");
+        } catch (error) {
+          res.statusCode = 500;
+          res.end(String(error));
+        }
+      } else if (req.url === "/drop-socket") {
         for (const socket of proxySockets) socket.destroy();
         res.end("ok");
       } else if (req.url === "/performance-script") {
@@ -225,10 +242,9 @@ for (const [index, template] of selected.entries()) {
         }
         try {
           const result = execFileSync(
-            "npx",
+            process.execPath,
             [
-              "--yes",
-              "agent-device@0.21.36",
+              foldHelper,
               "fold",
               pose,
               "--platform",
@@ -279,6 +295,7 @@ for (const [index, template] of selected.entries()) {
     });
     await new Promise((resolve) => proxy.listen(47324, "127.0.0.1", resolve));
     const result = `test-results/ios/${kind || "all"}-${index}-${device.name.replaceAll(" ", "-")}.xcresult`;
+    rmSync(result, { recursive: true, force: true });
     const test = spawn(
       "xcodebuild",
       [
@@ -305,17 +322,12 @@ for (const [index, template] of selected.entries()) {
       { stdio: "inherit" },
     );
     const exit = await new Promise((r) => test.on("exit", r));
-    execFileSync(
-      "xcrun",
-      [
-        "simctl",
-        "io",
-        device.udid,
-        "screenshot",
-        `test-results/ios/${kind || "all"}-${index}-screen.png`,
-      ],
-      { stdio: "inherit" },
-    );
+    if (!existsSync(screenshot))
+      execFileSync(
+        "xcrun",
+        ["simctl", "io", device.udid, "screenshot", screenshot],
+        { stdio: "inherit" },
+      );
     assert.equal(exit, 0, `${device.name} native integration tests must pass`);
     console.log(
       `PASS: ${device.name} native pairing, Keychain, streaming, answers, uploads, ordered PTY, reconnect and long-lived socket`,

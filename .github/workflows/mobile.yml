@@ -13,8 +13,12 @@ concurrency:
   cancel-in-progress: true
 jobs:
   ios:
-    name: iOS native Simulator and iPhone Duo
+    name: iOS native ${{ matrix.kind }}
     runs-on: xcode-27
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [phone, fold, tablet]
     timeout-minutes: 60
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
@@ -43,25 +47,18 @@ jobs:
       - name: Compile iOS native application
         working-directory: desktop
         run: node mobile/scripts/ios-build.mjs
-      - name: Native iPhone remote-hub integration
+      - name: Verify installed fold-control helper
+        working-directory: desktop
+        run: node node_modules/agent-device/bin/agent-device.mjs --version
+      - name: Native remote-hub and layout integration
         working-directory: desktop
         env:
-          TWR_IOS_KIND: phone
-        run: node mobile/scripts/ios-qa.mjs
-      - name: Native iPhone Duo hinge transitions and integration
-        working-directory: desktop
-        env:
-          TWR_IOS_KIND: fold
-        run: node mobile/scripts/ios-qa.mjs
-      - name: Native iPad integration
-        working-directory: desktop
-        env:
-          TWR_IOS_KIND: tablet
+          TWR_IOS_KIND: ${{ matrix.kind }}
         run: node mobile/scripts/ios-qa.mjs
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: twr-ios-simulator-qa
+          name: twr-ios-${{ matrix.kind }}-qa
           path: |
             desktop/test-results/ios/
             desktop/test-results/performance-ios-*.json
