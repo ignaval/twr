@@ -1,6 +1,8 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopAPI, DesktopEvent } from "../shared/types";
 const api: DesktopAPI = {
+  setAppearance: (appearance) =>
+    ipcRenderer.invoke("twr:set-appearance", appearance),
   quit: () => ipcRenderer.invoke("twr:quit"),
   copyText: (text) => ipcRenderer.invoke("twr:copy-text", text),
   bootstrap: () => ipcRenderer.invoke("twr:bootstrap"),

@@ -382,7 +382,27 @@ try {
   mkdirSync("test-results", { recursive: true });
   writeFileSync(
     `test-results/${serial === "emulator-5556" ? "android-fold" : "android-phone"}-keyboard.png`,
-    execFileSync(adb, ["-s", serial, "exec-out", "screencap", "-p"]),
+    (() => {
+      const display = adbRun([
+        "shell",
+        "dumpsys",
+        "SurfaceFlinger",
+        "--display-id",
+      ]).match(/Display (\d+)/)?.[1];
+      const bytes = execFileSync(adb, [
+        "-s",
+        serial,
+        "exec-out",
+        "screencap",
+        "-p",
+        ...(display ? ["-d", display] : []),
+      ]);
+      const start = bytes.indexOf(
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      );
+      assert(start >= 0, "Native screencap must contain a PNG");
+      return bytes.subarray(start);
+    })(),
   );
   console.log(
     "PASS: keyboard hides tabs and composer docks above native IME without an empty band",
@@ -553,12 +573,15 @@ try {
         hubLeft: document
           .querySelector(".mobile-hub-switch")
           .getBoundingClientRect().left,
+        hubRight: document
+          .querySelector(".mobile-hub-switch")
+          .getBoundingClientRect().right,
       };
     });
     assert(
-      header.leftRight <= header.actionsLeft + 1 &&
-        header.actionsRight <= header.headerRight + 1 &&
-        header.actionsRight <= header.hubLeft + 1,
+      header.leftRight <= header.hubLeft + 1 &&
+        header.hubRight <= header.actionsLeft + 1 &&
+        header.actionsRight <= header.headerRight + 1,
       JSON.stringify(header),
     );
 
@@ -999,9 +1022,7 @@ try {
       "tools.twr.mobile.dev",
       "android.permission.POST_NOTIFICATIONS",
     ]);
-    await page
-      .getByRole("button", { name: "Remote hub settings", exact: true })
-      .click();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
     await page
       .getByRole("button", { name: "Test notification", exact: true })
       .click();
@@ -1330,9 +1351,7 @@ try {
     console.log(
       "PASS: duplicate pairing is rejected without consuming its code or storing another credential",
     );
-    await page
-      .getByRole("button", { name: "Remote hub settings", exact: true })
-      .click();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
     await page
       .getByRole("button", { name: "Revoke this device", exact: true })
       .click();
@@ -1385,9 +1404,7 @@ try {
       exact: true,
     });
     if (await drawerClose.isVisible()) await drawerClose.click();
-    await page
-      .getByRole("button", { name: "Remote hub settings", exact: true })
-      .click();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
     await page
       .getByRole("button", { name: "Revoke this device", exact: true })
       .click();
@@ -1466,9 +1483,7 @@ try {
         { timeout: 30000 },
       )
       .toBe(hubPid);
-    await page
-      .getByRole("button", { name: "Remote hub settings", exact: true })
-      .click();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
     await page
       .getByRole("button", { name: "Revoke this device", exact: true })
       .click();

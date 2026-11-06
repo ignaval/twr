@@ -99,9 +99,7 @@ export async function multiHubQA({
     await page.evaluate(() => {
       window.__qaPreviousHubAPI = window.twr;
     });
-    await page
-      .getByRole("button", { name: "Remote hub settings", exact: true })
-      .click();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
     await page.getByRole("button", { name: "Switch hub", exact: true }).click();
     await page.getByRole("button", { name: /Pair.*hub/i }).click();
     await page.getByLabel("Hub name", { exact: true }).fill("Second hub QA");
@@ -116,7 +114,7 @@ export async function multiHubQA({
       .getByRole("button", { name: "Pair and connect", exact: true })
       .click();
     await expect(
-      page.getByRole("button", { name: "Remote hub settings", exact: true }),
+      page.getByRole("button", { name: /^Remote hub settings:/ }),
     ).toHaveText("Second hub QA");
     await expect
       .poll(() =>
@@ -210,7 +208,7 @@ export async function multiHubQA({
     );
     await notification(originalGateway, "default", "twr · hub switch QA");
     await expect(
-      page.getByRole("button", { name: "Remote hub settings", exact: true }),
+      page.getByRole("button", { name: /^Remote hub settings:/ }),
     ).toHaveText("QA workstation", { timeout: 30000 });
     await expect(
       page.locator(".mobile-tabs").getByRole("button", { name: /Needs you/ }),
@@ -231,7 +229,7 @@ export async function multiHubQA({
     ).toHaveCount(0);
     await notification(secondGateway, "work", "twr · work QA");
     await expect(
-      page.getByRole("button", { name: "Remote hub settings", exact: true }),
+      page.getByRole("button", { name: /^Remote hub settings:/ }),
     ).toHaveText("Second hub QA", { timeout: 30000 });
     await expect(page.locator(".workspace-breadcrumb")).toHaveText("work", {
       timeout: 30000,
@@ -245,7 +243,7 @@ export async function multiHubQA({
       .toBe("work");
     await notification(originalGateway, "default", "twr · return QA");
     await expect(
-      page.getByRole("button", { name: "Remote hub settings", exact: true }),
+      page.getByRole("button", { name: /^Remote hub settings:/ }),
     ).toHaveText("QA workstation", { timeout: 30000 });
     console.log(
       "PASS: a real notification switches between two remote hubs and binds the new UI subscriptions",
@@ -265,7 +263,7 @@ export async function multiHubQA({
       .filter({ hasText: "QA workstation" })
       .click();
     await expect(
-      page.getByRole("button", { name: "Remote hub settings", exact: true }),
+      page.getByRole("button", { name: /^Remote hub settings:/ }),
     ).toHaveText("QA workstation");
     console.log(
       "PASS: a failed notification hub switch returns to the hub list and reconnects cleanly",

@@ -1,3 +1,4 @@
+import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
@@ -113,11 +114,6 @@ const statusIcon = (status: string) =>
     <Circle size={10} />
   );
 
-function errorMessage(error: unknown) {
-  return (error instanceof Error ? error.message : String(error))
-    .replace(/^Error invoking remote method '[^']+':\s*/i, "")
-    .replace(/^Error:\s*/i, "");
-}
 function operationAction(command: Command, again: boolean) {
   const labels: Record<string, string> = {
     new: "Create thread",
@@ -180,15 +176,34 @@ function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
     selection: theme.selection || theme.selection_background,
   }))
     root.style.setProperty("--omarchy-" + key, value || "");
-  const hex = theme.background?.slice(1);
-  if (hex?.length === 6) {
-    const rgb = [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  const rgb = (value?: string) => {
+    if (!value || !/^#[0-9a-f]{6}$/i.test(value)) return undefined;
+    return [1, 3, 5].map((i) => parseInt(value.slice(i, i + 2), 16));
+  };
+  const background = rgb(theme.background);
+  const scheme =
+    theme.mode === "light" || theme.mode === "dark"
+      ? theme.mode
+      : background &&
+          (background[0] * 299 + background[1] * 587 + background[2] * 114) /
+            1000 >
+            140
+        ? "light"
+        : "dark";
+  root.style.setProperty("--omarchy-scheme", scheme);
+  const accent = rgb(theme.accent);
+  if (accent) {
+    const luminance = accent
+      .map((channel) => channel / 255)
+      .map((channel) =>
+        channel <= 0.04045
+          ? channel / 12.92
+          : ((channel + 0.055) / 1.055) ** 2.4,
+      )
+      .reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
     root.style.setProperty(
-      "--omarchy-scheme",
-      theme.mode ||
-        ((rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) / 1000 > 140
-          ? "light"
-          : "dark"),
+      "--omarchy-accent-fg",
+      luminance > 0.179 ? "#06191c" : "#ffffff",
     );
   }
 }
@@ -1678,6 +1693,12 @@ export default function App({
                     : section === "attention"
                       ? "Needs you"
                       : nav.find((n) => n.id === section)?.label || "Decisions"}
+              {section === "chat" && target && (
+                <small className="mobile-runtime">
+                  {target.runtime} ·{" "}
+                  {target.model_actual || target.model || "default model"}
+                </small>
+              )}
             </span>
             {connected && (
               <span
@@ -1733,6 +1754,10 @@ export default function App({
                     ).removeAttribute("open")
                   }
                 >
+                  <button onClick={() => setSidebar(true)}>
+                    <PanelLeftOpen size={16} />
+                    Threads and navigation
+                  </button>
                   <button
                     disabled={!permitted("operate")}
                     onClick={() => action("new")}
@@ -2073,6 +2098,14 @@ export default function App({
                         </button>
                       )}
                     </span>
+
+                    <span>
+                      {!connected
+                        ? "Disconnected"
+                        : target
+                          ? target.status_label || target.status
+                          : "Choose an orchestrator"}
+                    </span>
                     {onDismissKeyboard && (
                       <button
                         type="button"
@@ -2083,13 +2116,6 @@ export default function App({
                         <ChevronDown size={18} />
                       </button>
                     )}
-                    <span>
-                      {!connected
-                        ? "Disconnected"
-                        : target
-                          ? target.status_label || target.status
-                          : "Choose an orchestrator"}
-                    </span>
                   </div>
                   <textarea
                     ref={input}
@@ -2301,7 +2327,7 @@ export default function App({
                     </p>
                   </div>
                   <button
-                    className="primary"
+                    className="primary grid-new-thread"
                     disabled={!permitted("operate")}
                     onClick={() => action("new")}
                   >
@@ -2752,6 +2778,11 @@ export default function App({
           }}
           wide={operation.fields.some((f) => f.type === "textarea")}
         >
+          {operationError && (
+            <div className="operation-error error-banner" role="alert">
+              {operationError}
+            </div>
+          )}
           <form
             onSubmit={(e) => {
               e.preventDefault();
@@ -2812,11 +2843,7 @@ export default function App({
                   confirmation or login stays there.
                 </p>
               )}
-              {operationError && (
-                <div className="error-banner" role="alert">
-                  {operationError}
-                </div>
-              )}
+
               {result !== undefined && (
                 <div className="operation-result">
                   {operation.id === "job-log" ? (
@@ -2867,6 +2894,8 @@ export default function App({
                     <Spinner />
                   ) : operation.cli ? (
                     <TerminalSquare size={15} />
+                  ) : operation.id === "new" ? (
+                    <Plus size={15} />
                   ) : (
                     <ArrowUpRight size={15} />
                   )}{" "}
@@ -3051,6 +3080,7 @@ function ThreadCard({
           <ArrowUpRight
             size={13}
             className="dive-marker"
+            role="img"
             aria-label="Current destination"
           />
         )}
@@ -3094,11 +3124,6 @@ function ThreadCard({
           </>
         )}
       </span>
-      {large && (
-        <span className="thread-open-hint">
-          Select to inspect <ArrowUpRight size={12} />
-        </span>
-      )}
     </button>
   );
 }
@@ -3233,7 +3258,11 @@ function AttentionCard({
               onClick={() => void respond(option)}
             >
               <kbd>{i + 1}</kbd>
-              {option}
+              {option === "allow"
+                ? "Allow"
+                : option === "deny"
+                  ? "Deny"
+                  : option}
             </button>
           ))}
           {!options.length &&

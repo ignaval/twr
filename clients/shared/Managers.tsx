@@ -1,3 +1,4 @@
+import { errorMessage } from "./errors";
 import { savedAppearance, type Appearance } from "./appearance";
 import { useHostAPI } from "./host";
 import { useCallback, useEffect, useState, useRef } from "react";
@@ -112,7 +113,7 @@ export function Manager(props: ManagerProps) {
     try {
       setData(await rpc(info.method));
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     } finally {
       setLoading(false);
     }
@@ -1001,7 +1002,7 @@ export function JobLog({
           }
         })
         .catch((e) => {
-          if (active) setError(String(e));
+          if (active) setError(errorMessage(e));
         });
     load();
     const timer = setInterval(load, 1500);

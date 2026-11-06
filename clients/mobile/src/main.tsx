@@ -1,3 +1,4 @@
+import { errorMessage } from "../../shared/errors";
 import { Keyboard } from "@capacitor/keyboard";
 import { initializeAppearance } from "../../shared/appearance";
 import { observeNativeAppearance } from "./appearance";
@@ -58,7 +59,7 @@ function Mobile() {
     try {
       setHubs((await Transport.listHubs()).hubs);
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     }
   }
   useEffect(() => {
@@ -99,7 +100,7 @@ function Mobile() {
             await host.current.resume();
             setPendingNotification(data);
           }
-        })().catch((error) => setError(String(error)));
+        })().catch((error) => setError(errorMessage(error)));
       },
       () =>
         activeHub.current && pushEnabled(activeHub.current.id)
@@ -130,11 +131,11 @@ function Mobile() {
             .then(() => {
               if (hubId)
                 return refreshPush(remote, hubId).catch((error) => {
-                  if (host.current === remote) setNotice(String(error));
+                  if (host.current === remote) setNotice(errorMessage(error));
                 });
             })
             .catch((error) => {
-              if (host.current === remote) setError(String(error));
+              if (host.current === remote) setError(errorMessage(error));
             });
         } else
           void host.current
@@ -198,7 +199,7 @@ function Mobile() {
       await forgetLocal(hub);
       await load();
     } catch (error) {
-      setError(String(error));
+      setError(errorMessage(error));
     } finally {
       setBusy(false);
     }
@@ -212,7 +213,8 @@ function Mobile() {
           old ? { ...old, ...listing, verified: listing.path } : old,
         );
     } catch (error) {
-      if (generation === folderGeneration.current) setError(String(error));
+      if (generation === folderGeneration.current)
+        setError(errorMessage(error));
     }
   }
   async function connect(hub: Hub) {
@@ -246,7 +248,7 @@ function Mobile() {
       return true;
     } catch (e) {
       await remote?.stop().catch(() => {});
-      setError(String(e));
+      setError(errorMessage(e));
       return false;
     } finally {
       setBusy(false);
@@ -268,7 +270,7 @@ function Mobile() {
       setPairing(false);
       await connect(hub);
     } catch (e) {
-      setError(String(e));
+      setError(errorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -293,10 +295,10 @@ function Mobile() {
           <button
             className="mobile-hub-switch"
             onClick={() => setHubSheet(true)}
-            aria-label="Remote hub settings"
+            aria-label={`Remote hub settings: ${active.name}`}
           >
             <span className="status-dot online" aria-hidden="true" />
-            {active.name}
+            <span className="mobile-hub-name">{active.name}</span>
           </button>
         }
         onReady={() => {
@@ -304,7 +306,7 @@ function Mobile() {
           const remote = host.current;
           if (remote && activeHub.current?.id === active.id)
             void refreshPush(remote, active.id).catch((error) =>
-              setNotice(String(error)),
+              setNotice(errorMessage(error)),
             );
         }}
       />
@@ -324,7 +326,7 @@ function Mobile() {
               onClick={() =>
                 void testNotification()
                   .then(() => setNotice("Local notification sent."))
-                  .catch((e) => setNotice(String(e)))
+                  .catch((e) => setNotice(errorMessage(e)))
               }
             >
               Test notification
@@ -334,7 +336,7 @@ function Mobile() {
                 if (host.current)
                   void enablePush(host.current, active.id)
                     .then(() => setNotice("Remote push enabled."))
-                    .catch((e) => setNotice(String(e)));
+                    .catch((e) => setNotice(errorMessage(e)));
               }}
             >
               Enable remote push
@@ -347,7 +349,7 @@ function Mobile() {
                   setBusy(true);
                   void disablePush(host.current, active.id)
                     .then(() => setNotice("Remote push disabled for this hub."))
-                    .catch((error) => setNotice(String(error)))
+                    .catch((error) => setNotice(errorMessage(error)))
                     .finally(() => setBusy(false));
                 }}
               >
@@ -386,7 +388,7 @@ function Mobile() {
                     await disconnectNow();
                     await load();
                   });
-                })().catch((error) => setNotice(String(error)))
+                })().catch((error) => setNotice(errorMessage(error)))
               }
             >
               Revoke this device

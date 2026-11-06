@@ -6,6 +6,7 @@ import {
   dialog,
   shell,
   clipboard,
+  nativeTheme,
 } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -34,7 +35,7 @@ import {
   sizeSchema,
   workspaceSchema,
 } from "./validation";
-import type { DesktopEvent } from "../shared/types";
+import type { DesktopAppearance, DesktopEvent } from "../shared/types";
 import { EngineDigests, cleanupEngines } from "./engines";
 import { discoverCatalog } from "./catalog";
 
@@ -72,6 +73,50 @@ const terminals = new Map<
   }
 >();
 const settingsPath = () => join(app.getPath("userData"), "desktop.json");
+const appearanceSchema = z
+  .object({
+    preference: z.enum(["dark", "light", "system"]),
+    colorScheme: z.enum(["dark", "light"]),
+    background: z
+      .string()
+      .regex(/^#[0-9a-fA-F]{6}$/)
+      .transform((value) => value.toLowerCase()),
+  })
+  .strict();
+let appearance: DesktopAppearance = {
+  preference: "dark",
+  colorScheme: "dark",
+  background: "#0e1013",
+};
+let desktopSettings: Record<string, unknown> = {};
+function saveDesktopSettings(update: Record<string, unknown>) {
+  const next = { ...desktopSettings, ...update };
+  const path = settingsPath();
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  writeFileSync(temporary, JSON.stringify(next), { mode: 0o600 });
+  renameSync(temporary, path);
+  desktopSettings = next;
+}
+function nativeAppearanceSource(value: DesktopAppearance) {
+  // Omarchy's selected theme is the system appearance for this client, even
+  // when the GTK/portal preference differs. Keep the user's System choice.
+  if (value.preference === "system" && process.platform === "linux") {
+    const theme = omarchyTheme();
+    if (theme)
+      return theme.mode === "light" || theme.mode === "dark"
+        ? theme.mode
+        : value.colorScheme;
+  }
+  return value.preference;
+}
+function applyNativeAppearance() {
+  const source = nativeAppearanceSource(appearance);
+  if (nativeTheme.themeSource !== source) nativeTheme.themeSource = source;
+  if (window && !window.isDestroyed())
+    window.setBackgroundColor(appearance.background);
+}
+
 const devUrl = !app.isPackaged ? process.env.TWR_DESKTOP_DEV_URL : undefined;
 if (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
   app.setPath("userData", resolve(process.env.TWR_DESKTOP_TEST_USER_DATA));
@@ -280,10 +325,7 @@ async function connectWorkspace(next: string) {
     void current
       .call("notify.looking", { looking: window?.isFocused() || false })
       .catch(() => {});
-    mkdirSync(dirname(settingsPath()), { recursive: true });
-    writeFileSync(settingsPath(), JSON.stringify({ workspace: next }), {
-      mode: 0o600,
-    });
+    saveDesktopSettings({ workspace: next });
     return {
       ...paths,
       hubVersion: hubInfo.version,
@@ -317,6 +359,13 @@ function omarchyTheme(): Record<string, string> | null {
   }
 }
 function register() {
+  handle("set-appearance", (value) => {
+    const next = appearanceSchema.parse(value);
+    appearance = next;
+    applyNativeAppearance();
+    if (JSON.stringify(desktopSettings.appearance) !== JSON.stringify(next))
+      saveDesktopSettings({ appearance: next });
+  });
   handle("copy-text", (text) =>
     clipboard.writeText(
       z
@@ -645,13 +694,14 @@ async function checkUpdates() {
 }
 async function createWindow() {
   quitting = false;
+  applyNativeAppearance();
   window = new BrowserWindow({
     width: 1360,
     height: 900,
     minWidth: 420,
     minHeight: 480,
     title: "twr",
-    backgroundColor: "#0e1013",
+    backgroundColor: appearance.background,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
       preload: join(__dirname, "preload.cjs"),
@@ -737,9 +787,20 @@ else {
         app.setDesktopName("tools.twr.desktop.desktop");
       try {
         const saved = JSON.parse(readFileSync(settingsPath(), "utf8"));
-        if (!process.env.TWR_WORKSPACE)
-          workspace = workspaceSchema.parse(saved.workspace);
+        if (saved && typeof saved === "object" && !Array.isArray(saved))
+          desktopSettings = saved;
       } catch {}
+      if (!process.env.TWR_WORKSPACE) {
+        const savedWorkspace = workspaceSchema.safeParse(
+          desktopSettings.workspace,
+        );
+        if (savedWorkspace.success) workspace = savedWorkspace.data;
+      }
+      const savedAppearance = appearanceSchema.safeParse(
+        desktopSettings.appearance,
+      );
+      if (savedAppearance.success) appearance = savedAppearance.data;
+      applyNativeAppearance();
       await loadLoginEnvironment();
       binaries = findBinaries();
       register();

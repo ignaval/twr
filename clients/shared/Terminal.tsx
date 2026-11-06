@@ -122,7 +122,7 @@ export function Terminal({
       void hostApi
         .terminalRead(session.id)
         .then((snapshot) => {
-          if (!terminal.current) return;
+          if (terminal.current !== term) return;
           term.write(snapshot.data);
           if (snapshot.exited)
             term.write("\r\n\x1b[90mProcess exited.\x1b[0m\r\n");
@@ -138,11 +138,18 @@ export function Terminal({
           queued.length = 0;
         })
         .catch(() => {
+          if (terminal.current !== term) return;
           ready = true;
-          for (const chunk of queued)
+          term.write(
+            "\r\n\x1b[90mCould not restore terminal history; showing live output.\x1b[0m\r\n",
+          );
+          for (const chunk of queued.splice(0)) {
+            if (chunk.sequence <= sequence) continue;
+            sequence = chunk.sequence;
             term.write(chunk.data, () =>
               hostApi.terminalAck(session.id, chunk.data.length),
             );
+          }
         })
         .finally(() => {
           snapshotLoading = false;

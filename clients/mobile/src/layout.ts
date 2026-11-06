@@ -5,8 +5,9 @@ import {
   type PluginListenerHandle,
 } from "@capacitor/core";
 import { usableViewportHeight, type Posture } from "./geometry";
-const Layout = registerPlugin<{
+export const Layout = registerPlugin<{
   current(): Promise<Posture>;
+  setAppearance(options: { background: string }): Promise<void>;
   addListener(
     name: "change",
     callback: (value: Posture) => void,

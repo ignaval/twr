@@ -1,12 +1,5 @@
-import {
-  Capacitor,
-  registerPlugin,
-  SystemBars,
-  SystemBarsStyle,
-} from "@capacitor/core";
-const Layout = registerPlugin<{
-  setAppearance(options: { background: string }): Promise<void>;
-}>("TwrLayout");
+import { Capacitor, SystemBars, SystemBarsStyle } from "@capacitor/core";
+import { Layout } from "./layout";
 type NativeAppearance = { style: SystemBarsStyle; background: string };
 
 // Match system-bar contrast to the rendered theme, including an explicit dark
@@ -15,7 +8,9 @@ export function observeNativeAppearance() {
   if (!Capacitor.isNativePlatform()) return () => {};
   const root = document.documentElement;
   const scheme = matchMedia("(prefers-color-scheme: dark)");
+  const lightScheme = matchMedia("(prefers-color-scheme: light)");
   let pendingFrame: number | undefined;
+  let settledUpdate: ReturnType<typeof setTimeout> | undefined;
   let desired: NativeAppearance;
   let applied = "";
   const colorCanvas = document.createElement("canvas");
@@ -63,7 +58,7 @@ export function observeNativeAppearance() {
     }
   };
   const update = () => {
-    pendingFrame = undefined;
+    if (disposed) return;
     const colors = getComputedStyle(root);
     const resolved = colors.colorScheme.trim();
     const dark =
@@ -82,8 +77,19 @@ export function observeNativeAppearance() {
     if (signature(desired) !== applied) void synchronize();
   };
   const schedule = () => {
+    if (disposed) return;
     if (pendingFrame === undefined)
-      pendingFrame = requestAnimationFrame(update);
+      pendingFrame = requestAnimationFrame(() => {
+        pendingFrame = undefined;
+        update();
+      });
+    // WebKit can notify one media query before the other query's CSS override
+    // has invalidated. Re-read the rendered theme once that change settles.
+    if (settledUpdate !== undefined) clearTimeout(settledUpdate);
+    settledUpdate = setTimeout(() => {
+      settledUpdate = undefined;
+      update();
+    }, 50);
   };
   const observer = new MutationObserver(schedule);
   observer.observe(root, {
@@ -91,11 +97,14 @@ export function observeNativeAppearance() {
     attributeFilter: ["data-theme", "data-omarchy"],
   });
   scheme.addEventListener("change", schedule);
+  lightScheme.addEventListener("change", schedule);
   update();
   return () => {
     disposed = true;
     observer.disconnect();
     scheme.removeEventListener("change", schedule);
+    lightScheme.removeEventListener("change", schedule);
+    if (settledUpdate !== undefined) clearTimeout(settledUpdate);
     if (pendingFrame !== undefined) cancelAnimationFrame(pendingFrame);
   };
 }

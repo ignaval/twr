@@ -1,3 +1,4 @@
+import type { Appearance } from "./appearance";
 export type Json = any;
 export interface Thread {
   id: string;
@@ -72,7 +73,13 @@ export interface TerminalSession {
   workspace: string;
   exited?: boolean;
 }
+export interface DesktopAppearance {
+  preference: Appearance;
+  colorScheme: "dark" | "light";
+  background: string;
+}
 export interface DesktopAPI {
+  setAppearance?(appearance: DesktopAppearance): Promise<void>;
   uploadFile?(file: File, thread: string): Promise<{ path: string }>;
   quit(): Promise<void>;
   copyText(text: string): Promise<void>;

@@ -63,10 +63,14 @@ select {
   line-height: 20px;
 }
 [data-mobile="true"] .topbar-accessory {
+  flex: 0 1 auto;
+  min-width: 0;
   max-width: min(34%, 160px);
 }
 .mobile-hub-switch {
   display: inline-flex;
+  justify-content: flex-start;
+  width: 100%;
   position: static;
   min-width: 0;
   max-width: 100%;
@@ -78,6 +82,12 @@ select {
   color: var(--muted);
   font-size: 12px;
   gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mobile-hub-name {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -98,16 +108,25 @@ select {
 }
 [data-mobile="true"] .composer-label {
   grid-column: 1 / -1;
-  padding: 4px 8px 0;
-  min-height: 40px;
+  padding: 0 8px;
+  min-height: 44px;
 }
 [data-mobile="true"] .destination-chip {
+  height: 32px;
   min-height: 32px;
-  padding-inline: 8px;
+  padding: 0 8px;
   max-width: 100%;
 }
-[data-mobile="true"] .composer-label > span:last-child {
+[data-mobile="true"] .composer-label > span:last-of-type {
+  margin-left: auto;
   flex-shrink: 0;
+  max-width: 88px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+[data-mobile="true"] .destination-chip > button {
+  margin-block: -6px;
 }
 [data-mobile="true"] .composer-label button {
   min-width: 44px;
@@ -381,7 +400,21 @@ select {
   max-width: calc(
     100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right)
   );
-  bottom: calc(12px + env(safe-area-inset-bottom));
+  top: calc(
+    max(env(safe-area-inset-top), var(--occlusion-top, 0px)) +
+      var(--header-height) + 8px
+  );
+  bottom: auto;
+  max-height: min(
+    200px,
+    max(
+      44px,
+      calc(
+        var(--viewport-height, 100dvh) -
+          max(env(safe-area-inset-top), var(--occlusion-top, 0px)) - 224px
+      )
+    )
+  );
 }
 
 /* Compact phones use one header and a single bottom inset, inside the tab bar. */
@@ -440,9 +473,60 @@ select {
   [data-mobile="true"] .dialog-footer {
     padding-bottom: calc(12px + env(safe-area-inset-bottom));
   }
-  [data-mobile="true"] .toast {
-    bottom: calc(var(--mobile-bottom) + 12px);
+}
+
+/* A flat foldable retains the sidebar but still needs a compact main header. */
+@media (min-width: 800px) and (max-width: 1099px) {
+  [data-mobile="true"] .conversation-heading,
+  [data-mobile="true"] .workspace-breadcrumb,
+  [data-mobile="true"] .topbar-left > .workspace-breadcrumb + svg,
+  [data-mobile="true"] .live-indicator,
+  [data-mobile="true"] .topbar-actions > [aria-label="Open command palette"],
+  [data-mobile="true"] .topbar-new-thread {
+    display: none;
   }
+  [data-mobile="true"] .topbar-accessory {
+    max-width: min(30%, 140px);
+  }
+  [data-mobile="true"] .topbar-actions {
+    gap: 0;
+  }
+  [data-mobile="true"] .conversation-menu {
+    display: block;
+  }
+  [data-mobile="true"] .conversation-menu > summary {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+[data-mobile="true"] .grid-new-thread {
+  display: inline-flex;
+}
+@media (max-width: 1099px) {
+  [data-mobile="true"] .mobile-runtime {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 400;
+    line-height: 14px;
+  }
+}
+[data-fold="vertical"] .mobile-runtime,
+[data-fold="horizontal"] .mobile-runtime,
+:root[data-mobile="true"].short-content .mobile-runtime {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 14px;
 }
 
 /* A separating hinge owns the gap: each pane retains independent controls. */
@@ -560,7 +644,7 @@ select {
   margin-bottom: 8px;
 }
 :root[data-mobile="true"][data-keyboard="true"] .toast {
-  bottom: 12px;
+  bottom: auto;
 }
 :root[data-mobile="true"].short-content .conversation-heading,
 :root[data-mobile="true"].short-content .utility-nav {
@@ -579,6 +663,10 @@ select {
   max-height: 25%;
   overflow: auto;
   flex-shrink: 1;
+}
+:root[data-mobile="true"].tiny-content .toast {
+  top: calc(max(env(safe-area-inset-top), var(--occlusion-top, 0px)) + 8px);
+  max-height: 44px;
 }
 :root[data-mobile="true"].tiny-content .topbar {
   display: none;

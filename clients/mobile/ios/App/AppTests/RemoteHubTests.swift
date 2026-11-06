@@ -48,8 +48,17 @@ final class RemoteHubTests: XCTestCase {
         try await Task.sleep(nanoseconds: 350_000_000)
     }
 
-    private func statusBar(_ expected: UIStatusBarStyle) async throws {
+    private func appearanceDiagnostics(_ stage: String, controller: TwrViewController) async -> String {
+        let state = try? await js("""
+          const root=document.documentElement,colors=getComputedStyle(root);
+          return JSON.stringify({theme:root.dataset.theme,scheme:colors.colorScheme,background:colors.getPropertyValue('--bg').trim(),prefersDark:matchMedia('(prefers-color-scheme: dark)').matches,prefersLight:matchMedia('(prefers-color-scheme: light)').matches,trace:window.__qaAppearanceTrace||[]});
+          """)
+        return "stage=\(stage) status=\(controller.preferredStatusBarStyle.rawValue) trait=\(controller.traitCollection.userInterfaceStyle.rawValue) override=\(controller.overrideUserInterfaceStyle.rawValue) view=\(String(describing:controller.view.backgroundColor)) web=\(String(describing:web.backgroundColor)) state=\(String(describing:state))"
+    }
+
+    private func statusBar(_ expected: UIStatusBarStyle, stage: String) async throws {
         let controller = try XCTUnwrap(web.window?.rootViewController as? TwrViewController)
+        print("APPEARANCE start expected=\(expected.rawValue) " + (await appearanceDiagnostics(stage, controller: controller)))
         let backgroundValue = try await js("return getComputedStyle(document.documentElement).getPropertyValue('--bg').trim().slice(1)") as? String
         let background = try XCTUnwrap(backgroundValue)
         let rgb = try XCTUnwrap(UInt32(background, radix: 16))
@@ -57,12 +66,17 @@ final class RemoteHubTests: XCTestCase {
                                     green: CGFloat((rgb >> 8) & 255) / 255,
                                     blue: CGFloat(rgb & 255) / 255, alpha: 1)
         for _ in 0..<100 {
-            if controller.preferredStatusBarStyle == expected && controller.view.backgroundColor == expectedColor && web.backgroundColor == expectedColor { return }
+            if controller.preferredStatusBarStyle == expected && controller.view.backgroundColor == expectedColor && web.backgroundColor == expectedColor {
+                print("APPEARANCE pass expected=\(expected.rawValue) " + (await appearanceDiagnostics(stage, controller: controller)))
+                return
+            }
             try await Task.sleep(nanoseconds: 50_000_000)
         }
-        XCTAssertEqual(controller.preferredStatusBarStyle, expected, "Native status-bar contrast must match the rendered theme")
-        XCTAssertEqual(controller.view.backgroundColor, expectedColor, "Native background must match the rendered theme")
-        XCTAssertEqual(web.backgroundColor, expectedColor, "WebView background must match the rendered theme")
+        let diagnostic = await appearanceDiagnostics(stage, controller: controller)
+        print("APPEARANCE fail expected=\(expected.rawValue) " + diagnostic)
+        XCTAssertEqual(controller.preferredStatusBarStyle, expected, "Native status-bar contrast must match the rendered theme: " + diagnostic)
+        XCTAssertEqual(controller.view.backgroundColor, expectedColor, "Native background must match the rendered theme: " + stage)
+        XCTAssertEqual(web.backgroundColor, expectedColor, "WebView background must match the rendered theme: " + stage)
     }
 
     private func capture(_ name: String) async throws {
@@ -122,23 +136,37 @@ final class RemoteHubTests: XCTestCase {
         if fixture["foldable"] as? Bool == true {try await pose("closed")}
 
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub')")
+        // Trace only appearance requests and rendered theme state. Device
+        // credentials and ordinary hub calls are deliberately not recorded.
+        _ = try await js("""
+          window.__qaAppearanceTrace=[];
+          const state=()=>{const root=document.documentElement,style=getComputedStyle(root);return {theme:root.dataset.theme,scheme:style.colorScheme,prefersDark:matchMedia('(prefers-color-scheme: dark)').matches,prefersLight:matchMedia('(prefers-color-scheme: light)').matches,background:style.getPropertyValue('--bg').trim()}};
+          const record=(phase,extra={})=>{window.__qaAppearanceTrace.push({phase,time:performance.now(),...state(),...extra});if(window.__qaAppearanceTrace.length>48)window.__qaAppearanceTrace.shift()};
+          const original=window.Capacitor.nativePromise;
+          window.Capacitor.nativePromise=(...args)=>{const [plugin,method,options]=args,result=original.apply(window.Capacitor,args);if((plugin==='SystemBars'&&method==='setStyle')||(plugin==='TwrLayout'&&method==='setAppearance')){record('request',{plugin,method,options});void Promise.resolve(result).then(()=>record('reply',{plugin,method,options}),error=>record('error',{plugin,method,message:String(error)}))}return result};
+          const media=[];for(const query of ['(prefers-color-scheme: dark)','(prefers-color-scheme: light)']){const match=matchMedia(query),listener=()=>{record('media',{query});requestAnimationFrame(()=>record('media-frame',{query}))};match.addEventListener('change',listener);media.push([match,listener])}
+          const observer=new MutationObserver(()=>record('theme'));observer.observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+          window.__qaStopAppearanceTrace=()=>{window.Capacitor.nativePromise=original;for(const [match,listener] of media)match.removeEventListener('change',listener);observer.disconnect()};
+          record('initial');return true;
+          """)
         // Verify native contrast independently of the OS's current appearance.
         let controller = try XCTUnwrap(web.window?.rootViewController as? TwrViewController)
         controller.overrideUserInterfaceStyle = .light
         try await until("return document.documentElement.dataset.theme === 'dark'")
-        try await statusBar(.lightContent)
+        try await statusBar(.lightContent, stage: "dark-on-light-os")
         _ = try await js("document.documentElement.dataset.theme='light';return true")
-        try await statusBar(.darkContent)
+        try await statusBar(.darkContent, stage: "explicit-light")
         _ = try await js("document.documentElement.dataset.theme='system';return true")
         try await until("return getComputedStyle(document.documentElement).colorScheme === 'light'")
-        try await statusBar(.darkContent)
+        try await statusBar(.darkContent, stage: "system-light")
         controller.overrideUserInterfaceStyle = .dark
         try await until("return getComputedStyle(document.documentElement).colorScheme === 'dark'")
-        try await statusBar(.lightContent)
+        try await statusBar(.lightContent, stage: "system-dark")
         controller.overrideUserInterfaceStyle = .unspecified
         _ = try await js("document.documentElement.dataset.theme='dark';return true")
-        try await statusBar(.lightContent)
+        try await statusBar(.lightContent, stage: "restored-dark")
         print("PASS: native status-bar contrast follows Dark, Light, System and native trait changes")
+        _ = try await js("window.__qaStopAppearanceTrace();return true")
         _ = try await js("""
           window.__qaErrors=[];window.addEventListener('error',e=>window.__qaErrors.push(e.message));
           [...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub').click();return true;
@@ -286,11 +314,22 @@ final class RemoteHubTests: XCTestCase {
             try? await capture("performance-failure")
             throw error
         }
-        var performanceRequest = URLRequest(url: URL(string: "http://127.0.0.1:47323/performance")!)
+        let performanceData = try JSONSerialization.data(withJSONObject: try XCTUnwrap(performanceResult))
+        let performanceAttachment = XCTAttachment(data: performanceData, uniformTypeIdentifier: "public.json")
+        performanceAttachment.name = "twr-performance";performanceAttachment.lifetime = .keepAlways;add(performanceAttachment)
+        print("PERFORMANCE_JSON " + (String(data: performanceData, encoding: .utf8) ?? "{}"))
+        var performanceRequest = URLRequest(url: URL(string: "http://127.0.0.1:47323/performance")!, timeoutInterval: 15)
         performanceRequest.httpMethod = "POST"
-        performanceRequest.httpBody = try JSONSerialization.data(withJSONObject: try XCTUnwrap(performanceResult))
-        _ = try await URLSession.shared.data(for: performanceRequest)
-        try await until("const top=parseFloat(getComputedStyle(document.body).paddingTop)||0;return Math.abs(document.querySelector('.mobile-hub-switch').getBoundingClientRect().top-top-8)<=1")
+        performanceRequest.httpBody = performanceData
+        performanceRequest.setValue("close", forHTTPHeaderField: "Connection")
+        do { _ = try await URLSession.shared.data(for: performanceRequest) }
+        catch { print("Performance JSON export failed; evidence remains in XCTest attachment: \(error)") }
+        try await dismissKeyboard()
+        try await until("""
+          const bar=document.querySelector('.topbar').getBoundingClientRect(),hub=document.querySelector('.mobile-hub-switch').getBoundingClientRect();
+          const top=parseFloat(getComputedStyle(document.body).paddingTop)||0;
+          return bar.top>=top-1 && hub.top>=bar.top-1 && hub.bottom<=bar.bottom+1 && hub.left>=bar.left && hub.right<=bar.right+1 && hub.width>=44 && hub.height>=44;
+          """)
         // Verify landscape safe areas through UIKit, rather than changing CSS dimensions.
         if fixture["foldable"] as? Bool != true && UIDevice.current.userInterfaceIdiom == .phone,
            let scene = web.window?.windowScene {
