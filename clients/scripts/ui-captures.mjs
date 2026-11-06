@@ -379,19 +379,17 @@ export async function captureUI(page, { hubPids } = {}) {
         `Case ${n + 1}: pagination preserves stable ordering, empty results, and keyboard focus after navigation.`,
     ),
   });
-  await rpc("thread.send", {
-    thread: "release-notes",
-    prompt:
-      "## Release verification checklist\n\n" +
-      Array.from(
-        { length: 24 },
-        (_, n) =>
-          `- Check ${n + 1}: Verify pagination, accessible result counts, and a stable empty state.`,
-      ).join("\n") +
-      "\n!tool Read " +
-      input +
-      "\nReview checklist ready.",
-  });
+  const longPrompt =
+    "## Release verification checklist\n\n" +
+    Array.from(
+      { length: 24 },
+      (_, n) =>
+        `- Check ${n + 1}: Verify pagination, accessible result counts, and a stable empty state.`,
+    ).join("\n") +
+    "\n!tool Read " +
+    input +
+    "\nReview checklist ready.";
+  await rpc("thread.send", { thread: "release-notes", prompt: longPrompt });
   await primary(/^Thread grid/);
   await page
     .locator(".thread-grid .thread-card")
@@ -415,6 +413,7 @@ export async function captureUI(page, { hubPids } = {}) {
   const collapsedUserHeight = await user
     .locator(".message-body")
     .evaluate((element) => element.getBoundingClientRect().height);
+  await expect(user.locator(".message-body")).not.toContainText("Check 24:");
   await snap("dark-long-message-collapsed");
   await user.locator(".message-expand").click();
   await expect(user.locator(".message-expand")).toHaveAttribute(
@@ -426,7 +425,14 @@ export async function captureUI(page, { hubPids } = {}) {
     .evaluate((element) => element.getBoundingClientRect().height);
   expect(expandedUserHeight).toBeGreaterThan(collapsedUserHeight + 20);
   await user.evaluate((element) => element.scrollIntoView({ block: "start" }));
+  await expect(user.locator(".message-body")).toContainText("Check 24:");
+  await expect(user.locator(".message-body")).toContainText("Case 32:");
   await snap("dark-long-message-expanded");
+  await user.locator(".message-meta").hover();
+  await user.getByRole("button", { name: "Copy message", exact: true }).click();
+  expect(execFileSync("/usr/bin/pbpaste", { encoding: "utf8" })).toBe(
+    longPrompt,
+  );
   await user.locator(".message-expand").click();
   const showTools = page.getByRole("button", {
     name: "Toggle tool calls",
@@ -447,6 +453,7 @@ export async function captureUI(page, { hubPids } = {}) {
     .locator(".message-body")
     .evaluate((element) => element.getBoundingClientRect().height);
   await tool.evaluate((element) => element.scrollIntoView({ block: "start" }));
+  await expect(tool.locator(".message-body")).not.toContainText("Case 32:");
   await snap("dark-long-tool-open-clamped");
   await toolExpand.click();
   await expect(toolExpand).toHaveAttribute("aria-expanded", "true");
@@ -455,7 +462,15 @@ export async function captureUI(page, { hubPids } = {}) {
     .evaluate((element) => element.getBoundingClientRect().height);
   expect(expandedToolHeight).toBeGreaterThan(collapsedToolHeight + 20);
   await tool.evaluate((element) => element.scrollIntoView({ block: "start" }));
+  expect(await tool.locator(".message-body").textContent()).toBe(
+    input + "\n\nok",
+  );
   await snap("dark-long-tool-expanded");
+  await tool.locator(".message-meta").hover();
+  await tool.getByRole("button", { name: "Copy message", exact: true }).click();
+  expect(execFileSync("/usr/bin/pbpaste", { encoding: "utf8" })).toBe(
+    input + "\n\nok",
+  );
   checks.push({
     name: "long-content-disclosures",
     collapsedUserHeight,

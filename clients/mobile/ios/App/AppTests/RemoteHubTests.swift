@@ -1,6 +1,7 @@
 import XCTest
 import WebKit
 import UIKit
+import UserNotifications
 @testable import App
 
 /// Runs in the real Simulator app, through its WKWebView and native plugins.
@@ -77,6 +78,41 @@ final class RemoteHubTests: XCTestCase {
         XCTAssertEqual(controller.preferredStatusBarStyle, expected, "Native status-bar contrast must match the rendered theme: " + diagnostic)
         XCTAssertEqual(controller.view.backgroundColor, expectedColor, "Native background must match the rendered theme: " + stage)
         XCTAssertEqual(web.backgroundColor, expectedColor, "WebView background must match the rendered theme: " + stage)
+    }
+
+    private func verifyLocalNotificationDelivery() async throws {
+        let center = UNUserNotificationCenter.current()
+        // Provisional authorization is public, quiet and does not show a
+        // permission prompt. It needs neither APNs credentials nor entitlements.
+        let granted = try await center.requestAuthorization(options: [.alert, .sound, .badge, .provisional])
+        XCTAssertTrue(granted, "The disposable Simulator must permit provisional local notifications")
+        let settings = await center.notificationSettings()
+        XCTAssertTrue(settings.authorizationStatus == .provisional || settings.authorizationStatus == .authorized,
+                      "Notification authorization must be granted before exercising delivery")
+        _ = try await js("""
+          window.__qaLocalNotification=null;
+          window.__qaLocalNotificationListener=await window.Capacitor.Plugins.LocalNotifications.addListener('localNotificationReceived',notification=>{window.__qaLocalNotification=notification});
+          document.querySelector('button[aria-label="Remote hub settings"]').click();return true;
+          """)
+        try await until("return [...document.querySelectorAll('[role=dialog] button')].some(button=>button.textContent.trim()==='Test notification')")
+        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(button=>button.textContent.trim()==='Test notification').click();return true")
+        try await until("return window.__qaLocalNotification?.title==='twr · local test' && window.__qaLocalNotification?.extra?.event==='test'", seconds: 20)
+        let identifierValue = try await js("return String(window.__qaLocalNotification.id)") as? String
+        let identifier = try XCTUnwrap(identifierValue)
+        var delivered: UNNotification?
+        for _ in 0..<100 {
+            delivered = await center.deliveredNotifications().first { $0.request.identifier == identifier }
+            if delivered != nil { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let actual = try XCTUnwrap(delivered, "The notification received through the native bridge must also exist in Notification Center")
+        XCTAssertEqual(actual.request.content.title, "twr · local test")
+        XCTAssertTrue(actual.request.content.body.contains("Tap to open Needs you"))
+        let extra = try XCTUnwrap(actual.request.content.userInfo["cap_extra"] as? [String: Any])
+        XCTAssertEqual(extra["event"] as? String, "test")
+        print("PASS: real iOS local notification delivered to Notification Center and emitted by the native plugin; provisional authorization=\(settings.authorizationStatus.rawValue) id=\(identifier)")
+        _ = try await js("await window.__qaLocalNotificationListener.remove();document.querySelector('[aria-label=\"Close dialog\"]').click();return true")
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
     }
 
     private func capture(_ name: String) async throws {
@@ -351,8 +387,21 @@ final class RemoteHubTests: XCTestCase {
                   """)
             }
         }
-        // Exercise the same available-height contract as keyboard resizing in native WKWebView.
+        // Native file inputs must not steal taps from the adjacent Send control.
+        // Check the full viewport first so a real input-overlay issue cannot be
+        // mistaken for a side effect of the compact-height contract below.
         try await dismissKeyboard()
+        _ = try await js("""
+          const input=document.querySelector('.composer textarea');
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(input,'COMPACT_VIEWPORT_SEND_QA');
+          input.dispatchEvent(new Event('input',{bubbles:true}));return true;
+          """)
+        try await until("""
+          const upload=document.querySelector('.attachment-button'),send=document.querySelector('button[aria-label="Send message"]');
+          return !send.disabled && [upload,send].every(element=>{const box=element.getBoundingClientRect();return box.width>=44 && box.height>=44 && element.contains(document.elementFromPoint(box.x+box.width/2,box.y+box.height/2))});
+          """)
+        print("PASS: adjacent Upload and Send have separate reachable 44-point targets in the full viewport")
+        // Exercise the same available-height contract as keyboard resizing in native WKWebView.
         _ = try await js("""
           const root=document.documentElement,style=getComputedStyle(document.body);
           window.__qaAvailableHeight=root.style.getPropertyValue('--viewport-height');
@@ -367,9 +416,10 @@ final class RemoteHubTests: XCTestCase {
             const tabs=document.querySelector('.mobile-tabs'),tabsVisible=!!tabs?.getClientRects().length;
             const limit=tabsVisible?tabs.getBoundingClientRect().top:window.__qaCompactHeight;
             const point={x:box.x+box.width/2,y:box.y+box.height/2},hit=document.elementFromPoint(point.x,point.y);
-            const checks={rootWithinAvailableHeight:rootBox.height<=window.__qaCompactHeight+1,enabled:!button.disabled,width44:box.width>=44,height44:box.height>=44,aboveNavigation:box.bottom<=limit+1,ownsHit:button.contains(hit)};
+            const upload=document.querySelector('.attachment-button'),uploadBox=upload.getBoundingClientRect(),uploadPoint={x:uploadBox.x+uploadBox.width/2,y:uploadBox.y+uploadBox.height/2};
+            const checks={rootWithinAvailableHeight:rootBox.height<=window.__qaCompactHeight+1,enabled:!button.disabled,width44:box.width>=44,height44:box.height>=44,aboveNavigation:box.bottom<=limit+1,ownsHit:button.contains(hit),uploadWidth44:uploadBox.width>=44,uploadHeight44:uploadBox.height>=44,uploadOwnsHit:upload.contains(document.elementFromPoint(uploadPoint.x,uploadPoint.y))};
             const describe=element=>element?{tag:element.tagName,id:element.id,classes:typeof element.className==='string'?element.className:element.className?.baseVal,aria:element.getAttribute('aria-label'),role:element.getAttribute('role')}:null;
-            const result={pass:Object.values(checks).every(Boolean),checks,disabled:button.disabled,inputValue:document.querySelector('.composer textarea').value,classes:document.documentElement.className,height:window.__qaCompactHeight,root:rootBox.toJSON(),send:box.toJSON(),tabs:tabs?.getBoundingClientRect().toJSON(),tabsVisible,limit,point,hit:describe(hit)};
+            const result={pass:Object.values(checks).every(Boolean),checks,disabled:button.disabled,inputValue:document.querySelector('.composer textarea').value,classes:document.documentElement.className,height:window.__qaCompactHeight,root:rootBox.toJSON(),upload:uploadBox.toJSON(),send:box.toJSON(),tabs:tabs?.getBoundingClientRect().toJSON(),tabsVisible,limit,point,hit:describe(hit)};
             if(!verbose)return result;
             const inspect=element=>{
               if(!element)return null;
@@ -397,6 +447,8 @@ final class RemoteHubTests: XCTestCase {
         _ = try await js("document.querySelector('button[aria-label=\"Send message\"]').click();return true")
         try await until("return [...document.querySelectorAll('.block-assistant .markdown')].some(e=>e.textContent.trim()==='COMPACT_VIEWPORT_SEND_QA')")
         _ = try await js("document.documentElement.style.setProperty('--viewport-height',window.__qaAvailableHeight);window.dispatchEvent(new Event('resize'));await new Promise(requestAnimationFrame);await new Promise(requestAnimationFrame);return true")
+        try await until("return document.querySelector('button[aria-label=\"Remote hub settings\"]').getClientRects().length>0")
+        try await verifyLocalNotificationDelivery()
         let layout = try await js("return await window.Capacitor.Plugins.TwrLayout.current()")
         XCTAssertNotNil(layout)
         let result = try await js("return {errors:window.__qaErrors,width:innerWidth,height:innerHeight,layout:await window.Capacitor.Plugins.TwrLayout.current(),identity:(await window.twr.rpc('hub.info')).identity}")

@@ -65,6 +65,8 @@ The gateway accepts `--push-config /absolute/push.json`. That file and any priva
 
 Omit either provider if unused. Enable remote push in the app after configuring it. Registration is scoped to a device and workspace. After opt-in, the active hub refreshes its registration on connection and foreground resume without prompting again. Token-change events also update the active opted-in hub; a closed hub client cannot submit late requests through another hub’s connection. Device grants hide admin sections and disable terminals when those capabilities were not granted. Notifications use the shared attention policy, hold delays and rate gap; resolved requests are suppressed and active foreground viewers are excluded. Payloads contain routing metadata, not prompts, tool commands or request summaries. Tapping opens Needs you; notification buttons never approve a request.
 
+Dark is the first-launch default. Appearance controls in the hub sheet and pairing screen are local preferences available to every device scope; they do not require hub admin access. Native system bars and backgrounds follow Dark, Light and System. Keyboard-visible layouts hide the bottom navigation and retain a reachable dismiss-keyboard control.
+
 ## Verification status
 
 Remote push can be disabled for a hub from its settings. Forget unregisters this device's push tokens when the hub is reachable; if it is offline, the app warns that host-side revocation is still needed. Forget and Revoke both remove that hub's local drafts and editor sessions.

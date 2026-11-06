@@ -323,8 +323,8 @@ function Mobile() {
               Device access: {active.scopes.join(" · ")}
             </p>
             <section className="mobile-appearance">
-              <h3>Appearance</h3>
-              <AppearanceOptions />
+              <h3 id="hub-appearance-title">Appearance</h3>
+              <AppearanceOptions labelledBy="hub-appearance-title" />
             </section>
             {notice && <p role="status">{notice}</p>}
             <button
@@ -589,8 +589,8 @@ function Mobile() {
         </form>
       )}
       <section className="mobile-appearance">
-        <h3>Appearance</h3>
-        <AppearanceOptions />
+        <h3 id="pairing-appearance-title">Appearance</h3>
+        <AppearanceOptions labelledBy="pairing-appearance-title" />
       </section>
     </main>
   );

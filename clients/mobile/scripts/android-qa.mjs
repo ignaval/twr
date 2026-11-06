@@ -380,6 +380,34 @@ try {
     dock.composer <= dock.viewport + 1 && dock.tabs === "none",
     JSON.stringify(dock),
   );
+  const adjacentTargets = await page.evaluate(() => {
+    const upload = document.querySelector(".attachment-button"),
+      send = document.querySelector('button[aria-label="Send message"]');
+    return [upload, send].map((element) => {
+      const box = element.getBoundingClientRect(),
+        hit = document.elementFromPoint(
+          box.x + box.width / 2,
+          box.y + box.height / 2,
+        );
+      return {
+        label: element === send ? "Send" : "Upload",
+        box: box.toJSON(),
+        ownedHit: element.contains(hit),
+        hit: hit?.getAttribute("aria-label") || hit?.tagName,
+      };
+    });
+  });
+  assert(
+    adjacentTargets.every(
+      (target) =>
+        target.box.width >= 44 && target.box.height >= 44 && target.ownedHit,
+    ),
+    JSON.stringify(adjacentTargets),
+  );
+  console.log(
+    "PASS: adjacent Upload and Send have separate reachable 44-point targets",
+    JSON.stringify(adjacentTargets),
+  );
   mkdirSync("test-results", { recursive: true });
   writeFileSync(
     `test-results/${serial === "emulator-5556" ? "android-fold" : "android-phone"}-keyboard.png`,
@@ -1254,7 +1282,16 @@ try {
           limit = tabs.getClientRects().length
             ? tabs.getBoundingClientRect().top
             : 250;
+        const upload = document.querySelector(".attachment-button"),
+          uploadBox = upload.getBoundingClientRect();
         const result = {
+          uploadBox: uploadBox.toJSON(),
+          uploadHit: upload.contains(
+            document.elementFromPoint(
+              uploadBox.x + uploadBox.width / 2,
+              uploadBox.y + uploadBox.height / 2,
+            ),
+          ),
           box: box.toJSON(),
           height: document.getElementById("root").getBoundingClientRect()
             .height,
@@ -1272,7 +1309,10 @@ try {
           box.width < 44 ||
           box.height < 44 ||
           box.bottom > limit + 1 ||
-          !result.hit
+          !result.hit ||
+          uploadBox.width < 44 ||
+          uploadBox.height < 44 ||
+          !result.uploadHit
         )
           throw new Error(
             "Compact composer unreachable: " + JSON.stringify(result),

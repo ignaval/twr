@@ -75,12 +75,17 @@ twr update                             # install the latest release over this tw
 
 `twr say` never answers a permission or question, because it can't tell which ones you had seen. Use `twr respond`, or the TUI. [docs/usage.md](docs/usage.md) walks through a session.
 
-## Desktop
+## Desktop and mobile
 
 The [desktop client](docs/desktop.md) provides a graphical interface for Apple Silicon macOS
 and x86_64 Linux, including Omarchy/Arch packaging. It shares the hub with the CLI and includes
 embedded terminals for agent attach, account login and interactive commands. See its setup
 guide for building and running it from this repository.
+
+The [iOS and Android clients](docs/mobile.md) connect to remote hubs and reuse the same
+interface. The graphical clients live in `clients/`: `desktop/` owns the Electron shell,
+`mobile/` owns the native phone shells, and `shared/` owns the common React interface.
+There is one frontend dependency set and build package. Dark is the default appearance.
 
 ## Keys
 

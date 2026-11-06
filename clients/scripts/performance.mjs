@@ -68,6 +68,9 @@ export async function performanceAudit(page, label, application) {
       frames: [],
       longTasks: [],
       inputPaint: [],
+      inputFrames: [],
+      focusChanges: [],
+      startedAt: performance.now(),
       running: true,
       last: 0,
     };
@@ -78,12 +81,34 @@ export async function performanceAudit(page, label, application) {
       if (sample.running) requestAnimationFrame(frame);
     };
     requestAnimationFrame(frame);
-    sample.onInput = () => {
+    sample.onInput = (event) => {
       const start = performance.now();
-      requestAnimationFrame(() =>
-        sample.inputPaint.push(performance.now() - start),
-      );
+      const input = {
+        atMs: start - sample.startedAt,
+        target:
+          event.target?.getAttribute?.("aria-label") || event.target?.tagName,
+        trusted: event.isTrusted,
+        focused: document.hasFocus(),
+        visibility: document.visibilityState,
+      };
+      sample.inputFrames.push(input);
+      requestAnimationFrame(() => {
+        input.nextAnimationFrameMs = performance.now() - start;
+        input.frameFocused = document.hasFocus();
+        input.frameVisibility = document.visibilityState;
+        sample.inputPaint.push(input.nextAnimationFrameMs);
+      });
     };
+    sample.onFocus = () =>
+      sample.focusChanges.push({
+        atMs: performance.now() - sample.startedAt,
+        focused: document.hasFocus(),
+        visibility: document.visibilityState,
+      });
+    sample.onFocus();
+    window.addEventListener("focus", sample.onFocus);
+    window.addEventListener("blur", sample.onFocus);
+    document.addEventListener("visibilitychange", sample.onFocus);
     document.addEventListener("input", sample.onInput, true);
     if (typeof PerformanceObserver !== "undefined")
       try {
@@ -144,8 +169,13 @@ export async function performanceAudit(page, label, application) {
     s.running = false;
     s.observer?.disconnect();
     document.removeEventListener("input", s.onInput, true);
+    window.removeEventListener("focus", s.onFocus);
+    window.removeEventListener("blur", s.onFocus);
+    document.removeEventListener("visibilitychange", s.onFocus);
     return {
       inputPaint: s.inputPaint,
+      inputFrames: s.inputFrames,
+      focusChanges: s.focusChanges,
       rendererDOMContentLoadedMs:
         performance.getEntriesByType("navigation")[0]?.domContentLoadedEventEnd,
       frames: s.frames,
@@ -169,12 +199,18 @@ export async function performanceAudit(page, label, application) {
     rpcMedianMs: Math.round(pct(rpcSamples, 0.5)),
     rpcP95Ms: Math.round(pct(rpcSamples, 0.95)),
     inputPaintP95Ms: Math.round(pct(browser.inputPaint, 0.95)),
+    inputFrameMedianMs: Math.round(pct(browser.inputPaint, 0.5)),
+    inputEventCount: browser.inputFrames.length,
+    inputFrameSamplesCompleted: browser.inputPaint.length,
+    inputMeasurement:
+      "input event to next requestAnimationFrame; not paint or INP",
     rendererDOMContentLoadedMs: Math.round(
       browser.rendererDOMContentLoadedMs || 0,
     ),
     inputMedianMs: Math.round(pct(inputSamples, 0.5)),
     inputP95Ms: Math.round(pct(inputSamples, 0.95)),
     frameP95Ms: Math.round(pct(browser.frames, 0.95)),
+    frameMaxMs: Math.round(Math.max(0, ...browser.frames)),
     longTasks: browser.longTasks.length,
     longestTaskMs: Math.round(Math.max(0, ...browser.longTasks)),
     heapMiB: browser.heap ? Math.round(browser.heap / 1048576) : null,
@@ -182,6 +218,10 @@ export async function performanceAudit(page, label, application) {
     renderedBlocks: browser.renderedBlocks,
     viewport: browser.viewport,
     userAgent: browser.userAgent,
+    inputToAnimationFrameSamplesMs: browser.inputPaint,
+    inputFrameDiagnostics: browser.inputFrames,
+    frameSamplesMs: browser.frames,
+    focusChanges: browser.focusChanges,
   };
   if (application) {
     const metrics = await application.evaluate(({ app }) =>
@@ -212,6 +252,13 @@ export async function performanceAudit(page, label, application) {
     JSON.stringify(report, null, 2) + "\n",
   );
   await input.fill("");
-  console.log("PERFORMANCE", JSON.stringify(report));
+  const {
+    inputToAnimationFrameSamplesMs,
+    inputFrameDiagnostics,
+    frameSamplesMs,
+    focusChanges,
+    ...summary
+  } = report;
+  console.log("PERFORMANCE", JSON.stringify(summary));
   return report;
 }

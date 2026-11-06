@@ -817,15 +817,13 @@ function Settings({
         </div>
       </header>
       <section className="settings-section">
-        <h2>Appearance</h2>
+        <h2 id="settings-appearance-title">Appearance</h2>
         <p>
-          System follows your{" "}
           {document.documentElement.dataset.mobile === "true"
-            ? "device"
-            : "desktop"}
-          . On Omarchy, its current theme is used when available.
+            ? "System follows your device."
+            : "System follows your desktop. On Omarchy, its current theme is used when available."}
         </p>
-        <AppearanceOptions />
+        <AppearanceOptions labelledBy="settings-appearance-title" />
       </section>
       <section className="settings-section">
         <h2>Orchestrator</h2>

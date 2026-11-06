@@ -86,8 +86,9 @@ including Ctrl-K/Ctrl-W. Ctrl/Cmd-K opens the palette outside terminals; Ctrl/Cm
 the sidebar; Ctrl/Cmd-G toggles the grid. On macOS the focus filter is Cmd-Shift-F, preserving
 normal text-editing Control keys. Narrow windows expose Chat / Needs you / Threads / More;
 all manager pages remain accessible through More. In short windows, expanding a terminal
-temporarily gives it the main area. Themes follow the system; Omarchy colors are re-read
-when its current theme changes. No tray, multiwindow or launch-at-login integration is
+temporarily gives it the main area. Dark is the default. Light and System are available in Appearance; System follows
+the selected Omarchy theme on Linux. Native menus and window backgrounds follow
+the client preference, which is restored on the next launch. No tray, multiwindow or launch-at-login integration is
 required for this release.
 
 ## Architecture and extension points

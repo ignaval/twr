@@ -33,16 +33,18 @@ or leak claim. Summed process RSS double-counts shared mappings and is not physi
 
 The same Mac development harness at 420 × 480 measured 881 → 293 ms for 1,000 tool
 calls to become visible, and 112 → 1 ms median hub RPC. The current packaged app is
-measured separately. The benchmark's input-to-paint metric measures the input event to
-the next animation frame; automation command completion includes unrelated driver/IME
-work and is recorded separately in raw JSON.
+measured separately. The benchmark's input-to-frame diagnostic measures the input event to
+the next requestAnimationFrame callback, not actual pixel paint or INP. Automation
+command completion includes unrelated driver/IME work and is recorded separately in
+raw JSON. The Mac harness retains raw input/frame samples, focus and visibility state
+so a single slow callback can be investigated rather than attributed to rendering.
 
-| Current environment | 1,000 tool calls visible | RPC p95 | Input → paint p95 | Frame p95 |
+| Current environment | 1,000 tool calls visible | RPC p95 | Input → frame p95 | Frame p95 |
 | --- | ---: | ---: | ---: | ---: |
 | Apple Silicon packaged app | 190 ms | 2 ms | 16 ms | 18 ms |
 | Android ARM64 phone emulator | 410 ms | 14 ms | 15 ms | 17 ms |
 | Android ARM64 Pixel Fold emulator | 457 ms | 22 ms | 15 ms | 33 ms |
-| iPhone Simulator, iOS 18.7, Xcode 27.1 CI | 3,754 ms | 75 ms | 33 ms | 22 ms |
+| iPhone Simulator, Xcode 27.1 CI | 3,754 ms | 75 ms | 33 ms | 22 ms |
 | Arch x86_64 QEMU, software GPU, Hyprland at 125% | 1,931 ms | 46 ms | 128 ms | 40 ms |
 
 The Linux VM validates behavior and catches layout regressions; its timing does not
@@ -66,11 +68,12 @@ benchmark. A regression test checks both the digest against native SHA-256 and t
 
 Earlier iOS stream timing samples were discarded because the test could match the user
 prompt. The corrected harness waits for the rendered assistant reply and records
-`assistantCompletion: true`; the report excludes earlier iOS samples automatically.
+`assistantCompletion: true`. The report also requires `qaVerified: true`, set only
+after the complete native integration test succeeds; failed or partial runs are excluded.
 
 ## Reproduction
 
-Build the Rust engine first and run from `desktop`:
+Build the Rust engine first and run from `clients`:
 
 ```sh
 TWR_PERF=1 npm run test:integration

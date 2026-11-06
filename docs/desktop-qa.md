@@ -42,6 +42,8 @@ npm run test:qa:mac
 | --- | --- |
 | Packaged startup | Production user authentication, bundled engine startup, native PTY, hub survives app quit |
 | Native interface | All manager pages, New menu, thread selection, orchestrator and direct-worker destinations |
+| Appearance | Dark first launch, persisted Light/Dark/System, native window/menu colors, Omarchy light/dark palette and contrast |
+| Responsive UI | Narrow panes, long-message disclosure, errors above form fields, sticky composer, 44 px mobile controls |
 | Slash commands | Model/effort/runtime, account-add routing, multi-delete targets, boolean flags, unknown workspace safety |
 | Messages | Streaming, question/permission responses, revision checks, queued message take-back |
 | Jobs | Launch, live output and cancellation |
@@ -60,3 +62,29 @@ CLI implementations are bundled and reachable; the above fixtures validate the d
 bridge and UI rather than those external services. An installed x86_64 Arch package passed the same integration suite under Cage/Wayland in a local QEMU VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers use ad hoc signatures for testing. Developer ID signing and notarization remain release steps that require the owner’s Apple credentials.
 
 Performance measurements and reproduction commands are in [performance.md](performance.md).
+
+## Visual QA
+
+The shared interface uses native sans-serif text, monospace for code and metadata,
+neutral thread labels and a restrained cyan accent. Dark is the first-launch default.
+Appearance is a local preference, including on devices without hub admin access.
+
+To capture the actual packaged Mac application and its disposable fixture:
+
+```sh
+cd clients
+TWR_UI_CAPTURES=1 npm run test:qa:mac
+```
+
+Captures and measured typography/layout details are written to `test-results/ui`.
+The set includes Dark and Light conversations, grid, inspector, permission cards,
+palette, new-thread validation, settings, long messages, tool disclosures and narrow
+windows. Android's native integration harness accepts the same `TWR_UI_CAPTURES=1`
+flag and captures the drawer, management navigation, local appearance controls,
+thread menu and keyboard/toast layout. iOS records application snapshots as XCTest
+attachments, with friendly PNG copies when the local export succeeds.
+
+`node scripts/native-appearance-qa.mjs` checks native Mac appearance persistence and
+validated IPC. `node scripts/omarchy-qa.mjs`, run inside a Hyprland session, checks
+actual theme-file changes, text contrast and native Linux window colors. These are
+focused local checks in addition to the packaged functional suites.

@@ -66,16 +66,39 @@ for (const [index, template] of selected.entries()) {
   };
   const fixture = mkdtempSync(join(tmpdir(), "twr-ios-"));
   const screenshot = `test-results/ios/${kind || "all"}-${index}-screen.png`;
+  const performanceLabel = device.name.includes("Duo")
+    ? "ios-fold"
+    : device.name.includes("iPad")
+      ? "ios-tablet"
+      : "ios-phone";
+  const performancePath = `test-results/performance-${performanceLabel}.json`;
+  rmSync(performancePath, { force: true });
   const foldHelper = join(fixture, "fold-helper");
   async function fold(pose) {
-    const command = (args) =>
-      execFileAsync(
+    // Cold Simulator helper startup can take longer than the old 60 s settling
+    // budget. Bound the whole pose below the native request's 240 s timeout,
+    // and still require two independent, stable CoreMotion observations.
+    const deadline = Date.now() + 210000;
+    const command = async (args) => {
+      const started = Date.now();
+      const remaining = deadline - started;
+      assert(remaining > 0, `Simulator ${pose} pose exceeded its time budget`);
+      const result = await execFileAsync(
         "xcrun",
         ["simctl", "spawn", device.udid, foldHelper, ...args],
-        { timeout: 120000 },
+        { timeout: Math.min(120000, remaining) },
       );
+      console.log(
+        "FOLD_HELPER",
+        JSON.stringify({
+          pose,
+          command: args[0],
+          elapsedMs: Date.now() - started,
+        }),
+      );
+      return result;
+    };
     await command(["set", pose]);
-    const deadline = Date.now() + 60000;
     let previous;
     while (Date.now() < deadline) {
       const { stdout } = await command(["hinge", "0"]);
@@ -252,6 +275,25 @@ for (const [index, template] of selected.entries()) {
     execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
       stdio: "inherit",
     });
+    if (device.name.includes("Duo")) {
+      // Load the helper/CoreMotion runtime before Xcode launches the test app.
+      // This is only a warmup; fold() validates each requested pose separately.
+      const started = Date.now();
+      const { stdout } = await execFileAsync(
+        "xcrun",
+        ["simctl", "spawn", device.udid, foldHelper, "hinge", "0"],
+        { timeout: 120000 },
+      );
+      const reading = JSON.parse(stdout.trim().split("\n").at(-1));
+      assert(
+        reading.angleValid && Number.isFinite(reading.angleDegrees),
+        "Simulator CoreMotion warmup must return a valid angle",
+      );
+      console.log(
+        "HINGE_WARMUP",
+        JSON.stringify({ ...reading, elapsedMs: Date.now() - started }),
+      );
+    }
     const developer =
       process.env.DEVELOPER_DIR ||
       execFileSync("xcode-select", ["-p"], { encoding: "utf8" }).trim();
@@ -352,11 +394,10 @@ for (const [index, template] of selected.entries()) {
         req.on("end", () => {
           const report = {
             ...JSON.parse(body),
-            label: device.name.includes("Duo")
-              ? "ios-fold"
-              : device.name.includes("iPad")
-                ? "ios-tablet"
-                : "ios-phone",
+            label: performanceLabel,
+            simulatorDevice: device.name,
+            simulatorRuntime: device.runtime,
+            qaVerified: false,
           };
           writeFileSync(
             `test-results/performance-${report.label}.json`,
@@ -468,6 +509,13 @@ for (const [index, template] of selected.entries()) {
       }
     }
     assert.equal(exit, 0, `${device.name} native integration tests must pass`);
+    if (existsSync(performancePath)) {
+      const report = JSON.parse(readFileSync(performancePath, "utf8"));
+      writeFileSync(
+        performancePath,
+        JSON.stringify({ ...report, qaVerified: true }, null, 2) + "\n",
+      );
+    }
     console.log(
       `PASS: ${device.name} native pairing, Keychain, streaming, answers, uploads, ordered PTY, reconnect and long-lived socket`,
     );

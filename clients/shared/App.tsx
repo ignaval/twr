@@ -1,3 +1,4 @@
+import { MessageBody } from "./MessageBody";
 import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
@@ -129,40 +130,6 @@ function operationAction(command: Command, again: boolean) {
   const label = labels[command.id] || command.title.replace(/…$/, "");
   return again ? `${label} again` : label;
 }
-function MessageBody({
-  text,
-  mono = false,
-  clamp = true,
-}: {
-  text: string;
-  mono?: boolean;
-  clamp?: boolean;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const lines = text.split("\n").length;
-  const long = clamp && (lines > 16 || text.length > 1600);
-  return (
-    <>
-      <div className={`message-body ${long && !expanded ? "clamped" : ""}`}>
-        {mono ? <pre>{text}</pre> : <Markdown text={text} />}
-      </div>
-      {long && (
-        <button
-          className="message-expand"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((v) => !v)}
-        >
-          {expanded
-            ? "Show less"
-            : lines > 16
-              ? `Show ${lines - 12} more lines`
-              : "Show full message"}
-        </button>
-      )}
-    </>
-  );
-}
-
 function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
   const root = document.documentElement;
   root.dataset.omarchy = theme ? "true" : "false";

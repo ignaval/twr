@@ -10,10 +10,17 @@ function subscribe(changed: () => void) {
   };
 }
 
-export function AppearanceOptions() {
+export function AppearanceOptions({
+  labelledBy,
+}: { labelledBy?: string } = {}) {
   const theme = useSyncExternalStore(subscribe, savedAppearance);
   return (
-    <div className="segmented" role="group" aria-label="Appearance">
+    <div
+      className="segmented"
+      role="group"
+      aria-label={labelledBy ? undefined : "Appearance"}
+      aria-labelledby={labelledBy}
+    >
       {(["dark", "light", "system"] as const).map((value) => (
         <button
           type="button"
