@@ -62,11 +62,16 @@ jobs:
       - name: Real application integration
         working-directory: clients
         run: npm run test:integration
-      - name: Build unsigned review installer
+      - name: Build ad hoc signed review installer
         working-directory: clients
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm run package:mac
+          # package:mac forces identity '-' and never uses a private signing
+          # identity. Permit that credential-free signature in PR builds too.
+          CSC_FOR_PULL_REQUEST: "true"
+        run: |
+          npm run package:mac
+          codesign --verify --deep --strict release/mac-arm64/twr.app
       - name: Packaged Mac workflow QA
         working-directory: clients
         run: npm run test:qa:mac
