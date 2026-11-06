@@ -153,7 +153,12 @@ jobs:
     name: Arch Linux package and native Wayland (portable bundle)
     needs: linux
     runs-on: ubuntu-latest
-    container: archlinux:base-devel
+    container:
+      image: archlinux:base-devel
+      # The installed app keeps Chromium's sandbox enabled. Allow its SUID
+      # helper to create namespaces inside this disposable outer container,
+      # just as in the clean Debian runtime checks above.
+      options: --cap-add=SYS_ADMIN
     timeout-minutes: 75
     steps:
       - name: Install Arch build and Wayland runtime dependencies
