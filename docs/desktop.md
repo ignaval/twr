@@ -21,7 +21,7 @@ npm run dev
 builds the host, isolated preload and React UI. The development host takes a matched CLI
 and companion from `desktop/bin`, `target/debug`, or `target/release`. An explicit
 `TWR_DESKTOP_BINARY_DIR` is accepted only in development. Packaged builds always use the
-two bundled executables. `TWR_HOME` remains useful for an independent test installation.
+three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remains useful for an independent test installation.
 
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
@@ -96,7 +96,7 @@ required for this release.
   The companion uses `twr-core::Client`, peer-credential checks, protocol negotiation,
   `ClientFold` snapshots and gap-free subscriptions. Snapshot fold mismatches fall back
   to replay. Missing blobs leave a visibly incomplete, non-actionable request, rather than
-  repeatedly breaking the entire stream. Mutations are never automatically retried.
+  repeatedly breaking the entire stream. A mutation is retried only when the hub protocol proves it was not executed; uncertain outcomes are never blindly replayed.
 - `twr-core::slash`, `routine`, `card_order`, `config_edit`, `blob::hydrate_item` and `paths::project_param`:
   behavior shared by TUI and graphical clients. Rendering is separate from reducers.
 - `desktop/electron`: window lifecycle, isolated and validated IPC, terminal processes,

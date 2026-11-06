@@ -3,10 +3,31 @@ import { PushNotifications } from "@capacitor/push-notifications";
 import { LocalNotifications } from "@capacitor/local-notifications";
 import type { RemoteHost } from "./transport";
 
+const registering = new Map<
+  RemoteHost,
+  { promise: Promise<void>; allowPrompt: boolean }
+>();
+export const pushPreferenceKey = (id: string) => `twr.mobile.push.${id}`;
+export const pushEnabled = (id: string) =>
+  localStorage.getItem(pushPreferenceKey(id)) === "true";
+export async function refreshPush(host: RemoteHost, id: string) {
+  if (pushEnabled(id)) await enablePush(host, id, false);
+}
 export async function notificationListeners(
   open: (data: Record<string, string>) => void,
+  currentPushHost: () => RemoteHost | undefined = () => undefined,
 ) {
   const handles = await Promise.all([
+    PushNotifications.addListener("registration", ({ value }) => {
+      const host = currentPushHost();
+      if (host && !registering.has(host))
+        void host
+          .request("push-register", {
+            platform: Capacitor.getPlatform(),
+            token: value,
+          })
+          .catch(() => {});
+    }),
     PushNotifications.addListener(
       "pushNotificationReceived",
       (notification) => {
@@ -63,7 +84,27 @@ export async function testNotification() {
     ],
   });
 }
-export async function enablePush(host: RemoteHost) {
+export function enablePush(
+  host: RemoteHost,
+  id: string,
+  allowPrompt = true,
+): Promise<void> {
+  const current = registering.get(host);
+  if (current)
+    return allowPrompt && !current.allowPrompt
+      ? current.promise.catch(() => {}).then(() => enablePush(host, id, true))
+      : current.promise;
+  const promise = registerPush(host, id, allowPrompt).finally(() =>
+    registering.delete(host),
+  );
+  registering.set(host, { promise, allowPrompt });
+  return promise;
+}
+async function registerPush(
+  host: RemoteHost,
+  id: string,
+  allowPrompt: boolean,
+) {
   const config = await host.request("push-status");
   const platform = Capacitor.getPlatform();
   if (!(platform === "ios" ? config.apns : config.fcm))
@@ -71,8 +112,9 @@ export async function enablePush(host: RemoteHost) {
       "Remote push is not configured on this hub yet. Local test notifications are available.",
     );
   let permission = await PushNotifications.checkPermissions();
-  if (permission.receive === "prompt")
+  if (permission.receive === "prompt" && allowPrompt)
     permission = await PushNotifications.requestPermissions();
+  if (!allowPrompt && permission.receive !== "granted") return;
   if (permission.receive !== "granted")
     throw new Error("Allow notifications in system Settings to enable push.");
   if (platform === "android")
@@ -94,7 +136,10 @@ export async function enablePush(host: RemoteHost) {
       "registration",
       async (token) => {
         try {
-          await host.request("push-register", { platform, token: token.value });
+          await host.request("push-register", {
+            platform,
+            token: token.value,
+          });
           resolve();
         } catch (error) {
           reject(error);
@@ -123,4 +168,5 @@ export async function enablePush(host: RemoteHost) {
         reject(error);
       });
   });
+  localStorage.setItem(pushPreferenceKey(id), "true");
 }

@@ -11,6 +11,9 @@ import {
   notificationListeners,
   testNotification,
   enablePush,
+  refreshPush,
+  pushEnabled,
+  pushPreferenceKey,
 } from "./notifications";
 import "../../src/style.css";
 import "./mobile.css";
@@ -58,32 +61,38 @@ function Mobile() {
     };
   }, []);
   useEffect(() => {
-    const stop = notificationListeners((data) => {
-      void (async () => {
-        if (
-          data.gateway_id &&
-          activeHub.current?.gateway_id !== data.gateway_id
-        ) {
-          const hub = (await Transport.listHubs()).hubs.find(
-            (hub) => hub.gateway_id === data.gateway_id,
-          );
-          if (!hub)
-            throw new Error(
-              "This notification belongs to a hub that is no longer paired.",
+    const stop = notificationListeners(
+      (data) => {
+        void (async () => {
+          if (
+            data.gateway_id &&
+            activeHub.current?.gateway_id !== data.gateway_id
+          ) {
+            const hub = (await Transport.listHubs()).hubs.find(
+              (hub) => hub.gateway_id === data.gateway_id,
             );
-          if (!(await connect(hub))) return;
-        }
-        setHubSheet(false);
-        setFolder((old) => {
-          old?.resolve(null);
-          return undefined;
-        });
-        if (host.current) {
-          await host.current.resume();
-          setPendingNotification(data);
-        }
-      })().catch((error) => setError(String(error)));
-    });
+            if (!hub)
+              throw new Error(
+                "This notification belongs to a hub that is no longer paired.",
+              );
+            if (!(await connect(hub))) return;
+          }
+          setHubSheet(false);
+          setFolder((old) => {
+            old?.resolve(null);
+            return undefined;
+          });
+          if (host.current) {
+            await host.current.resume();
+            setPendingNotification(data);
+          }
+        })().catch((error) => setError(String(error)));
+      },
+      () =>
+        activeHub.current && pushEnabled(activeHub.current.id)
+          ? host.current || undefined
+          : undefined,
+    );
     return () => {
       void stop.then((fn) => fn());
     };
@@ -100,9 +109,21 @@ function Mobile() {
     const listener = NativeApp.addListener("appStateChange", ({ isActive }) => {
       if (host.current) {
         host.current.setForeground(isActive);
-        if (isActive)
-          void host.current.resume().catch((error) => setError(String(error)));
-        else
+        if (isActive) {
+          const remote = host.current;
+          const hubId = activeHub.current?.id;
+          void remote
+            .resume()
+            .then(() => {
+              if (hubId)
+                return refreshPush(remote, hubId).catch((error) => {
+                  if (host.current === remote) setNotice(String(error));
+                });
+            })
+            .catch((error) => {
+              if (host.current === remote) setError(String(error));
+            });
+        } else
           void host.current
             .request("rpc", {
               method: "notify.looking",
@@ -197,7 +218,14 @@ function Mobile() {
       <App
         key={active.id}
         deviceScopes={active.scopes}
-        onReady={() => setReadyHubId(active.id)}
+        onReady={() => {
+          setReadyHubId(active.id);
+          const remote = host.current;
+          if (remote && activeHub.current?.id === active.id)
+            void refreshPush(remote, active.id).catch((error) =>
+              setNotice(String(error)),
+            );
+        }}
       />
       <button
         className="mobile-hub-switch"
@@ -229,7 +257,7 @@ function Mobile() {
             <button
               onClick={() => {
                 if (host.current)
-                  void enablePush(host.current)
+                  void enablePush(host.current, active.id)
                     .then(() => setNotice("Remote push enabled."))
                     .catch((e) => setNotice(String(e)));
               }}
@@ -260,6 +288,7 @@ function Mobile() {
                     return;
                   await host.current?.request("unpair");
                   await Transport.removeHub({ id: active.id });
+                  localStorage.removeItem(pushPreferenceKey(active.id));
                   await disconnect();
                   await load();
                   setHubSheet(false);
@@ -382,6 +411,7 @@ function Mobile() {
                 await Transport.removeHub({ id: hub.id });
                 editors.forget(hub.id);
                 localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
+                localStorage.removeItem(pushPreferenceKey(hub.id));
                 await load();
               }}
             >

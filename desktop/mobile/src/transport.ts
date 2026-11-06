@@ -77,7 +77,10 @@ export class RemoteHost {
   private send(message: string) {
     const sent = this.sendTail
       .catch(() => {})
-      .then(() => Transport.send({ message }));
+      .then(() => {
+        if (this.stopped) throw new Error("This hub connection was closed");
+        return Transport.send({ message });
+      });
     this.sendTail = sent;
     return sent;
   }
@@ -248,6 +251,8 @@ export class RemoteHost {
     return this.reconnecting;
   }
   request(method: string, params: Json = {}, timeout = 660_000): Promise<any> {
+    if (this.stopped)
+      return Promise.reject(new Error("This hub connection was closed"));
     const id = requestId();
     const durable =
       ["config-save", "config-set", "terminal-open", "push-register"].includes(

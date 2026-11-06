@@ -96,6 +96,9 @@ export async function multiHubQA({
     const code = out.match(/Pairing code[^:]+: (\w+)/)?.[1];
     assert(code, err);
     adbRun(["reverse", "tcp:47323", "tcp:47323"]);
+    await page.evaluate(() => {
+      window.__qaPreviousHubAPI = window.twr;
+    });
     await page
       .getByRole("button", { name: "Remote hub settings", exact: true })
       .click();
@@ -133,6 +136,18 @@ export async function multiHubQA({
         runtime: "fake",
       }),
     );
+    const late = await page.evaluate(async () => {
+      try {
+        await window.__qaPreviousHubAPI.rpc("thread.send", {
+          thread: "second-hub-worker",
+          prompt: "LATE_CALL_MUST_NOT_REACH_THIS_HUB",
+        });
+        return "unexpected success";
+      } catch (error) {
+        return String(error);
+      }
+    });
+    assert.match(late, /closed/);
     await page
       .locator(".mobile-tabs")
       .getByRole("button", { name: "Threads", exact: true })

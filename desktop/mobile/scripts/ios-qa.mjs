@@ -106,10 +106,29 @@ for (const [index, template] of targets.entries()) {
         ],
         { stdio: "inherit", timeout: 180000 },
       );
-    hub = spawn(join(bin, "twr"), ["hub"], { env, stdio: "ignore" });
-    for (let i = 0; i < 150 && !existsSync(join(fixture, "hub.sock")); i++)
-      await delay(100);
-    assert(existsSync(join(fixture, "hub.sock")), "Fixture hub must start");
+    let hubLog = "";
+    hub = spawn(join(bin, "twr"), ["hub"], {
+      env,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    hub.stderr.on("data", (chunk) => (hubLog += chunk));
+    const hubDeadline = Date.now() + 120000;
+    while (!existsSync(join(fixture, "hub.sock")) && Date.now() < hubDeadline) {
+      assert(hub.exitCode === null, hubLog);
+      await delay(200);
+    }
+    assert(
+      existsSync(join(fixture, "hub.sock")),
+      "Fixture hub must start: " + hubLog,
+    );
+    const info = JSON.parse(
+      execFileSync(join(bin, "twr"), ["info", "--json"], {
+        env,
+        encoding: "utf8",
+        timeout: 120000,
+      }),
+    );
+    assert(info.pid, "Fixture hub must answer before starting the gateway");
     gateway = spawn(
       join(bin, "twr-mobile-gateway"),
       [
@@ -128,12 +147,20 @@ for (const [index, template] of targets.entries()) {
       stderr = "";
     gateway.stdout.on("data", (d) => (stdout += d));
     gateway.stderr.on("data", (d) => (stderr += d));
-    for (let i = 0; i < 150 && !stdout.includes("Pairing code"); i++) {
+    const started = Date.now();
+    while (!stdout.includes("Pairing code") && Date.now() - started < 120000) {
       assert(gateway.exitCode === null, stderr);
-      await delay(100);
+      await delay(200);
     }
     const code = stdout.match(/Pairing code[^:]+: (\w+)/)?.[1];
-    assert(code, stderr);
+    assert(
+      code,
+      "Gateway did not finish owner authentication and pairing initialization: " +
+        stderr +
+        "\nHub: " +
+        hubLog,
+    );
+    console.log(`Gateway ready after ${Date.now() - started} ms`);
     server = createServer((req, res) => {
       res.setHeader("content-type", "application/json");
       if (req.url === "/fixture")

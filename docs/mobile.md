@@ -63,7 +63,7 @@ The gateway accepts `--push-config /absolute/push.json`. That file and any priva
 }
 ```
 
-Omit either provider if unused. Enable remote push in the app after configuring it. Registration is scoped to a device and workspace. Device grants hide admin sections and disable terminals when those capabilities were not granted. Notifications use the shared attention policy, hold delays and rate gap; resolved requests are suppressed and active foreground viewers are excluded. Payloads contain routing metadata, not prompts, tool commands or request summaries. Tapping opens Needs you; notification buttons never approve a request.
+Omit either provider if unused. Enable remote push in the app after configuring it. Registration is scoped to a device and workspace. After opt-in, the active hub refreshes its registration on connection and foreground resume without prompting again. Token-change events also update the active opted-in hub; a closed hub client cannot submit late requests through another hub’s connection. Device grants hide admin sections and disable terminals when those capabilities were not granted. Notifications use the shared attention policy, hold delays and rate gap; resolved requests are suppressed and active foreground viewers are excluded. Payloads contain routing metadata, not prompts, tool commands or request summaries. Tapping opens Needs you; notification buttons never approve a request.
 
 ## Verification status
 

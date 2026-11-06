@@ -111,4 +111,54 @@ describe("mobile reconnect", () => {
     expect(connections).toEqual(["work"]);
     await host.stop();
   });
+  it("fences late and queued calls from a hub after another hub takes the native transport", async () => {
+    const old = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await old.start();
+    await old.api().connect("default");
+    const mutations: string[] = [];
+    let release!: () => void;
+    fake.send.mockImplementation(async ({ message }) => {
+      const call = JSON.parse(message);
+      if (call.method === "rpc" && call.params.method === "thread.send") {
+        mutations.push(call.params.params.prompt);
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      } else reply(call.id, {});
+    });
+    const accepted = old
+      .api()
+      .rpc("thread.send", { thread: "worker", prompt: "already dispatched" })
+      .catch((error) => error);
+    const queued = old
+      .api()
+      .rpc("thread.send", {
+        thread: "worker",
+        prompt: "must not reach the next hub",
+      })
+      .catch((error) => error);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await old.stop();
+    const next = new RemoteHost(
+      { ...hub, id: "another-hub" },
+      () => {},
+      async () => null,
+    );
+    await next.start();
+    release();
+    await Promise.all([accepted, queued]);
+    await expect(
+      old
+        .api()
+        .rpc("thread.send", { thread: "worker", prompt: "late callback" }),
+    ).rejects.toThrow("closed");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(mutations).toEqual(["already dispatched"]);
+    expect(await next.api().rpc("hub.info")).toEqual({});
+    await next.stop();
+  });
 });
