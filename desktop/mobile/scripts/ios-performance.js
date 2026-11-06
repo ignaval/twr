@@ -145,6 +145,17 @@ const report = {
 };
 if (report.renderedBlocks >= 80)
   throw new Error("Unbounded transcript rendering");
+const toolToggle = document.querySelector(
+  'button[aria-label="Toggle tool calls"]',
+);
+toolToggle.click();
+await wait(() => document.querySelectorAll(".block-tool").length > 0, 15000);
+report.detailedRenderedBlocks =
+  document.querySelectorAll(".transcript-block").length;
+if (report.detailedRenderedBlocks >= 80)
+  throw new Error("Unbounded detailed transcript rendering");
+toolToggle.click();
+await new Promise(requestAnimationFrame);
 const send = document
   .querySelector('button[aria-label="Send message"]')
   .getBoundingClientRect();

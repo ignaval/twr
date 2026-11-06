@@ -260,7 +260,13 @@ try {
   const errors = [];
   page.on("pageerror", (e) => errors.push(e.message));
   await page.getByRole("button", { name: "Pair a hub", exact: true }).click();
-  await page.getByLabel("Hub name", { exact: true }).fill("QA workstation");
+  await page
+    .getByLabel("Hub name", { exact: true })
+    .fill(
+      serial === "emulator-5556"
+        ? "QA workstation with a deliberately long hub name"
+        : "QA workstation",
+    );
   await page
     .getByLabel("Hub URL", { exact: true })
     .fill(`http://127.0.0.1:${port}`);
@@ -477,11 +483,15 @@ try {
         actionsLeft: actions.left,
         actionsRight: actions.right,
         headerRight: header.right,
+        hubLeft: document
+          .querySelector(".mobile-hub-switch")
+          .getBoundingClientRect().left,
       };
     });
     assert(
       header.leftRight <= header.actionsLeft + 1 &&
-        header.actionsRight <= header.headerRight + 1,
+        header.actionsRight <= header.headerRight + 1 &&
+        header.actionsRight <= header.hubLeft + 1,
       JSON.stringify(header),
     );
 

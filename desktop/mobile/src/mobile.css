@@ -255,6 +255,10 @@ select {
   min-height: 44px;
 }
 /* The right pane needs its own compact header even on a wide unfolded display. */
+[data-fold="vertical"] .mobile-hub-switch {
+  right: 10px;
+  max-width: 100px;
+}
 [data-fold="vertical"] .topbar {
   gap: 6px;
   padding-left: 12px;

@@ -172,6 +172,20 @@ export async function performanceAudit(page, label, application) {
     report.electronProcesses = metrics;
   }
   expect(report.renderedBlocks).toBeLessThan(80);
+  // Verify virtualization with all 1,000 tool calls visible as well as the default view.
+  const tools = page.getByRole("button", {
+    name: "Toggle tool calls",
+    exact: true,
+  });
+  await tools.click();
+  await expect
+    .poll(() => page.locator(".block-tool").count())
+    .toBeGreaterThan(0);
+  report.detailedRenderedBlocks = await page
+    .locator(".transcript-block")
+    .count();
+  expect(report.detailedRenderedBlocks).toBeLessThan(80);
+  await tools.click();
   mkdirSync("test-results", { recursive: true });
   writeFileSync(
     `test-results/performance-${label}.json`,
