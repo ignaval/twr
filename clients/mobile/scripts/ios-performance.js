@@ -12,11 +12,90 @@ const wait = async (check, limit = 120000) => {
   );
 };
 const rpc = (method, params = {}) => window.twr.rpc(method, params);
+const probeStarted = performance.now();
 await rpc("thread.new", {
   project: "demo",
   name: "performance-audit",
   runtime: "fake",
 });
+const worker = await rpc("thread.get", { thread: "performance-audit" });
+if (typeof worker.id !== "string" || !worker.id)
+  throw new Error("Performance worker identity is missing");
+const marker = "PERFORMANCE_STREAM_FINISHED";
+const expectedCounts = {
+  toolCalls: 1000,
+  toolResults: 1000,
+  textDeltas: 1,
+  textFinals: 1,
+};
+const eventCounts = {
+  toolCalls: 0,
+  toolResults: 0,
+  textDeltas: 0,
+  textFinals: 0,
+};
+const streamEvents = [];
+const observedSeqs = new Set();
+const measurementErrors = [];
+const transitions = [];
+let duplicateEvents = 0;
+let workloadStart;
+const stopMeasuring = window.twr.onEvent((message) => {
+  if (message.type === "resync" || message.type === "connection") {
+    if (transitions.length < 32)
+      transitions.push({
+        type: message.type,
+        scope: message.scope ?? null,
+        connected: message.connected ?? null,
+        atMs: performance.now() - probeStarted,
+      });
+  }
+  const event = message.event;
+  if (
+    workloadStart === undefined ||
+    message.type !== "thread" ||
+    event?.thread !== worker.id
+  )
+    return;
+  let category;
+  if (event.kind === "agent.tool_call") category = "toolCalls";
+  else if (event.kind === "agent.tool_result") category = "toolResults";
+  else if (event.kind === "agent.text" && event.data?.text === marker) {
+    if (event.data.final === true) category = "textFinals";
+    else if (event.data.delta === true) category = "textDeltas";
+  }
+  if (!category) return;
+  const server = Date.parse(event.ts);
+  if (
+    !Number.isSafeInteger(event.seq) ||
+    event.seq <= 0 ||
+    !Number.isFinite(server)
+  ) {
+    if (measurementErrors.length < 4)
+      measurementErrors.push("Invalid event sequence or timestamp");
+    return;
+  }
+  if (observedSeqs.has(event.seq)) {
+    duplicateEvents++;
+    return;
+  }
+  if (streamEvents.length >= 2002) {
+    if (measurementErrors.length < 4)
+      measurementErrors.push("Unexpected extra fixture events");
+    return;
+  }
+  observedSeqs.add(event.seq);
+  eventCounts[category]++;
+  streamEvents.push({
+    seq: event.seq,
+    kind: event.kind,
+    delta: event.data?.delta === true,
+    final: event.data?.final === true,
+    server,
+    received: performance.now() - workloadStart,
+  });
+});
+const readiness = { workerId: worker.id, frameFlushes: 2 };
 const visible = (e) => e.getClientRects().length > 0;
 [...document.querySelectorAll(".mobile-tabs button,.primary-nav button")]
   .find(
@@ -46,6 +125,39 @@ await wait(
     document.querySelector(".composer textarea")?.getAttribute("aria-label") ===
     "Message performance-audit directly",
 );
+// The empty transcript is rendered only after initial history and desktop.subscribe
+// finish. Flush passive effects first, then require that positive ready state.
+const transcriptState = () => ({
+  composer:
+    document.querySelector(".composer textarea")?.getAttribute("aria-label") ??
+    null,
+  loading: !!document.querySelector(".conversation-scroll .transcript-loading"),
+  error: !!document.querySelector(".conversation-scroll .error-banner"),
+  emptyTitle:
+    document.querySelector(".conversation-scroll .empty h2")?.textContent ??
+    null,
+  emptyVisible: !!document
+    .querySelector(".conversation-scroll .empty")
+    ?.getClientRects().length,
+  blocks: document.querySelectorAll(".conversation-scroll .transcript-block")
+    .length,
+});
+readiness.beforeFrames = transcriptState();
+await new Promise(requestAnimationFrame);
+await new Promise(requestAnimationFrame);
+await wait(() => {
+  const state = transcriptState();
+  return (
+    state.composer === `Message ${worker.name} directly` &&
+    !state.loading &&
+    !state.error &&
+    state.emptyTitle === worker.name &&
+    state.emptyVisible &&
+    state.blocks === 0
+  );
+});
+readiness.ready = transcriptState();
+readiness.readyAtMs = Math.round(performance.now() - probeStarted);
 const frames = [],
   inputPaint = [],
   rpcTimes = [];
@@ -57,46 +169,69 @@ const frame = (now) => {
   if (running) requestAnimationFrame(frame);
 };
 requestAnimationFrame(frame);
-const streamEvents = [];
-const stopMeasuring = window.twr.onEvent((message) => {
-  if (
-    message.type === "thread" &&
-    message.event?.ts &&
-    (message.event.kind === "agent.tool_call" ||
-      message.event.kind === "agent.tool_result" ||
-      (message.event.kind === "agent.text" &&
-        message.event.data?.text === "PERFORMANCE_STREAM_FINISHED"))
-  )
-    streamEvents.push({
-      server: Date.parse(message.event.ts),
-      received: performance.now(),
-      final: message.event.kind === "agent.text",
-    });
-});
-const start = performance.now();
-await rpc("thread.send", {
-  thread: "performance-audit",
-  prompt:
-    Array.from({ length: 1000 }, (_, i) => `!tool Read performance-${i}`).join(
-      "\n",
-    ) + "\nPERFORMANCE_STREAM_FINISHED",
-});
-const sendAckMs = Math.round(performance.now() - start);
-await wait(() =>
+workloadStart = performance.now();
+let sendAckMs, streamToVisibleMs;
+const finalTextEvent = () =>
+  streamEvents.find((event) => event.kind === "agent.text" && event.final);
+const exactAssistantText = () =>
   [...document.querySelectorAll(".block-assistant .markdown")].some(
-    (node) => node.textContent.trim() === "PERFORMANCE_STREAM_FINISHED",
-  ),
-);
-const streamToVisibleMs = Math.round(performance.now() - start);
-stopMeasuring();
+    (node) => node.textContent.trim() === marker,
+  );
+try {
+  // Observe the DOM independently of the RPC reply, which may arrive later.
+  const observed = wait(() => {
+    if (measurementErrors.length) throw new Error(measurementErrors.join("; "));
+    return !!finalTextEvent() && exactAssistantText();
+  }).then(() => {
+    streamToVisibleMs = Math.round(performance.now() - workloadStart);
+  });
+  const acknowledged = rpc("thread.send", {
+    thread: worker.id,
+    prompt:
+      Array.from(
+        { length: 1000 },
+        (_, i) => `!tool Read performance-${i}`,
+      ).join("\n") +
+      "\n" +
+      marker,
+  }).then(() => {
+    sendAckMs = Math.round(performance.now() - workloadStart);
+  });
+  await Promise.all([observed, acknowledged]);
+  if (
+    measurementErrors.length ||
+    streamEvents.length !== 2002 ||
+    Object.entries(expectedCounts).some(
+      ([key, value]) => eventCounts[key] !== value,
+    )
+  )
+    throw new Error(
+      "Incomplete unique live-stream measurement: " +
+        JSON.stringify({
+          expectedCounts,
+          eventCounts,
+          uniqueEvents: streamEvents.length,
+          duplicateEvents,
+          measurementErrors,
+          readiness,
+          transitions,
+        }),
+    );
+} catch (error) {
+  running = false;
+  throw error;
+} finally {
+  stopMeasuring();
+}
 const firstEvent = streamEvents[0],
   lastEvent = streamEvents.at(-1);
-const serverStreamSpanMs =
-  firstEvent && lastEvent ? lastEvent.server - firstEvent.server : null;
-const receivedStreamSpanMs =
-  firstEvent && lastEvent
-    ? Math.round(lastEvent.received - firstEvent.received)
-    : null;
+const serverStreamSpanMs = lastEvent.server - firstEvent.server;
+const receivedStreamSpanMs = Math.round(
+  lastEvent.received - firstEvent.received,
+);
+const finalEventToDomObservationMs = Math.round(
+  streamToVisibleMs - finalTextEvent().received,
+);
 const input = document.querySelector(".composer textarea");
 const storageTimes = [];
 const originalStorageWrite = Storage.prototype.setItem;
@@ -142,23 +277,27 @@ const pct = (values, p) =>
 const report = {
   date: new Date().toISOString(),
   toolCalls: 1000,
-  assistantCompletion: true,
+  assistantCompletion: !!finalTextEvent() && exactAssistantText(),
+  measurementDescription:
+    "Exact final event to DOM text observation, polled every 30ms; includes UI batching/scheduling, not paint or INP. Server/received spans cover 2002 unique fixture events.",
+  inputMeasurement: "Input to next requestAnimationFrame, not paint or INP.",
   sendAckMs,
   streamToVisibleMs,
   serverStreamSpanMs,
   receivedStreamSpanMs,
   streamMessageCount: streamEvents.length,
+  streamEventCounts: eventCounts,
+  duplicateStreamEvents: duplicateEvents,
+  readiness,
+  streamTransitions: transitions,
+  streamEventTimings: streamEvents,
   rpcMedianMs: pct(rpcTimes, 0.5),
   rpcP95Ms: pct(rpcTimes, 0.95),
   inputPaintP95Ms: pct(inputPaint, 0.95),
   inputPaintMedianMs: pct(inputPaint, 0.5),
   inputPaintSamplesMs: inputPaint.map(Math.round),
   storageWriteMaxMs: Math.round(Math.max(0, ...storageTimes) * 10) / 10,
-  finalEventToRenderMs: streamEvents.find((e) => e.final)
-    ? Math.round(
-        start + streamToVisibleMs - streamEvents.find((e) => e.final).received,
-      )
-    : null,
+  finalEventToDomObservationMs,
   frameP95Ms: pct(frames, 0.95),
   heapMiB: null,
   domNodes: document.getElementsByTagName("*").length,

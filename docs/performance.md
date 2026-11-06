@@ -104,9 +104,18 @@ the emulators and Linux VM stopped: p95 was 15 ms, all 12 samples were focused a
 visible, maximum frame interval was 19 ms and no long tasks were observed. This does
 not establish the cause of the earlier outlier. Both raw runs are preserved.
 
-iOS raw reports separate server emission, received-event span and final-event-to-render
-time. The workload includes a debug hub and native bridge on the CI host; end-to-end
-stream duration must not be attributed entirely to WebKit rendering. A small local
-TCP probe did not demonstrate a latency benefit from disabling Nagle, so no speculative
-transport or batching change was made. Physical-device and release-server profiling
-remain outside these Simulator diagnostics.
+The table retains earlier iOS diagnostics. Their legacy `finalEventToRenderMs` field
+measured the first matching text event to a later DOM polling observation; it did not
+measure final-frame-to-paint latency. Some early live recorders started before transcript
+subscription completed, so fewer than the expected 2,002 events were captured. Their
+server/receive spans cover only that observed subset and cannot describe the full stream.
+The overall workload-to-observed-assistant-reply measurement remains separate.
+
+The corrected iOS probe waits for transcript subscription readiness, requires the full
+workload event counts and an actual final text event, and retains per-event timing.
+`finalEventToDomObservationMs` includes UI batching and polling; it is not paint timing.
+The workload includes a debug hub and native bridge on the CI host, so end-to-end time
+must not be attributed entirely to WebKit rendering. A small local TCP probe did not
+demonstrate a latency benefit from disabling Nagle; no speculative transport or batching
+change was made. Physical-device and release-server profiling remain outside these
+Simulator diagnostics.
