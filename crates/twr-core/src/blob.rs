@@ -656,6 +656,25 @@ pub async fn hydrate_deep<F: BlobFetch>(data: &mut Value, fetch: &mut F) -> anyh
     Ok(restored)
 }
 
+/// Hydrate a streamed event only when its payload has capped fields. Callers retain the
+/// original item if a blob is unavailable, and decide whether its preview is actionable.
+pub async fn hydrate_item<F: BlobFetch>(
+    item: &crate::proto::StreamItem,
+    fetch: &mut F,
+) -> anyhow::Result<Option<crate::proto::StreamItem>> {
+    if !item.event.body.maybe_capped() {
+        return Ok(None);
+    }
+    let mut data = item.event.body.data()?;
+    if !has_capped(&data) {
+        return Ok(None);
+    }
+    hydrate_deep(&mut data, fetch).await?;
+    let mut full = item.clone();
+    full.event.body = crate::event::EventBody::from_kind_data(item.event.kind(), data)?;
+    Ok(Some(full))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

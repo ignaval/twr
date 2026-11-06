@@ -722,6 +722,35 @@ pub fn one_unlabeled(shown: Vec<Shown>, usable: impl Fn(&str, Option<&str>) -> b
         .collect()
 }
 
+/// Parse the CLI and desktop usage window: relative span, date, or RFC 3339.
+pub fn parse_since(
+    s: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    let bad = || {
+        anyhow::anyhow!("--since {s:?}: give a window such as 30m, 24h, 7d or 2w, a date such as 2026-10-01, or an RFC 3339 time")
+    };
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(t.with_timezone(&chrono::Utc));
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Ok(d.and_time(chrono::NaiveTime::MIN).and_utc());
+    }
+    let split = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+    let (n, unit) = s.split_at(split);
+    let n: i64 = n.parse().map_err(|_| bad())?;
+    let delta = match unit {
+        "m" => chrono::TimeDelta::try_minutes(n),
+        "h" => chrono::TimeDelta::try_hours(n),
+        "d" => chrono::TimeDelta::try_days(n),
+        "w" => chrono::TimeDelta::try_weeks(n),
+        _ => None,
+    }
+    .ok_or_else(bad)?;
+    now.checked_sub_signed(delta).ok_or_else(bad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

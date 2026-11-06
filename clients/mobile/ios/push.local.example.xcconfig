@@ -1,0 +1,5 @@
+// Opt in only when signing with an Apple Developer team that supports push.
+// xcodebuild ... -xcconfig mobile/ios/push.local.xcconfig
+CODE_SIGN_ENTITLEMENTS = $(SRCROOT)/Push.entitlements
+TWR_APNS_ENVIRONMENT = development
+// Set DEVELOPMENT_TEAM in your local copy; never commit credentials or signing files.

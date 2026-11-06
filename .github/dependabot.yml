@@ -1,6 +1,17 @@
 # Weekly dependency updates, proposed as pull requests against dev (the default branch).
 version: 2
 updates:
+  - package-ecosystem: npm
+    directory: /desktop
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      desktop-minor-and-patch:
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: cargo
     directory: /
     target-branch: dev

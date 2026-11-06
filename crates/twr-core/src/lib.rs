@@ -30,10 +30,12 @@ pub mod activity;
 pub mod adapter;
 pub mod b64;
 pub mod blob;
+pub mod card_order;
 pub mod client;
 pub mod client_state;
 pub mod compact;
 pub mod config;
+pub mod config_edit;
 pub mod event;
 pub mod fsread;
 pub mod git;
@@ -45,9 +47,11 @@ pub mod paths;
 pub mod project_lookup;
 pub mod proto;
 pub mod reduce;
+pub mod routine;
 pub mod runner;
 pub mod sealed;
 pub mod shell;
+pub mod slash;
 pub mod sorted;
 pub mod speech;
 pub mod testkit;
@@ -291,6 +295,7 @@ mod tests {
 
     /// What [`replaced_exe_child`] runs as: the gate file it waits for.
     const EXE_GATE_ENV: &str = "TWR_TEST_EXE_GATE";
+    const EXE_READY_ENV: &str = "TWR_TEST_EXE_READY";
 
     /// Run by [`a_running_process_starts_the_build_that_replaced_it`] from a copy of this test
     /// binary (nothing otherwise): once the gate file exists, prints what
@@ -300,6 +305,9 @@ mod tests {
         let Some(gate) = std::env::var_os(EXE_GATE_ENV) else {
             return;
         };
+        if let Some(ready) = std::env::var_os(EXE_READY_ENV) {
+            std::fs::write(ready, "ready").unwrap();
+        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !std::path::Path::new(&gate).exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -320,10 +328,12 @@ mod tests {
         let run = |replace: bool| {
             let exe = dir.path().join(if replace { "twr-up" } else { "twr-rm" });
             let gate = dir.path().join(format!("gate-{replace}"));
+            let ready = dir.path().join(format!("ready-{replace}"));
             std::fs::copy(&me, &exe).unwrap();
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(["--exact", "tests::replaced_exe_child", "--nocapture", "-q"])
                 .env(EXE_GATE_ENV, &gate)
+                .env(EXE_READY_ENV, &ready)
                 .stdout(std::process::Stdio::piped());
             // A file just written can be busy for a moment ("Text file busy"): another test's
             // fork may hold it open until its exec.
@@ -337,6 +347,14 @@ mod tests {
                     r => break r.unwrap(),
                 }
             };
+            // Wait until the copied executable is actually running. Replacing/unlinking
+            // it before macOS has loaded and verified it can kill it during exec, testing
+            // launch-time code signing rather than the lifetime of a running executable.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "copied test executable did not start");
             if replace {
                 let new = dir.path().join("twr-new");
                 std::fs::copy(&me, &new).unwrap();
@@ -363,3 +381,6 @@ mod tests {
         );
     }
 }
+
+pub mod app_commands;
+pub mod devices;

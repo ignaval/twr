@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=twr
+Comment=One conversation for all your coding agents
+Exec=twr-desktop %U
+Icon=tools.twr.desktop
+Terminal=false
+Type=Application
+Categories=Development;
+Keywords=agents;coding;terminal;
+StartupWMClass=tools.twr.desktop

@@ -1245,6 +1245,20 @@ fn main() -> ExitCode {
     if std::env::args_os().nth(1).as_deref() == Some(twr_hub::job_gate::GATE_ARG.as_ref()) {
         twr_hub::job_gate_main(std::env::args_os().skip(1).collect());
     }
+    // The bundled desktop validates form arguments with this exact clap grammar before
+    // opening a terminal. No configuration, hub, runtime or user operation is started.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--desktop-validate")) {
+        return match Cli::try_parse_from(
+            std::iter::once(std::ffi::OsString::from("twr")).chain(std::env::args_os().skip(2)),
+        ) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(error) => {
+                let code = error.exit_code();
+                let _ = error.print();
+                ExitCode::from(code as u8)
+            }
+        };
+    }
     let cli = Cli::parse();
     twr_core::trace::mark_with(|| {
         let role = match &cli.cmd {
@@ -5007,28 +5021,7 @@ fn parse_since(
     s: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
-    let s = s.trim();
-    let bad = || {
-        anyhow::anyhow!("--since {s:?}: give a window such as 30m, 24h, 7d or 2w, a date such as 2026-10-01, or an RFC 3339 time")
-    };
-    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&chrono::Utc));
-    }
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Ok(d.and_time(chrono::NaiveTime::MIN).and_utc());
-    }
-    let split = s.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
-    let (n, unit) = s.split_at(split);
-    let n: i64 = n.parse().map_err(|_| bad())?;
-    let delta = match unit {
-        "m" => chrono::TimeDelta::try_minutes(n),
-        "h" => chrono::TimeDelta::try_hours(n),
-        "d" => chrono::TimeDelta::try_days(n),
-        "w" => chrono::TimeDelta::try_weeks(n),
-        _ => None,
-    }
-    .ok_or_else(bad)?;
-    now.checked_sub_signed(delta).ok_or_else(bad)
+    twr_core::usage::parse_since(s, now)
 }
 
 /// `twr usage --threads`'s lines for a `usage.threads` answer `u`: a table of the rows, then
@@ -7821,6 +7814,8 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         .stderr(log)
         // Started from an agent's shell, this process carries its marker; the hub never does.
         .env_remove(twr_hub::host::AGENT_ENV)
+        .env_remove("TWR_DEVICE_TOKEN")
+        .env_remove("TWR_MOBILE_TRANSPORT")
         // Nor a test's user token: a hub started for whoever runs the TUI trusts no token
         // file named in their environment.
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);

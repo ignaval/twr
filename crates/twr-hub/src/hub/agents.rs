@@ -460,7 +460,7 @@ impl Hub {
                 hook(peer);
             }
             let (marker, left) = read_markers(peer, &walked);
-            (marker, left, twr_ancestor(&walked, reap::process_args))
+            (marker, left, read_twr_ancestor(&walked))
         });
         let (marker, left, hub) = match read.await {
             Ok(m) => m,
@@ -593,6 +593,12 @@ fn twr_ancestor(
         .find_map(|p| Some((p.pid, reap::twr_parent(&args_of(p.pid)?)?)))
 }
 
+fn read_twr_ancestor(ancestry: &reap::Ancestry) -> Option<(u32, TwrParent)> {
+    let pids: Vec<_> = ancestry.chain.iter().skip(1).map(|p| p.pid).collect();
+    let arguments = reap::process_arguments(&pids);
+    twr_ancestor(ancestry, |pid| arguments.get(&pid).cloned())
+}
+
 /// `decision`, unless it makes `peer` the user while it descends from a twr hub or attach
 /// (`under`, the nearest such ancestor): then an agent of no known thread
 /// ([`AgentWhy::Under`]). Only restricts: an agent stays the agent it is.
@@ -625,7 +631,7 @@ fn under_hub(decision: Decision, peer: u32, under: Option<(u32, TwrParent)>) -> 
 pub fn local_agent(pid: u32) -> Option<AgentPeer> {
     let ancestry = settled_ancestry(pid);
     let (marker, _) = read_markers(pid, &ancestry);
-    let under = twr_ancestor(&ancestry, reap::process_args);
+    let under = read_twr_ancestor(&ancestry);
     let agent = unmatched(pid, &ancestry, marker, &StartedTable::default(), |_| None);
     match under_hub(Decision::Agent(agent), pid, under) {
         Decision::Agent(a) => a,

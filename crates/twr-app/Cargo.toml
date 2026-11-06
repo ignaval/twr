@@ -1,0 +1,42 @@
+[package]
+name = "twr-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Shared desktop application projection and authenticated hub companion"
+
+[dependencies]
+twr-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+libc.workspace = true
+sha2.workspace = true
+hex.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+futures.workspace = true
+portable-pty.workspace = true
+subtle = "2.6.1"
+clap = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["v4"] }
+ring.workspace = true
+base64 = "0.23.1"
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+reqwest = { workspace = true, features = ["http2"] }
+rustls.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "twr-desktop-bridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "twr-mobile-gateway"
+path = "src/gateway.rs"

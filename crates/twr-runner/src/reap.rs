@@ -1131,6 +1131,20 @@ pub fn process_args(pid: u32) -> Option<Vec<String>> {
     sys::args(pid)
 }
 
+/// A chain's arguments. macOS batches its `ps` calls; Linux reads each `/proc` record.
+pub fn process_arguments(pids: &[u32]) -> std::collections::HashMap<u32, Vec<String>> {
+    #[cfg(all(target_os = "linux", not(twr_ps)))]
+    {
+        pids.iter()
+            .filter_map(|pid| Some((*pid, sys::args(*pid)?)))
+            .collect()
+    }
+    #[cfg(any(not(target_os = "linux"), twr_ps))]
+    {
+        ps::args_many(pids)
+    }
+}
+
 /// What a twr process an agent can descend from is ([`twr_parent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TwrParent {
