@@ -566,7 +566,9 @@ pub struct SpeechConfig {
     pub rate: u32,
     /// Volume, 0.0 to 1.0, where the engine has one.
     pub volume: f32,
-    /// Which texts are read: `replies` (a turn's last text), `commentary` (texts before it).
+    /// Which texts are read: `replies` (a turn's last text), `commentary` (texts before it),
+    /// `attention` (a short announcement when something needs you: `api needs your
+    /// permission`).
     pub read: Vec<crate::speech::ReadKind>,
     /// Whose turns: `all`, or `mine` (the turns you started).
     pub turn_from: crate::speech::TurnsRead,
@@ -620,7 +622,9 @@ impl SpeechConfig {
             );
         }
         if self.read.is_empty() {
-            anyhow::bail!("speech.read: name at least one of \"replies\", \"commentary\"");
+            anyhow::bail!(
+                "speech.read: name at least one of \"replies\", \"commentary\", \"attention\""
+            );
         }
         if self.catchup_secs > crate::speech::CATCHUP_MAX {
             anyhow::bail!(
@@ -2575,6 +2579,13 @@ mod tests {
         assert_eq!(c.speech.engine, SpeechEngine::Command);
         assert_eq!(c.speech.local, SpeechLocal::Off);
         assert_eq!(c.speech.read, vec![crate::speech::ReadKind::Replies]);
+        let c = Config::from_toml_str(
+            "[speech]\nread = [\"replies\", \"commentary\", \"attention\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.speech.read.len(), 3);
+        let c = Config::from_toml_str("[speech]\nread = [\"attention\"]\n").unwrap();
+        assert_eq!(c.speech.read, vec![crate::speech::ReadKind::Attention]);
         for bad in [
             "[speech]\nengine = \"command\"\n",
             "[speech]\nvolume = 2.0\n",

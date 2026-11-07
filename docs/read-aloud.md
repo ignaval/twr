@@ -23,7 +23,8 @@ Never read:
 - tool calls and results;
 - your own prompts;
 - worker threads' texts (except with `/read N` in a dive);
-- the hub's updates and cards;
+- the hub's updates and cards (with `"attention"` in `[speech] read`, a short sentence says
+  that a card needs you: [below](#hearing-when-something-needs-you));
 - [summaries](tui.md#routine-updates-and-summaries);
 - the turns twr runs for itself: the handoff to a new orchestrator and the old one's summary
   before it, a context compaction (yours, one you accepted from an offer, or the hub's idle
@@ -35,6 +36,44 @@ runs; that message's reply is read like any other.
 In live mode, `[speech] read = ["replies"]` leaves the commentary out, and `turn_from =
 "mine"` reads only the turns you started. `/read N` reads any of the conversation's messages:
 you asked for them.
+
+### Hearing when something needs you
+
+For a hands-free session, add `"attention"` to `[speech] read`:
+
+```toml
+[speech]
+read = ["replies", "commentary", "attention"]
+```
+
+The speaker then also says, in live mode, when an attention item is raised in the workspace:
+
+| Item | Said |
+|---|---|
+| a permission | `api needs your permission` |
+| a question | `docs has a question` |
+| a failure | `api failed` |
+| a review | `api needs your review` |
+| a hung turn | `api seems hung` |
+| a stall | `api is stalled` |
+| the hub's own ("which thread did you mean?", the orchestrator's proposals) | `twr has a question for you` |
+
+Each is a fixed sentence and the thread's name, nothing more: never what the card says, the
+command or anything an agent wrote. Answer on screen, or by voice.
+
+- **New items only.** A permission sent again with new input while it is open is not said
+  again. One answered within two seconds (five for a failure, which twr may retry by itself)
+  is never said.
+- **One per thread.** Items of a thread raised close together are said once, as the most
+  urgent of them. One still waiting on the speaker is replaced by the thread's next.
+- **Never stale.** Once every item an announcement was about is answered or withdrawn (or its
+  thread stopped), it is dropped if it still waits behind a message. One being said ends.
+- **Live only.** An item raised while the speaker was away (or with live mode off) is never
+  said later, nor counted with the missed messages; it is on screen. Stop, pause and skip act
+  on announcements as on messages.
+
+A hub older than announcements refuses `"attention"`: the speaker says so once and reads
+without them until twr is updated there.
 
 The words are read as written. Only markup changes:
 
@@ -162,7 +201,7 @@ engine = "auto"          # auto | say | avspeech | spd | command
 voice = ""               # the engine's voice; empty: the system's default
 rate = 0                 # words per minute (80-500); 0: the engine's default
 volume = 1.0             # 0.0-1.0 (avspeech, spd)
-read = ["replies", "commentary"]
+read = ["replies", "commentary"]   # and "attention": hear when something needs you
 turn_from = "all"        # all | mine
 code = "announce"        # announce | read | skip
 paths = "short"          # short | full
@@ -188,8 +227,9 @@ feed (below) with `termux-tts-speak`.
 ## The feed, for your own reader
 
 `twr speech feed --text` on the hub's machine prints each new message's sentences, one per
-line, as they're said, and nothing else. It is a public interface: pipe it into anything that
-reads lines.
+line, as they're said, and nothing else. With `--attention` it also prints each announcement
+(`api needs your permission`) as a line when it is made. It is a public interface: pipe it
+into anything that reads lines.
 
 ```
 ssh myserver twr speech feed --text | while IFS= read -r line; do printf '%s\n' "$line" | my-tts; done
@@ -215,7 +255,8 @@ Only you:
   aim speech.
 - **Only the conversation's text.** No method says a text it is given: a speaker reads
   messages from the log, by thread and position. Nothing an agent sends can make your laptop
-  say something the conversation doesn't hold.
+  say something the conversation doesn't hold. Announcements are the hub's own fixed
+  sentences; the only word in them that comes from elsewhere is the thread's name.
 - **Nothing recorded.** Speech adds nothing to the event log. The speakers and what they play
   are kept in the hub's memory.
 

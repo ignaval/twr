@@ -578,6 +578,13 @@ fn item_to_player(
             // The feed reads a new orchestrator from its start.
             changes.push(Box::new(move |s| s.init_watermark(&thread, 0)));
         }
+        // No more than a hub sends, whatever this one sent: one clean line.
+        SpeechItem::Announce { key, text } => {
+            let text = twr_core::speech::clean(&text);
+            let text = text.chars().take(twr_core::speech::ANNOUNCE_MAX).collect();
+            m.announce(ws, &key, text)
+        }
+        SpeechItem::Retract { key } => m.retract(ws, &key),
     }
 }
 
@@ -1033,6 +1040,37 @@ mod tests {
             vec!["3 earlier messages came while I was disconnected; they're on screen"]
         );
         assert_eq!(r.state().watermark("T"), Some(9));
+        r.shut().await;
+    }
+
+    /// An announcement from the hub is said as it came, cleaned and cut to
+    /// [`twr_core::speech::ANNOUNCE_MAX`]; a retract drops one still waiting.
+    #[tokio::test(start_paused = true)]
+    async fn announcements_are_said_and_retracted() {
+        let (_d, store) = store();
+        live_on(&store, "default");
+        let mut r = start(&store, FakeEngine::timed(Duration::from_secs(1)));
+        r.connect("default", Some("T"), 0).await;
+        let announce = |key: &str, text: String| SpeechItem::Announce {
+            key: key.into(),
+            text,
+        };
+        r.item(
+            "default",
+            announce("api", "api\u{1b}[2J needs your permission".into()),
+        );
+        r.item("default", announce("web", "web failed".into()));
+        r.item("default", SpeechItem::Retract { key: "web".into() });
+        r.item("default", announce("docs", "d".repeat(1000)));
+        until("said", || r.fake.finished().len() == 2).await;
+        assert_eq!(
+            r.fake.spoken(),
+            vec![
+                "api[2J needs your permission".to_string(),
+                "d".repeat(twr_core::speech::ANNOUNCE_MAX)
+            ]
+        );
+        assert_eq!(r.state().watermark("T"), Some(0), "no watermark moved");
         r.shut().await;
     }
 

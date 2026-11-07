@@ -17,6 +17,12 @@
 //! - **Watermarks** ([`Effect::Watermark`]): a live or catch-up message's seq is handled once
 //!   it starts playing, or once it is dropped (live off, stop, replace, an engine failure).
 //!   So a restart mid-message never repeats it.
+//! - **Announcements** ([`Machine::announce`]): a hub's fixed sentence that something needs
+//!   the user (`api needs your permission`), queued like any entry, only while live reading is
+//!   on for its workspace, and let go when it goes off. One waiting with the same key is
+//!   replaced in place (one per thread), and a retract ([`Machine::retract`]) drops one still
+//!   waiting: its items were answered meanwhile. They move no watermark, and a hub gone takes
+//!   its waiting ones with it (no retract can come any more, and none is sent again).
 //! - **Prefaces.** `Reading N messages` before a batch of several; the workspace's name when
 //!   several workspaces read live; `long message, about N minutes` for one over two minutes;
 //!   `message cut short; the rest is on screen` after a truncated one.
@@ -83,10 +89,12 @@ enum Entry {
     /// A message.
     Msg(Msg),
     /// Something to say that is no message (`N earlier messages came while I was
-    /// disconnected`).
+    /// disconnected`, an announcement).
     Notice {
         /// The workspace it is about.
         ws: String,
+        /// An announcement's key ([`Machine::announce`]); none for the speaker's own notes.
+        key: Option<String>,
         /// What to say.
         text: String,
     },
@@ -403,6 +411,9 @@ impl Machine {
     /// attaches next (this one, or the one that stood by), and said once, by that one. Kept,
     /// both could say them.
     ///
+    /// Its announcements waiting go too: no retract of theirs can come now, and none is sent
+    /// again.
+    ///
     /// Its live switch goes too (an attach sets it again), so a hub gone no longer counts
     /// among the workspaces reading live; and the batch ids it sent, which a restarted hub
     /// numbers from 1 again.
@@ -420,6 +431,12 @@ impl Machine {
                 Entry::Msg(m) if m.ws == ws && m.origin != Origin::Request => {
                     forget.push((m.thread.clone(), m.seq));
                 }
+                // Its announcements: no retract can come for them now, and none is sent again.
+                Entry::Notice {
+                    ws: w,
+                    key: Some(_),
+                    ..
+                } if w == ws => {}
                 _ => {
                     if i < self.batch_queued {
                         kept_batch += 1;
@@ -538,9 +555,63 @@ impl Machine {
         };
         self.queue.push_back(Entry::Notice {
             ws: ws.to_string(),
+            key: None,
             text,
         });
         self.advance();
+    }
+
+    /// `ws`'s hub announces `text` (something needs the user), under `key`: queued when `ws`
+    /// reads live, in place of one of the same key still waiting (said where that one would
+    /// have been); dropped otherwise, or when it is empty.
+    pub fn announce(&mut self, ws: &str, key: &str, text: String) {
+        if !self.live(ws) || text.trim().is_empty() {
+            return;
+        }
+        let waiting = self.queue.iter_mut().find_map(|e| match e {
+            Entry::Notice {
+                ws: w,
+                key: Some(k),
+                text,
+            } if w == ws && k == key => Some(text),
+            _ => None,
+        });
+        if let Some(t) = waiting {
+            *t = text;
+            return;
+        }
+        self.queue.push_back(Entry::Notice {
+            ws: ws.to_string(),
+            key: Some(key.to_string()),
+            text,
+        });
+        self.advance();
+    }
+
+    /// `ws`'s hub retracts announcement `key`: dropped if it waits; one being said ends as
+    /// it would.
+    pub fn retract(&mut self, ws: &str, key: &str) {
+        self.drop_waiting(
+            |e| matches!(e, Entry::Notice { ws: w, key: Some(k), .. } if w == ws && k == key),
+        );
+    }
+
+    /// Drops the waiting entries `gone` picks (never one of a batch), as handled.
+    fn drop_waiting(&mut self, gone: impl Fn(&Entry) -> bool) {
+        let mut kept = VecDeque::new();
+        let mut kept_batch = 0;
+        for (i, e) in std::mem::take(&mut self.queue).into_iter().enumerate() {
+            if i >= self.batch_queued && gone(&e) {
+                self.handled(&e);
+            } else {
+                if i < self.batch_queued {
+                    kept_batch += 1;
+                }
+                kept.push_back(e);
+            }
+        }
+        self.queue = kept;
+        self.batch_queued = kept_batch;
     }
 
     /// Use the voice `voice` from the next chunk on.
@@ -1160,6 +1231,89 @@ mod tests {
             vec!["4 earlier messages came while I was disconnected; they're on screen"]
         );
         assert_eq!(marks(&mut m), vec![wm(44)]);
+    }
+
+    /// An announcement is said only while its workspace reads live, after what waits, with
+    /// the workspace's name when several read live; it moves no watermark, and live going off
+    /// lets it go.
+    #[test]
+    fn announcements_are_said_when_live() {
+        let mut m = Machine::new(Prefs::default());
+        m.announce("w", "api", "api needs your permission".into());
+        assert!(!m.busy(), "live off: not queued");
+        m.set_live("w", true);
+        m.push(live("w", 3, &["a message"]));
+        m.announce("w", "api", "api needs your permission".into());
+        assert_eq!(m.queued(), 1);
+        assert_eq!(m.state_for("w").queued, 1);
+        assert_eq!(
+            drain(&mut m),
+            vec!["a message", "api needs your permission"]
+        );
+        assert_eq!(marks(&mut m), vec![wm(3)], "the message's only");
+        // Two workspaces live: named, as messages are.
+        m.set_live("x", true);
+        m.announce("x", "docs", "docs has a question".into());
+        assert_eq!(drain(&mut m), vec!["x:", "docs has a question"]);
+        // Live off drops one waiting, and the one being said.
+        m.push(live("w", 4, &["first"]));
+        m.announce("x", "docs", "docs has a question".into());
+        m.set_live("x", false);
+        assert_eq!(drain(&mut m), vec!["w:", "first"], "named as it started");
+        m.announce("w", "api", "api is stalled".into());
+        assert!(m.current().is_some());
+        m.set_live("w", false);
+        assert!(!m.busy());
+        // Nothing to say is nothing queued.
+        m.set_live("w", true);
+        m.announce("w", "api", "  ".into());
+        assert!(!m.busy());
+    }
+
+    /// One waiting is replaced by the next of its key (in its place), and a retract drops it;
+    /// one being said is left to end. Stop, skip and pause act on announcements as on any
+    /// entry; a hub gone takes its waiting ones.
+    #[test]
+    fn announcements_are_replaced_retracted_stopped_and_skipped() {
+        let mut m = Machine::new(Prefs::default());
+        m.set_live("w", true);
+        m.push(live("w", 1, &["one", "two"]));
+        m.announce("w", "api", "api needs your permission".into());
+        m.announce("w", "web", "web failed".into());
+        m.announce("w", "api", "api has a question".into());
+        assert_eq!(m.queued(), 2, "api's replaced");
+        m.retract("w", "web");
+        // Another workspace's key is another announcement.
+        m.retract("x", "api");
+        assert_eq!(drain(&mut m), vec!["one", "two", "api has a question"]);
+        // Being said: a retract leaves it.
+        m.announce("w", "api", "api is stalled".into());
+        m.retract("w", "api");
+        assert_eq!(drain(&mut m), vec!["api is stalled"]);
+        // Skip ends it and goes on; stop empties the queue of them.
+        m.announce("w", "a", "a failed".into());
+        m.announce("w", "b", "b failed".into());
+        m.skip();
+        assert_eq!(drain(&mut m), vec!["b failed"]);
+        m.announce("w", "a", "a failed".into());
+        m.announce("w", "b", "b failed".into());
+        m.stop();
+        assert!(!m.busy());
+        // Paused: it waits, and is said on resume.
+        m.pause();
+        m.announce("w", "a", "a failed".into());
+        assert_eq!(m.current(), None);
+        m.resume();
+        assert_eq!(drain(&mut m), vec!["a failed"]);
+        // A hub gone: its waiting ones go, another's stay.
+        m.set_live("x", true);
+        marks(&mut m);
+        m.push(live("w", 2, &["long"]));
+        m.announce("w", "a", "a failed".into());
+        m.announce("x", "b", "b failed".into());
+        m.detached("w");
+        assert_eq!(drain(&mut m), vec!["w:", "long", "b failed"]);
+        assert_eq!(marks(&mut m), vec![wm(2)], "the message's only");
     }
 
     #[test]

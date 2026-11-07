@@ -160,7 +160,7 @@ engine = "auto"                   # say (macOS) | avspeech (macOS) | spd (Linux)
 voice = ""                        # the engine's voice; empty = the system's default
 rate = 0                          # words per minute, 80-500; 0 = the engine's default
 volume = 1.0                      # 0.0-1.0 (avspeech, spd)
-read = ["replies", "commentary"]  # replies: a turn's last text; commentary: texts before it
+read = ["replies", "commentary"]  # replies: a turn's last text; commentary: texts before it; add "attention" to hear "api needs your permission"
 turn_from = "all"                 # mine: only the turns you started
 code = "announce"                 # read | skip: what a code block reads as
 paths = "short"                   # full: paths as written
