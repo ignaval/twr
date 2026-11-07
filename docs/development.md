@@ -8,6 +8,12 @@ The tests run from inside a twr thread too. Their hubs and clients descend from 
 
 The tests use a scripted fake adapter plus recorded Claude Code, Codex and Grok Build sessions, so they don't need any agent CLI installed or signed in. The recordings live in `crates/twr-adapters/tests/fixtures/`, one JSON line per message in either direction.
 
+## Tests on macOS
+
+The reap, attach and agent tests start `sleep` and `sh` with marker variables and read them back the way twr does on macOS, with `ps -E`. macOS 27 hides the environment of Apple's own programs (`/bin/sleep`, `/bin/sh`, `/bin/zsh`) from every other process, the same user's included, so there those tests skip and say why (`skipping <test>: this machine does not show the environment of ...`). They probe this once per test binary (`twr_runner::reap::test_environs_hidden`). CI sets `TWR_TEST_REQUIRE_PROCESS_ENV=1`, which makes such a skip a failure, so CI runs them on every run. On such a machine `reap::tests::this_processs_own_chain_hides_nothing` also skips when the test run's own chain has one of those programs whose parent is the user's process: a `/bin/zsh` under tmux or an editor, not one that `login` started.
+
+Tests that compare paths twr reports resolved with the temporary directories they make resolve those first: macOS's `$TMPDIR` is under `/var`, a link to `/private/var`. CI's macOS job also points `TMPDIR` at a directory with no links in its path.
+
 ## Disk usage
 
 Each twr worktree builds into its own `target/`, so several threads working on twr at once can fill a disk. Measured on Linux with Rust 1.98, a full `cargo test --workspace --no-run` followed by one edit-and-rebuild of `twr-hub` (what an agent does all day):
@@ -172,6 +178,7 @@ Each runner protocol version has fixtures captured from a real revision of it, i
 - `cargo fmt --check`, shellcheck over `install.sh` and the shell scripts in `docs/tools/` and `.github/scripts/`, and the docs' relative links (`docs/tools/check-links.py`);
 - clippy with `-D warnings` and `cargo test --workspace --locked` on Ubuntu and macOS, with Git LFS installed so the LFS tests of `twr-runner` run;
 - the `twr-runner` tests on Linux with `RUSTFLAGS=--cfg twr_ps`;
+- both test jobs with `TWR_TEST_REQUIRE_PROCESS_ENV=1`, so the tests that read the environment of processes they start fail instead of skipping ([Tests on macOS](#tests-on-macos));
 - `cargo deny check` (cargo-deny 0.20.2), with the rules in `deny.toml`: the licences twr's dependencies may have, no known vulnerability or unmaintained crate, crates from crates.io only, no OpenSSL, and HTTP clients in `twr-cli` only. A dependency with a new licence fails it until the licence is added to both `deny.toml` and `about.toml`;
 - actionlint (a checksum-pinned release binary) over the workflows, with shellcheck over their `run:` scripts;
 - a real-systemd job on Ubuntu: it starts a user manager for the runner's user and runs the ignored `real_systemd_scope` test of `crates/twr-hub/tests/limits.rs`, one worker under `cpu_weight` and `memory_high` whose scope and slice it checks with `systemctl --user show`. When no user manager comes up, it skips with a notice; when one does, the test must not skip (`TWR_TEST_REQUIRE_SYSTEMD`). The rest of the suite replaces `systemd-run` and `systemctl` with stubs. On a machine with a user manager, run it with `cargo test -p twr-hub --test limits -- --ignored real_systemd`; it sets the weight of your `twr.slice` while it runs and puts the old value back;

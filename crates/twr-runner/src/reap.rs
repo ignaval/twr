@@ -310,6 +310,107 @@ mod proc_faults {
     }
 }
 
+/// The variable [`skip_if_test_environs_hidden`] reads: when set, a hidden environment fails
+/// the test instead of skipping it (CI sets it, so its runs never skip these tests).
+#[doc(hidden)]
+pub const TEST_REQUIRE_ENVIRONS_ENV: &str = "TWR_TEST_REQUIRE_PROCESS_ENV";
+
+/// Test support (doc-hidden: nothing in twr calls it outside tests): why the tests that read
+/// the environment of the processes they start (`sleep` and `sh`, found on `PATH`, as stand-ins
+/// for runtimes, attached CLIs and agents) cannot run on this machine, if they cannot. The
+/// first of these programs whose environment, as this process set it, still does not show once
+/// the program runs (its command line shows it exec'd): macOS 27 withholds the environment of
+/// Apple's platform binaries (`/bin/sleep`, `/bin/sh`) from every other process, those of the
+/// same user included (`KERN_PROCARGS2`, which `ps -E` reads, returns only their arguments),
+/// while it still shows that of other programs. `None` where both show (Linux, earlier macOS),
+/// and when a probe never exec'd (that is not this). Probed once per process.
+#[doc(hidden)]
+pub fn test_environs_hidden() -> Option<&'static str> {
+    static HIDDEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HIDDEN
+        .get_or_init(|| {
+            [("sleep", &["30"][..]), ("sh", &["-c", "read x"][..])]
+                .into_iter()
+                .find_map(|(program, args)| environ_hidden_from(program, args))
+        })
+        .as_deref()
+}
+
+/// [`test_environs_hidden`] for one `program`, run with `args` (and its standard input a pipe
+/// it may wait on): why its environment does not show, if it does not.
+///
+/// It reads the process table a few times only: with `ps` each read forks this process, and
+/// until the fork execs `ps` it holds every descriptor of this process, the listening sockets
+/// of the tests running meanwhile too (one that a test dropped then still accepts).
+fn environ_hidden_from(program: &str, args: &[&str]) -> Option<String> {
+    use std::process::{Command, Stdio};
+    const PROBE: &str = "TWR_TEST_ENVIRON_PROBE";
+    let mut child = Command::new(program)
+        .args(args)
+        .env(PROBE, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let pid = child.id();
+    let shown = || sys::environ(pid).is_ok_and(|e| environ_has(&e, PROBE, "1"));
+    // Until the child has exec'd, its environment may still be this process's.
+    let exec_d = || {
+        use std::os::unix::ffi::OsStrExt;
+        sys::cmdline(pid).is_some_and(|c| {
+            let argv0 = c.split(|&b| b == 0).next().unwrap_or_default();
+            std::path::Path::new(std::ffi::OsStr::from_bytes(argv0))
+                .file_name()
+                .is_some_and(|n| n == program)
+        })
+    };
+    // Shown: not hidden. Not shown in three reads over a second once it runs: hidden (a `ps`
+    // that failed now and then shows it in one of them). Never exec'd: not this.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let hidden = loop {
+        if shown() {
+            break false;
+        }
+        if exec_d() {
+            break !(0..3).any(|_| {
+                std::thread::sleep(Duration::from_millis(330));
+                shown()
+            });
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    hidden.then(|| {
+        format!(
+            "this machine does not show the environment of `{program}` (pid {pid}), a process \
+             this test run started, to this user (macOS 27 hides those of Apple's platform \
+             binaries, /bin/sleep and /bin/sh among them)"
+        )
+    })
+}
+
+/// Test support (doc-hidden): whether test `test`, which reads the environment of the `sleep`
+/// or `sh` processes it starts, skips because this machine hides them
+/// ([`test_environs_hidden`]). It then prints why and returns `true`; with
+/// [`TEST_REQUIRE_ENVIRONS_ENV`] set it panics instead.
+#[doc(hidden)]
+pub fn skip_if_test_environs_hidden(test: &str) -> bool {
+    let Some(why) = test_environs_hidden() else {
+        return false;
+    };
+    assert!(
+        std::env::var_os(TEST_REQUIRE_ENVIRONS_ENV).is_none(),
+        "{test}: {why}, and {TEST_REQUIRE_ENVIRONS_ENV} is set"
+    );
+    eprintln!("skipping {test}: {why}");
+    true
+}
+
 /// A process a recovery scan found ([`leftover`]): its pid and status, and its environment
 /// (`None`: this user's, but it cannot be read).
 type Candidate = (u32, ProcStat, Option<Vec<u8>>);
@@ -2065,6 +2166,11 @@ mod tests {
     /// time where they are not (`ps`: a clock set back puts a survivor below the bound).
     #[test]
     fn leftovers_are_not_ruled_out_by_missing_markers_or_unordered_times() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::leftovers_are_not_ruled_out_by_missing_markers_or_unordered_times",
+        ) {
+            return;
+        }
         let spawn = |marker: Option<&str>| {
             let mut c = std::process::Command::new("sleep");
             c.arg("30");
@@ -2314,6 +2420,11 @@ mod tests {
 
     #[test]
     fn runtime_running_sees_the_recorded_process_and_the_marked_ones() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::runtime_running_sees_the_recorded_process_and_the_marked_ones",
+        ) {
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new("sleep")
             .arg("30")
@@ -2355,6 +2466,11 @@ mod tests {
     /// runtime (both carry the thread's marker; only their generations differ).
     #[test]
     fn reap_marked_with_a_generation_spares_the_threads_other_runtimes() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::reap_marked_with_a_generation_spares_the_threads_other_runtimes",
+        ) {
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let spawn = |gen: &str| {
             std::process::Command::new("sleep")
@@ -2399,6 +2515,11 @@ mod tests {
     /// that run still running.
     #[test]
     fn a_recorded_process_of_another_generation_is_never_signalled() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::a_recorded_process_of_another_generation_is_never_signalled",
+        ) {
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new("sleep")
             .arg("30")
@@ -2433,6 +2554,9 @@ mod tests {
 
     #[test]
     fn reaps_only_the_marked_process() {
+        if skip_if_test_environs_hidden("reap::tests::reaps_only_the_marked_process") {
+            return;
+        }
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         use std::process::{Child, Command};
 
@@ -2590,6 +2714,10 @@ mod tests {
 
     #[test]
     fn reaps_group_members_that_outlive_the_leader() {
+        if skip_if_test_environs_hidden("reap::tests::reaps_group_members_that_outlive_the_leader")
+        {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
 
         // The leader dies on SIGTERM; its child ignores it and must still be killed.
@@ -2733,6 +2861,10 @@ mod tests {
     /// refused.
     #[test]
     fn a_just_spawned_attach_process_is_recognized() {
+        if skip_if_test_environs_hidden("reap::tests::a_just_spawned_attach_process_is_recognized")
+        {
+            return;
+        }
         use std::process::{Command, Stdio};
         let spawn = || {
             Command::new("sh")
@@ -2767,6 +2899,11 @@ mod tests {
     /// `ps` with `--cfg twr_ps`), `None` without it, an error once the process is gone.
     #[test]
     fn the_agent_marker_is_read_from_the_environment() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::the_agent_marker_is_read_from_the_environment",
+        ) {
+            return;
+        }
         use std::process::Command;
         let spawn = |marker: Option<&str>| {
             let mut c = Command::new("sleep");
@@ -2812,6 +2949,9 @@ mod tests {
     /// `--cfg twr_ps`).
     #[test]
     fn the_agent_marker_is_found_on_an_ancestor() {
+        if skip_if_test_environs_hidden("reap::tests::the_agent_marker_is_found_on_an_ancestor") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
         let mut sh = std::process::Command::new("sh")
@@ -2866,6 +3006,9 @@ mod tests {
     /// hidden.
     #[test]
     fn an_exited_process_is_not_an_absent_marker() {
+        if skip_if_test_environs_hidden("reap::tests::an_exited_process_is_not_an_absent_marker") {
+            return;
+        }
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3035,6 +3178,19 @@ mod tests {
         assert!(a.end.is_whole(), "{a:?}");
         let pids: Vec<u32> = a.chain.iter().map(|p| p.pid).collect();
         let found = first_agent_marker(&pids);
+        // On a machine that hides the environments of the system's own programs, a shell of
+        // this user in the chain (`/bin/zsh` under a terminal multiplexer or an editor, not
+        // `login`) hides its environment too.
+        if let ChainMarker::Hidden { pid } = found {
+            let test = format!(
+                "reap::tests::this_processs_own_chain_hides_nothing (pid {pid} of its chain, \
+                 {:?})",
+                process_cmdline(pid).map(|c| String::from_utf8_lossy(&c).into_owned())
+            );
+            if skip_if_test_environs_hidden(&test) {
+                return;
+            }
+        }
         assert!(
             !matches!(found, ChainMarker::Hidden { .. }),
             "{found:?}: {a:?}"

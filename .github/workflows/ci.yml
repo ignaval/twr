@@ -97,6 +97,11 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - run: cargo test --workspace --locked --no-fail-fast
+        env:
+          # The tests that read the environment of the `sleep` and `sh` processes they start
+          # skip where the system hides it (macOS 27 does for its own programs); here they
+          # must run (twr_runner::reap::skip_if_test_environs_hidden).
+          TWR_TEST_REQUIRE_PROCESS_ENV: "1"
 
   ps-backend:
     # macOS reads the process table with `ps` (crates/twr-runner/src/reap/ps.rs). Run the
@@ -106,6 +111,8 @@ jobs:
     timeout-minutes: 30
     env:
       RUSTFLAGS: --cfg twr_ps
+      # As in the test job: the process-environment tests must not skip.
+      TWR_TEST_REQUIRE_PROCESS_ENV: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
