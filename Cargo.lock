@@ -3334,6 +3334,7 @@ dependencies = [
  "tokio",
  "toml",
  "twr-core",
+ "twr-speech",
  "uuid",
 ]
 
