@@ -447,6 +447,8 @@ pub fn error_status(method: &str, error: &str) -> String {
 pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
     match action {
         Action::Quit
+        | Action::Runner { .. }
+        | Action::CancelRunner { .. }
         | Action::Copy { .. }
         | Action::Mouse(_)
         | Action::Workspace { .. }
@@ -2715,6 +2717,7 @@ async fn drive(
         view: result_tx,
         followed: followed_tx.clone(),
     };
+    let private_results = results.view.clone();
     let calls = HubCalls {
         socket: socket.clone(),
         client: Some(calls),
@@ -3099,6 +3102,20 @@ async fn drive(
                     for action in actions {
                         match action {
                             Action::Quit => return Ok(End::Quit),
+                            Action::Runner {..} | Action::CancelRunner{..} => {
+                                let (cancel,session,generation)=match action {Action::CancelRunner{session}=>(true,session,0),Action::Runner{generation}=>(false,None,generation),_=>unreachable!()};
+                                if cancel && session.is_none() {continue;}
+                                let sender=private_results.clone();
+                                ctx.all_callers.push(tokio::spawn(async move {
+                                    let result=async {
+                                        let paths=twr_core::paths::Paths::from_env()?;
+                                        if !cancel {twr_link::bootstrap::start(&paths,&std::env::current_exe()?).await?;}
+                                        twr_link::bootstrap::request(&paths,&if cancel {twr_link::service::Request::CancelPairing{session}}else{twr_link::service::Request::UseAsRunner}).await
+                                    }.await;
+                                    if !cancel {let mut value=result.unwrap_or_else(|e:anyhow::Error|serde_json::json!({"error":format!("{e:#}")}));value["generation"]=generation.into();if let Err(tokio::sync::mpsc::error::SendError((_,value)))=sender.send(("runner.local",value)) {if let (Ok(paths),Some(session))=(twr_core::paths::Paths::from_env(),value["session"].as_str()){let _=twr_link::bootstrap::request(&paths,&twr_link::service::Request::CancelPairing{session:Some(session.into())}).await;}}}
+                                }).abort_handle());
+                                continue;
+                            }
                             Action::Copy { text } => {
                                 copy_text(text, status.clone());
                                 continue;
@@ -3264,7 +3281,13 @@ async fn drive(
                 Some((msg, transient)) = err_rx.recv() => {
                     state.set_status(msg, transient, std::time::Instant::now());
                 }
-                Some((method, result)) = result_rx.recv() => state.apply_result(method, &result),
+                Some((method, result)) = result_rx.recv() => {
+                    if method=="runner.local" && (state.view.runner.is_none() || result["generation"].as_u64()!=Some(state.view.runner_generation)) {
+                        if let Some(session)=result["session"].as_str() {
+                            let session=session.to_string();tokio::spawn(async move {if let Ok(paths)=twr_core::paths::Paths::from_env(){let _=twr_link::bootstrap::request(&paths,&twr_link::service::Request::CancelPairing{session:Some(session)}).await;}});
+                        }
+                    } else {state.apply_result(method,&result);}
+                },
                 Some((method, result)) = followed_rx.recv() => state.apply_result(method, &result),
                 // A transient status is due to clear.
                 _ = sleep_opt(state.status_deadline()) => {

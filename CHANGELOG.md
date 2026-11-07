@@ -6,6 +6,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Added
 
+- Pair Linux and macOS machines as runners with a short-lived code from the CLI, TUI or desktop app. Local hubs start a private independent runner service; linked runners preserve workspace workers, synchronize exact Git commits and build the hub's recorded source when needed. Includes machine-wide runtime admission, idle-session retirement, durable revocation, offline forgetting and committed-result pulls. See [runner-links.md](docs/runner-links.md).
 - Guided remote gateway setup with expiring QR invitations and saved remote hubs on desktop, sharing the mobile gateway client.
 - A grouped Needs you inbox with request filters and keyboard/touch navigation, plus conversation search and exact archived event context.
 - Saved pane sizes, density and independent text/code sizing, with mobile system text scaling.
@@ -17,6 +18,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Changed
 
+- Client protocol 2 requires updated CLI and native clients for resumable capacity retirement. Runner protocol 8 and its spool formats are inherited from the merged client baseline. The tested Rust compiler floor is 1.98.
 - Graphical clients and the TUI share command parsing, card ordering, configuration editing and routine-update handling. Hub RPC pooling, bounded message previews and executable hashing reduce startup allocation and streaming work. See [performance.md](docs/performance.md).
 
 ### Fixed

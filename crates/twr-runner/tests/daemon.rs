@@ -720,6 +720,7 @@ async fn the_relay_starts_the_daemon_and_relays_to_it() {
     let paths = paths(dir.path());
     let _stop = StopOnDrop(paths.socket.clone());
     let opts = RelayOptions {
+        managed: None,
         box_name: BOX.into(),
         hub_key: key.public(),
         replace: true,

@@ -690,6 +690,12 @@ pub const METHODS: &[&str] = &[
     "hub.glance",
     "hub.shutdown",
     "config.show",
+    "runner.manage",
+    "runner.status",
+    "runner.connect",
+    "runner.recover",
+    "runner.revoke",
+    "runner.forget",
     "box.add",
     "box.install",
     "box.restart",
@@ -703,6 +709,7 @@ pub const METHODS: &[&str] = &[
     "account.add",
     "account.remove",
     "account.status",
+    "thread.pull",
     "thread.new",
     "thread.spawn",
     "thread.spawn_status",
@@ -1252,13 +1259,15 @@ async fn connection(
                     break;
                 }
             }
-            "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
-            | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
-            | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
-            | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
-            | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
-            | "box.projects" | "box.token" | "account.status" | "account.remove"
-            | "thread.set_model" | "speech.request" | "speech.control" => {
+            "thread.pull" | "thread.new" | "thread.park" | "thread.resume" | "thread.delete"
+            | "thread.trim" | "usage.threads" | "context.read" | "context.set"
+            | "orchestrator.use" | "orchestrator.reset" | "trash.list" | "trash.empty"
+            | "trash.restore" | "log.compact" | "log.stats" | "project.files" | "project.read"
+            | "project.search" | "memory.list" | "memory.read" | "box.add" | "box.install"
+            | "box.restart" | "runner.manage" | "runner.status" | "runner.connect"
+            | "runner.recover" | "runner.revoke" | "runner.forget" | "box.projects"
+            | "box.token" | "account.status" | "account.remove" | "thread.set_model"
+            | "speech.request" | "speech.control" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -2251,10 +2260,19 @@ async fn call_async(
     received: Option<&crate::hub::OrchCall>,
 ) -> Result<Value, RpcError> {
     match method {
-        // Committed files of a project on the hub's box (`hub::project_read`).
+        "runner.manage" => hub.runner_control(method, p, caller).await,
+        "runner.status" => hub.runner_control(method, p, caller).await,
+        "runner.connect" => hub.runner_control(method, p, caller).await,
+        "runner.recover" => hub.runner_control(method, p, caller).await,
+        "runner.revoke" => hub.runner_control(method, p, caller).await,
+        "runner.forget" => hub.runner_control(method, p, caller).await,
         "project.files" => hub.project_read(ReadTool::Files, params(p)?, caller).await,
         "project.read" => hub.project_read(ReadTool::Read, params(p)?, caller).await,
         "project.search" => hub.project_read(ReadTool::Search, params(p)?, caller).await,
+        "thread.pull" => {
+            let p: ThreadRef = params(p)?;
+            hub.thread_pull(&p.thread, caller).await
+        }
         "thread.new" => {
             let p: NewThread = params(p)?;
             hub.new_thread_bound(p, caller, received).await

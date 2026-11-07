@@ -10,6 +10,7 @@ description = "twr hub daemon: event store, control stream, socket API and adapt
 
 [dependencies]
 twr-core.workspace = true
+twr-link.workspace = true
 twr-adapters.workspace = true
 twr-decisions.workspace = true
 twr-mcp.workspace = true

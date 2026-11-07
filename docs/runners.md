@@ -1,6 +1,6 @@
 # Runners: threads on other machines
 
-A box other than `local` is another machine, or a container, that runs threads for the hub. Adapters, git worktrees and snapshots all happen on the box. There are three kinds. A box the hub can reach over SSH needs one command and nothing else on your side: no token, listener, tunnel or service. A container box is the same, with `docker exec` (or podman, or `kubectl exec`) in place of ssh ([Container boxes](#container-boxes)). A box the hub can't reach either way, a dial-in box, runs `twr runner`, which connects out to the hub ([Dial-in boxes](#dial-in-boxes)).
+A box other than `local` is another machine, or a container, that runs threads for the hub. Adapters, git worktrees and snapshots all happen on the box. There are four kinds. [Linked runners](runner-links.md) pair with a short private code, work across supported platforms and receive projects from the hub. A box the hub can reach over SSH needs one command and nothing else on your side: no token, listener, tunnel or service. A container box is the same, with `docker exec` (or podman, or `kubectl exec`) in place of ssh ([Container boxes](#container-boxes)). A box the hub can't reach either way, a dial-in box, runs `twr runner`, which connects out to the hub ([Dial-in boxes](#dial-in-boxes)).
 
 ## SSH boxes
 

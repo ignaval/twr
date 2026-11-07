@@ -27,6 +27,7 @@ pub mod client;
 pub mod daemon;
 pub mod lbox;
 pub mod local;
+pub mod managed;
 pub mod reap;
 pub mod relay;
 pub mod repos;

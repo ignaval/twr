@@ -243,7 +243,7 @@ impl Hub {
     /// removed again.
     pub async fn new_thread_bound(
         &self,
-        req: NewThread,
+        mut req: NewThread,
         caller: &Caller,
         bound: Option<&OrchCall>,
     ) -> Result<Value, RpcError> {
@@ -265,6 +265,7 @@ impl Hub {
         )?;
         // Held until the thread is recorded (or refused): its box is not switched meanwhile.
         let (box_name, host, remote, mut op) = self.thread_box(&req)?;
+        self.linked_prepare_project(&mut req).await?;
         let found = self.find_project(&req, remote).await?;
         let target = self.thread_project(&req, &box_name, remote, found.as_deref())?;
         // A twr-managed worktree unless asked otherwise: `no_worktree`, or the project's
@@ -1161,7 +1162,7 @@ struct ThreadProject {
 }
 
 /// The box of a new thread: `box`, else the project's `box`, else `local`.
-fn thread_box_name(req: &NewThread, cfg: &Config) -> String {
+pub(super) fn thread_box_name(req: &NewThread, cfg: &Config) -> String {
     req.box_name
         .clone()
         .or_else(|| {

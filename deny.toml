@@ -40,14 +40,14 @@ deny = [
     # TLS is rustls (with ring); nothing links OpenSSL.
     { crate = "openssl", reason = "TLS is rustls only" },
     { crate = "openssl-sys", reason = "TLS is rustls only" },
-    # HTTP ends at the CLI updater or the application gateway (its listener and opt-in
-    # APNs/FCM delivery). The hub, runner and core still cannot add an HTTP dependency.
-    { crate = "reqwest", wrappers = ["twr-cli", "twr-app"], reason = "HTTP clients in the updater and application gateway only" },
+    # HTTP is owned by the updater, application gateway and linked-runner discovery.
+    # Core and worker executors cannot introduce direct HTTP clients.
+    { crate = "reqwest", wrappers = ["twr-cli", "twr-app", "iroh", "iroh-relay", "n0-dns-resolver", "pkarr"], reason = "HTTP clients in updater, app gateway and link discovery only" },
     { crate = "axum", wrappers = ["twr-app"], reason = "HTTP listener in the application gateway only" },
     { crate = "axum-server", wrappers = ["twr-app"], reason = "TLS listener in the application gateway only" },
     { crate = "hyper-rustls", wrappers = ["reqwest"], reason = "HTTP TLS through reqwest only" },
-    { crate = "hyper-util", wrappers = ["hyper-rustls", "reqwest", "axum", "axum-server"], reason = "HTTP in the updater and application gateway only" },
-    { crate = "hyper", wrappers = ["hyper-rustls", "hyper-util", "reqwest", "axum", "axum-server"], reason = "HTTP in the updater and application gateway only" },
+    { crate = "hyper-util", wrappers = ["hyper-rustls", "reqwest", "axum", "axum-server", "iroh-relay"], reason = "HTTP in the updater and application gateway only" },
+    { crate = "hyper", wrappers = ["hyper-rustls", "hyper-util", "reqwest", "axum", "axum-server", "iroh-relay"], reason = "HTTP in the updater and application gateway only" },
 ]
 
 [sources]

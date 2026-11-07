@@ -119,6 +119,7 @@ mod box_agents;
 mod box_switch;
 mod boxes;
 mod checkpoint;
+mod linked;
 pub use checkpoint::{build_key as checkpoint_build, prewarm as prewarm_checkpoint, Prewarm};
 mod closing;
 mod coalesce;
@@ -462,6 +463,8 @@ pub struct HubOptions {
     /// no upload, no relay; [`crate::ssh_box::BoxDialer`]). Never set outside tests.
     #[doc(hidden)]
     pub box_dialer: Option<crate::ssh_box::BoxDialer>,
+    /// Immutable copy of the executable this hub runs, for linked-worker provisioning.
+    pub link_program: Option<PathBuf>,
     /// Test hook: awaited with the box's name by `box.add` and `box.projects` once they have
     /// read the config files, before they compare and apply what they read (a slow read).
     /// Never set outside tests.
@@ -571,6 +574,7 @@ impl HubOptions {
             reap_job_group_hook: None,
             job_members_hook: None,
             box_dialer: None,
+            link_program: None,
             box_files_read_hook: None,
             pins_lookup_hook: None,
             socket_removed_hook: None,
@@ -800,6 +804,7 @@ struct Inner {
     box_switch: crate::ssh_box::SwitchTiming,
     /// [`HubOptions::box_dialer`].
     box_dialer: Option<crate::ssh_box::BoxDialer>,
+    link_program: Option<PathBuf>,
     /// The hub's own box's agent CLIs ([`HubOptions::agent_probe`], `hub::box_agents`).
     local_agents: Arc<box_agents::LocalAgents>,
     /// [`HubOptions::agents_poll`].

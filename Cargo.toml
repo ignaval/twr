@@ -11,6 +11,8 @@ repository = "https://github.com/ignaval/twr"
 
 [workspace.dependencies]
 twr-core = { path = "crates/twr-core" }
+twr-link = { path = "crates/twr-link" }
+twr-source = { path = "crates/twr-source" }
 twr-adapters = { path = "crates/twr-adapters" }
 twr-decisions = { path = "crates/twr-decisions" }
 twr-runner = { path = "crates/twr-runner" }
@@ -80,3 +82,8 @@ debug = "line-tables-only"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Temporary API-compatible re-export until iroh adopts netwatch 0.20.
+# This keeps the maintained netlink backend without ignoring RustSec advisories.
+[patch.crates-io]
+netwatch = { path = "compat/netwatch" }

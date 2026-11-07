@@ -135,7 +135,7 @@ On a phone (below 60 columns, or `/compact on`) it shows one screen at a time: t
 
 ## How it works
 
-Everything is an event in an append-only SQLite log. Thread state, the attention stack and reports are reducers over that log. Adapters drive each agent CLI through its headless JSON mode and turn its output into one small event schema. The orchestrator is another thread that works through the hub's tools over MCP. It can relay an answer you typed, but it can't decide one. Threads on other machines run under a box daemon the hub reaches over SSH (`twr box add`), or under `twr runner`, which connects out to the hub over WebSocket.
+Everything is an event in an append-only SQLite log. Thread state, the attention stack and reports are reducers over that log. Adapters drive each agent CLI through its headless JSON mode and turn its output into one small event schema. The orchestrator is another thread that works through the hub's tools over MCP. It can relay an answer you typed, but it can't decide one. [Paired runners](docs/runner-links.md) work on Linux and macOS: run `twr runner up` on the runner and `twr box pair <name>` on the hub. Starting a hub also starts the dormant runner service. Threads on other machines run under a box daemon the hub reaches over SSH (`twr box add`), or under `twr runner`, which connects out to the hub over WebSocket.
 
 ```mermaid
 flowchart LR
