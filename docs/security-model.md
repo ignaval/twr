@@ -69,7 +69,7 @@ push payloads contain routing metadata rather than prompts or request text. Uplo
 size- and SHA-256-checked, avoid symlinks and commit atomically into private upload folders
 in local worktrees. Pending mutation receipts prevent duplicate execution across socket
 reconnects within their retention period. See [mobile.md](mobile.md) for limits, scopes,
-revocation, gateway lifecycle and the unsupported remote-box upload case.
+revocation and gateway lifecycle. Remote-box attachments use the authenticated runner upload operation with the same pinned-directory and checksum checks; see [thread attachments](attachments.md).
 
 ## The orchestrator
 

@@ -1,3 +1,4 @@
+import { MessageReceipts } from "./message-receipts";
 import {
   app,
   BrowserWindow,
@@ -27,6 +28,11 @@ import { randomUUID, createHash } from "node:crypto";
 import * as pty from "node-pty";
 import { z } from "zod";
 import { Bridge } from "./bridge";
+import { SecureStore } from "./secure-store";
+import { DesktopTransport } from "./remote-transport";
+import { GatewaySetup } from "./gateway-setup";
+import { coalesceInboxSources, localInboxSources } from "./inbox";
+import { localUploadRequest } from "./upload-request";
 import {
   cliArgs,
   nonInteractiveArgs,
@@ -41,6 +47,16 @@ import { discoverCatalog } from "./catalog";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
+// Omarchy uses GNOME's secret service under Hyprland, which Chromium does not
+// recognize as a keyring desktop. Respect an explicit user-selected backend.
+if (
+  process.platform === "linux" &&
+  !app.commandLine.hasSwitch("password-store") &&
+  existsSync(
+    join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "omarchy"),
+  )
+)
+  app.commandLine.appendSwitch("password-store", "gnome-libsecret");
 if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
   app.commandLine.removeSwitch("remote-debugging-port");
   app.commandLine.removeSwitch("remote-debugging-pipe");
@@ -55,8 +71,10 @@ let quitRequested = false;
 let connectTail: Promise<any> = Promise.resolve();
 let loginEnv: NodeJS.ProcessEnv = { ...process.env };
 let workspaceReady = false;
+let localGeneration = 0;
 const exec = promisify(execFile);
 let openingTerminals = 0;
+let remoteTransport: DesktopTransport;
 const terminals = new Map<
   string,
   {
@@ -300,11 +318,16 @@ async function cli(args: unknown) {
 }
 async function connect(name: unknown) {
   const next = workspaceSchema.parse(name);
-  const task = connectTail.then(() => connectWorkspace(next));
+  const generation = localGeneration;
+  const task = connectTail.then(() => {
+    if (generation !== localGeneration)
+      throw new Error("This hub connection was closed");
+    return connectWorkspace(next, generation);
+  });
   connectTail = task.catch(() => {});
   return task;
 }
-async function connectWorkspace(next: string) {
+async function connectWorkspace(next: string, generation: number) {
   workspaceReady = false;
   emit({ type: "connection", connected: false });
   const previous = bridge;
@@ -323,6 +346,10 @@ async function connectWorkspace(next: string) {
     const hubInfo = await current.call("desktop.ensure_hub", {
       binary: binaries.twr,
     });
+    if (generation !== localGeneration || bridge !== current) {
+      current.close();
+      throw new Error("This hub connection was closed");
+    }
     workspace = next;
     workspaceReady = true;
     emit({ type: "connection", connected: true });
@@ -363,6 +390,124 @@ function omarchyTheme(): Record<string, string> | null {
   }
 }
 function register() {
+  const vault = new SecureStore(
+    join(app.getPath("userData"), "secure", "connections"),
+  );
+  const offlineVault = new SecureStore(
+    join(app.getPath("userData"), "secure", "offline"),
+  );
+  remoteTransport = new DesktopTransport(
+    vault,
+    (message) => {
+      if (window && !window.isDestroyed())
+        window.webContents.send("twr:remote-message", { message });
+    },
+    !app.isPackaged,
+  );
+  const gateway = new GatewaySetup(
+    binaries.gateway,
+    env,
+    join(app.getPath("userData"), "gateway.log"),
+    (url, timeout) => remoteTransport.check(url, timeout),
+    (settings) => saveDesktopSettings({ gateway: settings }),
+    desktopSettings.gateway,
+  );
+  const messageReceipts = new MessageReceipts(
+    new SecureStore(join(app.getPath("userData"), "secure", "receipts")),
+  );
+  handle("send-message", (input) => {
+    const message = z
+      .object({
+        id: z.uuid(),
+        workspace: z.string().min(1).max(100),
+        method: z.enum(["say", "thread.send"]),
+        params: z.record(z.string(), z.unknown()),
+        createdAt: z.number().finite(),
+      })
+      .parse(input);
+    if (!workspaceReady || message.workspace !== workspace)
+      throw new Error(
+        "Connect to this message’s workspace before delivering it",
+      );
+    if (JSON.stringify(message.params).length > 2 * 1024 * 1024)
+      throw new Error("Message exceeds 2 MiB");
+    const currentBridge = companion();
+    return messageReceipts.send(message, () =>
+      currentBridge.call(message.method, message.params),
+    );
+  });
+  handle("secure-read", (key) =>
+    offlineVault.read(z.string().max(512).parse(key)),
+  );
+  handle("secure-write", (key, value) =>
+    offlineVault.write(
+      z.string().max(512).parse(key),
+      z
+        .string()
+        .max(8 * 1024 * 1024)
+        .parse(value),
+    ),
+  );
+  handle("secure-delete", (key) =>
+    offlineVault.delete(z.string().max(512).parse(key)),
+  );
+  handle(
+    "inbox-sources",
+    coalesceInboxSources(async () => {
+      const started = Date.now();
+      const { stdout } = await exec(binaries.twr, ["ws", "list", "--json"], {
+        env: env(),
+        timeout: 1000,
+        maxBuffer: 1024 * 1024,
+      });
+      const listing = JSON.parse(stdout);
+      return localInboxSources(
+        Array.isArray(listing) ? listing : listing.workspaces,
+        (name) =>
+          new Bridge(
+            binaries.bridge,
+            name,
+            { ...env(), TWR_BRIDGE_READ_ONLY: "1" },
+            () => {},
+          ),
+        Math.max(0, 4000 - (Date.now() - started)),
+      );
+    }),
+  );
+  handle("remote-list", () => remoteTransport.listHubs());
+  handle("remote-pair", (request) => remoteTransport.pair(request));
+  handle("remote-connect", (request) => remoteTransport.connect(request));
+  handle("remote-send", (request) => remoteTransport.send(request));
+  handle("remote-disconnect", () => remoteTransport.disconnect());
+  handle("remote-remove", (request) => remoteTransport.removeHub(request));
+  handle("remote-reset", () => remoteTransport.resetSavedHubs());
+  handle("gateway-status", () => gateway.status());
+  handle("gateway-cancel-invitation", () => gateway.cancelInvitation());
+  handle("gateway-stop", () => gateway.stop());
+  handle("gateway-settings", () => gateway.saved());
+  handle("gateway-check", (request) => remoteTransport.check(request.url));
+  handle("gateway-setup", (request) => gateway.setup(request));
+  handle("gateway-restart", (request) => gateway.restart(request));
+  handle("gateway-invite", (request) => gateway.invite(request));
+  handle("deactivate-local", async () => {
+    ++localGeneration;
+    workspaceReady = false;
+    void bridge?.call("notify.looking", { looking: false }).catch(() => {});
+    bridge?.close();
+    bridge = undefined;
+    // Native PTYs remain owned by the app and are restored on returning locally.
+    // Switching a hub never discards a running shell, editor, or build.
+    for (const session of terminals.values()) {
+      session.outstanding = 0;
+      if (!session.exited) {
+        try {
+          session.process.resume();
+        } catch {
+          /* Exit notification may still be queued. */
+        }
+      }
+    }
+  });
   handle("set-appearance", (value) => {
     const next = appearanceSchema.parse(value);
     appearance = next;
@@ -409,6 +554,7 @@ function register() {
   );
   handle("bootstrap", () => ({
     workspace,
+    hostId: "local",
     platform: process.platform,
     home: homedir(),
     version: app.getVersion(),
@@ -421,6 +567,14 @@ function register() {
     })),
   }));
   handle("connect", connect);
+  handle(
+    "upload-request",
+    localUploadRequest(() => ({
+      workspace,
+      ready: workspaceReady,
+      bridge: companion(),
+    })),
+  );
   handle("rpc", (method, params) => {
     z.string().max(100).parse(method);
     if (method === "desktop.check_updates") return checkUpdates();
@@ -564,6 +718,10 @@ function register() {
         const data = session.pending;
         session.pending = "";
         session.sequence++;
+        if (!workspaceReady) {
+          session.outstanding = 0;
+          return;
+        }
         session.outstanding += data.length;
         emit({ type: "terminal-data", id, data, sequence: session.sequence });
         if (session.outstanding > 512 * 1024) session.process.pause();
@@ -717,6 +875,15 @@ async function createWindow() {
     },
   });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  window.webContents.on(
+    "did-start-navigation",
+    (_event, _url, _inPlace, mainFrame) => {
+      if (mainFrame) void remoteTransport?.disconnect();
+    },
+  );
+  window.webContents.on("render-process-gone", () => {
+    void remoteTransport?.disconnect();
+  });
   window.webContents.on("will-navigate", (event, url) => {
     if (url !== (devUrl || pathToFileURL(appFile).href)) event.preventDefault();
   });
@@ -741,10 +908,12 @@ async function createWindow() {
     }
   });
   window.on("focus", () => {
-    void bridge?.call("notify.looking", { looking: true }).catch(() => {});
+    if (workspaceReady)
+      void bridge?.call("notify.looking", { looking: true }).catch(() => {});
   });
   window.on("blur", () => {
-    void bridge?.call("notify.looking", { looking: false }).catch(() => {});
+    if (workspaceReady)
+      void bridge?.call("notify.looking", { looking: false }).catch(() => {});
   });
   window.on("close", async (event) => {
     if (!quitting && [...terminals.values()].some((t) => !t.exited)) {
@@ -766,6 +935,9 @@ async function createWindow() {
     }
   });
   window.on("closed", () => {
+    ++localGeneration;
+    workspaceReady = false;
+    void remoteTransport.disconnect();
     bridge?.close();
     bridge = undefined;
     for (const session of terminals.values())

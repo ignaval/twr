@@ -1320,15 +1320,31 @@ impl RemoteBox {
         kind: Kind,
         on: Option<u64>,
     ) -> Result<(String, oneshot::Receiver<Result<Value, CmdError>>), CmdError> {
+        let upload_begin = matches!(
+            &op,
+            Op::Upload {
+                request: twr_core::upload::Request {
+                    action: twr_core::upload::Action::Begin { .. },
+                    ..
+                },
+                ..
+            }
+        );
+        let rejected = |mut error: CmdError| {
+            if upload_begin {
+                error.code = cmd_errors::UPLOAD_REJECTED.into();
+            }
+            error
+        };
         let mut st = self.state();
         if kind == Kind::Request && !st.ready {
-            return Err(offline(&self.inner.name));
+            return Err(rejected(offline(&self.inner.name)));
         }
         // A runner of an older protocol gets drain-safe commands only, requests and session
         // commands alike (see the module docs, "Connections").
         if let Some(p) = st.conn.as_ref().and_then(|c| c.legacy) {
             if !op.drain_safe() {
-                return Err(not_drain_safe(&self.inner.name, p, &op));
+                return Err(rejected(not_drain_safe(&self.inner.name, p, &op)));
             }
         }
         if on.is_some_and(|e| !st.conn.as_ref().is_some_and(|c| c.epoch == e)) {
@@ -1766,6 +1782,26 @@ impl Drop for PendingGuard {
 }
 
 impl ThreadHost for RemoteBox {
+    fn upload(
+        &self,
+        scope: String,
+        thread: String,
+        root: PathBuf,
+        registered_repository: bool,
+        request: twr_core::upload::Request,
+    ) -> BoxFuture<'static, anyhow::Result<Value>> {
+        let rbox = self.clone();
+        async move {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), rbox.call(Op::Upload { scope, thread, root, registered_repository, request }, Kind::Request)).await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) if error.code == twr_core::runner::cmd_errors::UPLOAD_REJECTED => Err(anyhow::Error::new(twr_core::upload::Rejected(error.into()))),
+                Ok(Err(error)) if error.code == twr_core::runner::cmd_errors::UPLOAD_FAILED => Err(anyhow::Error::new(twr_core::upload::Failed(error.into()))),
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => anyhow::bail!("Upload runner did not answer within 10 seconds; its outcome is unknown. Check upload status before retrying."),
+            }
+        }.boxed()
+    }
+
     fn has_runtime(&self, runtime: &str) -> bool {
         self.state()
             .info
@@ -2337,6 +2373,29 @@ mod tests {
     /// id and run; nothing recorded is left behind (seed 1134 of the runner fuzz: the second
     /// answer's id replaced the first's, the first answer went out under it, and the first's
     /// record stayed in `remote_outbox` unsent).
+    #[tokio::test]
+    async fn offline_upload_begin_is_a_definite_rejection_before_queueing() {
+        let remote = RemoteBox::new("gpu", Secret::new("token"), None);
+        let error = remote
+            .upload(
+                "device:phone".into(),
+                "thread".into(),
+                PathBuf::from("/remote/thread"),
+                false,
+                twr_core::upload::Request {
+                    id: "file".into(),
+                    sha256: "a".repeat(64),
+                    action: twr_core::upload::Action::Begin {
+                        name: "file.txt".into(),
+                        size: 0,
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<twr_core::upload::Rejected>().is_some());
+        assert!(remote.state().pending.is_empty());
+    }
     #[test]
     fn answers_to_a_reused_attention_id_keep_their_own_ids() {
         let b = RemoteBox::new("gpu", Secret::new("t"), None);

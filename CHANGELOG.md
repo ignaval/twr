@@ -6,6 +6,12 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Added
 
+- Guided remote gateway setup with expiring QR invitations and saved remote hubs on desktop, sharing the mobile gateway client.
+- A grouped Needs you inbox with request filters and keyboard/touch navigation, plus conversation search and exact archived event context.
+- Saved pane sizes, density and independent text/code sizing, with mobile system text scaling.
+- File previews, progress, cancellation and verified resume for local and remote-box uploads; runner protocol 8.
+- Device-encrypted recent history, persistent message drafts and a receipt-backed outbox that preserves message IDs across restarts and keeps uncertain deliveries for review.
+
 - Desktop hub clients for Apple Silicon macOS and x86_64 Linux, with embedded terminals, generated CLI forms, shared thread and attention views, and Dark, Light and System appearance. Linux packages include AppImage, Debian and Arch/Omarchy builds. See [desktop.md](docs/desktop.md).
 - iOS and Android hub clients using the same interface, with responsive folding layouts, paired remote hubs, native credential storage, file uploads and optional APNs/FCM push delivery. The separate gateway enforces device scopes and revocation; notifications open requests without answering them. See [mobile.md](docs/mobile.md).
 

@@ -2886,3 +2886,246 @@ async fn non_session_ops_are_bounded() {
     assert!(max <= twr_runner::lbox::MAX_CONCURRENT_OPS, "{counts:?}");
     assert!(max >= 2, "ops should still run concurrently: {counts:?}");
 }
+
+/// Attachments use the mutually authenticated runner connection, retain their staged offset
+/// across a connection interruption, and become visible only after checksum verification.
+#[tokio::test]
+async fn remote_attachments_resume_and_commit_over_authenticated_runner_protocol() {
+    use sha2::{Digest, Sha256};
+    use twr_core::upload::{Action, Request};
+    let dir = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let hub = FakeHub::start().await;
+    let lbox = open_box(&dir.path().join("runner"));
+    let runner = start(opts(&hub, dir.path()), lbox);
+    hub.wait("authenticated and synced", |s| s.synced == 1)
+        .await;
+    let root = dir.path().join("remote-thread");
+    std::fs::create_dir(&root).unwrap();
+    let checksum = Sha256::digest(b"hello")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let upload = |action| Op::Upload {
+        scope: "device:phone".into(),
+        thread: "t1".into(),
+        root: root.clone(),
+        registered_repository: false,
+        request: Request {
+            id: "remote-file".into(),
+            sha256: checksum.clone(),
+            action,
+        },
+    };
+    hub.cmd(
+        "upload-begin",
+        upload(Action::Begin {
+            name: "hello.txt".into(),
+            size: 5,
+        }),
+    );
+    hub.wait("upload begin", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-begin")
+    })
+    .await;
+    assert!(
+        hub.state()
+            .results
+            .iter()
+            .find(|r| r.cmd_id == "upload-begin")
+            .unwrap()
+            .ok
+    );
+    hub.cmd(
+        "upload-first",
+        upload(Action::Chunk {
+            offset: 0,
+            data: twr_core::b64::encode(b"he"),
+        }),
+    );
+    hub.wait("first chunk", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-first")
+    })
+    .await;
+    *hub.conn.lock().unwrap() = None;
+    hub.wait("reconnected upload session", |s| s.synced == 2)
+        .await;
+    hub.cmd("upload-status", upload(Action::Status));
+    hub.wait("resume status", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-status")
+    })
+    .await;
+    let status = hub
+        .state()
+        .results
+        .iter()
+        .find(|r| r.cmd_id == "upload-status")
+        .unwrap()
+        .clone()
+        .into_outcome()
+        .unwrap();
+    assert_eq!(status["received"], 2);
+    assert_eq!(
+        status["prefix_sha256"],
+        Sha256::digest(b"he")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    assert!(status["path"].is_null());
+    hub.cmd(
+        "upload-last",
+        upload(Action::Chunk {
+            offset: 2,
+            data: twr_core::b64::encode(b"llo"),
+        }),
+    );
+    hub.wait("last chunk", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-last")
+    })
+    .await;
+    hub.cmd("upload-commit", upload(Action::Commit));
+    hub.wait("atomic commit", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-commit")
+    })
+    .await;
+    let result = hub
+        .state()
+        .results
+        .iter()
+        .find(|r| r.cmd_id == "upload-commit")
+        .unwrap()
+        .clone()
+        .into_outcome()
+        .unwrap();
+    let path = Path::new(result["path"].as_str().unwrap());
+    assert!(path.starts_with(root.join(".twr-uploads")));
+    assert_eq!(std::fs::read(path).unwrap(), b"hello");
+    runner.shutdown().await;
+}
+
+#[tokio::test]
+async fn explicit_worktree_removal_discards_thread_attachments_by_default() {
+    use twr_core::upload::{Action, Request};
+    let directory =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let lbox = open_box(&directory.path().join("runner"));
+    let repo = twr_core::testkit::git::init_repo(&directory.path().join("repo"));
+    let root = lbox.worktrees().join("repo/t1");
+    lbox.execute(Op::WorktreeCreate {
+        repo: repo.clone(),
+        path: root.clone(),
+        branch: "twr/t1".into(),
+        base: None,
+    })
+    .await
+    .unwrap();
+    let upload = |action| Op::Upload {
+        scope: "uid:owner".into(),
+        thread: "t1".into(),
+        root: root.clone(),
+        registered_repository: false,
+        request: Request {
+            id: "cleanup".into(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            action,
+        },
+    };
+    lbox.execute(upload(Action::Begin {
+        name: "file.txt".into(),
+        size: 0,
+    }))
+    .await
+    .unwrap();
+    let result = lbox.execute(upload(Action::Commit)).await.unwrap();
+    assert!(Path::new(result["path"].as_str().unwrap()).exists());
+    let removed = lbox
+        .execute(Op::WorktreeRemove {
+            repo,
+            path: root.clone(),
+            branch: Some("twr/t1".into()),
+            disposable: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed["outcome"], "removed");
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn uploading_25_mib_preserves_ordinary_command_receipts_and_replays_chunks() {
+    use sha2::{Digest, Sha256};
+    use twr_core::upload::{Action, Request, MAX_CHUNK};
+    let directory =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let lbox = open_box(&directory.path().join("runner"));
+    let root = directory.path().join("thread");
+    std::fs::create_dir(&root).unwrap();
+    assert!(
+        lbox.handle_cmd(
+            "ordinary-receipt",
+            Op::WorktreeExists {
+                path: directory.path().join("missing")
+            }
+        )
+        .await
+        .ok
+    );
+    let initial = lbox.spool().cmd_results_len().unwrap();
+    let bytes = vec![42u8; MAX_CHUNK];
+    let mut hash = Sha256::new();
+    for _ in 0..400 {
+        hash.update(&bytes);
+    }
+    let checksum = hash
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let upload = |action| Op::Upload {
+        scope: "owner".into(),
+        thread: "thread".into(),
+        root: root.clone(),
+        registered_repository: false,
+        request: Request {
+            id: "large".into(),
+            sha256: checksum.clone(),
+            action,
+        },
+    };
+    assert!(
+        lbox.handle_cmd(
+            "upload-begin",
+            upload(Action::Begin {
+                name: "file.bin".into(),
+                size: 400 * MAX_CHUNK
+            })
+        )
+        .await
+        .ok
+    );
+    let data = twr_core::b64::encode(&bytes);
+    for index in 0..400 {
+        let id = format!("chunk-{index}");
+        let request = upload(Action::Chunk {
+            offset: index * MAX_CHUNK,
+            data: data.clone(),
+        });
+        assert!(lbox.handle_cmd(&id, request.clone()).await.ok);
+        if index == 0 {
+            assert!(lbox.handle_cmd(&id, request).await.ok);
+        }
+    }
+    let status = lbox
+        .handle_cmd("status", upload(Action::Status))
+        .await
+        .into_outcome()
+        .unwrap();
+    assert_eq!(status["received"], 400 * MAX_CHUNK);
+    assert!(lbox.handle_cmd("commit", upload(Action::Commit)).await.ok);
+    assert_eq!(lbox.spool().cmd_results_len().unwrap(), initial);
+    assert!(lbox
+        .spool()
+        .cmd_result("ordinary-receipt")
+        .unwrap()
+        .is_some());
+}

@@ -1,6 +1,12 @@
 package tools.twr.mobile.dev;
 
 import android.content.Context;
+import androidx.activity.result.ActivityResult;
+import com.getcapacitor.annotation.ActivityCallback;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
+import com.google.zxing.integration.android.IntentIntegrator;
+import com.google.zxing.integration.android.IntentResult;
 import android.content.SharedPreferences;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
@@ -18,7 +24,7 @@ import okhttp3.*;
 import org.json.*;
 
 /** Tokens stay in Android Keystore protected storage and never cross the JS bridge. */
-@CapacitorPlugin(name="TwrTransport")
+@CapacitorPlugin(name="TwrTransport", permissions={@Permission(alias="camera",strings={android.Manifest.permission.CAMERA})})
 public class TwrTransportPlugin extends Plugin {
     private static final String KEY="tools.twr.mobile.credentials";
     // Application heartbeats/watchdog observe frame progress; OkHttp's fixed
@@ -57,6 +63,33 @@ public class TwrTransportPlugin extends Plugin {
     private JSObject metadata(String id,JSONObject hub) throws JSONException {
         JSObject data=new JSObject();data.put("id",id);data.put("name",hub.optString("name"));data.put("url",hub.optString("url"));data.put("scopes",hub.optJSONArray("scopes"));data.put("gateway_id",hub.optString("gateway_id"));return data;
     }
+    private final java.util.concurrent.atomic.AtomicBoolean scanning=new java.util.concurrent.atomic.AtomicBoolean();
+    @PluginMethod public void scanInvitation(PluginCall call) {
+        if(!scanning.compareAndSet(false,true)){call.reject("The QR scanner is already open","SCAN_BUSY");return;}
+        if(!getContext().getPackageManager().hasSystemFeature(android.content.pm.PackageManager.FEATURE_CAMERA_ANY)){scanning.set(false);call.reject("This device has no available camera. Enter the address and code manually.","CAMERA_UNAVAILABLE");return;}
+        if(getPermissionState("camera")!=PermissionState.GRANTED){requestPermissionForAlias("camera",call,"cameraPermission");return;}
+        launchScanner(call);
+    }
+    @PermissionCallback private void cameraPermission(PluginCall call) {
+        if(getPermissionState("camera")!=PermissionState.GRANTED){scanning.set(false);call.reject("Camera permission was denied. Allow it in Settings or enter the address and code manually.","CAMERA_PERMISSION_DENIED");return;}
+        launchScanner(call);
+    }
+    private void launchScanner(PluginCall call) {
+        getActivity().runOnUiThread(()->{
+            try {
+                android.content.Intent intent=new IntentIntegrator(getActivity()).setDesiredBarcodeFormats(IntentIntegrator.QR_CODE).setPrompt("Scan the one-use invitation from twr on your computer").setBeepEnabled(false).setOrientationLocked(false).createScanIntent();
+                startActivityForResult(call,intent,"invitationScanned");
+            } catch(Exception error) { scanning.set(false);call.reject("Could not open the camera. Enter the address and code manually.","CAMERA_UNAVAILABLE",error); }
+        });
+    }
+    @ActivityCallback private void invitationScanned(PluginCall call, ActivityResult result) {
+        scanning.set(false);if(call==null)return;
+        IntentResult scanned=IntentIntegrator.parseActivityResult(IntentIntegrator.REQUEST_CODE,result.getResultCode(),result.getData());
+        if(scanned==null||scanned.getContents()==null){call.reject("QR scan cancelled","SCAN_CANCELLED");return;}
+        String text=scanned.getContents();
+        if(text.length()>2048){call.reject("Scan a twr pairing invitation");return;}
+        call.resolve(new JSObject().put("invitation",text));
+    }
     @PluginMethod public void listHubs(PluginCall call){try{JSONObject data=vault();JSArray hubs=new JSArray();java.util.Iterator<String> keys=data.keys();while(keys.hasNext()){String id=keys.next();hubs.put(metadata(id,data.getJSONObject(id)));}JSObject value=new JSObject();value.put("hubs",hubs);call.resolve(value);}catch(Exception e){call.reject("Could not read paired hubs",e);}}
     @PluginMethod public void pair(PluginCall call){worker.execute(()->{try{
         String url=endpoint(call.getString("url",""));JSONObject body=new JSONObject();body.put("code",call.getString("code",""));body.put("name",call.getString("name",""));
@@ -93,8 +126,9 @@ public class TwrTransportPlugin extends Plugin {
             @Override public void onOpen(WebSocket ws,Response response){}
             @Override public void onMessage(WebSocket ws,String text){if(generation!=connectionGeneration.get())return;try{if(text.length()>16*1024*1024)throw new Exception("Hub response too large");JSObject message=new JSObject(text);if("authenticated".equals(message.optString("type"))){authenticated=true;call.resolve();}JSObject value=new JSObject();value.put("message",message);notifyListeners("message",value);}catch(Exception e){ws.cancel();}}
             @Override public void onClosed(WebSocket ws,int code,String reason){if(!authenticated)call.reject("Hub authentication failed");closed(ws);}
-            @Override public void onFailure(WebSocket ws,Throwable error,Response response){if(!authenticated)call.reject("Could not connect to the hub");closed(ws);}
-            private void closed(WebSocket ws){if(generation!=connectionGeneration.get())return;JSObject value=new JSObject();value.put("message",new JSObject().put("type","transport-closed").put("connected",false).put("error","Remote hub connection closed"));notifyListeners("message",value);}
+            @Override public void onFailure(WebSocket ws,Throwable error,Response response){boolean revoked=response!=null&&(response.code()==401||response.code()==403);String message=revoked?"AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again.":"Remote hub connection closed";if(!authenticated)call.reject(message,revoked?"AUTH_REVOKED":null);closed(ws,message);}
+            private void closed(WebSocket ws){closed(ws,"Remote hub connection closed");}
+            private void closed(WebSocket ws,String error){if(generation!=connectionGeneration.get())return;JSObject value=new JSObject();value.put("message",new JSObject().put("type","transport-closed").put("connected",false).put("error",error));notifyListeners("message",value);}
         });
         if(generation==connectionGeneration.get())socket=opened;else opened.cancel();
     }catch(Exception e){call.reject("Could not connect to the paired hub",e);}}

@@ -63,7 +63,7 @@
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>Attach a photo or video to a thread on your hub.</string>
+	<string>Scan a one-use hub invitation or attach a photo or video to a thread.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo or video to upload to your thread.</string>
 	<key>NSMicrophoneUsageDescription</key>

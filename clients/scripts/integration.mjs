@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { spawn, execFileSync } from "node:child_process";
 import {
   mkdtempSync,
+  realpathSync,
   mkdirSync,
   writeFileSync,
   readFileSync,
@@ -30,7 +31,7 @@ async function within(promise, ms, message) {
     clearTimeout(timer);
   }
 }
-const home = mkdtempSync(join(tmpdir(), "twr-desktop-"));
+const home = realpathSync(mkdtempSync(join(tmpdir(), "twr-desktop-")));
 const repo = join(home, "repo");
 mkdirSync(repo);
 execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
@@ -270,17 +271,28 @@ try {
       .fields.some((f) => f.key === "name"),
     "box add next-line help must produce fields",
   );
-  await page.evaluate(async () => {
+  const uploadPath = await page.evaluate(async () => {
     const thread = await window.twr.rpc("thread.new", {
       project: "demo",
       name: "api",
       runtime: "fake",
     });
+    const uploaded = await window.twr.uploadFile(
+      new File(["DESKTOP_ATTACHMENT_UTF8_✓"], "desktop-attachment.txt", {
+        type: "text/plain",
+      }),
+      thread.id,
+    );
     await window.twr.rpc("thread.send", {
       thread: thread.id,
       prompt: "Hello desktop\n!perm Bash printf safe\nFinished safely",
     });
+    return uploaded.path;
   });
+  assert.equal(readFileSync(uploadPath, "utf8"), "DESKTOP_ATTACHMENT_UTF8_✓");
+  console.log(
+    "Local attachment reached its worktree through the actual companion",
+  );
   await page
     .getByRole("button", { name: /api.*waiting/ })
     .first()

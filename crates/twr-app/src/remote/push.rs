@@ -218,7 +218,7 @@ impl Push {
                 Ok(false) => {
                     self.remove(&recipient).await?;
                 }
-                Err(error) => eprintln!(
+                Err(error) => crate::gateway_log!(
                     "Push delivery failed for device {}: {error}",
                     recipient.device
                 ),

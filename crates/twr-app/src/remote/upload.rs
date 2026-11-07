@@ -1,237 +1,172 @@
-use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-use std::{
-    ffi::CString,
-    fs::File,
-    io::Write,
-    os::fd::{AsRawFd, FromRawFd},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
-pub const MAX_FILE: usize = 25 * 1024 * 1024;
-#[derive(Default)]
-pub struct Quota {
-    charges: std::collections::HashMap<String, (std::time::Instant, usize)>,
+//! Gateway upload metadata; files are staged by the authenticated thread host.
+pub use twr_core::upload::{Quota, MAX_FILE};
+pub struct Pending {
+    pub workspace: String,
+    pub thread: String,
+    pub sha256: String,
+    pub size: usize,
+    pub created: std::time::Instant,
+    pub committed: bool,
+    pub busy: bool,
 }
-impl Quota {
-    pub fn reserve(&mut self, id: &str, size: usize, now: std::time::Instant) -> Result<()> {
-        self.charges
-            .retain(|_, (at, _)| now.duration_since(*at) < std::time::Duration::from_secs(600));
-        let used: usize = self.charges.values().map(|(_, size)| size).sum();
-        anyhow::ensure!(
-            used.saturating_add(size) <= 128 * 1024 * 1024,
-            "Upload limit reached (128 MiB per 10 minutes). Try again later."
-        );
-        self.charges.insert(id.into(), (now, size));
-        Ok(())
-    }
-    pub fn release(&mut self, id: &str) {
-        self.charges.remove(id);
-    }
+
+/// Only a typed hub rejection proves a new begin did not accept a reservation.
+pub fn definite_rejection(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<twr_core::proto::RpcError>()
+        .is_some_and(|e| e.code == twr_core::proto::codes::UPLOAD_REJECTED)
 }
-pub fn cancel(
-    pending: &mut std::collections::HashMap<String, Upload>,
+pub fn finish_begin(
+    pending: &mut std::collections::HashMap<String, Pending>,
     quota: &mut Quota,
     id: &str,
+    reserved: bool,
+    result: &anyhow::Result<serde_json::Value>,
 ) {
-    if pending.remove(id).is_some() {
+    if reserved && result.as_ref().is_err_and(definite_rejection) {
+        pending.remove(id);
         quota.release(id);
+    } else {
+        finish_command(pending, quota, id, "upload-begin", result);
     }
 }
-pub struct Upload {
-    base: File,
-    directory: String,
-    pub created: std::time::Instant,
-    file: File,
-    dir: File,
-    name: String,
-    pub path: PathBuf,
-    size: usize,
-    written: usize,
-    hash: Sha256,
-    expected: String,
-    committed: bool,
-}
-fn dir_at(parent: &File, name: &str) -> Result<File> {
-    let name = CString::new(name)?;
-    let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
-    if created < 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e.into());
-        }
-    }
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_DIRECTORY | libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    anyhow::ensure!(
-        fd >= 0,
-        "Unsafe upload directory: {}",
-        std::io::Error::last_os_error()
-    );
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-impl Upload {
-    pub fn begin(root: &Path, name: &str, size: usize, expected: &str) -> Result<Self> {
-        anyhow::ensure!(size <= MAX_FILE, "Files can be at most 25 MiB");
-        anyhow::ensure!(
-            !name.is_empty()
-                && name.len() <= 120
-                && name != "."
-                && name != ".."
-                && name
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || "_. -".contains(c)),
-            "Use a filename without directories or control characters"
-        );
-        anyhow::ensure!(
-            expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
-            "File checksum required"
-        );
-        let root_file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(root)
-            .context("Opening thread working directory")?;
-        let base = dir_at(&root_file, ".twr-uploads")?;
-        let id = uuid::Uuid::new_v4().to_string();
-        let dir = dir_at(&base, &id)?;
-        let part_name = CString::new(format!("{name}.part"))?;
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                part_name.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        anyhow::ensure!(fd >= 0, "Could not create staged upload");
-        let path = root.join(".twr-uploads").join(&id).join(name);
-        Ok(Self {
-            base,
-            directory: id,
-            created: std::time::Instant::now(),
-            file: unsafe { File::from_raw_fd(fd) },
-            dir,
-            name: name.to_owned(),
-            path,
-            size,
-            written: 0,
-            hash: Sha256::new(),
-            expected: expected.to_lowercase(),
-            committed: false,
+pub fn finish_command(
+    pending: &mut std::collections::HashMap<String, Pending>,
+    quota: &mut Quota,
+    id: &str,
+    method: &str,
+    result: &anyhow::Result<serde_json::Value>,
+) {
+    if method == "upload-commit"
+        && result.as_ref().is_err_and(|error| {
+            error
+                .downcast_ref::<twr_core::proto::RpcError>()
+                .is_some_and(|e| e.code == twr_core::proto::codes::UPLOAD_FAILED)
         })
+        && pending.get(id).is_some_and(|upload| !upload.committed)
+    {
+        pending.remove(id);
+        quota.release(id);
+        return;
     }
-    pub fn chunk(&mut self, data: &[u8]) -> Result<usize> {
-        anyhow::ensure!(
-            data.len() <= 1024 * 1024 && self.written + data.len() <= self.size,
-            "Upload exceeds its declared size"
-        );
-        self.file.write_all(data)?;
-        self.hash.update(data);
-        self.written += data.len();
-        Ok(self.written)
-    }
-    pub fn commit(mut self) -> Result<PathBuf> {
-        anyhow::ensure!(self.written == self.size, "Upload is incomplete");
-        anyhow::ensure!(
-            hex::encode(self.hash.clone().finalize()) == self.expected,
-            "Upload checksum mismatch"
-        );
-        self.file.sync_all()?;
-        let part = CString::new(format!("{}.part", self.name))?;
-        let name = CString::new(self.name.as_str())?;
-        let result = unsafe {
-            libc::renameat(
-                self.dir.as_raw_fd(),
-                part.as_ptr(),
-                self.dir.as_raw_fd(),
-                name.as_ptr(),
-            )
-        };
-        anyhow::ensure!(
-            result == 0,
-            "Could not commit upload: {}",
-            std::io::Error::last_os_error()
-        );
-        self.committed = true;
-        Ok(self.path.clone())
-    }
-}
-impl Drop for Upload {
-    fn drop(&mut self) {
-        if !self.committed {
-            if let Ok(name) = CString::new(format!("{}.part", self.name)) {
-                unsafe { libc::unlinkat(self.dir.as_raw_fd(), name.as_ptr(), 0) };
+    if let Some(upload) = pending.get_mut(id) {
+        upload.busy = false;
+        if result.as_ref().is_ok_and(|value| value["path"].is_string()) {
+            if !upload.committed {
+                quota.commit(id, std::time::Instant::now());
             }
-            if let Ok(name) = CString::new(self.directory.as_str()) {
-                unsafe { libc::unlinkat(self.base.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
-            }
+            upload.committed = true;
+        }
+        if method == "upload-cancel"
+            && result
+                .as_ref()
+                .is_ok_and(|value| value["cancelled"] == true)
+            && !upload.committed
+        {
+            pending.remove(id);
+            quota.release(id);
         }
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    fn pending() -> Pending {
+        Pending {
+            workspace: "default".into(),
+            thread: "thread".into(),
+            sha256: "a".repeat(64),
+            size: 5,
+            created: std::time::Instant::now(),
+            committed: false,
+            busy: true,
+        }
+    }
     #[test]
-    fn cancelling_a_committed_file_does_not_refund_its_quota() {
-        let root = tempfile::tempdir().unwrap();
+    fn definite_begin_rejections_refund_new_slots_but_uncertain_results_do_not() {
+        let mut uploads = std::collections::HashMap::new();
         let mut quota = Quota::default();
         let now = std::time::Instant::now();
-        let mut file = Upload::begin(
-            root.path(),
-            "committed.txt",
-            5,
-            &hex::encode(Sha256::digest(b"hello")),
+        for index in 0..8 {
+            let id = index.to_string();
+            uploads.insert(id.clone(), pending());
+            quota.reserve(&id, 5, now).unwrap();
+            let result = Err(twr_core::proto::RpcError::new(
+                twr_core::proto::codes::UPLOAD_REJECTED,
+                "invalid name",
+            )
+            .into());
+            finish_begin(&mut uploads, &mut quota, &id, true, &result);
+        }
+        assert!(uploads.is_empty());
+        quota.reserve("remaining", 128 * 1024 * 1024, now).unwrap();
+        quota.release("remaining");
+        uploads.insert("uncertain".into(), pending());
+        quota.reserve("uncertain", 5, now).unwrap();
+        finish_begin(
+            &mut uploads,
+            &mut quota,
+            "uncertain",
+            true,
+            &Err(anyhow::anyhow!("Companion closed; result unknown")),
+        );
+        assert!(uploads.contains_key("uncertain"));
+        assert!(!uploads["uncertain"].busy);
+        assert!(quota.reserve("remaining", 128 * 1024 * 1024, now).is_err());
+        let rejected = Err(twr_core::proto::RpcError::new(
+            twr_core::proto::codes::UPLOAD_REJECTED,
+            "retry rejected",
         )
-        .unwrap();
-        file.chunk(b"hello").unwrap();
-        let mut pending = std::collections::HashMap::from([("committed".into(), file)]);
-        quota.reserve("committed", 5, now).unwrap();
-        let path = pending.remove("committed").unwrap().commit().unwrap();
-        cancel(&mut pending, &mut quota, "committed");
-        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+        .into());
+        finish_begin(&mut uploads, &mut quota, "uncertain", false, &rejected);
+        assert!(uploads.contains_key("uncertain"));
+    }
+    #[test]
+    fn only_definitive_failed_commits_refund_gateway_reservations() {
+        let mut uploads = std::collections::HashMap::from([("file".into(), pending())]);
+        let mut quota = Quota::default();
+        let now = std::time::Instant::now();
+        quota.reserve("file", 5, now).unwrap();
+        finish_command(
+            &mut uploads,
+            &mut quota,
+            "file",
+            "upload-commit",
+            &Err(anyhow::anyhow!("Reply lost; result unknown")),
+        );
+        assert!(uploads.contains_key("file"));
+        let rejected = Err(twr_core::proto::RpcError::new(
+            twr_core::proto::codes::UPLOAD_FAILED,
+            "Checksum mismatch; staging removed",
+        )
+        .into());
+        finish_command(&mut uploads, &mut quota, "file", "upload-commit", &rejected);
+        assert!(uploads.is_empty());
+        quota.reserve("remaining", 128 * 1024 * 1024, now).unwrap();
+    }
+    #[test]
+    fn cancellation_after_a_lost_commit_ack_retains_receipt_and_quota() {
+        let mut uploads = std::collections::HashMap::from([("file".into(), pending())]);
+        let mut quota = Quota::default();
+        let now = std::time::Instant::now();
+        quota.reserve("file", 5, now).unwrap();
+        finish_command(
+            &mut uploads,
+            &mut quota,
+            "file",
+            "upload-cancel",
+            &Ok(json!({"cancelled":false,"committed":true,"path":"/thread/file"})),
+        );
+        assert!(uploads["file"].committed);
+        assert!(!uploads["file"].busy);
         quota
-            .reserve("remaining", 128 * 1024 * 1024 - 5, now)
+            .reserve(
+                "remaining",
+                128 * 1024 * 1024 - twr_core::upload::MIN_FILE_CHARGE,
+                now,
+            )
             .unwrap();
         assert!(quota.reserve("overflow", 1, now).is_err());
-    }
-    #[test]
-    fn cancelled_and_expired_uploads_do_not_exhaust_the_quota() {
-        let mut quota = Quota::default();
-        let now = std::time::Instant::now();
-        for i in 0..5 {
-            quota.reserve(&i.to_string(), MAX_FILE, now).unwrap();
-        }
-        assert!(quota.reserve("sixth", MAX_FILE, now).is_err());
-        quota.release("0");
-        quota.reserve("replacement", MAX_FILE, now).unwrap();
-        assert!(quota.reserve("still-full", MAX_FILE, now).is_err());
-        quota
-            .reserve("later", MAX_FILE, now + std::time::Duration::from_secs(601))
-            .unwrap();
-    }
-    #[test]
-    fn complete_file_checks_size_hash_and_traversal() {
-        let root = tempfile::tempdir().unwrap();
-        let hash = hex::encode(Sha256::digest(b"hello"));
-        assert!(Upload::begin(root.path(), "../escape", 5, &hash).is_err());
-        let mut file = Upload::begin(root.path(), "hello.txt", 5, &hash).unwrap();
-        assert!(file.chunk(b"oversize").is_err());
-        file.chunk(b"hello").unwrap();
-        let path = file.commit().unwrap();
-        assert_eq!(std::fs::read(path).unwrap(), b"hello");
-    }
-    #[test]
-    fn symlink_destination_is_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join(".twr-uploads")).unwrap();
-        assert!(Upload::begin(root.path(), "x", 0, &hex::encode(Sha256::digest(b""))).is_err());
-        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

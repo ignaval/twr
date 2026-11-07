@@ -10,6 +10,8 @@ export async function systemPickerQA({
   adbRun,
   fixture,
   serial,
+  adbPort,
+  transportSerial = serial,
 }) {
   const filename = `twr-system-picker-${randomUUID().slice(0, 8)}.txt`;
   const local = join(fixture, filename);
@@ -100,8 +102,11 @@ export async function systemPickerQA({
     throw new Error(
       "Could not select the test file through Android's system document picker",
     );
-  const fresh = await _android.devices({ omitDriverInstall: true });
-  const device = fresh.find((d) => d.serial() === serial);
+  const fresh = await _android.devices({
+    omitDriverInstall: true,
+    ...(adbPort ? { port: Number(adbPort) } : {}),
+  });
+  const device = fresh.find((d) => d.serial() === transportSerial);
   if (!device) throw new Error("Android device disconnected");
   const web = await device.webView({ pkg: "tools.twr.mobile.dev" });
   const next = await web.page();

@@ -53,7 +53,9 @@ fn runner_emits(body: &EventBody) -> bool {
         | EventBody::AgentThinking(_)
         | EventBody::AttentionRaised(_)
         | EventBody::AttentionResolved(_)
-        | EventBody::RuntimeLimits(_) => true,
+        | EventBody::RuntimeLimits(_)
+        | EventBody::ContextCompacting(_)
+        | EventBody::ContextCompacted(_) => true,
         EventBody::ThreadCreated(_)
         | EventBody::ThreadParked(_)
         | EventBody::ThreadStopped(_)
@@ -77,6 +79,11 @@ fn runner_emits(body: &EventBody) -> bool {
         | EventBody::RunnerDisconnected(_)
         | EventBody::ContextUpdated(_)
         | EventBody::AccountUsage(_)
+        | EventBody::AccountAdded(_)
+        | EventBody::AccountRemoved(_)
+        | EventBody::AccountStatus(_)
+        | EventBody::MemoryChanged(_)
+        | EventBody::TrashPurged(_)
         | EventBody::ProjectRead(_)
         | EventBody::WorktreeDisk(_)
         | EventBody::WorktreeTrimmed(_)
@@ -389,6 +396,24 @@ fn runner_samples() -> Vec<(String, Value, u32)> {
     bare.1.as_object_mut().unwrap().remove("at_ms");
     v.push((raw.0, raw.1, 6));
     v.push((bare.0, bare.1, 6));
+    for (name, frame) in [
+        event(
+            "event context.compacting",
+            26,
+            Some(3),
+            "context.compacting",
+            json!({"trigger":"auto"}),
+        ),
+        event(
+            "event context.compacted",
+            27,
+            Some(3),
+            "context.compacted",
+            json!({"trigger":"auto","pre_tokens":120000,"post_tokens":20000,"duration_ms":1500}),
+        ),
+    ] {
+        v.push((name, frame, 8));
+    }
     let exits = [
         (
             "exited",
@@ -584,6 +609,36 @@ fn capture() {
             "accepted": accepted,
         }),
     );
+
+    // Current attachment commands are not drain-safe and deliberately live in their own
+    // fixture; hub-accepts above continues to prove only commands older runners may receive.
+    if protocol >= 8 {
+        let mut samples = Vec::new();
+        for registered_repository in [false, true] {
+            for request in [
+                json!({"action":"begin","name":"file.txt","size":5}),
+                json!({"action":"chunk","offset":0,"data":"aGVsbG8="}),
+                json!({"action":"status"}),
+                json!({"action":"commit"}),
+                json!({"action":"cancel"}),
+            ] {
+                let action = request["action"].as_str().unwrap().to_owned();
+                let mut request = request;
+                request["id"] = json!("attachment");
+                request["sha256"] =
+                    json!("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+                let name = format!("upload {action} registered_repository={registered_repository}");
+                let frame = json!({"type":"cmd","cmd_id":name,"op":{"type":"upload","scope":"device:phone","thread":"t1","root":"/worktrees/project/t1","registered_repository":registered_repository,"request":request}});
+                let _: HubMsg = same_after_round_trip("upload command", &name, &frame);
+                samples.push(json!({"name":name,"frame":frame}));
+            }
+        }
+        write(
+            &out,
+            "upload-ops.json",
+            &json!({"protocol":protocol,"revision":rev,"what":"attachment commands accepted by this runner, including the trusted root policy","samples":samples}),
+        );
+    }
 
     // Its proofs, and its sealed channel.
     let mut vectors = Vec::new();

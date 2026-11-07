@@ -56,6 +56,32 @@ const cmd = (
   confirm?: string,
 ): Command => ({ id, title, group, method, fields, description, confirm });
 export const commands: Command[] = [
+  cmd(
+    "conversation-search",
+    "Search saved conversations",
+    "History",
+    "conversation.search",
+    [
+      f("query", "Search text", { required: true }),
+      f("thread", "Thread (optional)"),
+      f("before", "Before event ID"),
+      f("limit", "Results (1–100)", { type: "number", initial: 30 }),
+    ],
+    "Search messages, tool output and decisions in the selected workspace, including archived output.",
+  ),
+  cmd(
+    "event-context",
+    "Read exact conversation event",
+    "History",
+    "thread.event_context",
+    [
+      thread,
+      f("event_id", "Event ID", { required: true }),
+      f("before", "Earlier events (0–30)", { type: "number", initial: 12 }),
+      f("after", "Later events (0–30)", { type: "number", initial: 12 }),
+    ],
+    "Read the selected event and its surrounding history without changing the message destination.",
+  ),
   cmd("device-list", "Paired devices", "Devices", "device.list"),
   cmd(
     "device-revoke",

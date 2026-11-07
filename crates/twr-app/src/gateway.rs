@@ -11,7 +11,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::Engine;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use remote::{
@@ -21,6 +20,7 @@ use remote::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::future::IntoFuture;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -32,6 +32,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
+use twr_core::proto::codes;
 
 #[derive(Parser)]
 #[command(
@@ -53,6 +54,18 @@ struct Args {
     /// Create a code for an already running gateway, then exit.
     #[arg(long, requires = "pair")]
     pair_only: bool,
+    /// Grant read access only. Cannot be combined with terminal or admin access.
+    #[arg(long, requires = "pair", conflicts_with_all = ["allow_terminal", "allow_admin"])]
+    read_only: bool,
+    /// Emit the short-lived invitation as JSON for native launchers.
+    #[arg(long = "json", requires = "pair")]
+    pair_json: bool,
+    /// Cancel only the matching one-use invitation. Reads {code} from stdin.
+    #[arg(long)]
+    cancel_invitation: bool,
+    /// Desktop launcher: bounded, private operational log.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
     #[arg(long)]
     allow_terminal: bool,
     #[arg(long)]
@@ -61,12 +74,33 @@ struct Args {
     revoke: Option<String>,
     #[arg(long)]
     list_devices: bool,
+    /// Stop only the verified running gateway instance, leaving the hub alone.
+    #[arg(long, requires = "expected_instance")]
+    stop_gateway: bool,
+    #[arg(long, requires = "stop_gateway")]
+    expected_instance: Option<String>,
+    /// Print this installation's verified gateway identity and process metadata, then exit.
+    #[arg(long)]
+    gateway_info: bool,
     #[arg(long)]
     binary_dir: Option<PathBuf>,
     #[arg(long)]
     push_config: Option<PathBuf>,
     #[arg(long)]
     push_test_log: Option<PathBuf>,
+}
+fn pairing_scopes(args: &Args) -> Vec<&'static str> {
+    let mut scopes = vec!["read"];
+    if !args.read_only {
+        scopes.push("operate");
+    }
+    if args.allow_terminal {
+        scopes.push("terminal");
+    }
+    if args.allow_admin {
+        scopes.push("admin");
+    }
+    scopes
 }
 struct Server {
     pairing_window: std::sync::Mutex<(std::time::Instant, u32)>,
@@ -145,6 +179,146 @@ fn socket_message(event: &Value) -> Message {
 #[cfg(test)]
 mod socket_tests {
     use super::*;
+    #[test]
+    fn launcher_pairing_flags_cannot_expand_read_only_invitations() {
+        let args =
+            Args::try_parse_from(["gateway", "--pair", "--pair-only", "--json", "--read-only"])
+                .unwrap();
+        assert_eq!(pairing_scopes(&args), vec!["read"]);
+        assert!(
+            Args::try_parse_from(["gateway", "--pair", "--read-only", "--allow-terminal"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from(["gateway", "--pair", "--read-only", "--allow-admin"]).is_err()
+        );
+        assert!(Args::try_parse_from(["gateway", "--json"]).is_err());
+        assert!(Args::try_parse_from(["gateway", "--read-only"]).is_err());
+        let args = Args::try_parse_from(["gateway", "--pair", "--allow-terminal"]).unwrap();
+        assert_eq!(pairing_scopes(&args), vec!["read", "operate", "terminal"]);
+    }
+    #[test]
+    fn stopped_inbox_sources_require_a_typed_socket_error() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(inbox_socket_stopped(
+                &anyhow::Error::new(std::io::Error::new(kind, "socket"))
+                    .context("connecting workspace")
+            ));
+        }
+        assert!(!inbox_socket_stopped(&anyhow::anyhow!("No such file")));
+        assert!(!inbox_socket_stopped(&anyhow::Error::new(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "socket")
+        )));
+    }
+    #[tokio::test]
+    async fn inbox_deadline_returns_partial_results_and_drops_unfinished_readers() {
+        let names: Vec<String> = (0..64)
+            .map(|number| format!("workspace-{number}"))
+            .collect();
+        let alive = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Reader(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Reader {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let stream = futures::stream::iter(names.clone()).map(|workspace| {
+            let alive = alive.clone();
+            async move {
+                alive.fetch_add(1, Ordering::SeqCst);
+                let _reader = Reader(alive);
+                if workspace != "workspace-0" { std::future::pending::<()>().await; }
+                json!({"workspace":workspace,"attention":[{"attn_id":"ready","revision":7}],"threads":[]})
+            }
+        }).buffer_unordered(4);
+        let started = tokio::time::Instant::now();
+        let sources =
+            collect_inbox_sources(stream, names, "test-gateway", Duration::from_millis(20)).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(sources.len(), 64);
+        assert_eq!(sources[0]["attention"][0]["attn_id"], "ready");
+        assert!(sources[1..].iter().all(|source| {
+            source["cached"].as_bool() != Some(true)
+                && source["attention"].as_array().unwrap().is_empty()
+                && source["error"].as_str().unwrap().contains("deadline")
+        }));
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            0,
+            "unfinished socket readers must be cancelled"
+        );
+    }
+    #[tokio::test]
+    async fn inbox_reads_prove_device_and_workspace_without_switching_or_writing() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (identity, workspace, expected_calls) in [
+            ("user:device:reader", "review", 4),
+            ("user:local-owner", "review", 1),
+            ("user:device:reader", "other", 2),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hub.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let mut methods = Vec::new();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    methods.push(method.to_owned());
+                    let result = match method {
+                        "hello" => {
+                            assert_eq!(request["params"]["device_token"], "device-secret");
+                            json!({"identity":identity})
+                        }
+                        "hub.info" => json!({"workspace":workspace}),
+                        "attention.list" => json!([{"attn_id":"permission","revision":8}]),
+                        "thread.list" => json!([{"id":"worker"}]),
+                        _ => panic!("inbox attempted a non-read operation: {method}"),
+                    };
+                    let line = json!({"id":request["id"],"result":result}).to_string() + "\n";
+                    writer.write_all(line.as_bytes()).await.unwrap();
+                }
+                methods
+            });
+            let device = Device {
+                id: "reader".into(),
+                name: "Reader".into(),
+                created: 0,
+                token_hash: String::new(),
+                scopes: vec!["read".into()],
+            };
+            let result = read_inbox_workspace(&path, "review", &device, "device-secret").await;
+            assert_eq!(result.is_ok(), expected_calls == 4);
+            let calls = server.await.unwrap();
+            assert_eq!(calls.len(), expected_calls);
+            assert_eq!(calls[0], "hello");
+        }
+    }
+    #[test]
+    fn stalled_uploads_cannot_exhaust_approval_request_slots() {
+        let uploads = Arc::new(Semaphore::new(4));
+        let general = Arc::new(Semaphore::new(64));
+        let permits = (0..4)
+            .map(|_| {
+                operation_slots("upload-commit", &uploads, &general)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(operation_slots("upload-begin", &uploads, &general)
+            .try_acquire_owned()
+            .is_err());
+        assert!(operation_slots("rpc", &uploads, &general)
+            .try_acquire_owned()
+            .is_ok());
+        assert_eq!(general.available_permits(), 64);
+        drop(permits);
+    }
     #[test]
     fn denied_and_unknown_rpc_calls_cannot_claim_receipts() {
         let mut device = Device {
@@ -260,6 +434,7 @@ impl Server {
     }
 }
 struct DeviceSession {
+    upload_slots: Arc<Semaphore>,
     input: mpsc::Sender<OrderedInput>,
     session: Session,
     events: remote::events::Sender,
@@ -270,6 +445,21 @@ struct DeviceSession {
     foreground: AtomicBool,
 }
 type Shared = Arc<Server>;
+fn operation_slots(
+    method: &str,
+    uploads: &Arc<Semaphore>,
+    general: &Arc<Semaphore>,
+) -> Arc<Semaphore> {
+    if matches!(
+        method,
+        "upload-begin" | "upload-status" | "upload-chunk" | "upload-commit" | "upload-cancel"
+    ) {
+        uploads.clone()
+    } else {
+        general.clone()
+    }
+}
+
 #[derive(Deserialize)]
 struct Pair {
     code: String,
@@ -372,6 +562,7 @@ struct WorkspaceConnection {
     bridge: Option<Arc<Companion>>,
 }
 struct Session {
+    inbox_reading: AtomicBool,
     terminal_slots: Arc<Semaphore>,
     device: Device,
     token: String,
@@ -381,11 +572,111 @@ struct Session {
     terminals: Mutex<HashMap<String, Terminal>>,
     events: mpsc::Sender<Value>,
     terminal_events: mpsc::Sender<Value>,
-    uploads: Mutex<HashMap<String, remote::upload::Upload>>,
+    uploads: Mutex<HashMap<String, remote::upload::Pending>>,
     upload_quota: std::sync::Mutex<remote::upload::Quota>,
     latest_state: Arc<std::sync::Mutex<Option<Value>>>,
 }
+/// The workspace owns the device check too: an unrestricted gateway process must never
+/// substitute its own local-user authority for a paired device's read grant.
+async fn read_inbox_workspace(
+    socket: &Path,
+    workspace: &str,
+    device: &Device,
+    token: &str,
+) -> Result<(Value, Value)> {
+    let mut client = twr_core::client::Client::connect(socket).await?;
+    let hello = client
+        .hello(json!({"client":format!("inbox-{}", device.id),"device_token":token}))
+        .await?;
+    anyhow::ensure!(
+        hello["identity"].as_str() == Some(format!("user:device:{}", device.id).as_str()),
+        "Workspace did not authenticate this device"
+    );
+    let info = client.call("hub.info", json!({})).await?;
+    anyhow::ensure!(
+        info["workspace"].as_str() == Some(workspace),
+        "Socket serves another workspace"
+    );
+    let attention = client.call("attention.list", json!({"all":true})).await?;
+    let threads = client.call("thread.list", json!({})).await?;
+    Ok((attention, threads))
+}
+fn inbox_socket_stopped(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+        })
+}
+async fn collect_inbox_sources<S: futures::Stream<Item = Value> + Unpin>(
+    mut stream: S,
+    names: Vec<String>,
+    gateway_id: &str,
+    budget: Duration,
+) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut sources = Vec::new();
+    while let Ok(Some(source)) = tokio::time::timeout_at(deadline, stream.next()).await {
+        sources.push(source);
+    }
+    let checked: std::collections::HashSet<String> = sources
+        .iter()
+        .filter_map(|source| source["workspace"].as_str().map(str::to_owned))
+        .collect();
+    for workspace in names
+        .into_iter()
+        .filter(|workspace| !checked.contains(workspace))
+    {
+        sources.push(json!({"hubId":gateway_id,"hubName":"Remote hub","workspace":workspace,"attention":[],"threads":[],"error":"Summary not checked before refresh deadline"}));
+    }
+    sources
+}
 impl Session {
+    /// Read other workspaces with the same device credential. These short-lived sockets
+    /// never replace the active companion, subscribe, start a hub or emit client state.
+    async fn inbox_sources(&self, server: &Server) -> Result<Value> {
+        anyhow::ensure!(
+            self.device.allows("attention.list") && self.device.allows("thread.list"),
+            "This device does not have read access"
+        );
+        let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
+        let mut workspaces = vec!["default".to_owned()];
+        workspaces.extend(paths.named_workspaces()?);
+        anyhow::ensure!(
+            workspaces.len() <= 256,
+            "Too many workspaces to summarize at once"
+        );
+        let names = workspaces.clone();
+        let stream = futures::stream::iter(workspaces).map(|workspace| async move {
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                let paths = twr_core::paths::Paths::from_env_in(Some(&workspace))?;
+                let config = twr_core::config::Config::load_from(&paths)?;
+                read_inbox_workspace(&config.socket_path(&paths), &workspace, &self.device, &self.token).await
+            }).await;
+            match result {
+                Ok(Ok((attention, threads))) => json!({"hubId":server.push.gateway_id,"hubName":"Remote hub","workspace":workspace,"attention":attention,"threads":threads}),
+                Ok(Err(error)) => {
+                    let stopped = inbox_socket_stopped(&error);
+                    if stopped {json!({"hubId":server.push.gateway_id,"hubName":"Remote hub","workspace":workspace,"attention":[],"threads":[],"running":false})}
+                    else {json!({"hubId":server.push.gateway_id,"hubName":"Remote hub","workspace":workspace,"attention":[],"threads":[],"error":error.to_string()})}
+                },
+                Err(_) => json!({"hubId":server.push.gateway_id,"hubName":"Remote hub","workspace":workspace,"attention":[],"threads":[],"error":"Workspace did not answer within 3 seconds"}),
+            }
+        }).buffer_unordered(4);
+        Ok(json!(
+            collect_inbox_sources(
+                stream,
+                names,
+                &server.push.gateway_id,
+                Duration::from_secs(4)
+            )
+            .await
+        ))
+    }
     async fn call(&self, server: &Server, call: &Call) -> Result<Value> {
         let p = &call.params;
         let connection = self.connection.read().await;
@@ -406,6 +697,7 @@ impl Session {
             "Workspace changed; review the destination before retrying"
         );
         match call.method.as_str() {
+            "inbox-sources" => self.inbox_sources(server).await,
             "bootstrap" => Ok(
                 json!({"workspace":workspace,"platform":"remote","home":std::env::var("HOME").unwrap_or_default(),"version":twr_core::version(),"theme":null,"terminals":self.terminals.lock().await.values().map(Terminal::summary).collect::<Vec<_>>(),"scopes":self.device.scopes,"allowed_methods":twr_core::devices::METHOD_SCOPES.iter().flat_map(|(_,m)|m.iter()).filter(|m|self.device.allows(m) && !m.starts_with("device.pair_")).collect::<Vec<_>>(),"read_methods":twr_core::devices::METHOD_SCOPES.iter().find(|(s,_)|*s=="read").map(|(_,m)|*m).unwrap_or_default()}),
             ),
@@ -515,6 +807,10 @@ impl Session {
             }
             "rpc" => {
                 let method = p["method"].as_str().context("Method required")?;
+                anyhow::ensure!(
+                    method != "thread.upload",
+                    "Use the bounded attachment upload commands"
+                );
                 let private = [
                     "desktop.subscribe",
                     "desktop.preferences",
@@ -578,128 +874,153 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             }
             "upload-begin" => {
                 anyhow::ensure!(
-                    self.device.allows("thread.send"),
+                    self.device.allows("thread.upload"),
                     "Uploading requires operate permission"
                 );
+                let thread = p["thread"].as_str().context("Thread required")?;
+                let sha256 = p["sha256"].as_str().context("Checksum required")?;
+                let name = p["name"].as_str().context("Filename required")?;
                 anyhow::ensure!(
-                    self.uploads.lock().await.len() < 4,
-                    "Finish an existing upload first"
+                    !name.is_empty() && name.len() <= 120,
+                    "Filename must contain 1–120 UTF-8 bytes"
                 );
                 let size = usize::try_from(p["size"].as_u64().context("File size required")?)?;
                 anyhow::ensure!(
                     size <= remote::upload::MAX_FILE,
                     "Files can be at most 25 MiB"
                 );
-                let thread = bridge()?
-                    .call("thread.get", json!({"thread":p["thread"]}))
-                    .await?;
-                anyhow::ensure!(thread["box_name"].as_str()==Some("local"),"File upload to a worker on another box is not available yet. Choose a thread running on this hub.");
-                let root = thread["worktree"]
+                let id = p["id"]
                     .as_str()
-                    .or(thread["repo"].as_str())
-                    .context("Thread has no working directory")?;
-                let name = p["name"].as_str().context("Filename required")?;
-                let upload = remote::upload::Upload::begin(
-                    Path::new(root),
-                    name,
-                    size,
-                    p["sha256"].as_str().context("Checksum required")?,
-                )?;
-                let out = tokio::process::Command::new("git")
-                    .args([
-                        "-c",
-                        "core.fsmonitor=false",
-                        "-C",
-                        root,
-                        "rev-parse",
-                        "--is-inside-work-tree",
-                        "--git-path",
-                        "info/exclude",
-                    ])
-                    .env("LC_ALL", "C")
-                    .output()
-                    .await?;
-                let not_git = !out.status.success()
-                    && String::from_utf8_lossy(&out.stderr).contains("not a git repository");
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 anyhow::ensure!(
-                    out.status.success() || not_git,
-                    "Could not check the upload directory's git status"
+                    id.len() <= 64
+                        && !id.is_empty()
+                        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+                    "Invalid upload ID"
                 );
-                let output = String::from_utf8(out.stdout)?;
-                if out.status.success() && output.lines().next() == Some("true") {
-                    let exclude =
-                        PathBuf::from(output.lines().nth(1).context("Git exclude path missing")?);
-                    let exclude = if exclude.is_absolute() {
-                        exclude
-                    } else {
-                        Path::new(root).join(exclude)
-                    };
-                    use std::io::Write;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    if let Some(parent) = exclude.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let mut file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .append(true)
-                        .create(true)
-                        .mode(0o600)
-                        .custom_flags(libc::O_NOFOLLOW)
-                        .open(exclude)?;
-                    use std::io::Read;
-                    let mut contents = String::new();
-                    (&mut file).take(65536).read_to_string(&mut contents)?;
-                    if !contents.lines().any(|line| line == ".twr-uploads/") {
-                        file.write_all(b"\n.twr-uploads/\n")?;
-                    }
-                }
-                let id = uuid::Uuid::new_v4().to_string();
+                let selected = bridge()?;
                 let mut uploads = self.uploads.lock().await;
-                anyhow::ensure!(uploads.len() < 4, "Finish an existing upload first");
-                self.upload_quota
-                    .lock()
-                    .unwrap()
-                    .reserve(&id, size, std::time::Instant::now())?;
-                uploads.insert(id.clone(), upload);
-                Ok(json!({"id":id,"chunk_size":262144}))
+                let reserved = if let Some(upload) = uploads.get_mut(&id) {
+                    anyhow::ensure!(
+                        upload.workspace == workspace
+                            && upload.thread == thread
+                            && upload.sha256 == sha256
+                            && upload.size == size,
+                        "Upload destination or checksum changed"
+                    );
+                    anyhow::ensure!(
+                        !upload.busy,
+                        "An upload operation is in progress; check status shortly"
+                    );
+                    upload.busy = true;
+                    false
+                } else {
+                    anyhow::ensure!(
+                        uploads.values().filter(|u| !u.committed).count() < 4,
+                        "Finish an existing upload first"
+                    );
+                    self.upload_quota.lock().unwrap().reserve(
+                        &id,
+                        size,
+                        std::time::Instant::now(),
+                    )?;
+                    uploads.insert(
+                        id.clone(),
+                        remote::upload::Pending {
+                            workspace: workspace.clone(),
+                            thread: thread.into(),
+                            sha256: sha256.into(),
+                            size,
+                            created: std::time::Instant::now(),
+                            committed: false,
+                            busy: true,
+                        },
+                    );
+                    true
+                };
+                drop(uploads);
+                let result = selected.call_with_timeout("thread.upload", json!({"thread":thread,"id":id,"sha256":sha256,"action":"begin","name":name,"size":size}), Duration::from_secs(12)).await;
+                let mut uploads = self.uploads.lock().await;
+                remote::upload::finish_begin(
+                    &mut uploads,
+                    &mut self.upload_quota.lock().unwrap(),
+                    &id,
+                    reserved,
+                    &result,
+                );
+                result
             }
-            "upload-chunk" => {
+            method @ ("upload-status" | "upload-chunk" | "upload-commit" | "upload-cancel") => {
+                anyhow::ensure!(
+                    self.device.allows("thread.upload"),
+                    "Uploading requires operate permission"
+                );
                 let id = p["id"].as_str().context("Upload ID required")?;
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(p["data"].as_str().context("File data required")?)?;
-                let count = self
-                    .uploads
-                    .lock()
-                    .await
-                    .get_mut(id)
-                    .context("Upload not found")?
-                    .chunk(&data)?;
-                Ok(json!({"received":count}))
-            }
-            "upload-commit" => {
-                let id = p["id"].as_str().unwrap_or("");
-                let upload = self
-                    .uploads
-                    .lock()
-                    .await
-                    .remove(id)
-                    .context("Upload not found")?;
-                match upload.commit() {
-                    Ok(path) => Ok(json!({"path":path})),
-                    Err(error) => {
-                        self.upload_quota.lock().unwrap().release(id);
-                        Err(error)
-                    }
+                let selected = bridge()?;
+                let mut uploads = self.uploads.lock().await;
+                if method == "upload-cancel" && !uploads.contains_key(id) {
+                    drop(uploads);
+                    let thread = p["thread"].as_str().context("Thread required")?;
+                    let sha256 = p["sha256"].as_str().context("Checksum required")?;
+                    let result = selected
+                        .call_with_timeout(
+                            "thread.upload",
+                            json!({"thread":thread,"id":id,"sha256":sha256,"action":"cancel"}),
+                            Duration::from_secs(12),
+                        )
+                        .await;
+                    // A definite refusal cannot leave this gateway reservation alive.
+                    // The host also expires staged files; a transport failure remains uncertain.
+                    return result.or_else(|error| {
+                        if error
+                            .downcast_ref::<twr_core::proto::RpcError>()
+                            .is_some_and(|rpc| {
+                                rpc.code == codes::BAD_REQUEST || rpc.code == codes::UPLOAD_REJECTED
+                            })
+                        {
+                            Ok(json!({"cancelled":true,"committed":false}))
+                        } else {
+                            Err(error)
+                        }
+                    });
                 }
-            }
-            "upload-cancel" => {
-                let id = p["id"].as_str().unwrap_or("");
-                remote::upload::cancel(
-                    &mut *self.uploads.lock().await,
+                let upload = uploads
+                    .get_mut(id)
+                    .context("Upload expired or was not found; start again")?;
+                anyhow::ensure!(
+                    upload.workspace == workspace
+                        && p["thread"].as_str() == Some(&upload.thread)
+                        && p["sha256"].as_str() == Some(&upload.sha256),
+                    "Upload destination or checksum changed"
+                );
+                if upload.busy && method == "upload-status" {
+                    return Ok(json!({"id":id,"busy":true}));
+                }
+                anyhow::ensure!(
+                    !upload.busy,
+                    "An upload operation is in progress; retry status or cancellation shortly"
+                );
+                upload.busy = true;
+                upload.created = std::time::Instant::now();
+                let mut params = json!({"thread":upload.thread,"id":id,"sha256":upload.sha256,"action":method.trim_start_matches("upload-")});
+                if method == "upload-chunk" {
+                    params["offset"] = p["offset"].clone();
+                    params["data"] = p["data"].clone();
+                }
+                drop(uploads);
+                let result = selected
+                    .call_with_timeout("thread.upload", params, Duration::from_secs(12))
+                    .await;
+                let mut uploads = self.uploads.lock().await;
+                remote::upload::finish_command(
+                    &mut uploads,
                     &mut self.upload_quota.lock().unwrap(),
                     id,
+                    method,
+                    &result,
                 );
-                Ok(Value::Null)
+                result
             }
             "cli" => {
                 let args: Vec<String> = serde_json::from_value(p["args"].clone())?;
@@ -919,8 +1240,10 @@ async fn serve_socket(
             });
             let (input, mut input_rx) = mpsc::channel::<OrderedInput>(64);
             let slot = Arc::new(DeviceSession {
+                upload_slots: Arc::new(Semaphore::new(4)),
                 input,
                 session: Session {
+                    inbox_reading: AtomicBool::new(false),
                     terminal_slots: Arc::new(Semaphore::new(4)),
                     device: device.clone(),
                     token: token.clone(),
@@ -955,6 +1278,34 @@ async fn serve_socket(
                     if slot.generation.load(Ordering::SeqCst) != generation
                         || !server.auth.current(&slot.session.device)
                     {
+                        continue;
+                    }
+                    if call.method == "inbox-sources" {
+                        if slot.session.inbox_reading.swap(true, Ordering::SeqCst) {
+                            let _ = replies.send(json!({"id":call.id,"error":"An inbox refresh is already running"})).await;
+                            continue;
+                        }
+                        tokio::spawn(async move {
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                slot.session.inbox_sources(&server),
+                            )
+                            .await;
+                            slot.session.inbox_reading.store(false, Ordering::SeqCst);
+                            if slot.generation.load(Ordering::SeqCst) != generation
+                                || !server.auth.current(&slot.session.device)
+                            {
+                                return;
+                            }
+                            let reply = match result {
+                                Ok(Ok(value)) => json!({"id":call.id,"result":value}),
+                                Ok(Err(error)) => json!({"id":call.id,"error":error.to_string()}),
+                                Err(_) => {
+                                    json!({"id":call.id,"error":"Inbox refresh timed out after 5 seconds; live requests remain available"})
+                                }
+                            };
+                            let _ = replies.send(reply).await;
+                        });
                         continue;
                     }
                     let result = slot.session.call(&server, &call).await;
@@ -1102,7 +1453,8 @@ async fn serve_socket(
                 if slot.input.try_send((call,replies.clone(),generation)).is_err() {let _=replies.try_send(json!({"id":id,"error":"Terminal input queue is full"}));}
                 continue;
             }
-            let Ok(permit)=calls.clone().try_acquire_owned()else{let _=replies.try_send(json!({"id":call.id,"error":"Too many pending operations"}));continue};
+            let lane=operation_slots(&call.method,&slot.upload_slots,&calls);
+            let Ok(permit)=lane.try_acquire_owned()else{let _=replies.try_send(json!({"id":call.id,"error":"Too many pending operations"}));continue};
                     let task_server=server.clone();let task_slot=slot.clone();let task_device=device.clone();let task_replies=replies.clone();
                     tokio::spawn(async move{
                       let _permit=permit;
@@ -1128,7 +1480,7 @@ async fn serve_socket(
                       if result.is_ok()&&call.method=="connect"{let workspace=task_slot.session.connection.read().await.workspace.clone();start_observer(task_server.clone(),workspace).await;}
                       if result.is_ok()&&call.method=="rpc"&&call.params["method"]=="notify.looking"{task_slot.foreground.store(call.params["params"]["looking"].as_bool().unwrap_or(false),Ordering::SeqCst);}
                       let reply=match result{Ok(result)=>json!({"id":call.id,"result":result}),Err(error)=>json!({"id":call.id,"error":error.to_string()})};
-                      if mutation{if let Err(error)=task_server.receipts.finish(&task_device.id,&call.id,&reply){eprintln!("Could not record request outcome: {error}");}}
+                      if mutation{if let Err(error)=task_server.receipts.finish(&task_device.id,&call.id,&reply){crate::gateway_log!("Could not record request outcome: {error}");}}
                       if let Some(completion)=completion {completion.send_replace(Some(reply.clone()));task_server.receipt_waiters.lock().await.remove(&receipt_key);}
                       let _=task_replies.send(reply).await;
                     });
@@ -1153,7 +1505,16 @@ async fn serve_socket(
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
-    let administration = args.pair_only || args.list_devices || args.revoke.is_some();
+    if let Some(path) = args.log_file.clone() {
+        remote::gateway_lifecycle::set_log_file(path);
+    }
+    let invitation_scopes = pairing_scopes(&args);
+    let administration = args.pair_only
+        || args.list_devices
+        || args.gateway_info
+        || args.stop_gateway
+        || args.cancel_invitation
+        || args.revoke.is_some();
     anyhow::ensure!(
         !args.development || (cfg!(debug_assertions) && args.listen.ip().is_loopback()),
         "Cleartext development transport requires a debug build on loopback"
@@ -1171,6 +1532,53 @@ async fn main() -> Result<()> {
     let binary = dir.join("twr");
     let companion = dir.join("twr-desktop-bridge");
     let paths = twr_core::paths::Paths::from_env_in(Some("default"))?;
+    let mobile_dir = paths.config_file.with_file_name("mobile");
+    if args.gateway_info {
+        println!("{}", remote::gateway_lifecycle::info(&mobile_dir).await?);
+        return Ok(());
+    }
+    if args.stop_gateway {
+        remote::gateway_lifecycle::stop(
+            &mobile_dir,
+            args.expected_instance
+                .as_deref()
+                .context("Gateway instance required")?,
+        )
+        .await?;
+        println!("{}", json!({"stopped":true}));
+        return Ok(());
+    }
+    if args.cancel_invitation {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        tokio::io::stdin()
+            .take(1025)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(
+            bytes.len() <= 1024,
+            "Cancellation request exceeds its limit"
+        );
+        let request: Value = serde_json::from_slice(&bytes)?;
+        let code = request["code"]
+            .as_str()
+            .context("Invitation code required")?;
+        let cancelled = match remote::gateway_lifecycle::info(&mobile_dir).await {
+            Ok(info) if info["running"] == true => {
+                remote::gateway_lifecycle::cancel_invitation(&mobile_dir, code).await?
+            }
+            _ => {
+                let mut owner = owner_client().await?;
+                owner
+                    .call("device.pair_cancel", json!({"code":code}))
+                    .await?["cancelled"]
+                    .as_bool()
+                    .context("Invalid cancellation reply")?
+            }
+        };
+        println!("{}", json!({"cancelled":cancelled}));
+        return Ok(());
+    }
     let auth = Auth::open(&paths.config_file.with_file_name("mobile"))?;
     let config = twr_core::config::Config::load_from(&paths)?;
     twr_app::runtime::ensure_hub(&paths, &config.socket_path(&paths), &binary).await?;
@@ -1184,20 +1592,27 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if args.pair {
-        let mut scopes = vec!["read", "operate"];
-        if args.allow_terminal {
-            scopes.push("terminal")
-        }
-        if args.allow_admin {
-            scopes.push("admin")
-        }
+        let scopes = invitation_scopes;
+        let pairing_started = remote::auth::now();
         let code = local
             .call("device.pair_begin", json!({"scopes":scopes}))
             .await?;
-        println!(
-            "Pairing code (one use, five minutes): {}",
-            code["code"].as_str().unwrap_or("")
-        );
+        if args.pair_json {
+            println!(
+                "{}",
+                json!({
+                    "code": code["code"],
+                    "expires_at": pairing_started + code["expires_in"].as_u64().unwrap_or(300).min(300),
+                    "scopes": scopes,
+                    "gateway_id": std::fs::read_to_string(paths.config_file.with_file_name("mobile").join("gateway-id")).unwrap_or_default().trim(),
+                })
+            );
+        } else {
+            println!(
+                "Pairing code (one use, five minutes): {}",
+                code["code"].as_str().unwrap_or("")
+            );
+        }
         if args.pair_only {
             return Ok(());
         }
@@ -1206,6 +1621,15 @@ async fn main() -> Result<()> {
         &paths.config_file.with_file_name("mobile"),
         args.push_config.as_deref(),
         args.push_test_log,
+    )?;
+    let mut lifecycle = remote::gateway_lifecycle::Lifecycle::acquire(
+        &mobile_dir,
+        remote::gateway_lifecycle::Info::new(
+            push.gateway_id.clone(),
+            args.listen.to_string(),
+            args.tls_cert.as_deref(),
+            args.tls_key.as_deref(),
+        )?,
     )?;
     let receipts = remote::receipts::Receipts::new(&paths.root().data_dir.join("mobile"))?;
     let server = Arc::new(Server {
@@ -1236,8 +1660,8 @@ async fn main() -> Result<()> {
             let active: Vec<_> = cleanup.sessions.lock().await.values().cloned().collect();
             for slot in active {
                 slot.session.uploads.lock().await.retain(|id, upload| {
-                    let keep = upload.created.elapsed() < Duration::from_secs(900);
-                    if !keep {
+                    let keep = upload.busy || upload.created.elapsed() < Duration::from_secs(900);
+                    if !keep && !upload.committed {
                         slot.session.upload_quota.lock().unwrap().release(id);
                     }
                     keep
@@ -1269,18 +1693,75 @@ async fn main() -> Result<()> {
         )
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .with_state(server);
-    eprintln!("twr mobile gateway listening on {}", args.listen);
+    crate::gateway_log!("twr mobile gateway listening on {}", args.listen);
     if args.development {
-        axum::serve(tokio::net::TcpListener::bind(args.listen).await?, router).await?;
+        let listener = tokio::net::TcpListener::bind(args.listen).await?;
+        tokio::select! {
+            result = axum::serve(listener, router).into_future() => { result?; },
+            _ = lifecycle.stopping() => {},
+        }
     } else {
-        let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            args.tls_cert.unwrap(),
-            args.tls_key.unwrap(),
-        )
-        .await?;
-        axum_server::bind_rustls(args.listen, config)
-            .serve(router.into_make_service())
-            .await?;
+        let cert = args.tls_cert.unwrap();
+        let key = args.tls_key.unwrap();
+        use sha2::Digest;
+        let cert_bytes = std::fs::read(&cert)?;
+        let key_bytes = std::fs::read(&key)?;
+        let config =
+            axum_server::tls_rustls::RustlsConfig::from_pem(cert_bytes.clone(), key_bytes.clone())
+                .await?;
+        let reload = config.clone();
+        let metadata = lifecycle.metadata();
+        metadata.certificate(hex::encode(sha2::Sha256::digest(&cert_bytes)), &cert, &key)?;
+        let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("Register gateway TLS reload signal")?;
+        tokio::spawn(async move {
+            let signature = |certificate: &[u8], private_key: &[u8]| {
+                let mut digest = sha2::Sha256::new();
+                digest.update(certificate);
+                digest.update(private_key);
+                digest.finalize().to_vec()
+            };
+            let mut previous = signature(&cert_bytes, &key_bytes);
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! { _ = tick.tick() => {}, _ = hangup.recv() => {} }
+                let (Ok(certificate), Ok(private_key)) =
+                    (std::fs::read(&cert), std::fs::read(&key))
+                else {
+                    let _ = metadata.renewal("failed", Some("Certificate or private key could not be read; the previous TLS context remains active"));
+                    crate::gateway_log!("Gateway TLS renewal files could not be read; the previous certificate remains active");
+                    continue;
+                };
+                let current = signature(&certificate, &private_key);
+                if current == previous {
+                    continue;
+                }
+                // Parse exactly the bytes whose digest is published. Certbot's symlink
+                // rotation cannot make metadata claim a certificate we have not loaded.
+                let _ = metadata.renewal("pending", None);
+                match reload
+                    .reload_from_pem(certificate.clone(), private_key)
+                    .await
+                {
+                    Ok(()) => {
+                        previous = current;
+                        let _ = metadata.certificate(
+                            hex::encode(sha2::Sha256::digest(&certificate)),
+                            &cert,
+                            &key,
+                        );
+                    }
+                    Err(_) => {
+                        let _ = metadata.renewal("failed", Some("Certificate or private key could not be loaded; the previous TLS context remains active"));
+                        crate::gateway_log!("Gateway TLS renewal could not be loaded; the previous certificate remains active");
+                    }
+                }
+            }
+        });
+        tokio::select! {
+            result = axum_server::bind_rustls(args.listen, config).serve(router.into_make_service()) => { result?; },
+            _ = lifecycle.stopping() => {},
+        }
     }
     Ok(())
 }
@@ -1292,7 +1773,7 @@ async fn start_observer(server: Shared, workspace: String) {
     tokio::spawn(async move {
         loop {
             if let Err(error) = observe_push(&server, &workspace).await {
-                eprintln!("Push observer for {workspace}: {error}");
+                crate::gateway_log!("Push observer for {workspace}: {error}");
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
@@ -1351,7 +1832,7 @@ async fn observe_push(server: &Server, workspace: &str) -> Result<()> {
           let mut exclude=std::collections::HashSet::new();
           for(id,slot)in slots {if slot.foreground.load(Ordering::SeqCst)&&slot.session.connection.read().await.workspace==workspace{exclude.insert(id);}}
           last_sent=Some(now);
-          if let Err(error)=server.push.deliver(&server.auth,workspace,&exclude,&due).await{eprintln!("Push delivery failed: {error}");}
+          if let Err(error)=server.push.deliver(&server.auth,workspace,&exclude,&due).await{crate::gateway_log!("Push delivery failed: {error}");}
 
          }
         }

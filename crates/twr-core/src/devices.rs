@@ -100,6 +100,20 @@ impl Auth {
         self.save(&db)?;
         Ok(code)
     }
+    /// Cancel exactly this invitation; closing an old window cannot cancel a newer code.
+    pub fn cancel_pairing(&self, code: &str) -> Result<bool> {
+        let _lock = self.lock()?;
+        let mut db = self.read()?;
+        let cancelled = db
+            .pairing
+            .as_ref()
+            .is_some_and(|pairing| pairing.hash == digest(code));
+        if cancelled {
+            db.pairing = None;
+            self.save(&db)?;
+        }
+        Ok(cancelled)
+    }
     fn read(&self) -> Result<Database> {
         use std::os::unix::fs::MetadataExt;
         match std::fs::symlink_metadata(&self.path) {
@@ -244,6 +258,8 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "thread.activity",
             "thread.events",
             "thread.transcript",
+            "conversation.search",
+            "thread.event_context",
             "thread.spawn_status",
             "thread.queue",
             "attention.list",
@@ -286,6 +302,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "device.revoke",
             "device.pair_begin",
             "device.pair_complete",
+            "device.pair_cancel",
             "account.list",
             "account.status",
             "account.add",
@@ -315,6 +332,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "thread.new",
             "thread.spawn",
             "thread.send",
+            "thread.upload",
             "thread.send_cancel",
             "thread.stop",
             "thread.park",
@@ -352,6 +370,31 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelling_an_invitation_never_cancels_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let first = auth.begin(vec!["read".into()]).unwrap();
+        let second = auth.begin(vec!["read".into()]).unwrap();
+        assert!(!auth.cancel_pairing(&first).unwrap());
+        assert!(!auth.cancel_pairing("wrong").unwrap());
+        assert!(auth.pair(&second, "reader").is_ok());
+        let third = auth.begin(vec!["read".into()]).unwrap();
+        assert!(auth.cancel_pairing(&third).unwrap());
+        assert!(!auth.cancel_pairing(&third).unwrap());
+        assert!(auth.pair(&third, "reader").is_err());
+    }
+    #[test]
+    fn read_only_history_access_cannot_answer_or_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let (device, _) = auth.pair(&code, "reader").unwrap();
+        assert!(device.allows("conversation.search"));
+        assert!(device.allows("thread.event_context"));
+        assert!(!device.allows("attention.respond"));
+        assert!(!device.allows("thread.send"));
+    }
     #[test]
     fn pairing_is_one_use_and_revocation_is_immediate() {
         let dir = tempfile::tempdir().unwrap();

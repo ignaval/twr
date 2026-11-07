@@ -251,13 +251,28 @@ export async function multiHubQA({
     gateway.kill();
     await new Promise((resolve) => gateway.once("exit", resolve));
     await notification(secondGateway, "work", "twr · offline hub QA");
-    await expect(page.locator(".mobile-onboarding")).toBeVisible({
+    // The previously visited hub can reopen its encrypted cache even though
+    // its gateway is unavailable. Verify its identity and disabled authority.
+    await expect(page.locator(".offline-banner")).toContainText("Offline", {
       timeout: 40000,
     });
-    await expect(page.locator(".mobile-onboarding [role=alert]")).toContainText(
-      /connect|authenticate/i,
-    );
+    await expect(
+      page.getByRole("button", { name: /^Remote hub settings:/ }),
+    ).toHaveText("Second hub QA");
+    await expect(
+      page.getByRole("button", { name: "Search conversations", exact: true }),
+    ).toBeDisabled();
     assert.equal(await page.locator(".live-mark").count(), 0);
+    const dismissError = page.getByRole("button", {
+      name: "Dismiss error",
+      exact: true,
+    });
+    if (await dismissError.isVisible()) await dismissError.click();
+    const dismissConnection = page.locator(".mobile-error button");
+    if (await dismissConnection.isVisible()) await dismissConnection.click();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
+    await page.getByRole("button", { name: "Switch hub", exact: true }).click();
+    await expect(page.locator(".mobile-onboarding")).toBeVisible();
     await page
       .locator(".hub-connect")
       .filter({ hasText: "QA workstation" })
@@ -266,7 +281,7 @@ export async function multiHubQA({
       page.getByRole("button", { name: /^Remote hub settings:/ }),
     ).toHaveText("QA workstation");
     console.log(
-      "PASS: a failed notification hub switch returns to the hub list and reconnects cleanly",
+      "PASS: an offline notification hub opens its own cache without live authority and switches back cleanly",
     );
   } finally {
     gateway?.kill();

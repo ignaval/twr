@@ -102,6 +102,26 @@ node mobile/scripts/ios-qa.mjs
 node scripts/performance-report.mjs
 ```
 
+Packaged Mac performance runs also write `packaged-native-foreground.json`. The helper
+identifies only the isolated fixture app, records the native frontmost PID and overlapping
+windows before and after sampling, and skips activation while `loginwindow` owns the screen.
+Default QA and CI can finish while the session is locked; their timing is classified as
+`occluded-or-inactive` and must not be presented as foreground interaction latency.
+For a foreground-only sample, unlock the Mac, keep other UI automation paused, and run:
+
+```sh
+TWR_PERF=1 TWR_PERF_REQUIRE_FOREGROUND=1 npm run test:qa:mac
+```
+
+The 2026-11-07 local review build passed functional packaged QA while the Mac remained
+locked. Native evidence recorded `loginwindow` as frontmost (PID 1355), an inactive target
+app, and one higher overlapping window. Its later occluded diagnostic observed 291 ms
+for 1,000 tool calls, 1 ms RPC p95, 16 ms input-to-next-frame p95, and no long tasks;
+an earlier occluded run observed 145 ms input-to-next-frame p95. These variations do not
+identify a cause or establish foreground responsiveness. A foreground latency check remains
+pending until the user unlocks the Mac. No product identity or permission policy is relaxed
+for these measurements.
+
 Native iOS QA requires Xcode 27.1 and installed phone/Duo runtimes. The Mobile CI workflow
 uses the Xcode 27 runner. Raw samples, viewport/device details, screenshots and the HTML
 report are written under ignored `clients/test-results`. Preserve these with each release

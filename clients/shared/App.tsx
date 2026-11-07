@@ -1,4 +1,16 @@
+import {
+  appendDraft,
+  messageDraft,
+  offlineJournal,
+  type OfflineJournal,
+} from "./offline";
+import { TerminalSnapshots } from "./terminalSnapshots";
+import { Outbox } from "./Outbox";
+import { UploadController } from "./uploads";
+import { AttachmentManager } from "./AttachmentManager";
 import { MessageBody } from "./MessageBody";
+import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
+import { PaneResize } from "./LayoutOptions";
 import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
@@ -68,6 +80,7 @@ import {
 } from "./commands";
 import type {
   Attention,
+  InboxSource,
   DesktopEvent,
   HubEvent,
   Json,
@@ -204,13 +217,17 @@ export default function App({
   const visibleNav = nav.filter(
     (n) =>
       !(
-        ["accounts", "boxes", "settings", "maintenance"].includes(n.id) &&
+        ["accounts", "boxes", "maintenance"].includes(n.id) &&
         !permitted("admin")
       ),
   );
 
   const [view, setView] = useState(initial);
   const [workspace, setWorkspace] = useState("default");
+  const [hostId, setHostId] = useState("local");
+  const [inboxSources, setInboxSources] = useState<InboxSource[]>([]);
+  const [inboxRefreshing, setInboxRefreshing] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [homePath, setHomePath] = useState("");
   const [workspaces, setWorkspaces] = useState<Json[]>([]);
   const [paths, setPaths] = useState<Json>();
@@ -230,32 +247,93 @@ export default function App({
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
   const observedDestination = useRef<string | undefined>(undefined);
-  const mobileDraftKey = useRef(
-    `twr.mobile.drafts.${document.documentElement.dataset.hub || ""}`,
-  ).current;
-  const [drafts, setDrafts] = useState<Record<string, string>>(() => {
-    if (document.documentElement.dataset.mobile !== "true") return {};
-    try {
-      const value = JSON.parse(localStorage.getItem(mobileDraftKey) || "{}");
-      return value && typeof value === "object" && !Array.isArray(value)
-        ? Object.fromEntries(
-            Object.entries(value).filter(
-              (entry): entry is [string, string] =>
-                typeof entry[1] === "string",
-            ),
-          )
-        : {};
-    } catch {
-      return {};
-    }
-  });
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const currentDrafts = useRef(drafts);
+  currentDrafts.current = drafts;
+  const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
+  const pendingEnqueue = useRef<
+    { key: string; text: string; saved: boolean } | undefined
+  >(undefined);
+  const [journal, setJournal] = useState<OfflineJournal>();
+  const [offlineNotice, setOfflineNotice] = useState("");
   useEffect(() => {
-    if (document.documentElement.dataset.mobile === "true") {
-      try {
-        localStorage.setItem(mobileDraftKey, JSON.stringify(drafts));
-      } catch {}
-    }
-  }, [drafts, mobileDraftKey]);
+    const reset = (event: Event) => {
+      if ((event as CustomEvent).detail?.hostId === hostId) {
+        setDrafts({});
+        setJournal(offlineJournal(hostApi, hostId));
+        setOfflineNotice("");
+      }
+    };
+    const ready = (event: Event) => {
+      if ((event as CustomEvent).detail?.hostId !== hostId) return;
+      const saved = offlineJournal(hostApi, hostId);
+      void saved
+        .load()
+        .then(() => {
+          setDrafts((current) => ({ ...saved.snapshot.drafts, ...current }));
+          setJournal(saved);
+          setOfflineNotice("");
+        })
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    };
+    window.addEventListener("twr:offline-ready", ready);
+    window.addEventListener("twr:offline-reset", reset);
+    return () => {
+      window.removeEventListener("twr:offline-reset", reset);
+      window.removeEventListener("twr:offline-ready", ready);
+    };
+  }, [hostId]);
+  const liveView = useRef(false);
+  const hasLiveSnapshot = useRef(false);
+  const [uploads] = useState(
+    () =>
+      new UploadController(hostApi, (attachment) => {
+        const key = attachment.workspace + ":" + attachment.thread;
+        const orchKey = attachment.workspace + ":orchestrator";
+        setDrafts((old) => {
+          const targetKey =
+            attachment.thread ===
+            currentOrchestrator.current[attachment.workspace]
+              ? orchKey
+              : key;
+          return {
+            ...old,
+            [targetKey]:
+              `${old[targetKey] || ""}\nUploaded file: ${attachment.file.name}\n${attachment.path}\n`.trimStart(),
+          };
+        });
+      }),
+  );
+  const currentOrchestrator = useRef<Record<string, string | undefined>>({});
+  useEffect(() => () => uploads.dispose(), [uploads]);
+  useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
+  useEffect(() => {
+    if (!journal) return;
+    const pending = pendingEnqueue.current;
+    if (pending?.saved && drafts[pending.key] !== pending.text)
+      pendingEnqueue.current = undefined;
+    const epoch = journal.epoch;
+    let timer: ReturnType<typeof setTimeout>;
+    const persist = () => {
+      if (pendingEnqueue.current) {
+        timer = setTimeout(persist, 100);
+        draftSaveTimer.current = timer;
+        return;
+      }
+      void journal
+        .drafts(currentDrafts.current, epoch)
+        .then(() => setOfflineNotice(""))
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    };
+    timer = setTimeout(persist, 350);
+    draftSaveTimer.current = timer;
+    return () => {
+      clearTimeout(timer);
+      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+    };
+  }, [journal, drafts]);
   const [sending, setSending] = useState(false);
   const slashPending = useRef(false);
   const [queued, setQueued] = useState<Json[]>([]);
@@ -288,6 +366,7 @@ export default function App({
   const [transcriptRefresh, setTranscriptRefresh] = useState(0);
   const [queueRefresh, setQueueRefresh] = useState(0);
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
+  const terminalSnapshots = useRef(new TerminalSnapshots());
   const [activeTerminal, setActiveTerminal] = useState<string>();
   const [terminalVisible, setTerminalVisible] = useState(true);
   const [confirmation, setConfirmation] = useState<{
@@ -323,6 +402,7 @@ export default function App({
     [],
   );
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
+  currentOrchestrator.current[workspace] = orchestrator?.id;
   const target = destination
     ? view.threads.find((t) => t.id === destination)
     : orchestrator;
@@ -430,13 +510,47 @@ export default function App({
     const parsed = JSON.parse(value.stdout);
     setWorkspaces(Array.isArray(parsed) ? parsed : parsed.workspaces || []);
   }, []);
+  const inboxGeneration = useRef(0);
+  const refreshInboxSources = useCallback(async () => {
+    if (!hostApi.inboxSources) return;
+    const generation = ++inboxGeneration.current;
+    setInboxRefreshing(true);
+    try {
+      const sources = await hostApi.inboxSources();
+      if (generation === inboxGeneration.current)
+        setInboxSources(
+          sources.map((source) => ({
+            ...source,
+            updatedAt:
+              source.updatedAt ||
+              (!source.cached && !source.error && source.running !== false
+                ? Date.now()
+                : undefined),
+          })),
+        );
+    } catch (error) {
+      if (generation === inboxGeneration.current) {
+        setInboxSources((old) =>
+          old.map((source) => ({ ...source, cached: true })),
+        );
+        fail(error);
+      }
+    } finally {
+      if (generation === inboxGeneration.current) setInboxRefreshing(false);
+    }
+  }, [hostApi, fail]);
+  useEffect(() => {
+    if (section === "attention" && connected) void refreshInboxSources();
+  }, [section, connected, workspace, refreshInboxSources]);
   const openTerminal = useCallback(
     async (
       request: Parameters<typeof hostApi.terminalOpen>[0],
       throwOnFailure = false,
     ) => {
       try {
+        terminalSnapshots.current.changed();
         const session = await hostApi.terminalOpen(request);
+        terminalSnapshots.current.changed();
         setTerminals((old) => [...old, session]);
         setActiveTerminal(session.id);
         setTerminalVisible(true);
@@ -455,6 +569,14 @@ export default function App({
       activeThread.current = undefined;
       connectionRef.current = false;
       setWorkspace(name);
+      setSearchOpen(false);
+      inboxGeneration.current++;
+      setInboxRefreshing(false);
+      setInboxSources((old) =>
+        old.map((source) => ({ ...source, cached: true })),
+      );
+      liveView.current = false;
+      hasLiveSnapshot.current = false;
       setView(initial);
       setConnected(false);
       setConnecting(true);
@@ -501,14 +623,29 @@ export default function App({
   }, [connect, workspace]);
   useEffect(() => {
     let refreshingTerminals = false;
+    let terminalsDirty = false;
+    let stopped = false;
     const api = hostApi;
     const refreshTerminals = () => {
-      if (refreshingTerminals) return;
+      if (stopped) return;
+      if (refreshingTerminals) {
+        terminalsDirty = true;
+        return;
+      }
       refreshingTerminals = true;
+      const revision = terminalSnapshots.current.begin();
       void api
         .bootstrap()
         .then((boot) => {
-          const sessions = boot.terminals || [];
+          const sessions = terminalSnapshots.current.apply(
+            revision,
+            boot.terminals || [],
+          );
+          if (stopped) return;
+          if (!sessions) {
+            terminalsDirty = true;
+            return;
+          }
           setTerminals(sessions);
           setActiveTerminal((id) =>
             sessions.some((session) => session.id === id)
@@ -519,6 +656,10 @@ export default function App({
         .catch(() => {})
         .finally(() => {
           refreshingTerminals = false;
+          if (terminalsDirty && !stopped) {
+            terminalsDirty = false;
+            refreshTerminals();
+          }
         });
     };
     const unsubscribe = hostApi.onEvent((event) => {
@@ -526,11 +667,17 @@ export default function App({
         refreshTerminals();
       if (event.type === "resync" && event.scope !== "terminal")
         setTranscriptRefresh((n) => n + 1);
-      if (event.type === "state" && event.state) setView(event.state);
+      if (event.type === "state" && event.state) {
+        liveView.current = true;
+        hasLiveSnapshot.current = true;
+        setView(event.state);
+        if (connectionRef.current) setConnected(true);
+      }
       if (event.type === "connection") {
         const restored = event.connected && !connectionRef.current;
         connectionRef.current = !!event.connected;
-        setConnected(!!event.connected);
+        if (!event.connected) liveView.current = false;
+        setConnected(!!event.connected && liveView.current);
         setConnectionError(event.error || "");
         if (restored) {
           refreshTerminals();
@@ -574,25 +721,65 @@ export default function App({
         setConnectionError(event.error || "Configuration needs repair");
         setSection("settings");
       }
-      if (event.type === "terminal-exit")
+      if (event.type === "terminal-exit") {
+        terminalSnapshots.current.changed();
         setTerminals((old) =>
           old.map((t) => (t.id === event.id ? { ...t, exited: true } : t)),
         );
-      if (event.type === "terminal-removed")
+      }
+      if (event.type === "terminal-removed") {
+        if (event.id) terminalSnapshots.current.removed(event.id);
         setTerminals((old) => old.filter((t) => t.id !== event.id));
+      }
       if (event.type === "menu-new") actionRef.current("new");
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");
       }
     });
+    const initialTerminalRevision = terminalSnapshots.current.begin();
     void hostApi
       .bootstrap()
       .then((boot) => {
+        if (stopped) return;
+        const id = boot.hostId || "local";
+        setHostId(id);
+        const saved = offlineJournal(hostApi, id);
+        void saved
+          .load()
+          .then(async () => {
+            // Migrate previous mobile message drafts into device-encrypted storage.
+            const oldKey = `twr.mobile.drafts.${document.documentElement.dataset.hub || ""}`;
+            let legacy: Record<string, string> = {};
+            try {
+              legacy = JSON.parse(localStorage.getItem(oldKey) || "{}");
+            } catch {}
+            const previous = Object.fromEntries(
+              Object.entries(legacy || {}).filter(
+                (entry): entry is [string, string] =>
+                  typeof entry[1] === "string",
+              ),
+            );
+            const restored = { ...previous, ...saved.snapshot.drafts };
+            if (Object.keys(previous).length) {
+              await saved.drafts(restored);
+              localStorage.removeItem(oldKey);
+            }
+            setDrafts((current) => ({ ...restored, ...current }));
+            setJournal(saved);
+            setOfflineNotice(saved.historyError);
+          })
+          .catch((error) => setOfflineNotice(errorMessage(error)));
         setAllowedMethods(boot.allowed_methods);
         document.documentElement.dataset.platform = boot.platform;
-        setTerminals(boot.terminals || []);
-        setActiveTerminal(boot.terminals?.at(-1)?.id);
+        const sessions = terminalSnapshots.current.apply(
+          initialTerminalRevision,
+          boot.terminals || [],
+        );
+        if (sessions) {
+          setTerminals(sessions);
+          setActiveTerminal(sessions.at(-1)?.id);
+        } else refreshTerminals();
         document.documentElement.dataset.theme = savedAppearance();
         applyOmarchyTheme(boot.theme);
         setHomePath(boot.home);
@@ -601,12 +788,72 @@ export default function App({
       .catch(fail);
     void hostApi.catalog().then(setCliCommands).catch(fail);
     return () => {
+      stopped = true;
       unsubscribe();
       if (eventTimer.current) clearTimeout(eventTimer.current);
       eventTimer.current = undefined;
       pendingEvents.current = [];
     };
   }, []);
+  useEffect(() => {
+    if (!journal || connected || hasLiveSnapshot.current) return;
+    const cached = journal.snapshot.workspaces[workspace];
+    if (cached) {
+      setView(cached.view);
+      setEvents(
+        cached.transcripts[
+          target?.id ||
+            cached.view.threads.find((t) => t.is_orchestrator)?.id ||
+            ""
+        ] || [],
+      );
+    }
+  }, [journal, connected, workspace, target?.id]);
+  const latestCache = useRef({
+    view,
+    events,
+    thread: activeThread.current,
+    transcriptLoading,
+    transcriptError,
+  });
+  latestCache.current = {
+    view,
+    events,
+    thread: activeThread.current,
+    transcriptLoading,
+    transcriptError,
+  };
+  useEffect(() => {
+    if (!journal || !hasLiveSnapshot.current) return;
+    let saved: typeof latestCache.current | undefined;
+    const save = () => {
+      const latest = latestCache.current;
+      if (
+        saved?.view === latest.view &&
+        saved.events === latest.events &&
+        saved.thread === latest.thread
+      )
+        return;
+      void journal
+        .cache(
+          workspace,
+          latest.view,
+          !latest.transcriptLoading && !latest.transcriptError
+            ? latest.thread
+            : undefined,
+          latest.events,
+        )
+        .then(() => {
+          saved = latest;
+        })
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    };
+    // Flush on loss and throttle streaming history instead of postponing it forever.
+    save();
+    if (!connected) return;
+    const timer = setInterval(save, 5000);
+    return () => clearInterval(timer);
+  }, [journal, workspace, connected]);
   useEffect(() => {
     const media = window.matchMedia("(max-width:800px)");
     const change = () => {
@@ -625,9 +872,17 @@ export default function App({
   }, [connected, refreshInfo, refreshWorkspaces]);
   useEffect(() => {
     const id = target?.id;
+    const previousThread = activeThread.current;
     activeThread.current = id;
     const generation = ++transcriptGeneration.current;
-    setEvents([]);
+    const buffered = pendingEvents.current.splice(0);
+    setEvents((previous) =>
+      !connected && hasLiveSnapshot.current && previousThread === id
+        ? mergeEvents(previous, buffered)
+        : !connected && journal && id
+          ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
+          : [],
+    );
     setTranscriptError("");
     setEarliestTurn(undefined);
     activeSubscription.current = "";
@@ -772,6 +1027,16 @@ export default function App({
         return;
       }
       const mod = mac ? event.metaKey : event.ctrlKey;
+      if (
+        mod &&
+        event.key.toLowerCase() === "f" &&
+        !event.shiftKey &&
+        !(event.target as HTMLElement)?.closest(".terminal-surface")
+      ) {
+        event.preventDefault();
+        if (connectionRef.current && liveView.current) setSearchOpen(true);
+        return;
+      }
       const inTerminal = (event.target as HTMLElement)?.closest(
         ".terminal-surface",
       );
@@ -902,7 +1167,12 @@ export default function App({
   };
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
-    if (!permitted("operate") || !draft.trim() || sending || !connected) return;
+    if (!permitted("operate") || !draft.trim() || sending) return;
+    if (
+      !connected &&
+      (!journal || draft.startsWith("/") || draft.startsWith("!"))
+    )
+      return;
     if (draft.startsWith("/") && !draft.startsWith("//")) {
       await submitSlash(draft);
       return;
@@ -949,24 +1219,73 @@ export default function App({
             [...old, { job: response.job, command }].slice(-5),
           );
         }
-      } else
-        response = destination
-          ? await rpc("thread.send", { thread: destination, prompt: text })
-          : await rpc("say", {
+      } else {
+        const method = destination ? "thread.send" : "say";
+        const params = destination
+          ? { thread: destination, prompt: text }
+          : {
               message: text,
               seen_gseq: view.head,
               to: "orchestrator",
               suggested:
                 acceptedSuggestion?.key === key &&
                 acceptedSuggestion.text === text,
+            };
+        // Live replies to a waiting request use only the current visible head.
+        // They never enter the delayed message outbox or receive automatic retries.
+        const liveReply =
+          !destination &&
+          connected &&
+          liveView.current &&
+          view.attention.some(
+            (item) =>
+              item.reason === "permission" || item.reason === "question",
+          );
+        if (journal && hostApi.sendMessage && !liveReply) {
+          const pending = { key, text: draft, saved: false };
+          pendingEnqueue.current = pending;
+          const epoch = journal.epoch;
+          clearTimeout(draftSaveTimer.current);
+          draftSaveTimer.current = undefined;
+          const message = await journal
+            .enqueue(workspace, method, params, draft)
+            .catch((error) => {
+              if (pendingEnqueue.current === pending)
+                pendingEnqueue.current = undefined;
+              void journal.drafts(currentDrafts.current, epoch).catch(() => {});
+              throw error;
             });
+          pending.saved = true;
+          setDrafts((old) => ({
+            ...old,
+            [key]: old[key] === draft ? "" : old[key],
+          }));
+          if (connected) response = await journal.deliver(message);
+          else response = { saved_offline: true };
+        } else response = await rpc(method, params);
+      }
+
+      for (const restored of response.restored_drafts || [])
+        setDrafts((old) => ({
+          ...old,
+          [restored.key]: appendDraft(old[restored.key], restored.text),
+        }));
       if (response.action === "pending") {
+        setDrafts((old) => ({
+          ...old,
+          [key]: appendDraft(old[key], draft),
+        }));
         setSection("attention");
         throw new Error(
           "Message not sent. Review the waiting requests and answer the exact item shown.",
         );
       }
-      setDrafts((old) => ({ ...old, [key]: "" }));
+      setDrafts((old) => ({
+        ...old,
+        [key]: old[key] === draft ? "" : old[key],
+      }));
+      if (!response.saved_offline && target)
+        uploads.dismissReady(target.id, workspace, draft);
       setQueueRefresh((n) => n + 1);
     } catch (e) {
       fail(e);
@@ -1362,7 +1681,7 @@ export default function App({
   const attentionFor = (id: string) =>
     view.attention.filter((a) => a.thread === id);
   const respond = async (item: Attention, answer: string, message?: string) => {
-    if (!permitted("operate")) return;
+    if (!connected || !liveView.current || !permitted("operate")) return;
     try {
       await rpc("attention.respond", {
         attn_id: item.attn_id,
@@ -1454,6 +1773,7 @@ export default function App({
       />
       <aside
         className="sidebar"
+        id="twr-sidebar"
         onClick={(event) => {
           if (
             window.innerWidth <= 800 &&
@@ -1464,6 +1784,7 @@ export default function App({
             setSidebar(false);
         }}
       >
+        <PaneResize pane="sidebar" />
         <div className="brand drag-region">
           <span className="wordmark">
             twr<span>_</span>
@@ -1633,10 +1954,7 @@ export default function App({
                 : "Ctrl K"}
             </span>
           </button>
-          <button
-            disabled={!permitted("admin")}
-            onClick={() => setSection("settings")}
-          >
+          <button onClick={() => setSection("settings")}>
             <Settings2 size={15} />
             Settings
           </button>
@@ -1652,6 +1970,20 @@ export default function App({
         </div>
       </aside>
       <main className="main-shell">
+        {!connected && journal?.snapshot.workspaces[workspace] && (
+          <div className="offline-banner" role="status">
+            Offline · saved{" "}
+            {new Date(
+              journal.snapshot.workspaces[workspace].savedAt,
+            ).toLocaleString()}
+            . Requests need a live connection before you can answer.
+          </div>
+        )}
+        {offlineNotice && (
+          <div className="offline-banner" role="status">
+            {offlineNotice}
+          </div>
+        )}
         <header className="topbar drag-region">
           <div className="topbar-left no-drag">
             {!sidebar && (
@@ -1707,6 +2039,15 @@ export default function App({
           <div className="topbar-actions no-drag">
             <button
               className="icon-button"
+              aria-label="Search conversations"
+              title="Search conversations (⌘/Ctrl F)"
+              disabled={!connected}
+              onClick={() => setSearchOpen(true)}
+            >
+              <Search size={17} />
+            </button>
+            <button
+              className="icon-button"
               aria-label="Open shell"
               disabled={!permitted("terminal")}
               title={
@@ -1733,74 +2074,96 @@ export default function App({
             >
               <CommandIcon size={17} />
             </button>
-            {section === "chat" && (
-              <details className="conversation-menu">
-                <summary aria-label="Thread actions">
-                  <MoreHorizontal size={18} />
-                </summary>
-                <div
-                  onClick={(event) =>
-                    (
-                      event.currentTarget.parentElement as HTMLDetailsElement
-                    ).removeAttribute("open")
+            <details className="conversation-menu">
+              <summary
+                aria-label={
+                  section === "chat" ? "Thread actions" : "More actions"
+                }
+              >
+                <MoreHorizontal size={18} />
+              </summary>
+              <div
+                onClick={(event) =>
+                  (
+                    event.currentTarget.parentElement as HTMLDetailsElement
+                  ).removeAttribute("open")
+                }
+              >
+                <button onClick={() => setSidebar(true)}>
+                  <PanelLeftOpen size={16} />
+                  Threads and navigation
+                </button>
+                <button
+                  disabled={!permitted("operate")}
+                  onClick={() => action("new")}
+                >
+                  <Plus size={16} />
+                  New thread
+                </button>
+                <button
+                  disabled={!permitted("terminal")}
+                  onClick={() =>
+                    void openTerminal({
+                      shell: true,
+                      cwd: localWorkingDirectory(target, homePath) || undefined,
+                    })
                   }
                 >
-                  <button onClick={() => setSidebar(true)}>
-                    <PanelLeftOpen size={16} />
-                    Threads and navigation
-                  </button>
-                  <button
-                    disabled={!permitted("operate")}
-                    onClick={() => action("new")}
-                  >
-                    <Plus size={16} />
-                    New thread
-                  </button>
-                  <button
-                    aria-pressed={showTools}
-                    onClick={() => setShowTools((v) => !v)}
-                  >
-                    <Wrench size={16} />
-                    Tool calls
-                  </button>
-                  <button
-                    aria-pressed={showThinking}
-                    onClick={() => setShowThinking((v) => !v)}
-                  >
-                    <Eye size={16} />
-                    Reasoning
-                  </button>
-                  {target && (
-                    <button onClick={() => void exportConversation()}>
-                      <Download size={16} />
-                      Export conversation
+                  <TerminalSquare size={16} />
+                  Open shell
+                </button>
+                {section === "chat" && (
+                  <>
+                    <button
+                      aria-pressed={showTools}
+                      onClick={() => setShowTools((v) => !v)}
+                    >
+                      <Wrench size={16} />
+                      Tool calls
                     </button>
-                  )}
-                  <button
-                    onClick={() =>
-                      action(
-                        destination ? "model" : "orch",
-                        destination ? { thread: destination } : {},
-                      )
-                    }
-                  >
-                    <Settings2 size={16} />
-                    {destination ? "Thread settings" : "Orchestrator settings"}
-                  </button>
-                  <button
-                    onClick={() => {
-                      setPalette(true);
-                      setQuery("");
-                    }}
-                  >
-                    <Search size={16} />
-                    Commands
-                  </button>
-                </div>
-              </details>
-            )}
+                    <button
+                      aria-pressed={showThinking}
+                      onClick={() => setShowThinking((v) => !v)}
+                    >
+                      <Eye size={16} />
+                      Reasoning
+                    </button>
+                    {target && (
+                      <button onClick={() => void exportConversation()}>
+                        <Download size={16} />
+                        Export conversation
+                      </button>
+                    )}
+                    <button
+                      onClick={() =>
+                        action(
+                          destination ? "model" : "orch",
+                          destination ? { thread: destination } : {},
+                        )
+                      }
+                    >
+                      <Settings2 size={16} />
+                      {destination
+                        ? "Thread settings"
+                        : "Orchestrator settings"}
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => {
+                    setPalette(true);
+                    setQuery("");
+                  }}
+                >
+                  <Search size={16} />
+                  Commands
+                </button>
+              </div>
+            </details>
             <button
               className="topbar-new-thread"
+              aria-label="New thread"
+              title="New thread"
               disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
@@ -1916,7 +2279,7 @@ export default function App({
                         key={item.attn_id + ":" + item.revision}
                         item={item}
                         thread={view.threads.find((t) => t.id === item.thread)}
-                        readOnly={!permitted("operate")}
+                        readOnly={!connected || !permitted("operate")}
                         onRespond={respond}
                         rpc={rpc}
                         fail={fail}
@@ -1957,6 +2320,45 @@ export default function App({
                         </button>
                       ))}
                   </details>
+                )}
+                <Outbox
+                  journal={journal}
+                  workspace={workspace}
+                  connected={connected}
+                  onSent={(result) => {
+                    setQueueRefresh((n) => n + 1);
+                    for (const restored of [
+                      ...(result.restored_drafts || []),
+                      ...(result.restored_draft ? [result.restored_draft] : []),
+                    ])
+                      setDrafts((old) => ({
+                        ...old,
+                        [restored.key]: appendDraft(
+                          old[restored.key],
+                          restored.text,
+                        ),
+                      }));
+                  }}
+                  onCopy={(message) => {
+                    const key =
+                      message.workspace +
+                      ":" +
+                      (message.method === "say"
+                        ? "orchestrator"
+                        : message.params.thread);
+                    const text = messageDraft(message);
+                    setDrafts((old) => ({
+                      ...old,
+                      [key]: appendDraft(old[key], text),
+                    }));
+                  }}
+                />
+                {target && (
+                  <AttachmentManager
+                    controller={uploads}
+                    thread={target.id}
+                    workspace={workspace}
+                  />
                 )}
                 {queued.length > 0 && (
                   <div className="queue">
@@ -2142,7 +2544,7 @@ export default function App({
                         draft.split("\n").length,
                       ),
                     )}
-                    disabled={!connected || !permitted("operate")}
+                    disabled={(!connected && !journal) || !permitted("operate")}
                     onKeyDown={(e) => {
                       if (e.nativeEvent.isComposing || e.keyCode === 229)
                         return;
@@ -2215,29 +2617,15 @@ export default function App({
                           aria-label="Upload files"
                           multiple
                           disabled={!connected || !target || sending}
-                          onChange={async (event) => {
+                          onChange={(event) => {
                             const files = Array.from(event.target.files || []);
                             event.target.value = "";
-                            if (!target) return;
-                            const thread = target.id;
-                            const key = draftKey;
-                            setSending(true);
-                            try {
-                              for (const file of files) {
-                                const uploaded = await hostApi.uploadFile!(
-                                  file,
-                                  thread,
-                                );
-                                setDrafts((old) => ({
-                                  ...old,
-                                  [key]:
-                                    `${old[key] || ""}\nUploaded file: ${file.name}\n${uploaded.path}\n`.trimStart(),
-                                }));
+                            if (target) {
+                              try {
+                                uploads.add(files, target.id, workspace);
+                              } catch (error) {
+                                fail(error);
                               }
-                            } catch (error) {
-                              fail(error);
-                            } finally {
-                              setSending(false);
                             }
                           }}
                         />
@@ -2264,11 +2652,21 @@ export default function App({
                       disabled={
                         !permitted("operate") ||
                         !draft.trim() ||
-                        !connected ||
+                        (!connected &&
+                          (!journal ||
+                            draft.startsWith("/") ||
+                            draft.startsWith("!"))) ||
                         (!target && !draft.startsWith("/")) ||
                         sending
                       }
-                      aria-label="Send message"
+                      aria-label={
+                        connected ? "Send message" : "Save message for later"
+                      }
+                      title={
+                        connected
+                          ? "Send message"
+                          : "Save on this device until the hub reconnects"
+                      }
                     >
                       {sending ? <Spinner /> : <ArrowUp size={18} />}
                     </button>
@@ -2370,40 +2768,71 @@ export default function App({
               </div>
             )}
             {section === "attention" && (
-              <div className="manager">
-                <header className="section-heading">
-                  <div>
-                    <span className="eyebrow">Your attention</span>
-                    <h1>
-                      Needs you{" "}
-                      <span className="heading-count">
-                        {view.attention.length}
-                      </span>
-                    </h1>
-                    <p>
-                      Review the request, then decide. Your agents will take it
-                      from there.
-                    </p>
-                  </div>
-                </header>
-                {view.attention.map((item) => (
+              <NeedsYouInbox
+                source={{
+                  hubId: hostId,
+                  cached: !connected,
+                  provisional:
+                    !connected &&
+                    !hasLiveSnapshot.current &&
+                    !journal?.snapshot.workspaces[workspace],
+                  updatedAt: !connected
+                    ? journal?.snapshot.workspaces[workspace]?.savedAt
+                    : undefined,
+                  hubName:
+                    hostId === "local"
+                      ? "This computer"
+                      : String(
+                          inboxSources.find((source) => source.hubId === hostId)
+                            ?.hubName ||
+                            info?.hostname ||
+                            hostId,
+                        ),
+                  workspace,
+                  attention:
+                    !connected && !hasLiveSnapshot.current
+                      ? journal?.snapshot.workspaces[workspace]?.view
+                          .attention || view.attention
+                      : view.attention,
+                  threads:
+                    !connected && !hasLiveSnapshot.current
+                      ? journal?.snapshot.workspaces[workspace]?.view.threads ||
+                        view.threads
+                      : view.threads,
+                }}
+                sources={inboxSources}
+                refreshing={inboxRefreshing}
+                onRefresh={() => void refreshInboxSources()}
+                onOpenSource={(source) => {
+                  if (source.hubId === hostId)
+                    void connect(source.workspace).then(() =>
+                      setSection("attention"),
+                    );
+                  else
+                    window.dispatchEvent(
+                      new CustomEvent("twr:select-host", {
+                        detail: {
+                          hubId: source.hubId,
+                          workspace: source.workspace,
+                          attention: true,
+                        },
+                      }),
+                    );
+                }}
+                renderItem={(item) => (
                   <AttentionCard
                     key={item.attn_id + ":" + item.revision}
                     item={item}
-                    thread={view.threads.find((t) => t.id === item.thread)}
-                    readOnly={!permitted("operate")}
+                    thread={view.threads.find(
+                      (thread) => thread.id === item.thread,
+                    )}
+                    readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
                     rpc={rpc}
                     fail={fail}
                   />
-                ))}
-                {!view.attention.length && (
-                  <Empty
-                    title="You’re all caught up"
-                    description="Questions, permissions, and completed work will appear here."
-                  />
                 )}
-              </div>
+              />
             )}
             {section === "decisions" && (
               <div className="manager">
@@ -2428,6 +2857,7 @@ export default function App({
               <Manager
                 key={workspace + ":" + section}
                 section={section}
+                canAdmin={permitted("admin")}
                 workspace={workspace}
                 refreshKey={refresh}
                 rpc={rpc}
@@ -2438,7 +2868,8 @@ export default function App({
             )}
           </div>
           {selectedThread && (
-            <aside className="inspector">
+            <aside className="inspector" id="twr-inspector">
+              <PaneResize pane="inspector" />
               <header>
                 <span className="eyebrow">Thread details</span>
                 <button
@@ -2515,7 +2946,7 @@ export default function App({
                     key={item.attn_id + ":" + item.revision}
                     item={item}
                     thread={selectedThread}
-                    readOnly={!permitted("operate")}
+                    readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
                     rpc={rpc}
                     fail={fail}
@@ -2631,9 +3062,11 @@ export default function App({
                           ? "Remove this terminal tab?"
                           : "Its interactive program will exit. The hub and other agents keep running.",
                         run: () => {
+                          terminalSnapshots.current.changed();
                           void hostApi
                             .terminalClose(t.id)
                             .then(() => {
+                              terminalSnapshots.current.removed(t.id);
                               setTerminals((old) =>
                                 old.filter((s) => s.id !== t.id),
                               );
@@ -2927,6 +3360,24 @@ export default function App({
           </footer>
         </Dialog>
       )}
+      {searchOpen && (
+        <ConversationSearch
+          rpc={rpc}
+          workspace={workspace}
+          hubName={
+            hostId === "local"
+              ? "This computer"
+              : String(
+                  inboxSources.find((source) => source.hubId === hostId)
+                    ?.hubName ||
+                    info?.hostname ||
+                    hostId,
+                )
+          }
+          threads={view.threads}
+          onClose={() => setSearchOpen(false)}
+        />
+      )}
       {workspaceModal && (
         <Dialog
           title="Workspaces"
@@ -3000,7 +3451,7 @@ export default function App({
             }}
           >
             <MessageSquare size={19} />
-            Chat
+            <span>Chat</span>
           </button>
           <button
             aria-current={section === "attention" ? "page" : undefined}
@@ -3010,8 +3461,10 @@ export default function App({
             }}
           >
             <Bell size={19} />
-            Needs you
-            {view.attention.length ? ` · ${view.attention.length}` : ""}
+            <span>
+              Needs you
+              {view.attention.length ? ` · ${view.attention.length}` : ""}
+            </span>
           </button>
           <button
             aria-current={section === "grid" ? "page" : undefined}
@@ -3021,11 +3474,11 @@ export default function App({
             }}
           >
             <LayoutGrid size={19} />
-            Threads
+            <span>Threads</span>
           </button>
           <button aria-expanded={sidebar} onClick={() => setSidebar((v) => !v)}>
             <MoreHorizontal size={19} />
-            More
+            <span>More</span>
           </button>
         </nav>
       )}

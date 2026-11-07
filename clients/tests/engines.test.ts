@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { it, expect, vi } from "vitest";
 import {
@@ -103,6 +103,14 @@ it("retains an engine used by a live OS process and prunes it after exit", async
     const executable = join(dirs[0], "twr");
     copyFileSync("/bin/sleep", executable);
     chmodSync(executable, 0o755);
+    // Current macOS can kill a copied platform binary after spawn. Give the
+    // disposable fixture its own valid identity before checking live retention.
+    if (globalThis.process.platform === "darwin")
+      execFileSync(
+        "/usr/bin/codesign",
+        ["--force", "--sign", "-", executable],
+        { stdio: "ignore" },
+      );
     utimesSync(dirs[0], new Date(0), new Date(0));
     process = spawn(executable, ["60"], { stdio: "ignore" });
     const exited = once(process, "exit");

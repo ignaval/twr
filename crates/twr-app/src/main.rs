@@ -174,6 +174,9 @@ async fn run_call(
     looking: watch::Sender<bool>,
 ) {
     let result: Result<Value> = async {
+        if std::env::var_os("TWR_BRIDGE_READ_ONLY").is_some() {
+            anyhow::ensure!(matches!(call.method.as_str(), "hub.info" | "attention.list" | "thread.list"), "Inbox connections only read workspace summaries");
+        }
         if call.method == "desktop.cli_plan" {
             let args: Vec<String> = serde_json::from_value(call.params["args"].clone())?;
             let workspace = call.params["workspace"].as_str().context("Workspace required")?;
@@ -351,7 +354,9 @@ async fn run_call(
     }.await;
     let response = match result {
         Ok(v) => json!({"id":call.id,"result":v}),
-        Err(e) => json!({"id":call.id,"error":format!("{e:#}")}),
+        Err(e) => {
+            json!({"id":call.id,"error":format!("{e:#}"),"rpc_error":e.downcast_ref::<twr_core::proto::RpcError>()})
+        }
     };
     let _ = tx.send(response).await;
 }
@@ -399,30 +404,35 @@ async fn main() -> Result<()> {
             .send(json!({"type":"config-error","error":format!("{error:#}")}))
             .await;
     }
+    let read_only = std::env::var_os("TWR_BRIDGE_READ_ONLY").is_some();
     let state_out = tx.clone();
-    tokio::spawn(async move {
-        while state_rx.changed().await.is_ok() {
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            let view = state_rx.borrow_and_update().clone();
-            if state_out
-                .send(json!({"type":"state","state":view}))
-                .await
-                .is_err()
-            {
-                break;
+    let state_pump = (!read_only).then(|| {
+        tokio::spawn(async move {
+            while state_rx.changed().await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                let view = state_rx.borrow_and_update().clone();
+                if state_out
+                    .send(json!({"type":"state","state":view}))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }
+        })
     });
     let presentation = Arc::new(std::sync::Mutex::new(twr_app::Presentation::default()));
-    let control = tokio::spawn(control(
-        socket.clone(),
-        tx.clone(),
-        state_tx,
-        presentation.clone(),
-    ));
+    let control = (!read_only).then(|| {
+        tokio::spawn(control(
+            socket.clone(),
+            tx.clone(),
+            state_tx,
+            presentation.clone(),
+        ))
+    });
     let streams = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let (looking_tx, looking_rx) = watch::channel(false);
-    let looking = tokio::spawn(looking_link(socket.clone(), looking_rx));
+    let looking = (!read_only).then(|| tokio::spawn(looking_link(socket.clone(), looking_rx)));
     let mut calls = tokio::task::JoinSet::new();
     while let Some(line) = lines.next_line().await? {
         if line.len() > 16 * 1024 * 1024 {
@@ -458,8 +468,15 @@ async fn main() -> Result<()> {
         }
         while calls.try_join_next().is_some() {}
     }
-    control.abort();
-    looking.abort();
+    if let Some(task) = control {
+        task.abort();
+    }
+    if let Some(task) = looking {
+        task.abort();
+    }
+    if let Some(task) = state_pump {
+        task.abort();
+    }
     calls.abort_all();
     for (_, task) in streams.lock().await.drain() {
         task.abort();

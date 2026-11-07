@@ -586,6 +586,7 @@ fn contexts_of(dir: &Path, args: &[OsString]) -> (Vec<PathBuf>, bool, Option<Pat
 /// keep the worktree. See [`LocalGit::with_park_disposable`].
 pub const DEFAULT_PARK_DISPOSABLE: &[&str] = &[
     "target/",
+    ".twr-uploads/",
     "node_modules/",
     "dist/",
     "build/",

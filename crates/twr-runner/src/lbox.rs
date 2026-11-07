@@ -122,6 +122,7 @@ const FRAME_MARGIN: usize = 64;
 
 /// Non-session ops (git, attach info) executing at once, at most.
 pub const MAX_CONCURRENT_OPS: usize = 8;
+pub const MAX_CONCURRENT_UPLOADS: usize = 4;
 
 /// Strings of an oversized event's placeholder are cut to this many bytes.
 const PLACEHOLDER_STRING: usize = 4 << 10;
@@ -304,11 +305,13 @@ struct Inner {
     adapters: AdapterLookup,
     runtimes: Vec<String>,
     git: LocalGit,
+    uploads: Arc<Mutex<twr_core::upload::Manager>>,
     worktrees: PathBuf,
     next_gen: AtomicU64,
     inflight: Mutex<HashMap<String, watch::Receiver<Option<CmdResult>>>>,
     /// Bounds the non-session ops executing at once ([`MAX_CONCURRENT_OPS`]).
     op_permits: tokio::sync::Semaphore,
+    upload_permits: tokio::sync::Semaphore,
     /// Repository changes received from the hub and not finished ([`LocalBox::begin_change`]).
     changes: watch::Sender<usize>,
     /// [`LocalBox::hold_change_receipts`] (tests).
@@ -449,10 +452,12 @@ impl LocalBox {
                         None => git.with_trash_root(&opts.trash),
                     }
                 },
+                uploads: twr_core::upload::Manager::shared(),
                 worktrees: opts.worktrees,
                 next_gen: AtomicU64::new(1),
                 inflight: Mutex::new(HashMap::new()),
                 op_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_OPS),
+                upload_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOADS),
                 changes: watch::Sender::new(0),
                 receipt_hold: Mutex::new(None),
                 agents: BoxAgents::new(opts.env),
@@ -634,7 +639,8 @@ impl LocalBox {
         v
     }
 
-    /// Runs command `cmd_id` once: a repeated id returns the first execution's result.
+    /// Runs a command once using its recorded result. Upload commands instead use their
+    /// transfer identity, offsets, and terminal receipt for idempotence, without a spool row.
     ///
     /// What the command waits for before it runs (the login shell's `PATH`, asked once) is
     /// waited for before the command is recorded as running: a connection replaced meanwhile
@@ -642,6 +648,13 @@ impl LocalBox {
     /// repeat of the id runs it. A command dropped later, part way ([`Settle`]), is settled
     /// all the same: not in flight any more, and run again when repeated if it had not begun.
     pub async fn handle_cmd(&self, cmd_id: &str, op: Op) -> CmdResult {
+        if matches!(op, Op::Upload { .. }) {
+            // Upload IDs, exact chunk offsets/data and terminal receipts provide their own
+            // idempotence. Streaming chunks must not evict ordinary durable command results.
+            let _permit = self.inner.upload_permits.acquire().await.ok();
+            return CmdResult::new(cmd_id, self.execute(op).await);
+        }
+
         enum Plan {
             Wait(watch::Receiver<Option<CmdResult>>),
             Done(CmdResult),
@@ -1012,6 +1025,48 @@ impl LocalBox {
             .await
             .map(|o| json!(o))
             .map_err(failed),
+            Op::Upload {
+                scope,
+                thread,
+                root,
+                registered_repository,
+                request,
+            } => {
+                let uploads = self.inner.uploads.clone();
+                let git = self.inner.git.clone();
+                twr_core::upload::Manager::start_cleanup(&uploads);
+                tokio::task::spawn_blocking(move || {
+                    let root = twr_core::upload::resolve_root(&root, registered_repository)
+                        .map_err(|e| twr_core::upload::reject_begin(&request, e))?;
+                    let _workdir = git
+                        .workdirs()
+                        .begin_use(&root, &format!("upload:{}", request.id))
+                        .map_err(|e| {
+                            twr_core::upload::reject_begin(
+                                &request,
+                                anyhow::anyhow!(e.replace(
+                                    "cannot start a runtime in",
+                                    "cannot upload files to"
+                                )),
+                            )
+                        })?;
+                    twr_core::upload::Manager::request_shared(
+                        &uploads, &scope, &thread, &root, request,
+                    )
+                })
+                .await
+                .map_err(|e| failed(e.into()))?
+                .map_err(|e| {
+                    let code = if e.downcast_ref::<twr_core::upload::Rejected>().is_some() {
+                        cmd_errors::UPLOAD_REJECTED
+                    } else if e.downcast_ref::<twr_core::upload::Failed>().is_some() {
+                        cmd_errors::UPLOAD_FAILED
+                    } else {
+                        cmd_errors::FAILED
+                    };
+                    CmdError::new(code, format!("{e:#}"))
+                })
+            }
             // As last probed, unless asked for a fresh look (or none was made yet).
             Op::Agents { refresh } => {
                 let agents = if refresh || !self.inner.agents.probed() {
@@ -2037,4 +2092,48 @@ async fn pump(
     tracing::info!(thread = %thread, "runtime exited");
     shared.notify.notify_waiters();
     shared.ended.notify_waiters();
+}
+
+#[cfg(test)]
+mod upload_lane_tests {
+    use super::*;
+    #[tokio::test]
+    async fn uploads_and_ordinary_operations_have_independent_execution_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let lbox = LocalBox::open(LocalBoxOptions::new(directory.path(), "upload-lanes")).unwrap();
+        let uploads = (0..MAX_CONCURRENT_UPLOADS)
+            .map(|_| lbox.inner.upload_permits.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(1),
+            lbox.handle_cmd(
+                "ordinary",
+                Op::WorktreeExists {
+                    path: directory.path().join("missing"),
+                },
+            ),
+        )
+        .await
+        .expect("ordinary operation blocked behind uploads");
+        assert!(reply.ok);
+        drop(uploads);
+        let ordinary = (0..MAX_CONCURRENT_OPS)
+            .map(|_| lbox.inner.op_permits.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let request = Op::Upload {
+            scope: "owner".into(),
+            thread: "thread".into(),
+            root: directory.path().into(),
+            registered_repository: false,
+            request: twr_core::upload::Request {
+                id: "missing".into(),
+                sha256: "a".repeat(64),
+                action: twr_core::upload::Action::Status,
+            },
+        };
+        tokio::time::timeout(Duration::from_secs(1), lbox.handle_cmd("upload", request))
+            .await
+            .expect("upload operation blocked behind ordinary operations");
+        drop(ordinary);
+    }
 }

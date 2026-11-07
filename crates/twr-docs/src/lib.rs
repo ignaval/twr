@@ -24,6 +24,14 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("docs/tui.md", include_str!("../../../docs/tui.md")),
     ("docs/desktop.md", include_str!("../../../docs/desktop.md")),
     (
+        "docs/remote-clients.md",
+        include_str!("../../../docs/remote-clients.md"),
+    ),
+    (
+        "docs/attachments.md",
+        include_str!("../../../docs/attachments.md"),
+    ),
+    (
         "docs/desktop-qa.md",
         include_str!("../../../docs/desktop-qa.md"),
     ),
