@@ -101,7 +101,7 @@ With a command engine the audio goes wherever your program sends it, and the app
 it listens ("audio leaves this device").
 
 `twr voice transcribe < speech.wav` prints the text of one recording, for testing a setup or
-for scripts (`--json` for `{"text": ...}`, `--hint "api docs"` for words to expect).
+for scripts (`--json` for `{"text": ...}`, `--expect "api docs"` for words to expect).
 
 ## Where it plays
 

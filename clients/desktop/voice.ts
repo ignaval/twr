@@ -136,7 +136,7 @@ export class DesktopVoice {
     const wav = recordingSchema.parse(recording);
     const words = hintSchema.parse(hint);
     const args = ["voice", "transcribe", "--json"];
-    if (words.length) args.push("--hint", words.join(" "));
+    if (words.length) args.push("--expect", words.join(" "));
     const run = await runWithInput(
       this.twr(),
       args,

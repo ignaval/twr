@@ -857,7 +857,7 @@ enum VoiceCmd {
         json: bool,
         /// Words to expect (thread names), space- or comma-separated: plain words of
         /// `[A-Za-z0-9._-]` only, the rest left out.
-        #[arg(long, value_name = "WORDS")]
+        #[arg(long = "expect", value_name = "WORDS")]
         hint: Vec<String>,
     },
 }
