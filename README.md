@@ -26,7 +26,7 @@ twr is not a terminal multiplexer. It doesn't manage panes or depend on tmux, an
 curl -fsSL https://twr.tools/install.sh | sh
 ```
 
-The script installs the release build for your machine in `~/.local/bin`, without sudo, after checking it against the release's checksums. You can also download an archive from the [releases page](https://github.com/ignaval/twr/releases), or build twr with Rust 1.89 or newer:
+The script installs the release build for your machine in `~/.local/bin`, without sudo, after checking it against the release's checksums. You can also download an archive from the [releases page](https://github.com/ignaval/twr/releases), or build twr with Rust 1.98 or newer:
 
 ```sh
 cargo install --locked --git https://github.com/ignaval/twr twr-cli

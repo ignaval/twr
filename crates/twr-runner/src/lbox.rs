@@ -828,7 +828,10 @@ impl LocalBox {
     ) -> Result<Value, CmdError> {
         let failed = |e: anyhow::Error| CmdError::new(cmd_errors::FAILED, format!("{e:#}"));
         if let Some(managed) = &self.inner.managed {
-            managed.check(&op).map_err(failed)?;
+            managed.check(&op).map_err(|e| {
+                let code = if matches!(&op, Op::Upload { request, .. } if matches!(request.action, twr_core::upload::Action::Begin {..})) { cmd_errors::UPLOAD_REJECTED } else { cmd_errors::FAILED };
+                CmdError::new(code, format!("{e:#}"))
+            })?;
         }
         let git = &self.inner.git;
         match op {
@@ -1169,6 +1172,16 @@ impl LocalBox {
         {
             return Err(CmdError::new(cmd_errors::FAILED, "invalid run id"));
         }
+        let cwd = cfg.cwd.clone();
+        let adapter = self.adapter(runtime)?;
+        let shared = &self.inner.shared;
+        let mut sessions = shared.sessions();
+        if sessions.contains_key(thread) {
+            return Err(CmdError::new(
+                cmd_errors::ALREADY_RUNNING,
+                format!("thread {thread} already has a running session on this box"),
+            ));
+        }
         let run = run.unwrap_or_else(twr_core::event::new_id);
         let lease = self
             .inner
@@ -1191,16 +1204,6 @@ impl LocalBox {
             return Err(CmdError::new(
                 cmd_errors::BOX_FULL,
                 "runner spool reached its high-water mark",
-            ));
-        }
-        let cwd = cfg.cwd.clone();
-        let adapter = self.adapter(runtime)?;
-        let shared = &self.inner.shared;
-        let mut sessions = shared.sessions();
-        if sessions.contains_key(thread) {
-            return Err(CmdError::new(
-                cmd_errors::ALREADY_RUNNING,
-                format!("thread {thread} already has a running session on this box"),
             ));
         }
         // Held for as long as the session lives: no worktree change removes `cwd` under it.
@@ -2166,6 +2169,41 @@ async fn pump(
 #[cfg(test)]
 mod upload_lane_tests {
     use super::*;
+    #[tokio::test]
+    async fn an_upload_refused_before_reservation_has_a_definitive_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let owned = root.join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        let mut opts = LocalBoxOptions::new(&owned, "managed-uploads");
+        opts.managed = Some(crate::managed::Managed {
+            root: owned,
+            resources: root.join("leases"),
+            revocation: root.join("revoked"),
+        });
+        let lbox = LocalBox::open(opts).unwrap();
+        let reply = lbox
+            .handle_cmd(
+                "outside",
+                Op::Upload {
+                    scope: "owner".into(),
+                    thread: "thread".into(),
+                    root: root.clone(),
+                    registered_repository: false,
+                    request: twr_core::upload::Request {
+                        id: twr_core::event::new_id(),
+                        sha256: "a".repeat(64),
+                        action: twr_core::upload::Action::Begin {
+                            name: "x".into(),
+                            size: 1,
+                        },
+                    },
+                },
+            )
+            .await;
+        assert_eq!(reply.error.unwrap().code, cmd_errors::UPLOAD_REJECTED);
+        assert!(!root.join(".twr-uploads").exists());
+    }
     #[tokio::test]
     async fn uploads_and_ordinary_operations_have_independent_execution_slots() {
         let directory = tempfile::tempdir().unwrap();

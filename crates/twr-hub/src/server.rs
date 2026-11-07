@@ -2266,6 +2266,7 @@ async fn call_async(
         "runner.recover" => hub.runner_control(method, p, caller).await,
         "runner.revoke" => hub.runner_control(method, p, caller).await,
         "runner.forget" => hub.runner_control(method, p, caller).await,
+        // Committed files of a project on the hub's box (`hub::project_read`).
         "project.files" => hub.project_read(ReadTool::Files, params(p)?, caller).await,
         "project.read" => hub.project_read(ReadTool::Read, params(p)?, caller).await,
         "project.search" => hub.project_read(ReadTool::Search, params(p)?, caller).await,
