@@ -639,6 +639,8 @@ pub struct Speak {
     pub print_service: bool,
     /// `--control stdio`: controls on stdin, what it plays on stdout ([`stdio_keys`]).
     pub control_stdio: bool,
+    /// `--announce`: attention items too, whatever `[speech] read` says.
+    pub announce: bool,
 }
 
 /// What a speaker reads: this machine's hubs of `paths`'s root, or a remote one's over ssh.
@@ -729,7 +731,10 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         return print_service(&args);
     }
     let root = paths.root();
-    let config = Config::load_from(&root)?;
+    let mut config = Config::load_from(&root)?;
+    if args.announce && !config.speech.read.contains(&ReadKind::Attention) {
+        config.speech.read.push(ReadKind::Attention);
+    }
     let engine = twr_speech::from_config(&config.speech, engine_override)?;
     let (mut sigint, mut sigterm, mut sighup) = (
         signal(SignalKind::interrupt()).context("handling SIGINT")?,
@@ -877,6 +882,9 @@ fn service_args(args: &Speak) -> Vec<String> {
         if let Some(v) = value {
             a.extend([flag.to_string(), v]);
         }
+    }
+    if args.announce {
+        a.push("--announce".into());
     }
     a
 }

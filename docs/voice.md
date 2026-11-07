@@ -106,8 +106,11 @@ for scripts (`--json` for `{"text": ...}`, `--expect "api docs"` for words to ex
 ## Where it plays
 
 The desktop app starts a speaker of its own when you turn voice on: `twr speak --control stdio
---name "<computer> desktop"` for this machine's hubs, with live reading turned on for the
-workspace. It is an ordinary speaker ([read-aloud.md](read-aloud.md#speakers)): `/read status`
+--announce --name "<computer> desktop"` for this machine's hubs, with live reading turned on for
+the workspace. `--announce` makes it also say when something needs you ("api needs your
+permission"), as `"attention"` in `[speech] read` does
+([read-aloud.md](read-aloud.md#hearing-when-something-needs-you)): a fixed sentence with the
+thread's name, never what the request says. Answer it on screen, or ask the orchestrator. It is an ordinary speaker ([read-aloud.md](read-aloud.md#speakers)): `/read status`
 lists it, and it stops when the app quits. If the TUI's own speaker already speaks for this
 machine, the app's waits, and voice mode pauses and resumes the one that speaks through the hub.
 

@@ -448,6 +448,10 @@ enum Cmd {
         /// on stdout, one JSON object per line. Its notes stay on stderr.
         #[arg(long, value_name = "MODE", value_parser = ["stdio"], conflicts_with = "print_service")]
         control: Option<String>,
+        /// Also say when something needs you ("api needs your permission"), as `"attention"`
+        /// in `[speech] read` does.
+        #[arg(long)]
+        announce: bool,
     },
     /// Speech to text for talking to the orchestrator (docs/voice.md): what the desktop app
     /// runs on the machine with the microphone, with `[voice]` of this machine's config.
@@ -1802,6 +1806,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             rate,
             print_service,
             control,
+            announce,
         }) => {
             refuse_agent_action("start a speaker")?;
             if cli.socket.is_some() {
@@ -1818,6 +1823,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     rate,
                     print_service,
                     control_stdio: control.is_some(),
+                    announce,
                 },
                 &paths,
             )

@@ -177,7 +177,8 @@ export class DesktopVoice {
     if (this.speaker) return this.state;
     const child = spawn(
       this.twr(),
-      ["speak", "--control", "stdio", "--name", this.state.name],
+      // `--announce`: in voice mode you also hear when something needs you.
+      ["speak", "--control", "stdio", "--announce", "--name", this.state.name],
       { env: this.env(), stdio: "pipe" },
     );
     this.speaker = child;
