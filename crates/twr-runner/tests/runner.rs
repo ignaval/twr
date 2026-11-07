@@ -1925,7 +1925,8 @@ fn nondumpable_child_process() {
     // SAFETY: prctl(PR_SET_DUMPABLE, 0) only changes this process's dumpable flag.
     assert_eq!(unsafe { prctl(PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) }, 0);
     let dir = std::path::PathBuf::from(dir);
-    std::fs::write(dir.join("ready"), std::process::id().to_string()).unwrap();
+    std::fs::write(dir.join("ready.tmp"), std::process::id().to_string()).unwrap();
+    std::fs::rename(dir.join("ready.tmp"), dir.join("ready")).unwrap();
     std::thread::sleep(Duration::from_secs(300));
 }
 
