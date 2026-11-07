@@ -15,6 +15,8 @@ import { join } from "node:path";
  */
 export function redact(text: string, home?: string) {
   let value = text
+    // Whole cookie headers: every cookie in them is a credential.
+    .replace(/\b((?:set-)?cookie\s*:\s*)[^\n]*/gi, "$1[redacted]")
     // Authorization headers and bearer tokens.
     .replace(
       /\b(Bearer|Basic|token)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
@@ -22,15 +24,33 @@ export function redact(text: string, home?: string) {
     )
     // key=value / "key": "value" pairs whose names imply a secret.
     .replace(
-      /(["']?\b[\w-]*(?:token|secret|password|passphrase|api[_-]?key|authorization|cookie|pairing[_-]?code|private[_-]?key)[\w-]*["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}&]+)/gi,
+      /(["']?\b[\w-]*(?:token|secret|password|passphrase|api[_-]?key|authorization|cookie|pairing[_-]?code|private[_-]?key|credential|session[_-]?id)[\w-]*["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}&]+)/gi,
       "$1[redacted]",
     )
     // URL credentials and query secrets.
     .replace(/(\w+:\/\/)[^\s/@:]+:[^\s/@]+@/g, "$1[redacted]@")
-    .replace(/([?&](?:code|token|key|sig|signature)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(
+      /([?&#](?:code|token|key|sig|signature|access_token|id_token|state)=)[^&#\s]+/gi,
+      "$1[redacted]",
+    )
+    // One-use pairing invitations carry a "code" string: ten characters of
+    // A-Z/2-9 (twr-core devices.rs). Error constants ("REQUEST_TOO_LARGE",
+    // "ENOENT") stay readable; any ten-character code is always redacted.
+    .replace(/("code"\s*:\s*)"([^"]*)"/g, (match, prefix, code) =>
+      code.length !== 10 && (/_/.test(code) || /^E[A-Z]+$/.test(code))
+        ? match
+        : `${prefix}"[redacted]"`,
+    )
     // Well-known credential shapes.
     .replace(/\bsk-[A-Za-z0-9_-]{16,}/g, "[redacted-key]")
     .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, "[redacted-key]")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}/g, "[redacted-key]")
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, "[redacted-key]")
+    .replace(/\bAIza[A-Za-z0-9_-]{30,}/g, "[redacted-key]")
+    .replace(
+      /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/g,
+      "[redacted-jwt]",
+    )
     .replace(/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, "[redacted-key]")
     .replace(
       /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,

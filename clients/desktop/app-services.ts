@@ -10,6 +10,7 @@ import {
   linuxAutostartEnabled,
   linuxLaunchCommand,
   setLinuxAutostart,
+  refreshLinuxAutostart,
 } from "./autostart";
 import {
   DiagnosticLog,
@@ -38,9 +39,10 @@ const attentionSchema = z
       .array(
         z
           .object({
+            // Menu labels are short; never reject a summary for its length.
             thread: z.string().max(200),
-            title: z.string().max(500),
-            summary: z.string().max(2000),
+            title: z.string().transform((value) => value.slice(0, 200)),
+            summary: z.string().transform((value) => value.slice(0, 300)),
           })
           .strict(),
       )
@@ -63,6 +65,8 @@ export interface AppServiceHost {
   save(update: Record<string, unknown>): void;
   /** Ends the session without the background-close behavior. */
   prepareQuit(): void;
+  /** Undoes prepareQuit when the quit does not happen. */
+  cancelQuit(): void;
   activeTerminals(): number;
   facts(): Record<string, unknown>;
 }
@@ -80,6 +84,7 @@ export class AppServices {
   private tray: AppTray;
   private trayAvailable = process.platform !== "linux";
   private errors = new RateLimiter(30, 60_000);
+  private rejected = new RateLimiter(10, 60_000);
   private timer?: ReturnType<typeof setInterval>;
   private autostartFile = autostartPath(process.env, homedir());
   constructor(
@@ -184,6 +189,8 @@ export class AppServices {
       current: app.getVersion(),
       log: this.log,
       autoDownload: () => this.autoUpdate,
+      // AppImageUpdater renames a versioned image (twr-0.3.0 → twr-0.4.0).
+      onAppImageRenamed: (path) => this.refreshAutostart(path),
       onChange: (status) => {
         const window = this.host.window();
         if (window && !window.isDestroyed())
@@ -191,12 +198,16 @@ export class AppServices {
         this.tray.render();
       },
     });
+    this.refreshAutostart(linuxLaunchCommand(process.env, process.execPath));
     this.trayAvailable = await statusNotifierAvailable();
-    if (!this.trayAvailable)
+    if (!this.trayAvailable) {
       this.log.info(
         "tray",
-        "No StatusNotifier host on this session; the tray icon is unavailable.",
+        "No StatusNotifier host yet; checking again while the session starts.",
       );
+      // At login, uwsm can start twr before Waybar registers its tray.
+      void this.waitForTray();
+    }
     this.applyTray();
     // Automated QA never reaches the network on its own schedule.
     const scheduled =
@@ -229,6 +240,33 @@ export class AppServices {
 
   get autoUpdate() {
     return this.host.settings().autoUpdate !== false;
+  }
+
+  private async waitForTray() {
+    for (let attempt = 0; attempt < 24 && !this.trayAvailable; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      if (await statusNotifierAvailable()) {
+        this.trayAvailable = true;
+        this.log.info("tray", "StatusNotifier host appeared; showing the tray");
+        this.applyTray();
+      }
+    }
+  }
+
+  /** Keeps an existing Linux login entry pointing at this executable. */
+  private refreshAutostart(command: string) {
+    if (process.platform !== "linux" || !app.isPackaged) return;
+    try {
+      if (refreshLinuxAutostart(this.autostartFile, command))
+        this.log.info("login", "Updated the login entry for this executable");
+    } catch (error) {
+      this.log.warn("login", "Could not update the login entry", error);
+    }
+  }
+
+  logRejected(channel: string, error: unknown) {
+    if (this.rejected.allow())
+      this.log.warn("ipc", `Rejected ${channel} message`, error);
   }
 
   private applyTray() {
@@ -300,7 +338,11 @@ export class AppServices {
   }
 
   async install() {
+    if (this.updater.status.state !== "downloaded")
+      throw new Error("No update has been downloaded yet");
     if (this.host.activeTerminals() > 0) {
+      // A sheet on a hidden window would be invisible.
+      this.host.showWindow();
       const window = this.host.window();
       const options = {
         type: "question" as const,
@@ -317,7 +359,13 @@ export class AppServices {
       if (response !== 1) return;
     }
     this.host.prepareQuit();
-    this.updater.install();
+    try {
+      this.updater.install();
+    } catch (error) {
+      this.host.cancelQuit();
+      this.log.error("updater", "Could not start the update", error);
+      throw error;
+    }
   }
 
   diagnostics() {

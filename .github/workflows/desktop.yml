@@ -45,9 +45,12 @@ jobs:
     name: Apple Silicon application
     runs-on: macos-latest
     timeout-minutes: 90
+    # Apple credentials live in the protected `release` environment (tags and
+    # main only), so pull requests and branch pushes can never read them.
+    environment: ${{ inputs.release && 'release' || '' }}
     env:
       # Developer ID signing and notarization run only for releases, and only
-      # when the repository has the Apple credentials (see docs/desktop.md).
+      # when the release environment has the Apple credentials (docs/desktop.md).
       MAC_SIGNED_RELEASE: ${{ inputs.release && secrets.CSC_LINK != '' && secrets.APPLE_TEAM_ID != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,6 +131,9 @@ jobs:
           path: clients/release/*.dmg
       # Self-update metadata is published only for Developer ID builds: macOS
       # refuses to swap in an update whose signature differs from the app's.
+      - name: Note an unsigned release
+        if: inputs.release && env.MAC_SIGNED_RELEASE != 'true'
+        run: echo "::warning::the release environment has no Developer ID credentials; this release ships the ad hoc Mac disk image without self-update metadata"
       - name: Stage macOS release assets
         if: inputs.release
         working-directory: clients/release
@@ -187,6 +193,10 @@ jobs:
           npm run package:linux
           test -f release/latest-linux.yml
           node scripts/arch.mjs
+          if tar -tzf release/arch/*-linux-x64.tar.gz | grep -qx 'twr-desktop/resources/package-type'; then
+            echo "::error::the portable archive must not carry the Debian package-type marker"
+            exit 1
+          fi
           node scripts/linux-abi.mjs release/linux-unpacked release/linux-abi.json
           # Integration fixtures use debug engines; the app contains release engines.
           cargo build --manifest-path ../Cargo.toml --locked -p twr-cli -p twr-app

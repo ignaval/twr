@@ -442,9 +442,10 @@ export default function App({
       count: view.attention.length,
       items: view.attention.slice(0, 5).map((item) => ({
         thread: item.thread,
-        title:
-          view.threads.find((t) => t.id === item.thread)?.name || item.thread,
-        summary: item.summary || item.reason,
+        title: (
+          view.threads.find((t) => t.id === item.thread)?.name || item.thread
+        ).slice(0, 200),
+        summary: (item.summary || item.reason || "").slice(0, 300),
       })),
     });
   }, [view.attention, view.threads]);
@@ -3685,14 +3686,24 @@ export default function App({
                   ) : operation.id === "app-update" ? (
                     <>
                       <DataView value={result} />
-                      <button
-                        onClick={() =>
-                          void hostApi
-                            .openExternal(result.release_page)
-                            .catch(fail)
-                        }
-                      >
-                        Open release downloads <ExternalLink size={14} />
+                      {result?.releaseUrl && (
+                        <button
+                          onClick={() =>
+                            void hostApi
+                              .openExternal(
+                                result.download?.url || result.releaseUrl,
+                              )
+                              .catch(fail)
+                          }
+                        >
+                          {result.download
+                            ? `Download ${result.download.name}`
+                            : "Open release page"}{" "}
+                          <ExternalLink size={14} aria-hidden="true" />
+                        </button>
+                      )}
+                      <button onClick={() => setSection("settings")}>
+                        Update settings
                       </button>
                     </>
                   ) : operation.id === "context-read" ? (

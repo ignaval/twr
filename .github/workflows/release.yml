@@ -511,7 +511,8 @@ jobs:
     with:
       ref: ${{ needs.resolve.outputs.sha }}
       release: true
-    secrets: inherit
+    # No secrets are forwarded: the signing job reads the Apple credentials from
+    # the `release` environment it declares.
 
   desktop-release:
     name: attach the desktop installers

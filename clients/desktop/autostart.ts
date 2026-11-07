@@ -101,3 +101,15 @@ export function setLinuxAutostart(
   writeFileSync(temporary, autostartEntry(command), { mode: 0o644 });
   renameSync(temporary, path);
 }
+
+/**
+ * Rewrites an enabled twr entry whose command differs from `command` (an
+ * AppImage that was moved or renamed by an update). Returns true if changed.
+ */
+export function refreshLinuxAutostart(path: string, command: string) {
+  if (!linuxAutostartEnabled(path)) return false;
+  const expected = autostartEntry(command);
+  if (readFileSync(path, "utf8") === expected) return false;
+  setLinuxAutostart(path, true, command);
+  return true;
+}

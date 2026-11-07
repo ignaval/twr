@@ -16,6 +16,7 @@ import {
   linuxAutostartEnabled,
   linuxLaunchCommand,
   setLinuxAutostart,
+  refreshLinuxAutostart,
 } from "../desktop/autostart";
 import {
   compareVersions,
@@ -257,5 +258,49 @@ describe("AUR package", () => {
     expect(srcinfo).toContain("\tprovides = twr-desktop\n");
     expect(srcinfo).toContain("\toptdepends = openssh: remote boxes\n");
     expect(() => aurFiles(template, "0.4.0-rc.1", hash)).toThrow(/stable/);
+  });
+});
+
+describe("diagnostics redaction gaps", () => {
+  it("covers cookies, fragments, pairing codes and more key shapes", () => {
+    const text = [
+      "Cookie: a=1; sessionkey=SECRETCOOKIE",
+      "https://example.test/cb#access_token=FRAGMENTSECRET&ok=1",
+      '{"code":"ABCD-1234","host":"x"}',
+      "github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+      "AKIAABCDEFGHIJKLMNOP",
+      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlX3ZhbHVl",
+    ].join("\n");
+    const result = redact(text);
+    for (const secret of [
+      "SECRETCOOKIE",
+      "FRAGMENTSECRET",
+      "ABCD-1234",
+      "github_pat_11",
+      "AKIAABCDEFGHIJKLMNOP",
+      "eyJhbGci",
+    ])
+      expect(result).not.toContain(secret);
+    expect(result).toContain('"host":"x"');
+    expect(redact('{"code":"ENOENT","exit":{"code":1}}')).toBe(
+      '{"code":"ENOENT","exit":{"code":1}}',
+    );
+    // The real pairing format, even when it happens to look like a constant.
+    for (const code of ["K7MQ2WXR9P", "EABCDEFGHJ"])
+      expect(redact(`{"code":"${code}"}`)).toBe('{"code":"[redacted]"}');
+    expect(redact('{"code":"REQUEST_TOO_LARGE"}')).toContain(
+      "REQUEST_TOO_LARGE",
+    );
+  });
+  it("keeps a Linux login entry pointing at a renamed AppImage", () => {
+    const dir = mkdtempSync(join(tmpdir(), "twr-autostart-refresh-"));
+    const file = join(dir, "tools.twr.desktop.desktop");
+    expect(refreshLinuxAutostart(file, "/a/twr-0.4.0.AppImage")).toBe(false);
+    setLinuxAutostart(file, true, "/a/twr-0.3.0.AppImage");
+    expect(refreshLinuxAutostart(file, "/a/twr-0.3.0.AppImage")).toBe(false);
+    expect(refreshLinuxAutostart(file, "/a/twr-0.4.0.AppImage")).toBe(true);
+    expect(readFileSync(file, "utf8")).toContain(
+      'Exec="/a/twr-0.4.0.AppImage"',
+    );
   });
 });

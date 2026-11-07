@@ -110,8 +110,10 @@ Settings › Application has three switches:
 - **Show in menu bar / Show tray icon.**
 - **Keep running when the window is closed.** Closing the window hides it instead,
   so terminals, the hub connection and the badge stay live. A login launch then starts
-  hidden. Open twr again from the tray, the Dock or your launcher (a second launch
-  shows the existing window). Quit from the tray menu or with the Quit shortcut.
+  hidden on Linux. macOS 13 and later do not always tell an app it was opened at login, so
+  the window may appear; close it and twr stays in the menu bar. Open twr again from the tray, the Dock or your launcher (a second launch
+  shows the existing window). Quit from the tray menu, File › Quit (Ctrl-Q on Linux) or
+  Cmd-Q on macOS.
 
 ## Updates
 
@@ -233,14 +235,15 @@ The AUR package `twr-desktop-bin` installs the same files from the release's
 Pushing a stable `v<version>` tag runs `release.yml`. That publishes the CLI release,
 calls `desktop.yml` for the same commit (with all of its QA), then attaches the installers,
 update metadata and `desktop-sha256sums.txt` to the release. Prerelease tags skip the
-desktop. Optional repository secrets:
+desktop. Optional secrets, all in the protected `release` environment (never repository-wide
+secrets, which pull-request runs can read):
 
 - `CSC_LINK`, `CSC_KEY_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`,
   `APPLE_TEAM_ID`: a Developer ID certificate (base64 `.p12`) and notarization
   credentials. With them, the Mac app is signed, notarized and stapled, and
   `latest-mac.yml` is published so Macs update themselves. Without them, the release
   carries the ad hoc review disk image only.
-- `AUR_SSH_PRIVATE_KEY` (in the `release` environment): the key registered on the
+- `AUR_SSH_PRIVATE_KEY`: the key registered on the
   `twr-desktop-bin` AUR account. With it, the release pushes the new PKGBUILD to the AUR.
   Otherwise, push the `twr-desktop-aur` workflow artifact by hand.
 

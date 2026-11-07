@@ -30,6 +30,7 @@ export class Updater {
       current: string;
       log: DiagnosticLog;
       onChange(status: UpdateStatus): void;
+      onAppImageRenamed?(path: string): void;
       autoDownload(): boolean;
       fetch?: typeof fetch;
     },
@@ -64,6 +65,9 @@ export class Updater {
         state: "downloading",
         progress: Math.round(progress.percent),
       }),
+    );
+    autoUpdater.on("appimage-filename-updated", (path: string) =>
+      this.options.onAppImageRenamed?.(path),
     );
     autoUpdater.on("update-not-available", () =>
       this.set({ state: "up-to-date", instructions: undefined }),
@@ -148,8 +152,15 @@ export class Updater {
       }
       this.wire();
       autoUpdater.autoDownload = this.options.autoDownload();
-      this.set({ ...base, state: "available", instructions: undefined });
-      await autoUpdater.checkForUpdates();
+      // Stay "checking" until electron-updater has its own update info, so a
+      // Download request cannot arrive before it can be served.
+      this.set({ ...base, instructions: undefined });
+      const result = await autoUpdater.checkForUpdates();
+      if (this.status.state === "checking")
+        this.set({
+          state:
+            result?.isUpdateAvailable === false ? "up-to-date" : "available",
+        });
       return this.status;
     } catch (error) {
       log.warn("updater", "Update check failed", error);

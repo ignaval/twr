@@ -403,7 +403,9 @@ function register() {
       try {
         trusted(event);
         callback(...args);
-      } catch {}
+      } catch (error) {
+        services?.logRejected(channel, error);
+      }
     }),
   );
   const vault = new SecureStore(
@@ -845,6 +847,9 @@ function register() {
   });
 }
 function showWindow() {
+  // During a quit (including an update restart) a relaunch hands over to this
+  // process; never reopen a window that is closing.
+  if (quitRequested) return;
   if (!window || window.isDestroyed()) {
     void createWindow();
     return;
@@ -925,6 +930,8 @@ async function createWindow(hidden = false) {
     }
     if (!quitting && [...terminals.values()].some((t) => !t.exited)) {
       event.preventDefault();
+      // Quitting from the tray while hidden: the question must be visible.
+      if (!window.isVisible()) window.show();
       const result = await dialog.showMessageBox(window, {
         type: "question",
         message: "Close active terminal sessions?",
@@ -991,6 +998,10 @@ else {
             quitting = true;
             quitRequested = true;
           },
+          cancelQuit: () => {
+            quitting = false;
+            quitRequested = false;
+          },
           activeTerminals: () =>
             [...terminals.values()].filter((t) => !t.exited).length,
           facts: () => ({
@@ -1046,6 +1057,11 @@ else {
               },
               { type: "separator" as const },
               { role: "close" as const },
+              // macOS has Quit in the app menu; Linux needs it here so a
+              // background-mode window can always end the app.
+              ...(process.platform === "darwin"
+                ? []
+                : [{ role: "quit" as const, accelerator: "Ctrl+Q" }]),
             ],
           },
           { role: "editMenu" },
