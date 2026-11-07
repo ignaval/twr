@@ -78,13 +78,39 @@ export interface DesktopAppearance {
   colorScheme: "dark" | "light";
   background: string;
 }
+export interface InboxSource {
+  scanError?: boolean;
+  provisional?: boolean;
+  running?: boolean;
+  updatedAt?: number;
+  hubId: string;
+  hubName: string;
+  workspace: string;
+  attention: Attention[];
+  threads: Thread[];
+  cached?: boolean;
+  error?: string;
+}
 export interface DesktopAPI {
+  sendMessage?(message: import("./offline").DurableMessage): Promise<Json>;
+  inboxSources?(): Promise<InboxSource[]>;
+  secureRead?(key: string): Promise<string | null>;
+  secureWrite?(key: string, value: string): Promise<void>;
+  secureDelete?(key: string): Promise<void>;
   setAppearance?(appearance: DesktopAppearance): Promise<void>;
-  uploadFile?(file: File, thread: string): Promise<{ path: string }>;
+  uploadFile?(
+    file: File,
+    thread: string,
+    options?: import("./uploads").UploadOptions,
+  ): Promise<{ path: string }>;
+  cancelUpload?(
+    resume: import("./uploads").UploadResume,
+  ): Promise<import("./uploads").UploadCancelResult>;
   quit(): Promise<void>;
   copyText(text: string): Promise<void>;
   bootstrap(): Promise<{
     workspace: string;
+    hostId?: string;
     scopes?: string[];
     allowed_methods?: string[];
     platform: string;

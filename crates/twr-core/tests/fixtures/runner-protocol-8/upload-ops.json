@@ -1,0 +1,206 @@
+{
+  "protocol": 8,
+  "revision": "7970bbdc9c68260e17104377893ef101429f7a4a",
+  "samples": [
+    {
+      "frame": {
+        "cmd_id": "upload begin registered_repository=false",
+        "op": {
+          "registered_repository": false,
+          "request": {
+            "action": "begin",
+            "id": "attachment",
+            "name": "file.txt",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "size": 5
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload begin registered_repository=false"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload chunk registered_repository=false",
+        "op": {
+          "registered_repository": false,
+          "request": {
+            "action": "chunk",
+            "data": "aGVsbG8=",
+            "id": "attachment",
+            "offset": 0,
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload chunk registered_repository=false"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload status registered_repository=false",
+        "op": {
+          "registered_repository": false,
+          "request": {
+            "action": "status",
+            "id": "attachment",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload status registered_repository=false"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload commit registered_repository=false",
+        "op": {
+          "registered_repository": false,
+          "request": {
+            "action": "commit",
+            "id": "attachment",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload commit registered_repository=false"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload cancel registered_repository=false",
+        "op": {
+          "registered_repository": false,
+          "request": {
+            "action": "cancel",
+            "id": "attachment",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload cancel registered_repository=false"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload begin registered_repository=true",
+        "op": {
+          "registered_repository": true,
+          "request": {
+            "action": "begin",
+            "id": "attachment",
+            "name": "file.txt",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            "size": 5
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload begin registered_repository=true"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload chunk registered_repository=true",
+        "op": {
+          "registered_repository": true,
+          "request": {
+            "action": "chunk",
+            "data": "aGVsbG8=",
+            "id": "attachment",
+            "offset": 0,
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload chunk registered_repository=true"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload status registered_repository=true",
+        "op": {
+          "registered_repository": true,
+          "request": {
+            "action": "status",
+            "id": "attachment",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload status registered_repository=true"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload commit registered_repository=true",
+        "op": {
+          "registered_repository": true,
+          "request": {
+            "action": "commit",
+            "id": "attachment",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload commit registered_repository=true"
+    },
+    {
+      "frame": {
+        "cmd_id": "upload cancel registered_repository=true",
+        "op": {
+          "registered_repository": true,
+          "request": {
+            "action": "cancel",
+            "id": "attachment",
+            "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          },
+          "root": "/worktrees/project/t1",
+          "scope": "device:phone",
+          "thread": "t1",
+          "type": "upload"
+        },
+        "type": "cmd"
+      },
+      "name": "upload cancel registered_repository=true"
+    }
+  ],
+  "uncommitted": true,
+  "what": "attachment commands accepted by this runner, including the trusted root policy"
+}

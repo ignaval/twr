@@ -56,6 +56,7 @@ pub mod sorted;
 pub mod speech;
 pub mod testkit;
 pub mod trace;
+pub mod upload;
 pub mod usage;
 pub mod work;
 

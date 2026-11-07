@@ -42,7 +42,9 @@
 //!    the event at that time, within the thread's order and never in the future).
 //! 6. The hub drives the box with [`HubMsg::Cmd`]; each carries a durable `cmd_id`, and the
 //!    runner answers [`RunnerMsg::CmdResult`] exactly once per id (a repeated id gets the
-//!    stored result again without re-executing).
+//!    stored result again without re-executing). Attachment operations use their scoped
+//!    transfer ID, checked chunk offsets/bytes, and upload receipt instead of per-chunk
+//!    durable command rows.
 //!
 //! `rseq` is per thread, starts at 1, never repeats and has no gaps on the wire: the runner
 //! allocates it durably together with spooling the frame, before sending. A frame with
@@ -107,6 +109,8 @@ pub fn valid_run_id(run: &str) -> bool {
 /// inventory's [`Inventory::agents`] came with it (additive: an older runner's inventory has
 /// none). No spooled frame changed: a protocol 6 spool's frames decode as they are.
 ///
+/// 8: bounded resumable thread attachments ([`Op::Upload`]); session/spool frames are unchanged.
+///
 /// A runner's spool keeps its frames across a restart, and so across an upgrade (it records
 /// the protocol they were written under): a bump that changes how spooled frames encode must
 /// migrate the spool, or the next runner refuses to open one that holds such frames.
@@ -125,7 +129,7 @@ pub fn valid_run_id(run: &str) -> bool {
 /// 3. List the previous version in [`DRAINABLE_PROTOCOLS`] only if its fixtures pass and the
 ///    bump changed nothing a drain uses (see there); else leave it out, and the hub replaces
 ///    such a daemon at once.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Older runner protocols this hub still serves drain-only: it accepts such a runner's hello
 /// (and then authenticates it as any other), sends it nothing but acks, pings and the commands
@@ -146,7 +150,7 @@ pub const PROTOCOL_VERSION: u32 = 7;
 /// The box daemon's socket lines (`twr-box 1 ...`) must be the same too. Usually only the
 /// previous version is listed; it may leave the list at any time (the hub then replaces such
 /// a daemon at once, its runtimes recorded as stopped for the upgrade).
-pub const DRAINABLE_PROTOCOLS: &[u32] = &[6];
+pub const DRAINABLE_PROTOCOLS: &[u32] = &[7, 6];
 
 /// Whether the hub serves a runner of protocol `p` drain-only ([`DRAINABLE_PROTOCOLS`]).
 pub fn drainable(p: u32) -> bool {
@@ -754,6 +758,7 @@ pub mod hub_errors {
 /// | `trash_restore_undo` | bool |
 /// | `disk_usage` | [`crate::git::DiskReading`] |
 /// | `agents` | `[`[`AgentInfo`]`]` |
+/// | `upload` | attachment ID, verified offset/prefix SHA-256, committed path when ready |
 ///
 /// `git_common_dir`, `worktree_trash`, `branch_only_commits`, `worktree_inventory` and the
 /// `trash_*` ops came with protocol 3 ([`PROTOCOL_VERSION`]): a runner from before them is refused at its hello, so it is never
@@ -953,6 +958,16 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposable: Option<Vec<String>>,
     },
+    /// Bounded, staged thread attachment operations (protocol 8). The authenticated hub
+    /// resolves `root` from the thread; the client never supplies a path.
+    Upload {
+        scope: String,
+        thread: String,
+        root: PathBuf,
+        #[serde(default)]
+        registered_repository: bool,
+        request: crate::upload::Request,
+    },
     /// The box's agent CLIs ([`AgentInfo`], protocol 7): as the runner last probed them, or
     /// probed again first when `refresh` (a probe started after the request, at most 10 s a
     /// command). A box that probes none answers an empty list.
@@ -1041,6 +1056,7 @@ impl Op {
             Op::TrashRestoreUndo { .. } => "trash_restore_undo",
             Op::DiskUsage { .. } => "disk_usage",
             Op::Agents { .. } => "agents",
+            Op::Upload { .. } => "upload",
         }
     }
 
@@ -1058,6 +1074,10 @@ impl Op {
 /// Codes of [`CmdError`].
 pub mod cmd_errors {
     /// The box has no adapter by that name.
+    /// The upload begin was rejected before any reservation was accepted.
+    pub const UPLOAD_REJECTED: &str = "upload_rejected";
+    /// The attachment commit failed definitively and its staging/reservation was removed.
+    pub const UPLOAD_FAILED: &str = "upload_failed";
     pub const UNKNOWN_RUNTIME: &str = "unknown_runtime";
     /// The thread has no live session.
     pub const NOT_RUNNING: &str = "not_running";

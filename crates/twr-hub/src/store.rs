@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS spawn_intents (
     ts        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_kind_turn ON events (kind, thread, turn);
+CREATE INDEX IF NOT EXISTS events_thread_id ON events (thread, id);
 "#;
 
 /// Schema 5: the interactive processes of attaches.
@@ -321,6 +322,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     check_version(version, ACCOUNTS_SCHEMA_VERSION)?;
     // (10 has 9's tables: only its account data is new.)
     if version >= SCHEMA_VERSION {
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS events_thread_id ON events (thread, id);")?;
         // A database a development build of schema 9 made before agent events could be
         // deleted: its trigger is replaced. One a development build of accounts raised from 8
         // to 9 when 9 marked account data has no `checkpoints`: it gets 9's tables.
@@ -1368,6 +1370,64 @@ pub fn read_thread_events(
         params![thread, to_i64(since_seq)?, limit as i64],
         row_to_raw,
     )?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// Newest searchable event candidates before an exclusive event-id cursor. ULIDs are
+/// monotonic when recorded; a cursor covers every thread, including non-control output.
+pub fn search_candidates(
+    conn: &Connection,
+    thread: Option<&str>,
+    before: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT {EVENT_COLS} FROM events WHERE id < ?1 {}
+         AND kind IN ('turn.started','agent.text','agent.tool_call','agent.tool_result',
+                      'decision.made','conversation.update','report.ready')
+         AND (kind != 'agent.text' OR coalesce(json_extract(data,'$.delta'),0) != 1 OR json_extract(data,'$.final') = 1)
+         ORDER BY id DESC LIMIT ?3",
+        if thread.is_some() {
+            "AND thread = ?2"
+        } else {
+            "AND ?2 IS NULL"
+        }
+    ))?;
+    let rows = st.query_map(params![before, thread, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// A deleted thread still has its creation/rename event even after its live view is gone.
+pub fn latest_thread_name(conn: &Connection, thread: &str) -> anyhow::Result<Option<String>> {
+    Ok(conn.query_row("SELECT json_extract(data, '$.name') FROM events WHERE thread=?1 AND kind IN ('thread.created','thread.renamed') ORDER BY seq DESC LIMIT 1",[thread],|row|row.get(0)).optional()?)
+}
+
+/// One exact event, scoped to its recorded thread (also in an archive).
+pub fn event_by_id(conn: &Connection, thread: &str, id: &str) -> anyhow::Result<Option<Event>> {
+    conn.query_row(
+        &format!("SELECT {EVENT_COLS} FROM events WHERE thread = ?1 AND id = ?2"),
+        params![thread, id],
+        row_to_raw,
+    )
+    .optional()?
+    .map(RawRow::into_event)
+    .transpose()
+}
+
+/// The nearest events on one side of `seq`; the selected event is read separately.
+pub fn event_neighbors(
+    conn: &Connection,
+    thread: &str,
+    seq: u64,
+    before: bool,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let comparison = if before { "<" } else { ">" };
+    let order = if before { "DESC" } else { "ASC" };
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT {EVENT_COLS} FROM events WHERE thread = ?1 AND seq {comparison} ?2 ORDER BY seq {order} LIMIT ?3"
+    ))?;
+    let rows = st.query_map(params![thread, to_i64(seq)?, limit as i64], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
 }
 
@@ -2787,6 +2847,57 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |r| r.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn search_sql_filters_stream_deltas_before_the_page_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("twr.db")).unwrap();
+        let at = |seq, text: &str, delta, is_final| {
+            Event::new(
+                "thread",
+                seq,
+                None,
+                Source::Hub,
+                EventBody::AgentText(AgentText {
+                    text: text.into(),
+                    delta,
+                    is_final,
+                    ..Default::default()
+                }),
+            )
+        };
+        let standalone = at(1, "standalone message", false, false);
+        let final_message = at(2, "complete message", true, true);
+        for event in [&standalone, &final_message] {
+            store.append(event, false, AppendExtras::default()).unwrap();
+        }
+        // More than one scan of newer token deltas must not hide complete messages.
+        for seq in 3..=620 {
+            store
+                .append(
+                    &at(seq, "streaming token", true, false),
+                    false,
+                    AppendExtras::default(),
+                )
+                .unwrap();
+        }
+        let found = search_candidates(store.conn(), Some("thread"), "~", 2).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            [final_message.id.as_str(), standalone.id.as_str()]
+        );
+        assert_eq!(
+            search_candidates(store.conn(), None, "~", 1).unwrap()[0].id,
+            final_message.id
+        );
+        assert_eq!(
+            search_candidates(store.conn(), Some("thread"), &final_message.id, 1).unwrap()[0].id,
+            standalone.id
+        );
     }
 
     /// The per-kind lookups find the newest (or first) match, also when a later turn or

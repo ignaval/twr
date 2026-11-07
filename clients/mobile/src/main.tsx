@@ -1,3 +1,5 @@
+import { forgetOfflineHost } from "../../shared/offline";
+import { initializeLayout } from "../../shared/layoutPreferences";
 import { AppearanceOptions } from "../../shared/AppearanceOptions";
 import { errorMessage } from "../../shared/errors";
 import { Keyboard } from "@capacitor/keyboard";
@@ -15,6 +17,8 @@ import {
 } from "../../shared/editors";
 import { RemoteHost, Transport, type Hub } from "./transport";
 import { observeLayout } from "./layout";
+import { observeTextScale, secureDelete } from "./offline";
+import { parseInvitation } from "../../shared/connections";
 import {
   notificationListeners,
   testNotification,
@@ -27,6 +31,8 @@ import {
 import "../../shared/style.css";
 import "./mobile.css";
 
+initializeLayout();
+
 function Mobile() {
   const editors = useEditorSessions();
   const [hubs, setHubs] = useState<Hub[]>([]);
@@ -34,6 +40,24 @@ function Mobile() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [pairing, setPairing] = useState(false);
+  const [pairName, setPairName] = useState("");
+  const [scanned, setScanned] = useState<{
+    url: string;
+    code: string;
+    expiresAt?: number;
+  }>();
+  const [pairingNow, setPairingNow] = useState(Date.now());
+  useEffect(() => {
+    if (!pairing) {
+      setScanned(undefined);
+      setPairName("");
+      return;
+    }
+    if (!scanned?.expiresAt) return;
+    setPairingNow(Date.now());
+    const timer = setInterval(() => setPairingNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [pairing, scanned?.expiresAt]);
   const [hubSheet, setHubSheet] = useState(false);
   const [notice, setNotice] = useState("");
   const [folder, setFolder] = useState<{
@@ -70,9 +94,11 @@ function Mobile() {
     };
   }, []);
   useEffect(() => {
+    const textScale = observeTextScale();
     const stop = observeLayout();
     return () => {
       void stop.then((fn) => fn());
+      void textScale.then((fn) => fn());
     };
   }, []);
   useEffect(() => {
@@ -120,6 +146,27 @@ function Mobile() {
       setPendingNotification(undefined);
     }
   }, [active, readyHubId, pendingNotification]);
+  useEffect(() => {
+    const navigate = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ hubId: string; workspace?: string }>
+      ).detail;
+      void (async () => {
+        if (activeHub.current?.id !== detail.hubId) {
+          const hub = (await Transport.listHubs()).hubs.find(
+            (hub) => hub.id === detail.hubId,
+          );
+          if (!hub) throw new Error("Saved hub no longer exists");
+          if (!(await connect(hub))) return;
+        }
+        setPendingNotification(
+          detail.workspace ? { workspace: detail.workspace } : {},
+        );
+      })().catch((error) => setError(errorMessage(error)));
+    };
+    window.addEventListener("twr:select-host", navigate);
+    return () => window.removeEventListener("twr:select-host", navigate);
+  }, []);
   useEffect(() => {
     const listener = NativeApp.addListener("appStateChange", ({ isActive }) => {
       if (host.current) {
@@ -171,6 +218,7 @@ function Mobile() {
     await previous?.stop();
   }
   async function forgetLocal(hub: Hub) {
+    await forgetOfflineHost(hub.id, { secureDelete });
     await Transport.removeHub({ id: hub.id });
     editors.forget(hub.id);
     localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
@@ -530,12 +578,34 @@ function Mobile() {
             Start pairing from your computer, then enter its address and one-use
             code.
           </p>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              setError("");
+              void Transport.scanInvitation()
+                .then(({ invitation }) => {
+                  const value = parseInvitation(invitation);
+                  setScanned(value);
+                  setPairName((name) => name || new URL(value.url).hostname);
+                })
+                .catch((e) => {
+                  if (e?.code !== "SCAN_CANCELLED") setError(errorMessage(e));
+                })
+                .finally(() => setBusy(false));
+            }}
+          >
+            Scan QR code
+          </button>
           <label>
             Hub name
             <input
               name="hubName"
               required
               maxLength={80}
+              value={pairName}
+              onChange={(event) => setPairName(event.target.value)}
               placeholder="My workstation"
             />
           </label>
@@ -543,6 +613,14 @@ function Mobile() {
             Hub URL
             <input
               name="url"
+              value={scanned?.url ?? ""}
+              onChange={(e) =>
+                setScanned((old) => ({
+                  ...old,
+                  url: e.target.value,
+                  code: old?.code || "",
+                }))
+              }
               required
               type="url"
               autoCapitalize="none"
@@ -554,6 +632,13 @@ function Mobile() {
             Pairing code
             <input
               name="code"
+              value={scanned?.code ?? ""}
+              onChange={(e) =>
+                setScanned((old) => ({
+                  url: old?.url || "",
+                  code: e.target.value,
+                }))
+              }
               required
               autoCapitalize="none"
               autoCorrect="off"
@@ -561,6 +646,13 @@ function Mobile() {
               spellCheck={false}
             />
           </label>
+          {scanned?.expiresAt && (
+            <p role="status">
+              {scanned.expiresAt > pairingNow
+                ? `Expiry estimate: ${Math.ceil((scanned.expiresAt - pairingNow) / 1000)} seconds. Device clocks can differ; the hub checks expiry.`
+                : "This invitation may have expired. The hub will check it when pairing; device clocks can differ."}
+            </p>
+          )}
           <label>
             This device
             <input

@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { createServer as createProxy, connect as connectTCP } from "node:net";
 import {
   mkdtempSync,
+  realpathSync,
   mkdirSync,
   writeFileSync,
   readFileSync,
@@ -125,7 +126,7 @@ for (const [
       runtime: runtimeDescription(selectedRuntime),
     }),
   );
-  const fixture = mkdtempSync(join(tmpdir(), "twr-ios-"));
+  const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-ios-")));
   const screenshot = `test-results/ios/${kind || "all"}-${index}-screen.png`;
   const performanceLabel = device.name.includes("Duo")
     ? "ios-fold"
@@ -301,7 +302,7 @@ for (const [
     }
     gateway = spawn(
       join(bin, "twr-mobile-gateway"),
-      ["--development", "--binary-dir", bin, "--listen", "127.0.0.1:47321"],
+      ["--development", "--binary-dir", bin, "--listen", "127.0.0.1:47421"],
       { env, stdio: ["ignore", "pipe", "pipe"] },
     );
     let stderr = "";
@@ -381,7 +382,7 @@ for (const [
       process.env.DEVELOPER_DIR ||
       execFileSync("xcode-select", ["-p"], { encoding: "utf8" }).trim();
     const applications = join(developer, "Applications");
-    if (existsSync(applications)) {
+    if (process.env.TWR_IOS_HEADLESS !== "1" && existsSync(applications)) {
       console.log(
         "Simulator UI applications",
         readdirSync(applications).filter((name) => name.endsWith(".app")),
@@ -420,7 +421,7 @@ for (const [
             JSON.stringify({
               repo,
               code,
-              url: "http://127.0.0.1:47324",
+              url: "http://127.0.0.1:47424",
               foldable: device.name.includes("Duo"),
             }),
           );
@@ -466,6 +467,10 @@ for (const [
       } else if (req.url === "/drop-socket") {
         for (const socket of proxySockets) socket.destroy();
         res.end("ok");
+      } else if (req.url === "/typography-script") {
+        res.end(
+          readFileSync(new URL("./connected-typography.js", import.meta.url)),
+        );
       } else if (req.url === "/performance-script") {
         res.end(readFileSync(new URL("./ios-performance.js", import.meta.url)));
       } else if (req.url === "/performance" && req.method === "POST") {
@@ -518,9 +523,9 @@ for (const [
         res.end();
       }
     });
-    await new Promise((r) => server.listen(47323, "127.0.0.1", r));
+    await new Promise((r) => server.listen(47423, "127.0.0.1", r));
     proxy = createProxy((socket) => {
-      const upstream = connectTCP(47321, "127.0.0.1");
+      const upstream = connectTCP(47421, "127.0.0.1");
       for (const current of [socket, upstream]) {
         proxySockets.add(current);
         current.on("close", () => {
@@ -536,7 +541,7 @@ for (const [
       socket.pipe(upstream);
       upstream.pipe(socket);
     });
-    await new Promise((resolve) => proxy.listen(47324, "127.0.0.1", resolve));
+    await new Promise((resolve) => proxy.listen(47424, "127.0.0.1", resolve));
     const result = `test-results/ios/${kind || "all"}-${index}-${device.name.replaceAll(" ", "-")}.xcresult`;
     rmSync(result, { recursive: true, force: true });
     const test = spawn(
@@ -553,6 +558,10 @@ for (const [
         `platform=iOS Simulator,id=${device.udid}`,
         "-derivedDataPath",
         "mobile/ios/App/DerivedData",
+        "-packageAuthorizationProvider",
+        "netrc",
+        "-disableAutomaticPackageResolution",
+        "-onlyUsePackageVersionsFromResolvedFile",
         "-resultBundlePath",
         result,
         "-parallel-testing-enabled",

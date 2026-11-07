@@ -1,0 +1,83 @@
+.connections-content {
+  padding: 20px;
+  display: grid;
+  gap: 16px;
+  overflow: auto;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+.connection-form {
+  display: grid;
+  gap: 12px;
+}
+.connection-form label {
+  display: grid;
+  gap: 6px;
+}
+.connection-form input,
+.connection-form select {
+  width: 100%;
+  min-height: 38px;
+  padding: 8px;
+}
+.connections-content pre,
+.connection-form p,
+.connections-content > p {
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.saved-hub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.saved-hub > div {
+  flex: 1;
+  min-width: 160px;
+}
+.saved-hub small {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+}
+.pair-invitation {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  text-align: center;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pair-invitation img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+.pair-invitation code {
+  user-select: all;
+  font-size: 1.2rem;
+}
+.remote-directory {
+  display: grid;
+  padding: 20px;
+  gap: 10px;
+  overflow: auto;
+  min-height: 0;
+  overscroll-behavior: contain;
+}
+.connection-error {
+  position: fixed;
+  left: 20px;
+  bottom: 20px;
+  max-width: min(600px, 90vw);
+  z-index: 100;
+  padding: 16px;
+  background: var(--overlay);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}

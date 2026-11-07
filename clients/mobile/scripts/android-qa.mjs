@@ -21,13 +21,26 @@ import { terminalUIQA } from "./terminal-ui-qa.mjs";
 import { captureMobileUI } from "./ui-captures.mjs";
 import { multiHubQA } from "./multi-hub-qa.mjs";
 import { systemPickerQA } from "./system-picker-qa.mjs";
+import { shellAction } from "./native-actions.mjs";
 const adb =
   process.env.TWR_ADB ||
   join(process.env.HOME, "Library/Android/sdk/platform-tools/adb");
 const serial = process.env.TWR_ANDROID_SERIAL || "emulator-5554";
+const adbPort = process.env.TWR_ADB_PORT;
+const adbPrefix = adbPort ? ["-P", adbPort] : [];
+const emulatorPort = serial.match(/^emulator-(\d+)$/)?.[1];
+const transportSerial =
+  adbPort && emulatorPort ? `127.0.0.1:${Number(emulatorPort) + 1}` : serial;
+if (adbPort && transportSerial.includes(":"))
+  execFileSync(adb, [...adbPrefix, "connect", transportSerial], {
+    stdio: "ignore",
+  });
 const adbRun = (args, options = {}) =>
-  execFileSync(adb, ["-s", serial, ...args], { encoding: "utf8", ...options });
-const fixture = mkdtempSync(join(tmpdir(), "twr-mobile-"));
+  execFileSync(adb, [...adbPrefix, "-s", transportSerial, ...args], {
+    encoding: "utf8",
+    ...options,
+  });
+const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-mobile-")));
 const repo = join(fixture, "repo");
 mkdirSync(repo);
 const plain = join(fixture, "plain");
@@ -275,8 +288,11 @@ try {
   adbRun(["shell", "am", "force-stop", "tools.twr.mobile.dev"]);
   adbRun(["shell", "pm", "clear", "tools.twr.mobile.dev"]);
   adbRun(["shell", "am", "start", "-n", "tools.twr.mobile.dev/.MainActivity"]);
-  devices = await _android.devices({ omitDriverInstall: true });
-  device = devices.find((d) => d.serial() === serial);
+  devices = await _android.devices({
+    omitDriverInstall: true,
+    ...(adbPort ? { port: Number(adbPort) } : {}),
+  });
+  device = devices.find((d) => d.serial() === transportSerial);
   assert(device, "An Android emulator must be running");
   const webview = await device.webView({ pkg: "tools.twr.mobile.dev" });
   page = await webview.page();
@@ -295,6 +311,11 @@ try {
     .fill(`http://127.0.0.1:${port}`);
   await page.getByLabel("Pairing code", { exact: true }).fill(code);
   await page.getByLabel("This device", { exact: true }).fill("Android QA");
+  await dismissKeyboard();
+  assert(
+    await page.locator(".pair-form").evaluate((form) => form.checkValidity()),
+    "Pairing fields must be valid before native submission",
+  );
   await page
     .getByRole("button", { name: "Pair and connect", exact: true })
     .click();
@@ -437,8 +458,9 @@ try {
         "--display-id",
       ]).match(/Display (\d+)/)?.[1];
       const bytes = execFileSync(adb, [
+        ...adbPrefix,
         "-s",
-        serial,
+        transportSerial,
         "exec-out",
         "screencap",
         "-p",
@@ -493,6 +515,45 @@ try {
   console.log(
     "PASS: native file picker upload, checksum, working-directory placement and git exclusion",
   );
+  const cancelRecovery = await page.evaluate(async () => {
+    let resume;
+    let rejected = false;
+    try {
+      await window.twr.uploadFile(
+        new File(["BEGIN_REJECTED_QA"], "begin-rejected.txt", {
+          type: "text/plain",
+        }),
+        "missing-qa-thread",
+        {
+          onProgress: (progress) => {
+            if (progress.resume) resume = progress.resume;
+          },
+        },
+      );
+    } catch {
+      rejected = true;
+    }
+    if (!rejected || !resume)
+      throw new Error(
+        "Rejected begin must retain upload identity for cancellation",
+      );
+    const rejectedBegin = await window.twr.cancelUpload(resume);
+    const worker = await window.twr.rpc("thread.get", {
+      thread: "android-worker",
+    });
+    const missingMetadata = await window.twr.cancelUpload({
+      ...resume,
+      id: crypto.randomUUID(),
+      thread: worker.id,
+    });
+    return { rejectedBegin, missingMetadata };
+  });
+  assert.equal(cancelRecovery.rejectedBegin.cancelled, true);
+  assert.equal(cancelRecovery.missingMetadata.cancelled, true);
+  console.log(
+    "PASS: rejected upload begin and missing gateway metadata cancel without a stuck attachment",
+    JSON.stringify(cancelRecovery),
+  );
   const plainUpload = await page.evaluate(async () => {
     await window.twr.rpc("thread.new", {
       project: "plain",
@@ -525,6 +586,8 @@ try {
       adbRun,
       fixture,
       serial,
+      adbPort,
+      transportSerial,
     });
     page = next.page;
     devices = next.devices;
@@ -784,13 +847,55 @@ try {
     );
     await assertFoldComposer("tabletop");
     await foldDialog("horizontal");
-    await page.getByRole("button", { name: "Open shell", exact: true }).click();
+    await page.evaluate(() => {
+      const chat = [
+        ...document.querySelectorAll(".mobile-tabs button,.primary-nav button"),
+      ].find(
+        (e) =>
+          e.getClientRects().length &&
+          (e.textContent === "Chat" || e.textContent.includes("Orchestrator")),
+      );
+      chat?.click();
+    });
+    await page.locator(".composer textarea").waitFor();
+    const shellButton = page.getByRole("button", {
+      name: "Open shell",
+      exact: true,
+    });
+    if (!(await shellButton.isVisible()))
+      await page.locator(".conversation-menu summary").click();
+    await shellButton.click();
     await page
       .locator(".terminal-session")
       .filter({ visible: true })
       .locator(".xterm-helper-textarea")
       .waitFor({ state: "attached" });
-    await page.evaluate(() => window.Capacitor.Plugins.Keyboard.hide());
+    // The new terminal focuses in a RAF. Dismiss only after that commit,
+    // then verify the lower pane has returned before checking hinge bounds.
+    await page.evaluate(
+      () =>
+        new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)),
+        ),
+    );
+    await page.waitForTimeout(150);
+    await dismissKeyboard();
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const style = getComputedStyle(document.documentElement);
+            const bottom =
+              parseFloat(style.getPropertyValue("--fold-top")) +
+              parseFloat(style.getPropertyValue("--hinge-height"));
+            return (
+              document.documentElement.dataset.keyboard !== "true" &&
+              visualViewport.height - bottom >= 160
+            );
+          }),
+        { timeout: 10000 },
+      )
+      .toBe(true);
     await expect
       .poll(() => page.evaluate(() => document.documentElement.dataset.fold))
       .toBe("horizontal");
@@ -912,6 +1017,25 @@ try {
   console.log(
     "PASS: mobile attention response and complete shared CLI catalog",
   );
+  const chatTab = page
+    .locator(".mobile-tabs")
+    .getByRole("button", { name: "Chat", exact: true });
+  if (await chatTab.isVisible()) await chatTab.click();
+  else {
+    const show = page.getByRole("button", {
+      name: "Show sidebar",
+      exact: true,
+    });
+    if (await show.isVisible()) await show.click();
+    await page
+      .locator(".thread-list .thread-card")
+      .filter({ hasText: "android-worker" })
+      .click();
+    await page
+      .getByRole("button", { name: "Talk to this thread", exact: true })
+      .click();
+  }
+  await page.locator(".composer textarea").waitFor({ state: "attached" });
   const terminal = await page.evaluate(() =>
     window.twr.terminalOpen({ shell: true, title: "Android shell" }),
   );
@@ -931,11 +1055,24 @@ try {
   await page.evaluate((id) => {
     window.__qaTerminal = id;
   }, terminal.id);
-  await page.getByRole("button", { name: "Open shell", exact: true }).click();
+  await (await shellAction(page)).click();
   const offlineTerminal = page
     .locator(".terminal-session")
     .filter({ visible: true });
   const offlineId = await offlineTerminal.getAttribute("data-session-id");
+  const typography = await page.evaluate(
+    "(async()=>{" +
+      readFileSync(
+        new URL("./connected-typography.js", import.meta.url),
+        "utf8",
+      ) +
+      "})()",
+  );
+  assert.equal(typography.pass, true);
+  console.log(
+    "PASS: connected large-text terminal tabs, collapsed dock and composer",
+    JSON.stringify(typography),
+  );
   await page.evaluate(
     (id) =>
       window.twr.terminalWrite(
@@ -1540,12 +1677,13 @@ try {
       .fill(`http://127.0.0.1:${port}`);
     await page.getByLabel("Pairing code", { exact: true }).fill(limitedCode);
     await page.getByLabel("This device", { exact: true }).fill("Limited QA");
+    await dismissKeyboard();
     await page
       .getByRole("button", { name: "Pair and connect", exact: true })
       .click();
-    await expect(
-      page.getByRole("button", { name: "Open shell", exact: true }),
-    ).toBeDisabled();
+    await expect(await shellAction(page)).toBeDisabled();
+    const overflow = page.locator(".conversation-menu[open] summary");
+    if (await overflow.isVisible()) await overflow.click();
     await page
       .locator(".mobile-tabs")
       .getByRole("button", { name: "More", exact: true })
@@ -1589,19 +1727,20 @@ try {
       .fill(`http://127.0.0.1:${port}`);
     await page.getByLabel("Pairing code", { exact: true }).fill(readOnlyCode);
     await page.getByLabel("This device", { exact: true }).fill("Read only QA");
+    await dismissKeyboard();
     await page
       .getByRole("button", { name: "Pair and connect", exact: true })
       .click();
+    await expect(page.locator(".connection-status")).toContainText(
+      "Hub connected",
+      { timeout: 30000 },
+    );
     await expect(page.locator(".composer textarea")).toBeDisabled();
     await expect(
       page.getByRole("button", { name: "Send message", exact: true }),
     ).toBeDisabled();
     await expect(page.getByLabel("Upload files", { exact: true })).toHaveCount(
       0,
-    );
-    await expect(page.locator(".connection-status")).toContainText(
-      "Hub connected",
-      { timeout: 30000 },
     );
     await expect
       .poll(

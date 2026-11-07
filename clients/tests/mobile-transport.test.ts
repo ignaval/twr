@@ -7,6 +7,11 @@ const fake = vi.hoisted(() => ({
   addListener: vi.fn(),
 }));
 vi.mock("@capacitor/core", () => ({ registerPlugin: () => fake }));
+vi.mock("../mobile/src/offline", () => ({
+  secureRead: async () => null,
+  secureWrite: async () => {},
+  secureDelete: async () => {},
+}));
 import { RemoteHost } from "../mobile/src/transport";
 const hub = {
   id: "local",

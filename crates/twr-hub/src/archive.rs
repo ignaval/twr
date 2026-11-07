@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS events (
     raw    TEXT,
     PRIMARY KEY (thread, seq)
 );
+CREATE INDEX IF NOT EXISTS events_thread_id ON events(thread,id);
 CREATE TABLE IF NOT EXISTS blobs (
     hash  TEXT PRIMARY KEY,
     bytes BLOB NOT NULL
@@ -63,6 +64,8 @@ pub fn open(path: &Path) -> anyhow::Result<Connection> {
         ))
         .with_context(|| format!("creating the archive {}", path.display()))?;
     }
+    // Schema-1 archives created by older builds also need the search index.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS events_thread_id ON events(thread,id);")?;
     crate::store::restrict_db_files(path)?;
     Ok(conn)
 }
@@ -83,7 +86,14 @@ pub fn open_reader(path: &Path) -> Option<Connection> {
     let version: rusqlite::Result<i32> =
         conn.pragma_query_value(None, "user_version", |r| r.get(0));
     match version {
-        Ok(ARCHIVE_SCHEMA_VERSION) => Some(conn),
+        Ok(ARCHIVE_SCHEMA_VERSION) => {
+            if let Err(error) = conn
+                .execute_batch("CREATE INDEX IF NOT EXISTS events_thread_id ON events(thread,id);")
+            {
+                tracing::debug!(%error,"archive search index unavailable");
+            }
+            Some(conn)
+        }
         Ok(0) => None,
         Ok(v) => {
             tracing::warn!(
@@ -103,6 +113,43 @@ pub fn open_reader(path: &Path) -> Option<Connection> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn existing_archives_gain_search_cursor_index_without_changing_data_or_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.db");
+        let old = open(&path).unwrap();
+        old.execute("INSERT INTO events(thread,seq,id,v,ts,source,kind,data) VALUES ('archived',1,'01',1,'2026-11-06T12:00:00.000Z','hub','agent.text','{\"text\":\"kept\"}')", []).unwrap();
+        old.execute_batch("DROP INDEX events_thread_id;").unwrap();
+        drop(old);
+        for reader_first in [true, false] {
+            let conn = if reader_first {
+                open_reader(&path).unwrap()
+            } else {
+                open(&path).unwrap()
+            };
+            let version: i32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, ARCHIVE_SCHEMA_VERSION);
+            let columns: Vec<String> = conn
+                .prepare("PRAGMA index_info(events_thread_id)")
+                .unwrap()
+                .query_map([], |row| row.get(2))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(columns, ["thread", "id"]);
+            let plan: Vec<String> = conn.prepare("EXPLAIN QUERY PLAN SELECT id FROM events WHERE thread=?1 AND id<?2 ORDER BY id DESC LIMIT 10").unwrap().query_map(["archived", "z"], |row| row.get(3)).unwrap().collect::<Result<_, _>>().unwrap();
+            assert!(
+                plan.iter().any(|step| step.contains("events_thread_id")),
+                "{plan:?}"
+            );
+            let found = crate::store::search_candidates(&conn, Some("archived"), "z", 1).unwrap();
+            assert_eq!(found[0].body.data().unwrap()["text"], "kept");
+            conn.execute_batch("DROP INDEX events_thread_id;").unwrap();
+        }
+    }
 
     /// The archive is made private and with its schema once; a reader sees none before it.
     #[test]

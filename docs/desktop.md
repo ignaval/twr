@@ -83,8 +83,8 @@ updates remain visible and summaries are bound to their conversation and covered
 
 macOS uses Command shortcuts; Linux uses Control. Terminal keys pass to the terminal,
 including Ctrl-K/Ctrl-W. Ctrl/Cmd-K opens the palette outside terminals; Ctrl/Cmd-B toggles
-the sidebar; Ctrl/Cmd-G toggles the grid. On macOS the focus filter is Cmd-Shift-F, preserving
-normal text-editing Control keys. Narrow windows expose Chat / Needs you / Threads / More;
+the sidebar; Ctrl/Cmd-G toggles the grid. The focus filter is Cmd-Shift-F on macOS
+and Ctrl-Shift-F on Linux, preserving normal text-editing Control keys. Narrow windows expose Chat / Needs you / Threads / More;
 all manager pages remain accessible through More. In short windows, expanding a terminal
 temporarily gives it the main area. Dark is the default. Light and System are available in Appearance; System follows
 the selected Omarchy theme on Linux. Native menus and window backgrounds follow
@@ -184,3 +184,43 @@ Review builds select the ad hoc identity in pull-request CI. Before uploading th
 installer, CI verifies the complete app signature and checks that it is ad hoc,
 with no signing team. These signatures require no Apple account; Developer ID
 signing and notarization remain the distribution path for public releases.
+
+
+### Needs you across workspaces
+
+The Needs you inbox groups requests by hub and workspace. Filter it to permissions,
+questions, completed work that needs review, or other issues. J/K and the up/down arrow
+keys move between current requests outside text fields and dialogs; Previous and Next provide
+the same controls on touch screens. Number keys answer only the focused request's
+current revision. Inputs keep their normal typing behavior.
+
+Other workspaces show a summary with an Open action. Open the workspace before
+answering so the full live request and its current revision can be reviewed. Saved
+summaries for disconnected hubs are labeled; they cannot authorize a response.
+Refresh reads each running workspace without moving your active conversation.
+
+### Search saved conversations
+
+Use the search button in the header or Cmd/Ctrl-F. Search matches saved messages,
+tool input and output summaries, reports, and recorded decisions in the active
+workspace, including archived agent output and text moved to the blob store. Filter
+by conversation to narrow the results. Search older events continues through older
+pages, including pages without matches. The first archive read after an upgrade may take
+longer while an existing archive receives its search index.
+
+Selecting a result opens its exact event and surrounding history, labeled with the
+hub, workspace, thread and event sequence. It keeps your current message destination
+and draft. Large context fields carry a display-truncated marker. The bounded view
+retains the event id and sequence and omits runtime extras and blob references.
+Use `twr events THREAD --hydrate` to read the full recorded data. Search runs on
+the hub, so it requires a connection to that workspace.
+
+## Layout and offline recovery
+
+Settings → Layout & text offers Compact and Comfortable density, independent interface and code text sizes, and sidebar/inspector width sliders. Drag the pane's header edge or focus its separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
+
+Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings. Configuration/editor drafts stay in memory because they may contain credentials.
+
+When a saved hub is offline, the app shows dated cached history with request buttons disabled. Plain messages can be saved in the outbox for their original workspace and destination. Reopening the app preserves the original request ID; reconnecting retries that ID within 23 hours. An expired receipt or an unknown delivery outcome requires review in the conversation before a new message is sent. Removing an outbox entry never recalls a message already delivered to the hub. Shell commands, slash commands and permission answers require a live connection. Forgetting a hub removes its local encrypted history, drafts, outbox and bootstrap metadata.
+
+See [remote setup and QR pairing](remote-clients.md) and [thread attachments](attachments.md) for the shared desktop/mobile flows.

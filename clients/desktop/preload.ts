@@ -1,6 +1,13 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopAPI, DesktopEvent } from "../shared/types";
+import type { DesktopConnections } from "../shared/connections";
 const api: DesktopAPI = {
+  inboxSources: () => ipcRenderer.invoke("twr:inbox-sources"),
+  sendMessage: (message) => ipcRenderer.invoke("twr:send-message", message),
+  secureRead: (key) => ipcRenderer.invoke("twr:secure-read", key),
+  secureWrite: (key, value) =>
+    ipcRenderer.invoke("twr:secure-write", key, value),
+  secureDelete: (key) => ipcRenderer.invoke("twr:secure-delete", key),
   setAppearance: (appearance) =>
     ipcRenderer.invoke("twr:set-appearance", appearance),
   quit: () => ipcRenderer.invoke("twr:quit"),
@@ -34,4 +41,38 @@ const api: DesktopAPI = {
     return () => ipcRenderer.removeListener("twr:event", listener);
   },
 };
-contextBridge.exposeInMainWorld("twr", api);
+contextBridge.exposeInMainWorld("twrLocal", api);
+const connections: DesktopConnections = {
+  listHubs: () => ipcRenderer.invoke("twr:remote-list"),
+  pair: (request) => ipcRenderer.invoke("twr:remote-pair", request),
+  connect: (request) => ipcRenderer.invoke("twr:remote-connect", request),
+  send: (request) => ipcRenderer.invoke("twr:remote-send", request),
+  disconnect: () => ipcRenderer.invoke("twr:remote-disconnect"),
+  removeHub: (request) => ipcRenderer.invoke("twr:remote-remove", request),
+  resetSavedHubs: () => ipcRenderer.invoke("twr:remote-reset"),
+  gatewayStatus: () => ipcRenderer.invoke("twr:gateway-status"),
+  cancelInvitation: () => ipcRenderer.invoke("twr:gateway-cancel-invitation"),
+  stopGateway: () => ipcRenderer.invoke("twr:gateway-stop"),
+  settings: () => ipcRenderer.invoke("twr:gateway-settings"),
+  check: (request) => ipcRenderer.invoke("twr:gateway-check", request),
+  setup: (request) => ipcRenderer.invoke("twr:gateway-setup", request),
+  restart: (request) => ipcRenderer.invoke("twr:gateway-restart", request),
+  invite: (request) => ipcRenderer.invoke("twr:gateway-invite", request),
+  deactivateLocal: () => ipcRenderer.invoke("twr:deactivate-local"),
+  addListener: async (_event, callback) => {
+    const listener = (_: unknown, value: any) => callback(value);
+    ipcRenderer.on("twr:remote-message", listener);
+    return {
+      remove: async () => {
+        ipcRenderer.removeListener("twr:remote-message", listener);
+      },
+    };
+  },
+};
+contextBridge.exposeInMainWorld("twrRemote", connections);
+
+contextBridge.exposeInMainWorld(
+  "twrUploadRequest",
+  (workspace: string, method: string, params: unknown) =>
+    ipcRenderer.invoke("twr:upload-request", workspace, method, params),
+);

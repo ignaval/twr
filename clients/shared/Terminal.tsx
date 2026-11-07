@@ -76,7 +76,26 @@ export function Terminal({
       previousTheme = signature;
       term.options.theme = theme;
     };
+    const applyTypography = () => {
+      const size =
+        parseFloat(
+          getComputedStyle(document.documentElement).getPropertyValue(
+            "--code-size",
+          ),
+        ) || 13;
+      if (term.options.fontSize !== size) {
+        term.options.fontSize = size;
+        resize.current();
+      }
+    };
+    let typographyTimer: ReturnType<typeof setTimeout> | undefined;
+    const updateTypography = () => {
+      clearTimeout(typographyTimer);
+      typographyTimer = setTimeout(applyTypography, 100);
+    };
     updateTheme();
+    applyTypography();
+    window.addEventListener("twr:typography", updateTypography);
     const themeObserver = new MutationObserver(updateTheme);
     themeObserver.observe(document.documentElement, { attributes: true });
     const scheme = matchMedia("(prefers-color-scheme: light)");
@@ -204,6 +223,8 @@ export function Terminal({
       input.dispose();
       observer.disconnect();
       themeObserver.disconnect();
+      window.removeEventListener("twr:typography", updateTypography);
+      clearTimeout(typographyTimer);
       scheme.removeEventListener("change", updateTheme);
       hostApi.terminalFocus(false);
       terminal.current = null;

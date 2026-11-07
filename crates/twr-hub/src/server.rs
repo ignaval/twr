@@ -16,6 +16,8 @@
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
 //! | `thread.spawn_status` | `{operation_id}` | durable operation |
+//! | `conversation.search` | `{query, thread?, before?:event_id, limit?}` | literal case-insensitive search across messages, tool output and decisions, including archive; `{items, next, more, workspace}` |
+//! | `thread.event_context` | `{thread, event_id, before?, after?, query?}` | exact event plus nearby events in its recorded workspace/thread, including archive |
 //! | `thread.transcript` | `{thread, turn?, since_seq?, limit?}` | filtered semantic events, default latest turn |
 //! | `thread.new`        | `{project, runtime?, name?, mode?, model?, effort?, aliases?, box?, worktree?, no_worktree?, base?}` | thread object |
 //! | `thread.list`       | -                                                   | `[thread object]` |
@@ -604,6 +606,7 @@ async fn send<T: Serialize>(w: &Writer, msg: &T) -> std::io::Result<()> {
 /// orchestrator token, or its peer is a thread's agent.
 struct Conn {
     client: String,
+    upload_uid: Option<u32>,
     device: Option<twr_core::devices::Device>,
     /// The orchestrator token this connection presented; checked again on every request, with
     /// the peer's ancestry walked again ([`still_orchestrator`]), so a connection from an
@@ -632,6 +635,20 @@ static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 impl Conn {
     /// The agent this connection is restricted as: its peer is a thread's agent and it did not
     /// present the orchestrator token (only the orchestrator's own agent may, [`hello`]).
+    fn upload_scope(&self) -> Result<String, RpcError> {
+        if let Some(device) = &self.device {
+            return Ok(format!("device:{}", device.id));
+        }
+        self.upload_uid
+            .map(|uid| format!("uid:{uid}"))
+            .ok_or_else(|| {
+                RpcError::new(
+                    codes::UNAUTHORIZED,
+                    "Cannot authenticate the upload owner from socket credentials",
+                )
+            })
+    }
+
     fn restricted(&self) -> Option<&AgentPeer> {
         self.agent.as_ref().filter(|_| self.token.is_none())
     }
@@ -665,6 +682,7 @@ pub const METHODS: &[&str] = &[
     "hello",
     "device.pair_begin",
     "device.pair_complete",
+    "device.pair_cancel",
     "device.list",
     "device.revoke",
     "say",
@@ -692,6 +710,7 @@ pub const METHODS: &[&str] = &[
     "thread.activity",
     "thread.get",
     "thread.send",
+    "thread.upload",
     "thread.send_cancel",
     "thread.stop",
     "thread.set_mode",
@@ -703,6 +722,8 @@ pub const METHODS: &[&str] = &[
     "thread.trim",
     "thread.events",
     "thread.transcript",
+    "conversation.search",
+    "thread.event_context",
     "thread.subscribe",
     "message.withdraw",
     "message.send_now",
@@ -785,6 +806,8 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "thread.resume",
     "thread.events",
     "thread.transcript",
+    "conversation.search",
+    "thread.event_context",
     "thread.subscribe",
     "attention.list",
     "attention.respond",
@@ -860,6 +883,8 @@ pub const AGENT_METHODS: &[&str] = &[
     "thread.get",
     "thread.events",
     "thread.transcript",
+    "conversation.search",
+    "thread.event_context",
     "thread.subscribe",
     "attention.list",
     "control.read",
@@ -956,11 +981,13 @@ async fn connection(
     if let Some(a) = &agent {
         tracing::info!(thread = ?a.thread, peer = a.peer, why = ?a.why, "a connection from a thread's agent: it reads, and starts and cancels its own thread's jobs only");
     }
+    let upload_uid = stream.peer_cred().ok().map(|credential| credential.uid());
     let (r, w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let writer: Writer = Arc::new(Mutex::new(w));
     let mut conn = Conn {
         client: default_client,
+        upload_uid,
         device: None,
         token: None,
         agent,
@@ -1024,7 +1051,7 @@ async fn connection(
             if !device.allows_params(&req.method, &req.params)
                 || matches!(
                     req.method.as_str(),
-                    "device.pair_begin" | "device.pair_complete"
+                    "device.pair_begin" | "device.pair_complete" | "device.pair_cancel"
                 )
             {
                 let _ = send(
@@ -1248,6 +1275,46 @@ async fn connection(
             "memory.save" | "memory.forget" => {
                 let result =
                     memory_change(&hub, &caller, &req.method, req.params, received.as_ref()).await;
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
+            "conversation.search" | "thread.event_context" => {
+                let search_hub = hub.clone();
+                let method = req.method.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    search_call(&search_hub, &method, req.params)
+                })
+                .await
+                .unwrap_or_else(|error| Err(internal(error)));
+                let response = match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, error),
+                };
+                if send(&writer, &response).await.is_err() {
+                    break;
+                }
+            }
+            "thread.upload" => {
+                #[derive(Deserialize)]
+                struct UploadParams {
+                    thread: String,
+                    #[serde(flatten)]
+                    request: twr_core::upload::Request,
+                }
+                let result = match serde_json::from_value::<UploadParams>(req.params)
+                    .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
+                {
+                    Ok(p) => match conn.upload_scope() {
+                        Ok(scope) => hub.upload(scope, &p.thread, p.request).await,
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -2760,6 +2827,48 @@ async fn box_agents(hub: &Hub, conn: &Conn, caller: &Caller, p: Value) -> Result
         .await
 }
 
+fn search_call(hub: &Hub, method: &str, p: Value) -> Result<Value, RpcError> {
+    match method {
+        "conversation.search" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct SearchParams {
+                query: String,
+                thread: Option<String>,
+                before: Option<String>,
+                limit: Option<usize>,
+            }
+            let p: SearchParams = params(p)?;
+            hub.conversation_search(
+                &p.query,
+                p.thread.as_deref(),
+                p.before.as_deref(),
+                p.limit.unwrap_or(30),
+            )
+        }
+        "thread.event_context" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ContextParams {
+                thread: String,
+                event_id: String,
+                before: Option<usize>,
+                after: Option<usize>,
+                query: Option<String>,
+            }
+            let p: ContextParams = params(p)?;
+            hub.thread_event_context_matching(
+                &p.thread,
+                &p.event_id,
+                p.before.unwrap_or(12),
+                p.after.unwrap_or(12),
+                p.query.as_deref(),
+            )
+        }
+        _ => unreachable!("search method dispatch"),
+    }
+}
+
 fn call(
     hub: &Hub,
     conn: &mut Conn,
@@ -2784,6 +2893,13 @@ fn call(
                 .begin(scopes)
                 .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
             Ok(json!({"code":code,"expires_in":300}))
+        }
+        "device.pair_cancel" => {
+            let cancelled = hub
+                .device_auth()
+                .and_then(|auth| auth.cancel_pairing(p["code"].as_str().unwrap_or("")))
+                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+            Ok(json!({"cancelled":cancelled}))
         }
         "device.pair_complete" => {
             let auth = hub
@@ -3054,6 +3170,7 @@ fn call(
                 "more": more,
             }))
         }
+        "conversation.search" | "thread.event_context" => search_call(hub, method, p),
         "thread.transcript" => {
             #[derive(Default, Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -3306,6 +3423,7 @@ mod tests {
         let me = std::process::id();
         Conn {
             client: "c".into(),
+            upload_uid: Some(unsafe { libc::geteuid() }),
             device: None,
             token: Some("t".into()),
             agent: None,
@@ -3316,6 +3434,25 @@ mod tests {
             }),
             id: 0,
         }
+    }
+
+    #[test]
+    fn upload_identity_uses_peer_credentials_instead_of_client_hello_names() {
+        let mut first = conn(None);
+        first.client = "desktop".into();
+        let mut second = conn(None);
+        second.client = "different-client".into();
+        assert_eq!(
+            first.upload_scope().unwrap(),
+            second.upload_scope().unwrap()
+        );
+        second.upload_uid = first.upload_uid.map(|id| id + 1);
+        assert_ne!(
+            first.upload_scope().unwrap(),
+            second.upload_scope().unwrap()
+        );
+        second.upload_uid = None;
+        assert!(second.upload_scope().is_err());
     }
 
     #[tokio::test]
@@ -3387,6 +3524,7 @@ mod tests {
         .unwrap();
         let c = Conn {
             client: "c".into(),
+            upload_uid: Some(unsafe { libc::geteuid() }),
             device: None,
             token: None,
             agent: Some(AgentPeer::unidentified()),

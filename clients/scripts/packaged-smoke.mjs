@@ -5,6 +5,7 @@ import { chromium } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
+  realpathSync,
   mkdirSync,
   writeFileSync,
   existsSync,
@@ -14,6 +15,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
 if (process.platform !== "darwin" || process.arch !== "arm64")
@@ -22,7 +24,7 @@ if (process.platform !== "darwin" || process.arch !== "arm64")
   );
 const application = resolve("release/mac-arm64/twr.app");
 assert(existsSync(application), "Build the Mac application first");
-const fixture = mkdtempSync(join(tmpdir(), "twr-package-"));
+const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-package-")));
 const repository = join(fixture, "repo");
 const speechScript = join(fixture, "speech-sink.sh");
 const spoken = join(fixture, "spoken.txt");
@@ -58,6 +60,23 @@ const port = await new Promise((resolvePort, reject) => {
     socket.close(() => resolvePort(port));
   });
 });
+function fixtureLauncherPID() {
+  for (const line of execFileSync("/bin/ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+  }).split("\n")) {
+    const match = line.trim().match(/^(\d+) (.+)$/);
+    if (
+      match &&
+      match[2].startsWith(application + "/Contents/MacOS/twr ") &&
+      match[2].includes(`--user-data-dir=${join(fixture, "user-data")}`) &&
+      match[2].includes(`--remote-debugging-port=${port}`)
+    )
+      return Number(match[1]);
+  }
+  throw new Error(
+    "Could not identify this fixture's app process for foreground evidence",
+  );
+}
 let browser;
 let hubPid;
 const hubPids = new Set();
@@ -150,6 +169,24 @@ try {
       runtime: "fake",
     }),
   );
+  const attachmentPath = await page.evaluate(async () => {
+    const thread = await window.twr.rpc("thread.get", { thread: "packaged" });
+    const result = await window.twr.uploadFile(
+      new File(["PACKAGED_ATTACHMENT_✓"], "packaged-attachment.txt", {
+        type: "text/plain",
+      }),
+      thread.id,
+    );
+    return result.path;
+  });
+  assert(
+    attachmentPath.startsWith(fixture + "/"),
+    "Packaged upload must remain in its isolated fixture",
+  );
+  assert.equal(readFileSync(attachmentPath, "utf8"), "PACKAGED_ATTACHMENT_✓");
+  console.log(
+    "PASS: packaged local File upload reached the pinned worktree through production authentication",
+  );
   await page
     .locator(".thread-card")
     .filter({ hasText: "packaged" })
@@ -164,6 +201,48 @@ try {
     .locator(".block-assistant")
     .getByText("PACKAGED_AGENT_OK", { exact: true })
     .waitFor();
+  const directComposer = page.getByRole("textbox", {
+    name: "Message packaged directly",
+    exact: true,
+  });
+  const assistantMessages = await page.locator(".block-assistant").count();
+  await page.getByLabel("Upload files", { exact: true }).setInputFiles({
+    name: "preview.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from(
+      "PLAIN_TEXT_PREVIEW_<script>window.unsafePreview=true</script>",
+    ),
+  });
+  const attachment = page
+    .locator(".attachment-item")
+    .filter({ hasText: "preview.txt" });
+  await attachment.getByText("Ready to send", { exact: false }).waitFor();
+  await attachment.getByText("Preview text", { exact: false }).click();
+  assert(
+    (await attachment.locator("pre").innerText()).includes(
+      "<script>window.unsafePreview=true</script>",
+    ),
+  );
+  assert.equal(
+    await page.evaluate(() => window.unsafePreview),
+    undefined,
+    "Text previews must remain inert",
+  );
+  assert(
+    (await directComposer.inputValue()).includes("Uploaded file: preview.txt"),
+  );
+  assert.equal(
+    await page.locator(".block-assistant").count(),
+    assistantMessages,
+    "Selecting a file must not send a prompt",
+  );
+  await attachment
+    .getByRole("button", { name: "Dismiss", exact: true })
+    .click();
+  await directComposer.fill("");
+  console.log(
+    "PASS: packaged attachment preview is inert, progresses to ready, and waits for explicit send",
+  );
   if (process.env.TWR_DESKTOP_EXTENDED_QA === "1") {
     const { runMacQA } = await import("./qa-scenarios.mjs");
     await runMacQA(page, { fixture, hubPids });
@@ -217,8 +296,65 @@ try {
   }
   await page.evaluate((id) => window.twr.terminalClose(id), terminal.id);
   mkdirSync("test-results", { recursive: true });
-  if (process.env.TWR_PERF === "1")
+  if (process.env.TWR_PERF === "1") {
+    const helper = join(fixture, "mac-foreground");
+    execFileSync(
+      "/usr/bin/xcrun",
+      [
+        "swiftc",
+        fileURLToPath(new URL("./mac-foreground.swift", import.meta.url)),
+        "-module-cache-path",
+        join(fixture, "swift-modules"),
+        "-o",
+        helper,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const pid = fixtureLauncherPID();
+    const sample = (activate = false) =>
+      JSON.parse(
+        execFileSync(
+          helper,
+          [String(pid), ...(activate ? ["--activate"] : [])],
+          { encoding: "utf8" },
+        ),
+      );
+    await page.bringToFront();
+    const before = sample(true);
+    const foreground = (state) =>
+      state.targetActive &&
+      state.targetOnScreen &&
+      state.frontmostPID === pid &&
+      state.overlappingHigherWindows === 0;
+    const requireForeground = process.env.TWR_PERF_REQUIRE_FOREGROUND === "1";
+    writeFileSync(
+      "test-results/packaged-native-foreground.json",
+      JSON.stringify({ before, after: null }, null, 2) + "\n",
+    );
+    if (requireForeground)
+      assert(
+        foreground(before),
+        "Performance requires this fixture app foreground and unoccluded: " +
+          JSON.stringify(before),
+      );
     await performanceAudit(page, "mac-packaged");
+    const after = sample();
+    const classification =
+      foreground(before) && foreground(after)
+        ? "foreground-unoccluded"
+        : "occluded-or-inactive";
+    const evidence = { before, after, classification };
+    writeFileSync(
+      "test-results/packaged-native-foreground.json",
+      JSON.stringify(evidence, null, 2) + "\n",
+    );
+    console.log("PERFORMANCE_CONTEXT", JSON.stringify(evidence));
+    if (requireForeground)
+      assert(
+        foreground(after),
+        "Native foreground changed during the performance audit",
+      );
+  }
   await page.screenshot({ path: "test-results/packaged-macos.png" });
   if (process.env.TWR_UI_CAPTURES === "1") {
     const { captureUI } = await import("./ui-captures.mjs");

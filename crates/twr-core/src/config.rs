@@ -1635,6 +1635,7 @@ pub fn check_env_name(name: &str) -> Result<(), String> {
 /// twr-cli test keeps them equal).
 pub const DEFAULT_PARK_DISPOSABLE: &[&str] = &[
     "target/",
+    ".twr-uploads/",
     "node_modules/",
     "dist/",
     "build/",

@@ -62,6 +62,12 @@ jobs:
       - name: Real application integration
         working-directory: clients
         run: npm run test:integration
+      - name: Remote setup, inbox, search, and encrypted recovery QA
+        working-directory: clients
+        run: |
+          node scripts/gateway-lifecycle-qa.mjs
+          node scripts/inbox-search-qa.mjs
+          node scripts/preferences-offline-qa.mjs
       - name: Build ad hoc signed review installer
         working-directory: clients
         env:
@@ -77,11 +83,23 @@ jobs:
           grep -qx 'TeamIdentifier=not set' release/mac-signature.txt
       - name: Packaged Mac workflow QA
         working-directory: clients
+        env:
+          TWR_PERF: "1"
         run: npm run test:qa:mac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-macos-arm64
           path: clients/release/*.dmg
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: twr-desktop-client-workflow-qa
+          path: |
+            clients/test-results/*qa.json
+            clients/test-results/*qa.png
+            clients/test-results/preferences-*.png
+            clients/test-results/offline-*.png
+            clients/test-results/performance-*.json
 
   linux:
     # Build the *same* native-addon/Rust bundle used by AppImage and Arch on
@@ -116,6 +134,11 @@ jobs:
           node scripts/linux-abi.mjs release/linux-unpacked release/linux-abi.json
           # Integration fixtures use debug engines; the app contains release engines.
           cargo build --manifest-path ../Cargo.toml --locked -p twr-cli -p twr-app
+      - name: Remote setup, inbox, and archive search QA on Linux
+        working-directory: clients
+        run: |
+          node scripts/gateway-lifecycle-qa.mjs
+          xvfb-run -a dbus-run-session -- node scripts/inbox-search-qa.mjs
       - name: Clean Debian dependency closure and sandboxed launch
         working-directory: clients
         run: |

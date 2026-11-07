@@ -1,3 +1,5 @@
+import { OfflineOptions } from "./OfflineOptions";
+import { LayoutOptions } from "./LayoutOptions";
 import { errorMessage } from "./errors";
 import { AppearanceOptions } from "./AppearanceOptions";
 import { useHostAPI } from "./host";
@@ -51,6 +53,7 @@ export interface ManagerProps {
   action: (id: string, initial?: Json) => void;
   cliAction: (path: string, initial?: Json) => void;
   fail: (error: unknown) => void;
+  canAdmin?: boolean;
 }
 const meta: Record<
   string,
@@ -128,7 +131,14 @@ export function Manager(props: ManagerProps) {
     return () => clearInterval(timer);
   }, [section, load]);
   if (section === "settings")
-    return <Settings fail={fail} rpc={rpc} action={action} />;
+    return (
+      <Settings
+        fail={fail}
+        rpc={rpc}
+        action={action}
+        canAdmin={props.canAdmin !== false}
+      />
+    );
   if (!info) return null;
   const inspect = async (method: string, params: Json = {}) => {
     try {
@@ -771,7 +781,9 @@ function Settings({
   fail,
   rpc,
   action,
+  canAdmin,
 }: {
+  canAdmin: boolean;
   fail: ManagerProps["fail"];
   rpc: ManagerProps["rpc"];
   action: ManagerProps["action"];
@@ -789,6 +801,7 @@ function Settings({
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState<Json>();
   useEffect(() => {
+    if (!canAdmin) return;
     void hostApi
       .configRead()
       .then((c) => {
@@ -797,9 +810,9 @@ function Settings({
       })
       .catch(fail);
     void rpc("config.show").then(setLoaded).catch(fail);
-  }, [rpc, fail]);
+  }, [rpc, fail, canAdmin]);
   useEffect(() => {
-    if (text === config?.content) return;
+    if (!config || text === config.content) return;
     const listener = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = "";
@@ -807,6 +820,18 @@ function Settings({
     window.addEventListener("beforeunload", listener);
     return () => window.removeEventListener("beforeunload", listener);
   }, [text, config]);
+  if (!canAdmin)
+    return (
+      <div className="manager">
+        <header className="section-heading">
+          <div>
+            <h1>Settings</h1>
+            <p>Preferences for this device.</p>
+          </div>
+        </header>
+        <ClientPreferences />
+      </div>
+    );
   return (
     <div className="manager">
       <header className="section-heading">
@@ -816,15 +841,7 @@ function Settings({
           <p>Make twr feel at home.</p>
         </div>
       </header>
-      <section className="settings-section">
-        <h2 id="settings-appearance-title">Appearance</h2>
-        <p>
-          {document.documentElement.dataset.mobile === "true"
-            ? "System follows your device."
-            : "System follows your desktop. On Omarchy, its current theme is used when available."}
-        </p>
-        <AppearanceOptions labelledBy="settings-appearance-title" />
-      </section>
+      <ClientPreferences />
       <section className="settings-section">
         <h2>Orchestrator</h2>
         <p>
@@ -1251,5 +1268,23 @@ function ScalarSetting({
         {busy ? <Spinner /> : done ? "Saved" : "Save"}
       </button>
     </form>
+  );
+}
+
+function ClientPreferences() {
+  return (
+    <>
+      <section className="settings-section">
+        <h2 id="settings-appearance-title">Appearance</h2>
+        <p>
+          {document.documentElement.dataset.mobile === "true"
+            ? "System follows your device."
+            : "System follows your desktop. On Omarchy, its current theme is used when available."}
+        </p>
+        <AppearanceOptions labelledBy="settings-appearance-title" />
+      </section>
+      <LayoutOptions />
+      <OfflineOptions />
+    </>
   );
 }

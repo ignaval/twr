@@ -36,6 +36,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Well-known error codes.
 pub mod codes {
     /// Malformed request or params.
+    /// Attachment begin rejected without accepting a new upload.
+    pub const UPLOAD_REJECTED: &str = "upload_rejected";
+    /// The attachment commit failed definitively and its staging/reservation was removed.
+    pub const UPLOAD_FAILED: &str = "upload_failed";
     pub const BAD_REQUEST: &str = "bad_request";
     /// Unknown method.
     pub const METHOD_NOT_FOUND: &str = "method_not_found";
