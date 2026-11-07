@@ -7,6 +7,7 @@ import {
   dialog,
   shell,
   clipboard,
+  crashReporter,
   nativeTheme,
   systemPreferences,
 } from "electron";
@@ -45,6 +46,7 @@ import {
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
 import { ENGINE_BINARIES, EngineDigests, cleanupEngines } from "./engines";
 import { discoverCatalog } from "./catalog";
+import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
@@ -81,6 +83,8 @@ let localGeneration = 0;
 const exec = promisify(execFile);
 let openingTerminals = 0;
 let remoteTransport: DesktopTransport;
+let services: AppServices | undefined;
+let hubVersion: string | undefined;
 let voice: DesktopVoice | undefined;
 // The microphone is granted only after the user turned voice mode on (`voice-arm`), and only
 // for audio, to the app's own page.
@@ -148,6 +152,8 @@ function applyNativeAppearance() {
 const devUrl = !app.isPackaged ? process.env.TWR_DESKTOP_DEV_URL : undefined;
 if (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
   app.setPath("userData", resolve(process.env.TWR_DESKTOP_TEST_USER_DATA));
+// Crash reports stay on this machine (app.getPath("crashDumps")); nothing is uploaded.
+crashReporter.start({ uploadToServer: false });
 const appFile = resolve(__dirname, "../dist/index.html");
 const env = (): NodeJS.ProcessEnv => ({
   ...loginEnv,
@@ -367,6 +373,7 @@ async function connectWorkspace(next: string, generation: number) {
       .call("notify.looking", { looking: window?.isFocused() || false })
       .catch(() => {});
     saveDesktopSettings({ workspace: next });
+    hubVersion = hubInfo.version;
     return {
       ...paths,
       hubVersion: hubInfo.version,
@@ -374,6 +381,7 @@ async function connectWorkspace(next: string, generation: number) {
     };
   } catch (error) {
     // Retain the companion for config repair, while blocking workspace-bound commands.
+    services?.log.warn("hub", `Could not open workspace ${next}`, error);
     emit({ type: "config-available", error: String(error) });
     throw error;
   }
@@ -400,6 +408,16 @@ function omarchyTheme(): Record<string, string> | null {
   }
 }
 function register() {
+  services!.register(handle, (channel, callback) =>
+    ipcMain.on(`twr:${channel}`, (event, ...args) => {
+      try {
+        trusted(event);
+        callback(...args);
+      } catch (error) {
+        services?.logRejected(channel, error);
+      }
+    }),
+  );
   const vault = new SecureStore(
     join(app.getPath("userData"), "secure", "connections"),
   );
@@ -614,7 +632,7 @@ function register() {
   );
   handle("rpc", (method, params) => {
     z.string().max(100).parse(method);
-    if (method === "desktop.check_updates") return checkUpdates();
+    if (method === "desktop.check_updates") return services!.updater.check();
     if (method === "desktop.runner.use")
       return companion().call(method, { binary: binaries.twr });
     if (
@@ -870,36 +888,23 @@ function register() {
     } catch {}
   });
 }
-async function checkUpdates() {
-  const response = await fetch(
-    "https://api.github.com/repos/ignaval/twr/releases/latest",
-    {
-      headers: { Accept: "application/vnd.github+json" },
-      signal: AbortSignal.timeout(15000),
-    },
-  );
-  if (!response.ok)
-    throw new Error(
-      `Could not check releases (${response.status}). Try again later.`,
-    );
-  const release = (await response.json()) as any;
-  const assets = (release.assets || [])
-    .filter((a: any) => /\.dmg$|\.AppImage$|\.pkg\.tar\.zst$/.test(a.name))
-    .map((a: any) => ({ name: a.name, url: a.browser_download_url }));
-  return {
-    installed: app.getVersion(),
-    latest: release.tag_name,
-    release_page: release.html_url,
-    desktop_installers: assets,
-    message: assets.length
-      ? "Download the desktop installer for your platform. The application and bundled engine must be updated together."
-      : "This release does not contain desktop installers yet. The current bundled engine has not been changed.",
-  };
+function showWindow() {
+  // During a quit (including an update restart) a relaunch hands over to this
+  // process; never reopen a window that is closing.
+  if (quitRequested) return;
+  if (!window || window.isDestroyed()) {
+    void createWindow();
+    return;
+  }
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
 }
-async function createWindow() {
+async function createWindow(hidden = false) {
   quitting = false;
   applyNativeAppearance();
   window = new BrowserWindow({
+    show: !hidden,
     width: 1360,
     height: 900,
     minWidth: 420,
@@ -987,8 +992,17 @@ async function createWindow() {
       void bridge?.call("notify.looking", { looking: false }).catch(() => {});
   });
   window.on("close", async (event) => {
+    // Background mode: keep the renderer, hub connection and terminals alive.
+    if (!quitting && !quitRequested && services?.background) {
+      event.preventDefault();
+      services.log.info("window", "Hiding the window (background mode)");
+      window.hide();
+      return;
+    }
     if (!quitting && [...terminals.values()].some((t) => !t.exited)) {
       event.preventDefault();
+      // Quitting from the tray while hidden: the question must be visible.
+      if (!window.isVisible()) window.show();
       const result = await dialog.showMessageBox(window, {
         type: "question",
         message: "Close active terminal sessions?",
@@ -1006,6 +1020,7 @@ async function createWindow() {
     }
   });
   window.on("closed", () => {
+    services?.setAttention({ count: 0, items: [] });
     ++localGeneration;
     workspaceReady = false;
     void remoteTransport.disconnect();
@@ -1020,12 +1035,7 @@ async function createWindow() {
 }
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on("second-instance", () => {
-    if (window) {
-      if (window.isMinimized()) window.restore();
-      window.focus();
-    }
-  });
+  app.on("second-instance", () => showWindow());
   app
     .whenReady()
     .then(async () => {
@@ -1048,9 +1058,43 @@ else {
       );
       if (savedAppearance.success) appearance = savedAppearance.data;
       applyNativeAppearance();
+      services = new AppServices(
+        {
+          window: () => (window && !window.isDestroyed() ? window : undefined),
+          showWindow,
+          emit,
+          settings: () => desktopSettings,
+          save: saveDesktopSettings,
+          prepareQuit: () => {
+            quitting = true;
+            quitRequested = true;
+          },
+          cancelQuit: () => {
+            quitting = false;
+            quitRequested = false;
+          },
+          activeTerminals: () =>
+            [...terminals.values()].filter((t) => !t.exited).length,
+          facts: () => ({
+            window:
+              window && !window.isDestroyed()
+                ? { visible: window.isVisible(), focused: window.isFocused() }
+                : "closed",
+            workspace: workspaceReady ? "connected" : "not connected",
+            hubVersion,
+            terminals: [...terminals.values()].filter((t) => !t.exited).length,
+          }),
+        },
+        // Automated runs keep their log with their isolated user data.
+        process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" ||
+          (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
+          ? join(app.getPath("userData"), "logs")
+          : app.getPath("logs"),
+      );
       await loadLoginEnvironment();
       binaries = findBinaries();
       register();
+      await services.start();
       if (process.platform === "linux") {
         let previous = JSON.stringify(omarchyTheme());
         const timer = setInterval(() => {
@@ -1084,6 +1128,11 @@ else {
               },
               { type: "separator" as const },
               { role: "close" as const },
+              // macOS has Quit in the app menu; Linux needs it here so a
+              // background-mode window can always end the app.
+              ...(process.platform === "darwin"
+                ? []
+                : [{ role: "quit" as const, accelerator: "Ctrl+Q" }]),
             ],
           },
           { role: "editMenu" },
@@ -1102,6 +1151,27 @@ else {
             label: "Help",
             submenu: [
               {
+                label: "Check for Updates…",
+                click: () => {
+                  showWindow();
+                  void services?.updater.check();
+                  emit({ type: "menu-settings" });
+                },
+              },
+              {
+                label: "Copy Diagnostics",
+                click: () => {
+                  if (services) clipboard.writeText(services.diagnostics());
+                },
+              },
+              {
+                label: "Open Log Folder",
+                click: () => {
+                  if (services) void shell.openPath(services.log.directory);
+                },
+              },
+              { type: "separator" as const },
+              {
                 label: "twr Documentation",
                 click: () => {
                   void shell.openExternal(
@@ -1113,12 +1183,21 @@ else {
           },
         ]),
       );
-      await createWindow();
+      // Packaged QA closes the window the way the title-bar button does.
+      // Synthetic input cannot reach native menu accelerators.
+      if (process.env.TWR_DESKTOP_TEST_AUTOMATION === "1")
+        process.on("SIGUSR2", () => {
+          services?.log.info("test", "Closing the window (SIGUSR2)");
+          if (window && !window.isDestroyed()) window.close();
+        });
+      await createWindow(services.startHidden);
       app.on("activate", () => {
-        if (BrowserWindow.getAllWindows().length === 0) void createWindow();
+        services?.log.info("window", "Activated; showing the window");
+        showWindow();
       });
     })
     .catch((error) => {
+      services?.log.error("app", "Startup failed", error);
       dialog.showErrorBox("Could not open twr", String(error));
       app.quit();
     });

@@ -3,6 +3,7 @@ import { ArrowDown, ArrowUp, Search } from "lucide-react";
 import type { Attention, HubEvent, InboxSource, Json, Thread } from "./types";
 import { Dialog, Empty, Markdown, Spinner } from "./ui";
 import { errorMessage } from "./errors";
+import { announce, scrollBehavior } from "./a11y";
 import "./inbox-search.css";
 
 export type InboxFilter =
@@ -84,7 +85,7 @@ export function NeedsYouInbox({
       ...(root.current?.querySelectorAll<HTMLElement>("[data-inbox-key]") ||
         []),
     ].find((element) => element.dataset.inboxKey === key);
-    node?.scrollIntoView({ block: "center", behavior: "smooth" });
+    node?.scrollIntoView({ block: "center", behavior: scrollBehavior() });
     node
       ?.querySelector<HTMLElement>(".attention-card")
       ?.focus({ preventScroll: true });
@@ -118,6 +119,10 @@ export function NeedsYouInbox({
           <span className="eyebrow">Your attention</span>
           <h1>
             Needs you <span className="heading-count">{count}</span>
+            <span className="visually-hidden">
+              {" "}
+              {count === 1 ? "request" : "requests"}
+            </span>
           </h1>
           <p>
             Review requests by hub and workspace. J / K moves between current
@@ -141,7 +146,11 @@ export function NeedsYouInbox({
             </button>
           ))}
         </div>
-        <div className="inbox-navigation">
+        <div
+          className="inbox-navigation"
+          role="group"
+          aria-label="Move between requests"
+        >
           <button
             aria-label="Previous request"
             disabled={!keys.length}
@@ -182,9 +191,10 @@ export function NeedsYouInbox({
           <section
             key={group.hubId + ":" + group.workspace}
             className="inbox-group"
+            aria-labelledby={`inbox-${group.hubId}-${group.workspace}`}
           >
             <header>
-              <h2>
+              <h2 id={`inbox-${group.hubId}-${group.workspace}`}>
                 {group.hubName} <span> / {group.workspace}</span>
               </h2>
               <span>
@@ -215,31 +225,46 @@ export function NeedsYouInbox({
                 {group.error}
               </p>
             )}
-            {group.attention.map((item) =>
-              live ? (
-                <div
-                  key={item.attn_id + ":" + item.revision}
-                  data-inbox-key={item.attn_id + ":" + item.revision}
-                  onFocus={() => setActive(item.attn_id + ":" + item.revision)}
-                >
-                  {renderItem(item)}
-                </div>
-              ) : (
-                <button
-                  key={item.attn_id}
-                  className="inbox-source-request"
-                  onClick={() => onOpenSource(group)}
-                >
-                  <b>
-                    {group.threads.find((thread) => thread.id === item.thread)
-                      ?.name || item.thread}
-                  </b>
-                  <span>
-                    {inboxCategory(item)} · {item.summary}
-                  </span>
-                  <small>Open {group.workspace}</small>
-                </button>
-              ),
+            {group.attention.length > 0 && (
+              <div
+                className="inbox-items"
+                role="list"
+                aria-label={`Requests in ${group.workspace}`}
+              >
+                {group.attention.map((item) =>
+                  live ? (
+                    <div
+                      role="listitem"
+                      key={item.attn_id + ":" + item.revision}
+                      data-inbox-key={item.attn_id + ":" + item.revision}
+                      onFocus={() =>
+                        setActive(item.attn_id + ":" + item.revision)
+                      }
+                    >
+                      {renderItem(item)}
+                    </div>
+                  ) : (
+                    <div role="listitem" key={item.attn_id}>
+                      <button
+                        className="inbox-source-request"
+                        onClick={() => onOpenSource(group)}
+                      >
+                        <b>
+                          {group.threads.find(
+                            (thread) => thread.id === item.thread,
+                          )?.name || item.thread}
+                        </b>
+                        <span className="visually-hidden">, </span>
+                        <span>
+                          {inboxCategory(item)} · {item.summary}
+                        </span>
+                        <span className="visually-hidden">. </span>
+                        <small>Open {group.workspace}</small>
+                      </button>
+                    </div>
+                  ),
+                )}
+              </div>
             )}
             {!group.error &&
               group.running !== false &&
@@ -324,6 +349,20 @@ export function ConversationSearch({
   }>();
   const generation = useRef(0);
   const contextGeneration = useRef(0);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const backButton = useRef<HTMLButtonElement>(null);
+  const returnTo = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    // Keep focus inside the dialog when its content is swapped.
+    if (chosen) backButton.current?.focus();
+    else if (returnTo.current) {
+      const hit = document.querySelector<HTMLElement>(
+        `[data-search-hit="${CSS.escape(returnTo.current)}"]`,
+      );
+      (hit || searchInput.current)?.focus();
+      returnTo.current = undefined;
+    }
+  }, [chosen]);
   useEffect(() => {
     const id = ++generation.current;
     setPage(undefined);
@@ -346,6 +385,10 @@ export function ConversationSearch({
           if (id === generation.current) {
             setPage(result);
             setLastAdded(result.items.length);
+            if (result.items.length)
+              announce(
+                `${result.items.length}${result.more ? " or more" : ""} matching ${result.items.length === 1 && !result.more ? "event" : "events"}`,
+              );
           }
         })
         .catch((failure) => {
@@ -382,6 +425,8 @@ export function ConversationSearch({
       if (id === generation.current) {
         setLastAdded(result.items.length);
         setPage({ ...result, items: [...page.items, ...result.items] });
+        if (result.items.length)
+          announce(`${result.items.length} more matching events loaded`);
       }
     } catch (failure) {
       if (id === generation.current) setError(errorMessage(failure));
@@ -425,7 +470,10 @@ export function ConversationSearch({
       {chosen ? (
         <div className="search-context">
           <button
+            ref={backButton}
+            aria-label="Back to search results"
             onClick={() => {
+              returnTo.current = chosen.event_id;
               contextGeneration.current++;
               setChosen(undefined);
               setContext(undefined);
@@ -442,36 +490,39 @@ export function ConversationSearch({
           </p>
           <blockquote className="search-match">{chosen.excerpt}</blockquote>
           {!context && !error && <Spinner />}
-          {context?.events.map((event) => (
-            <article
-              key={event.id}
-              className={
-                event.id === context.event.id
-                  ? "search-event selected"
-                  : "search-event"
-              }
-              ref={
-                event.id === context.event.id
-                  ? (node) => {
-                      node?.scrollIntoView({ block: "center" });
-                    }
-                  : undefined
-              }
-            >
-              <header>
-                <b>{event.kind}</b>
-                <time>{new Date(event.ts).toLocaleString()}</time>
-                <span>#{event.seq}</span>
-              </header>
-              <Markdown text={eventText(event)} />
-            </article>
-          ))}
+          <div aria-busy={!context && !error ? true : undefined}>
+            {context?.events.map((event) => (
+              <article
+                key={event.id}
+                className={
+                  event.id === context.event.id
+                    ? "search-event selected"
+                    : "search-event"
+                }
+                ref={
+                  event.id === context.event.id
+                    ? (node) => {
+                        node?.scrollIntoView({ block: "center" });
+                      }
+                    : undefined
+                }
+              >
+                <header>
+                  <b>{event.kind}</b>
+                  <time>{new Date(event.ts).toLocaleString()}</time>
+                  <span>#{event.seq}</span>
+                </header>
+                <Markdown text={eventText(event)} />
+              </article>
+            ))}
+          </div>
         </div>
       ) : (
         <div className="conversation-search">
           <label className="conversation-search-input">
             <Search size={18} />
             <input
+              ref={searchInput}
               aria-label="Search messages, tool output, and decisions"
               placeholder="Messages, tool output, decisions…"
               value={query}
@@ -501,6 +552,7 @@ export function ConversationSearch({
             {page?.items.map((hit) => (
               <button
                 key={hit.event_id}
+                data-search-hit={hit.event_id}
                 className="search-hit"
                 onClick={() => void open(hit)}
               >

@@ -1620,6 +1620,11 @@ fn child_runner(dir: &Path, runtime: &str, thread: &str) -> (std::process::Child
 
 #[tokio::test]
 async fn a_runner_killed_while_its_runtime_initializes_leaves_nothing_behind() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_runner_killed_while_its_runtime_initializes_leaves_nothing_behind",
+    ) {
+        return;
+    }
     let _one = RECOVERY.lock().await;
     let dir = tempfile::tempdir().unwrap();
     // Recovery finds the runtime by its thread marker alone, machine-wide: a thread id no
@@ -1655,6 +1660,11 @@ async fn a_runner_killed_while_its_runtime_initializes_leaves_nothing_behind() {
 
 #[tokio::test]
 async fn a_stop_for_another_run_leaves_the_session_alone() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_stop_for_another_run_leaves_the_session_alone",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let lbox = sleeper_box(dir.path());
     let spawn = |id: &str| {
@@ -1715,6 +1725,9 @@ async fn a_stop_for_another_run_leaves_the_session_alone() {
 
 #[tokio::test]
 async fn a_killed_runner_leaves_no_runtime_behind() {
+    if twr_runner::reap::skip_if_test_environs_hidden("a_killed_runner_leaves_no_runtime_behind") {
+        return;
+    }
     let _one = RECOVERY.lock().await;
     let dir = tempfile::tempdir().unwrap();
     // A real runner process (this test binary, running only `runner_child_process`).
@@ -1880,6 +1893,11 @@ fn record_runtime(
 /// its exit recorded.
 #[tokio::test]
 async fn a_recorded_runtime_without_a_start_time_is_not_taken_for_gone() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_recorded_runtime_without_a_start_time_is_not_taken_for_gone",
+    ) {
+        return;
+    }
     // A thread id of this test run only (recovery finds marked processes machine-wide).
     let t = format!("t-nostart-{}", twr_core::event::new_id());
     let _one = RECOVERY.lock().await;
@@ -2246,6 +2264,11 @@ async fn wait_overflowed(stops: &std::sync::atomic::AtomicUsize) {
 /// A runner that dies in between still has the next one kill it (its row stays).
 #[tokio::test]
 async fn an_overflowed_runtime_stays_live_until_it_really_exits() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "an_overflowed_runtime_stays_live_until_it_really_exits",
+    ) {
+        return;
+    }
     use twr_core::runner::{decode_result, WireRemoveOutcome};
     let dir = tempfile::tempdir().unwrap();
     let release = Arc::new(tokio::sync::Notify::new());
@@ -2665,6 +2688,11 @@ impl twr_core::adapter::Adapter for Mute {
 /// (found by its thread and run markers).
 #[tokio::test]
 async fn shutdown_records_an_exit_only_once_the_runtime_is_gone() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "shutdown_records_an_exit_only_once_the_runtime_is_gone",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let (lbox, pid) = mute_box(dir.path(), false).await;
     // Past execve: its marker is visible.
@@ -2727,6 +2755,11 @@ async fn mute_box(dir: &Path, vanish: bool) -> (LocalBox, u32) {
 /// the exit.
 #[tokio::test]
 async fn an_adapter_that_vanishes_has_its_process_killed_before_the_exit_is_recorded() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "an_adapter_that_vanishes_has_its_process_killed_before_the_exit_is_recorded",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let (lbox, pid) = mute_box(dir.path(), true).await;
     wait_for("the exit", || {

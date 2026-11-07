@@ -17,6 +17,7 @@ import { useHostAPI } from "./host";
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -97,6 +98,16 @@ import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
+import {
+  announce,
+  attentionAnnouncement,
+  focusableWithin,
+  handleRovingKey,
+  prepareAnnouncer,
+  scrollBehavior,
+  turnAnnouncement,
+  useModal,
+} from "./a11y";
 const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
@@ -240,6 +251,21 @@ export default function App({
   const [error, setError] = useState("");
   const [section, setSection] = useState<Section>("chat");
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 800);
+  const [narrow, setNarrow] = useState(
+    () => window.matchMedia("(max-width:800px)").matches,
+  );
+  const sidebarRef = useRef<HTMLElement>(null);
+  // On narrow layouts the sidebar is an overlay sheet ("More"): treat it as modal.
+  const sidebarModal = narrow && sidebar;
+  useModal(sidebarRef, {
+    active: sidebarModal,
+    onClose: () => setSidebar(false),
+    inertBackground: false,
+    initialFocus: (root) =>
+      focusableWithin(root).find((node) =>
+        node.matches('[aria-current="page"]'),
+      ),
+  });
   const [hovering, setHovering] = useState(false);
   const [focus, setFocus] = useState(false);
   const [parked, setParked] = useState(false);
@@ -345,6 +371,7 @@ export default function App({
   const [slashHidden, setSlashHidden] = useState(false);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [mentionHidden, setMentionHidden] = useState(false);
+  const [slashIndex, setSlashIndex] = useState(-1);
   const [palette, setPalette] = useState(false);
   const [query, setQuery] = useState("");
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -411,6 +438,19 @@ export default function App({
   const draftKey = workspace + ":" + (destination || "orchestrator");
   const draft = drafts[draftKey] || "";
   const selectedThread = view.threads.find((t) => t.id === selected);
+  // The desktop tray/menu bar and Dock badge mirror what needs the user.
+  useEffect(() => {
+    window.twrApp?.setAttention({
+      count: view.attention.length,
+      items: view.attention.slice(0, 5).map((item) => ({
+        thread: item.thread,
+        title: (
+          view.threads.find((t) => t.id === item.thread)?.name || item.thread
+        ).slice(0, 200),
+        summary: (item.summary || item.reason || "").slice(0, 300),
+      })),
+    });
+  }, [view.attention, view.threads]);
   const [visibleRoutines, setVisibleRoutines] = useState<string[]>([]);
   const presentedEvents = useMemo(() => {
     const resolved = new Set(view.went_on || []);
@@ -734,6 +774,15 @@ export default function App({
         setTerminals((old) => old.filter((t) => t.id !== event.id));
       }
       if (event.type === "menu-new") actionRef.current("new");
+      if (event.type === "menu-settings") {
+        setSection("settings");
+        setSidebar(false);
+      }
+      if (event.type === "menu-attention") {
+        setSection("attention");
+        setSidebar(false);
+        if (event.thread) setSelected(event.thread);
+      }
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");
@@ -859,6 +908,7 @@ export default function App({
   useEffect(() => {
     const media = window.matchMedia("(max-width:800px)");
     const change = () => {
+      setNarrow(media.matches);
       if (media.matches) setSidebar(false);
     };
     media.addEventListener("change", change);
@@ -1109,6 +1159,68 @@ export default function App({
         held: !!selected || hovering,
       }).catch(() => {});
   }, [pins, selected, hovering, connected, rpc]);
+  useEffect(() => prepareAnnouncer(), []);
+  // Screen-reader announcements. The transcript itself is not a live region, so
+  // streaming output never floods the reader; only state changes are spoken.
+  const connectionAnnounced = useRef("");
+  useEffect(() => {
+    if (connecting) return;
+    const key = workspace + ":" + connected;
+    const previous = connectionAnnounced.current;
+    if (key === previous) return;
+    connectionAnnounced.current = key;
+    if (connected) announce(`Connected to ${workspace}`);
+    else if (previous)
+      announce(
+        `Disconnected from ${workspace}${connectionError ? ". " + connectionError : ""}`,
+      );
+    else if (connectionError)
+      announce(`Could not connect to ${workspace}. ${connectionError}`);
+  }, [connected, connecting, workspace]);
+  const knownAttention = useRef<{ workspace: string; ids: Set<string> }>(
+    undefined,
+  );
+  useEffect(() => {
+    if (!connected) return;
+    const ids = new Set(view.attention.map((item) => item.attn_id));
+    const known = knownAttention.current;
+    knownAttention.current = { workspace, ids };
+    if (!known || known.workspace !== workspace) return;
+    const fresh = view.attention.filter((item) => !known.ids.has(item.attn_id));
+    for (const item of fresh.slice(0, 3))
+      announce(
+        attentionAnnouncement({
+          reason: item.reason,
+          summary: item.summary,
+          threadName: view.threads.find((t) => t.id === item.thread)?.name,
+        }),
+      );
+    if (fresh.length > 3)
+      announce(`${fresh.length - 3} more requests need you`);
+  }, [view.attention, connected, workspace]);
+  const turnBaseline = useRef<{ thread?: string; end?: string }>({});
+  useEffect(() => {
+    const end = events.findLast((event) => event.kind === "turn.ended");
+    const id = end ? end.id || String(end.seq) : undefined;
+    const baseline = turnBaseline.current;
+    turnBaseline.current = { thread: target?.id, end: id };
+    if (
+      transcriptLoading ||
+      !end ||
+      baseline.thread !== target?.id ||
+      baseline.end === id
+    )
+      return;
+    announce(
+      turnAnnouncement(
+        destination ? target?.name || "Thread" : "Orchestrator",
+        end.data?.result,
+      ),
+    );
+  }, [events, transcriptLoading, target?.id]);
+  useEffect(() => {
+    if (result !== undefined && operation) announce(`${operation.title}: done`);
+  }, [result]);
   const execute = async () => {
     if (!operation) return;
     const run = async () => {
@@ -1288,6 +1400,13 @@ export default function App({
       }));
       if (!response.saved_offline && target)
         uploads.dismissReady(target.id, workspace, draft);
+      announce(
+        response.saved_offline
+          ? "Message saved on this device. It sends when the hub reconnects."
+          : text.startsWith("!") && !text.startsWith("!!!")
+            ? "Shell command started"
+            : "Message sent",
+      );
       setQueueRefresh((n) => n + 1);
     } catch (e) {
       fail(e);
@@ -1808,14 +1927,31 @@ export default function App({
   return (
     <div className={`app ${sidebar ? "" : "sidebar-hidden"}`} style={rootStyle}>
       <button
+        type="button"
+        className="skip-link"
+        onClick={() => {
+          const composer = input.current;
+          if (composer && !composer.disabled && section === "chat")
+            composer.focus();
+          else document.getElementById("twr-main")?.focus();
+        }}
+      >
+        Skip to {section === "chat" ? "message composer" : "main content"}
+      </button>
+      <button
         className="sidebar-backdrop"
         aria-label="Close navigation"
+        tabIndex={-1}
         onClick={() => setSidebar(false)}
         style={{ display: sidebar ? undefined : "none" }}
       />
       <aside
         className="sidebar"
         id="twr-sidebar"
+        ref={sidebarRef}
+        aria-label={sidebarModal ? "Navigation" : "Sidebar"}
+        role={sidebarModal ? "dialog" : undefined}
+        aria-modal={sidebarModal ? true : undefined}
         onClick={(event) => {
           if (
             window.innerWidth <= 800 &&
@@ -1835,6 +1971,9 @@ export default function App({
           <button
             className="icon-button no-drag"
             aria-label="Hide sidebar"
+            aria-controls="twr-sidebar"
+            aria-expanded={true}
+            title="Hide sidebar"
             onClick={() => setSidebar(false)}
           >
             <PanelLeftClose size={16} />
@@ -1867,15 +2006,20 @@ export default function App({
             <button
               className="icon-button"
               aria-label="Manage workspaces"
+              title="Manage workspaces"
+              aria-haspopup="dialog"
               onClick={() => setWorkspaceModal(true)}
             >
               <Plus size={16} />
             </button>
           </div>
         </div>
-        <nav className="primary-nav">
+        <nav className="primary-nav" aria-label="Primary">
           <button
             className={section === "chat" && !destination ? "active" : ""}
+            aria-current={
+              section === "chat" && !destination ? "page" : undefined
+            }
             onClick={() => {
               setSection("chat");
               setDestination(undefined);
@@ -1886,31 +2030,39 @@ export default function App({
           </button>
           <button
             className={section === "attention" ? "active" : ""}
+            aria-current={section === "attention" ? "page" : undefined}
             onClick={() => setSection("attention")}
           >
             <Bell size={17} />
             Needs you
             {view.attention.length > 0 && (
-              <span className="count attention-count">
-                {view.attention.length}
-              </span>
+              <>
+                {" "}
+                <span className="count attention-count">
+                  {view.attention.length}
+                </span>
+              </>
             )}
           </button>
           <button
             className={section === "grid" ? "active" : ""}
+            aria-current={section === "grid" ? "page" : undefined}
             onClick={() => setSection("grid")}
           >
             <LayoutGrid size={17} />
-            Thread grid<span className="count">{workers.length}</span>
+            Thread grid <span className="count">{workers.length}</span>
           </button>
         </nav>
         <div className="threads-heading">
-          <span>Threads</span>
+          <span role="heading" aria-level={2} id="twr-threads-heading">
+            Threads
+          </span>
           <div>
             <button
               className={`icon-button ${focus ? "on" : ""}`}
               title="Only active threads"
               aria-label="Toggle focus filter"
+              aria-pressed={focus}
               onClick={() => setFocus((v) => !v)}
             >
               <Filter size={13} />
@@ -1918,6 +2070,7 @@ export default function App({
             <button
               className="icon-button"
               aria-label="New thread"
+              title="New thread"
               disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
@@ -1927,11 +2080,14 @@ export default function App({
         </div>
         <div
           className="thread-list"
+          role="list"
+          aria-labelledby="twr-threads-heading"
           onMouseEnter={() => setHovering(true)}
           onMouseLeave={() => setHovering(false)}
         >
           {visible.map((thread) => (
             <ThreadCard
+              listItem
               key={thread.id}
               thread={thread}
               items={attentionFor(thread.id)}
@@ -1947,7 +2103,7 @@ export default function App({
             />
           ))}
           {!visible.length && (
-            <p className="sidebar-empty">
+            <p className="sidebar-empty" role="listitem">
               {workers.length
                 ? "No threads match your filters."
                 : "Threads appear here as your agents start working."}
@@ -1957,6 +2113,7 @@ export default function App({
         {workers.some((t) => t.status === "parked") && (
           <button
             className="parked-toggle"
+            aria-pressed={parked}
             onClick={() => setParked((v) => !v)}
           >
             {parked
@@ -1966,16 +2123,23 @@ export default function App({
         )}
         <details className="sidebar-secondary manage-nav">
           <summary>Manage</summary>
-          <nav>
+          <nav aria-label="Manage">
             {visibleNav
               .filter((n) => n.id !== "settings")
               .map((n) => (
-                <button key={n.id} onClick={() => setSection(n.id)}>
+                <button
+                  key={n.id}
+                  aria-current={section === n.id ? "page" : undefined}
+                  onClick={() => setSection(n.id)}
+                >
                   <n.icon size={15} />
                   {n.label}
                 </button>
               ))}
-            <button onClick={() => setSection("decisions")}>
+            <button
+              aria-current={section === "decisions" ? "page" : undefined}
+              onClick={() => setSection("decisions")}
+            >
               <CheckCircle2 size={15} />
               Decisions
             </button>
@@ -1983,6 +2147,7 @@ export default function App({
         </details>
         <div className="sidebar-footer">
           <button
+            aria-haspopup="dialog"
             onClick={() => {
               setQuery("");
               setPalette(true);
@@ -1996,12 +2161,18 @@ export default function App({
                 : "Ctrl K"}
             </span>
           </button>
-          <button onClick={() => setSection("settings")}>
+          <button
+            aria-current={section === "settings" ? "page" : undefined}
+            onClick={() => setSection("settings")}
+          >
             <Settings2 size={15} />
             Settings
           </button>
           <div className="connection-status">
-            <span className={`status-dot ${connected ? "online" : ""}`} />
+            <span
+              className={`status-dot ${connected ? "online" : ""}`}
+              aria-hidden="true"
+            />
             {connected
               ? "Hub connected"
               : connecting
@@ -2011,7 +2182,7 @@ export default function App({
           </div>
         </div>
       </aside>
-      <main className="main-shell">
+      <main className="main-shell" id="twr-main" tabIndex={-1}>
         {!connected && journal?.snapshot.workspaces[workspace] && (
           <div className="offline-banner" role="status">
             Offline · saved{" "}
@@ -2032,6 +2203,9 @@ export default function App({
               <button
                 className="icon-button"
                 aria-label="Show sidebar"
+                aria-controls="twr-sidebar"
+                aria-expanded={false}
+                title="Show sidebar"
                 onClick={() => setSidebar(true)}
               >
                 <PanelLeftOpen size={18} />
@@ -2041,6 +2215,7 @@ export default function App({
               <button
                 className="icon-button mobile-back-button"
                 aria-label="Return to orchestrator"
+                title="Return to orchestrator"
                 onClick={() => setDestination(undefined)}
               >
                 <ArrowLeft size={18} />
@@ -2048,6 +2223,7 @@ export default function App({
             )}
             <span className="workspace-breadcrumb">{workspace}</span>
             <ChevronRight size={13} />
+            <span className="visually-hidden">,</span>
             <span className="topbar-title">
               {destination
                 ? target?.name
@@ -2069,6 +2245,7 @@ export default function App({
               <span
                 className="live-indicator"
                 title="Hub connected"
+                role="img"
                 aria-label="Live connection"
               >
                 <span />
@@ -2109,6 +2286,8 @@ export default function App({
             <button
               className="icon-button"
               aria-label="Open command palette"
+              title="Commands (⌘/Ctrl K)"
+              aria-haspopup="dialog"
               onClick={() => {
                 setPalette(true);
                 setQuery("");
@@ -2116,22 +2295,57 @@ export default function App({
             >
               <CommandIcon size={17} />
             </button>
-            <details className="conversation-menu">
+            <details
+              className="conversation-menu"
+              onToggle={(event) => {
+                const menu = event.currentTarget;
+                // Keyboard users land on the first action; pointer users keep focus.
+                if (menu.open && menu.dataset.keyboard === "true")
+                  menu
+                    .querySelector<HTMLElement>("div > button:not(:disabled)")
+                    ?.focus();
+                delete menu.dataset.keyboard;
+              }}
+            >
               <summary
                 aria-label={
                   section === "chat" ? "Thread actions" : "More actions"
                 }
+                title={section === "chat" ? "Thread actions" : "More actions"}
+                onKeyDown={(event) => {
+                  const menu = event.currentTarget
+                    .parentElement as HTMLDetailsElement;
+                  if (["Enter", " "].includes(event.key))
+                    menu.dataset.keyboard = "true";
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    menu.dataset.keyboard = "true";
+                    if (!menu.open) menu.open = true;
+                    else
+                      menu
+                        .querySelector<HTMLElement>(
+                          "div > button:not(:disabled)",
+                        )
+                        ?.focus();
+                  }
+                }}
               >
                 <MoreHorizontal size={18} />
               </summary>
               <div
+                onKeyDown={(event) =>
+                  handleRovingKey(event, event.currentTarget, ":scope > button")
+                }
                 onClick={(event) =>
                   (
                     event.currentTarget.parentElement as HTMLDetailsElement
                   ).removeAttribute("open")
                 }
               >
-                <button onClick={() => setSidebar(true)}>
+                <button
+                  aria-controls="twr-sidebar"
+                  onClick={() => setSidebar(true)}
+                >
                   <PanelLeftOpen size={16} />
                   Threads and navigation
                 </button>
@@ -2228,6 +2442,7 @@ export default function App({
         {(connectionError || connecting) && (
           <div
             className={`connection-banner ${connectionError ? "warning" : ""}`}
+            aria-busy={connecting || undefined}
           >
             {connecting ? <Spinner /> : <AlertCircle size={15} />}
             <span>
@@ -2248,6 +2463,7 @@ export default function App({
                       <button
                         className="icon-button"
                         aria-label="Back to orchestrator"
+                        title="Back to orchestrator"
                         onClick={() => setDestination(undefined)}
                       >
                         <ArrowLeft size={17} />
@@ -2255,6 +2471,7 @@ export default function App({
                     )}
                     <span
                       className={`destination-symbol ${destination ? "worker" : ""}`}
+                      aria-hidden="true"
                     >
                       {destination ? (
                         <ArrowUpRight size={18} />
@@ -2275,6 +2492,7 @@ export default function App({
                     <button
                       className={`icon-button ${showTools ? "on" : ""}`}
                       aria-label="Toggle tool calls"
+                      aria-pressed={showTools}
                       title="Show tool calls"
                       onClick={() => setShowTools((v) => !v)}
                     >
@@ -2283,6 +2501,7 @@ export default function App({
                     <button
                       className={`icon-button ${showThinking ? "on" : ""}`}
                       aria-label="Toggle reasoning"
+                      aria-pressed={showThinking}
                       title="Show reasoning"
                       onClick={() => setShowThinking((v) => !v)}
                     >
@@ -2292,6 +2511,7 @@ export default function App({
                       <button
                         className="icon-button"
                         aria-label="Export conversation"
+                        title="Export conversation"
                         onClick={() => void exportConversation()}
                       >
                         <Download size={16} />
@@ -2299,7 +2519,17 @@ export default function App({
                     )}
                     <button
                       className="icon-button"
-                      aria-label="Orchestrator settings"
+                      aria-label={
+                        destination
+                          ? "Thread settings"
+                          : "Orchestrator settings"
+                      }
+                      title={
+                        destination
+                          ? "Thread settings"
+                          : "Orchestrator settings"
+                      }
+                      aria-haspopup="dialog"
                       onClick={() =>
                         action(
                           destination ? "model" : "orch",
@@ -2311,7 +2541,17 @@ export default function App({
                     </button>
                   </div>
                 </header>
-                <div className="conversation-attention">
+                <div
+                  className="conversation-attention"
+                  role={
+                    view.attention.some(
+                      (a) => a.thread === "hub" || a.thread === target?.id,
+                    )
+                      ? "region"
+                      : undefined
+                  }
+                  aria-label="Requests for this conversation"
+                >
                   {view.attention
                     .filter(
                       (a) => a.thread === "hub" || a.thread === target?.id,
@@ -2355,8 +2595,13 @@ export default function App({
                     {workers
                       .filter((t) => t.last_report)
                       .map((t) => (
-                        <button key={t.id} onClick={() => setSelected(t.id)}>
+                        <button
+                          key={t.id}
+                          aria-controls="twr-inspector"
+                          onClick={() => setSelected(t.id)}
+                        >
                           <span style={{ color: t.accent }}>{t.name}</span>
+                          <span className="visually-hidden">: </span>
                           <span>{t.last_report.summary}</span>
                           <ArrowUpRight size={14} />
                         </button>
@@ -2403,7 +2648,7 @@ export default function App({
                   />
                 )}
                 {queued.length > 0 && (
-                  <div className="queue">
+                  <section className="queue" aria-label="Queued messages">
                     <div className="eyebrow">
                       QUEUED MESSAGES · {queueInfo.total || queued.length}
                       {queueInfo.held ? " · Held after a failure" : ""}
@@ -2439,7 +2684,7 @@ export default function App({
                         </button>
                       </div>
                     ))}
-                  </div>
+                  </section>
                 )}
                 <div className="shell-runs">
                   {shellJobs.map((job) => (
@@ -2457,7 +2702,8 @@ export default function App({
                         Stop…
                       </button>
                       <button
-                        aria-label="Hide shell output"
+                        aria-label={`Hide shell command ${job.command}`}
+                        title="Hide"
                         onClick={() =>
                           setShellJobs((old) =>
                             old.filter((j) => j.job !== job.job),
@@ -2490,6 +2736,7 @@ export default function App({
                     <button
                       onClick={assistance.clearNotice}
                       aria-label="Dismiss assistance notice"
+                      title="Dismiss"
                     >
                       <X size={12} />
                     </button>
@@ -2500,17 +2747,19 @@ export default function App({
                     className="suggested-message"
                     onClick={acceptSuggestion}
                   >
+                    <span className="visually-hidden">Suggested reply: </span>
                     <span>{assistance.suggestion}</span>
                     <kbd>Tab to use</kbd>
                   </button>
                 )}
                 <form
                   className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
+                  aria-label="Message composer"
                   onSubmit={(event) => void send(event)}
                 >
                   <div className="composer-label">
                     <span className="destination-chip">
-                      <span className="destination-dot" />
+                      <span className="destination-dot" aria-hidden="true" />
                       To:{" "}
                       <b>
                         {draft.startsWith("!") && !draft.startsWith("!!!")
@@ -2527,6 +2776,7 @@ export default function App({
                         <button
                           type="button"
                           aria-label="Return to orchestrator"
+                          title="Return to orchestrator"
                           onClick={() => setDestination(undefined)}
                         >
                           <X size={12} />
@@ -2559,6 +2809,26 @@ export default function App({
                         ? `Message ${target?.name} directly`
                         : "Message orchestrator"
                     }
+                    aria-describedby="twr-composer-hints"
+                    aria-autocomplete={
+                      mentions.length || slashMatches.length
+                        ? "list"
+                        : undefined
+                    }
+                    aria-controls={
+                      mentions.length && !mentionHidden
+                        ? "twr-mentions"
+                        : slashMatches.length && !slashHidden
+                          ? "twr-slash-suggestions"
+                          : undefined
+                    }
+                    aria-activedescendant={
+                      mentions.length && !mentionHidden
+                        ? `twr-mention-${mentionIndex % mentions.length}`
+                        : slashMatches.length && !slashHidden && slashIndex >= 0
+                          ? `twr-slash-${slashIndex % slashMatches.length}`
+                          : undefined
+                    }
                     value={draft}
                     onChange={(e) => {
                       setAcceptedSuggestion(undefined);
@@ -2567,6 +2837,7 @@ export default function App({
                         [draftKey]: e.target.value,
                       }));
                       setSlashHidden(false);
+                      setSlashIndex(-1);
                       setMentionHidden(false);
                       setMentionIndex(0);
                     }}
@@ -2633,6 +2904,40 @@ export default function App({
                         e.preventDefault();
                         e.stopPropagation();
                         setSlashHidden(true);
+                        setSlashIndex(-1);
+                        return;
+                      }
+                      if (
+                        slashMatches.length &&
+                        !slashHidden &&
+                        !draft.includes("\n") &&
+                        (e.key === "ArrowDown" || e.key === "ArrowUp")
+                      ) {
+                        // Arrow keys pick a suggested command; Enter then runs it.
+                        e.preventDefault();
+                        setSlashIndex((i) =>
+                          e.key === "ArrowDown"
+                            ? (i + 1) % slashMatches.length
+                            : i <= 0
+                              ? slashMatches.length - 1
+                              : i - 1,
+                        );
+                        return;
+                      }
+                      if (
+                        e.key === "Enter" &&
+                        !e.shiftKey &&
+                        slashMatches.length &&
+                        !slashHidden &&
+                        slashIndex >= 0
+                      ) {
+                        e.preventDefault();
+                        const command =
+                          slashMatches[slashIndex % slashMatches.length];
+                        setSlashIndex(-1);
+                        void submitSlash(
+                          "/" + command.id + draft.slice(1).replace(/^\S+/, ""),
+                        );
                         return;
                       }
                       if (
@@ -2673,7 +2978,7 @@ export default function App({
                         />
                       </label>
                     )}
-                    <span>
+                    <span id="twr-composer-hints">
                       <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd>{" "}
                       reference a thread <span>·</span> Shift Enter for a new
                       line
@@ -2737,11 +3042,22 @@ export default function App({
                     </div>
                   </div>
                   {mentions.length > 0 && !mentionHidden && (
-                    <div className="mentions">
+                    <div
+                      className="mentions"
+                      id="twr-mentions"
+                      role="listbox"
+                      aria-label="Threads to reference"
+                    >
                       {mentions.map((t, i) => (
                         <button
-                          className={i === mentionIndex ? "active" : ""}
+                          className={
+                            i === mentionIndex % mentions.length ? "active" : ""
+                          }
                           type="button"
+                          role="option"
+                          id={`twr-mention-${i}`}
+                          aria-selected={i === mentionIndex % mentions.length}
+                          tabIndex={-1}
                           key={t.id}
                           onClick={() => chooseMention(t)}
                         >
@@ -2752,10 +3068,28 @@ export default function App({
                     </div>
                   )}
                   {slashMatches.length > 0 && !slashHidden && (
-                    <div className="mentions slash-suggestions">
-                      {slashMatches.map((command) => (
+                    <div
+                      className="mentions slash-suggestions"
+                      id="twr-slash-suggestions"
+                      role="listbox"
+                      aria-label="Commands"
+                    >
+                      {slashMatches.map((command, i) => (
                         <button
                           type="button"
+                          role="option"
+                          id={`twr-slash-${i}`}
+                          className={
+                            slashIndex >= 0 &&
+                            i === slashIndex % slashMatches.length
+                              ? "active"
+                              : ""
+                          }
+                          aria-selected={
+                            slashIndex >= 0 &&
+                            i === slashIndex % slashMatches.length
+                          }
+                          tabIndex={-1}
                           key={command.id}
                           onClick={() =>
                             submitSlash(
@@ -2766,6 +3100,7 @@ export default function App({
                           }
                         >
                           <b>/{command.id}</b>
+                          <span className="visually-hidden">, </span>
                           <span>{command.title}</span>
                         </button>
                       ))}
@@ -2793,21 +3128,30 @@ export default function App({
                     New thread
                   </button>
                 </header>
-                <div className="manager-actions">
+                <div
+                  className="manager-actions"
+                  role="group"
+                  aria-label="Thread filters"
+                >
                   <button
                     className={focus ? "active" : ""}
+                    aria-pressed={focus}
                     onClick={() => setFocus((v) => !v)}
                   >
                     <Filter size={14} />
                     Focus {focus ? "on" : "off"}
                   </button>
-                  <button onClick={() => setParked((v) => !v)}>
+                  <button
+                    aria-pressed={parked}
+                    onClick={() => setParked((v) => !v)}
+                  >
                     {parked ? "Hide" : "Show"} parked
                   </button>
                 </div>
-                <div className="thread-grid">
+                <div className="thread-grid" role="list" aria-label="Threads">
                   {visible.map((t) => (
                     <ThreadCard
+                      listItem
                       key={t.id}
                       thread={t}
                       items={attentionFor(t.id)}
@@ -2933,13 +3277,18 @@ export default function App({
             )}
           </div>
           {selectedThread && (
-            <aside className="inspector" id="twr-inspector">
+            <aside
+              className="inspector"
+              id="twr-inspector"
+              aria-label={`Thread details: ${selectedThread.name}`}
+            >
               <PaneResize pane="inspector" />
               <header>
                 <span className="eyebrow">Thread details</span>
                 <button
                   className="icon-button"
                   aria-label="Close thread details"
+                  title="Close thread details"
                   onClick={() => setSelected(undefined)}
                 >
                   <X size={17} />
@@ -2995,6 +3344,7 @@ export default function App({
                   <span>Worktree</span>
                   <button
                     className="text-button path"
+                    title="Reveal worktree"
                     onClick={() =>
                       void hostApi
                         .reveal(
@@ -3024,7 +3374,10 @@ export default function App({
                   </section>
                 )}
                 <div className="inspector-actions">
-                  <button onClick={() => togglePin(selectedThread.id)}>
+                  <button
+                    aria-pressed={pins.includes(selectedThread.id)}
+                    onClick={() => togglePin(selectedThread.id)}
+                  >
                     <Pin size={14} />
                     {pins.includes(selectedThread.id) ? "Unpin" : "Pin"} thread
                   </button>
@@ -3060,8 +3413,9 @@ export default function App({
             </aside>
           )}
         </div>
-        <nav className="compact-nav">
+        <nav className="compact-nav" aria-label="Sections">
           <button
+            aria-current={section === "chat" ? "page" : undefined}
             onClick={() => {
               setSection("chat");
             }}
@@ -3069,18 +3423,31 @@ export default function App({
             <MessageSquare size={15} />
             Chat
           </button>
-          <button onClick={() => setSection("attention")}>
+          <button
+            aria-current={section === "attention" ? "page" : undefined}
+            onClick={() => setSection("attention")}
+          >
             <Bell size={15} />
             Needs you
             {view.attention.length > 0 && (
-              <span className="count">{view.attention.length}</span>
+              <>
+                {" "}
+                <span className="count">{view.attention.length}</span>
+              </>
             )}
           </button>
-          <button onClick={() => setSection("grid")}>
+          <button
+            aria-current={section === "grid" ? "page" : undefined}
+            onClick={() => setSection("grid")}
+          >
             <LayoutGrid size={15} />
             Threads
           </button>
-          <button onClick={() => setSidebar((v) => !v)}>
+          <button
+            aria-expanded={sidebar}
+            aria-controls="twr-sidebar"
+            onClick={() => setSidebar((v) => !v)}
+          >
             <MoreHorizontal size={16} />
             More
           </button>
@@ -3089,6 +3456,7 @@ export default function App({
         {terminals.length > 0 && (
           <section
             className={`terminal-dock ${terminalVisible ? "" : "collapsed"}`}
+            aria-label="Terminals"
           >
             <div className="terminal-tabs">
               <button
@@ -3096,6 +3464,11 @@ export default function App({
                 aria-label={
                   terminalVisible ? "Collapse terminals" : "Expand terminals"
                 }
+                title={
+                  terminalVisible ? "Collapse terminals" : "Expand terminals"
+                }
+                aria-expanded={terminalVisible}
+                aria-controls="twr-terminal-content"
                 onClick={() => setTerminalVisible((v) => !v)}
               >
                 <ChevronDown size={15} />
@@ -3106,6 +3479,7 @@ export default function App({
                   key={t.id}
                 >
                   <button
+                    aria-current={t.id === activeTerminal ? "true" : undefined}
                     onClick={() => {
                       setActiveTerminal(t.id);
                       setTerminalVisible(true);
@@ -3117,9 +3491,13 @@ export default function App({
                       <TerminalSquare size={13} />
                     )}
                     <span>{t.title}</span>
+                    {t.exited && (
+                      <span className="visually-hidden"> (exited)</span>
+                    )}
                   </button>
                   <button
                     aria-label={`Close ${t.title}`}
+                    title={`Close ${t.title}`}
                     onClick={() =>
                       setConfirmation({
                         title: "Close terminal?",
@@ -3152,6 +3530,7 @@ export default function App({
               <button
                 className="icon-button"
                 aria-label="New shell terminal"
+                title="New shell terminal"
                 onClick={() => void openTerminal({ shell: true })}
               >
                 <Plus size={15} />
@@ -3159,6 +3538,7 @@ export default function App({
             </div>
             <div
               className="terminal-content"
+              id="twr-terminal-content"
               style={{ display: terminalVisible ? "block" : "none" }}
             >
               <Suspense
@@ -3182,10 +3562,14 @@ export default function App({
         )}
       </main>
       {error && (
-        <div role="alert" className="toast">
+        <div role="alert" className="toast" data-modal-keep="">
           <AlertCircle size={17} />
           <span>{error}</span>
-          <button aria-label="Dismiss error" onClick={() => setError("")}>
+          <button
+            aria-label="Dismiss error"
+            title="Dismiss"
+            onClick={() => setError("")}
+          >
             <X size={15} />
           </button>
         </div>
@@ -3201,6 +3585,13 @@ export default function App({
             <input
               autoFocus
               aria-label="Search commands"
+              aria-controls="twr-palette-list"
+              aria-autocomplete="list"
+              aria-activedescendant={
+                matching[paletteIndex]
+                  ? `twr-palette-${paletteIndex}`
+                  : undefined
+              }
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search commands, settings, or CLI actions…"
@@ -3223,27 +3614,43 @@ export default function App({
             />
           </div>
           <div className="palette-list">
-            {matching.map((command, index) => (
-              <button
-                data-cli={command.cli ? "true" : undefined}
-                data-palette-active={index === paletteIndex}
-                className={index === paletteIndex ? "active" : ""}
-                key={command.id}
-                onClick={() =>
-                  openOperation(command, {
-                    thread: selected || destination || "",
-                  })
-                }
-              >
-                <span>
-                  <b>{command.title}</b>
-                  <small>{command.description.slice(0, 130)}</small>
-                </span>
-                <span className="command-group">{command.group}</span>
-                <ChevronRight size={15} />
-              </button>
-            ))}
-            {!matching.length && <p className="muted">No matching commands.</p>}
+            <div
+              className="palette-options"
+              id="twr-palette-list"
+              role="listbox"
+              aria-label="Commands"
+            >
+              {matching.map((command, index) => (
+                <button
+                  data-cli={command.cli ? "true" : undefined}
+                  data-palette-active={index === paletteIndex}
+                  className={index === paletteIndex ? "active" : ""}
+                  role="option"
+                  id={`twr-palette-${index}`}
+                  aria-selected={index === paletteIndex}
+                  tabIndex={-1}
+                  key={command.id}
+                  onClick={() =>
+                    openOperation(command, {
+                      thread: selected || destination || "",
+                    })
+                  }
+                >
+                  <span>
+                    <b>{command.title}</b>
+                    <small>{command.description.slice(0, 130)}</small>
+                  </span>
+                  <span className="visually-hidden">, </span>
+                  <span className="command-group">{command.group}</span>
+                  <ChevronRight size={15} />
+                </button>
+              ))}
+            </div>
+            {!matching.length && (
+              <p className="muted" role="status">
+                No matching commands.
+              </p>
+            )}
             {!cliCommands.length && (
               <button
                 onClick={() =>
@@ -3344,14 +3751,24 @@ export default function App({
                   ) : operation.id === "app-update" ? (
                     <>
                       <DataView value={result} />
-                      <button
-                        onClick={() =>
-                          void hostApi
-                            .openExternal(result.release_page)
-                            .catch(fail)
-                        }
-                      >
-                        Open release downloads <ExternalLink size={14} />
+                      {result?.releaseUrl && (
+                        <button
+                          onClick={() =>
+                            void hostApi
+                              .openExternal(
+                                result.download?.url || result.releaseUrl,
+                              )
+                              .catch(fail)
+                          }
+                        >
+                          {result.download
+                            ? `Download ${result.download.name}`
+                            : "Open release page"}{" "}
+                          <ExternalLink size={14} aria-hidden="true" />
+                        </button>
+                      )}
+                      <button onClick={() => setSection("settings")}>
+                        Update settings
                       </button>
                     </>
                   ) : operation.id === "context-read" ? (
@@ -3453,17 +3870,20 @@ export default function App({
             {workspaces.map((w) => (
               <div className="workspace-row" key={w.name}>
                 <button
+                  aria-current={w.name === workspace ? "true" : undefined}
                   onClick={() => {
                     setWorkspaceModal(false);
                     void connect(w.name);
                   }}
                 >
                   {w.name}
+                  <span className="visually-hidden">, </span>
                   <span>{w.state || w.status}</span>
                 </button>
                 <button
                   className="icon-button danger-quiet"
                   aria-label={`Remove workspace ${w.name}`}
+                  title={`Remove workspace ${w.name}`}
                   onClick={() => {
                     setWorkspaceModal(false);
                     cliAction("ws rm", { name: w.name });
@@ -3492,11 +3912,16 @@ export default function App({
                 <input
                   value={newWorkspace}
                   onChange={(e) => setNewWorkspace(e.target.value)}
+                  aria-describedby="twr-workspace-name-hint"
                   pattern="[a-z0-9][a-z0-9-]{0,31}"
                   maxLength={32}
                   required
                   placeholder="e.g. client-project"
                 />
+                <span className="visually-hidden" id="twr-workspace-name-hint">
+                  Lowercase letters, numbers and hyphens, starting with a letter
+                  or number; up to 32 characters.
+                </span>
               </label>
               <button className="primary">
                 <Plus size={15} />
@@ -3541,12 +3966,19 @@ export default function App({
             <LayoutGrid size={19} />
             <span>Threads</span>
           </button>
-          <button aria-expanded={sidebar} onClick={() => setSidebar((v) => !v)}>
+          <button
+            aria-expanded={sidebar}
+            aria-controls="twr-sidebar"
+            onClick={() => setSidebar((v) => !v)}
+          >
             <MoreHorizontal size={19} />
             <span>More</span>
           </button>
         </nav>
       )}
+      <span id="twr-thread-open-hint" hidden>
+        Details shown. Press Enter to open this conversation.
+      </span>
     </div>
   );
 }
@@ -3560,6 +3992,7 @@ function ThreadCard({
   onSelect,
   onOpen,
   large = false,
+  listItem = false,
 }: {
   thread: Thread;
   items: Attention[];
@@ -3569,6 +4002,46 @@ function ThreadCard({
   onSelect: () => void;
   onOpen: () => void;
   large?: boolean;
+  listItem?: boolean;
+}) {
+  const card = (
+    <ThreadCardButton
+      thread={thread}
+      items={items}
+      selected={selected}
+      dived={dived}
+      pinned={pinned}
+      onSelect={onSelect}
+      onOpen={onOpen}
+      large={large}
+    />
+  );
+  return listItem ? (
+    <div role="listitem" className="thread-item">
+      {card}
+    </div>
+  ) : (
+    card
+  );
+}
+function ThreadCardButton({
+  thread,
+  items,
+  selected,
+  dived,
+  pinned,
+  onSelect,
+  onOpen,
+  large,
+}: {
+  thread: Thread;
+  items: Attention[];
+  selected: boolean;
+  dived: boolean;
+  pinned: boolean;
+  onSelect: () => void;
+  onOpen: () => void;
+  large: boolean;
 }) {
   const git = thread.git || thread.git_snapshot;
   const report = thread.last_report;
@@ -3576,6 +4049,7 @@ function ThreadCard({
     <button
       className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
       aria-current={dived ? "location" : undefined}
+      aria-describedby={selected ? "twr-thread-open-hint" : undefined}
       style={{ "--thread-color": thread.accent } as CSSProperties}
       onClick={onSelect}
       onDoubleClick={onOpen}
@@ -3587,7 +4061,7 @@ function ThreadCard({
       }}
     >
       <div className="thread-card-title">
-        <span className="thread-color-dot" />
+        <span className="thread-color-dot" aria-hidden="true" />
         <b>{thread.name}</b>
         {dived && (
           <ArrowUpRight
@@ -3597,16 +4071,19 @@ function ThreadCard({
             aria-label="Current destination"
           />
         )}
-        {pinned && <Pin size={11} />}
+        {pinned && <Pin size={11} role="img" aria-label="Pinned" />}
+        <span className="visually-hidden">, </span>
         <span className={`thread-status status-${thread.status}`}>
           {statusIcon(thread.status)}
           {thread.status_label || thread.status}
         </span>
       </div>
 
+      <span className="visually-hidden">. </span>
       {items[0] ? (
         <span className="thread-card-request">
           <AlertCircle size={12} />
+          <span className="visually-hidden">Request: </span>
           {items[0].summary}
         </span>
       ) : report && ["done", "idle", "parked"].includes(thread.status) ? (
@@ -3622,6 +4099,7 @@ function ThreadCard({
             "Ready for a task"}
         </span>
       )}
+      <span className="visually-hidden">. </span>
       <span className="thread-card-runtime">
         {thread.runtime}
         {thread.box_name !== "local" ? " @" + thread.box_name : ""} ·{" "}
@@ -3664,6 +4142,7 @@ function AttentionCard({
   const [busy, setBusy] = useState(false);
   const [requestError, setRequestError] = useState("");
   const options = item.options || [];
+  const ids = useId();
   const respond = async (value: string) => {
     if (readOnly || !canRespond(item, busy)) return;
     setBusy(true);
@@ -3685,6 +4164,13 @@ function AttentionCard({
     <article
       className={`attention-card attention-${item.reason}`}
       tabIndex={0}
+      aria-labelledby={`${ids}-kind ${ids}-thread`}
+      aria-describedby={`${ids}-summary`}
+      aria-keyshortcuts={
+        options.length && !readOnly
+          ? options.map((_, i) => String(i + 1)).join(" ")
+          : undefined
+      }
       onKeyDown={(event) => {
         if (
           event.target !== event.currentTarget ||
@@ -3705,7 +4191,7 @@ function AttentionCard({
       }}
     >
       <header>
-        <span className="attention-kind">
+        <span className="attention-kind" id={`${ids}-kind`}>
           <AlertCircle size={14} />
           {item.reason === "permission"
             ? "Permission requested"
@@ -3713,7 +4199,7 @@ function AttentionCard({
               ? "Question for you"
               : item.reason}
         </span>
-        <span>{thread?.name || "twr"}</span>
+        <span id={`${ids}-thread`}>{thread?.name || "twr"}</span>
       </header>
       <div className="attention-body">
         {item.incomplete && (
@@ -3732,7 +4218,9 @@ function AttentionCard({
             </button>
           </p>
         )}
-        <pre className="attention-summary">{item.summary}</pre>
+        <pre className="attention-summary" id={`${ids}-summary`}>
+          {item.summary}
+        </pre>
         {item.context?.task && (
           <details>
             <summary>Task</summary>
@@ -3758,6 +4246,7 @@ function AttentionCard({
       <div className="attention-response">
         <input
           aria-label="Optional message with your decision"
+          aria-describedby={requestError ? `${ids}-error` : undefined}
           placeholder="Add a note (optional)…"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
@@ -3768,9 +4257,10 @@ function AttentionCard({
             <button
               disabled={readOnly || busy || !item.revision || item.incomplete}
               key={option + ":" + i}
+              aria-keyshortcuts={String(i + 1)}
               onClick={() => void respond(option)}
             >
-              <kbd>{i + 1}</kbd>
+              <kbd aria-hidden="true">{i + 1}</kbd>
               {option === "allow"
                 ? "Allow"
                 : option === "deny"
@@ -3788,6 +4278,9 @@ function AttentionCard({
               >
                 <input
                   aria-label="Your answer"
+                  aria-required="true"
+                  aria-describedby={requestError ? `${ids}-error` : undefined}
+                  aria-invalid={requestError ? true : undefined}
                   value={answer}
                   onChange={(e) => setAnswer(e.target.value)}
                   placeholder="Your answer…"
@@ -3825,7 +4318,7 @@ function AttentionCard({
           {busy && <Spinner />}
         </div>
         {requestError && (
-          <p role="alert" className="error-text">
+          <p role="alert" className="error-text" id={`${ids}-error`}>
             {requestError} Review the current request before trying again.
           </p>
         )}
@@ -3938,6 +4431,10 @@ function Conversation({
     <div
       className="conversation-scroll"
       ref={parent}
+      role="region"
+      aria-label={`Conversation with ${target?.name || "orchestrator"}`}
+      aria-busy={loading || undefined}
+      tabIndex={0}
       onScroll={() => {
         const p = parent.current!;
         follow.current = p.scrollHeight - p.scrollTop - p.clientHeight < 100;
@@ -3955,7 +4452,11 @@ function Conversation({
           {earlierBusy ? <Spinner /> : null}Load earlier turn
         </button>
       )}
-      {error && <div className="error-banner">{error}</div>}
+      {error && (
+        <div className="error-banner" role="status">
+          {error}
+        </div>
+      )}
       {loading && (
         <div className="transcript-loading">
           <Spinner />
@@ -4022,7 +4523,7 @@ function Conversation({
               }}
             >
               <div className="message-meta">
-                <span className="message-avatar">
+                <span className="message-avatar" aria-hidden="true">
                   {block.kind === "user" ? (
                     <span aria-hidden="true">›</span>
                   ) : block.kind === "tool" ? (
@@ -4071,6 +4572,7 @@ function Conversation({
                 <button
                   className="icon-button copy-message"
                   aria-label="Copy message"
+                  title="Copy message"
                   onClick={() =>
                     void hostApi.copyText(block.detail || block.text)
                   }
@@ -4120,7 +4622,7 @@ function Conversation({
             setFollowing(true);
             parent.current?.scrollTo({
               top: parent.current.scrollHeight,
-              behavior: "smooth",
+              behavior: scrollBehavior(),
             });
           }}
         >

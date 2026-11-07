@@ -32,7 +32,7 @@ export function LayoutOptions() {
         </select>
       </label>
       <label>
-        Interface text <output>{prefs.textSize} px</output>
+        Interface text <output aria-hidden="true">{prefs.textSize} px</output>
         <input
           type="range"
           aria-label="Interface text"
@@ -44,7 +44,8 @@ export function LayoutOptions() {
         />
       </label>
       <label>
-        Code & terminal text <output>{prefs.codeSize} px</output>
+        Code & terminal text{" "}
+        <output aria-hidden="true">{prefs.codeSize} px</output>
         <input
           type="range"
           aria-label="Code & terminal text"
@@ -59,7 +60,7 @@ export function LayoutOptions() {
         {(["sidebar", "inspector"] as const).map((pane) => (
           <label key={pane}>
             {pane === "sidebar" ? "Sidebar width" : "Inspector width"}
-            <output>{prefs[pane]} px</output>
+            <output aria-hidden="true">{prefs[pane]} px</output>
             <input
               type="range"
               aria-label={

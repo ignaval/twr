@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { Markdown } from "./ui";
 
 /** Bound parser and DOM work while collapsed; expanding keeps the exact original text. */
@@ -12,6 +12,7 @@ export function MessageBody({
   clamp?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const id = useId();
   const { long, preview } = useMemo(() => {
     if (!clamp) return { long: false, preview: text };
     const head = text.slice(0, 1600);
@@ -36,13 +37,14 @@ export function MessageBody({
   const content = collapsed ? preview : text;
   return (
     <>
-      <div className={`message-body ${collapsed ? "clamped" : ""}`}>
+      <div className={`message-body ${collapsed ? "clamped" : ""}`} id={id}>
         {mono ? <pre>{content}</pre> : <Markdown text={content} />}
       </div>
       {long && (
         <button
           className="message-expand"
           aria-expanded={expanded}
+          aria-controls={id}
           onClick={() => setExpanded((v) => !v)}
         >
           {expanded ? "Show less" : "Show full message"}

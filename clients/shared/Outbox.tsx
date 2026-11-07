@@ -61,9 +61,10 @@ export function Outbox({
     journal?.snapshot.outbox.filter((item) => item.workspace === workspace) ||
     [];
   return messages.length ? (
-    <section className="outbox" aria-label="Saved outbox">
-      <h3>
+    <section className="outbox" aria-labelledby="twr-outbox-title">
+      <h3 id="twr-outbox-title">
         Outbox <span>{messages.length}</span>
+        <span className="visually-hidden"> saved messages</span>
       </h3>
       {error && <p role="status">{error}</p>}
       {messages.map((message) => (
@@ -96,7 +97,11 @@ export function Outbox({
               : "To orchestrator"}{" "}
             · {new Date(message.createdAt).toLocaleString()}
           </small>
-          {message.error && <p className="outbox-error">{message.error}</p>}
+          {message.error && (
+            <p className="outbox-error" role="status">
+              {message.error}
+            </p>
+          )}
           <div>
             <button
               onClick={() =>

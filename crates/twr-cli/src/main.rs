@@ -10955,8 +10955,17 @@ mod tests {
         let sock = dir.path().join("hub.sock");
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Absent);
         assert_eq!(ws_status(&sock, "default").await["hub"], "stopped");
-        // A socket file nobody listens on: connection refused.
+        // A socket file nobody listens on: connection refused (once the forks of this process
+        // made meanwhile, which hold the listener too, have exec'd).
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped listener still answers"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Absent);
         assert_eq!(ws_status(&sock, "default").await["hub"], "stopped");
         std::fs::remove_file(&sock).unwrap();

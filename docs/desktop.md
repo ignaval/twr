@@ -88,8 +88,60 @@ and Ctrl-Shift-F on Linux, preserving normal text-editing Control keys. Narrow w
 all manager pages remain accessible through More. In short windows, expanding a terminal
 temporarily gives it the main area. Dark is the default. Light and System are available in Appearance; System follows
 the selected Omarchy theme on Linux. Native menus and window backgrounds follow
-the client preference, which is restored on the next launch. No tray, multiwindow or launch-at-login integration is
-required for this release.
+the client preference, which is restored on the next launch.
+
+## Tray, login and background mode
+
+The app adds a menu bar item on macOS and a tray icon on Linux. It shows how many
+items need you, lists up to five of them (choose one to open it) and has quick
+actions for a new thread, Launch at Login, background mode, updates and Quit. The
+Dock icon (macOS) and Unity-style launchers (Linux) show the same count as a badge.
+On Linux the icon needs a StatusNotifierItem host: Waybar's `tray` module on Omarchy,
+KDE Plasma, or GNOME with the AppIndicator extension. Without one, Settings says so
+and background mode stays off, so the window can always be brought back.
+
+Settings › Application has three switches:
+
+- **Launch at login.** On macOS this registers a login item (macOS may ask you to
+  allow it in System Settings › General › Login Items). On Linux it writes
+  `~/.config/autostart/tools.twr.desktop.desktop`, which Omarchy (through uwsm),
+  GNOME and KDE start at login. AppImages are started through the image itself. twr
+  only removes an autostart entry that it created.
+- **Show in menu bar / Show tray icon.**
+- **Keep running when the window is closed.** Closing the window hides it instead,
+  so terminals, the hub connection and the badge stay live. A login launch then starts
+  hidden on Linux. macOS 13 and later do not always tell an app it was opened at login, so
+  the window may appear; close it and twr stays in the menu bar. Open twr again from the tray, the Dock or your launcher (a second launch
+  shows the existing window). Quit from the tray menu, File › Quit (Ctrl-Q on Linux) or
+  Cmd-Q on macOS.
+
+## Updates
+
+| Install | How it updates |
+|---|---|
+| macOS, Developer ID signed | Downloads in the background; **Restart to update**, or it installs when you quit |
+| macOS, ad hoc review build | Notifies and links the new disk image (macOS only swaps in signed updates) |
+| AppImage | Downloads in the background and replaces the AppImage file |
+| Debian/Ubuntu package | Notifies with the `sudo apt install ./…deb` command and a download link |
+| Arch / AUR (`twr-desktop-bin`) | Notifies; update with your AUR helper (`yay -Syu twr-desktop-bin`) |
+
+The app checks the latest GitHub release 45 seconds after launch and then every six
+hours. Turn this off, or check by hand, in Settings › Updates or Help › Check for Updates.
+It only reacts to a release once that release has the installers and update metadata for
+this platform. Self-updating builds verify the download against the SHA-512 in the
+release's `latest-*.yml`, and on macOS against the app's code signature. The hub and its
+agents keep running through an app update. Each app build keeps its engine in its own
+content-addressed directory, so a running hub's executable is never replaced.
+
+## Diagnostics
+
+twr keeps a local log (`twr-desktop.log`, rotated at 2 MiB) in the folder shown by
+**Help › Open Log Folder** and in Settings › Diagnostics (`~/Library/Logs/twr-desktop`
+on macOS; under the app's configuration folder on Linux). The log records startup, update checks, hub connection failures, renderer errors
+and crashed helper processes. Chromium crash reports are kept on disk and never uploaded.
+**Settings › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
+version, install kind, platform and session details, GPU status, memory use and the recent
+log. Tokens, keys, URL credentials and your home folder path are removed first.
 
 ## Architecture and extension points
 
@@ -160,7 +212,7 @@ the complete cross-distribution flow:
 
 ```sh
 cd clients
-npm run package:mac        # release/*.dmg
+npm run package:mac        # release/*.dmg (+ *-mac.zip and latest-mac.yml for updates)
 npm run package:linux      # on Ubuntu 22.04: release/*.AppImage, *.deb, linux-unpacked/
 node scripts/arch.mjs       # same portable linux-unpacked/ → checksummed Arch source
 # Transfer release/arch to an Arch machine, then:
@@ -172,6 +224,28 @@ The Arch package includes its own matching Electron runtime and native terminal 
 so a system Electron upgrade cannot change the app's ABI. The Arch package reuses
 the portable producer's native terminal module without recompiling it. Its launcher uses the stable
 `tools.twr.desktop` class for Hyprland rules. Chromium's sandbox stays enabled.
+
+The AUR package `twr-desktop-bin` installs the same files from the release's
+`twr-desktop-<version>-linux-x64.tar.gz`. `node scripts/aur.mjs <archive>` writes its
+`PKGBUILD` and `.SRCINFO`. CI builds that package from the identical archive, checks
+`.SRCINFO` against `makepkg --printsrcinfo`, and installs it over the release package.
+
+### Releases
+
+Pushing a stable `v<version>` tag runs `release.yml`. That publishes the CLI release,
+calls `desktop.yml` for the same commit (with all of its QA), then attaches the installers,
+update metadata and `desktop-sha256sums.txt` to the release. Prerelease tags skip the
+desktop. Optional secrets, all in the protected `release` environment (never repository-wide
+secrets, which pull-request runs can read):
+
+- `CSC_LINK`, `CSC_KEY_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`,
+  `APPLE_TEAM_ID`: a Developer ID certificate (base64 `.p12`) and notarization
+  credentials. With them, the Mac app is signed, notarized and stapled, and
+  `latest-mac.yml` is published so Macs update themselves. Without them, the release
+  carries the ad hoc review disk image only.
+- `AUR_SSH_PRIVATE_KEY`: the key registered on the
+  `twr-desktop-bin` AUR account. With it, the release pushes the new PKGBUILD to the AUR.
+  Otherwise, push the `twr-desktop-aur` workflow artifact by hand.
 
 macOS packaging supports normal electron-builder signing/notarization credentials when
 provided by the release environment. After packaging on macOS, `npm run test:packaged:mac` launches the actual app through

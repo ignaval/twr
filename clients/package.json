@@ -15,7 +15,7 @@
     "test": "vitest run",
     "test:integration": "node scripts/integration.mjs",
     "test:voice": "node scripts/voice-qa.mjs",
-    "package": "npm run build:rust && npm run build && electron-builder",
+    "package": "npm run build:rust && npm run build && electron-builder --publish never",
     "package:mac": "npm run package -- --mac --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false",
     "package:linux": "npm run package -- --linux --x64",
     "postinstall": "electron-builder install-app-deps",
@@ -36,6 +36,7 @@
     "mobile:test:ios": "node mobile/scripts/ios-qa.mjs"
   },
   "dependencies": {
+    "electron-updater": "6.8.11",
     "node-pty": "1.1.0",
     "qrcode": "^1.5.4",
     "ws": "^8.22.1"
@@ -102,6 +103,10 @@
       {
         "from": "bin",
         "to": "bin"
+      },
+      {
+        "from": "packaging/tray",
+        "to": "tray"
       }
     ],
     "mac": {
@@ -109,6 +114,12 @@
       "target": [
         {
           "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
           "arch": [
             "arm64"
           ]
@@ -178,7 +189,15 @@
       "enableNodeCliInspectArguments": false,
       "enableEmbeddedAsarIntegrityValidation": true,
       "onlyLoadAppFromAsar": true
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "ignaval",
+        "repo": "twr",
+        "releaseType": "release"
+      }
+    ]
   },
   "type": "module",
   "overrides": {

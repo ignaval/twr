@@ -1064,7 +1064,10 @@ Commands:
         path
     }
 
-    /// [`stub`] at `path`, counting its `--help` runs in `<dir>/probes`.
+    /// [`stub`] at `path`, counting its `--help` runs in `<dir>/probes`. Run once (with an
+    /// argument no arm takes) before it is returned: macOS assesses a new executable the first
+    /// time it runs (some 150 ms of it on a developer's Mac), which would count against the
+    /// probes' short time limits and could kill a probe before it counts itself.
     fn stub_at(path: &Path, dir: &Path, help: &str, version: &str) {
         let d = dir.display();
         install(
@@ -1074,6 +1077,11 @@ Commands:
                  --version) {version};;\nesac\nexit 9\n"
             ),
         );
+        let warm = std::process::Command::new(path)
+            .arg("--warm-up")
+            .status()
+            .unwrap();
+        assert_eq!(warm.code(), Some(9), "{}", path.display());
     }
 
     fn probes(dir: &Path) -> usize {

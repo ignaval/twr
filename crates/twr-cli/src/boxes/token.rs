@@ -1083,9 +1083,15 @@ mod tests {
         assert!(matches!(found, Found::None), "no data directory");
 
         std::fs::create_dir_all(&paths.data_dir).unwrap();
+        // Retried until the forks of this process made meanwhile have exec'd (another test's
+        // spawn): until then a fork still holds the lock of the file this test let go.
         let hold = || {
             let f = std::fs::File::create(paths.data_dir.join(twr_hub::LOCK_FILE)).unwrap();
-            f.try_lock().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while let Err(e) = f.try_lock() {
+                assert!(std::time::Instant::now() < deadline, "{e:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
             f
         };
         let lock = hold();

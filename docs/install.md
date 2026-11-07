@@ -72,6 +72,22 @@ xattr -d com.apple.quarantine twr
 
 `curl` sets no such flag, so the install script and `twr update` don't need this.
 
+### Desktop app
+
+Stable releases also carry the desktop app, built from the same commit:
+
+| File | Platform |
+|---|---|
+| `twr-<version>-arm64.dmg` | macOS on Apple silicon, 13 or newer |
+| `twr-<version>.AppImage` | Linux x86_64 (glibc 2.35+), any distribution |
+| `twr-desktop_<version>_amd64.deb` | Debian, Ubuntu 22.04 or newer |
+| `twr-desktop-<version>-1-x86_64.pkg.tar.zst` | Arch Linux, Omarchy |
+
+On Arch and Omarchy, install from the AUR with `yay -S twr-desktop-bin` (or your AUR
+helper), so updates come with the rest of your system. `desktop-sha256sums.txt` lists
+the desktop files' checksums. The app updates itself or tells you how to, depending on how
+it was installed. See [desktop updates](desktop.md#updates).
+
 ### Checking the signature
 
 The checksums are only as good as the file they come from. To check that `sha256sums.txt` is the one the release workflow signed, save the release public key, [`release/signing-key.pub`](../release/signing-key.pub) in the repository, as `signing-key.pub`, download `sha256sums.txt.sig` next to `sha256sums.txt`, and run, with OpenSSL 3.0 or newer:

@@ -17,6 +17,10 @@ const stage = "release/arch-stage/twr-desktop";
 rmSync(stage, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
 cpSync("release/linux-unpacked", stage, { recursive: true });
+// electron-builder's deb target marks the shared linux-unpacked tree as a
+// Debian install (resources/package-type). The Arch/AUR/portable archive is
+// not one: the app must not offer apt instructions on Omarchy.
+rmSync(stage + "/resources/package-type", { force: true });
 mkdirSync(stage + "/packaging", { recursive: true });
 for (const name of ["LICENSE", "NOTICE"])
   cpSync("../" + name, stage + "/" + name);

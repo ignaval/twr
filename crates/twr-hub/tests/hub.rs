@@ -1890,6 +1890,11 @@ fn sleeper(dir: &Path, children: Arc<std::sync::Mutex<Vec<std::process::Child>>>
 
 #[test]
 fn a_runtime_that_outlived_its_hub_is_killed_before_the_thread_closes() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_runtime_that_outlived_its_hub_is_killed_before_the_thread_closes",
+    ) {
+        return;
+    }
     use std::os::unix::process::ExitStatusExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3939,6 +3944,11 @@ fn raised_ids(evs: &[Event]) -> Vec<String> {
 
 #[tokio::test]
 async fn shutdown_kills_a_runtime_that_ignores_its_stop_before_recording_it() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "shutdown_kills_a_runtime_that_ignores_its_stop_before_recording_it",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let children = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut o = sleeper(dir.path(), Arc::clone(&children));
@@ -3961,6 +3971,11 @@ async fn shutdown_kills_a_runtime_that_ignores_its_stop_before_recording_it() {
 
 #[test]
 fn a_runtime_whose_hub_died_before_it_reported_its_process_is_killed() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_runtime_whose_hub_died_before_it_reported_its_process_is_killed",
+    ) {
+        return;
+    }
     use std::os::unix::process::CommandExt;
     let dir = tempfile::tempdir().unwrap();
     let children = Arc::new(std::sync::Mutex::new(Vec::<std::process::Child>::new()));
@@ -4135,6 +4150,11 @@ fn marked_sleeper(cfg: &SpawnConfig) -> std::process::Child {
 /// process running. The hub kills it (identity-checked) before it records the crash.
 #[tokio::test]
 async fn an_adapter_that_vanishes_has_its_process_killed_before_the_crash_is_recorded() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "an_adapter_that_vanishes_has_its_process_killed_before_the_crash_is_recorded",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let child: Arc<std::sync::Mutex<Option<std::process::Child>>> = Arc::default();
     let c = Arc::clone(&child);
@@ -4170,6 +4190,11 @@ async fn an_adapter_that_vanishes_has_its_process_killed_before_the_crash_is_rec
 /// timeout; its exit then records the crash.
 #[tokio::test]
 async fn a_runtime_the_hub_gave_up_on_that_ignores_the_stop_is_killed() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_runtime_the_hub_gave_up_on_that_ignores_the_stop_is_killed",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts_with(dir.path(), move |mut end, cfg, _prompt| {
         let mut child = marked_sleeper(&cfg);

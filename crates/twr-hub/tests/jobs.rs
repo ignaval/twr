@@ -325,6 +325,11 @@ async fn a_cancel_or_a_timeout_ends_its_process_group() {
 
 #[tokio::test]
 async fn a_job_a_stopped_hub_ran_is_lost_at_the_next_start() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_job_a_stopped_hub_ran_is_lost_at_the_next_start",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let t = {
         let hub = Hub::open(opts(dir.path(), 2)).await.unwrap();
@@ -855,6 +860,11 @@ async fn a_queued_agents_job_does_not_start_once_the_mode_narrowed() {
 /// the attach is over, its CLI's process starts none.
 #[tokio::test]
 async fn an_attached_clis_job_wakes_no_stopped_thread() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "an_attached_clis_job_wakes_no_stopped_thread",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let hub = Hub::open(opts(dir.path(), 2)).await.unwrap();
     let t = thread(&hub, &dir.path().join("proj"), "api").await;

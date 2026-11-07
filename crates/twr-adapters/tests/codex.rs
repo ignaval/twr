@@ -2319,7 +2319,10 @@ async fn driver_approve_multi_turn_and_stop_match_the_recorded_stdin() {
     let run = parse(&std::fs::read_to_string(dir.path().join("run.json")).unwrap());
     assert_eq!(run["args"], json!(["app-server", "--stdio"]));
     assert_eq!(run["thread"], "T1");
-    assert_eq!(run["cwd"], dir.path().to_string_lossy().as_ref());
+    // The stub's `os.getcwd()` resolves links (macOS's temporary directory is under `/var`, a
+    // link to `/private/var`).
+    let cwd = std::fs::canonicalize(dir.path()).unwrap();
+    assert_eq!(run["cwd"], cwd.to_string_lossy().as_ref());
     assert_eq!(run["pgid"], run["pid"], "own process group");
 }
 

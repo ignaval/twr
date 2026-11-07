@@ -570,6 +570,16 @@ async fn bind_replaces_stale_sockets_and_creates_a_private_dir() {
     assert_eq!(dmode & 0o777, 0o700);
     drop(l); // leaves a socket file nobody answers on
     assert!(sock.exists());
+    // Once the forks of this process made meanwhile have exec'd: until then they hold the
+    // listener too (another test's spawn, a `ps` read), and it still answers.
+    let deadline = std::time::Instant::now() + WAIT;
+    while std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dropped listener still answers"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let _l = server::bind(&sock).await.unwrap();
     // A regular file is never removed.
     let file = dir.path().join("not-a-socket");
@@ -854,6 +864,9 @@ fn attach_process(marker: &str) -> (std::process::Child, u64) {
 /// process exited`) and the queued prompt runs.
 #[tokio::test]
 async fn an_attach_lasts_while_its_process_runs() {
+    if twr_runner::reap::skip_if_test_environs_hidden("an_attach_lasts_while_its_process_runs") {
+        return;
+    }
     let th = start().await;
     let mut c = Client::connect(&th.socket).await.unwrap();
     c.call("hello", json!({"client": "itest"})).await.unwrap();

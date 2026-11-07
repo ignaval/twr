@@ -24,6 +24,20 @@ if (process.platform !== "darwin" || process.arch !== "arm64")
   );
 const application = resolve("release/mac-arm64/twr.app");
 assert(existsSync(application), "Build the Mac application first");
+// The menu bar icon and electron-updater's feed configuration ship in the bundle.
+for (const name of ["trayTemplate.png", "trayTemplate@2x.png"])
+  assert(
+    existsSync(join(application, "Contents/Resources/tray", name)),
+    `Missing menu bar icon ${name}`,
+  );
+{
+  const feed = readFileSync(
+    join(application, "Contents/Resources/app-update.yml"),
+    "utf8",
+  );
+  for (const line of ["provider: github", "owner: ignaval", "repo: twr"])
+    assert(feed.split("\n").includes(line), `app-update.yml lacks ${line}`);
+}
 const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-package-")));
 const repository = join(fixture, "repo");
 const speechScript = join(fixture, "speech-sink.sh");
@@ -243,6 +257,101 @@ try {
   console.log(
     "PASS: packaged attachment preview is inert, progresses to ready, and waits for explicit send",
   );
+  // Application services: settings, background mode, diagnostics and the
+  // update policy of an ad hoc signed build. Launch at login is not toggled
+  // here because macOS login items belong to the real user session.
+  {
+    const settings = await page.evaluate(() => window.twrApp.settings());
+    assert.equal(settings.update.kind, "mac");
+    assert.equal(
+      settings.update.automatic,
+      false,
+      "Ad hoc builds must not self-update",
+    );
+    assert.match(settings.update.manualReason, /Developer ID/);
+    assert.equal(settings.login.supported, true);
+    assert.equal(settings.tray.available, true);
+    assert.equal(settings.tray.enabled, true);
+    const trayOff = await page.evaluate(() => window.twrApp.setTray(false));
+    assert.equal(trayOff.tray.enabled, false);
+    await page.evaluate(() => window.twrApp.setTray(true));
+    await page.evaluate(() =>
+      window.twrApp.setAttention({
+        count: 2,
+        items: [{ thread: "packaged", title: "packaged", summary: "QA" }],
+      }),
+    );
+    // Background mode: closing the window hides it and keeps the renderer live.
+    await page.evaluate(() => window.twrApp.setBackground(true));
+    // The automation-only SIGUSR2 hook calls BrowserWindow.close(), the path
+    // of the title-bar button and File › Close. (Synthetic keystrokes do not
+    // reach native menu accelerators, and a script's window.close() skips the
+    // window's close event.)
+    process.kill(fixtureLauncherPID(), "SIGUSR2");
+    const windowState = async () =>
+      JSON.parse(
+        /^window: (.*)$/m.exec(
+          await page.evaluate(() => window.twrApp.diagnostics()),
+        )[1],
+      );
+    for (let i = 0; i < 50 && (await windowState()).visible; i++)
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      (await windowState()).visible,
+      false,
+      "Background mode must hide the window instead of closing it",
+    );
+    // Launching again (a launcher, the Dock or a login item) hands over to the
+    // running instance, which shows its hidden window and then exits.
+    execFileSync(
+      join(application, "Contents/MacOS/twr"),
+      [`--user-data-dir=${join(fixture, "user-data")}`],
+      {
+        stdio: "ignore",
+        timeout: 30000,
+        env: {
+          ...process.env,
+          HOME: fixture,
+          TWR_HOME: fixture,
+          TWR_DESKTOP_TEST_AUTOMATION: "1",
+        },
+      },
+    );
+    for (let i = 0; i < 50 && !(await windowState()).visible; i++)
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    if (!(await windowState()).visible)
+      console.log(await page.evaluate(() => window.twrApp.diagnostics()));
+    assert.equal((await windowState()).visible, true);
+    await page
+      .locator(".connection-status")
+      .filter({ hasText: "Hub connected" })
+      .waitFor({ timeout: 10000 });
+    await page.evaluate(() => window.twrApp.setBackground(false));
+    await page.evaluate(() =>
+      window.twrApp.reportError({
+        message: "packaged QA probe token=SHOULD_NOT_APPEAR",
+        source: "qa",
+      }),
+    );
+    const diagnostics = await page.evaluate(() => window.twrApp.diagnostics());
+    assert.match(diagnostics, /^install: mac$/m);
+    assert.match(diagnostics, /packaged QA probe token=\[redacted\]/);
+    assert(!diagnostics.includes("SHOULD_NOT_APPEAR"));
+    assert(
+      !diagnostics.includes(fixture),
+      "Diagnostics must hide the home path",
+    );
+    await page
+      .getByRole("button", { name: "Settings", exact: true })
+      .first()
+      .click();
+    await page.getByRole("heading", { name: "Application" }).waitFor();
+    await page.getByRole("switch", { name: "Launch at login" }).waitFor();
+    await page.getByRole("heading", { name: "Diagnostics" }).waitFor();
+    console.log(
+      "PASS: packaged tray settings, background close/reopen, redacted diagnostics and ad hoc update policy",
+    );
+  }
   if (process.env.TWR_DESKTOP_EXTENDED_QA === "1") {
     const { runMacQA } = await import("./qa-scenarios.mjs");
     await runMacQA(page, { fixture, hubPids });
