@@ -424,6 +424,12 @@ for (const [
               code,
               url: "http://127.0.0.1:47424",
               foldable: device.name.includes("Duo"),
+              catalogIds: JSON.parse(
+                readFileSync(
+                  new URL("../catalog.json", import.meta.url),
+                  "utf8",
+                ),
+              ).map((command) => command.id),
             }),
           );
         } catch (error) {
