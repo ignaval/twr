@@ -97,6 +97,9 @@ jobs:
         if: runner.os == 'macOS'
         run: echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
       - run: cargo test --workspace --locked --no-fail-fast
+      - name: Build the hub's recorded source as a native worker
+        timeout-minutes: 40
+        run: cargo test --workspace --test runner_link --locked -- --ignored
 
   ps-backend:
     # macOS reads the process table with `ps` (crates/twr-runner/src/reap/ps.rs). Run the
