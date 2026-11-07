@@ -13,7 +13,9 @@
 //! - **`--text`**: a speaker of its own that prints each message's sentences, one per line, as
 //!   they are said: a public interface for a reader of your own. With several workspaces each
 //!   line starts with `<workspace>: `. Live mode is always on; controls are ignored; messages
-//!   asked for with `/read N` are printed too.
+//!   asked for with `/read N` are printed too. With `--attention` it also reads announcements
+//!   (`api needs your permission`), each a line as it comes (a retract comes too late for a
+//!   line already printed, and is ignored).
 //!
 //! And the listening end: `twr speak` ([`speak`]), a speaker on this machine
 //! (`twr_speech::speaker::run`), and `twr remote` ([`remote`]), a mosh or ssh session with
@@ -35,8 +37,8 @@ use twr_core::config::{Config, SpeechEngine};
 use twr_core::paths::{Paths, DEFAULT_WORKSPACE};
 use twr_core::proto::codes;
 use twr_core::speech::{
-    utterances, ProxyIn, ProxyOut, SpeakOpts, SpeechAttachParams, SpeechItem, TurnsRead,
-    PROXY_METHODS, PROXY_VERSION,
+    utterances, ProxyIn, ProxyOut, ReadKind, SpeakOpts, SpeechAttachParams, SpeechItem, TurnsRead,
+    ANNOUNCE_MAX, PROXY_METHODS, PROXY_VERSION,
 };
 use twr_speech::link::PROXY_PING;
 use twr_speech::{LinkSpec, Reporter, SpeakerOpts, SshSpec, StateStore, Workspaces};
@@ -463,8 +465,8 @@ async fn serve_workspace(
     }
 }
 
-/// `twr speech feed --text`.
-pub async fn text(workspaces: Vec<(String, PathBuf)>) -> anyhow::Result<()> {
+/// `twr speech feed --text`, with announcements too when `attention`.
+pub async fn text(workspaces: Vec<(String, PathBuf)>, attention: bool) -> anyhow::Result<()> {
     let prefix = workspaces.len() > 1;
     let mut random = [0u8; 8];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
@@ -474,7 +476,13 @@ pub async fn text(workspaces: Vec<(String, PathBuf)>) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for (ws, socket) in workspaces {
         let label = prefix.then(|| format!("{ws}: "));
-        tasks.spawn(text_workspace(socket, device.clone(), label, tx.clone()));
+        tasks.spawn(text_workspace(
+            socket,
+            device.clone(),
+            label,
+            attention,
+            tx.clone(),
+        ));
     }
     drop(tx);
     while let Some(line) = rx.recv().await {
@@ -486,13 +494,36 @@ pub async fn text(workspaces: Vec<(String, PathBuf)>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the text feed asks to read: both kinds of text, and announcements with `attention`.
+fn text_read(attention: bool) -> Vec<ReadKind> {
+    let mut read = twr_core::speech::default_read();
+    if attention {
+        read.push(ReadKind::Attention);
+    }
+    read
+}
+
+/// The line of announcement `text` (a hub's, cleaned and cut again: one line of at most
+/// [`ANNOUNCE_MAX`] characters), after `label`; `None` when nothing is left of it.
+fn announce_line(label: Option<&str>, text: &str) -> Option<String> {
+    let text: String = twr_core::speech::clean(text)
+        .trim()
+        .chars()
+        .take(ANNOUNCE_MAX)
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("{}{text}", label.unwrap_or("")))
+}
+
 /// One workspace of the text feed: attached as a speaker with live mode on, again after its
-/// hub went away, printing each message's sentences. Within one run it reads no message
-/// twice: it keeps its place per thread across reconnects.
+/// hub went away, printing each message's sentences (and each announcement, with
+/// `attention`). Within one run it reads no message twice: it keeps its place per thread
+/// across reconnects.
 async fn text_workspace(
     socket: PathBuf,
     device: String,
     label: Option<String>,
+    attention: bool,
     out: mpsc::Sender<String>,
 ) {
     let mut watermarks: BTreeMap<String, u64> = BTreeMap::new();
@@ -504,7 +535,7 @@ async fn text_workspace(
             engine: "text".into(),
             voice: None,
             live: true,
-            read: twr_core::speech::default_read(),
+            read: text_read(attention),
             turn_from: TurnsRead::All,
             watermarks: watermarks.clone(),
             catchup_secs: twr_core::speech::default_catchup(),
@@ -571,7 +602,14 @@ async fn text_workspace(
                     watermarks.retain(|t, _| *t == thread);
                     watermarks.entry(thread).or_insert(0);
                 }
-                SpeechItem::Ctl { .. } => {}
+                SpeechItem::Announce { text, .. } => {
+                    if let Some(line) = announce_line(label.as_deref(), &text) {
+                        if out.send(line).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                SpeechItem::Ctl { .. } | SpeechItem::Retract { .. } => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1183,6 +1221,30 @@ mod tests {
 
     /// `--control stdio` takes the five controls, trimmed, and ignores anything else (a newer
     /// program's control), so a typo never quits a speaker.
+    /// The text feed asks for announcements only with `--attention`, and prints each as one
+    /// clean line after the workspace's label.
+    #[test]
+    fn the_text_feed_prints_announcements_when_asked() {
+        assert_eq!(text_read(false), twr_core::speech::default_read());
+        assert_eq!(
+            text_read(true),
+            vec![ReadKind::Replies, ReadKind::Commentary, ReadKind::Attention]
+        );
+        assert_eq!(
+            announce_line(None, "api needs your permission").as_deref(),
+            Some("api needs your permission")
+        );
+        assert_eq!(
+            announce_line(Some("work: "), "a\npi\u{202E} failed\u{7}").as_deref(),
+            Some("work: a pi failed")
+        );
+        assert_eq!(
+            announce_line(None, &"x".repeat(999)).map(|l| l.chars().count()),
+            Some(ANNOUNCE_MAX)
+        );
+        assert_eq!(announce_line(Some("work: "), " \u{200B} "), None);
+    }
+
     #[test]
     fn stdio_controls_are_read_line_by_line() {
         use twr_speech::Key;

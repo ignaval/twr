@@ -21,6 +21,11 @@
 //!
 //! The attach params are made by the speaker at each attach ([`ParamsFn`]): they carry the
 //! watermarks as they are then.
+//!
+//! A hub older than announcements refuses an attach whose `read` names `attention`
+//! ([`older_than_attention`]): the link attaches to it again at once without it
+//! ([`without_attention`]), says so once, and asks for it again after that hub went away (it
+//! may come back updated).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,8 +41,8 @@ use twr_core::client::{Client, SpeechLink};
 use twr_core::paths::{sh_word, workspace_name_error, Paths, DEFAULT_WORKSPACE};
 use twr_core::proto::{codes, RpcError};
 use twr_core::speech::{
-    ProxyIn, ProxyOut, SpeechAttachAck, SpeechAttachParams, SpeechItem, SpeechStateParams,
-    PROXY_VERSION,
+    ProxyIn, ProxyOut, ReadKind, SpeechAttachAck, SpeechAttachParams, SpeechItem,
+    SpeechStateParams, PROXY_VERSION,
 };
 
 /// How often a hub that is down, or a standby speaker, tries again.
@@ -78,6 +83,23 @@ pub fn hub_words(text: &str) -> String {
     let mut cut: String = text.chars().take(HUB_WORDS_MAX).collect();
     cut.push('…');
     cut
+}
+
+/// Whether `e`, a hub's refusal of `speech.attach`, says the hub is older than
+/// [`ReadKind::Attention`]: its `read` doesn't know the kind.
+pub fn older_than_attention(e: &RpcError) -> bool {
+    e.code == codes::BAD_REQUEST && e.message.contains("unknown variant `attention`")
+}
+
+/// `p` without [`ReadKind::Attention`], for a hub older than it.
+pub fn without_attention(mut p: SpeechAttachParams) -> SpeechAttachParams {
+    p.read.retain(|k| *k != ReadKind::Attention);
+    p
+}
+
+/// What a link says once of a hub older than announcements.
+fn older_note(ws: &str) -> String {
+    format!("{ws}: the hub is older than announcements (read = \"attention\"); reading without them until twr is updated there")
 }
 
 /// Which workspaces a link reads.
@@ -457,6 +479,8 @@ enum Ended {
     Standby,
     /// The hub refused the attach otherwise (one older than `speech.attach`, say).
     Refused(String),
+    /// The hub is older than announcements ([`older_than_attention`]).
+    Older,
     /// It was attached, and the connection ended.
     Detached(String),
     /// The speaker is gone.
@@ -473,9 +497,19 @@ async fn local_ws(
 ) {
     let mut standby = false;
     let mut refused: Option<String> = None;
+    // The hub is older than announcements: attached without them until it goes away.
+    let mut older = false;
     loop {
-        match local_once(&root, &ws, &params, &tx, &board).await {
+        match local_once(&root, &ws, &params, older, &tx, &board).await {
             Ended::Gone => return,
+            Ended::Older => {
+                older = true;
+                if tx.send(LinkEvent::Note(older_note(&ws))).await.is_err() {
+                    return;
+                }
+                // Again at once, without them.
+                continue;
+            }
             Ended::NotThere(why) => {
                 tracing::debug!(ws, "hub not reachable: {why}");
             }
@@ -502,6 +536,7 @@ async fn local_ws(
             Ended::Detached(why) => {
                 standby = false;
                 refused = None;
+                older = false;
                 let ev = LinkEvent::Detached {
                     ws: ws.clone(),
                     why,
@@ -515,11 +550,13 @@ async fn local_ws(
     }
 }
 
-/// Connects to `ws`'s hub, attaches, and passes items on until the connection ends.
+/// Connects to `ws`'s hub, attaches (without announcements when it is `older`), and passes
+/// items on until the connection ends.
 async fn local_once(
     root: &Paths,
     ws: &str,
     params: &ParamsFn,
+    older: bool,
     tx: &mpsc::Sender<LinkEvent>,
     board: &Board,
 ) -> Ended {
@@ -549,12 +586,16 @@ async fn local_once(
         Ok(Err(e)) => return Ended::NotThere(format!("{e:#}")),
         Err(_) => return Ended::NotThere("no answer".into()),
     };
-    let p = params(ws);
+    let p = match older {
+        true => without_attention(params(ws)),
+        false => params(ws),
+    };
     let (ack, mut link) = match SpeechLink::attach(client, &p).await {
         Ok(x) => x,
         Err(e) => {
             return match e.downcast_ref::<RpcError>() {
                 Some(r) if r.code == codes::CONFLICT => Ended::Standby,
+                Some(r) if !older && older_than_attention(r) => Ended::Older,
                 Some(r) => Ended::Refused(hub_words(&r.message)),
                 None => Ended::NotThere(format!("{e:#}")),
             }
@@ -693,6 +734,8 @@ struct Remote {
     standby: bool,
     /// The last refusal said (once).
     refused: Option<String>,
+    /// Its hub is older than announcements: attached without them (until it is down).
+    older: bool,
     /// The state last sent.
     sent: Option<SpeechStateParams>,
 }
@@ -774,6 +817,8 @@ where
                         let was = std::mem::take(&mut r.attached);
                         r.up = true;
                         r.sent = None;
+                        // A hub connected again may be an updated one.
+                        r.older = false;
                         if was {
                             send!(LinkEvent::Detached { ws: ws.clone(), why: "the hub reconnected".into() });
                         }
@@ -812,7 +857,12 @@ where
                                 let err: RpcError = serde_json::from_value(err.clone())
                                     .unwrap_or_else(|_| RpcError::new(codes::INTERNAL, err.to_string()));
                                 r.retry_at = r.up.then(|| tokio::time::Instant::now() + RETRY);
-                                if err.code == codes::CONFLICT {
+                                if !r.older && older_than_attention(&err) {
+                                    // Again at the next tick, without them.
+                                    r.older = true;
+                                    r.retry_at = r.up.then(tokio::time::Instant::now);
+                                    send!(LinkEvent::Note(older_note(&ws)));
+                                } else if err.code == codes::CONFLICT {
                                     if !std::mem::replace(&mut r.standby, true) {
                                         send!(LinkEvent::Note(format!(
                                             "{ws}: another speaker of this device is attached; standing by"
@@ -930,11 +980,15 @@ async fn write_attach<W: AsyncWrite + Unpin>(
     let r = wss.entry(ws.to_string()).or_default();
     r.attaching = Some(id);
     r.retry_at = None;
+    let p = match r.older {
+        true => without_attention(params(ws)),
+        false => params(ws),
+    };
     let req = ProxyIn {
         ws: ws.to_string(),
         id,
         method: "speech.attach".into(),
-        params: serde_json::to_value(params(ws))?,
+        params: serde_json::to_value(p)?,
     };
     write_line(writer, &req).await
 }
@@ -1192,6 +1246,68 @@ mod tests {
         // The proxy's output ends: so does the session, detaching what was attached.
         tw.shutdown().await.unwrap();
         assert!(session.await.unwrap(), "it said hello");
+    }
+
+    /// A hub older than announcements refuses `read: ["attention"]` (its serde's words): the
+    /// session says so once and attaches again at once without it; a hub connected again is
+    /// asked for it again.
+    #[tokio::test(start_paused = true)]
+    async fn an_older_hub_is_attached_without_announcements() {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (r, w) = tokio::io::split(ours);
+        let (tr, mut tw) = tokio::io::split(theirs);
+        let mut from_speaker = BufReader::new(tr).lines();
+        let (tx, mut events) = mpsc::channel(64);
+        let board = Arc::new(Board::new(Arc::new(|_: &str, _: Persist<'_>| {})));
+        let b2 = board.clone();
+        let base = params();
+        let with: ParamsFn = Arc::new(move |ws: &str| SpeechAttachParams {
+            read: vec![ReadKind::Replies, ReadKind::Attention],
+            ..base(ws)
+        });
+        let session = tokio::spawn(async move { proxy_session(r, w, &with, &tx, &b2).await });
+        put(
+            &mut tw,
+            json!({"proxy": 1, "host": "box", "workspaces": ["default"]}),
+        )
+        .await;
+        put(&mut tw, json!({"ws": "default", "up": true})).await;
+        let req: ProxyIn = serde_json::from_value(next(&mut from_speaker).await).unwrap();
+        assert_eq!(req.params["read"], json!(["replies", "attention"]));
+        let older = "unknown variant `attention`, expected `replies` or `commentary`";
+        let refuse = json!({"ws": "default", "msg": {"id": req.id, "error": {"code": "bad_request", "message": older}}});
+        put(&mut tw, refuse).await;
+        assert!(
+            matches!(events.recv().await, Some(LinkEvent::Note(n)) if n.contains("older than announcements"))
+        );
+        let again: ProxyIn = serde_json::from_value(next(&mut from_speaker).await).unwrap();
+        assert_eq!(again.method, "speech.attach");
+        assert_eq!(again.params["read"], json!(["replies"]));
+        let ok = json!({"ws": "default", "msg": {"id": again.id, "result": {"orchestrator": "T", "head": 9}}});
+        put(&mut tw, ok).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(LinkEvent::Attached { .. })
+        ));
+        // Connected again: asked for again.
+        put(&mut tw, json!({"ws": "default", "up": true})).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(LinkEvent::Detached { .. })
+        ));
+        let third: ProxyIn = serde_json::from_value(next(&mut from_speaker).await).unwrap();
+        assert_eq!(third.params["read"], json!(["replies", "attention"]));
+        tw.shutdown().await.unwrap();
+        assert!(session.await.unwrap());
+        // The words of a refusal for anything else are no such hub's.
+        assert!(!older_than_attention(&RpcError::new(
+            codes::CONFLICT,
+            older
+        )));
+        assert!(!older_than_attention(&RpcError::new(
+            codes::BAD_REQUEST,
+            "read: at least one of replies, commentary"
+        )));
     }
 
     /// The session pings the proxy every [`PING_EVERY`] with a line for the proxy itself (no

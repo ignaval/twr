@@ -38,6 +38,21 @@
 //!   a time per speaker), so two requests never interleave.
 //! - **Controls** (`speech.control`): stop, pause, resume, skip, live, voice, rate, sent to the
 //!   speakers asked.
+//! - **Announcements**, only to a speaker whose attach reads `attention` (an older speaker
+//!   never asks, and never gets an item it doesn't know): when an attention item is raised
+//!   after the speaker attached, its feed says so in a fixed sentence naming the thread
+//!   ([`announcement`]: `api needs your permission`, `twr has a question for you` for the
+//!   hub's own), never the item's summary, command or any agent's words. Which raises count is
+//!   the notifications' rule ([`Policy`]): a new item, not one raised again while open, nor a
+//!   delete card a user client asked for. A raise is held for [`Candidate::hold`] (an answer
+//!   given at once, a crash retried, says nothing) and a thread's raises held together are
+//!   one announcement, of the most urgent; one whose items are all closed by then is not
+//!   sent. Its key is the thread's id: the speaker replaces one of the same key still
+//!   waiting, and once every item an announcement said is closed (answered, withdrawn, its
+//!   thread stopped or deleted) the feed sends `retract` for its key, which drops it if it
+//!   still waits. Live only: an item raised while the speaker was away is never announced
+//!   (the control stream is read from the attach on), nothing is counted in `missed`, and no
+//!   watermark moves.
 //!
 //! Nothing any `speech.*` method does is recorded in the event log. Users only: the
 //! orchestrator gets `unauthorized` (and the server lets neither it nor agents call them).
@@ -51,12 +66,13 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::blob::{has_capped, hydrate_with};
 use twr_core::event::*;
+use twr_core::notify::{still_due, Candidate, NotifyEvent, Policy};
 use twr_core::proto::{codes, RpcError};
 use twr_core::speech::{
-    cap_text, clean, name_error, speakable_turn, turn_is_users, CtlOp, MsgKind, Origin, ReadKind,
-    SpeakerStatus, SpeechAttachAck, SpeechAttachParams, SpeechControlParams, SpeechControlResult,
-    SpeechItem, SpeechRequestParams, SpeechRequestResult, SpeechStateParams, SpeechStatus,
-    TurnsRead, REQUEST_MAX, TEXT_MAX,
+    announcement, cap_text, clean, name_error, speakable_turn, turn_is_users, CtlOp, MsgKind,
+    Origin, ReadKind, SpeakerStatus, SpeechAttachAck, SpeechAttachParams, SpeechControlParams,
+    SpeechControlResult, SpeechItem, SpeechRequestParams, SpeechRequestResult, SpeechStateParams,
+    SpeechStatus, TurnsRead, REQUEST_MAX, TEXT_MAX,
 };
 
 use super::{internal, rpc, Caller, ControlSubscription, Hub, ThreadSubscription};
@@ -180,6 +196,8 @@ impl Drop for Detach {
 struct Wants {
     replies: bool,
     commentary: bool,
+    /// Announcements of attention items ([`ReadKind::Attention`]).
+    attention: bool,
     mine_only: bool,
     watermarks: BTreeMap<String, u64>,
 }
@@ -298,6 +316,136 @@ impl Follow {
     }
 }
 
+/// The attention events an announcement can be about: all of an item's, none of a report's
+/// or a reply's.
+const ANNOUNCED: &[NotifyEvent] = &[
+    NotifyEvent::Permission,
+    NotifyEvent::Question,
+    NotifyEvent::Confirm,
+    NotifyEvent::Error,
+    NotifyEvent::Review,
+    NotifyEvent::Hung,
+    NotifyEvent::Stalled,
+];
+
+/// The announcements of a feed whose speaker reads `attention` (see the module docs): the
+/// raises held, and what each thread's last announcement said while any of it is open. Its
+/// candidates carry no text: the item's summary is never kept.
+struct Announcer {
+    /// Which raises are news.
+    policy: Policy,
+    /// Per thread, the raises held and when they are due.
+    held: BTreeMap<String, (tokio::time::Instant, Vec<Candidate>)>,
+    /// Per thread (the announcements' key), the raises announced whose items may be open.
+    said: BTreeMap<String, Vec<Candidate>>,
+}
+
+impl Announcer {
+    fn new() -> Announcer {
+        Announcer {
+            policy: Policy::new(ANNOUNCED),
+            held: BTreeMap::new(),
+            said: BTreeMap::new(),
+        }
+    }
+
+    /// When the next held raises are due.
+    fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.held.values().map(|(at, _)| *at).min()
+    }
+
+    /// Live control event `ev` at `gseq`: a raise that is news is held (with its thread's
+    /// other raises held, until the latest of their holds); the keys of announcements none of
+    /// whose items is open any more, to retract.
+    fn observe(&mut self, hub: &Hub, gseq: u64, ev: &Event) -> Vec<String> {
+        let closes = matches!(
+            ev.body,
+            EventBody::AttentionResolved(_)
+                | EventBody::ThreadCrashed(_)
+                | EventBody::ThreadStopped(_)
+                | EventBody::ThreadParked(_)
+                | EventBody::ThreadDeleted(_)
+        );
+        let raised = matches!(ev.body, EventBody::AttentionRaised(_));
+        if !raised && !(closes && !self.said.is_empty()) {
+            return Vec::new();
+        }
+        let core = hub.inner.core();
+        if raised {
+            // Judged by the state now, which may be past `ev`: an item closed meanwhile is no
+            // news, and one opened again since is the later raise's.
+            let c = self
+                .policy
+                .observe(ev, Some(gseq), &core.registry, &core.attention);
+            if let Some(mut c) = c {
+                c.text.clear();
+                let at = tokio::time::Instant::now() + c.hold();
+                let (due, held) = self
+                    .held
+                    .entry(c.thread.clone())
+                    .or_insert_with(|| (at, Vec::new()));
+                *due = (*due).max(at);
+                held.push(c);
+            }
+            return Vec::new();
+        }
+        let mut gone = Vec::new();
+        self.said.retain(|key, said| {
+            said.retain(|c| still_due(c, &core.registry, &core.attention));
+            if said.is_empty() {
+                gone.push(key.clone());
+            }
+            !said.is_empty()
+        });
+        gone
+    }
+
+    /// The announcements due at `now`: per thread whose held raises are due, one of the most
+    /// urgent of them still open, if any is.
+    fn take_due(&mut self, hub: &Hub, now: tokio::time::Instant) -> Vec<SpeechItem> {
+        let due: Vec<String> = self
+            .held
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(t, _)| t.clone())
+            .collect();
+        if due.is_empty() {
+            return Vec::new();
+        }
+        let core = hub.inner.core();
+        let mut out = Vec::new();
+        for thread in due {
+            let Some((_, held)) = self.held.remove(&thread) else {
+                continue;
+            };
+            let open: Vec<Candidate> = held
+                .into_iter()
+                .filter(|c| still_due(c, &core.registry, &core.attention))
+                .collect();
+            let Some(top) = open.iter().min_by_key(|c| c.event) else {
+                continue;
+            };
+            let text = announcement(top.event, &top.who, thread == HUB_THREAD);
+            out.push(SpeechItem::Announce {
+                key: thread.clone(),
+                text,
+            });
+            let said = self.said.entry(thread).or_default();
+            said.retain(|c| still_due(c, &core.registry, &core.attention));
+            said.extend(open);
+        }
+        out
+    }
+}
+
+/// Waits until `at`; never, without it.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// A speaker's feed task.
 struct Feed {
     hub: Hub,
@@ -312,6 +460,8 @@ enum Wake {
     Event(anyhow::Result<Option<Arc<Event>>>),
     /// Time to subscribe again to the thread whose subscription failed.
     Retry,
+    /// Held raises are due: sent at the top of the loop ([`Announcer::take_due`]).
+    Announce,
 }
 
 /// The next event of `follow`; never, without one.
@@ -338,18 +488,38 @@ impl Feed {
         let mut broken: Option<Follow> = None;
         let mut retry_at = tokio::time::Instant::now();
         let mut backoff = RETRY_FIRST;
+        let mut announcer = self.wants.attention.then(Announcer::new);
         loop {
+            // What is due goes out first, also while control events keep coming (the select
+            // below is biased to them).
+            if let Some(a) = announcer.as_mut() {
+                for item in a.take_due(&self.hub, tokio::time::Instant::now()) {
+                    if !self.send(item).await {
+                        return;
+                    }
+                }
+            }
+            let announce_at = announcer.as_ref().and_then(Announcer::next_due);
             let wake = tokio::select! {
                 biased;
                 c = control.next() => Wake::Control(c),
                 e = next_event(&mut follow) => Wake::Event(e),
                 () = tokio::time::sleep_until(retry_at), if broken.is_some() => Wake::Retry,
+                () = sleep_until_opt(announce_at) => Wake::Announce,
             };
             match wake {
                 // A switch the orchestrator read at attach already reflects (it came between
                 // the control subscription and that read) is no switch: the feed began there.
+                // Nor is anything else of before the attach news to announce.
                 Wake::Control(Ok(Some((gseq, _)))) if gseq <= seen => continue,
-                Wake::Control(Ok(Some((_, ev)))) => {
+                Wake::Control(Ok(Some((gseq, ev)))) => {
+                    if let Some(a) = announcer.as_mut() {
+                        for key in a.observe(&self.hub, gseq, &ev) {
+                            if !self.send(SpeechItem::Retract { key }).await {
+                                return;
+                            }
+                        }
+                    }
                     // A switch or a reset is a new orchestrator thread, read from its start,
                     // one after the other in the log's order: each one left is read through
                     // what it said, even when several switches came before the feed got here.
@@ -408,6 +578,8 @@ impl Feed {
                     retry_at = tokio::time::Instant::now() + backoff;
                     backoff = (backoff * 2).min(RETRY_MAX);
                 }
+                // Sent at the top of the loop.
+                Wake::Announce => {}
                 Wake::Retry => {
                     let Some(mut f) = broken.take() else {
                         continue;
@@ -794,6 +966,7 @@ impl Hub {
         let wants = Wants {
             replies: p.read.contains(&ReadKind::Replies),
             commentary: p.read.contains(&ReadKind::Commentary),
+            attention: p.read.contains(&ReadKind::Attention),
             mine_only: p.turn_from == TurnsRead::Mine,
             watermarks: p.watermarks,
         };

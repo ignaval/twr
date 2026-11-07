@@ -1002,6 +1002,9 @@ enum SpeechCmd {
         /// The line protocol (the default); for `twr speak --ssh`.
         #[arg(long, conflicts_with = "text")]
         proto: bool,
+        /// With `--text`, also a line when something needs you ("api needs your permission").
+        #[arg(long, requires = "text")]
+        attention: bool,
         /// Every workspace of this machine, not only the current one (`-w`).
         #[arg(long)]
         all_workspaces: bool,
@@ -1931,11 +1934,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 SpeechCmd::Feed {
                     text,
                     proto: _,
+                    attention,
                     all_workspaces,
                 },
         } => {
             if text {
-                speech::text(speech::workspace_sockets(&paths, &[], all_workspaces)?).await?;
+                let sockets = speech::workspace_sockets(&paths, &[], all_workspaces)?;
+                speech::text(sockets, attention).await?;
             } else {
                 speech::proxy(&paths, all_workspaces, speech::proxy_idle()).await?;
             }
