@@ -1,6 +1,4 @@
 //! macOS idle-sleep assertion while machine-wide runtime/build leases are held.
-#[cfg(any(target_os = "macos", test))]
-use std::os::fd::AsRawFd;
 use std::path::Path;
 #[derive(Default)]
 pub struct Power {
@@ -53,7 +51,7 @@ fn busy(root: &Path) -> bool {
             Ok(file) => file,
             Err(_) => continue,
         };
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if twr_runner::managed::Lease::try_exclusive(file).is_err() {
             return true;
         }
     }
@@ -63,7 +61,6 @@ fn busy(root: &Path) -> bool {
 mod tests {
     #[test]
     fn holds_only_for_live_leases() -> anyhow::Result<()> {
-        use std::os::fd::AsRawFd;
         let dir = tempfile::tempdir()?;
         let gate = twr_runner::managed::admission_gate(dir.path())?;
         assert!(super::busy(dir.path()));
@@ -71,18 +68,12 @@ mod tests {
         drop(gate);
         let file = std::fs::File::create(dir.path().join("build.lock"))?;
         assert!(!super::busy(dir.path()));
-        assert_eq!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let file = twr_runner::managed::Lease::try_exclusive(file)?;
         assert!(super::busy(dir.path()));
         drop(file);
         assert!(!super::busy(dir.path()));
         let high = std::fs::File::create(dir.path().join("runtime-63.lock"))?;
-        assert_eq!(
-            unsafe { libc::flock(high.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let high = twr_runner::managed::Lease::try_exclusive(high)?;
         assert!(super::busy(dir.path()));
         drop(high);
         assert!(!super::busy(dir.path()));

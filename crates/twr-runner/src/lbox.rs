@@ -219,7 +219,7 @@ impl LocalBoxOptions {
 
 /// A live runtime session.
 struct Live {
-    _lease: Option<std::fs::File>,
+    _lease: Option<crate::managed::Lease>,
     gen: u64,
     /// The run's id ([`RunningSession::run`]).
     run: String,

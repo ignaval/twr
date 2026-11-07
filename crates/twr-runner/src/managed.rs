@@ -6,6 +6,25 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 use twr_core::runner::Op;
+
+/// A runtime or probe lock released by its owner, even if a concurrent fork kept
+/// a duplicate descriptor alive until exec. Native compiler leases deliberately
+/// retain their separate descriptor-based lifetime across service crashes.
+pub struct Lease(std::fs::File);
+impl Lease {
+    pub fn try_exclusive(file: std::fs::File) -> std::io::Result<Self> {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            Ok(Self(file))
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 #[derive(Clone, Debug)]
 pub struct Managed {
     pub root: PathBuf,
@@ -175,16 +194,12 @@ impl Managed {
     /// Cross-process kernel leases survive service restarts and release on worker exit.
     /// Four resident runtimes by default; active work is never preempted for admission.
     #[cfg(test)]
-    pub fn lease(&self) -> Result<std::fs::File> {
+    pub fn lease(&self) -> Result<Lease> {
         self.lease_inner(None)
     }
-    fn lease_inner(&self, marker: Option<&LeaseMarker>) -> Result<std::fs::File> {
+    fn lease_inner(&self, marker: Option<&LeaseMarker>) -> Result<Lease> {
         twr_core::paths::ensure_private_dir(&self.resources)?;
-        let gate = twr_core::paths::open_private_append(&self.resources.join("slots.lock"))?;
-        ensure!(
-            unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX) } == 0,
-            "cannot lock runtime admission"
-        );
+        let _gate = admission_gate(&self.resources)?;
         let limit = Self::slots(&self.resources)?;
         let mut available = None;
         let mut occupied = 0;
@@ -192,7 +207,15 @@ impl Managed {
             let file = twr_core::paths::open_private_append(
                 &self.resources.join(format!("runtime-{slot}.lock")),
             )?;
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            let file = match Lease::try_exclusive(file) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    occupied += 1;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            {
                 let path = self.resources.join(format!("runtime-{slot}.json"));
                 if let Ok(bytes) = std::fs::read(&path) {
                     ensure!(bytes.len() <= 4096, "runtime lease metadata exceeds limit");
@@ -225,12 +248,6 @@ impl Managed {
                 if available.is_none() {
                     available = Some((file, slot));
                 }
-            } else {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    return Err(error.into());
-                }
-                occupied += 1;
             }
         }
         if occupied < limit {
@@ -292,7 +309,7 @@ struct Ticket {
 impl Managed {
     /// Round-robin across full machine owners, FIFO within each owner. Only metadata is
     /// persisted here; kernel locks remain the authority for occupied runtime slots.
-    pub fn admit(&self, thread: &str, generation: &str) -> Result<std::fs::File> {
+    pub fn admit(&self, thread: &str, generation: &str) -> Result<Lease> {
         use std::io::{Read, Seek, Write};
         self.active()?;
         disk_admission(&self.root)?;
@@ -524,7 +541,7 @@ impl Managed {
         for slot in 0..64 {
             let path = resources.join(format!("runtime-{slot}.lock"));
             if let Ok(file) = std::fs::File::open(path) {
-                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                if Lease::try_exclusive(file).is_err() {
                     occupied += 1;
                 }
             }
@@ -609,28 +626,24 @@ struct LeaseMarker {
 }
 
 /// Coordinate brief lease probes with allocation, so a probe never occupies a runtime/build slot.
-pub fn admission_gate(resources: &Path) -> Result<std::fs::File> {
+pub fn admission_gate(resources: &Path) -> Result<Lease> {
     twr_core::paths::ensure_private_dir(resources)?;
     let file = twr_core::paths::open_private_append(&resources.join("slots.lock"))?;
     ensure!(
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
         "cannot lock admission probes"
     );
-    Ok(file)
+    Ok(Lease(file))
 }
 
 /// A busy allocator must never block the service's expiry or control loop.
-pub fn try_admission_gate(resources: &Path) -> Result<Option<std::fs::File>> {
+pub fn try_admission_gate(resources: &Path) -> Result<Option<Lease>> {
     twr_core::paths::ensure_private_dir(resources)?;
     let file = twr_core::paths::open_private_append(&resources.join("slots.lock"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(file));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::WouldBlock {
-        Ok(None)
-    } else {
-        Err(error.into())
+    match Lease::try_exclusive(file) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -694,6 +707,54 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn a_finished_runtime_releases_capacity_despite_an_inherited_descriptor() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("hub");
+        let resources = temp.path().join("leases");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&resources)?;
+        std::fs::write(resources.join("slots.json"), b"1")?;
+        let managed = Managed {
+            root,
+            resources,
+            revocation: temp.path().join("retired"),
+        };
+        let live = managed.admit("finished", "first")?;
+        // dup and fork retain the same open file description, including its flock.
+        let inherited = live.0.try_clone()?;
+        drop(live);
+        assert!(!Managed::at_capacity(&managed.resources)?);
+        let next = managed.admit("next", "second")?;
+        drop(inherited);
+        assert!(
+            managed.admit("waiting", "third").is_err(),
+            "closing an old descriptor released a replacement runtime's slot"
+        );
+        drop(next);
+        let live = managed.admit("waiting", "third")?;
+        drop(live);
+        // Brief probes must not pin a slot either, including slots above capacity.
+        let probe = Lease::try_exclusive(std::fs::File::open(
+            managed.resources.join("runtime-63.lock"),
+        )?)?;
+        let inherited_probe = probe.0.try_clone()?;
+        drop(probe);
+        assert!(!Managed::at_capacity(&managed.resources)?);
+        let live = managed.admit("after-probe", "fourth")?;
+        drop(inherited_probe);
+        assert!(Managed::at_capacity(&managed.resources)?);
+        drop(live);
+        let gate = admission_gate(&managed.resources)?;
+        let inherited_gate = gate.0.try_clone()?;
+        drop(gate);
+        let next_gate =
+            try_admission_gate(&managed.resources)?.expect("finished admission gate stayed locked");
+        drop(inherited_gate);
+        assert!(try_admission_gate(&managed.resources)?.is_none());
+        drop(next_gate);
+        Ok(())
+    }
+    #[test]
     fn pending_owners_take_turns_and_fifo_survives_retries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let resources = temp.path().join("leases");
@@ -724,7 +785,7 @@ mod tests {
         );
         let live = b.admit("b1", "third")?;
         drop(live);
-        assert!(a.admit("a2", "second").is_ok());
+        let _live = a.admit("a2", "second")?;
         Ok(())
     }
     #[test]
