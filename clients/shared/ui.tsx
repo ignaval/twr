@@ -1,11 +1,14 @@
 import { useHostAPI } from "./host";
-import { memo, useEffect, useRef, type ReactNode } from "react";
+import { memo, useId, useRef, type ReactNode } from "react";
+import { focusableWithin, useModal } from "./a11y";
 import { X, LoaderCircle, FolderOpen, Copy, Check } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Field } from "./commands";
 export function Spinner() {
-  return <LoaderCircle size={16} className="spin" aria-label="Loading" />;
+  return (
+    <LoaderCircle size={16} className="spin" role="img" aria-label="Loading" />
+  );
 }
 export function Dialog({
   title,
@@ -21,43 +24,20 @@ export function Dialog({
   wide?: boolean;
 }) {
   const root = useRef<HTMLDivElement>(null);
-  const close = useRef(onClose);
-  close.current = onClose;
-  useEffect(() => {
-    const previous = document.activeElement as HTMLElement;
-    const first =
-      root.current?.querySelector<HTMLElement>(
-        "input:not([type=checkbox]), textarea, select",
-      ) || root.current?.querySelector<HTMLElement>("button");
-    first?.focus();
-    const keyboard = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        event.stopPropagation();
-        close.current();
-      }
-      if (event.key === "Tab") {
-        const nodes = [
-          ...root.current!.querySelectorAll<HTMLElement>(
-            "button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select:not(:disabled),a[href]",
-          ),
-        ].filter((n) => n.offsetParent !== null);
-        const index = nodes.indexOf(document.activeElement as HTMLElement);
-        if (event.shiftKey && index <= 0) {
-          event.preventDefault();
-          nodes.at(-1)?.focus();
-        } else if (!event.shiftKey && index === nodes.length - 1) {
-          event.preventDefault();
-          nodes[0]?.focus();
-        }
-      }
-    };
-    root.current?.addEventListener("keydown", keyboard);
-    return () => {
-      root.current?.removeEventListener("keydown", keyboard);
-      previous?.focus();
-    };
-  }, []);
+  const titleId = useId();
+  const subtitleId = useId();
+  useModal(root, {
+    onClose,
+    container: (node) => node.parentElement,
+    initialFocus: (node) => {
+      const nodes = focusableWithin(node);
+      return (
+        nodes.find((n) =>
+          n.matches("input:not([type=checkbox]), textarea, select"),
+        ) || nodes.find((n) => n.matches("button"))
+      );
+    },
+  });
   return (
     <div
       className="scrim"
@@ -69,18 +49,20 @@ export function Dialog({
         className={`dialog ${wide ? "wide" : ""}`}
         role="dialog"
         aria-modal="true"
-        aria-label={title}
+        aria-labelledby={titleId}
+        aria-describedby={subtitle ? subtitleId : undefined}
         ref={root}
       >
         <header>
           <div>
-            <h2>{title}</h2>
-            {subtitle && <p>{subtitle}</p>}
+            <h2 id={titleId}>{title}</h2>
+            {subtitle && <p id={subtitleId}>{subtitle}</p>}
           </div>
           <button
             className="icon-button"
             onClick={onClose}
             aria-label="Close dialog"
+            title="Close"
           >
             <X size={18} />
           </button>
@@ -108,7 +90,12 @@ export function FieldInput({
     >
       <span>
         {field.label}
-        {field.required && <span className="required"> *</span>}
+        {field.required && (
+          <span className="required" aria-hidden="true">
+            {" "}
+            *
+          </span>
+        )}
       </span>
       {field.type === "boolean" ? (
         <input
@@ -120,6 +107,7 @@ export function FieldInput({
       ) : field.type === "select" ? (
         <select
           id={id}
+          aria-required={field.required || undefined}
           value={value ?? ""}
           onChange={(e) => onChange(e.target.value)}
         >
@@ -133,6 +121,7 @@ export function FieldInput({
       ) : field.type === "textarea" ? (
         <textarea
           id={id}
+          aria-required={field.required || undefined}
           rows={5}
           value={value ?? ""}
           placeholder={field.placeholder}
@@ -142,6 +131,7 @@ export function FieldInput({
         <div className="input-with-button">
           <input
             id={id}
+            aria-required={field.required || undefined}
             type={field.type === "number" ? "number" : "text"}
             value={value ?? ""}
             placeholder={field.placeholder}
@@ -160,6 +150,7 @@ export function FieldInput({
             <button
               type="button"
               aria-label="Choose folder"
+              title="Choose folder"
               onClick={() =>
                 void hostApi.pickDirectory().then((path) => {
                   if (path) onChange(path);

@@ -32,6 +32,7 @@ import {
   ResourceTable,
 } from "./ui";
 import { useEditorSessions } from "./editors";
+import { setTerminalScreenReader, terminalScreenReader } from "./a11y";
 export type Section =
   | "chat"
   | "grid"
@@ -160,12 +161,14 @@ export function Manager(props: ManagerProps) {
           className="icon-button"
           onClick={() => void load()}
           aria-label="Refresh"
+          title="Refresh"
+          aria-busy={loading || undefined}
         >
           {loading ? <Spinner /> : <RefreshCw size={18} />}
         </button>
       </header>
       {error && (
-        <div className="error-banner">
+        <div className="error-banner" role="alert">
           {error}
           <button onClick={() => void load()}>Try again</button>
         </div>
@@ -670,9 +673,9 @@ export function Manager(props: ManagerProps) {
         </>
       )}
       {detail !== undefined && (
-        <section className="detail-result">
+        <section className="detail-result" aria-labelledby="twr-detail-title">
           <header>
-            <h2>Details</h2>
+            <h2 id="twr-detail-title">Details</h2>
             <button onClick={() => setDetail(undefined)}>Close</button>
           </header>
           {detail.kind === "job-log" ? (
@@ -889,6 +892,7 @@ function Settings({
               <button
                 className="icon-button"
                 aria-label="Show configuration file"
+                title="Show configuration file"
                 onClick={() => void hostApi.reveal(config.path)}
               >
                 <FolderOpen size={16} />
@@ -952,11 +956,9 @@ function Settings({
               >
                 Reload from disk
               </button>
-              {saved && (
-                <span className="success-text">
-                  Saved. Restart the hub to apply hub settings.
-                </span>
-              )}
+              <span className="success-text" role="status">
+                {saved ? "Saved. Restart the hub to apply hub settings." : ""}
+              </span>
             </div>
           </>
         )}
@@ -1027,9 +1029,14 @@ export function JobLog({
           Export log
         </button>
       </div>
-      {error && <p className="error-text">{error}</p>}
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
       <pre
         ref={output}
+        aria-label={`Job output ${job.slice(-8)}`}
         onScroll={() => {
           const p = output.current!;
           follow.current = p.scrollHeight - p.scrollTop - p.clientHeight < 48;
@@ -1285,8 +1292,34 @@ function ClientPreferences() {
         <AppearanceOptions labelledBy="settings-appearance-title" />
       </section>
       <LayoutOptions />
+      <AccessibilityOptions />
       <OfflineOptions />
       <AppOptions />
     </>
+  );
+}
+
+function AccessibilityOptions() {
+  const [reader, setReader] = useState(terminalScreenReader);
+  return (
+    <section className="settings-section">
+      <h2>Accessibility</h2>
+      <p>
+        Screen reader support lets VoiceOver, Orca and TalkBack read terminal
+        output. It can slow very busy terminals, so it is off by default.
+      </p>
+      <label className="field check-field" htmlFor="terminal-screen-reader">
+        <span>Terminal screen reader support</span>
+        <input
+          id="terminal-screen-reader"
+          type="checkbox"
+          checked={reader}
+          onChange={(event) => {
+            setReader(event.target.checked);
+            setTerminalScreenReader(event.target.checked);
+          }}
+        />
+      </label>
+    </section>
   );
 }

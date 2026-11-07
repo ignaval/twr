@@ -6,6 +6,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import type { TerminalSession } from "./types";
+import { terminalReaderEvent, terminalScreenReader } from "./a11y";
 export function Terminal({
   session,
   visible,
@@ -31,6 +32,8 @@ export function Terminal({
       lineHeight: 1.25,
       scrollback: 10000,
       cursorBlink: true,
+      // Renders output into an accessible buffer for VoiceOver, Orca and TalkBack.
+      screenReaderMode: terminalScreenReader(),
       allowProposedApi: false,
       linkHandler: {
         activate: (_event, uri) =>
@@ -95,6 +98,10 @@ export function Terminal({
     };
     updateTheme();
     applyTypography();
+    const updateReader = () => {
+      term.options.screenReaderMode = terminalScreenReader();
+    };
+    window.addEventListener(terminalReaderEvent, updateReader);
     window.addEventListener("twr:typography", updateTypography);
     const themeObserver = new MutationObserver(updateTheme);
     themeObserver.observe(document.documentElement, { attributes: true });
@@ -224,6 +231,7 @@ export function Terminal({
       observer.disconnect();
       themeObserver.disconnect();
       window.removeEventListener("twr:typography", updateTypography);
+      window.removeEventListener(terminalReaderEvent, updateReader);
       clearTimeout(typographyTimer);
       scheme.removeEventListener("change", updateTheme);
       hostApi.terminalFocus(false);
@@ -248,11 +256,11 @@ export function Terminal({
       aria-label={`${session.title}${session.exited ? " (exited)" : ""}`}
     >
       <div className="terminal-search">
-        <span>
+        <span aria-hidden="true">
           {session.workspace} / {session.title}
         </span>
         <input
-          aria-label="Search terminal"
+          aria-label={`Search terminal ${session.title}`}
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
@@ -266,12 +274,18 @@ export function Terminal({
       </div>
       <div
         className="terminal-surface"
+        role="group"
+        aria-label={`Terminal ${session.title}${session.exited ? " (exited)" : ""}`}
         ref={node}
         onFocus={() => hostApi.terminalFocus(true)}
         onBlur={() => hostApi.terminalFocus(false)}
       />
       {document.documentElement.dataset.mobile === "true" && (
-        <div className="terminal-accessory" aria-label="Terminal keys">
+        <div
+          className="terminal-accessory"
+          role="group"
+          aria-label="Terminal keys"
+        >
           <button
             onPointerDown={(e) => e.preventDefault()}
             onClick={() => {
