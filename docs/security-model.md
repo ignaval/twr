@@ -68,7 +68,10 @@ Remote approvals retain exact request revisions. Notification actions only open 
 push payloads contain routing metadata rather than prompts or request text. Uploads are
 size- and SHA-256-checked, avoid symlinks and commit atomically into private upload folders
 in local worktrees. Pending mutation receipts prevent duplicate execution across socket
-reconnects within their retention period. See [mobile.md](mobile.md) for limits, scopes,
+reconnects within their retention period. Voice mode recognizes speech on the phone and
+sends only text; the gateway's speaker for a phone attaches as you (the hub gives devices no
+`speech.attach`), needs the device's `read` grant, ends on revocation, and takes controls and
+acknowledgements from the phone, never text to say ([mobile.md](mobile.md#voice)). See [mobile.md](mobile.md) for limits, scopes,
 revocation and gateway lifecycle. Remote-box attachments use the authenticated runner upload operation with the same pinned-directory and checksum checks; see [thread attachments](attachments.md).
 
 ## The orchestrator
@@ -204,6 +207,7 @@ A speaker reads the orchestrator's messages aloud on the machine you listen on (
 - **Text is data.** The speaker never runs a shell. `say` and `spd-say` get each sentence on their stdin and fixed arguments, and a `command` engine is an argument list run without a shell, the text on its stdin, as `[notify] command` is. Control, bidirectional and zero-width characters are removed before an engine sees the text, and what an engine would read as a command of its own is defused: a line `spd-say -e` would take as a speech-dispatcher command (`!-!CANCEL ALL`, which silences every program's speech) gets a space in front, and macOS's embedded speech commands (`[[volm 0]]`) lose their double bracket. The proxy `twr speak --ssh` runs is fixed words and shell-quoted workspace names, with agent and X11 forwarding off, and it passes on `speech.attach` and `speech.state` only.
 - **What crosses the network.** Over SSH, the messages' text and the speakers' status, inside your SSH connection; nothing goes anywhere else, unless your `command` engine sends it (a hosted voice gets every word).
 - **The feed is trusted as far as the server is.** A server you don't trust could make your laptop speak any text: the speaker checks every item's shape, bounds its sizes (64 KB per message, 300 characters per utterance, 160 per announcement) and only plays it. The speaker never listens on a socket or port.
+- **A phone's speaker.** The mobile gateway runs one per phone on the hub's machine, attached as you; it sends each utterance to that phone over its authenticated socket. The phone may start, stop, pause, resume and skip it, and acknowledge utterances by the id the gateway gave them; nothing it sends is said. It needs the device's `read` scope and ends when the device is revoked ([mobile.md](mobile.md#voice)).
 - **What is kept.** Nothing in the event log. The hub keeps the attached speakers and their status in memory. The speaker keeps its device id, its live switch per workspace, its voice and rate, and the last message it read of each thread in `speech-state.json` in twr's data directory, readable only by you.
 
 ## Voice mode
