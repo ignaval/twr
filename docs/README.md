@@ -19,6 +19,7 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [orchestrator.md](orchestrator.md) | what the orchestrator may do, the relay rule, reports, switching runtimes and the handoff |
 | [worktrees.md](worktrees.md) | per-thread worktrees, working in your checkout, what parking removes and keeps |
 | [workspaces.md](workspaces.md) | separate twrs on one machine (`twr ws`, `-w`): each with its own hub, orchestrator and threads, as tabs in the TUI |
+| [runner-links.md](runner-links.md) | machine pairing, default runner service, source builds, access and capacity |
 | [runners.md](runners.md) | threads on other machines: tokens, tunnels, TLS, outages, attach over ssh |
 | [architecture.md](architecture.md) | the event log, control stream, reducers, decision ladder, adapters, crates |
 | [security-model.md](security-model.md) | what twr guarantees and how: agents on the socket, the orchestrator's limits, jobs, twr's git, the trash, runners, releases; and what it doesn't protect against |

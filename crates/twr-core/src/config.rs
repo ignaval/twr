@@ -872,6 +872,11 @@ impl BoxConfig {
             }
         }
         match transport {
+            BoxTransport::Link => {
+                if self.token.is_some() || self.ssh.is_some() || self.build.is_some() {
+                    anyhow::bail!("boxes.{name}: a linked runner uses machine trust and an exact build, not token, ssh or build overrides");
+                }
+            }
             BoxTransport::Command => {
                 let Some(argv) = &self.command else {
                     anyhow::bail!(
@@ -1165,6 +1170,8 @@ impl fmt::Debug for BoxConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BoxTransport {
+    /// A machine-owned runner paired by its one-time code.
+    Link,
     /// The box's runner (`twr runner --hub <url>`) connects to the hub's listener (`[hub]
     /// listen`) and both prove they know the box's `token`. For a box the hub cannot reach by
     /// ssh.

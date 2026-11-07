@@ -9,6 +9,8 @@ description = "Shared desktop application projection and authenticated hub compa
 
 [dependencies]
 twr-core.workspace = true
+twr-link.workspace = true
+twr-hub.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true

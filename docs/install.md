@@ -93,7 +93,7 @@ gh attestation verify twr-x86_64-unknown-linux-musl.tar.gz --repo ignaval/twr \
 
 ## From source
 
-You need a stable Rust toolchain, 1.89 or newer, and git. The repository's `rust-toolchain.toml` pins the Rust that CI and the releases use (1.98.1). With rustup, cargo installs that version and uses it in the repository. To build with another toolchain, run `cargo +<toolchain> ...`.
+You need a stable Rust toolchain, 1.98 or newer, and git. The repository's `rust-toolchain.toml` pins the Rust that CI and the releases use (1.98.1). With rustup, cargo installs that version and uses it in the repository. To build with another toolchain, run `cargo +<toolchain> ...`.
 
 ```sh
 cargo install --locked --git https://github.com/ignaval/twr twr-cli

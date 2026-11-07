@@ -13,7 +13,7 @@ Development happens on `dev`, the default branch. `main` only moves for a releas
 
 ## Build
 
-You need a stable Rust toolchain, 1.89 or newer, and git. `rust-toolchain.toml` pins the version CI and the releases use, and rustup installs it for you in the repository.
+You need a stable Rust toolchain, 1.98 or newer, and git. `rust-toolchain.toml` pins the version CI and the releases use, and rustup installs it for you in the repository.
 
 ```sh
 cargo build -p twr-cli          # target/debug/twr

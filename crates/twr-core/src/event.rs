@@ -779,6 +779,8 @@ pub const TRIM_RESTART_REASON: &str = "trim";
 /// runner protocol): every runtime of the box is stopped, the daemon replaced, and the thread
 /// does not count as stopped; its next prompt resumes the session on the new daemon.
 pub const BOX_UPGRADE_REASON: &str = "box_upgrade";
+/// Idle resumable runtime retired to free a machine-wide runner slot.
+pub const BOX_CAPACITY_REASON: &str = "box_capacity";
 
 /// `task.updated` `task_id` prefix of a job (`twr job run`, the hub's `job.start`): a command
 /// the hub runs for a thread, recorded as one of its background tasks by the hub
@@ -1021,6 +1023,7 @@ pub fn is_settings_restart(p: &SessionPayload) -> bool {
                 | ACCOUNT_RESTART_REASON
                 | TRIM_RESTART_REASON
                 | BOX_UPGRADE_REASON
+                | BOX_CAPACITY_REASON
         )
     )
 }

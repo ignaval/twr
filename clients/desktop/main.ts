@@ -578,11 +578,16 @@ function register() {
   handle("rpc", (method, params) => {
     z.string().max(100).parse(method);
     if (method === "desktop.check_updates") return checkUpdates();
+    if (method === "desktop.runner.use")
+      return companion().call(method, { binary: binaries.twr });
     if (
       method.startsWith("desktop.") &&
       ![
         "desktop.subscribe",
         "desktop.preferences",
+        "desktop.runner.use",
+        "desktop.runner.cancel",
+        "desktop.runner.status",
         "desktop.retry_attention",
         "desktop.parse_slash",
         "desktop.slash_commands",

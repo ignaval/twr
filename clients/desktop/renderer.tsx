@@ -10,6 +10,7 @@ import { RemoteHost, type Hub } from "../shared/remote";
 import type { DesktopAPI } from "../shared/types";
 import type {} from "../shared/connections";
 import { Connections } from "./Connections";
+import { routeRunnerControls } from "./runner-controls";
 import { Dialog } from "../shared/ui";
 import { errorMessage } from "../shared/errors";
 import { withLocalUploads } from "../shared/local-uploads";
@@ -24,6 +25,12 @@ function fenced(api: DesktopAPI, epoch: number): DesktopAPI {
     get(target, key) {
       const value = Reflect.get(target, key);
       if (typeof value !== "function") return value;
+      if (key === "rpc")
+        return routeRunnerControls(
+          local.rpc,
+          value.bind(target),
+          () => epoch === hostEpoch,
+        );
       return (...args: unknown[]) => {
         if (epoch !== hostEpoch) {
           if (

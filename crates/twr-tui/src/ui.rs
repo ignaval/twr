@@ -150,6 +150,14 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         crate::sidebar::render_new(frame, body, state, &mut panes);
     } else if state.view.settings.is_some() {
         crate::settings::render(frame, body, state, &mut panes);
+    } else if let Some(panel) = &state.view.runner {
+        frame.render_widget(ratatui::widgets::Clear, body);
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(panel.0.clone())
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(ratatui::widgets::Block::bordered().title("Use this machine as a runner")),
+            body,
+        );
     } else if state.view.help {
         render_help(frame, body, state.view.help_scroll, &mut panes);
     } else if let Some(trash) = &state.view.trash {

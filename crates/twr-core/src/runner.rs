@@ -1073,6 +1073,8 @@ impl Op {
 
 /// Codes of [`CmdError`].
 pub mod cmd_errors {
+    /// Admission refused before any side effect; safe to retry with another command id.
+    pub const BOX_FULL: &str = "box_full";
     /// The box has no adapter by that name.
     /// The upload begin was rejected before any reservation was accepted.
     pub const UPLOAD_REJECTED: &str = "upload_rejected";
