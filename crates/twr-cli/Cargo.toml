@@ -15,11 +15,13 @@ path = "src/main.rs"
 [dependencies]
 twr-adapters.workspace = true
 twr-core.workspace = true
+twr-link.workspace = true
 twr-hub.workspace = true
 twr-mcp.workspace = true
 twr-runner.workspace = true
 # `twr speak` and `twr remote`: the speaker (docs/read-aloud.md).
 twr-speech.workspace = true
+twr-voice.workspace = true
 twr-tui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
@@ -41,3 +43,9 @@ twr-docs.workspace = true
 crossterm.workspace = true
 portable-pty.workspace = true
 tempfile.workspace = true
+
+[build-dependencies]
+twr-source.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

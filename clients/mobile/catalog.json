@@ -479,6 +479,33 @@
     ]
   },
   {
+    "id": "cli:box access",
+    "title": "twr box access",
+    "description": "Show the hubs that can use a paired runner",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "box",
+      "access"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
     "id": "cli:box add",
     "title": "twr box add",
     "description": "Add a box the hub reaches over SSH, or through a command (--command: a container): no token, listener or tunnel. Probes the box with ssh in this terminal (ssh may ask about its host key or for a passphrase), checks that ssh also works without prompting (the hub's never prompts), says what will happen and asks y/N (without a terminal, only with --yes). A command is probed as the hub runs it: without a terminal, so nothing it runs may prompt, and checked to pass the hub's input to the box (`-i`) without giving it a terminal (no `-t`). Then writes `[boxes.<name>]` to boxes.toml, next to config.toml, and adds the box to the running hub (starting one when none runs). The hub installs its own twr build on the box (same OS and CPU; else run `twr box install <name>`), connects and starts a twr box daemon there, which runs the box's threads. Waits up to 90 s for the box to come online. Boxes belong to the default workspace.",
@@ -664,6 +691,33 @@
     ]
   },
   {
+    "id": "cli:box invite",
+    "title": "twr box invite",
+    "description": "Show a one-time code to invite another hub to this runner",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "box",
+      "invite"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
     "id": "cli:box list",
     "title": "twr box list",
     "description": "List the hub's remote boxes: name, transport (`ssh` or `command`: the hub connects to it; `token`: its runner connects to the hub), state, the twr version its runner reported, its OS and CPU (boxes the hub connects to), and its agent CLIs as it last reported them (`claude ✓`: logged in, `✗`: logged out, `?`: not known, `-`: not installed)",
@@ -734,6 +788,59 @@
         "many": false,
         "separator": false,
         "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box pair",
+    "title": "twr box pair",
+    "description": "Pair a runner using its one-time code (read from the terminal, outside shell history)",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": ""
+      },
+      {
+        "key": "code-stdin",
+        "label": "code stdin",
+        "type": "boolean",
+        "description": "",
+        "advanced": false
+      },
+      {
+        "key": "replace",
+        "label": "replace",
+        "type": "boolean",
+        "description": "Explicitly replace this machine's old grant if recovery is unavailable (stops its workers)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "box",
+      "pair"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "code-stdin",
+        "flag": "--code-stdin",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "replace",
+        "flag": "--replace",
+        "many": false,
+        "separator": false
       }
     ]
   },
@@ -830,6 +937,33 @@
     ]
   },
   {
+    "id": "cli:box recover",
+    "title": "twr box recover",
+    "description": "Finish a saved pairing after an interrupted acknowledgement or box registration",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "box",
+      "recover"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
     "id": "cli:box remove",
     "title": "twr box remove",
     "description": "Remove a box from boxes.toml (a box of config.toml: remove it there). The running hub keeps the box until it restarts; the box daemon and the box's worktrees stay on the box (the command that stops the daemon is printed), and a command box's container stays as it is (twr never stops or removes one). A token box's runner is no longer accepted from then on (the hub drops its connection), and how to stop it on the box is printed",
@@ -877,6 +1011,46 @@
     "cliFields": [
       {
         "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:box revoke",
+    "title": "twr box revoke",
+    "description": "Revoke a hub's full machine public key on this runner",
+    "group": "CLI · box",
+    "fields": [
+      {
+        "key": "name",
+        "label": "name",
+        "type": "text",
+        "required": true,
+        "description": ""
+      },
+      {
+        "key": "machine",
+        "label": "machine",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "box",
+      "revoke"
+    ],
+    "cliFields": [
+      {
+        "key": "name",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "machine",
         "many": false,
         "separator": false,
         "literal": false
@@ -2295,6 +2469,84 @@
     ]
   },
   {
+    "id": "cli:runner allow-sleep",
+    "title": "twr runner allow-sleep",
+    "description": "Allow macOS to sleep even while linked worker runtimes exist",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "allow-sleep"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:runner cancel-pairing",
+    "title": "twr runner cancel-pairing",
+    "description": "Cancel the current one-time pairing code",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "cancel-pairing"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:runner capacity",
+    "title": "twr runner capacity",
+    "description": "Limit resident runtimes across all linked hubs (1–64). Active work is never preempted",
+    "group": "CLI · runner",
+    "fields": [
+      {
+        "key": "slots",
+        "label": "slots",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "runner",
+      "capacity"
+    ],
+    "cliFields": [
+      {
+        "key": "slots",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:runner enable",
+    "title": "twr runner enable",
+    "description": "Enable or disable automatic runner service startup",
+    "group": "CLI · runner",
+    "fields": [
+      {
+        "key": "disable",
+        "label": "disable",
+        "type": "boolean",
+        "description": "",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "runner",
+      "enable"
+    ],
+    "cliFields": [
+      {
+        "key": "disable",
+        "flag": "--disable",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
     "id": "cli:runner install-token",
     "title": "twr runner install-token",
     "description": "On a dial-in box: store the box's token (`twr box add --dial-in` or `twr box token` on the hub prints it) in `~/.config/twr/runner-tokens/<box>.token` (mode 0600), where `twr runner` finds it. Asks for it at a prompt that does not show it, or reads it from a pipe. With --hub, prints the command that runs the runner and a service to paste that keeps it running (a systemd user unit, or a LaunchAgent on a Mac)",
@@ -2361,6 +2613,81 @@
     ]
   },
   {
+    "id": "cli:runner keep-awake",
+    "title": "twr runner keep-awake",
+    "description": "Keep macOS awake while linked worker runtimes exist (default)",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "keep-awake"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:runner prune",
+    "title": "twr runner prune",
+    "description": "Reclaim unused compiled worker, source and hub build caches; retains work and trust",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "prune"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:runner revoke",
+    "title": "twr runner revoke",
+    "description": "Revoke a paired hub's full machine public key",
+    "group": "CLI · runner",
+    "fields": [
+      {
+        "key": "machine",
+        "label": "machine",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "runner",
+      "revoke"
+    ],
+    "cliFields": [
+      {
+        "key": "machine",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:runner status",
+    "title": "twr runner status",
+    "description": "Show this machine's runner service and saved links",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "status"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:runner stop",
+    "title": "twr runner stop",
+    "description": "Stop the machine service. Worker data is retained",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "stop"
+    ],
+    "cliFields": []
+  },
+  {
     "id": "cli:runner token",
     "title": "twr runner token",
     "description": "Print a new random token (32 bytes from the OS, hex): put it in the hub's `[boxes.<name>] token` and in the runner's `--token-file` (`chmod 600`)",
@@ -2369,6 +2696,18 @@
     "cli": [
       "runner",
       "token"
+    ],
+    "cliFields": []
+  },
+  {
+    "id": "cli:runner up",
+    "title": "twr runner up",
+    "description": "Run the independent service and show a one-time code to pair from another hub",
+    "group": "CLI · runner",
+    "fields": [],
+    "cli": [
+      "runner",
+      "up"
     ],
     "cliFields": []
   },
@@ -2523,6 +2862,23 @@
         "type": "boolean",
         "description": "Print a LaunchAgent (macOS) or systemd user unit (Linux) that runs this `twr speak`, and the commands to install it; installs nothing",
         "advanced": false
+      },
+      {
+        "key": "control",
+        "label": "control",
+        "type": "select",
+        "description": "For a program that drives the speaker (the desktop app's voice mode): controls on stdin, one per line (`pause`, `resume`, `stop`, `skip`, `quit`), and what it plays on stdout, one JSON object per line. Its notes stay on stderr [possible values: stdio]",
+        "advanced": false,
+        "options": [
+          "stdio"
+        ]
+      },
+      {
+        "key": "announce",
+        "label": "announce",
+        "type": "boolean",
+        "description": "Also say when something needs you (\"api needs your permission\"), as `\"attention\"` in `[speech] read` does",
+        "advanced": false
       }
     ],
     "cli": [
@@ -2570,6 +2926,18 @@
         "flag": "--print-service",
         "many": false,
         "separator": false
+      },
+      {
+        "key": "control",
+        "flag": "--control",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "announce",
+        "flag": "--announce",
+        "many": false,
+        "separator": false
       }
     ]
   },
@@ -2594,6 +2962,13 @@
         "advanced": false
       },
       {
+        "key": "attention",
+        "label": "attention",
+        "type": "boolean",
+        "description": "With `--text`, also a line when something needs you (\"api needs your permission\")",
+        "advanced": false
+      },
+      {
         "key": "all-workspaces",
         "label": "all workspaces",
         "type": "boolean",
@@ -2615,6 +2990,12 @@
       {
         "key": "proto",
         "flag": "--proto",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "attention",
+        "flag": "--attention",
         "many": false,
         "separator": false
       },
@@ -2902,6 +3283,33 @@
     ]
   },
   {
+    "id": "cli:thread pull",
+    "title": "twr thread pull",
+    "description": "Pull committed runner results into a separate ref, preserving your checkout",
+    "group": "CLI · thread",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": ""
+      }
+    ],
+    "cli": [
+      "thread",
+      "pull"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
     "id": "cli:thread show",
     "title": "twr thread show",
     "description": "Show what a thread has in flight now, as the hub reads it (`work` of `thread.get`): its reading (working, waiting on its background work, on a tool call, nothing in flight, unknown), the open turn's tool calls, its tasks (background, foreground, detached: moved to the background after its call returned, nothing waits for them) and jobs, prompts queued behind it, its last progress apart from heartbeats, and its open items",
@@ -3139,6 +3547,33 @@
       {
         "key": "by",
         "flag": "--by",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voice status",
+    "title": "twr voice status",
+    "description": "Whether a recognizer is set up (`[voice]`), and how to set one up if not",
+    "group": "CLI · voice",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "One JSON object: `{available, engine, local, problem}`",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "voice",
+      "status"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
         "many": false,
         "separator": false
       }

@@ -9,6 +9,10 @@ description = "Shared desktop application projection and authenticated hub compa
 
 [dependencies]
 twr-core.workspace = true
+twr-link.workspace = true
+twr-hub.workspace = true
+# A phone's own speaker, run by the gateway (`remote::voice`).
+twr-speech.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -32,6 +36,8 @@ rustls.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tokio::time::pause`: the phone speaker's timeouts in virtual time.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "twr-desktop-bridge"

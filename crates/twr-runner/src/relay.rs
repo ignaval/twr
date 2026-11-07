@@ -334,6 +334,7 @@ impl Launcher {
 /// Everything the relay needs.
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
+    pub managed: Option<crate::managed::Managed>,
     /// The box.
     pub box_name: String,
     /// The hub's public key (`--hub-key`).
@@ -369,6 +370,7 @@ impl RelayOptions {
     /// restart.
     pub fn new(box_name: &str, hub_key: [u8; 32], replace: bool) -> anyhow::Result<RelayOptions> {
         Ok(RelayOptions {
+            managed: None,
             box_name: box_name.to_string(),
             hub_key,
             replace,
@@ -424,6 +426,16 @@ impl RelayOptions {
         ] {
             args.push(flag.into());
             args.push(path.clone().into_os_string());
+        }
+        if let Some(managed) = &self.managed {
+            args.extend([
+                "--managed-root".into(),
+                managed.root.clone().into_os_string(),
+                "--resource-root".into(),
+                managed.resources.clone().into_os_string(),
+                "--revocation-file".into(),
+                managed.revocation.clone().into_os_string(),
+            ]);
         }
         args
     }
@@ -1512,7 +1524,7 @@ const NOT_PASSED_ON: &[&str] = &[
 /// looks). `%` needs nothing: a transient unit's command line is not subject to specifier
 /// expansion. A `systemd-run` older than 254 refuses the option, and the relay falls back to
 /// `setsid`.
-fn systemd_run_args(
+pub fn systemd_run_args(
     unit: &str,
     program: &Path,
     args: &[OsString],
@@ -1550,7 +1562,22 @@ fn systemd_run_args(
 /// Starts `program args` as the transient user service `unit` (`systemd-run --user`) with the
 /// relay's environment ([`systemd_run_args`]): an error with what `systemd-run` said when it
 /// fails or does not finish within [`PROBE_TIMEOUT`].
-async fn systemd_run(unit: &str, program: &Path, args: &[OsString]) -> anyhow::Result<()> {
+pub async fn systemd_service_run(
+    unit: &str,
+    program: &Path,
+    args: &[OsString],
+) -> anyhow::Result<()> {
+    let mut flags = systemd_run_args(unit, program, args, std::env::vars_os());
+    flags.insert(0, "--property=KillMode=process".into());
+    let mut cmd = tokio::process::Command::new("systemd-run");
+    cmd.args(flags);
+    match twr_adapters::process::run_bounded(cmd, PROBE_TIMEOUT, 16 * 1024, |_| false).await {
+        twr_adapters::process::Bounded::Exited(Some(0), _) => Ok(()),
+        _ => bail!("systemd user service is unavailable"),
+    }
+}
+
+pub async fn systemd_run(unit: &str, program: &Path, args: &[OsString]) -> anyhow::Result<()> {
     let mut cmd = tokio::process::Command::new("systemd-run");
     cmd.args(systemd_run_args(unit, program, args, std::env::vars_os()))
         .stdin(std::process::Stdio::null())
@@ -1708,6 +1735,7 @@ mod tests {
                 .unwrap();
         }
         RelayOptions {
+            managed: None,
             box_name: "gpu".into(),
             hub_key: KEY,
             replace: false,
@@ -2329,6 +2357,7 @@ mod tests {
             log: dir.path().join("data/daemon.log"),
         };
         let opts = |stop_timeout: Duration| RelayOptions {
+            managed: None,
             box_name: "gpu".into(),
             hub_key: KEY,
             replace: false,

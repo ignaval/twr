@@ -1,3 +1,4 @@
+import { RunnerPanel } from "./RunnerPanel";
 import { OfflineOptions } from "./OfflineOptions";
 import { AppOptions } from "./AppOptions";
 import { LayoutOptions } from "./LayoutOptions";
@@ -319,6 +320,9 @@ export function Manager(props: ManagerProps) {
       )}
       {section === "boxes" && data && (
         <div className="cards">
+          {props.canAdmin !== false && (
+            <RunnerPanel rpc={rpc} refresh={() => void load()} />
+          )}
           {(data.boxes || []).map((box: Json) => (
             <article className="resource-card" key={box.name}>
               <div className="card-heading">

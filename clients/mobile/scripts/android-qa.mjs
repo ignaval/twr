@@ -1013,7 +1013,15 @@ try {
     .filter({ hasText: "Continue Android QA?" });
   await question.getByRole("button", { name: /Proceed/ }).click();
   await question.waitFor({ state: "hidden" });
-  assert.equal((await page.evaluate(() => window.twr.catalog())).length, 71);
+  const commandIds = await page.evaluate(async () =>
+    (await window.twr.catalog()).map((command) => command.id).sort(),
+  );
+  const expectedCatalogIds = JSON.parse(
+    readFileSync(new URL("../catalog.json", import.meta.url), "utf8"),
+  )
+    .map((command) => command.id)
+    .sort();
+  assert.deepEqual(commandIds, expectedCatalogIds);
   console.log(
     "PASS: mobile attention response and complete shared CLI catalog",
   );

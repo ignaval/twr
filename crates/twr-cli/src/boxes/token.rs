@@ -486,7 +486,7 @@ fn no_token_box(name: &str, cfg: &BoxConfig) -> Option<String> {
         BoxTransport::Command => Some(format!(
             "box {name} is a command box: it has no token (the hub reaches it through its command)"
         )),
-        BoxTransport::Token => None,
+        BoxTransport::Token | BoxTransport::Link => None,
     }
 }
 

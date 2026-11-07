@@ -131,6 +131,7 @@ impl Hub {
             pins_lookup_hook: opts.pins_lookup_hook,
             socket_removed_hook: opts.socket_removed_hook,
             box_dialer: opts.box_dialer,
+            link_program: opts.link_program,
             local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
             agents_poll: opts.agents_poll,
             accounts: super::accounts::AccountsRt::new(

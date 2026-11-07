@@ -1,3 +1,4 @@
+import { clientProtocol } from "../../scripts/client-protocol.mjs";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
@@ -351,7 +352,7 @@ for (const [
       });
     const hello = await ownerCall("hello", {
       client: "ios-qa-owner",
-      protocol: 1,
+      protocol: clientProtocol,
       user_token: readFileSync(token, "utf8").trim(),
     });
     assert(hello.identity.startsWith("user:"));
@@ -423,6 +424,12 @@ for (const [
               code,
               url: "http://127.0.0.1:47424",
               foldable: device.name.includes("Duo"),
+              catalogIds: JSON.parse(
+                readFileSync(
+                  new URL("../catalog.json", import.meta.url),
+                  "utf8",
+                ),
+              ).map((command) => command.id),
             }),
           );
         } catch (error) {

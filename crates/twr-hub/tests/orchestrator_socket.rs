@@ -866,3 +866,41 @@ async fn a_suggested_say_must_go_to_the_orchestrator() {
     assert_eq!(r["action"], "delegate", "{r}");
     th.stop().await;
 }
+
+/// A spoken message (a transcript) goes to the orchestrator only, and one that reads as an
+/// answer or a mode change is handed back to confirm, nothing recorded: a misheard word never
+/// answers a request or changes a mode by itself.
+#[tokio::test]
+async fn a_spoken_say_never_acts_as_a_command() {
+    let th = start().await;
+    let mut c = th.client("tui").await;
+    for params in [
+        json!({"message": "and the docs", "voice": true}),
+        json!({"message": "and the docs", "voice": true, "to": null}),
+        json!({"message": "and the docs", "voice": true, "suggested": true, "to": "orchestrator"}),
+    ] {
+        let e = c.call("say", params.clone()).await.unwrap_err();
+        assert_eq!(code(&e), "bad_request", "{params}: {e:#}");
+    }
+    let head = th.hub.info()["control_head"].clone();
+    let r = c
+        .call(
+            "say",
+            json!({"message": "set all to bypass", "voice": true, "to": "orchestrator", "seen_gseq": 0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["action"], "confirm", "{r}");
+    assert_eq!(r["heard"], "set all to bypass", "{r}");
+    assert!(r["ref"].is_null(), "nothing is queued: {r}");
+    assert_eq!(th.hub.info()["control_head"], head, "nothing is recorded");
+    let r = c
+        .call(
+            "say",
+            json!({"message": "and the docs", "voice": true, "to": "orchestrator", "seen_gseq": 0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["action"], "delegate", "{r}");
+    th.stop().await;
+}

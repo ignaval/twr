@@ -12,6 +12,7 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [desktop-qa.md](desktop-qa.md) | tested desktop workflows, visual checks and feature-parity limits |
 | [performance.md](performance.md) | application performance measurements, improvements and reproduction |
 | [read-aloud.md](read-aloud.md) | reading the orchestrator's messages aloud: `/read`, speakers, `twr speak` and `twr remote` over SSH and mosh, engines |
+| [voice.md](voice.md) | voice mode in the desktop and mobile apps: push to talk, hands-free, spoken controls, recognition with whisper.cpp or your own program |
 | [notifications.md](notifications.md) | the hub's notification command: what it's told and when, ntfy, desktop and Slack recipes |
 | [configuration.md](configuration.md) | every key in `config.toml` with its default, and the environment variables |
 | [runtimes.md](runtimes.md) | Claude Code, Codex, Grok Build, ACP agents and presets, PTY, permission modes, what's been checked against the real CLIs |
@@ -19,6 +20,7 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [orchestrator.md](orchestrator.md) | what the orchestrator may do, the relay rule, reports, switching runtimes and the handoff |
 | [worktrees.md](worktrees.md) | per-thread worktrees, working in your checkout, what parking removes and keeps |
 | [workspaces.md](workspaces.md) | separate twrs on one machine (`twr ws`, `-w`): each with its own hub, orchestrator and threads, as tabs in the TUI |
+| [runner-links.md](runner-links.md) | machine pairing, default runner service, source builds, access and capacity |
 | [runners.md](runners.md) | threads on other machines: tokens, tunnels, TLS, outages, attach over ssh |
 | [architecture.md](architecture.md) | the event log, control stream, reducers, decision ladder, adapters, crates |
 | [security-model.md](security-model.md) | what twr guarantees and how: agents on the socket, the orchestrator's limits, jobs, twr's git, the trash, runners, releases; and what it doesn't protect against |

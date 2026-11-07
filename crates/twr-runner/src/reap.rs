@@ -1036,7 +1036,7 @@ pub fn is_marked(environ: &[u8], thread: &str, gen: Option<&str>) -> bool {
 /// Live processes marked for `thread` (and `gen`, when given, see [`is_marked`]) that started
 /// at or after `min_start`, as `(pid, start time, process group)` (never this process); `None`
 /// when the process table cannot be read.
-fn marked_processes(
+pub(crate) fn marked_processes(
     thread: &str,
     min_start: u64,
     gen: Option<&str>,

@@ -385,3 +385,8 @@ mod tests {
 
 pub mod app_commands;
 pub mod devices;
+
+/// Target triple of this executable, used for native worker builds.
+pub fn build_target() -> &'static str {
+    env!("TWR_BUILD_TARGET")
+}

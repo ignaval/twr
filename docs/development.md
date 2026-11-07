@@ -1,5 +1,7 @@
 # Development
 
+The minimum supported Rust compiler is 1.98. CI and release builds use the exact version in `rust-toolchain.toml`. Linked runner networking requires a newer compiler than the previous 1.89 floor; keep the declared floor aligned with the versions we test.
+
 This page is the maintainer's reference: how the tests, fuzzers, CI and releases work, and how the screenshots and the site are made. [CONTRIBUTING.md](../CONTRIBUTING.md) covers building twr, the checks a change must pass and how to send one.
 
 ## Tests inside a twr thread

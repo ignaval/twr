@@ -91,6 +91,8 @@ import type {
 } from "./types";
 import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
+import { VoiceControl } from "./VoiceControl";
+import { announcements, voiceHint } from "./voice";
 import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
 import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
@@ -1413,6 +1415,43 @@ export default function App({
       input.current?.focus();
     }
   };
+  // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
+  // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
+  // not through the offline outbox: it is said now, about what is on screen now.
+  const submitVoice = async (text: string): Promise<Json> => {
+    if (!orchestrator)
+      throw new Error("Choose an orchestrator before talking to it.");
+    const response = await rpc("say", {
+      message: text,
+      seen_gseq: view.head,
+      to: "orchestrator",
+      voice: true,
+    });
+    if (response.action === "pending") {
+      setSection("attention");
+      throw new Error(
+        "Not sent: review the waiting requests and answer the exact item shown.",
+      );
+    }
+    setQueueRefresh((n) => n + 1);
+    return response;
+  };
+  const voiceHintWords = useMemo(() => voiceHint(view.threads), [view.threads]);
+  // What this device may have read aloud lately, for voice mode's echo check: the
+  // orchestrator's last messages (kept while a worker's conversation is on screen) and the
+  // sentences a speaker announces.
+  const orchestratorSaid = useRef<string[]>([]);
+  useEffect(() => {
+    if (destination || !orchestrator) return;
+    orchestratorSaid.current = blocksOf(events)
+      .filter((b) => b.kind === "assistant")
+      .slice(-3)
+      .map((b) => b.text);
+  }, [events, destination, orchestrator?.id]);
+  const spokenLately = () => [
+    ...orchestratorSaid.current,
+    ...announcements(view.threads),
+  ];
   async function submitSlash(text: string) {
     if (slashPending.current) return;
     slashPending.current = true;
@@ -1628,6 +1667,9 @@ export default function App({
           break;
         case "Decisions":
           setSection((old) => (old === "decisions" ? "chat" : "decisions"));
+          break;
+        case "Runner":
+          setSection("boxes");
           break;
         case "Accounts":
           setSection("accounts");
@@ -2951,30 +2993,53 @@ export default function App({
                         </small>
                       )}
                     </span>
-                    <button
-                      className="send-button"
-                      type="submit"
-                      disabled={
-                        !permitted("operate") ||
-                        !draft.trim() ||
-                        (!connected &&
-                          (!journal ||
-                            draft.startsWith("/") ||
-                            draft.startsWith("!"))) ||
-                        (!target && !draft.startsWith("/")) ||
-                        sending
-                      }
-                      aria-label={
-                        connected ? "Send message" : "Save message for later"
-                      }
-                      title={
-                        connected
-                          ? "Send message"
-                          : "Save on this device until the hub reconnects"
-                      }
-                    >
-                      {sending ? <Spinner /> : <ArrowUp size={18} />}
-                    </button>
+                    <div className="composer-actions">
+                      <VoiceControl
+                        host={hostApi}
+                        rpc={rpc}
+                        connected={connected}
+                        allowed={permitted("operate") && Boolean(orchestrator)}
+                        submit={submitVoice}
+                        hint={voiceHintWords}
+                        spoken={spokenLately}
+                        edit={(text) => {
+                          setDestination(undefined);
+                          setDrafts((old) => ({
+                            ...old,
+                            [workspace + ":orchestrator"]: appendDraft(
+                              old[workspace + ":orchestrator"],
+                              text,
+                            ),
+                          }));
+                          input.current?.focus();
+                        }}
+                        onError={fail}
+                      />
+                      <button
+                        className="send-button"
+                        type="submit"
+                        disabled={
+                          !permitted("operate") ||
+                          !draft.trim() ||
+                          (!connected &&
+                            (!journal ||
+                              draft.startsWith("/") ||
+                              draft.startsWith("!"))) ||
+                          (!target && !draft.startsWith("/")) ||
+                          sending
+                        }
+                        aria-label={
+                          connected ? "Send message" : "Save message for later"
+                        }
+                        title={
+                          connected
+                            ? "Send message"
+                            : "Save on this device until the hub reconnects"
+                        }
+                      >
+                        {sending ? <Spinner /> : <ArrowUp size={18} />}
+                      </button>
+                    </div>
                   </div>
                   {mentions.length > 0 && !mentionHidden && (
                     <div

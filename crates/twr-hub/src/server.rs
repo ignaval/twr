@@ -70,7 +70,7 @@
 //! | `memory.read`       | `{name}`                                            | a note of `memory.list` with its `body` |
 //! | `memory.save`       | `{name, type, description, body, rev?}`             | `{name, rev, op: saved \| updated, count, bytes}` (`conflict` when `rev` is stale, or missing for a note that exists) |
 //! | `memory.forget`     | `{name, rev?}`                                      | `{name, op: forgotten, count}` |
-//! | `speech.attach`     | `{device, name, engine, voice?, live?, read?, turn_from?, watermarks?, catchup_secs?}` (users only) | ack `{orchestrator, head}`, then `{"stream":"speech","item":{...}}` items (`msg`, `ctl`, `missed`, `orchestrator`): a speaker reads the orchestrator's messages aloud (`hub::speech`, `twr_core::speech`); `conflict` while a speaker of the device is attached |
+//! | `speech.attach`     | `{device, name, engine, voice?, live?, read?, turn_from?, watermarks?, catchup_secs?}` (users only) | ack `{orchestrator, head}`, then `{"stream":"speech","item":{...}}` items (`msg`, `ctl`, `missed`, `orchestrator`; `announce` and `retract` with `read` naming `attention`): a speaker reads the orchestrator's messages aloud (`hub::speech`, `twr_core::speech`); `conflict` while a speaker of the device is attached |
 //! | `speech.state`      | `{playing?, queued, batch?, paused, live, voice?, rate, error?}` (on the connection that attached a speaker) | `{ok: true}`: what that speaker plays, for `speech.status` |
 //! | `speech.request`    | `{thread?, last? \| seq?, speaker?}` (users only)   | `{count, speakers, thread}`: reads the last `last` messages, or the one at `seq`, on the speakers now, as one batch (`hub::speech`) |
 //! | `speech.control`    | `{op, value?, speaker?}` (users only)               | `{speakers}`: stop, pause, resume, skip, live, voice or rate, sent to the speakers |
@@ -271,7 +271,7 @@ use twr_runner::reap::{self, AncestryEnd, ProcessId};
 
 use crate::hub::{
     wait_state, AgentPeer, AgentWhy, BoxView, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
-    StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
+    SayOrigin, StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
 };
 
 /// Attach leases held by one connection: `(thread id, lease id)`.
@@ -690,6 +690,12 @@ pub const METHODS: &[&str] = &[
     "hub.glance",
     "hub.shutdown",
     "config.show",
+    "runner.manage",
+    "runner.status",
+    "runner.connect",
+    "runner.recover",
+    "runner.revoke",
+    "runner.forget",
     "box.add",
     "box.install",
     "box.restart",
@@ -703,6 +709,7 @@ pub const METHODS: &[&str] = &[
     "account.add",
     "account.remove",
     "account.status",
+    "thread.pull",
     "thread.new",
     "thread.spawn",
     "thread.spawn_status",
@@ -1252,13 +1259,15 @@ async fn connection(
                     break;
                 }
             }
-            "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
-            | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
-            | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
-            | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
-            | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
-            | "box.projects" | "box.token" | "account.status" | "account.remove"
-            | "thread.set_model" | "speech.request" | "speech.control" => {
+            "thread.pull" | "thread.new" | "thread.park" | "thread.resume" | "thread.delete"
+            | "thread.trim" | "usage.threads" | "context.read" | "context.set"
+            | "orchestrator.use" | "orchestrator.reset" | "trash.list" | "trash.empty"
+            | "trash.restore" | "log.compact" | "log.stats" | "project.files" | "project.read"
+            | "project.search" | "memory.list" | "memory.read" | "box.add" | "box.install"
+            | "box.restart" | "runner.manage" | "runner.status" | "runner.connect"
+            | "runner.recover" | "runner.revoke" | "runner.forget" | "box.projects"
+            | "box.token" | "account.status" | "account.remove" | "thread.set_model"
+            | "speech.request" | "speech.control" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -2052,6 +2061,10 @@ struct SayParams {
     /// as a short command at once.
     #[serde(default)]
     suggested: bool,
+    /// The message is a transcript of the user's speech (`docs/voice.md`): never applied as a
+    /// short command, and one that reads as one is handed back for the user to confirm.
+    #[serde(default)]
+    voice: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -2251,10 +2264,20 @@ async fn call_async(
     received: Option<&crate::hub::OrchCall>,
 ) -> Result<Value, RpcError> {
     match method {
+        "runner.manage" => hub.runner_control(method, p, caller).await,
+        "runner.status" => hub.runner_control(method, p, caller).await,
+        "runner.connect" => hub.runner_control(method, p, caller).await,
+        "runner.recover" => hub.runner_control(method, p, caller).await,
+        "runner.revoke" => hub.runner_control(method, p, caller).await,
+        "runner.forget" => hub.runner_control(method, p, caller).await,
         // Committed files of a project on the hub's box (`hub::project_read`).
         "project.files" => hub.project_read(ReadTool::Files, params(p)?, caller).await,
         "project.read" => hub.project_read(ReadTool::Read, params(p)?, caller).await,
         "project.search" => hub.project_read(ReadTool::Search, params(p)?, caller).await,
+        "thread.pull" => {
+            let p: ThreadRef = params(p)?;
+            hub.thread_pull(&p.thread, caller).await
+        }
         "thread.new" => {
             let p: NewThread = params(p)?;
             hub.new_thread_bound(p, caller, received).await
@@ -2469,14 +2492,32 @@ async fn say(hub: &Hub, caller: &Caller, p: Value) -> Result<Value, RpcError> {
             "a suggested message goes to the orchestrator only (`to: \"orchestrator\"`)",
         ));
     }
+    // A transcript, routed, could answer a request (`@api yes`) on a misheard word.
+    if p.voice && p.to.as_deref() != Some("orchestrator") {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a spoken message goes to the orchestrator only (`to: \"orchestrator\"`)",
+        ));
+    }
+    if p.voice && p.suggested {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a message is either suggested or spoken, not both",
+        ));
+    }
+    let origin = if p.voice {
+        SayOrigin::Voice
+    } else if p.suggested {
+        SayOrigin::Suggested
+    } else {
+        SayOrigin::Typed
+    };
     match p.to.as_deref() {
         None => {
             hub.say_seen(&p.message, p.focused.as_deref(), p.seen_gseq, caller)
                 .await
         }
-        Some("orchestrator") => {
-            hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, p.suggested)
-        }
+        Some("orchestrator") => hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, origin),
         Some(other) => Err(RpcError::new(
             codes::BAD_REQUEST,
             format!("say `to` can only be \"orchestrator\" (not {other:?}); omit it to route"),

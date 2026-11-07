@@ -31,7 +31,8 @@ pub const BLOB_CHUNK_MAX: usize = 1024 * 1024;
 ///
 /// 1: `turn.started` `from: runtime`. A twr from before it stops reading a stream at the first
 /// such turn.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 2: `box_capacity` stops retire a runtime while keeping its thread resumable.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Well-known error codes.
 pub mod codes {

@@ -24,7 +24,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use twr_core::config::SpeechConfig;
 use twr_core::speech::{
-    name_error, utterances, CtlOp, SpeakOpts, SpeechAttachParams, SpeechItem, TEXT_MAX,
+    name_error, utterances, CtlOp, SpeakOpts, SpeechAttachParams, SpeechItem, SpeechStateParams,
+    TEXT_MAX,
 };
 
 use crate::engine::{Engine, Prefs};
@@ -34,6 +35,13 @@ use crate::state::{live_key, SpeechState, StateStore};
 
 /// Where the speaker's notes go (attached, standing by, an engine error, ssh's own words).
 pub type Reporter = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// What a speaker plays, told after every round for each workspace attached (as it reports
+/// it to that workspace's hub), and whether it says anything now (a message, or a sentence of
+/// its own such as an announcement, of any workspace): for a device that also listens
+/// (`docs/voice.md`), which silences its own echo and pauses the voice when the user starts
+/// to talk.
+pub type StateObserver = Arc<dyn Fn(&str, &SpeechStateParams, bool) + Send + Sync>;
 
 /// How a speaker runs.
 #[derive(Clone)]
@@ -55,6 +63,8 @@ pub struct SpeakerOpts {
     /// ssh may ask for a passphrase or about the host key on the same terminal, and a key
     /// reader in raw mode would take what you type. With `keys` given, ignored.
     pub tty_keys_once_attached: bool,
+    /// Told what it plays ([`StateObserver`]); `None`: nobody.
+    pub observe: Option<StateObserver>,
 }
 
 impl std::fmt::Debug for SpeakerOpts {
@@ -77,6 +87,10 @@ pub enum Key {
     PauseResume,
     /// `n`: the next message.
     Skip,
+    /// Pause, whatever it was doing (a device's voice input: the user started to talk).
+    Pause,
+    /// Go on after a pause (the user stopped talking); nothing when not paused.
+    Resume,
     /// `q`, Ctrl-C: quit.
     Quit,
 }
@@ -298,6 +312,8 @@ pub async fn run(
                 Some(Key::Stop) => player.machine.stop(),
                 Some(Key::PauseResume) => player.machine.toggle_pause(),
                 Some(Key::Skip) => player.machine.skip(),
+                Some(Key::Pause) => player.machine.pause(),
+                Some(Key::Resume) => player.machine.resume(),
                 // The key reader ended (the terminal went away): the terminal goes back out
                 // of raw mode with it.
                 None => {
@@ -377,8 +393,13 @@ pub async fn run(
             ));
         }
         said_error = error;
+        let speaking = player.machine.current().is_some();
         for ws in &connected {
-            link.report(ws, player.machine.state_for(ws));
+            let state = player.machine.state_for(ws);
+            if let Some(observe) = &opts.observe {
+                observe(ws, &state, speaking);
+            }
+            link.report(ws, state);
         }
     }
     // Quitting stops the voice, also what speech-dispatcher still has of the chunk.
@@ -560,6 +581,13 @@ fn item_to_player(
             // The feed reads a new orchestrator from its start.
             changes.push(Box::new(move |s| s.init_watermark(&thread, 0)));
         }
+        // No more than a hub sends, whatever this one sent: one clean line.
+        SpeechItem::Announce { key, text } => {
+            let text = twr_core::speech::clean(&text);
+            let text = text.chars().take(twr_core::speech::ANNOUNCE_MAX).collect();
+            m.announce(ws, &key, text)
+        }
+        SpeechItem::Retract { key } => m.retract(ws, &key),
     }
 }
 
@@ -701,6 +729,7 @@ mod tests {
         let notes = notes.clone();
         SpeakerOpts {
             tty_keys_once_attached: false,
+            observe: None,
             name: "test speaker".into(),
             config: SpeechConfig::default(),
             voice: None,
@@ -1014,6 +1043,37 @@ mod tests {
             vec!["3 earlier messages came while I was disconnected; they're on screen"]
         );
         assert_eq!(r.state().watermark("T"), Some(9));
+        r.shut().await;
+    }
+
+    /// An announcement from the hub is said as it came, cleaned and cut to
+    /// [`twr_core::speech::ANNOUNCE_MAX`]; a retract drops one still waiting.
+    #[tokio::test(start_paused = true)]
+    async fn announcements_are_said_and_retracted() {
+        let (_d, store) = store();
+        live_on(&store, "default");
+        let mut r = start(&store, FakeEngine::timed(Duration::from_secs(1)));
+        r.connect("default", Some("T"), 0).await;
+        let announce = |key: &str, text: String| SpeechItem::Announce {
+            key: key.into(),
+            text,
+        };
+        r.item(
+            "default",
+            announce("api", "api\u{1b}[2J needs your permission".into()),
+        );
+        r.item("default", announce("web", "web failed".into()));
+        r.item("default", SpeechItem::Retract { key: "web".into() });
+        r.item("default", announce("docs", "d".repeat(1000)));
+        until("said", || r.fake.finished().len() == 2).await;
+        assert_eq!(
+            r.fake.spoken(),
+            vec![
+                "api[2J needs your permission".to_string(),
+                "d".repeat(twr_core::speech::ANNOUNCE_MAX)
+            ]
+        );
+        assert_eq!(r.state().watermark("T"), Some(0), "no watermark moved");
         r.shut().await;
     }
 

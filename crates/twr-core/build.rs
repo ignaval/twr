@@ -27,6 +27,10 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    println!(
+        "cargo:rustc-env=TWR_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap()
+    );
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let lock = manifest.join("../../Cargo.lock");
     let mut inputs = vec![manifest.join("Cargo.toml"), lock.clone()];

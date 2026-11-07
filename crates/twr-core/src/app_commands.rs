@@ -27,6 +27,7 @@ pub fn validate(args: &[String]) -> Result<()> {
         "job",
         "speech",
         "speak",
+        "voice",
         "remote",
         "events",
         "context",
@@ -51,6 +52,11 @@ pub fn validate(args: &[String]) -> Result<()> {
     anyhow::ensure!(
         args[0] != "hub" || args.get(1).is_some_and(|s| s == "stop"),
         "The app starts an independent hub; a foreground hub cannot run in a terminal"
+    );
+    // `twr voice transcribe` reads a recording on stdin: voice mode runs it with one.
+    anyhow::ensure!(
+        args[0] != "voice" || args.get(1).is_none_or(|s| s != "transcribe"),
+        "Voice mode transcribes what you say; use the microphone in the message box"
     );
     let boundary = args
         .iter()
@@ -95,6 +101,14 @@ pub fn plan(args: &[String], workspace: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn voice_status_runs_from_the_app_but_transcribe_needs_a_recording() {
+        let words = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(validate(&words(&["voice", "status", "--json"])).is_ok());
+        assert!(validate(&words(&["voice", "transcribe"])).is_err());
+        assert!(validate(&words(&["voice", "transcribe", "--json"])).is_err());
+    }
+
     #[test]
     fn scope_flags_cannot_change_the_target_but_subprocess_flags_are_preserved() {
         assert!(validate(&["attach".into(), "api".into(), "-wother".into()]).is_err());

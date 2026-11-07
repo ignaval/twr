@@ -68,7 +68,10 @@ Remote approvals retain exact request revisions. Notification actions only open 
 push payloads contain routing metadata rather than prompts or request text. Uploads are
 size- and SHA-256-checked, avoid symlinks and commit atomically into private upload folders
 in local worktrees. Pending mutation receipts prevent duplicate execution across socket
-reconnects within their retention period. See [mobile.md](mobile.md) for limits, scopes,
+reconnects within their retention period. Voice mode recognizes speech on the phone and
+sends only text; the gateway's speaker for a phone attaches as you (the hub gives devices no
+`speech.attach`), needs the device's `read` grant, ends on revocation, and takes controls and
+acknowledgements from the phone, never text to say ([mobile.md](mobile.md#voice)). See [mobile.md](mobile.md) for limits, scopes,
 revocation and gateway lifecycle. Remote-box attachments use the authenticated runner upload operation with the same pinned-directory and checksum checks; see [thread attachments](attachments.md).
 
 ## The orchestrator
@@ -200,11 +203,34 @@ The same small models write thread summaries, on by default too: `[tui] summarie
 A speaker reads the orchestrator's messages aloud on the machine you listen on ([read-aloud.md](read-aloud.md)): the TUI's own, `twr speak`, or `twr speech feed --text`.
 
 - **Who can make it speak.** User clients only. The `speech.*` methods are refused to the orchestrator and to every agent (`unauthorized`), like any method outside their lists, so nothing a model writes can start, stop, pause or aim speech, or change a speaker's voice. A speaker attaches as a user client on the hub's socket; over SSH, `twr speech feed` runs on the hub's machine as you, from your ssh login, and connects to the socket as any CLI does.
-- **What it can say.** Only what the log holds. No method takes a text to say: `speech.request` names messages by thread and position, and the hub reads them from the log, as `speech.attach` reads the orchestrator's new ones. Only final texts of conversation turns are sent, never maintenance turns (handoffs, compactions), and a turn whose metadata the hub can't read whole is silent.
+- **What it can say.** Only what the log holds, and the hub's own announcements. No method takes a text to say: `speech.request` names messages by thread and position, and the hub reads them from the log, as `speech.attach` reads the orchestrator's new ones. Only final texts of conversation turns are sent, never maintenance turns (handoffs, compactions), and a turn whose metadata the hub can't read whole is silent. With `[speech] read` naming `attention`, the hub also says when an attention item is raised, in a fixed sentence of its own with the thread's name in it ("api needs your permission", "twr has a question for you"): never the item's summary, its command, or anything an agent wrote beyond the thread's name, which is a validated identifier, cleaned and cut to 64 characters again. An agent can make a speaker that asked for them say that its thread needs you, as its card already shows, and nothing else.
 - **Text is data.** The speaker never runs a shell. `say` and `spd-say` get each sentence on their stdin and fixed arguments, and a `command` engine is an argument list run without a shell, the text on its stdin, as `[notify] command` is. Control, bidirectional and zero-width characters are removed before an engine sees the text, and what an engine would read as a command of its own is defused: a line `spd-say -e` would take as a speech-dispatcher command (`!-!CANCEL ALL`, which silences every program's speech) gets a space in front, and macOS's embedded speech commands (`[[volm 0]]`) lose their double bracket. The proxy `twr speak --ssh` runs is fixed words and shell-quoted workspace names, with agent and X11 forwarding off, and it passes on `speech.attach` and `speech.state` only.
 - **What crosses the network.** Over SSH, the messages' text and the speakers' status, inside your SSH connection; nothing goes anywhere else, unless your `command` engine sends it (a hosted voice gets every word).
-- **The feed is trusted as far as the server is.** A server you don't trust could make your laptop speak any text: the speaker checks every item's shape, bounds its sizes (64 KB per message, 300 characters per utterance) and only plays it. The speaker never listens on a socket or port.
+- **The feed is trusted as far as the server is.** A server you don't trust could make your laptop speak any text: the speaker checks every item's shape, bounds its sizes (64 KB per message, 300 characters per utterance, 160 per announcement) and only plays it. The speaker never listens on a socket or port.
+- **A phone's speaker.** The mobile gateway runs one per phone on the hub's machine, attached as you; it sends each utterance to that phone over its authenticated socket. The phone may start, stop, pause, resume and skip it, and acknowledge utterances by the id the gateway gave them; nothing it sends is said. It needs the device's `read` scope and ends when the device is revoked ([mobile.md](mobile.md#voice)).
 - **What is kept.** Nothing in the event log. The hub keeps the attached speakers and their status in memory. The speaker keeps its device id, its live switch per workspace, its voice and rate, and the last message it read of each thread in `speech-state.json` in twr's data directory, readable only by you.
+
+## Voice mode
+
+Voice mode ([voice.md](voice.md)) turns what you say into a message; its risks are a misheard
+word and a microphone left on:
+
+- **A transcript never answers.** `say {voice: true}` goes to the orchestrator only and is never
+  applied as a short command. One that reads as an answer to a permission or question, or as a
+  mode change, is handed back (`action: "confirm"`) with nothing recorded, and the app makes you
+  send it as typed. So no recognition error can approve a request, and a transcript gives the
+  orchestrator no more authority to relay than a typed message that reads as no command.
+- **The microphone is the app's, and only while voice is on.** The desktop window is granted the
+  microphone only after you turned voice on, only for audio, and only for the app's own page:
+  every other permission stays refused, as before. Agents have no way to turn it on.
+- **No audio leaves the device by default.** whisper.cpp runs on your machine, reading a 0600
+  file in a private temporary directory, removed once read; its arguments are fixed and the
+  vocabulary hint is thread names reduced to `[A-Za-z0-9._-]`. A `command` engine is an
+  argument list run without a shell, with the recording on its stdin, and receives every word
+  you say. `config.show` hides `[voice]`, as it hides `[speech]` (a hosted recognizer's key may be
+  in its arguments).
+- **The speaker it drives says only the log.** The app's speaker is an ordinary `twr speak`:
+  `--control stdio` reads five fixed control words and writes playback state with no text.
 
 ## Terminal setup from the TUI
 
@@ -244,6 +270,16 @@ Build output means the git-ignored entries that match `[threads] park_disposable
 - An idle trim (`trim_idle_after`, opt-in per project) runs without anyone looking, so it deletes an entry only when one of its path components is named by both `park_disposable` and `idle_trim_disposable`: by default `target/`, `node_modules/`, `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.tox/`, `.gradle/` and `.next/`, never `dist/`, `build/`, `.cache/`, `.venv/` or `coverage/`.
 
 Limits: the deletion is safe against symbolic links and repositories that are there when it runs, not against another process writing into the worktree at the same time (a parent swapped for a link). twr has stopped the thread's runtime by then, but a process of yours, or one the agent left behind, could still write. On macOS twr lists a held directory's entries by path, so a writer that swaps one of its parents meanwhile can make the repository check look elsewhere.
+
+## Paired runner machines
+
+[Linked runners](runner-links.md) trust a paired hub to run code as the runner's OS user. Local hub startup starts or reuses a private service; it publishes a runner endpoint only for an explicit pairing window or saved incoming trust. Pairing and runner management are user-only on the hub, desktop bridge and service sockets; mobile clients manage their connected hub and cannot host a runner.
+
+A 60-bit, 15-minute code derives an Argon2id/HKDF locator and confirmation keys. The signed public locator is an offline code verifier. This is not a PAKE. Mutual HMAC confirmations bind the full machine/workspace/endpoint transcript, explicit replacement flag and actual QUIC exporter, with a fresh machine signature. Three admitted failures close the window. New connections require a signed workspace binding and the current durable grant receipt; their accepted workspace and epoch cannot change mid-connection. Worker traffic is sealed end to end with the workspace key.
+
+Revocation persists a permanent grant fence before acknowledgement. Late worker, source and repository publication rechecks authority, and startup reconciles fences after interrupted saves. Revocation stops the retired runtime/build generation while retaining work and results. Re-pairing requires explicit replacement if an existing active grant cannot be reused. Offline forgetting queues a receipt-bound retirement that cannot revoke a later grant.
+
+Source and Git transfers are bounded, verified and credential-free; result imports use separate refs without changing the user's checkout or index. Worker programs are separate from the shared transport service. Only the locally executed installation bootstraps that service; unattended updates accept signed newer official stable releases with a compatible state schema. Runtime leases, disk admission and immutable build caches coordinate trusted owners; they do not sandbox a hostile paired hub or cap arbitrary same-user agent writes. Agents retain the OS account's ordinary permissions.
 
 ## Remote runners
 

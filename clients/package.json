@@ -14,6 +14,7 @@
     "start": "electron .",
     "test": "vitest run",
     "test:integration": "node scripts/integration.mjs",
+    "test:voice": "node scripts/voice-qa.mjs",
     "package": "npm run build:rust && npm run build && electron-builder --publish never",
     "package:mac": "npm run package -- --mac --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false",
     "package:linux": "npm run package -- --linux --x64",
@@ -125,7 +126,10 @@
         }
       ],
       "hardenedRuntime": true,
-      "entitlements": "packaging/entitlements.mac.plist"
+      "entitlements": "packaging/entitlements.mac.plist",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "twr listens only while voice mode is on, to turn what you say into a message for your orchestrator. The audio stays on this Mac unless you configure another recognizer."
+      }
     },
     "linux": {
       "category": "Development",

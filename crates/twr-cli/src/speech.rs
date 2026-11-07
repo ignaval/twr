@@ -13,7 +13,9 @@
 //! - **`--text`**: a speaker of its own that prints each message's sentences, one per line, as
 //!   they are said: a public interface for a reader of your own. With several workspaces each
 //!   line starts with `<workspace>: `. Live mode is always on; controls are ignored; messages
-//!   asked for with `/read N` are printed too.
+//!   asked for with `/read N` are printed too. With `--attention` it also reads announcements
+//!   (`api needs your permission`), each a line as it comes (a retract comes too late for a
+//!   line already printed, and is ignored).
 //!
 //! And the listening end: `twr speak` ([`speak`]), a speaker on this machine
 //! (`twr_speech::speaker::run`), and `twr remote` ([`remote`]), a mosh or ssh session with
@@ -35,8 +37,8 @@ use twr_core::config::{Config, SpeechEngine};
 use twr_core::paths::{Paths, DEFAULT_WORKSPACE};
 use twr_core::proto::codes;
 use twr_core::speech::{
-    utterances, ProxyIn, ProxyOut, SpeakOpts, SpeechAttachParams, SpeechItem, TurnsRead,
-    PROXY_METHODS, PROXY_VERSION,
+    utterances, ProxyIn, ProxyOut, ReadKind, SpeakOpts, SpeechAttachParams, SpeechItem, TurnsRead,
+    ANNOUNCE_MAX, PROXY_METHODS, PROXY_VERSION,
 };
 use twr_speech::link::PROXY_PING;
 use twr_speech::{LinkSpec, Reporter, SpeakerOpts, SshSpec, StateStore, Workspaces};
@@ -463,8 +465,8 @@ async fn serve_workspace(
     }
 }
 
-/// `twr speech feed --text`.
-pub async fn text(workspaces: Vec<(String, PathBuf)>) -> anyhow::Result<()> {
+/// `twr speech feed --text`, with announcements too when `attention`.
+pub async fn text(workspaces: Vec<(String, PathBuf)>, attention: bool) -> anyhow::Result<()> {
     let prefix = workspaces.len() > 1;
     let mut random = [0u8; 8];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut random)
@@ -474,7 +476,13 @@ pub async fn text(workspaces: Vec<(String, PathBuf)>) -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for (ws, socket) in workspaces {
         let label = prefix.then(|| format!("{ws}: "));
-        tasks.spawn(text_workspace(socket, device.clone(), label, tx.clone()));
+        tasks.spawn(text_workspace(
+            socket,
+            device.clone(),
+            label,
+            attention,
+            tx.clone(),
+        ));
     }
     drop(tx);
     while let Some(line) = rx.recv().await {
@@ -486,13 +494,36 @@ pub async fn text(workspaces: Vec<(String, PathBuf)>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What the text feed asks to read: both kinds of text, and announcements with `attention`.
+fn text_read(attention: bool) -> Vec<ReadKind> {
+    let mut read = twr_core::speech::default_read();
+    if attention {
+        read.push(ReadKind::Attention);
+    }
+    read
+}
+
+/// The line of announcement `text` (a hub's, cleaned and cut again: one line of at most
+/// [`ANNOUNCE_MAX`] characters), after `label`; `None` when nothing is left of it.
+fn announce_line(label: Option<&str>, text: &str) -> Option<String> {
+    let text: String = twr_core::speech::clean(text)
+        .trim()
+        .chars()
+        .take(ANNOUNCE_MAX)
+        .collect();
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("{}{text}", label.unwrap_or("")))
+}
+
 /// One workspace of the text feed: attached as a speaker with live mode on, again after its
-/// hub went away, printing each message's sentences. Within one run it reads no message
-/// twice: it keeps its place per thread across reconnects.
+/// hub went away, printing each message's sentences (and each announcement, with
+/// `attention`). Within one run it reads no message twice: it keeps its place per thread
+/// across reconnects.
 async fn text_workspace(
     socket: PathBuf,
     device: String,
     label: Option<String>,
+    attention: bool,
     out: mpsc::Sender<String>,
 ) {
     let mut watermarks: BTreeMap<String, u64> = BTreeMap::new();
@@ -504,7 +535,7 @@ async fn text_workspace(
             engine: "text".into(),
             voice: None,
             live: true,
-            read: twr_core::speech::default_read(),
+            read: text_read(attention),
             turn_from: TurnsRead::All,
             watermarks: watermarks.clone(),
             catchup_secs: twr_core::speech::default_catchup(),
@@ -571,7 +602,14 @@ async fn text_workspace(
                     watermarks.retain(|t, _| *t == thread);
                     watermarks.entry(thread).or_insert(0);
                 }
-                SpeechItem::Ctl { .. } => {}
+                SpeechItem::Announce { text, .. } => {
+                    if let Some(line) = announce_line(label.as_deref(), &text) {
+                        if out.send(line).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                SpeechItem::Ctl { .. } | SpeechItem::Retract { .. } => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -599,6 +637,10 @@ pub struct Speak {
     pub rate: Option<u32>,
     /// `--print-service`.
     pub print_service: bool,
+    /// `--control stdio`: controls on stdin, what it plays on stdout ([`stdio_keys`]).
+    pub control_stdio: bool,
+    /// `--announce`: attention items too, whatever `[speech] read` says.
+    pub announce: bool,
 }
 
 /// What a speaker reads: this machine's hubs of `paths`'s root, or a remote one's over ssh.
@@ -689,7 +731,10 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         return print_service(&args);
     }
     let root = paths.root();
-    let config = Config::load_from(&root)?;
+    let mut config = Config::load_from(&root)?;
+    if args.announce && !config.speech.read.contains(&ReadKind::Attention) {
+        config.speech.read.push(ReadKind::Attention);
+    }
     let engine = twr_speech::from_config(&config.speech, engine_override)?;
     let (mut sigint, mut sigterm, mut sighup) = (
         signal(SignalKind::interrupt()).context("handling SIGINT")?,
@@ -705,7 +750,7 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
     };
     // Keys are read once a hub is attached: before that, ssh may ask for a passphrase or about
     // the host key on this terminal. Raw mode while they are: lines end with "\r\n" then.
-    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let tty = !args.control_stdio && std::io::IsTerminal::is_terminal(&std::io::stdin());
     let report: Reporter = Arc::new(|note: &str| note_line(twr_speech::raw_mode(), note));
     let start = format!(
         "reading aloud what {} says, with {}",
@@ -721,9 +766,99 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         state: StateStore::in_data_dir(&root.data_dir),
         report: Some(report),
         tty_keys_once_attached: tty,
+        observe: args.control_stdio.then(stdio_observer),
     };
+    // The device id this speaker speaks as, shared by every speaker of this machine (the
+    // TUI's own too): a driver aims `speech.control` at it when this one stands by.
+    if args.control_stdio {
+        let device = opts.state.load()?.device;
+        let mut out = std::io::stdout().lock();
+        writeln!(
+            out,
+            "{}",
+            json!({"type": "speaker", "device": device, "name": opts.name})
+        )?;
+        out.flush()?;
+    }
+    let keys = args.control_stdio.then(stdio_keys);
     // `run` restores the terminal before it returns, so an error prints on a normal one.
-    twr_speech::run(opts, link, engine, None, shutdown).await
+    twr_speech::run(opts, link, engine, keys, shutdown).await
+}
+
+/// `--control stdio`'s controls: one per line on stdin. The end of stdin (the program that
+/// drives the speaker is gone) quits; an unknown line is ignored (a newer program's).
+fn stdio_keys() -> twr_speech::KeyInput {
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            let key = match lines.next_line().await {
+                Ok(Some(line)) => match stdio_key(&line) {
+                    Some(k) => k,
+                    None => continue,
+                },
+                Ok(None) | Err(_) => twr_speech::Key::Quit,
+            };
+            let quit = key == twr_speech::Key::Quit;
+            if tx.send(key).await.is_err() || quit {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// A line of `--control stdio`'s stdin, as a key.
+fn stdio_key(line: &str) -> Option<twr_speech::Key> {
+    use twr_speech::Key;
+    Some(match line.trim() {
+        "pause" => Key::Pause,
+        "resume" => Key::Resume,
+        "stop" => Key::Stop,
+        "skip" => Key::Skip,
+        "quit" => Key::Quit,
+        _ => return None,
+    })
+}
+
+/// `--control stdio`'s output: what the speaker plays for each workspace, one JSON line when
+/// it changes (`{"workspace", "playing", "paused", "queued", "live", "error"}`). `playing`
+/// counts a sentence of the speaker's own (an announcement) as well as a message: a program
+/// that pauses the voice when the user talks pauses that too.
+fn stdio_observer() -> twr_speech::StateObserver {
+    let last = std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
+    Arc::new(
+        move |ws: &str, state: &twr_core::speech::SpeechStateParams, speaking: bool| {
+            let line = stdio_state_line(ws, state, speaking);
+            let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+            if last.get(ws) == Some(&line) {
+                return;
+            }
+            last.insert(ws.to_string(), line.clone());
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        },
+    )
+}
+
+/// One line of [`stdio_observer`]: `speaking`, the speaker says something now (of any
+/// workspace; a message of this one shows as `playing` either way).
+fn stdio_state_line(
+    ws: &str,
+    state: &twr_core::speech::SpeechStateParams,
+    speaking: bool,
+) -> String {
+    json!({
+        "type": "state",
+        "workspace": ws,
+        "playing": state.playing.is_some() || (speaking && !state.paused),
+        "paused": state.paused,
+        "queued": state.queued,
+        "live": state.live,
+        "error": state.error,
+    })
+    .to_string()
 }
 
 /// One of the speaker's notes on stderr: `\r\n`-ended in raw mode; with the time in front
@@ -766,6 +901,9 @@ fn service_args(args: &Speak) -> Vec<String> {
         if let Some(v) = value {
             a.extend([flag.to_string(), v]);
         }
+    }
+    if args.announce {
+        a.push("--announce".into());
     }
     a
 }
@@ -1106,6 +1244,85 @@ mod tests {
 
     fn words(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--control stdio` takes the five controls, trimmed, and ignores anything else (a newer
+    /// program's control), so a typo never quits a speaker.
+    /// The text feed asks for announcements only with `--attention`, and prints each as one
+    /// clean line after the workspace's label.
+    #[test]
+    fn the_text_feed_prints_announcements_when_asked() {
+        assert_eq!(text_read(false), twr_core::speech::default_read());
+        assert_eq!(
+            text_read(true),
+            vec![ReadKind::Replies, ReadKind::Commentary, ReadKind::Attention]
+        );
+        assert_eq!(
+            announce_line(None, "api needs your permission").as_deref(),
+            Some("api needs your permission")
+        );
+        assert_eq!(
+            announce_line(Some("work: "), "a\npi\u{202E} failed\u{7}").as_deref(),
+            Some("work: a pi failed")
+        );
+        assert_eq!(
+            announce_line(None, &"x".repeat(999)).map(|l| l.chars().count()),
+            Some(ANNOUNCE_MAX)
+        );
+        assert_eq!(announce_line(Some("work: "), " \u{200B} "), None);
+    }
+
+    #[test]
+    fn stdio_controls_are_read_line_by_line() {
+        use twr_speech::Key;
+        for (line, key) in [
+            ("pause", Key::Pause),
+            (" resume\r", Key::Resume),
+            ("stop", Key::Stop),
+            ("skip", Key::Skip),
+            ("quit", Key::Quit),
+        ] {
+            assert_eq!(stdio_key(line), Some(key), "{line:?}");
+        }
+        for line in ["", "PAUSE", "pause now", "q"] {
+            assert_eq!(stdio_key(line), None, "{line:?}");
+        }
+    }
+
+    /// What a speaker plays reaches its driver as one JSON object a line: no text of the
+    /// conversation, only whether it plays, is paused and how much waits.
+    #[test]
+    fn stdio_state_lines_carry_no_text() {
+        let state = twr_core::speech::SpeechStateParams {
+            paused: true,
+            queued: 2,
+            live: true,
+            ..Default::default()
+        };
+        let speaking = stdio_state_line("work", &state, true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&speaking).unwrap()["playing"],
+            false,
+            "paused: nothing is heard"
+        );
+        let unpaused = twr_core::speech::SpeechStateParams {
+            paused: false,
+            ..state.clone()
+        };
+        let announcing = stdio_state_line("work", &unpaused, true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&announcing).unwrap()["playing"],
+            true,
+            "an announcement being said counts as playing"
+        );
+        let line = stdio_state_line("work", &state, false);
+        assert!(!line.contains('\n'));
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "state", "workspace": "work", "playing": false, "paused": true,
+                   "queued": 2, "live": true, "error": null})
+        );
     }
 
     /// mosh passes its command on as words; ssh joins it for the remote shell, so each word

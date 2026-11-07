@@ -6,4 +6,5 @@ pub mod push;
 pub mod receipts;
 pub mod terminal;
 pub mod upload;
+pub mod voice;
 pub mod wire;

@@ -8,3 +8,6 @@
 /THIRD-PARTY-LICENSES.html
 
 /artifacts/
+
+# Xcode resolves Swift packages into the iOS project's workspace on every build.
+/clients/mobile/ios/App/App.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/

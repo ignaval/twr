@@ -612,6 +612,49 @@ async fn acks_delete_spooled_frames() {
 }
 
 #[tokio::test]
+async fn a_repeated_spawn_on_a_full_managed_box_is_already_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let worktree = root.join("worktrees/test");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let resources = root.join("leases");
+    std::fs::create_dir(&resources).unwrap();
+    std::fs::write(resources.join("slots.json"), b"1").unwrap();
+    let mut options = with_fake(LocalBoxOptions::new(&root, BOX));
+    options.managed = Some(twr_runner::managed::Managed {
+        root: root.clone(),
+        resources,
+        revocation: root.join("revoked"),
+    });
+    let lbox = LocalBox::open(options).unwrap();
+    let spawn = |thread: &str| Op::Spawn {
+        thread: thread.into(),
+        runtime: "fake".into(),
+        cfg: WireSpawnConfig {
+            cwd: worktree.clone(),
+            ..Default::default()
+        },
+        prompt: None,
+        run: Some(twr_core::event::new_id()),
+    };
+    lbox.execute(spawn("resident")).await.unwrap();
+    assert_eq!(
+        lbox.execute(spawn("resident")).await.unwrap_err().code,
+        cmd_errors::ALREADY_RUNNING
+    );
+    assert_eq!(
+        lbox.execute(spawn("waiting")).await.unwrap_err().code,
+        cmd_errors::BOX_FULL
+    );
+    lbox.execute(Op::Stop {
+        thread: "resident".into(),
+        run: None,
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn a_repeated_command_id_runs_once() {
     let dir = tempfile::tempdir().unwrap();
     let hub = FakeHub::start().await;
@@ -1900,7 +1943,8 @@ fn nondumpable_child_process() {
     // SAFETY: prctl(PR_SET_DUMPABLE, 0) only changes this process's dumpable flag.
     assert_eq!(unsafe { prctl(PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) }, 0);
     let dir = std::path::PathBuf::from(dir);
-    std::fs::write(dir.join("ready"), std::process::id().to_string()).unwrap();
+    std::fs::write(dir.join("ready.tmp"), std::process::id().to_string()).unwrap();
+    std::fs::rename(dir.join("ready.tmp"), dir.join("ready")).unwrap();
     std::thread::sleep(Duration::from_secs(300));
 }
 

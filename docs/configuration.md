@@ -160,13 +160,21 @@ engine = "auto"                   # say (macOS) | avspeech (macOS) | spd (Linux)
 voice = ""                        # the engine's voice; empty = the system's default
 rate = 0                          # words per minute, 80-500; 0 = the engine's default
 volume = 1.0                      # 0.0-1.0 (avspeech, spd)
-read = ["replies", "commentary"]  # replies: a turn's last text; commentary: texts before it
+read = ["replies", "commentary"]  # replies: a turn's last text; commentary: texts before it; add "attention" to hear "api needs your permission"
 turn_from = "all"                 # mine: only the turns you started
 code = "announce"                 # read | skip: what a code block reads as
 paths = "short"                   # full: paths as written
 catchup_secs = 120                # after a disconnect, messages older than this are counted, not read
 local = "auto"                    # on | off: the TUI speaks by itself (auto: not under SSH or mosh)
 command = []                      # engine = "command": a program and its arguments (no shell), text on stdin
+
+[voice]                           # speech to text for voice mode, on the machine with the microphone; see voice.md
+engine = "auto"                   # whisper | command; auto: whisper if whisper-cli and the model are there, else command if set
+whisper = ""                      # whisper.cpp's CLI; empty = whisper-cli (or whisper-cpp) on PATH
+model = ""                        # the ggml model; empty = voice/ggml-base.en.bin in the data directory
+language = "en"                   # as whisper names it, or "auto"
+command = []                      # engine = "command": a program and its arguments (no shell), 16 kHz WAV on stdin, text on stdout
+timeout_secs = 60                 # how long one recording may take to recognize (1-600)
 
 [runtimes.gemini]                 # example: an ACP agent under a short name (--runtime gemini)
 acp = "gemini --experimental-acp"
