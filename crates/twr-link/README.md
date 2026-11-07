@@ -6,7 +6,7 @@ The implementation requires Linux/macOS, Rust 1.98 or later, and the checked-in 
 
 ## Review and verification
 
-Two requested Claude Opus 5.5 reviews at high effort found lifecycle, recovery and control-cache defects. The fixes include:
+Three requested Claude Opus 5.5 reviews at high effort found lifecycle, recovery, control-cache and desktop integration defects. The fixes include:
 
 - One window → registry → endpoint lock order, with a deadlock regression.
 - Reuse of an existing machine grant when adding an alias; explicit replacement for an active grant, covered over private QUIC.
@@ -14,8 +14,9 @@ Two requested Claude Opus 5.5 reviews at high effort found lifecycle, recovery a
 - Cached concurrent management/capacity controls without reconnecting, machine-wide retirement rate limits with releasable claims, full-capacity checks, generation-specific cancellation and a short wait-ticket expiry.
 - Nonblocking coordinated power/admission probes across all 64 possible slots, and a lease through native artifact publication and compiler descendants. Crash cleanup and revocation target the recorded grant epoch and runtime/build generation.
 - Native scratch cleanup and removal of changed source materializations before retry, explicit cache reclamation, immutable hub snapshots and asynchronous dormant-service bootstrap.
+- Duplicate-spawn detection before capacity admission and definitive rejection of unreserved uploads.
 - Temporary build-time source objects and refs, archive support, raw-byte/ignore preservation and a lightweight build dependency.
-- An explicit revocation confirmation, self identification and pairing recovery in the clients.
+- An explicit revocation confirmation, self identification and pairing recovery in the clients. Desktop hosting controls always reach the local service while viewing a remote hub; exact-session cancellation still works after the old view is fenced.
 - A private publisher in fixtures, publication-failure cleanup, and an unhealthy-candidate rollback test using private Unix sockets and a mock launcher.
 
 The native build quota scanner tolerates files disappearing during compiler scratch cleanup. Build failure output is bounded and returned to the owner. Executable uploads are bounded at 1 GiB; source/Git bundles are bounded separately at 128 MiB.
