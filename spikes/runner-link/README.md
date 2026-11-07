@@ -1,10 +1,12 @@
 # Linked runner validation
 
-This is the isolated, non-shipping first stage of the linked-runner design. It has
-its own workspace and lockfile: the shipping binary, hub, clients, root lockfile
-and dependency policy are unchanged. It installs no service, launches no agent,
-and reads no real pairing state. Automatic startup and client pairing UI wait for
-[the apps change](https://github.com/ignaval/twr/pull/12) to merge.
+These are the isolated, non-shipping fixtures from the first stage of the
+linked-runner design. They have their own workspace and lockfile, install no
+service, launch no agent and read no real pairing state. The apps baseline has
+merged; production now lives in `crates/twr-link`, `crates/twr-source` and the
+CLI/hub/runner/client integrations described in [runner-links.md](../../docs/runner-links.md).
+The production handshake uses exporter-bound ring HMAC confirmations rather than
+the unaudited SPAKE2 experiment retained here.
 
 The running fixtures use explicit addresses, local HTTP servers, a loopback Mainline
 DHT testnet, and an optional network-disabled Docker container. They never publish
@@ -29,8 +31,8 @@ also enable the server as a dev dependency. `transport_probe` echoes a bounded
 message between loopback endpoints and prints non-secret JSON evidence.
 
 These are manual, point-in-time checks. Root CI's workspace commands do not run
-this separate package. Add explicit CI checks before adopting these modules;
-there is no automatic regression protection for this spike.
+this separate package. Production has its own workspace regression tests; there is no automatic
+regression protection for this historical spike.
 
 ## What the fixtures establish
 
