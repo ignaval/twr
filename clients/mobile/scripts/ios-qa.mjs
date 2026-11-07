@@ -1,3 +1,4 @@
+import { clientProtocol } from "../../scripts/client-protocol.mjs";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
@@ -351,7 +352,7 @@ for (const [
       });
     const hello = await ownerCall("hello", {
       client: "ios-qa-owner",
-      protocol: 1,
+      protocol: clientProtocol,
       user_token: readFileSync(token, "utf8").trim(),
     });
     assert(hello.identity.startsWith("user:"));
