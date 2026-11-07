@@ -425,13 +425,28 @@ mod tests {
             .env(twr_runner::reap::AGENT_ENV, format!("{marker}-other"))
             .kill_on_drop(true)
             .spawn()?;
+        // ps can reject an out-of-range sentinel PID instead of reporting it gone.
+        // Record a real creator and wait for its exit, as a crashed service would.
+        let mut creator = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()?;
+        let creator_pid = creator.id().context("creator PID missing")?;
+        let creator_start = twr_runner::reap::process_start_time(creator_pid)
+            .context("creator start time missing")?;
+        creator.kill().await?;
+        creator.wait().await?;
         let record = BuildRecord {
             owner: "ab".repeat(32),
             epoch: 4,
             marker,
-            pid: u32::MAX,
-            start: None,
+            pid: creator_pid,
+            start: Some(creator_start),
         };
+        assert_eq!(
+            twr_runner::reap::process_liveness(record.pid, record.start),
+            twr_runner::reap::Alive::No
+        );
         crate::state::atomic_write(
             &machine.dir.join("runner/leases/build.json"),
             &serde_json::to_vec(&record)?,
