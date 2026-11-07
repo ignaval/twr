@@ -344,6 +344,17 @@ fn decision_ids(events: &[Event], n: usize) -> Vec<String> {
     events.iter().take(n).map(|e| e.id.clone()).collect()
 }
 
+/// Where a message `say` hands to the orchestrator comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SayOrigin {
+    /// Typed by the user: a short command in it is applied at once.
+    Typed,
+    /// A next message a model suggested, taken unedited (`hub::suggest`).
+    Suggested,
+    /// A transcript of the user's speech (`docs/voice.md`): may hold misheard words.
+    Voice,
+}
+
 impl Hub {
     /// `say {message, focused?}` without `seen_gseq`: [`Hub::say_seen`] with `None` (the
     /// message never answers an item).
@@ -611,19 +622,22 @@ impl Hub {
         seen_gseq: Option<u64>,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
-        self.say_to_orchestrator_as(message, seen_gseq, caller, false)
+        self.say_to_orchestrator_as(message, seen_gseq, caller, SayOrigin::Typed)
     }
 
-    /// [`Hub::say_to_orchestrator`]; `suggested`: the message is a suggestion the user took
-    /// unedited (`hub::suggest`), never applied as a short command at once: it goes to the
-    /// orchestrator as a message, whatever it reads like now.
+    /// [`Hub::say_to_orchestrator`], for a message of `origin`. A suggestion the user took
+    /// unedited (`hub::suggest`) or a transcript of their speech is never applied as a short
+    /// command at once: it goes to the orchestrator as a message. One that reads as a command
+    /// now is refused (a suggestion: `bad_request`) or handed back (a transcript:
+    /// `{action: "confirm", heard, reason}`), nothing recorded either way.
     pub fn say_to_orchestrator_as(
         &self,
         message: &str,
         seen_gseq: Option<u64>,
         caller: &Caller,
-        suggested: bool,
+        origin: SayOrigin,
     ) -> Result<Value, RpcError> {
+        let suggested = origin != SayOrigin::Typed;
         if caller.is_orchestrator() {
             return Err(rpc(
                 codes::BAD_REQUEST,
@@ -676,6 +690,16 @@ impl Hub {
         // made since it was suggested, an item it answers raised) would carry a command's
         // authority into the orchestrator's turn (`Core::mode_check`, `Core::relay_check`
         // read the message against the threads and items as they are when it arrives).
+        // A transcript that reads as one may be a misheard word ("allow" for "a loud"): it is
+        // handed back, nothing recorded, for the user to see and send as typed if they mean it.
+        if origin == SayOrigin::Voice && core.reads_as_command(message) {
+            return Ok(json!({
+                "action": "confirm",
+                "heard": message,
+                "reason": "this reads as an answer to a request or a mode change, and a spoken \
+                           message never gives one by itself: confirm it to send it as typed",
+            }));
+        }
         if suggested && core.reads_as_command(message) {
             return Err(rpc(
                 codes::BAD_REQUEST,

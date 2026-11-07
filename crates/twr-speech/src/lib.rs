@@ -35,5 +35,5 @@ mod test_support;
 
 pub use engine::{engine_available, from_config, Engine, Prefs};
 pub use link::{LinkSpec, SshSpec, Workspaces};
-pub use speaker::{raw_mode, run, tty_keys, Key, KeyInput, Reporter, SpeakerOpts};
+pub use speaker::{raw_mode, run, tty_keys, Key, KeyInput, Reporter, SpeakerOpts, StateObserver};
 pub use state::StateStore;

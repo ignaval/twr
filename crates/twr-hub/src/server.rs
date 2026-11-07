@@ -271,7 +271,7 @@ use twr_runner::reap::{self, AncestryEnd, ProcessId};
 
 use crate::hub::{
     wait_state, AgentPeer, AgentWhy, BoxView, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
-    StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
+    SayOrigin, StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
 };
 
 /// Attach leases held by one connection: `(thread id, lease id)`.
@@ -2052,6 +2052,10 @@ struct SayParams {
     /// as a short command at once.
     #[serde(default)]
     suggested: bool,
+    /// The message is a transcript of the user's speech (`docs/voice.md`): never applied as a
+    /// short command, and one that reads as one is handed back for the user to confirm.
+    #[serde(default)]
+    voice: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -2469,14 +2473,32 @@ async fn say(hub: &Hub, caller: &Caller, p: Value) -> Result<Value, RpcError> {
             "a suggested message goes to the orchestrator only (`to: \"orchestrator\"`)",
         ));
     }
+    // A transcript, routed, could answer a request (`@api yes`) on a misheard word.
+    if p.voice && p.to.as_deref() != Some("orchestrator") {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a spoken message goes to the orchestrator only (`to: \"orchestrator\"`)",
+        ));
+    }
+    if p.voice && p.suggested {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a message is either suggested or spoken, not both",
+        ));
+    }
+    let origin = if p.voice {
+        SayOrigin::Voice
+    } else if p.suggested {
+        SayOrigin::Suggested
+    } else {
+        SayOrigin::Typed
+    };
     match p.to.as_deref() {
         None => {
             hub.say_seen(&p.message, p.focused.as_deref(), p.seen_gseq, caller)
                 .await
         }
-        Some("orchestrator") => {
-            hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, p.suggested)
-        }
+        Some("orchestrator") => hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, origin),
         Some(other) => Err(RpcError::new(
             codes::BAD_REQUEST,
             format!("say `to` can only be \"orchestrator\" (not {other:?}); omit it to route"),

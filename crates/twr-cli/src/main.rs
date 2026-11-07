@@ -443,6 +443,11 @@ enum Cmd {
         /// and the commands to install it; installs nothing.
         #[arg(long)]
         print_service: bool,
+        /// For a program that drives the speaker (the desktop app's voice mode): controls on
+        /// stdin, one per line (`pause`, `resume`, `stop`, `skip`, `quit`), and what it plays
+        /// on stdout, one JSON object per line. Its notes stay on stderr.
+        #[arg(long, value_name = "MODE", value_parser = ["stdio"], conflicts_with = "print_service")]
+        control: Option<String>,
     },
     /// `mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak
     /// --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's
@@ -1766,6 +1771,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             voice,
             rate,
             print_service,
+            control,
         }) => {
             refuse_agent_action("start a speaker")?;
             if cli.socket.is_some() {
@@ -1781,6 +1787,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     voice,
                     rate,
                     print_service,
+                    control_stdio: control.is_some(),
                 },
                 &paths,
             )

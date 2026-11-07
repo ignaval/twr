@@ -24,7 +24,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use twr_core::config::SpeechConfig;
 use twr_core::speech::{
-    name_error, utterances, CtlOp, SpeakOpts, SpeechAttachParams, SpeechItem, TEXT_MAX,
+    name_error, utterances, CtlOp, SpeakOpts, SpeechAttachParams, SpeechItem, SpeechStateParams,
+    TEXT_MAX,
 };
 
 use crate::engine::{Engine, Prefs};
@@ -34,6 +35,11 @@ use crate::state::{live_key, SpeechState, StateStore};
 
 /// Where the speaker's notes go (attached, standing by, an engine error, ssh's own words).
 pub type Reporter = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// What a speaker plays, told after every round for each workspace attached (as it reports
+/// it to that workspace's hub): for a device that also listens (`docs/voice.md`), which
+/// silences its own echo and pauses the voice when the user starts to talk.
+pub type StateObserver = Arc<dyn Fn(&str, &SpeechStateParams) + Send + Sync>;
 
 /// How a speaker runs.
 #[derive(Clone)]
@@ -55,6 +61,8 @@ pub struct SpeakerOpts {
     /// ssh may ask for a passphrase or about the host key on the same terminal, and a key
     /// reader in raw mode would take what you type. With `keys` given, ignored.
     pub tty_keys_once_attached: bool,
+    /// Told what it plays ([`StateObserver`]); `None`: nobody.
+    pub observe: Option<StateObserver>,
 }
 
 impl std::fmt::Debug for SpeakerOpts {
@@ -77,6 +85,10 @@ pub enum Key {
     PauseResume,
     /// `n`: the next message.
     Skip,
+    /// Pause, whatever it was doing (a device's voice input: the user started to talk).
+    Pause,
+    /// Go on after a pause (the user stopped talking); nothing when not paused.
+    Resume,
     /// `q`, Ctrl-C: quit.
     Quit,
 }
@@ -298,6 +310,8 @@ pub async fn run(
                 Some(Key::Stop) => player.machine.stop(),
                 Some(Key::PauseResume) => player.machine.toggle_pause(),
                 Some(Key::Skip) => player.machine.skip(),
+                Some(Key::Pause) => player.machine.pause(),
+                Some(Key::Resume) => player.machine.resume(),
                 // The key reader ended (the terminal went away): the terminal goes back out
                 // of raw mode with it.
                 None => {
@@ -378,7 +392,11 @@ pub async fn run(
         }
         said_error = error;
         for ws in &connected {
-            link.report(ws, player.machine.state_for(ws));
+            let state = player.machine.state_for(ws);
+            if let Some(observe) = &opts.observe {
+                observe(ws, &state);
+            }
+            link.report(ws, state);
         }
     }
     // Quitting stops the voice, also what speech-dispatcher still has of the chunk.
@@ -701,6 +719,7 @@ mod tests {
         let notes = notes.clone();
         SpeakerOpts {
             tty_keys_once_attached: false,
+            observe: None,
             name: "test speaker".into(),
             config: SpeechConfig::default(),
             voice: None,

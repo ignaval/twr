@@ -599,6 +599,8 @@ pub struct Speak {
     pub rate: Option<u32>,
     /// `--print-service`.
     pub print_service: bool,
+    /// `--control stdio`: controls on stdin, what it plays on stdout ([`stdio_keys`]).
+    pub control_stdio: bool,
 }
 
 /// What a speaker reads: this machine's hubs of `paths`'s root, or a remote one's over ssh.
@@ -705,7 +707,7 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
     };
     // Keys are read once a hub is attached: before that, ssh may ask for a passphrase or about
     // the host key on this terminal. Raw mode while they are: lines end with "\r\n" then.
-    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let tty = !args.control_stdio && std::io::IsTerminal::is_terminal(&std::io::stdin());
     let report: Reporter = Arc::new(|note: &str| note_line(twr_speech::raw_mode(), note));
     let start = format!(
         "reading aloud what {} says, with {}",
@@ -721,9 +723,80 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         state: StateStore::in_data_dir(&root.data_dir),
         report: Some(report),
         tty_keys_once_attached: tty,
+        observe: args.control_stdio.then(stdio_observer),
     };
+    let keys = args.control_stdio.then(stdio_keys);
     // `run` restores the terminal before it returns, so an error prints on a normal one.
-    twr_speech::run(opts, link, engine, None, shutdown).await
+    twr_speech::run(opts, link, engine, keys, shutdown).await
+}
+
+/// `--control stdio`'s controls: one per line on stdin. The end of stdin (the program that
+/// drives the speaker is gone) quits; an unknown line is ignored (a newer program's).
+fn stdio_keys() -> twr_speech::KeyInput {
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            let key = match lines.next_line().await {
+                Ok(Some(line)) => match stdio_key(&line) {
+                    Some(k) => k,
+                    None => continue,
+                },
+                Ok(None) | Err(_) => twr_speech::Key::Quit,
+            };
+            let quit = key == twr_speech::Key::Quit;
+            if tx.send(key).await.is_err() || quit {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// A line of `--control stdio`'s stdin, as a key.
+fn stdio_key(line: &str) -> Option<twr_speech::Key> {
+    use twr_speech::Key;
+    Some(match line.trim() {
+        "pause" => Key::Pause,
+        "resume" => Key::Resume,
+        "stop" => Key::Stop,
+        "skip" => Key::Skip,
+        "quit" => Key::Quit,
+        _ => return None,
+    })
+}
+
+/// `--control stdio`'s output: what the speaker plays for each workspace, one JSON line when
+/// it changes (`{"workspace", "playing", "paused", "queued", "live", "error"}`).
+fn stdio_observer() -> twr_speech::StateObserver {
+    let last = std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
+    Arc::new(
+        move |ws: &str, state: &twr_core::speech::SpeechStateParams| {
+            let line = stdio_state_line(ws, state);
+            let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+            if last.get(ws) == Some(&line) {
+                return;
+            }
+            last.insert(ws.to_string(), line.clone());
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        },
+    )
+}
+
+/// One line of [`stdio_observer`].
+fn stdio_state_line(ws: &str, state: &twr_core::speech::SpeechStateParams) -> String {
+    json!({
+        "type": "state",
+        "workspace": ws,
+        "playing": state.playing.is_some(),
+        "paused": state.paused,
+        "queued": state.queued,
+        "live": state.live,
+        "error": state.error,
+    })
+    .to_string()
 }
 
 /// One of the speaker's notes on stderr: `\r\n`-ended in raw mode; with the time in front
@@ -1106,6 +1179,45 @@ mod tests {
 
     fn words(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `--control stdio` takes the five controls, trimmed, and ignores anything else (a newer
+    /// program's control), so a typo never quits a speaker.
+    #[test]
+    fn stdio_controls_are_read_line_by_line() {
+        use twr_speech::Key;
+        for (line, key) in [
+            ("pause", Key::Pause),
+            (" resume\r", Key::Resume),
+            ("stop", Key::Stop),
+            ("skip", Key::Skip),
+            ("quit", Key::Quit),
+        ] {
+            assert_eq!(stdio_key(line), Some(key), "{line:?}");
+        }
+        for line in ["", "PAUSE", "pause now", "q"] {
+            assert_eq!(stdio_key(line), None, "{line:?}");
+        }
+    }
+
+    /// What a speaker plays reaches its driver as one JSON object a line: no text of the
+    /// conversation, only whether it plays, is paused and how much waits.
+    #[test]
+    fn stdio_state_lines_carry_no_text() {
+        let state = twr_core::speech::SpeechStateParams {
+            paused: true,
+            queued: 2,
+            live: true,
+            ..Default::default()
+        };
+        let line = stdio_state_line("work", &state);
+        assert!(!line.contains('\n'));
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "state", "workspace": "work", "playing": false, "paused": true,
+                   "queued": 2, "live": true, "error": null})
+        );
     }
 
     /// mosh passes its command on as words; ssh joins it for the remote shell, so each word

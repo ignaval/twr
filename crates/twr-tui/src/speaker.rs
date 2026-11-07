@@ -121,6 +121,7 @@ impl OwnSpeaker {
             let root = paths.root();
             let opts = SpeakerOpts {
                 tty_keys_once_attached: false,
+                observe: None,
                 name: speaker_name(&crate::speech::host()),
                 config,
                 voice: None,
