@@ -206,6 +206,28 @@ A speaker reads the orchestrator's messages aloud on the machine you listen on (
 - **The feed is trusted as far as the server is.** A server you don't trust could make your laptop speak any text: the speaker checks every item's shape, bounds its sizes (64 KB per message, 300 characters per utterance) and only plays it. The speaker never listens on a socket or port.
 - **What is kept.** Nothing in the event log. The hub keeps the attached speakers and their status in memory. The speaker keeps its device id, its live switch per workspace, its voice and rate, and the last message it read of each thread in `speech-state.json` in twr's data directory, readable only by you.
 
+## Voice mode
+
+Voice mode ([voice.md](voice.md)) turns what you say into a message; its risks are a misheard
+word and a microphone left on:
+
+- **A transcript never answers.** `say {voice: true}` goes to the orchestrator only and is never
+  applied as a short command. One that reads as an answer to a permission or question, or as a
+  mode change, is handed back (`action: "confirm"`) with nothing recorded, and the app makes you
+  send it as typed. So no recognition error can approve a request, and a transcript gives the
+  orchestrator no more authority to relay than a typed message that reads as no command.
+- **The microphone is the app's, and only while voice is on.** The desktop window is granted the
+  microphone only after you turned voice on, only for audio, and only for the app's own page:
+  every other permission stays refused, as before. Agents have no way to turn it on.
+- **No audio leaves the device by default.** whisper.cpp runs on your machine, reading a 0600
+  file in a private temporary directory, removed once read; its arguments are fixed and the
+  vocabulary hint is thread names reduced to `[A-Za-z0-9._-]`. A `command` engine is an
+  argument list run without a shell, with the recording on its stdin, and receives every word
+  you say. `config.show` hides `[voice]`, as it hides `[speech]` (a hosted recognizer's key may be
+  in its arguments).
+- **The speaker it drives says only the log.** The app's speaker is an ordinary `twr speak`:
+  `--control stdio` reads five fixed control words and writes playback state with no text.
+
 ## Terminal setup from the TUI
 
 The TUI's offer to make `Shift-Enter` start a new line ([tui.md](tui.md#shift-enter-over-mosh-and-ssh)) changes a file of yours, your terminal's settings, so it is held to the rules of `twr terminal-setup`, and more:

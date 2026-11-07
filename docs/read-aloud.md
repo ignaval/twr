@@ -1,6 +1,7 @@
 # Reading aloud
 
-twr can read the orchestrator's messages aloud:
+twr can read the orchestrator's messages aloud (and, in the desktop and mobile apps, listen to
+what you say back: [voice.md](voice.md)):
 
 - **as they come**, with `/read on` (live mode);
 - **on demand**, with `/read N` for the last N messages.
@@ -116,6 +117,10 @@ Only one speaker of a machine speaks for the same hubs. If the TUI's own speaker
 speak` run on one machine for its own hubs (or two `twr speak --ssh` for one server), the
 second one waits and takes over if the first one goes. A speaker for another machine's hubs is
 not held up: the TUI's own speaker on your laptop and `twr speak --ssh myserver` both run.
+
+`twr speak --control stdio` is for a program that drives a speaker: controls on stdin and
+what it plays on stdout, one line each. The desktop app's voice mode runs one
+([voice.md](voice.md#where-it-plays)).
 
 To keep a speaker running whenever you're logged in, `twr speak --ssh myserver --print-service`
 prints a LaunchAgent (macOS) or a systemd user unit (Linux) to install yourself. twr installs

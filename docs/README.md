@@ -12,6 +12,7 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [desktop-qa.md](desktop-qa.md) | tested desktop workflows, visual checks and feature-parity limits |
 | [performance.md](performance.md) | application performance measurements, improvements and reproduction |
 | [read-aloud.md](read-aloud.md) | reading the orchestrator's messages aloud: `/read`, speakers, `twr speak` and `twr remote` over SSH and mosh, engines |
+| [voice.md](voice.md) | voice mode in the desktop and mobile apps: push to talk, hands-free, spoken controls, recognition with whisper.cpp or your own program |
 | [notifications.md](notifications.md) | the hub's notification command: what it's told and when, ntfy, desktop and Slack recipes |
 | [configuration.md](configuration.md) | every key in `config.toml` with its default, and the environment variables |
 | [runtimes.md](runtimes.md) | Claude Code, Codex, Grok Build, ACP agents and presets, PTY, permission modes, what's been checked against the real CLIs |

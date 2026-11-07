@@ -44,6 +44,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
         "docs/read-aloud.md",
         include_str!("../../../docs/read-aloud.md"),
     ),
+    ("docs/voice.md", include_str!("../../../docs/voice.md")),
     (
         "docs/configuration.md",
         include_str!("../../../docs/configuration.md"),
