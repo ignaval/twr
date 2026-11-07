@@ -177,8 +177,10 @@ macOS's documentation doesn't say whether its ordinary voices work offline. With
 engine, the text goes wherever your program sends it: a hosted voice gets every word of the
 conversation.
 
-Windows isn't supported, and iOS can't run a speaker. On Android, Termux can read the plain
-feed (below) with `termux-tts-speak`.
+Windows isn't supported. A phone can't run `twr speak`; the iOS and Android apps' voice mode has
+the mobile gateway run a speaker for the phone, which speaks with the platform's own voice
+([mobile.md](mobile.md#voice)). On Android, Termux can also read the plain feed (below) with
+`termux-tts-speak`.
 
 ## The feed, for your own reader
 

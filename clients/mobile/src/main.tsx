@@ -16,6 +16,7 @@ import {
   useEditorSessions,
 } from "../../shared/editors";
 import { RemoteHost, Transport, type Hub } from "./transport";
+import { mobileVoice } from "./voice";
 import { observeLayout } from "./layout";
 import { observeTextScale, secureDelete } from "./offline";
 import { parseInvitation } from "../../shared/connections";
@@ -70,6 +71,7 @@ function Mobile() {
   }>();
   const folderGeneration = useRef(0);
   const host = useRef<RemoteHost>(null);
+  const voice = useRef<ReturnType<typeof mobileVoice>>(undefined);
   const switchTail = useRef<Promise<unknown>>(Promise.resolve());
   function queueSwitch<T>(job: () => Promise<T>): Promise<T> {
     const pending = switchTail.current.catch(() => {}).then(job);
@@ -214,6 +216,8 @@ function Mobile() {
       old?.resolve(null);
       return undefined;
     });
+    voice.current?.dispose();
+    voice.current = undefined;
     Reflect.deleteProperty(window, "twr");
     await previous?.stop();
   }
@@ -289,7 +293,16 @@ function Mobile() {
       );
       await remote.start();
       host.current = remote;
-      window.twr = remote.api();
+      const api = remote.api();
+      // Voice mode where the app has the native recognizer and voice (docs/mobile.md).
+      const started = remote;
+      voice.current = mobileVoice({
+        request: (method, params, timeout) =>
+          started.request(method, params, timeout),
+        onEvent: api.onEvent,
+      });
+      if (voice.current) api.nativeVoice = voice.current;
+      window.twr = api;
       document.documentElement.dataset.mobile = "true";
       document.documentElement.dataset.hub = hub.id;
       activeHub.current = hub;

@@ -46,6 +46,28 @@ Uploads are explicit and never sent as messages automatically. The shared attach
 
 Remote terminals survive temporary connection loss. Mobile controls include Escape, Tab, Control and arrows. A reconnect restores the transcript and terminal history. While the app remains alive, reconnect reuses each pending mutation's original ID and payload. The gateway returns its durable receipt or waits for the original operation, without executing a second copy. Receipts live in the root twr data directory under `mobile/requests`, are bounded and expire after 24 hours. Plain messages also persist in the encrypted outbox across app termination and retain their original IDs for safe retries within 23 hours. Expired or uncertain outcomes require review before a new message is submitted. Other pending operations still require checking hub state after app termination. Gateway restarts end its PTYs; socket reconnects preserve them.
 
+## Voice
+
+The composer's microphone talks to the orchestrator: tap it to talk and tap again to send, hold it and let go, or start a hands-free session that sends one message per utterance and reads the replies aloud. The phone's own recognizer turns speech into text; the text goes through `say` like a typed message (marked as spoken), so a transcript that reads as an answer or a mode change comes back for confirmation instead. No audio leaves the phone except to the platform's recognizer when it is not on the device (below). Saying only "stop", "pause", "skip", "repeat" or "stop listening" controls the voice and is never sent.
+
+| | iOS | Android |
+|---|---|---|
+| Recognizer | Speech framework (`SFSpeechRecognizer`) from the microphone (`AVAudioEngine`), thread names as contextual strings | `SpeechRecognizer`, thread names as biasing strings on Android 13+ |
+| On the device | When the recognizer supports it (`requiresOnDeviceRecognition`); otherwise the audio goes to Apple's servers | With `createOnDeviceSpeechRecognizer` (Android 12+) when the language is installed; otherwise the default recognizer, asked to prefer offline, whose service may use the network |
+| Permissions | Speech Recognition and Microphone, asked the first time voice starts | Microphone (`RECORD_AUDIO`), asked the first time voice starts |
+| Echo | `.playAndRecord` in `.voiceChat` mode with voice processing: the system's echo cancellation | the recognizer's own audio path; no app-level echo cancellation |
+| Voice | `AVSpeechSynthesizer` | `TextToSpeech` |
+
+The voice bar says whether recognition stays on the device; a denied permission shows how to allow it in Settings. Hands-free ends an utterance after about 0.9 s of silence. When you start talking, the phone's voice pauses at once (barge-in); a reply heard back through the speaker is usually recognized as an echo and dropped, but a quiet room and headphones work best. Android has no continuous recognition: hands-free restarts the recognizer after each result, no-match or timeout, with a short pause in which a word can be missed, and some phones play a sound at each restart. Voice is foreground only on both platforms: leaving the app stops listening and the voice, and ends a hands-free session.
+
+### The phone's speaker
+
+A phone can't run `twr speak`, so the gateway runs a speaker for it on the hub's machine. Starting hands-free starts it for the connected workspace and turns live reading on for that phone only (`/read status` lists it as "<device name> phone"; `/read off` turns it off like any speaker, and the next hands-free session turns it on again). It attaches to the hub like `twr speak`, and sends each sentence to the phone, which says it and acknowledges it; controls (pause, skip, stop) act on the gateway's speaker directly, without a hub round trip. Its device id, live switch and the last message it read are the phone's own, in `mobile/speakers/<device>/speech-state.json` under twr's data directory, so it never stands by for the hub machine's own speaker: a TUI on that machine and the phone both read aloud. A sentence waits up to 30 seconds for a lost connection and is said again in full; the speaker ends when the phone stops it, switches workspace, has had no connection for a minute, or is revoked.
+
+Listening needs only the `read` scope: the speaker carries what the hub's speech feed sends a speaker (the orchestrator's finished messages, and those `/read N` asks for), which a read device can already open. Sending what you say needs `operate`, as typing does; asking the hub to repeat a message (`speech.request`) does too. The phone can only start, stop and control its speaker and acknowledge sentences: no call takes text, so it can never make the hub or another speaker say anything. The hub refuses `speech.attach` on a device's own connection, so the gateway attaches its speaker as your user, and checks the device's grant and revocation itself.
+
+Not verified on hardware: real microphone input, recognition, on-device availability, echo cancellation and the platform voices have only been built (iOS Simulator and Android debug builds), not exercised; Simulators and emulators have no usable microphone path in this repository's QA.
+
 ## Notifications
 
 **Test notification** in Remote hub settings exercises the native system notification and tap routing without paid credentials. Remote background push requires Apple or Firebase configuration; a local notification test does not prove APNs/FCM delivery.
