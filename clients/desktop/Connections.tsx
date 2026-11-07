@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
 import { Dialog } from "../shared/ui";
 import { errorMessage } from "../shared/errors";
+import { handleRovingKey } from "../shared/a11y";
 import {
   encodeInvitation,
   parseInvitation,
@@ -143,21 +144,37 @@ export function Connections({
           className="button-row"
           role="tablist"
           aria-label="Connection settings"
+          onKeyDown={(event) => {
+            const next = handleRovingKey(
+              event,
+              event.currentTarget,
+              '[role="tab"]',
+              "horizontal",
+            );
+            if (next?.dataset.tab) setTab(next.dataset.tab as typeof tab);
+          }}
         >
-          <button
-            role="tab"
-            aria-selected={tab === "hubs"}
-            onClick={() => setTab("hubs")}
-          >
-            Saved hubs
-          </button>
-          <button
-            role="tab"
-            aria-selected={tab === "gateway"}
-            onClick={() => setTab("gateway")}
-          >
-            Share this computer
-          </button>
+          {(
+            [
+              ["hubs", "Saved hubs"],
+              ["gateway", "Share this computer"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              role="tab"
+              id={`connections-tab-${key}`}
+              data-tab={key}
+              aria-selected={tab === key}
+              aria-controls={
+                tab === key ? `connections-panel-${key}` : undefined
+              }
+              tabIndex={tab === key ? 0 : -1}
+              onClick={() => setTab(key)}
+            >
+              {label}
+            </button>
+          ))}
         </div>
         {error && (
           <p role="alert">{error.replace(/^SAVED_HUBS_UNREADABLE:\s*/, "")}</p>
@@ -181,345 +198,354 @@ export function Connections({
             </button>
           </div>
         )}
-        {tab === "hubs" ? (
-          <>
-            <button
-              disabled={busy || !active}
-              onClick={() => void run(() => onSelect())}
-            >
-              This computer{!active ? " · connected" : ""}
-            </button>
-            {hubs.map((hub) => (
-              <article className="saved-hub" key={hub.id}>
-                <div>
-                  <strong>{hub.name}</strong>
+        <div
+          role="tabpanel"
+          id={`connections-panel-${tab}`}
+          aria-labelledby={`connections-tab-${tab}`}
+          className="connections-panel"
+        >
+          {tab === "hubs" ? (
+            <>
+              <button
+                disabled={busy || !active}
+                onClick={() => void run(() => onSelect())}
+              >
+                This computer{!active ? " · connected" : ""}
+              </button>
+              {hubs.map((hub) => (
+                <article className="saved-hub" key={hub.id}>
+                  <div>
+                    <strong>{hub.name}</strong>
+                    <small>
+                      {hub.url} · {hub.scopes.join(", ")}
+                    </small>
+                  </div>
+                  <button
+                    disabled={busy || active?.id === hub.id}
+                    onClick={() => void run(() => onSelect(hub))}
+                  >
+                    {active?.id === hub.id ? "Connected" : "Connect"}
+                  </button>
+                  <button
+                    disabled={busy || active?.id === hub.id}
+                    onClick={() =>
+                      void run(async () => {
+                        await forgetOfflineHost(hub.id, window.twrLocal);
+                        editors.forget(hub.id);
+                        await window.twrRemote.removeHub({ id: hub.id });
+                        await refresh();
+                      })
+                    }
+                  >
+                    Forget
+                  </button>
                   <small>
-                    {hub.url} · {hub.scopes.join(", ")}
+                    Forget removes this device's local token. Revoke the device
+                    on the hub to invalidate any other copies.
                   </small>
-                </div>
-                <button
-                  disabled={busy || active?.id === hub.id}
-                  onClick={() => void run(() => onSelect(hub))}
-                >
-                  {active?.id === hub.id ? "Connected" : "Connect"}
-                </button>
-                <button
-                  disabled={busy || active?.id === hub.id}
-                  onClick={() =>
-                    void run(async () => {
-                      await forgetOfflineHost(hub.id, window.twrLocal);
-                      editors.forget(hub.id);
-                      await window.twrRemote.removeHub({ id: hub.id });
-                      await refresh();
-                    })
-                  }
-                >
-                  Forget
-                </button>
-                <small>
-                  Forget removes this device's local token. Revoke the device on
-                  the hub to invalidate any other copies.
-                </small>
-              </article>
-            ))}
-            <form
-              className="connection-form"
-              onPaste={(event) => {
-                const raw = event.clipboardData.getData("text").trim();
-                if (!raw.startsWith("{")) return;
-                event.preventDefault();
-                try {
-                  const invitation = parseInvitation(raw);
-                  const form = event.currentTarget;
-                  const url = form.elements.namedItem(
-                    "url",
-                  ) as HTMLInputElement;
-                  const code = form.elements.namedItem(
-                    "code",
-                  ) as HTMLInputElement;
-                  const name = form.elements.namedItem(
-                    "hubName",
-                  ) as HTMLInputElement;
-                  url.value = invitation.url;
-                  code.value = invitation.code;
-                  if (!name.value)
-                    name.value = new URL(invitation.url).hostname;
-                  setError("");
-                  setNotice(
-                    "Invitation loaded. Check the hub address and device name, then pair.",
-                  );
-                } catch (error) {
-                  setError(errorMessage(error));
-                }
-              }}
-              onSubmit={(event) => {
-                event.preventDefault();
-                const data = new FormData(event.currentTarget);
-                void run(async () => {
-                  const hub = await window.twrRemote.pair({
-                    url: String(data.get("url")),
-                    code: String(data.get("code")).trim(),
-                    hubName: String(data.get("hubName")),
-                    name: String(data.get("name")),
-                  });
-                  await refresh();
-                  await onSelect(hub);
-                });
-              }}
-            >
-              <h3>Pair another hub</h3>
-              <p>
-                Create a one-use invitation on that computer. Paste it here, or
-                enter its address and code.
-              </p>
-              <label>
-                Hub name
-                <input
-                  name="hubName"
-                  maxLength={80}
-                  required
-                  placeholder="Workstation"
-                />
-              </label>
-              <label>
-                HTTPS hub URL
-                <input
-                  name="url"
-                  type="url"
-                  required
-                  placeholder="https://workstation.example:47321"
-                  autoCapitalize="none"
-                  autoCorrect="off"
-                />
-              </label>
-              <label>
-                One-use code
-                <input
-                  name="code"
-                  required
-                  autoComplete="off"
-                  autoCapitalize="none"
-                  spellCheck={false}
-                />
-              </label>
-              <label>
-                This device
-                <input
-                  name="name"
-                  required
-                  maxLength={80}
-                  defaultValue="twr desktop"
-                />
-              </label>
-              <button className="primary" disabled={busy}>
-                {busy ? "Connecting…" : "Pair and connect"}
-              </button>
-            </form>
-          </>
-        ) : (
-          <>
-            <p>
-              Use a hostname reachable from your other device and a TLS
-              certificate trusted by it. Your hub and gateway keep running after
-              you close the app, until this computer restarts.
-            </p>
-            <p role="status">
-              {gatewayStatus
-                ? gatewayStatus.running
-                  ? `Gateway running · ${gatewayStatus.runningVersion} · ${gatewayStatus.listen}`
-                  : "Gateway stopped. Starting it is optional."
-                : "Checking gateway status…"}
-            </p>
-            {gatewayStatus?.renewalState &&
-              gatewayStatus.renewalState !== "current" && (
-                <p role="status">
-                  Certificate renewal {gatewayStatus.renewalState}.{" "}
-                  {gatewayStatus.renewalError} The previous TLS context remains
-                  active.
-                </p>
-              )}
-            {gatewayStatus?.logTail && <pre>{gatewayStatus.logTail}</pre>}
-            <button
-              disabled={busy}
-              onClick={() =>
-                void run(async () => {
-                  await probeGateway();
-                })
-              }
-            >
-              Refresh gateway status
-            </button>
-            {gatewayStatus?.running && (
-              <button disabled={busy} onClick={() => setConfirmStop(true)}>
-                Stop gateway…
-              </button>
-            )}
-            <form
-              className="connection-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void run(async () => {
-                  await cancelInvitation();
-                  const result = await window.twrRemote.setup({
-                    ...settings,
-                    scopes,
-                  });
-                  setRestartRequired(!!result.restartRequired);
-                  setChecked(!result.restartRequired);
-                  await probeGateway();
-                  setNotice(
-                    result.advisory ||
-                      "Local TLS, hostname and gateway identity checks passed. Check the address from your other device before pairing.",
-                  );
-                });
-              }}
-            >
-              <label>
-                Public HTTPS address
-                <input
-                  required
-                  type="url"
-                  disabled={busy}
-                  value={settings.url}
-                  onChange={(e) => update("url", e.target.value)}
-                  placeholder="https://workstation.example:47321"
-                />
-              </label>
-              <label>
-                Listen IP and port
-                <input
-                  required
-                  disabled={busy}
-                  value={settings.listen}
-                  onChange={(e) => update("listen", e.target.value)}
-                />
-              </label>
-              <label>
-                TLS certificate path
-                <input
-                  required
-                  disabled={busy}
-                  value={settings.cert}
-                  onChange={(e) => update("cert", e.target.value)}
-                  placeholder="/absolute/path/fullchain.pem"
-                />
-              </label>
-              <label>
-                TLS private key path
-                <input
-                  required
-                  disabled={busy}
-                  value={settings.key}
-                  onChange={(e) => update("key", e.target.value)}
-                  placeholder="/absolute/path/privkey.pem"
-                />
-              </label>
-              <label>
-                Device access
-                <select
-                  disabled={busy}
-                  value={scopes}
-                  onChange={(e) => {
-                    setScopes(e.target.value as GatewaySettings["scopes"]);
-                    void cancelInvitation().catch((e) =>
-                      setError(errorMessage(e)),
+                </article>
+              ))}
+              <form
+                className="connection-form"
+                onPaste={(event) => {
+                  const raw = event.clipboardData.getData("text").trim();
+                  if (!raw.startsWith("{")) return;
+                  event.preventDefault();
+                  try {
+                    const invitation = parseInvitation(raw);
+                    const form = event.currentTarget;
+                    const url = form.elements.namedItem(
+                      "url",
+                    ) as HTMLInputElement;
+                    const code = form.elements.namedItem(
+                      "code",
+                    ) as HTMLInputElement;
+                    const name = form.elements.namedItem(
+                      "hubName",
+                    ) as HTMLInputElement;
+                    url.value = invitation.url;
+                    code.value = invitation.code;
+                    if (!name.value)
+                      name.value = new URL(invitation.url).hostname;
+                    setError("");
+                    setNotice(
+                      "Invitation loaded. Check the hub address and device name, then pair.",
                     );
-                  }}
-                >
-                  <option value="read">Read only</option>
-                  <option value="operate">Read and operate</option>
-                  <option value="terminal">Read, operate and terminals</option>
-                  <option value="admin">
-                    Read, operate, terminals and settings
-                  </option>
-                </select>
-              </label>
-              <button disabled={busy} className="primary">
-                {busy ? "Checking…" : "Start gateway and check connection"}
-              </button>
-            </form>
-            {restartRequired && (
+                  } catch (error) {
+                    setError(errorMessage(error));
+                  }
+                }}
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  const data = new FormData(event.currentTarget);
+                  void run(async () => {
+                    const hub = await window.twrRemote.pair({
+                      url: String(data.get("url")),
+                      code: String(data.get("code")).trim(),
+                      hubName: String(data.get("hubName")),
+                      name: String(data.get("name")),
+                    });
+                    await refresh();
+                    await onSelect(hub);
+                  });
+                }}
+              >
+                <h3>Pair another hub</h3>
+                <p>
+                  Create a one-use invitation on that computer. Paste it here,
+                  or enter its address and code.
+                </p>
+                <label>
+                  Hub name
+                  <input
+                    name="hubName"
+                    maxLength={80}
+                    required
+                    placeholder="Workstation"
+                  />
+                </label>
+                <label>
+                  HTTPS hub URL
+                  <input
+                    name="url"
+                    type="url"
+                    required
+                    placeholder="https://workstation.example:47321"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                  />
+                </label>
+                <label>
+                  One-use code
+                  <input
+                    name="code"
+                    required
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                  />
+                </label>
+                <label>
+                  This device
+                  <input
+                    name="name"
+                    required
+                    maxLength={80}
+                    defaultValue="twr desktop"
+                  />
+                </label>
+                <button className="primary" disabled={busy}>
+                  {busy ? "Connecting…" : "Pair and connect"}
+                </button>
+              </form>
+            </>
+          ) : (
+            <>
+              <p>
+                Use a hostname reachable from your other device and a TLS
+                certificate trusted by it. Your hub and gateway keep running
+                after you close the app, until this computer restarts.
+              </p>
+              <p role="status">
+                {gatewayStatus
+                  ? gatewayStatus.running
+                    ? `Gateway running · ${gatewayStatus.runningVersion} · ${gatewayStatus.listen}`
+                    : "Gateway stopped. Starting it is optional."
+                  : "Checking gateway status…"}
+              </p>
+              {gatewayStatus?.renewalState &&
+                gatewayStatus.renewalState !== "current" && (
+                  <p role="status">
+                    Certificate renewal {gatewayStatus.renewalState}.{" "}
+                    {gatewayStatus.renewalError} The previous TLS context
+                    remains active.
+                  </p>
+                )}
+              {gatewayStatus?.logTail && <pre>{gatewayStatus.logTail}</pre>}
               <button
                 disabled={busy}
-                onClick={() => {
-                  if (!confirmRestart) {
-                    setConfirmRestart(true);
-                    return;
-                  }
+                onClick={() =>
+                  void run(async () => {
+                    await probeGateway();
+                  })
+                }
+              >
+                Refresh gateway status
+              </button>
+              {gatewayStatus?.running && (
+                <button disabled={busy} onClick={() => setConfirmStop(true)}>
+                  Stop gateway…
+                </button>
+              )}
+              <form
+                className="connection-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
                   void run(async () => {
                     await cancelInvitation();
-                    const result = await window.twrRemote.restart({
+                    const result = await window.twrRemote.setup({
                       ...settings,
                       scopes,
                     });
                     setRestartRequired(!!result.restartRequired);
                     setChecked(!result.restartRequired);
-                    setConfirmRestart(false);
                     await probeGateway();
                     setNotice(
                       result.advisory ||
-                        "Gateway restarted with the selected configuration. The independent hub is still running.",
+                        "Local TLS, hostname and gateway identity checks passed. Check the address from your other device before pairing.",
                     );
                   });
                 }}
               >
-                {confirmRestart
-                  ? "Confirm restart · close gateway terminal sessions"
-                  : "Restart gateway with these settings"}
-              </button>
-            )}
-            {confirmRestart && (
-              <p role="alert">
-                Restarting disconnects phones and closes their gateway terminal
-                sessions. The independent hub keeps running.
-              </p>
-            )}
-            {checked && (
-              <button
-                disabled={busy}
-                onClick={() =>
-                  void run(async () =>
-                    setInvitation(
-                      await window.twrRemote.invite({
+                <label>
+                  Public HTTPS address
+                  <input
+                    required
+                    type="url"
+                    disabled={busy}
+                    value={settings.url}
+                    onChange={(e) => update("url", e.target.value)}
+                    placeholder="https://workstation.example:47321"
+                  />
+                </label>
+                <label>
+                  Listen IP and port
+                  <input
+                    required
+                    disabled={busy}
+                    value={settings.listen}
+                    onChange={(e) => update("listen", e.target.value)}
+                  />
+                </label>
+                <label>
+                  TLS certificate path
+                  <input
+                    required
+                    disabled={busy}
+                    value={settings.cert}
+                    onChange={(e) => update("cert", e.target.value)}
+                    placeholder="/absolute/path/fullchain.pem"
+                  />
+                </label>
+                <label>
+                  TLS private key path
+                  <input
+                    required
+                    disabled={busy}
+                    value={settings.key}
+                    onChange={(e) => update("key", e.target.value)}
+                    placeholder="/absolute/path/privkey.pem"
+                  />
+                </label>
+                <label>
+                  Device access
+                  <select
+                    disabled={busy}
+                    value={scopes}
+                    onChange={(e) => {
+                      setScopes(e.target.value as GatewaySettings["scopes"]);
+                      void cancelInvitation().catch((e) =>
+                        setError(errorMessage(e)),
+                      );
+                    }}
+                  >
+                    <option value="read">Read only</option>
+                    <option value="operate">Read and operate</option>
+                    <option value="terminal">
+                      Read, operate and terminals
+                    </option>
+                    <option value="admin">
+                      Read, operate, terminals and settings
+                    </option>
+                  </select>
+                </label>
+                <button disabled={busy} className="primary">
+                  {busy ? "Checking…" : "Start gateway and check connection"}
+                </button>
+              </form>
+              {restartRequired && (
+                <button
+                  disabled={busy}
+                  onClick={() => {
+                    if (!confirmRestart) {
+                      setConfirmRestart(true);
+                      return;
+                    }
+                    void run(async () => {
+                      await cancelInvitation();
+                      const result = await window.twrRemote.restart({
+                        ...settings,
                         scopes,
-                      }),
-                    ),
-                  )
-                }
-              >
-                Create one-use invitation
-              </button>
-            )}
-            {invitation &&
-              (invitation.expiresAt > now ? (
-                <div className="pair-invitation" ref={invitationPanel}>
-                  {qr && (
-                    <img
-                      src={qr}
-                      alt="Scan this one-use twr pairing invitation with your phone"
-                      width={280}
-                      height={280}
-                    />
-                  )}
-                  <p>On your phone, choose Pair a hub → Scan QR code.</p>
-                  <code>{invitation.code}</code>
-                  <p>{invitation.url}</p>
-                  <p>
-                    Granted access: {invitation.scopes?.join(", ") || scopes}.
-                  </p>
-                  <small>
-                    One use · expires in{" "}
-                    {Math.ceil((invitation.expiresAt - now) / 1000)} seconds.
-                    Creating another invitation replaces this one.
-                  </small>
-                </div>
-              ) : (
-                <p role="status">
-                  Invitation expired. Create a new one to pair a device.
+                      });
+                      setRestartRequired(!!result.restartRequired);
+                      setChecked(!result.restartRequired);
+                      setConfirmRestart(false);
+                      await probeGateway();
+                      setNotice(
+                        result.advisory ||
+                          "Gateway restarted with the selected configuration. The independent hub is still running.",
+                      );
+                    });
+                  }}
+                >
+                  {confirmRestart
+                    ? "Confirm restart · close gateway terminal sessions"
+                    : "Restart gateway with these settings"}
+                </button>
+              )}
+              {confirmRestart && (
+                <p role="alert">
+                  Restarting disconnects phones and closes their gateway
+                  terminal sessions. The independent hub keeps running.
                 </p>
-              ))}
-          </>
-        )}
+              )}
+              {checked && (
+                <button
+                  disabled={busy}
+                  onClick={() =>
+                    void run(async () =>
+                      setInvitation(
+                        await window.twrRemote.invite({
+                          scopes,
+                        }),
+                      ),
+                    )
+                  }
+                >
+                  Create one-use invitation
+                </button>
+              )}
+              {invitation &&
+                (invitation.expiresAt > now ? (
+                  <div className="pair-invitation" ref={invitationPanel}>
+                    {qr && (
+                      <img
+                        src={qr}
+                        alt="Scan this one-use twr pairing invitation with your phone"
+                        width={280}
+                        height={280}
+                      />
+                    )}
+                    <p>On your phone, choose Pair a hub → Scan QR code.</p>
+                    <code>{invitation.code}</code>
+                    <p>{invitation.url}</p>
+                    <p>
+                      Granted access: {invitation.scopes?.join(", ") || scopes}.
+                    </p>
+                    <small>
+                      One use · expires in{" "}
+                      {Math.ceil((invitation.expiresAt - now) / 1000)} seconds.
+                      Creating another invitation replaces this one.
+                    </small>
+                  </div>
+                ) : (
+                  <p role="status">
+                    Invitation expired. Create a new one to pair a device.
+                  </p>
+                ))}
+            </>
+          )}
+        </div>
         {confirmStop && (
           <Dialog
             title="Stop remote access?"

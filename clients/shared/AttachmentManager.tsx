@@ -1,4 +1,5 @@
-import { useSyncExternalStore } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import { announce } from "./a11y";
 import type { UploadController } from "./uploads";
 import "./attachments.css";
 
@@ -15,9 +16,26 @@ export function AttachmentManager({
     controller.subscribe,
     controller.getSnapshot,
   ).filter((item) => item.thread === thread && item.workspace === workspace);
+  const phases = useRef(new Map<string, string>());
+  useEffect(() => {
+    // Announce completion and failure once; progress itself stays silent.
+    const seen = phases.current;
+    for (const item of items) {
+      const previous = seen.get(item.id);
+      if (previous !== undefined && previous !== item.phase) {
+        if (item.phase === "ready")
+          announce(`${item.file.name} uploaded and ready to send`);
+        else if (item.phase === "error")
+          announce(
+            `Upload failed for ${item.file.name}${item.error ? ": " + item.error : ""}`,
+          );
+      }
+      seen.set(item.id, item.phase);
+    }
+  });
   if (!items.length) return null;
   return (
-    <div className="attachment-manager" aria-label="Attachments">
+    <section className="attachment-manager" aria-label="Attachments">
       {items.map((item) => (
         <article className="attachment-item" key={item.id}>
           {item.image && (
@@ -48,16 +66,24 @@ export function AttachmentManager({
                 <pre>{item.text}</pre>
               </details>
             )}
-            {item.error && <p role="status">{item.error}</p>}
+            {item.error && <p>{item.error}</p>}
           </div>
           <div className="attachment-actions">
             {["hashing", "uploading", "queued"].includes(item.phase) && (
-              <button type="button" onClick={() => controller.pause(item.id)}>
+              <button
+                type="button"
+                aria-label={`Pause ${item.file.name}`}
+                onClick={() => controller.pause(item.id)}
+              >
                 Pause
               </button>
             )}
             {["paused", "error"].includes(item.phase) && (
-              <button type="button" onClick={() => controller.resume(item.id)}>
+              <button
+                type="button"
+                aria-label={`Resume ${item.file.name}`}
+                onClick={() => controller.resume(item.id)}
+              >
                 Resume
               </button>
             )}
@@ -71,6 +97,6 @@ export function AttachmentManager({
           </div>
         </article>
       ))}
-    </div>
+    </section>
   );
 }

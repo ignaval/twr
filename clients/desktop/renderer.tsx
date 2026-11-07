@@ -263,7 +263,7 @@ function Desktop() {
         />
       )}
       {error && (
-        <div className="connection-error" role="alert">
+        <div className="connection-error" role="alert" data-modal-keep="">
           {error}
           <button onClick={() => setError("")}>Dismiss</button>
         </div>
@@ -285,6 +285,8 @@ function Desktop() {
             >
               <input
                 aria-label="Remote folder path"
+                autoCapitalize="none"
+                spellCheck={false}
                 value={folder.path}
                 onChange={(e) =>
                   setFolder({
@@ -302,7 +304,11 @@ function Desktop() {
               </button>
             )}
             {folder.entries.map((entry) => (
-              <button key={entry.path} onClick={() => void browse(entry.path)}>
+              <button
+                key={entry.path}
+                aria-label={`Open folder ${entry.name}`}
+                onClick={() => void browse(entry.path)}
+              >
                 {entry.name}
               </button>
             ))}

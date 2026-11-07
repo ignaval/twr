@@ -19,7 +19,7 @@
   --border-strong: #3b444e;
   --text: #e6e9ec;
   --muted: #a3abb4;
-  --faint: #8b949e;
+  --faint: #959ea8;
   --accent: #62c7d4;
   --accent-fg: #06191c;
   --accent-soft: rgb(98 199 212 / 13%);
@@ -99,6 +99,16 @@ summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
+/* Keyboard focus stays visible on every focusable element, including custom
+ * widgets (cards, scrollers, separators) that are not buttons or links. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+/* Containers focused only programmatically (skip target, dialog fallback). */
+[tabindex="-1"]:not(button, a, input, select, textarea):focus-visible {
+  outline: none;
+}
 input,
 textarea,
 select {
@@ -117,6 +127,60 @@ textarea:focus,
 select:focus {
   box-shadow: none;
   border-color: var(--accent);
+}
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 1px var(--focus);
+}
+/* Native checkboxes, radios and sliders ignore border colour; give them a ring. */
+input[type="checkbox"]:focus-visible,
+input[type="radio"]:focus-visible,
+input[type="range"]:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  box-shadow: none;
+}
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.skip-link {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 300;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-200%);
+}
+.skip-link:focus,
+.skip-link:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+}
+.conversation-scroll:focus-visible,
+pre[tabindex]:focus-visible,
+.thread-list:focus-visible {
+  outline-offset: -2px;
+}
+.thread-grid > .thread-item {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.thread-grid > .thread-item > .thread-card {
+  flex: 1;
 }
 input::placeholder,
 textarea::placeholder {
@@ -1992,7 +2056,8 @@ meter::-webkit-meter-optimum-value {
   max-height: 55vh;
   padding: 8px;
 }
-.palette-list > button {
+.palette-list > button,
+.palette-options > button {
   display: flex;
   align-items: center;
   width: 100%;
@@ -2005,10 +2070,12 @@ meter::-webkit-meter-optimum-value {
   min-height: 40px;
   border-radius: 6px;
 }
-.palette-list > button:hover {
+.palette-list > button:hover,
+.palette-options > button:hover {
   background: var(--hover);
 }
-.palette-list > button > span:first-child {
+.palette-list > button > span:first-child,
+.palette-options > button > span:first-child {
   flex: 1;
   min-width: 0;
 }
@@ -2070,15 +2137,15 @@ meter::-webkit-meter-optimum-value {
   --border-strong: #c2c5c7;
   --text: #1c1f22;
   --muted: #565d64;
-  --faint: #656d75;
-  --accent: #087486;
+  --faint: #5f666e;
+  --accent: #076c7c;
   --accent-fg: #ffffff;
-  --accent-soft: rgb(8 116 134 / 10%);
-  --warning: #946300;
-  --warning-soft: rgb(148 99 0 / 10%);
-  --danger: #c2413b;
-  --danger-soft: rgb(194 65 59 / 9%);
-  --success: #2f7d4f;
+  --accent-soft: rgb(7 108 124 / 10%);
+  --warning: #8a5c00;
+  --warning-soft: rgb(138 92 0 / 10%);
+  --danger: #b83a34;
+  --danger-soft: rgb(184 58 52 / 9%);
+  --success: #2b7449;
   --scrim: rgb(20 22 25 / 35%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
   --destination-strength: 45%;
@@ -2097,15 +2164,15 @@ meter::-webkit-meter-optimum-value {
     --border-strong: #c2c5c7;
     --text: #1c1f22;
     --muted: #565d64;
-    --faint: #656d75;
-    --accent: #087486;
+    --faint: #5f666e;
+    --accent: #076c7c;
     --accent-fg: #ffffff;
-    --accent-soft: rgb(8 116 134 / 10%);
-    --warning: #946300;
-    --warning-soft: rgb(148 99 0 / 10%);
-    --danger: #c2413b;
-    --danger-soft: rgb(194 65 59 / 9%);
-    --success: #2f7d4f;
+    --accent-soft: rgb(7 108 124 / 10%);
+    --warning: #8a5c00;
+    --warning-soft: rgb(138 92 0 / 10%);
+    --danger: #b83a34;
+    --danger-soft: rgb(184 58 52 / 9%);
+    --success: #2b7449;
     --scrim: rgb(20 22 25 / 35%);
     --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
     --destination-strength: 45%;
@@ -2145,7 +2212,9 @@ meter::-webkit-meter-optimum-value {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  * {
+  *,
+  *::before,
+  *::after {
     animation: none !important;
     transition: none !important;
     scroll-behavior: auto !important;
@@ -2273,7 +2342,8 @@ meter::-webkit-meter-optimum-value {
   background: var(--warning);
 }
 .mentions > button.active,
-.palette-list > button.active {
+.palette-list > button.active,
+.palette-options > button.active {
   background: var(--hover);
   color: var(--accent);
 }
@@ -2761,7 +2831,8 @@ meter::-webkit-meter-optimum-value {
   color: var(--thread-color);
   flex-shrink: 0;
 }
-.palette-list > button[data-cli="true"] b {
+.palette-list > button[data-cli="true"] b,
+.palette-options > button[data-cli="true"] b {
   font-family: var(--font-mono);
 }
 

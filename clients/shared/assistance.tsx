@@ -362,8 +362,13 @@ export function AssistanceNotice({
   disable: () => void;
 }) {
   return (
-    <aside className="assistance-notice">
-      <b>Small-model suggestions and summaries</b>
+    <aside
+      className="assistance-notice"
+      aria-labelledby="twr-assistance-notice-title"
+    >
+      <b id="twr-assistance-notice-title">
+        Small-model suggestions and summaries
+      </b>
       <p>
         Suggestions send the completed turn’s prompt (2 KB) and reply ending (6
         KB). Summaries send a thread’s name, state, activity and routine updates

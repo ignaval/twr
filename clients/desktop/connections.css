@@ -22,7 +22,8 @@
 }
 .connections-content pre,
 .connection-form p,
-.connections-content > p {
+.connections-content > p,
+.connections-panel > p {
   line-height: 1.5;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -80,4 +81,9 @@
   background: var(--overlay);
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+.connections-panel {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
 }
