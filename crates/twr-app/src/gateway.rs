@@ -239,8 +239,11 @@ mod socket_tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(sources.len(), 64);
         assert_eq!(sources[0]["attention"][0]["attn_id"], "ready");
-        assert!(sources[1..].iter().all(|source| source["cached"] == true
-            && source["error"].as_str().unwrap().contains("deadline")));
+        assert!(sources[1..].iter().all(|source| {
+            source["cached"].as_bool() != Some(true)
+                && source["attention"].as_array().unwrap().is_empty()
+                && source["error"].as_str().unwrap().contains("deadline")
+        }));
         assert_eq!(
             alive.load(Ordering::SeqCst),
             0,
