@@ -7,6 +7,7 @@ import {
   dialog,
   shell,
   clipboard,
+  crashReporter,
   nativeTheme,
 } from "electron";
 import { spawn, execFile } from "node:child_process";
@@ -44,6 +45,7 @@ import {
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
 import { ENGINE_BINARIES, EngineDigests, cleanupEngines } from "./engines";
 import { discoverCatalog } from "./catalog";
+import { AppServices } from "./app-services";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
@@ -75,6 +77,8 @@ let localGeneration = 0;
 const exec = promisify(execFile);
 let openingTerminals = 0;
 let remoteTransport: DesktopTransport;
+let services: AppServices | undefined;
+let hubVersion: string | undefined;
 const terminals = new Map<
   string,
   {
@@ -138,6 +142,8 @@ function applyNativeAppearance() {
 const devUrl = !app.isPackaged ? process.env.TWR_DESKTOP_DEV_URL : undefined;
 if (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
   app.setPath("userData", resolve(process.env.TWR_DESKTOP_TEST_USER_DATA));
+// Crash reports stay on this machine (app.getPath("crashDumps")); nothing is uploaded.
+crashReporter.start({ uploadToServer: false });
 const appFile = resolve(__dirname, "../dist/index.html");
 const env = (): NodeJS.ProcessEnv => ({
   ...loginEnv,
@@ -357,6 +363,7 @@ async function connectWorkspace(next: string, generation: number) {
       .call("notify.looking", { looking: window?.isFocused() || false })
       .catch(() => {});
     saveDesktopSettings({ workspace: next });
+    hubVersion = hubInfo.version;
     return {
       ...paths,
       hubVersion: hubInfo.version,
@@ -364,6 +371,7 @@ async function connectWorkspace(next: string, generation: number) {
     };
   } catch (error) {
     // Retain the companion for config repair, while blocking workspace-bound commands.
+    services?.log.warn("hub", `Could not open workspace ${next}`, error);
     emit({ type: "config-available", error: String(error) });
     throw error;
   }
@@ -390,6 +398,14 @@ function omarchyTheme(): Record<string, string> | null {
   }
 }
 function register() {
+  services!.register(handle, (channel, callback) =>
+    ipcMain.on(`twr:${channel}`, (event, ...args) => {
+      try {
+        trusted(event);
+        callback(...args);
+      } catch {}
+    }),
+  );
   const vault = new SecureStore(
     join(app.getPath("userData"), "secure", "connections"),
   );
@@ -577,7 +593,7 @@ function register() {
   );
   handle("rpc", (method, params) => {
     z.string().max(100).parse(method);
-    if (method === "desktop.check_updates") return checkUpdates();
+    if (method === "desktop.check_updates") return services!.updater.check();
     if (
       method.startsWith("desktop.") &&
       ![
@@ -828,36 +844,20 @@ function register() {
     } catch {}
   });
 }
-async function checkUpdates() {
-  const response = await fetch(
-    "https://api.github.com/repos/ignaval/twr/releases/latest",
-    {
-      headers: { Accept: "application/vnd.github+json" },
-      signal: AbortSignal.timeout(15000),
-    },
-  );
-  if (!response.ok)
-    throw new Error(
-      `Could not check releases (${response.status}). Try again later.`,
-    );
-  const release = (await response.json()) as any;
-  const assets = (release.assets || [])
-    .filter((a: any) => /\.dmg$|\.AppImage$|\.pkg\.tar\.zst$/.test(a.name))
-    .map((a: any) => ({ name: a.name, url: a.browser_download_url }));
-  return {
-    installed: app.getVersion(),
-    latest: release.tag_name,
-    release_page: release.html_url,
-    desktop_installers: assets,
-    message: assets.length
-      ? "Download the desktop installer for your platform. The application and bundled engine must be updated together."
-      : "This release does not contain desktop installers yet. The current bundled engine has not been changed.",
-  };
+function showWindow() {
+  if (!window || window.isDestroyed()) {
+    void createWindow();
+    return;
+  }
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
 }
-async function createWindow() {
+async function createWindow(hidden = false) {
   quitting = false;
   applyNativeAppearance();
   window = new BrowserWindow({
+    show: !hidden,
     width: 1360,
     height: 900,
     minWidth: 420,
@@ -916,6 +916,12 @@ async function createWindow() {
       void bridge?.call("notify.looking", { looking: false }).catch(() => {});
   });
   window.on("close", async (event) => {
+    // Background mode: keep the renderer, hub connection and terminals alive.
+    if (!quitting && !quitRequested && services?.background) {
+      event.preventDefault();
+      window.hide();
+      return;
+    }
     if (!quitting && [...terminals.values()].some((t) => !t.exited)) {
       event.preventDefault();
       const result = await dialog.showMessageBox(window, {
@@ -935,6 +941,7 @@ async function createWindow() {
     }
   });
   window.on("closed", () => {
+    services?.setAttention({ count: 0, items: [] });
     ++localGeneration;
     workspaceReady = false;
     void remoteTransport.disconnect();
@@ -949,12 +956,7 @@ async function createWindow() {
 }
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on("second-instance", () => {
-    if (window) {
-      if (window.isMinimized()) window.restore();
-      window.focus();
-    }
-  });
+  app.on("second-instance", () => showWindow());
   app
     .whenReady()
     .then(async () => {
@@ -977,9 +979,33 @@ else {
       );
       if (savedAppearance.success) appearance = savedAppearance.data;
       applyNativeAppearance();
+      services = new AppServices(
+        {
+          window: () => (window && !window.isDestroyed() ? window : undefined),
+          showWindow,
+          emit,
+          settings: () => desktopSettings,
+          save: saveDesktopSettings,
+          prepareQuit: () => {
+            quitting = true;
+            quitRequested = true;
+          },
+          activeTerminals: () =>
+            [...terminals.values()].filter((t) => !t.exited).length,
+          facts: () => ({
+            workspace: workspaceReady ? "connected" : "not connected",
+            hubVersion,
+            terminals: [...terminals.values()].filter((t) => !t.exited).length,
+          }),
+        },
+        !app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA
+          ? join(app.getPath("userData"), "logs")
+          : app.getPath("logs"),
+      );
       await loadLoginEnvironment();
       binaries = findBinaries();
       register();
+      await services.start();
       if (process.platform === "linux") {
         let previous = JSON.stringify(omarchyTheme());
         const timer = setInterval(() => {
@@ -1031,6 +1057,27 @@ else {
             label: "Help",
             submenu: [
               {
+                label: "Check for Updates…",
+                click: () => {
+                  showWindow();
+                  void services?.updater.check();
+                  emit({ type: "menu-settings" });
+                },
+              },
+              {
+                label: "Copy Diagnostics",
+                click: () => {
+                  if (services) clipboard.writeText(services.diagnostics());
+                },
+              },
+              {
+                label: "Open Log Folder",
+                click: () => {
+                  if (services) void shell.openPath(services.log.directory);
+                },
+              },
+              { type: "separator" as const },
+              {
                 label: "twr Documentation",
                 click: () => {
                   void shell.openExternal(
@@ -1042,12 +1089,11 @@ else {
           },
         ]),
       );
-      await createWindow();
-      app.on("activate", () => {
-        if (BrowserWindow.getAllWindows().length === 0) void createWindow();
-      });
+      await createWindow(services.startHidden);
+      app.on("activate", () => showWindow());
     })
     .catch((error) => {
+      services?.log.error("app", "Startup failed", error);
       dialog.showErrorBox("Could not open twr", String(error));
       app.quit();
     });

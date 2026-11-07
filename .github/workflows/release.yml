@@ -499,3 +499,119 @@ jobs:
           NOTES
           gh release create "$TAG" --verify-tag --title "twr $TAG" --generate-notes \
             --notes-file notes.md "${flags[@]}" dist/*
+
+  # The desktop installers for the same commit, built and tested by desktop.yml. They attach to
+  # the release after it is published, so the CLI release never waits on (or is blocked by) them;
+  # the desktop updater ignores a release until its update metadata is attached.
+  desktop:
+    name: desktop installers
+    needs: resolve
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    uses: ./.github/workflows/desktop.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      release: true
+    secrets: inherit
+
+  desktop-release:
+    name: attach the desktop installers
+    needs: [resolve, release, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: twr-desktop-release-macos
+          path: desktop
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: twr-desktop-release-linux
+          path: desktop
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: twr-desktop-release-arch
+          path: aur
+      - name: Check the desktop assets and write their checksums
+        run: |
+          version="${TAG#v}"
+          # Linux artifacts keep their release/ subdirectories; flatten to one level.
+          find desktop -mindepth 2 -type f -exec mv -n {} desktop/ \;
+          find desktop -mindepth 1 -type d -empty -delete
+          # The arch artifact holds arch/<package> and aur/{PKGBUILD,.SRCINFO}.
+          mv aur/arch/twr-desktop-*-x86_64.pkg.tar.zst desktop/
+          allowed="^(twr-$version-arm64\.dmg|twr-$version-arm64\.dmg\.blockmap|twr-$version-arm64-mac\.zip|twr-$version-arm64-mac\.zip\.blockmap|latest-mac\.yml|twr-$version\.AppImage|latest-linux\.yml|twr-desktop_${version}_amd64\.deb|twr-desktop-$version-linux-x64\.tar\.gz|twr-desktop-$version-1-x86_64\.pkg\.tar\.zst)$"
+          for f in desktop/*; do
+            name=$(basename "$f")
+            if ! [[ "$name" =~ $allowed ]]; then
+              echo "::error::unexpected desktop asset $name"
+              exit 1
+            fi
+          done
+          for required in "twr-$version-arm64.dmg" "twr-$version.AppImage" latest-linux.yml "twr-desktop_${version}_amd64.deb" "twr-desktop-$version-linux-x64.tar.gz" "twr-desktop-$version-1-x86_64.pkg.tar.zst"; do
+            test -f "desktop/$required" || { echo "::error::missing $required"; exit 1; }
+          done
+          grep -qx "version: $version" desktop/latest-linux.yml
+          if [ -f desktop/latest-mac.yml ]; then grep -qx "version: $version" desktop/latest-mac.yml; fi
+          (cd desktop && printf '# twr desktop release %s\n' "$TAG" > desktop-sha256sums.txt && sha256sum -- * | grep -v desktop-sha256sums >> desktop-sha256sums.txt)
+          cat desktop/desktop-sha256sums.txt
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$TAG" desktop/* --clobber
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: twr-desktop-aur
+          include-hidden-files: true
+          path: |
+            aur/**/PKGBUILD
+            aur/**/.SRCINFO
+
+  # Publishes twr-desktop-bin to the AUR when the repository has an AUR deploy key
+  # (AUR_SSH_PRIVATE_KEY, registered on the package's AUR account). Without it the PKGBUILD and
+  # .SRCINFO remain in the twr-desktop-aur artifact for a manual push.
+  aur:
+    name: publish twr-desktop-bin to the AUR
+    needs: [resolve, desktop-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    env:
+      HAS_AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: twr-desktop-aur
+          path: aur
+      - name: Push the package
+        if: env.HAS_AUR_KEY == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          pkgbuild=$(find aur -name PKGBUILD | head -n 1)
+          srcinfo=$(dirname "$pkgbuild")/.SRCINFO
+          test -f "$pkgbuild" && test -f "$srcinfo"
+          grep -qx "pkgver=${TAG#v}" "$pkgbuild"
+          keydir=$(mktemp -d "$RUNNER_TEMP/aur.XXXXXXXX")
+          (umask 077 && printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$keydir/key")
+          # The AUR's published host key (https://wiki.archlinux.org/title/AUR_submission_guidelines).
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > "$keydir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $keydir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$keydir/known_hosts -o StrictHostKeyChecking=yes"
+          git clone ssh://aur@aur.archlinux.org/twr-desktop-bin.git aur-repo
+          cp "$pkgbuild" "$srcinfo" aur-repo/
+          cd aur-repo
+          git config user.name "twr release"
+          git config user.email "releases@twr.tools"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR already has $TAG"
+          else
+            git commit -m "Update to ${TAG#v}"
+            git push origin HEAD:master
+          fi
+          rm -rf "$keydir"
+      - if: env.HAS_AUR_KEY != 'true'
+        run: echo "::notice::no AUR_SSH_PRIVATE_KEY; push the twr-desktop-aur artifact's PKGBUILD and .SRCINFO to the AUR by hand"

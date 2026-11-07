@@ -14,6 +14,33 @@ import { Dialog } from "../shared/ui";
 import { errorMessage } from "../shared/errors";
 import { withLocalUploads } from "../shared/local-uploads";
 import { withInboxCache } from "../shared/inbox-cache";
+import { UpdateBanner } from "./UpdateBanner";
+import "./app-shell.css";
+// Renderer failures go to the local diagnostics log (bounded and redacted in the main process).
+function reportError(message: string, stack?: string, source?: string) {
+  try {
+    window.twrApp?.reportError({
+      message: message.slice(0, 4000),
+      stack: stack?.slice(0, 16000),
+      source: source?.slice(0, 200),
+    });
+  } catch {}
+}
+window.addEventListener("error", (event) =>
+  reportError(
+    event.message || "Script error",
+    event.error instanceof Error ? event.error.stack : undefined,
+    event.filename ? `${event.filename}:${event.lineno}` : undefined,
+  ),
+);
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  reportError(
+    reason instanceof Error ? reason.message : String(reason),
+    reason instanceof Error ? reason.stack : undefined,
+    "unhandled rejection",
+  );
+});
 const local = withInboxCache(
   withLocalUploads(window.twrLocal, window.twrUploadRequest),
   () => window.twrRemote.listHubs(),
@@ -133,7 +160,13 @@ function Desktop() {
                 const offRemote = remoteApi.onEvent(callback);
                 const offLocal = local.onEvent((event) => {
                   if (
-                    ["menu-new", "menu-palette", "theme"].includes(event.type)
+                    [
+                      "menu-new",
+                      "menu-palette",
+                      "menu-attention",
+                      "menu-settings",
+                      "theme",
+                    ].includes(event.type)
                   )
                     callback(event);
                 });
@@ -262,6 +295,7 @@ function Desktop() {
           onSelect={select}
         />
       )}
+      <UpdateBanner />
       {error && (
         <div className="connection-error" role="alert">
           {error}

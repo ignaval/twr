@@ -1,0 +1,164 @@
+import { app, Menu, nativeImage, Tray } from "electron";
+import { execFile } from "node:child_process";
+import { join } from "node:path";
+import type { AttentionSummary } from "../shared/types";
+
+export interface TrayActions {
+  open(): void;
+  newThread(): void;
+  openAttention(thread?: string): void;
+  checkUpdates(): void;
+  installUpdate(): void;
+  quit(): void;
+  toggleLogin(enabled: boolean): void;
+  toggleBackground(enabled: boolean): void;
+}
+
+export interface TrayMenuState {
+  login: { supported: boolean; enabled: boolean };
+  background: boolean;
+  updateReady?: string;
+}
+
+/**
+ * Linux status icons need a StatusNotifierItem host (Waybar's tray module on
+ * Omarchy, KDE, GNOME with the AppIndicator extension). Without one, Electron
+ * would create an icon nobody can see, so the app must not hide into it.
+ */
+export function statusNotifierAvailable(): Promise<boolean> {
+  if (process.platform !== "linux") return Promise.resolve(true);
+  return new Promise((resolve) => {
+    execFile(
+      "dbus-send",
+      [
+        "--session",
+        "--print-reply",
+        "--dest=org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus.NameHasOwner",
+        "string:org.kde.StatusNotifierWatcher",
+      ],
+      { timeout: 3000 },
+      (error, stdout) => resolve(!error && /boolean true/.test(stdout)),
+    );
+  });
+}
+
+export function trayLabel(count: number) {
+  return count === 0
+    ? "Nothing needs you"
+    : count === 1
+      ? "1 item needs you"
+      : `${count} items need you`;
+}
+
+export function truncate(text: string, length: number) {
+  const single = text.replace(/\s+/g, " ").trim();
+  return single.length > length ? single.slice(0, length - 1) + "…" : single;
+}
+
+export class AppTray {
+  private tray?: Tray;
+  private attention: AttentionSummary = { count: 0, items: [] };
+  constructor(
+    private readonly iconDirectory: string,
+    private readonly actions: TrayActions,
+    private readonly state: () => TrayMenuState,
+  ) {}
+  get active() {
+    return !!this.tray && !this.tray.isDestroyed();
+  }
+  show() {
+    if (this.active) return;
+    this.tray = new Tray(this.image(false));
+    this.tray.setToolTip("twr");
+    if (process.platform === "darwin")
+      this.tray.setIgnoreDoubleClickEvents(true);
+    // Linux status notifiers activate on click; macOS opens the menu itself.
+    this.tray.on("click", () => {
+      if (process.platform !== "darwin") this.actions.open();
+    });
+    this.render();
+  }
+  hide() {
+    this.tray?.destroy();
+    this.tray = undefined;
+  }
+  setAttention(summary: AttentionSummary) {
+    this.attention = summary;
+    // Dock (macOS) and Unity launcher (Linux) badges.
+    app.setBadgeCount(summary.count);
+    this.render();
+  }
+  render() {
+    if (!this.active) return;
+    const tray = this.tray!;
+    const { count, items } = this.attention;
+    tray.setToolTip(count ? `twr — ${trayLabel(count)}` : "twr");
+    if (process.platform === "darwin")
+      tray.setTitle(count ? String(count) : "");
+    else tray.setImage(this.image(count > 0));
+    tray.setContextMenu(this.menu(count, items));
+  }
+  private image(attention: boolean) {
+    if (process.platform === "darwin") {
+      const image = nativeImage.createFromPath(
+        join(this.iconDirectory, "trayTemplate.png"),
+      );
+      image.setTemplateImage(true);
+      return image;
+    }
+    return nativeImage.createFromPath(
+      join(this.iconDirectory, attention ? "tray-attention.png" : "tray.png"),
+    );
+  }
+  private menu(count: number, items: AttentionSummary["items"]) {
+    const state = this.state();
+    const template: Electron.MenuItemConstructorOptions[] = [
+      { label: trayLabel(count), enabled: false },
+      ...items.slice(0, 5).map((item) => ({
+        label: truncate(`${item.title}: ${item.summary}`, 60),
+        click: () => this.actions.openAttention(item.thread),
+      })),
+    ];
+    if (count > Math.min(items.length, 5))
+      template.push({
+        label: "Show all in Needs you…",
+        click: () => this.actions.openAttention(),
+      });
+    template.push(
+      { type: "separator" },
+      { label: "Open twr", click: () => this.actions.open() },
+      { label: "New Thread", click: () => this.actions.newThread() },
+      { type: "separator" },
+      {
+        label: "Launch at Login",
+        type: "checkbox",
+        enabled: state.login.supported,
+        checked: state.login.enabled,
+        click: (item) => this.actions.toggleLogin(item.checked),
+      },
+      {
+        label:
+          process.platform === "darwin"
+            ? "Keep Running When Window Is Closed"
+            : "Keep Running in Tray When Window Is Closed",
+        type: "checkbox",
+        checked: state.background,
+        click: (item) => this.actions.toggleBackground(item.checked),
+      },
+      state.updateReady
+        ? {
+            label: `Restart to Update to ${state.updateReady}`,
+            click: () => this.actions.installUpdate(),
+          }
+        : {
+            label: "Check for Updates…",
+            click: () => this.actions.checkUpdates(),
+          },
+      { type: "separator" },
+      { label: "Quit twr", click: () => this.actions.quit() },
+    );
+    return Menu.buildFromTemplate(template);
+  }
+}

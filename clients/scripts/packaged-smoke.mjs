@@ -24,6 +24,16 @@ if (process.platform !== "darwin" || process.arch !== "arm64")
   );
 const application = resolve("release/mac-arm64/twr.app");
 assert(existsSync(application), "Build the Mac application first");
+// The menu bar icon and electron-updater's feed configuration ship in the bundle.
+for (const name of ["trayTemplate.png", "trayTemplate@2x.png"])
+  assert(
+    existsSync(join(application, "Contents/Resources/tray", name)),
+    `Missing menu bar icon ${name}`,
+  );
+assert.match(
+  readFileSync(join(application, "Contents/Resources/app-update.yml"), "utf8"),
+  /provider: github[\s\S]*owner: ignaval[\s\S]*repo: twr/,
+);
 const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-package-")));
 const repository = join(fixture, "repo");
 const speechScript = join(fixture, "speech-sink.sh");

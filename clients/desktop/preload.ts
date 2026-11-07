@@ -1,5 +1,10 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DesktopAPI, DesktopEvent } from "../shared/types";
+import type {
+  DesktopAPI,
+  DesktopAppAPI,
+  DesktopEvent,
+  UpdateStatus,
+} from "../shared/types";
 import type { DesktopConnections } from "../shared/connections";
 const api: DesktopAPI = {
   inboxSources: () => ipcRenderer.invoke("twr:inbox-sources"),
@@ -76,3 +81,25 @@ contextBridge.exposeInMainWorld(
   (workspace: string, method: string, params: unknown) =>
     ipcRenderer.invoke("twr:upload-request", workspace, method, params),
 );
+
+const application: DesktopAppAPI = {
+  settings: () => ipcRenderer.invoke("twr:app-settings"),
+  setLaunchAtLogin: (enabled) => ipcRenderer.invoke("twr:app-login", enabled),
+  setTray: (enabled) => ipcRenderer.invoke("twr:app-tray", enabled),
+  setBackground: (enabled) => ipcRenderer.invoke("twr:app-background", enabled),
+  setAutoUpdate: (enabled) =>
+    ipcRenderer.invoke("twr:app-auto-update", enabled),
+  checkForUpdates: () => ipcRenderer.invoke("twr:app-update-check"),
+  downloadUpdate: () => ipcRenderer.invoke("twr:app-update-download"),
+  installUpdate: () => ipcRenderer.invoke("twr:app-update-install"),
+  setAttention: (summary) => ipcRenderer.send("twr:app-attention", summary),
+  reportError: (report) => ipcRenderer.send("twr:app-error", report),
+  diagnostics: () => ipcRenderer.invoke("twr:app-diagnostics"),
+  openLogs: () => ipcRenderer.invoke("twr:app-open-logs"),
+  onUpdate: (callback) => {
+    const listener = (_: unknown, status: UpdateStatus) => callback(status);
+    ipcRenderer.on("twr:app-update", listener);
+    return () => ipcRenderer.removeListener("twr:app-update", listener);
+  },
+};
+contextBridge.exposeInMainWorld("twrApp", application);

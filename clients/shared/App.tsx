@@ -409,6 +409,18 @@ export default function App({
   const draftKey = workspace + ":" + (destination || "orchestrator");
   const draft = drafts[draftKey] || "";
   const selectedThread = view.threads.find((t) => t.id === selected);
+  // The desktop tray/menu bar and Dock badge mirror what needs the user.
+  useEffect(() => {
+    window.twrApp?.setAttention({
+      count: view.attention.length,
+      items: view.attention.slice(0, 5).map((item) => ({
+        thread: item.thread,
+        title:
+          view.threads.find((t) => t.id === item.thread)?.name || item.thread,
+        summary: item.summary || item.reason,
+      })),
+    });
+  }, [view.attention, view.threads]);
   const [visibleRoutines, setVisibleRoutines] = useState<string[]>([]);
   const presentedEvents = useMemo(() => {
     const resolved = new Set(view.went_on || []);
@@ -732,6 +744,15 @@ export default function App({
         setTerminals((old) => old.filter((t) => t.id !== event.id));
       }
       if (event.type === "menu-new") actionRef.current("new");
+      if (event.type === "menu-settings") {
+        setSection("settings");
+        setSidebar(false);
+      }
+      if (event.type === "menu-attention") {
+        setSection("attention");
+        setSidebar(false);
+        if (event.thread) setSelected(event.thread);
+      }
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");

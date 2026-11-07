@@ -157,8 +157,68 @@ export interface DesktopAPI {
   exportText(name: string, content: string): Promise<void>;
   onEvent(callback: (event: DesktopEvent) => void): () => void;
 }
+/** Items the host app shows in its tray/menu bar and dock badge. */
+export interface AttentionSummary {
+  count: number;
+  items: { thread: string; title: string; summary: string }[];
+}
+export type InstallKind =
+  "development" | "mac" | "appimage" | "deb" | "pacman" | "portable";
+export interface UpdateStatus {
+  kind: InstallKind;
+  /** Downloads and installs in the app (signed macOS, AppImage). */
+  automatic: boolean;
+  /** Why this install cannot update itself, when it cannot. */
+  manualReason?: string;
+  state:
+    | "idle"
+    | "checking"
+    | "up-to-date"
+    | "available"
+    | "downloading"
+    | "downloaded"
+    | "error";
+  current: string;
+  latest?: string;
+  releaseUrl?: string;
+  download?: { name: string; url: string };
+  instructions?: string;
+  progress?: number;
+  error?: string;
+  checkedAt?: number;
+}
+export interface DesktopAppSettings {
+  login: { supported: boolean; enabled: boolean; detail?: string };
+  tray: { enabled: boolean; available: boolean };
+  background: boolean;
+  autoUpdate: boolean;
+  update: UpdateStatus;
+  logDirectory: string;
+}
+/** Desktop application services, independent of which hub is shown. */
+export interface DesktopAppAPI {
+  settings(): Promise<DesktopAppSettings>;
+  setLaunchAtLogin(enabled: boolean): Promise<DesktopAppSettings>;
+  setTray(enabled: boolean): Promise<DesktopAppSettings>;
+  setBackground(enabled: boolean): Promise<DesktopAppSettings>;
+  setAutoUpdate(enabled: boolean): Promise<DesktopAppSettings>;
+  checkForUpdates(): Promise<UpdateStatus>;
+  downloadUpdate(): Promise<UpdateStatus>;
+  installUpdate(): Promise<void>;
+  setAttention(summary: AttentionSummary): void;
+  reportError(report: {
+    message: string;
+    stack?: string;
+    source?: string;
+  }): void;
+  diagnostics(): Promise<string>;
+  openLogs(): Promise<void>;
+  onUpdate(callback: (status: UpdateStatus) => void): () => void;
+}
 declare global {
   interface Window {
     twr: DesktopAPI;
+    /** Present only in the desktop application. */
+    twrApp?: DesktopAppAPI;
   }
 }

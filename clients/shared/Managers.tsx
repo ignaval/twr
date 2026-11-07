@@ -1,4 +1,5 @@
 import { OfflineOptions } from "./OfflineOptions";
+import { AppOptions } from "./AppOptions";
 import { LayoutOptions } from "./LayoutOptions";
 import { errorMessage } from "./errors";
 import { AppearanceOptions } from "./AppearanceOptions";
@@ -1285,6 +1286,7 @@ function ClientPreferences() {
       </section>
       <LayoutOptions />
       <OfflineOptions />
+      <AppOptions />
     </>
   );
 }
