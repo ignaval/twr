@@ -62,6 +62,10 @@ if (
 if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
   app.commandLine.removeSwitch("remote-debugging-port");
   app.commandLine.removeSwitch("remote-debugging-pipe");
+  // Chromium's fake microphone and its permission bypass are for tests only.
+  app.commandLine.removeSwitch("use-fake-ui-for-media-stream");
+  app.commandLine.removeSwitch("use-fake-device-for-media-stream");
+  app.commandLine.removeSwitch("use-file-for-fake-audio-capture");
 }
 
 let window: BrowserWindow;
@@ -536,12 +540,23 @@ function register() {
   handle("voice-status", () => voice!.status());
   handle("voice-arm", async (on) => {
     microphoneArmed = z.boolean().parse(on);
-    if (microphoneArmed && process.platform === "darwin") {
-      const granted = await systemPreferences.askForMediaAccess("microphone");
-      if (!granted)
+    // Voice QA (scripts/voice-qa.mjs) plays a recording as the microphone in a development
+    // build: no system access is asked for. A packaged build always asks.
+    const voiceQa =
+      !app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION === "1";
+    if (microphoneArmed && process.platform === "darwin" && !voiceQa) {
+      // macOS asks once; after that its answer stands until changed in System Settings.
+      const access = systemPreferences.getMediaAccessStatus("microphone");
+      const granted =
+        access === "granted" ||
+        (access === "not-determined" &&
+          (await systemPreferences.askForMediaAccess("microphone")));
+      if (!granted) {
+        microphoneArmed = false;
         throw new Error(
           "Microphone access is off for twr. Turn it on in System Settings > Privacy & Security > Microphone.",
         );
+      }
     }
   });
   handle("voice-transcribe", (recording, hint) =>

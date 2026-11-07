@@ -2677,51 +2677,53 @@ export default function App({
                         </small>
                       )}
                     </span>
-                    <VoiceControl
-                      host={hostApi}
-                      rpc={rpc}
-                      connected={connected}
-                      allowed={permitted("operate") && Boolean(orchestrator)}
-                      submit={submitVoice}
-                      hint={voiceHintWords}
-                      spoken={spokenLately}
-                      edit={(text) => {
-                        setDestination(undefined);
-                        setDrafts((old) => ({
-                          ...old,
-                          [workspace + ":orchestrator"]: appendDraft(
-                            old[workspace + ":orchestrator"],
-                            text,
-                          ),
-                        }));
-                        input.current?.focus();
-                      }}
-                      onError={fail}
-                    />
-                    <button
-                      className="send-button"
-                      type="submit"
-                      disabled={
-                        !permitted("operate") ||
-                        !draft.trim() ||
-                        (!connected &&
-                          (!journal ||
-                            draft.startsWith("/") ||
-                            draft.startsWith("!"))) ||
-                        (!target && !draft.startsWith("/")) ||
-                        sending
-                      }
-                      aria-label={
-                        connected ? "Send message" : "Save message for later"
-                      }
-                      title={
-                        connected
-                          ? "Send message"
-                          : "Save on this device until the hub reconnects"
-                      }
-                    >
-                      {sending ? <Spinner /> : <ArrowUp size={18} />}
-                    </button>
+                    <div className="composer-actions">
+                      <VoiceControl
+                        host={hostApi}
+                        rpc={rpc}
+                        connected={connected}
+                        allowed={permitted("operate") && Boolean(orchestrator)}
+                        submit={submitVoice}
+                        hint={voiceHintWords}
+                        spoken={spokenLately}
+                        edit={(text) => {
+                          setDestination(undefined);
+                          setDrafts((old) => ({
+                            ...old,
+                            [workspace + ":orchestrator"]: appendDraft(
+                              old[workspace + ":orchestrator"],
+                              text,
+                            ),
+                          }));
+                          input.current?.focus();
+                        }}
+                        onError={fail}
+                      />
+                      <button
+                        className="send-button"
+                        type="submit"
+                        disabled={
+                          !permitted("operate") ||
+                          !draft.trim() ||
+                          (!connected &&
+                            (!journal ||
+                              draft.startsWith("/") ||
+                              draft.startsWith("!"))) ||
+                          (!target && !draft.startsWith("/")) ||
+                          sending
+                        }
+                        aria-label={
+                          connected ? "Send message" : "Save message for later"
+                        }
+                        title={
+                          connected
+                            ? "Send message"
+                            : "Save on this device until the hub reconnects"
+                        }
+                      >
+                        {sending ? <Spinner /> : <ArrowUp size={18} />}
+                      </button>
+                    </div>
                   </div>
                   {mentions.length > 0 && !mentionHidden && (
                     <div className="mentions">

@@ -14,6 +14,7 @@
     "start": "electron .",
     "test": "vitest run",
     "test:integration": "node scripts/integration.mjs",
+    "test:voice": "node scripts/voice-qa.mjs",
     "package": "npm run build:rust && npm run build && electron-builder",
     "package:mac": "npm run package -- --mac --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false",
     "package:linux": "npm run package -- --linux --x64",

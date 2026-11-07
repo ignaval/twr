@@ -3040,9 +3040,11 @@ meter::-webkit-meter-optimum-value {
   background: var(--danger);
   border-color: var(--danger);
 }
-.composer-bottom > .voice-button + .send-button,
-.composer-bottom > .voice-button + .voice-button {
-  margin-left: -2px;
+.composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 .voice-bar,
 .voice-confirm {
