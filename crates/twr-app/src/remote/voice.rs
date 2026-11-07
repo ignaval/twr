@@ -353,6 +353,10 @@ pub struct DeviceVoice {
     running: Arc<Mutex<Option<Running>>>,
     status: Arc<Mutex<Status>>,
     starts: AtomicU64,
+    /// Held across a start or a stop: two of the phone's calls run at once, and a start that
+    /// replaced another's speaker would otherwise leave the first one's end publishing
+    /// "stopped" over the running one.
+    changing: tokio::sync::Mutex<()>,
 }
 
 impl DeviceVoice {
@@ -362,6 +366,7 @@ impl DeviceVoice {
             running: Arc::new(Mutex::new(None)),
             status: Arc::new(Mutex::new(Status::default())),
             starts: AtomicU64::new(0),
+            changing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -391,6 +396,7 @@ impl DeviceVoice {
             Op::Said(id) => return Ok(json!({"acked": self.out.ack(id, Ok(()))})),
             Op::Failed(id, why) => return Ok(json!({"acked": self.out.ack(id, Err(why))})),
             Op::Start => {
+                let _changing = self.changing.lock().await;
                 let start = start()?;
                 if self.workspace().as_deref() == Some(start.workspace.as_str()) {
                     return Ok(json!(self.status()));
@@ -398,7 +404,10 @@ impl DeviceVoice {
                 self.stop().await;
                 self.start(start)?;
             }
-            Op::Stop => self.stop().await,
+            Op::Stop => {
+                let _changing = self.changing.lock().await;
+                self.stop().await
+            }
             op => {
                 let key = op.key().expect("a control");
                 let keys = self
@@ -448,15 +457,18 @@ impl DeviceVoice {
         let (stop, stopped) = oneshot::channel::<()>();
         let observe: twr_speech::StateObserver = {
             let (status, out) = (self.status.clone(), self.out.clone());
-            Arc::new(move |_ws: &str, state: &SpeechStateParams| {
-                Self::publish(&status, &out, |s| {
-                    s.playing = state.playing.is_some();
-                    s.paused = state.paused;
-                    s.queued = state.queued;
-                    s.live = state.live;
-                    s.error = state.error.clone();
-                })
-            })
+            Arc::new(
+                move |_ws: &str, state: &SpeechStateParams, speaking: bool| {
+                    Self::publish(&status, &out, |s| {
+                        // An announcement being said counts: the user talking over it pauses it.
+                        s.playing = state.playing.is_some() || (speaking && !state.paused);
+                        s.paused = state.paused;
+                        s.queued = state.queued;
+                        s.live = state.live;
+                        s.error = state.error.clone();
+                    })
+                },
+            )
         };
         let opts = SpeakerOpts {
             name: start.name.clone(),

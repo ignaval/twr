@@ -91,7 +91,7 @@ import type {
 import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
-import { voiceHint } from "./voice";
+import { announcements, voiceHint } from "./voice";
 import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
 import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
@@ -1318,13 +1318,21 @@ export default function App({
     return response;
   };
   const voiceHintWords = useMemo(() => voiceHint(view.threads), [view.threads]);
-  const spokenLately = () =>
-    destination
-      ? []
-      : blocksOf(events)
-          .filter((b) => b.kind === "assistant")
-          .slice(-3)
-          .map((b) => b.text);
+  // What this device may have read aloud lately, for voice mode's echo check: the
+  // orchestrator's last messages (kept while a worker's conversation is on screen) and the
+  // sentences a speaker announces.
+  const orchestratorSaid = useRef<string[]>([]);
+  useEffect(() => {
+    if (destination || !orchestrator) return;
+    orchestratorSaid.current = blocksOf(events)
+      .filter((b) => b.kind === "assistant")
+      .slice(-3)
+      .map((b) => b.text);
+  }, [events, destination, orchestrator?.id]);
+  const spokenLately = () => [
+    ...orchestratorSaid.current,
+    ...announcements(view.threads),
+  ];
   async function submitSlash(text: string) {
     if (slashPending.current) return;
     slashPending.current = true;

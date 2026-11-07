@@ -9,7 +9,13 @@ import type { DesktopEvent } from "../shared/types";
 
 /** `twr voice transcribe`'s limit: two minutes of 16 kHz 16-bit mono, and a header. */
 export const MAX_RECORDING = 16000 * 2 * 120 + 4096;
-const TRANSCRIBE_TIMEOUT = 120_000;
+/**
+ * `twr voice` keeps `[voice] timeout_secs` (at most 600) itself; this only bounds a `twr` that
+ * stopped answering. It is asked to stop first (SIGTERM: it kills its recognizer and removes
+ * its copy of the recording), and killed only if it doesn't.
+ */
+const TRANSCRIBE_TIMEOUT = 630_000;
+const STOP_GRACE = 5_000;
 
 export const recordingSchema = z
   .instanceof(Uint8Array)
@@ -57,7 +63,8 @@ export function runWithInput(
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), STOP_GRACE).unref();
       reject(new Error("Speech recognition took too long"));
     }, timeout);
     child.stdout.on("data", (d) => {
@@ -88,6 +95,8 @@ const cliError = (run: Run) =>
 
 export interface SpeakerEvent {
   running: boolean;
+  /** The device id it speaks as, shared by every speaker of this computer. */
+  device?: string;
   /** Whether it speaks now (false: another speaker of this computer does, it stands by). */
   active: boolean;
   name: string;
@@ -99,6 +108,11 @@ export interface SpeakerEvent {
 
 export class DesktopVoice {
   private speaker?: ChildProcessWithoutNullStreams;
+  /** What it plays per workspace: the state shown is all of them together. */
+  private workspaces = new Map<
+    string,
+    { playing: boolean; paused: boolean; queued: number; error?: string }
+  >();
   private state: SpeakerEvent = {
     running: false,
     active: false,
@@ -192,14 +206,24 @@ export class DesktopVoice {
         out = out.slice(end + 1);
         try {
           const v = JSON.parse(line);
-          if (v.type === "state")
-            this.publish({
-              active: true,
+          if (v.type === "speaker" && typeof v.device === "string")
+            this.publish({ device: v.device });
+          if (v.type === "state" && typeof v.workspace === "string") {
+            this.workspaces.set(v.workspace, {
               playing: Boolean(v.playing),
               paused: Boolean(v.paused),
               queued: Number(v.queued) || 0,
               error: typeof v.error === "string" ? v.error : undefined,
             });
+            const all = [...this.workspaces.values()];
+            this.publish({
+              active: true,
+              playing: all.some((w) => w.playing),
+              paused: all.some((w) => w.paused),
+              queued: all.reduce((n, w) => n + w.queued, 0),
+              error: all.find((w) => w.error)?.error,
+            });
+          }
         } catch {
           /* A line of a newer speaker. */
         }
@@ -218,6 +242,7 @@ export class DesktopVoice {
     });
     child.on("close", (code) => {
       if (this.speaker === child) this.speaker = undefined;
+      this.workspaces.clear();
       const last = err.split("\n").filter(Boolean).pop();
       this.publish({
         running: false,

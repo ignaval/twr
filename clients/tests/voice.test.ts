@@ -96,7 +96,13 @@ describe("voice activity", () => {
   });
 });
 
-function rig(submitResult: Record<string, string> = { action: "delegate" }) {
+function rig(
+  submitResult: Record<string, string> = { action: "delegate" },
+  options: {
+    submit?: (text: string) => Promise<Record<string, string>>;
+    start?: () => Promise<void>;
+  } = {},
+) {
   let events: VoiceCaptureEvents | undefined;
   const log: string[] = [];
   const sent: string[] = [];
@@ -104,6 +110,7 @@ function rig(submitResult: Record<string, string> = { action: "delegate" }) {
   const capture: VoiceCapture = {
     status: async () => ({ available: true, local: true }),
     async start(mode, e) {
+      await options.start?.();
       log.push("start:" + mode);
       events = e;
       if (mode === "push") e.speechStart();
@@ -130,7 +137,7 @@ function rig(submitResult: Record<string, string> = { action: "delegate" }) {
     },
     async submit(text) {
       sent.push(text);
-      return submitResult;
+      return options.submit ? options.submit(text) : submitResult;
     },
     async repeat() {
       log.push("repeat");
@@ -211,6 +218,7 @@ describe("voice session", () => {
     expect(r.session.state.phase).toBe("ready");
     await r.session.press();
     r.events().error("no speech recognizer");
+    await new Promise((x) => setTimeout(x, 0));
     expect(r.session.state.phase).toBe("error");
     expect(r.session.state.error).toBe("no speech recognizer");
   });
@@ -245,5 +253,131 @@ describe("desktop voice host", async () => {
     );
     expect(run.code).toBe(0);
     expect(run.stdout.trim()).toBe("1234");
+  });
+});
+
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+describe("voice session races (review regressions)", () => {
+  it("resumes the speaker it paused when recognition fails", async () => {
+    const r = rig();
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    await r.session.press();
+    expect(r.log).toContain("speaker:pause");
+    r.events().error("whisper timed out");
+    await tick();
+    expect(r.log.slice(-1)).toEqual(["speaker:resume"]);
+    expect(r.session.state.phase).toBe("error");
+  });
+  it("refuses a new recording while one is being sent, and never loses the release", async () => {
+    let finish!: (v: Record<string, string>) => void;
+    const r = rig(undefined, {
+      submit: () => new Promise((resolve) => (finish = resolve)),
+    });
+    await r.session.press();
+    r.events().final("check the docs");
+    await tick();
+    expect(r.session.state.phase).toBe("sending");
+    expect(r.session.idle).toBe(false);
+    await r.session.press();
+    expect(r.log.filter((l) => l === "start:push")).toHaveLength(1);
+    finish({ action: "delegate" });
+    await tick();
+    await tick();
+    expect(r.session.state.phase).toBe("ready");
+    expect(r.session.idle).toBe(true);
+  });
+  it("holds the speaker until the last of overlapping utterances is handled", async () => {
+    let finish!: (v: Record<string, string>) => void;
+    const r = rig(undefined, {
+      submit: () => new Promise((resolve) => (finish = resolve)),
+    });
+    await r.session.begin();
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    r.events().speechStart();
+    r.events().final("first message");
+    await tick();
+    r.events().speechStart();
+    finish({ action: "delegate" });
+    await tick();
+    await tick();
+    expect(r.log).not.toContain("speaker:resume");
+    expect(r.session.state.phase).toBe("hearing");
+    r.events().final("");
+    await tick();
+    await tick();
+    expect(r.log.slice(-2)).toEqual(["speaker:skip", "speaker:resume"]);
+    expect(r.session.state.phase).toBe("listening");
+  });
+  it("stops a hold-to-talk released while the microphone was opening", async () => {
+    let open!: () => void;
+    const r = rig(undefined, {
+      start: () => new Promise<void>((resolve) => (open = resolve)),
+    });
+    const pressing = r.session.press();
+    await tick();
+    await r.session.release();
+    expect(r.log).not.toContain("stop");
+    open();
+    await pressing;
+    expect(r.log).toContain("stop");
+  });
+  it("resumes what was read when the hub hands a transcript back", async () => {
+    const r = rig({ action: "confirm", reason: "reads as an answer" });
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    await r.session.press();
+    await r.say("allow it");
+    expect(r.log.slice(-1)).toEqual(["speaker:resume"]);
+    expect(r.log).not.toContain("speaker:skip");
+    expect(r.session.state.heard?.outcome).toBe("confirm");
+  });
+  it("pauses a speaker it can't see, and checks for its echo", async () => {
+    const r = rig();
+    await r.session.begin();
+    r.session.speakerState({
+      playing: false,
+      paused: false,
+      queued: 0,
+      unknown: true,
+    });
+    r.events().speechStart();
+    expect(r.log).toContain("speaker:pause");
+    await r.say("api needs your permission");
+    expect(r.sent).toEqual(["api needs your permission"]);
+  });
+  it("drops an announcement heard back", async () => {
+    const r = rig(undefined, {});
+    const { announcements } = await import("../shared/voice");
+    expect(
+      isLikelyEcho(
+        "api needs your permission",
+        announcements([{ name: "api" }]),
+      ),
+    ).toBe(true);
+  });
+  it("still listens when the device's speaker can't start", async () => {
+    const r = rig();
+    const failing = new VoiceSession({
+      capture: {
+        status: async () => ({ available: true, local: true }),
+        start: async () => {},
+        stop: async () => {},
+        cancel: async () => {},
+      },
+      speaker: {
+        control: async () => {},
+        live: async () => {
+          throw new Error("Unsupported mobile operation");
+        },
+      },
+      submit: async () => ({}),
+      hint: () => [],
+      spoken: () => [],
+      onChange: () => {},
+    });
+    await failing.begin();
+    expect(failing.state.phase).toBe("listening");
+    expect(failing.state.error).toMatch(/not read aloud/);
+    void r;
   });
 });

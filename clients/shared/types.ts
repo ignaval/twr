@@ -69,6 +69,7 @@ export interface DesktopEvent {
   /** `voice-speaker`: this computer's own speaker (desktop/voice.ts). */
   speaker?: {
     running: boolean;
+    device?: string;
     active: boolean;
     name: string;
     playing: boolean;

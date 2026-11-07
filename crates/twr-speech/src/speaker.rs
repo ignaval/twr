@@ -37,9 +37,11 @@ use crate::state::{live_key, SpeechState, StateStore};
 pub type Reporter = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// What a speaker plays, told after every round for each workspace attached (as it reports
-/// it to that workspace's hub): for a device that also listens (`docs/voice.md`), which
-/// silences its own echo and pauses the voice when the user starts to talk.
-pub type StateObserver = Arc<dyn Fn(&str, &SpeechStateParams) + Send + Sync>;
+/// it to that workspace's hub), and whether it says anything now (a message, or a sentence of
+/// its own such as an announcement, of any workspace): for a device that also listens
+/// (`docs/voice.md`), which silences its own echo and pauses the voice when the user starts
+/// to talk.
+pub type StateObserver = Arc<dyn Fn(&str, &SpeechStateParams, bool) + Send + Sync>;
 
 /// How a speaker runs.
 #[derive(Clone)]
@@ -391,10 +393,11 @@ pub async fn run(
             ));
         }
         said_error = error;
+        let speaking = player.machine.current().is_some();
         for ws in &connected {
             let state = player.machine.state_for(ws);
             if let Some(observe) = &opts.observe {
-                observe(ws, &state);
+                observe(ws, &state, speaking);
             }
             link.report(ws, state);
         }

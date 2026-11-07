@@ -28,6 +28,9 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
 
     /// Silence that ends a hands-free utterance.
     private static let endSilence: TimeInterval = 0.9
+    /// A sound loud enough to count as speech that brings no words this soon (a cough, a door)
+    /// ends its utterance empty: the phone's own voice, paused for it, goes on.
+    private static let noWords: TimeInterval = 2.5
     /// A recognition task is restarted before Apple's limit of about a minute.
     private static let taskLimit: TimeInterval = 50
     /// How long a final result may take after the audio ended.
@@ -210,6 +213,14 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
         guard !heardSpeech else { return }
         heardSpeech = true
         emit(["type": "speechStart"])
+        // Words re-arm this with the shorter end-of-speech silence (`recognized`).
+        if mode == "hands-free", let pass, pass.text.isEmpty {
+            silenceTimer?.invalidate()
+            silenceTimer = Timer.scheduledTimer(withTimeInterval: Self.noWords, repeats: false) { [weak self, weak pass] _ in
+                guard let self, let pass, pass === self.pass, pass.text.isEmpty else { return }
+                self.endPass(pass)
+            }
+        }
     }
 
     private func beginPass() {

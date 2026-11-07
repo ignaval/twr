@@ -7638,7 +7638,16 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
                 .read_to_end(&mut recording)
                 .context("reading the recording from stdin")?;
             let timeout = std::time::Duration::from_secs(config.voice.timeout_secs);
-            let text = twr_voice::transcribe(&kind, &recording, timeout, &hint).await?;
+            // SIGTERM or SIGINT (the app giving up on it) drops the recognition: its process
+            // group is killed and its private copy of the recording removed before exiting.
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .context("handling SIGTERM")?;
+            let text = tokio::select! {
+                text = twr_voice::transcribe(&kind, &recording, timeout, &hint) => text?,
+                _ = term.recv() => anyhow::bail!("recognition stopped"),
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("recognition stopped"),
+            };
             let mut out = std::io::stdout().lock();
             if json {
                 writeln!(out, "{}", serde_json::json!({ "text": text }))?;

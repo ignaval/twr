@@ -63,13 +63,19 @@ export function VoiceControl(props: VoiceControlProps) {
   });
   const [status, setStatus] = useState<VoiceCaptureStatus>();
   const [speakerInfo, setSpeakerInfo] = useState<
-    SpeakerState & { running?: boolean; active?: boolean; name?: string }
+    SpeakerState & {
+      running?: boolean;
+      active?: boolean;
+      name?: string;
+      device?: string;
+    }
   >();
   const speakerRef = useRef(speakerInfo);
   speakerRef.current = speakerInfo;
   const latest = useRef(props);
   latest.current = props;
   const pressedAt = useRef(0);
+  const readyRef = useRef<() => Promise<boolean>>(async () => false);
   const wasRecording = useRef(false);
 
   // This device's speaker: the desktop's own `twr speak`, or the mobile one. When it is not
@@ -83,29 +89,37 @@ export function VoiceControl(props: VoiceControlProps) {
             host.nativeVoice!.speaker!(op === "stop" ? "silence" : op)
         : undefined;
     if (!local) return undefined;
+    // Another speaker of this computer (the TUI's own) may speak for it while this one
+    // stands by: they share the device id, so the hub reaches whichever speaks.
+    const target = () =>
+      speakerRef.current?.device || speakerRef.current?.name || undefined;
     return {
       async control(op) {
         const info = speakerRef.current;
         if (info?.running && info.active !== false) await local(op);
-        else await rpc("speech.control", { op });
+        else await rpc("speech.control", { op, speaker: target() });
       },
       async live(on) {
         if (host.voiceSpeaker) {
           const started = await host.voiceSpeaker(on ? "start" : "stop");
           if (!on) return;
-          // The speaker attaches in a moment; live reading is turned on for it once it has.
+          // The speaker attaches in a moment; live reading is turned on once one of this
+          // computer's has.
+          let last: unknown;
           for (let tries = 0; tries < 20; tries++) {
             try {
               await rpc("speech.control", {
                 op: "live",
                 value: true,
-                speaker: started.name,
+                speaker: target() || started.device || started.name,
               });
               return;
-            } catch {
+            } catch (error) {
+              last = error;
               await new Promise((r) => setTimeout(r, 250));
             }
           }
+          throw last;
         } else await host.nativeVoice?.speaker?.(on ? "start" : "stop");
       },
     };
@@ -128,6 +142,7 @@ export function VoiceControl(props: VoiceControlProps) {
             },
             hint: () => latest.current.hint,
             spoken: () => latest.current.spoken(),
+            prepare: () => readyRef.current(),
             onChange: setState,
           })
         : undefined,
@@ -137,8 +152,10 @@ export function VoiceControl(props: VoiceControlProps) {
   useEffect(() => {
     const off = host.onEvent((event) => {
       if (event.type === "voice-speaker" && event.speaker) {
-        setSpeakerInfo(event.speaker);
-        session?.speakerState(event.speaker);
+        const sp = event.speaker;
+        setSpeakerInfo(sp);
+        // Standing by, it can't see what this computer's speaking speaker plays.
+        session?.speakerState({ ...sp, unknown: sp.running && !sp.active });
       }
     });
     const native = host.nativeVoice?.onEvent((event) => {
@@ -173,6 +190,27 @@ export function VoiceControl(props: VoiceControlProps) {
     await host.voiceArm?.(true);
     return true;
   }, [capture, host]);
+  readyRef.current = ready;
+
+  // The microphone is granted while something is recorded or a session listens, and taken
+  // back once push to talk has sent (or dropped) its recording.
+  const armedFor =
+    state.mode === "hands-free"
+      ? state.phase !== "off"
+      : ["hearing"].includes(state.phase);
+  useEffect(() => {
+    if (!armedFor && state.phase !== "off") void host.voiceArm?.(false);
+  }, [armedFor, state.phase, host]);
+
+  // With the hub gone, nothing heard could be sent: a hands-free session ends.
+  useEffect(() => {
+    if (
+      !props.connected &&
+      state.mode === "hands-free" &&
+      state.phase !== "off"
+    )
+      void session?.end().then(() => host.voiceArm?.(false));
+  }, [props.connected, state.mode, state.phase, session, host]);
 
   // Mod+Shift+Space: talk, then send. Mod+Shift+L: a hands-free session on or off.
   const keys = useRef<(event: KeyboardEvent) => void>(() => {});
@@ -187,10 +225,11 @@ export function VoiceControl(props: VoiceControlProps) {
   const recording = state.mode === "push" && state.phase === "hearing";
   const handsFree = state.mode === "hands-free" && on;
   const disabled = !props.allowed || !props.connected;
+  // Busy: a recording is being opened, recognized or sent; a new one waits for it.
+  const busy = !session.idle && !recording;
 
   const start = async () => {
     try {
-      if (!(await ready())) return;
       await session.press();
     } catch (error) {
       props.onError(error);
@@ -199,7 +238,7 @@ export function VoiceControl(props: VoiceControlProps) {
   // A click starts recording and the next click sends; a long press is hold-to-talk, and
   // letting go sends.
   const micDown = () => {
-    if (disabled || handsFree) return;
+    if (disabled || handsFree || busy) return;
     pressedAt.current = Date.now();
     wasRecording.current = recording;
     if (!recording) void start();
@@ -219,7 +258,6 @@ export function VoiceControl(props: VoiceControlProps) {
         await host.voiceArm?.(false);
         return;
       }
-      if (!(await ready())) return;
       await session.begin();
     } catch (error) {
       props.onError(error);
@@ -235,7 +273,7 @@ export function VoiceControl(props: VoiceControlProps) {
       event.preventDefault();
       if (disabled || handsFree) return;
       if (recording) void session.release();
-      else void start();
+      else if (!busy) void start();
     } else if (event.code === "KeyL") {
       event.preventDefault();
       if (!disabled) void toggleHandsFree();
@@ -278,7 +316,9 @@ export function VoiceControl(props: VoiceControlProps) {
                         ? "Ignored its own voice"
                         : state.heard.outcome === "control"
                           ? `“${state.heard.text}”`
-                          : `Sent “${state.heard.text}”`))}
+                          : state.heard.outcome === "confirm"
+                            ? `Not sent yet: “${state.heard.text}”`
+                            : `Sent “${state.heard.text}”`))}
                 </span>
               )}
               {state.error && (
@@ -347,7 +387,7 @@ export function VoiceControl(props: VoiceControlProps) {
             ? "Click or let go to send"
             : "Talk to the orchestrator (click, or hold) · Mod+Shift+Space"
         }
-        disabled={disabled || handsFree || state.phase === "transcribing"}
+        disabled={disabled || handsFree || busy}
         onPointerDown={micDown}
         onPointerUp={micUp}
         onClick={micClick}

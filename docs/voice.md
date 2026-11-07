@@ -113,12 +113,14 @@ permission"), as `"attention"` in `[speech] read` does
 ([read-aloud.md](read-aloud.md#hearing-when-something-needs-you)): a fixed sentence with the
 thread's name, never what the request says. Answer it on screen, or ask the orchestrator. It is an ordinary speaker ([read-aloud.md](read-aloud.md#speakers)): `/read status`
 lists it, and it stops when the app quits. If the TUI's own speaker already speaks for this
-machine, the app's waits, and voice mode pauses and resumes the one that speaks through the hub.
+machine, the app's waits, and voice mode pauses and resumes the one that speaks through the hub:
+speakers of one machine share a device id, which `twr speak --control stdio` prints first
+(`{"type": "speaker", "device", "name"}`).
 
 `twr speak --control stdio` is how any program can drive a speaker: controls on stdin, one per
 line (`pause`, `resume`, `stop`, `skip`, `quit`; anything else is ignored), and what it plays
 on stdout, one JSON object per line when it changes: `{"type": "state", "workspace", "playing",
-"paused", "queued", "live", "error"}`. No text of the conversation is written there. The end of
+"paused", "queued", "live", "error"}` (`playing` counts an announcement being said too). No text of the conversation is written there. The end of
 stdin quits it.
 
 ## Microphone and privacy

@@ -768,6 +768,18 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         tty_keys_once_attached: tty,
         observe: args.control_stdio.then(stdio_observer),
     };
+    // The device id this speaker speaks as, shared by every speaker of this machine (the
+    // TUI's own too): a driver aims `speech.control` at it when this one stands by.
+    if args.control_stdio {
+        let device = opts.state.load()?.device;
+        let mut out = std::io::stdout().lock();
+        writeln!(
+            out,
+            "{}",
+            json!({"type": "speaker", "device": device, "name": opts.name})
+        )?;
+        out.flush()?;
+    }
     let keys = args.control_stdio.then(stdio_keys);
     // `run` restores the terminal before it returns, so an error prints on a normal one.
     twr_speech::run(opts, link, engine, keys, shutdown).await
@@ -810,12 +822,14 @@ fn stdio_key(line: &str) -> Option<twr_speech::Key> {
 }
 
 /// `--control stdio`'s output: what the speaker plays for each workspace, one JSON line when
-/// it changes (`{"workspace", "playing", "paused", "queued", "live", "error"}`).
+/// it changes (`{"workspace", "playing", "paused", "queued", "live", "error"}`). `playing`
+/// counts a sentence of the speaker's own (an announcement) as well as a message: a program
+/// that pauses the voice when the user talks pauses that too.
 fn stdio_observer() -> twr_speech::StateObserver {
     let last = std::sync::Mutex::new(std::collections::HashMap::<String, String>::new());
     Arc::new(
-        move |ws: &str, state: &twr_core::speech::SpeechStateParams| {
-            let line = stdio_state_line(ws, state);
+        move |ws: &str, state: &twr_core::speech::SpeechStateParams, speaking: bool| {
+            let line = stdio_state_line(ws, state, speaking);
             let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
             if last.get(ws) == Some(&line) {
                 return;
@@ -828,12 +842,17 @@ fn stdio_observer() -> twr_speech::StateObserver {
     )
 }
 
-/// One line of [`stdio_observer`].
-fn stdio_state_line(ws: &str, state: &twr_core::speech::SpeechStateParams) -> String {
+/// One line of [`stdio_observer`]: `speaking`, the speaker says something now (of any
+/// workspace; a message of this one shows as `playing` either way).
+fn stdio_state_line(
+    ws: &str,
+    state: &twr_core::speech::SpeechStateParams,
+    speaking: bool,
+) -> String {
     json!({
         "type": "state",
         "workspace": ws,
-        "playing": state.playing.is_some(),
+        "playing": state.playing.is_some() || (speaking && !state.paused),
         "paused": state.paused,
         "queued": state.queued,
         "live": state.live,
@@ -1280,7 +1299,23 @@ mod tests {
             live: true,
             ..Default::default()
         };
-        let line = stdio_state_line("work", &state);
+        let speaking = stdio_state_line("work", &state, true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&speaking).unwrap()["playing"],
+            false,
+            "paused: nothing is heard"
+        );
+        let unpaused = twr_core::speech::SpeechStateParams {
+            paused: false,
+            ..state.clone()
+        };
+        let announcing = stdio_state_line("work", &unpaused, true);
+        assert_eq!(
+            serde_json::from_str::<Value>(&announcing).unwrap()["playing"],
+            true,
+            "an announcement being said counts as playing"
+        );
+        let line = stdio_state_line("work", &state, false);
         assert!(!line.contains('\n'));
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(

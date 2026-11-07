@@ -63,6 +63,8 @@ export interface SpeakerState {
   playing: boolean;
   paused: boolean;
   queued: number;
+  /** This device can't see what it plays (another speaker of this computer speaks for it). */
+  unknown?: boolean;
 }
 
 /** The device's own speaker: what voice mode pauses when the user talks. */
@@ -196,6 +198,26 @@ export function isLikelyEcho(text: string, spoken: string[]): boolean {
     if (matched / heard.length >= 0.75) return true;
   }
   return false;
+}
+
+/** What a speaker announces ([speech] read "attention", twr_core::speech::announcement). */
+const ANNOUNCED = [
+  "needs your permission",
+  "has a question",
+  "failed",
+  "needs your review",
+  "seems hung",
+  "is stalled",
+  "finished",
+  "replied",
+];
+
+/** The sentences a speaker may announce for these threads: echoes to drop, never messages. */
+export function announcements(threads: { name: string }[]): string[] {
+  return [
+    "twr has a question for you",
+    ...threads.flatMap((t) => ANNOUNCED.map((says) => `${t.name} ${says}`)),
+  ];
 }
 
 /** The words a recognizer should expect: the names of the threads ("api" is heard as "appy"). */
@@ -503,6 +525,8 @@ export interface VoiceSessionDeps {
   submit(text: string): Promise<VoiceSubmitResult>;
   /** Reads the last orchestrator message aloud again. */
   repeat?(): Promise<void>;
+  /** Readies the microphone (recognizer set up, access granted); false: not now. */
+  prepare?(): Promise<boolean>;
   hint(): string[];
   /** What was read aloud lately (the orchestrator's last messages), for echo checks. */
   spoken(): string[];
@@ -515,7 +539,10 @@ export interface VoiceSessionState {
   level: number;
   partial: string;
   /** The last thing heard, and what became of it. */
-  heard?: { text: string; outcome: "sent" | "control" | "echo" | "empty" };
+  heard?: {
+    text: string;
+    outcome: "sent" | "confirm" | "control" | "echo" | "empty";
+  };
   /** A transcript the hub handed back to confirm (it reads as an answer or a mode change). */
   confirm?: { text: string; reason: string };
   error?: string;
@@ -537,8 +564,16 @@ export class VoiceSession {
   };
   /** Whether this session paused the speaker (and so may resume it). */
   private held = false;
-  /** Whether the speaker played when speech started (an echo is possible). */
+  /** Utterances begun (speech started) and not yet handled: the hold lasts until none is. */
+  private pending = 0;
+  /** A message was sent while the speaker was held: it goes past what it was reading. */
+  private sentWhileHeld = false;
+  /** Whether the speaker played (or may have) while these utterances were spoken. */
   private heardWhilePlaying = false;
+  /** The microphone is being opened; a release meanwhile is kept for when it is. */
+  private starting = false;
+  private releaseWanted = false;
+  private speakerStarted = false;
   private busy = Promise.resolve();
   constructor(private deps: VoiceSessionDeps) {}
   get state() {
@@ -548,10 +583,20 @@ export class VoiceSession {
     this.s = { ...this.s, ...patch };
     this.deps.onChange(this.s);
   }
+  /** Whether a recording can start now (none is being made, recognized or sent). */
+  get idle() {
+    return (
+      !this.starting &&
+      this.pending === 0 &&
+      ["off", "ready", "error"].includes(this.s.phase)
+    );
+  }
   /** What the device's speaker reports. */
   speakerState(state: SpeakerState) {
     this.set({ speaker: state });
-    this.deps.capture.setEchoGuard?.(state.playing && !state.paused);
+    this.deps.capture.setEchoGuard?.(
+      Boolean(state.unknown) || (state.playing && !state.paused),
+    );
   }
   private events(): VoiceCaptureEvents {
     return {
@@ -561,103 +606,118 @@ export class VoiceSession {
       final: (text) => {
         this.busy = this.busy.then(() => this.heard(text));
       },
-      error: (message) => this.fail(message),
+      error: (message) => {
+        this.busy = this.busy.then(() => this.failed(message));
+      },
     };
   }
   private speechStarted() {
+    this.pending++;
     const sp = this.s.speaker;
-    this.heardWhilePlaying = Boolean(sp?.playing);
-    if (sp?.playing && !sp.paused && this.deps.speaker) {
+    // A speaker this device can't see (another one of this computer speaks for it) may be
+    // playing: it is paused all the same, and what is heard is checked for its echo.
+    const playing = Boolean(sp?.unknown) || Boolean(sp?.playing && !sp.paused);
+    if (playing) this.heardWhilePlaying = true;
+    if (playing && !this.held && this.deps.speaker) {
       this.held = true;
       void this.deps.speaker.control("pause").catch(() => {});
     }
     this.set({ phase: "hearing", partial: "" });
   }
-  private fail(message: string) {
-    this.set({ phase: "error", error: message });
+  private after(): VoicePhase {
+    if (this.s.phase === "off") return "off";
+    if (this.pending > 0) return "hearing";
+    return this.s.mode === "hands-free" ? "listening" : "ready";
+  }
+  /** One utterance is handled: once none is left, the speaker this session paused goes on. */
+  private async done(patch: Partial<VoiceSessionState>) {
+    this.pending = Math.max(0, this.pending - 1);
+    if (this.pending === 0) {
+      await this.letGo(this.sentWhileHeld);
+      this.sentWhileHeld = false;
+      this.heardWhilePlaying = false;
+    }
+    this.set({ partial: "", ...patch, phase: patch.phase || this.after() });
+  }
+  private async failed(message: string) {
+    await this.done({ phase: "error", error: message });
   }
   private async heard(raw: string) {
     const text = raw.trim();
-    const listening = this.s.mode === "hands-free" && this.s.phase !== "off";
-    const after = (): VoicePhase =>
-      this.s.phase === "off" ? "off" : listening ? "listening" : "ready";
     if (!text) {
-      await this.letGo(false);
-      this.set({ phase: after(), heard: undefined, partial: "" });
+      await this.done({ heard: undefined });
       return;
     }
     if (this.heardWhilePlaying && isLikelyEcho(text, this.deps.spoken())) {
-      await this.letGo(false);
-      this.set({
-        phase: after(),
-        heard: { text, outcome: "echo" },
-        partial: "",
-      });
+      await this.done({ heard: { text, outcome: "echo" } });
       return;
     }
     const control = localCommand(text);
     if (control) {
       await this.applyControl(control);
-      this.set({
-        phase: control === "end" ? "off" : after(),
+      await this.done({
         heard: { text, outcome: "control" },
-        partial: "",
+        ...(control === "end" ? { phase: "off" as VoicePhase } : {}),
       });
       return;
     }
-    this.set({ phase: "sending", partial: "" });
+    if (this.pending <= 1) this.set({ phase: "sending", partial: "" });
     try {
       const result = await this.deps.submit(text);
-      // The message moves the conversation on: what was being read is not resumed.
-      await this.letGo(true);
-      if (result.action === "confirm")
-        this.set({
-          phase: after(),
+      if (result.action === "confirm") {
+        // Nothing was sent: what was being read goes on.
+        await this.done({
           confirm: { text, reason: result.reason || "" },
-          heard: { text, outcome: "sent" },
+          heard: { text, outcome: "confirm" },
         });
-      else
-        this.set({
-          phase: after(),
-          heard: { text, outcome: "sent" },
-          confirm: undefined,
-          error: undefined,
-        });
+        return;
+      }
+      // The message moves the conversation on: what was being read is not resumed.
+      this.sentWhileHeld = this.held;
+      await this.done({
+        heard: { text, outcome: "sent" },
+        confirm: undefined,
+        error: undefined,
+      });
     } catch (error) {
-      await this.letGo(false);
-      this.fail(error instanceof Error ? error.message : String(error));
+      await this.failed(error instanceof Error ? error.message : String(error));
     }
   }
   private async applyControl(control: LocalCommand) {
     const speaker = this.deps.speaker;
+    // Each of these decides what the speaker does next: the hold is over.
+    const own = () => {
+      this.held = false;
+      this.sentWhileHeld = false;
+    };
     switch (control) {
       case "quiet":
-        this.held = false;
+        own();
         await speaker?.control("stop");
+        await speaker?.control("resume");
         break;
       case "pause":
-        this.held = false;
+        own();
         await speaker?.control("pause");
         break;
       case "resume":
-        this.held = false;
+        own();
         await speaker?.control("resume");
         break;
       case "skip":
-        this.held = false;
+        own();
         await speaker?.control("skip");
         await speaker?.control("resume");
         break;
       case "repeat":
-        this.held = false;
+        own();
         await this.deps.repeat?.();
+        await speaker?.control("resume");
         break;
       case "cancel":
         this.set({ confirm: undefined });
-        await this.letGo(false);
         break;
       case "end":
-        await this.letGo(false);
         await this.deps.capture.cancel();
         break;
     }
@@ -669,18 +729,56 @@ export class VoiceSession {
     if (skip) await this.deps.speaker.control("skip").catch(() => {});
     await this.deps.speaker.control("resume").catch(() => {});
   }
-  /** Push-to-talk pressed. */
+  /** This device's speaker reads the replies: started once, the first time voice is used. */
+  private async startSpeaker() {
+    if (this.speakerStarted || !this.deps.speaker) return;
+    this.speakerStarted = true;
+    try {
+      await this.deps.speaker.live(true);
+    } catch (error) {
+      // An older gateway or a missing engine: voice still sends, nothing is read aloud here.
+      this.speakerStarted = false;
+      this.set({
+        error:
+          "Replies are not read aloud on this device: " +
+          (error instanceof Error ? error.message : String(error)),
+      });
+    }
+  }
+  /** Push-to-talk pressed. Refused while a recording is made, recognized or sent. */
   async press() {
-    if (this.s.phase === "listening" || this.s.phase === "hearing") return;
+    if (!this.idle) return;
+    this.starting = true;
+    this.releaseWanted = false;
+    const previous = this.s.phase;
     this.set({ mode: "push", phase: "hearing", error: undefined, partial: "" });
     try {
+      if (this.deps.prepare && !(await this.deps.prepare())) {
+        this.starting = false;
+        this.set({ phase: previous === "error" ? "off" : previous });
+        return;
+      }
+      void this.startSpeaker();
       await this.deps.capture.start("push", this.events(), this.deps.hint());
     } catch (error) {
-      this.fail(error instanceof Error ? error.message : String(error));
+      this.starting = false;
+      this.pending = 0;
+      await this.letGo(false);
+      this.set({
+        phase: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return;
     }
+    this.starting = false;
+    if (this.releaseWanted) await this.release();
   }
   /** Push-to-talk released: what was said is recognized and sent. */
   async release() {
+    if (this.starting) {
+      this.releaseWanted = true;
+      return;
+    }
     if (this.s.mode !== "push" || this.s.phase !== "hearing") return;
     this.set({ phase: "transcribing" });
     await this.deps.capture.stop();
@@ -688,6 +786,8 @@ export class VoiceSession {
   }
   /** A hands-free session: listens until `end`. */
   async begin() {
+    if (!this.idle) return;
+    this.starting = true;
     this.set({
       mode: "hands-free",
       phase: "listening",
@@ -695,19 +795,31 @@ export class VoiceSession {
       partial: "",
     });
     try {
-      await this.deps.speaker?.live(true);
+      if (this.deps.prepare && !(await this.deps.prepare())) {
+        this.set({ phase: "off" });
+        return;
+      }
+      await this.startSpeaker();
       await this.deps.capture.start(
         "hands-free",
         this.events(),
         this.deps.hint(),
       );
     } catch (error) {
-      this.fail(error instanceof Error ? error.message : String(error));
+      this.set({
+        phase: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.starting = false;
     }
   }
   /** Ends a session (hands-free) or drops a recording (push). */
   async end() {
+    this.releaseWanted = false;
     await this.deps.capture.cancel();
+    this.pending = 0;
+    this.sentWhileHeld = false;
     await this.letGo(false);
     this.set({ phase: "off", level: 0, partial: "" });
   }
