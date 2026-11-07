@@ -148,6 +148,9 @@ export function AppOptions() {
           sent anywhere. Copied diagnostics have tokens, keys and your home
           folder removed. Check them before sharing.
         </p>
+        <p className="app-options-path">
+          Log folder: <code>{settings.logDirectory}</code>
+        </p>
         <div className="manager-actions">
           <button
             disabled={busy}

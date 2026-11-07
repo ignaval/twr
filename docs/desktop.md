@@ -134,8 +134,8 @@ content-addressed directory, so a running hub's executable is never replaced.
 ## Diagnostics
 
 twr keeps a local log (`twr-desktop.log`, rotated at 2 MiB) in the folder shown by
-**Help › Open Log Folder** (`~/Library/Logs/twr` on macOS, `~/.config/twr/logs` on
-Linux). The log records startup, update checks, hub connection failures, renderer errors
+**Help › Open Log Folder** and in Settings › Diagnostics (`~/Library/Logs/twr-desktop`
+on macOS; under the app's configuration folder on Linux). The log records startup, update checks, hub connection failures, renderer errors
 and crashed helper processes. Chromium crash reports are kept on disk and never uploaded.
 **Settings › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
 version, install kind, platform and session details, GPU status, memory use and the recent

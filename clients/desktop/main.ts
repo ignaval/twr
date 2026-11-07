@@ -919,6 +919,7 @@ async function createWindow(hidden = false) {
     // Background mode: keep the renderer, hub connection and terminals alive.
     if (!quitting && !quitRequested && services?.background) {
       event.preventDefault();
+      services.log.info("window", "Hiding the window (background mode)");
       window.hide();
       return;
     }
@@ -993,12 +994,18 @@ else {
           activeTerminals: () =>
             [...terminals.values()].filter((t) => !t.exited).length,
           facts: () => ({
+            window:
+              window && !window.isDestroyed()
+                ? { visible: window.isVisible(), focused: window.isFocused() }
+                : "closed",
             workspace: workspaceReady ? "connected" : "not connected",
             hubVersion,
             terminals: [...terminals.values()].filter((t) => !t.exited).length,
           }),
         },
-        !app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA
+        // Automated runs keep their log with their isolated user data.
+        process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" ||
+          (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
           ? join(app.getPath("userData"), "logs")
           : app.getPath("logs"),
       );
@@ -1089,8 +1096,18 @@ else {
           },
         ]),
       );
+      // Packaged QA closes the window the way the title-bar button does.
+      // Synthetic input cannot reach native menu accelerators.
+      if (process.env.TWR_DESKTOP_TEST_AUTOMATION === "1")
+        process.on("SIGUSR2", () => {
+          services?.log.info("test", "Closing the window (SIGUSR2)");
+          if (window && !window.isDestroyed()) window.close();
+        });
       await createWindow(services.startHidden);
-      app.on("activate", () => showWindow());
+      app.on("activate", () => {
+        services?.log.info("window", "Activated; showing the window");
+        showWindow();
+      });
     })
     .catch((error) => {
       services?.log.error("app", "Startup failed", error);
