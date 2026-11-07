@@ -10,6 +10,11 @@ const api: DesktopAPI = {
   secureDelete: (key) => ipcRenderer.invoke("twr:secure-delete", key),
   setAppearance: (appearance) =>
     ipcRenderer.invoke("twr:set-appearance", appearance),
+  voiceStatus: () => ipcRenderer.invoke("twr:voice-status"),
+  voiceArm: (on) => ipcRenderer.invoke("twr:voice-arm", on),
+  voiceTranscribe: (recording, hint) =>
+    ipcRenderer.invoke("twr:voice-transcribe", recording, hint),
+  voiceSpeaker: (op) => ipcRenderer.invoke("twr:voice-speaker", op),
   quit: () => ipcRenderer.invoke("twr:quit"),
   copyText: (text) => ipcRenderer.invoke("twr:copy-text", text),
   bootstrap: () => ipcRenderer.invoke("twr:bootstrap"),

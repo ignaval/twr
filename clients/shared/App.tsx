@@ -90,6 +90,8 @@ import type {
 } from "./types";
 import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
+import { VoiceControl } from "./VoiceControl";
+import { voiceHint } from "./voice";
 import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
 import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
@@ -1294,6 +1296,35 @@ export default function App({
       input.current?.focus();
     }
   };
+  // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
+  // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
+  // not through the offline outbox: it is said now, about what is on screen now.
+  const submitVoice = async (text: string): Promise<Json> => {
+    if (!orchestrator)
+      throw new Error("Choose an orchestrator before talking to it.");
+    const response = await rpc("say", {
+      message: text,
+      seen_gseq: view.head,
+      to: "orchestrator",
+      voice: true,
+    });
+    if (response.action === "pending") {
+      setSection("attention");
+      throw new Error(
+        "Not sent: review the waiting requests and answer the exact item shown.",
+      );
+    }
+    setQueueRefresh((n) => n + 1);
+    return response;
+  };
+  const voiceHintWords = useMemo(() => voiceHint(view.threads), [view.threads]);
+  const spokenLately = () =>
+    destination
+      ? []
+      : blocksOf(events)
+          .filter((b) => b.kind === "assistant")
+          .slice(-3)
+          .map((b) => b.text);
   async function submitSlash(text: string) {
     if (slashPending.current) return;
     slashPending.current = true;
@@ -2646,6 +2677,27 @@ export default function App({
                         </small>
                       )}
                     </span>
+                    <VoiceControl
+                      host={hostApi}
+                      rpc={rpc}
+                      connected={connected}
+                      allowed={permitted("operate") && Boolean(orchestrator)}
+                      submit={submitVoice}
+                      hint={voiceHintWords}
+                      spoken={spokenLately}
+                      edit={(text) => {
+                        setDestination(undefined);
+                        setDrafts((old) => ({
+                          ...old,
+                          [workspace + ":orchestrator"]: appendDraft(
+                            old[workspace + ":orchestrator"],
+                            text,
+                          ),
+                        }));
+                        input.current?.focus();
+                      }}
+                      onError={fail}
+                    />
                     <button
                       className="send-button"
                       type="submit"

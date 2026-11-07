@@ -114,7 +114,10 @@
         }
       ],
       "hardenedRuntime": true,
-      "entitlements": "packaging/entitlements.mac.plist"
+      "entitlements": "packaging/entitlements.mac.plist",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "twr listens only while voice mode is on, to turn what you say into a message for your orchestrator. The audio stays on this Mac unless you configure another recognizer."
+      }
     },
     "linux": {
       "category": "Development",
