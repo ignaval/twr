@@ -28,7 +28,7 @@ export async function generatedCatalog(binary) {
   ).filter(
     (item) =>
       !["update", "mcp"].includes(item.cli?.[0]) &&
-      item.cli?.join(" ") !== "hub",
+      !["hub", "voice transcribe"].includes(item.cli?.join(" ")),
   );
 }
 if (
