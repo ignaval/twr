@@ -27,6 +27,14 @@ const PHASES: Record<string, string> = {
 
 const HOLD_MS = 350;
 
+/**
+ * Runs a call nobody waits for. A view's host calls fail once its hub connection is closed
+ * (switching hubs, forgetting one): cleanup then has nothing left to undo.
+ */
+const quietly = (call: Promise<unknown> | undefined) => {
+  void call?.catch(() => {});
+};
+
 function voiceCapture(host: DesktopAPI): VoiceCapture | undefined {
   if (host.nativeVoice) return createNativeCapture(host.nativeVoice);
   if (host.voiceTranscribe && host.voiceStatus && navigator.mediaDevices)
@@ -172,8 +180,8 @@ export function VoiceControl(props: VoiceControlProps) {
 
   useEffect(
     () => () => {
-      void session?.end();
-      void host.voiceArm?.(false);
+      quietly(session?.end());
+      quietly(host.voiceArm?.(false));
     },
     [session, host],
   );
@@ -199,7 +207,7 @@ export function VoiceControl(props: VoiceControlProps) {
       ? state.phase !== "off"
       : ["hearing"].includes(state.phase);
   useEffect(() => {
-    if (!armedFor && state.phase !== "off") void host.voiceArm?.(false);
+    if (!armedFor && state.phase !== "off") quietly(host.voiceArm?.(false));
   }, [armedFor, state.phase, host]);
 
   // With the hub gone, nothing heard could be sent: a hands-free session ends.
@@ -209,7 +217,7 @@ export function VoiceControl(props: VoiceControlProps) {
       state.mode === "hands-free" &&
       state.phase !== "off"
     )
-      void session?.end().then(() => host.voiceArm?.(false));
+      quietly(session?.end().then(() => host.voiceArm?.(false)));
   }, [props.connected, state.mode, state.phase, session, host]);
 
   // Mod+Shift+Space: talk, then send. Mod+Shift+L: a hands-free session on or off.
@@ -245,10 +253,10 @@ export function VoiceControl(props: VoiceControlProps) {
   };
   const micUp = () => {
     if (!wasRecording.current && Date.now() - pressedAt.current > HOLD_MS)
-      void session.release();
+      session.release().catch(props.onError);
   };
   const micClick = () => {
-    if (wasRecording.current) void session.release();
+    if (wasRecording.current) session.release().catch(props.onError);
     wasRecording.current = false;
   };
   const toggleHandsFree = async () => {
@@ -272,7 +280,7 @@ export function VoiceControl(props: VoiceControlProps) {
     if (event.code === "Space") {
       event.preventDefault();
       if (disabled || handsFree) return;
-      if (recording) void session.release();
+      if (recording) session.release().catch(props.onError);
       else if (!busy) void start();
     } else if (event.code === "KeyL") {
       event.preventDefault();
