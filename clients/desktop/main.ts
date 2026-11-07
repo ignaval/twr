@@ -8,6 +8,7 @@ import {
   shell,
   clipboard,
   nativeTheme,
+  systemPreferences,
 } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -44,6 +45,7 @@ import {
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
 import { ENGINE_BINARIES, EngineDigests, cleanupEngines } from "./engines";
 import { discoverCatalog } from "./catalog";
+import { DesktopVoice } from "./voice";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
@@ -60,6 +62,10 @@ if (
 if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
   app.commandLine.removeSwitch("remote-debugging-port");
   app.commandLine.removeSwitch("remote-debugging-pipe");
+  // Chromium's fake microphone and its permission bypass are for tests only.
+  app.commandLine.removeSwitch("use-fake-ui-for-media-stream");
+  app.commandLine.removeSwitch("use-fake-device-for-media-stream");
+  app.commandLine.removeSwitch("use-file-for-fake-audio-capture");
 }
 
 let window: BrowserWindow;
@@ -75,6 +81,10 @@ let localGeneration = 0;
 const exec = promisify(execFile);
 let openingTerminals = 0;
 let remoteTransport: DesktopTransport;
+let voice: DesktopVoice | undefined;
+// The microphone is granted only after the user turned voice mode on (`voice-arm`), and only
+// for audio, to the app's own page.
+let microphoneArmed = false;
 const terminals = new Map<
   string,
   {
@@ -526,6 +536,33 @@ function register() {
   handle("quit", () => {
     app.quit();
   });
+  voice = new DesktopVoice(() => binaries.twr, env, emit);
+  handle("voice-status", () => voice!.status());
+  handle("voice-arm", async (on) => {
+    microphoneArmed = z.boolean().parse(on);
+    // Voice QA (scripts/voice-qa.mjs) plays a recording as the microphone in a development
+    // build: no system access is asked for. A packaged build always asks.
+    const voiceQa =
+      !app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION === "1";
+    if (microphoneArmed && process.platform === "darwin" && !voiceQa) {
+      // macOS asks once; after that its answer stands until changed in System Settings.
+      const access = systemPreferences.getMediaAccessStatus("microphone");
+      const granted =
+        access === "granted" ||
+        (access === "not-determined" &&
+          (await systemPreferences.askForMediaAccess("microphone")));
+      if (!granted) {
+        microphoneArmed = false;
+        throw new Error(
+          "Microphone access is off for twr. Turn it on in System Settings > Privacy & Security > Microphone.",
+        );
+      }
+    }
+  });
+  handle("voice-transcribe", (recording, hint) =>
+    voice!.transcribe(recording, hint),
+  );
+  handle("voice-speaker", (op) => voice!.speakerControl(op));
   let catalog: ReturnType<typeof discoverCatalog> | undefined;
   handle(
     "catalog",
@@ -544,7 +581,7 @@ function register() {
           items.filter(
             (item) =>
               !["update", "mcp"].includes(item.cli?.[0] || "") &&
-              item.cli?.join(" ") !== "hub",
+              !["hub", "voice transcribe"].includes(item.cli?.join(" ") || ""),
           ),
         )
         .catch((error) => {
@@ -892,10 +929,39 @@ async function createWindow() {
   window.webContents.on("will-navigate", (event, url) => {
     if (url !== (devUrl || pathToFileURL(appFile).href)) event.preventDefault();
   });
+  // Only the microphone, only for audio, only for the app's own main frame, only once the
+  // user turned voice mode on. Everything else stays refused.
+  const appPage = (url: string) => {
+    try {
+      return devUrl
+        ? new URL(url).origin === new URL(devUrl).origin
+        : new URL(url).href === pathToFileURL(appFile).href;
+    } catch {
+      return false;
+    }
+  };
   window.webContents.session.setPermissionRequestHandler(
-    (_contents, _permission, callback) => callback(false),
+    (contents, permission, callback, details) => {
+      const media = details as { mediaTypes?: string[]; isMainFrame?: boolean };
+      callback(
+        permission === "media" &&
+          microphoneArmed &&
+          contents === window.webContents &&
+          media.isMainFrame !== false &&
+          Boolean(media.mediaTypes?.length) &&
+          media.mediaTypes!.every((t) => t === "audio") &&
+          appPage(contents.getURL()),
+      );
+    },
   );
-  window.webContents.session.setPermissionCheckHandler(() => false);
+  window.webContents.session.setPermissionCheckHandler(
+    (contents, permission, _origin, details) =>
+      permission === "media" &&
+      microphoneArmed &&
+      contents === window.webContents &&
+      (details as { mediaType?: string }).mediaType === "audio" &&
+      appPage(contents.getURL()),
+  );
   window.webContents.on("will-prevent-unload", (event) => {
     const choice = dialog.showMessageBoxSync(window, {
       type: "question",
@@ -1061,5 +1127,6 @@ else {
   });
   app.on("before-quit", () => {
     quitRequested = true;
+    voice?.dispose();
   });
 }

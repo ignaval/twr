@@ -2862,6 +2862,23 @@
         "type": "boolean",
         "description": "Print a LaunchAgent (macOS) or systemd user unit (Linux) that runs this `twr speak`, and the commands to install it; installs nothing",
         "advanced": false
+      },
+      {
+        "key": "control",
+        "label": "control",
+        "type": "select",
+        "description": "For a program that drives the speaker (the desktop app's voice mode): controls on stdin, one per line (`pause`, `resume`, `stop`, `skip`, `quit`), and what it plays on stdout, one JSON object per line. Its notes stay on stderr [possible values: stdio]",
+        "advanced": false,
+        "options": [
+          "stdio"
+        ]
+      },
+      {
+        "key": "announce",
+        "label": "announce",
+        "type": "boolean",
+        "description": "Also say when something needs you (\"api needs your permission\"), as `\"attention\"` in `[speech] read` does",
+        "advanced": false
       }
     ],
     "cli": [
@@ -2909,6 +2926,18 @@
         "flag": "--print-service",
         "many": false,
         "separator": false
+      },
+      {
+        "key": "control",
+        "flag": "--control",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "announce",
+        "flag": "--announce",
+        "many": false,
+        "separator": false
       }
     ]
   },
@@ -2933,6 +2962,13 @@
         "advanced": false
       },
       {
+        "key": "attention",
+        "label": "attention",
+        "type": "boolean",
+        "description": "With `--text`, also a line when something needs you (\"api needs your permission\")",
+        "advanced": false
+      },
+      {
         "key": "all-workspaces",
         "label": "all workspaces",
         "type": "boolean",
@@ -2954,6 +2990,12 @@
       {
         "key": "proto",
         "flag": "--proto",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "attention",
+        "flag": "--attention",
         "many": false,
         "separator": false
       },
@@ -3505,6 +3547,33 @@
       {
         "key": "by",
         "flag": "--by",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voice status",
+    "title": "twr voice status",
+    "description": "Whether a recognizer is set up (`[voice]`), and how to set one up if not",
+    "group": "CLI · voice",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "One JSON object: `{available, engine, local, problem}`",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "voice",
+      "status"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
         "many": false,
         "separator": false
       }

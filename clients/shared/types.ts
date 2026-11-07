@@ -66,6 +66,17 @@ export interface DesktopEvent {
   data?: string;
   exitCode?: number;
   theme?: Record<string, string> | null;
+  /** `voice-speaker`: this computer's own speaker (desktop/voice.ts). */
+  speaker?: {
+    running: boolean;
+    device?: string;
+    active: boolean;
+    name: string;
+    playing: boolean;
+    paused: boolean;
+    queued: number;
+    error?: string;
+  };
 }
 export interface TerminalSession {
   id: string;
@@ -106,6 +117,18 @@ export interface DesktopAPI {
   cancelUpload?(
     resume: import("./uploads").UploadResume,
   ): Promise<import("./uploads").UploadCancelResult>;
+  /** Voice mode (shared/voice.ts): desktop recognition through `twr voice`. */
+  voiceStatus?(): Promise<import("./voice").VoiceCaptureStatus>;
+  voiceArm?(on: boolean): Promise<void>;
+  voiceTranscribe?(
+    recording: Uint8Array,
+    hint: string[],
+  ): Promise<{ text: string }>;
+  voiceSpeaker?(
+    op: "start" | "stop" | "pause" | "resume" | "skip" | "silence",
+  ): Promise<NonNullable<DesktopEvent["speaker"]>>;
+  /** Voice mode with the platform's own recognizer and voice (mobile). */
+  nativeVoice?: import("./voice").NativeVoice;
   quit(): Promise<void>;
   copyText(text: string): Promise<void>;
   bootstrap(): Promise<{

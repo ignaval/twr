@@ -13,6 +13,9 @@
 //!   any engine, and an engine that cannot pause restarts the chunk.
 //! - **Which turns speak** ([`speakable_turn`]): conversation turns, never maintenance (a
 //!   handoff, a compaction).
+//! - **Announcements** ([`announcement`]): with [`ReadKind::Attention`], the hub also says
+//!   when an attention item is raised, in a fixed sentence naming the thread (`api needs
+//!   your permission`); the item's summary, command or anything an agent wrote is never in it.
 
 use std::collections::BTreeMap;
 
@@ -713,6 +716,11 @@ pub enum ReadKind {
     Replies,
     /// A text before the turn's last one (before a tool call).
     Commentary,
+    /// Announcements of attention items as they are raised ([`SpeechItem::Announce`]): a
+    /// fixed sentence naming the thread, never what the item says. A hub older than this
+    /// kind refuses an attach that names it (`unknown variant`); the speaker's link then
+    /// attaches again without it.
+    Attention,
 }
 
 /// `[speech] turn_from`: whose turns are read.
@@ -799,7 +807,7 @@ impl SpeechAttachParams {
             return Some(format!("catchup_secs: at most {CATCHUP_MAX}"));
         }
         if self.read.is_empty() {
-            return Some("read: at least one of replies, commentary".into());
+            return Some("read: at least one of replies, commentary, attention".into());
         }
         None
     }
@@ -922,6 +930,59 @@ pub enum SpeechItem {
         /// The new orchestrator thread.
         thread: String,
     },
+    /// Something needs the user: a fixed sentence of the hub's naming a thread
+    /// ([`announcement`]), sent live only to a speaker that reads [`ReadKind::Attention`]
+    /// (never in a catch-up, never counted in `missed`, no watermark). One waiting with the
+    /// same `key` on the speaker is replaced by it.
+    Announce {
+        /// What it is about (the hub sends its thread's id): an announcement waiting with this
+        /// key is replaced, and a [`SpeechItem::Retract`] of it drops it.
+        key: String,
+        /// What to say, at most [`ANNOUNCE_MAX`] characters.
+        text: String,
+    },
+    /// What the announcement `key` said is no longer true (every item it was about was
+    /// answered or withdrawn): dropped if it waits, left to end if it is being said.
+    Retract {
+        /// The announcement's key.
+        key: String,
+    },
+}
+
+/// The longest announcement ([`SpeechItem::Announce`]), in characters.
+pub const ANNOUNCE_MAX: usize = 160;
+
+/// The longest thread name an announcement says, in characters.
+pub const ANNOUNCE_NAME_MAX: usize = 64;
+
+/// What an announcement says when `what` needs the user on the thread called `who`
+/// (`hub`: the hub's own thread, whose questions are "which thread did you mean?" and the
+/// orchestrator's proposals): a fixed sentence and the name, cleaned ([`clean`]) and cut to
+/// [`ANNOUNCE_NAME_MAX`], never the item's own words. `api needs your permission`, `twr has a
+/// question for you`.
+pub fn announcement(what: crate::notify::NotifyEvent, who: &str, hub: bool) -> String {
+    use crate::notify::NotifyEvent as N;
+    if hub {
+        return "twr has a question for you".into();
+    }
+    let name: String = clean(who).trim().chars().take(ANNOUNCE_NAME_MAX).collect();
+    let name = if name.trim().is_empty() {
+        "a thread".to_string()
+    } else {
+        name.trim().to_string()
+    };
+    let says = match what {
+        N::Permission => "needs your permission",
+        N::Question | N::Confirm => "has a question",
+        N::Error => "failed",
+        N::Review => "needs your review",
+        N::Hung => "seems hung",
+        N::Stalled => "is stalled",
+        N::Report => "finished",
+        N::Reply => "replied",
+    };
+    let text = format!("{name} {says}");
+    text.chars().take(ANNOUNCE_MAX).collect()
 }
 
 /// What a speaker is playing.
@@ -1385,6 +1446,24 @@ mod tests {
         p.name = "x".into();
         p.read.clear();
         assert!(p.error().is_some());
+        // Announcements alone are something to read.
+        p.read = vec![ReadKind::Attention];
+        assert_eq!(p.error(), None);
+        let v: SpeechAttachParams = serde_json::from_value(
+            json!({"device": "d", "name": "n", "engine": "say", "read": ["replies", "attention"]}),
+        )
+        .unwrap();
+        assert_eq!(v.read, vec![ReadKind::Replies, ReadKind::Attention]);
+        assert_eq!(
+            serde_json::to_value(ReadKind::Attention).unwrap(),
+            json!("attention")
+        );
+        // What an older hub says of it (its `ReadKind` has no `attention`): the speaker's link
+        // looks for these words.
+        assert!(serde_json::from_value::<ReadKind>(json!("attentions"))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown variant `attentions`"));
         let v: SpeechAttachParams =
             serde_json::from_value(json!({"device": "d", "name": "n", "engine": "say"})).unwrap();
         assert_eq!(v.read, default_read());
@@ -1407,6 +1486,50 @@ mod tests {
         assert_eq!(c(CtlOp::Rate, Some(json!(200))).error(), None);
         assert!(c(CtlOp::Rate, Some(json!(20))).error().is_some());
         assert_eq!(c(CtlOp::Voice, Some(json!("Ava"))).error(), None);
+    }
+
+    #[test]
+    fn announcements_are_fixed_sentences_naming_the_thread() {
+        use crate::notify::NotifyEvent as N;
+        assert_eq!(
+            announcement(N::Permission, "api", false),
+            "api needs your permission"
+        );
+        assert_eq!(
+            announcement(N::Question, "docs", false),
+            "docs has a question"
+        );
+        assert_eq!(announcement(N::Stalled, "api", false), "api is stalled");
+        assert_eq!(announcement(N::Hung, "api", false), "api seems hung");
+        assert_eq!(announcement(N::Error, "api", false), "api failed");
+        assert_eq!(
+            announcement(N::Review, "api", false),
+            "api needs your review"
+        );
+        // The hub's own items, whatever they are.
+        assert_eq!(
+            announcement(N::Question, "twr", true),
+            "twr has a question for you"
+        );
+        assert_eq!(
+            announcement(N::Confirm, "twr", true),
+            "twr has a question for you"
+        );
+        // A name is cleaned and cut; an empty one is "a thread".
+        assert_eq!(
+            announcement(N::Permission, "a\u{202E}pi\n", false),
+            "api needs your permission"
+        );
+        let long = announcement(N::Question, &"n".repeat(500), false);
+        assert_eq!(
+            long,
+            format!("{} has a question", "n".repeat(ANNOUNCE_NAME_MAX))
+        );
+        assert!(long.chars().count() <= ANNOUNCE_MAX);
+        assert_eq!(
+            announcement(N::Error, " \u{200B}", false),
+            "a thread failed"
+        );
     }
 
     #[test]
@@ -1433,12 +1556,21 @@ mod tests {
                 upto: 9,
             },
             SpeechItem::Orchestrator { thread: "o".into() },
+            SpeechItem::Announce {
+                key: "t".into(),
+                text: "api needs your permission".into(),
+            },
+            SpeechItem::Retract { key: "t".into() },
         ];
         for it in items {
             let v = serde_json::to_value(&it).unwrap();
             assert!(v["item"].is_string());
             assert_eq!(serde_json::from_value::<SpeechItem>(v).unwrap(), it);
         }
+        assert_eq!(
+            serde_json::to_value(SpeechItem::Retract { key: "t".into() }).unwrap(),
+            json!({"item": "retract", "key": "t"})
+        );
         let hello: ProxyOut =
             serde_json::from_value(json!({"proxy": 1, "host": "h", "workspaces": ["default"]}))
                 .unwrap();

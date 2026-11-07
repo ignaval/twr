@@ -5000,6 +5000,7 @@ dependencies = [
  "twr-core",
  "twr-hub",
  "twr-link",
+ "twr-speech",
  "uuid",
 ]
 
@@ -5042,6 +5043,7 @@ dependencies = [
  "twr-source",
  "twr-speech",
  "twr-tui",
+ "twr-voice",
 ]
 
 [[package]]
@@ -5224,6 +5226,20 @@ dependencies = [
  "toml",
  "twr-core",
  "twr-link",
+ "twr-speech",
+]
+
+[[package]]
+name = "twr-voice"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "twr-core",
  "twr-speech",
 ]
 

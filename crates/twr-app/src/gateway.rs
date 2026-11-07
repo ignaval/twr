@@ -108,7 +108,7 @@ struct Server {
     binary: PathBuf,
     companion: PathBuf,
     owner: Mutex<Option<twr_core::client::Client>>,
-    auth: Auth,
+    auth: Arc<Auth>,
     slots: Arc<Semaphore>,
     development: bool,
     sessions: Mutex<HashMap<String, Arc<DeviceSession>>>,
@@ -575,6 +575,8 @@ struct Session {
     uploads: Mutex<HashMap<String, remote::upload::Pending>>,
     upload_quota: std::sync::Mutex<remote::upload::Quota>,
     latest_state: Arc<std::sync::Mutex<Option<Value>>>,
+    /// The phone's own speaker (`remote::voice`), when voice mode runs one.
+    voice: remote::voice::DeviceVoice,
 }
 /// The workspace owns the device check too: an unrestricted gateway process must never
 /// substitute its own local-user authority for a paired device's read grant.
@@ -1179,8 +1181,47 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
                 Ok(Value::Null)
             }
             "terminal-ack" | "terminal-focus" => Ok(Value::Null),
+            "voice-speaker" => {
+                remote::voice::allowed(&self.device)?;
+                let op = remote::voice::Op::parse(p)?;
+                self.voice
+                    .control(op, || self.voice_start(server, &workspace))
+                    .await
+            }
             _ => anyhow::bail!("Unsupported mobile operation"),
         }
+    }
+}
+impl Session {
+    /// The phone's speaker for `workspace`: this machine's hub of it, the device's own state
+    /// file, `[speech]`'s choices of what is read and attention announcements (its engine
+    /// settings are this machine's and play no part: the phone speaks). It ends once the device is revoked or loses `read`.
+    fn voice_start(&self, server: &Server, workspace: &str) -> Result<remote::voice::Start> {
+        let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
+        let root = paths.root();
+        let mut config = twr_core::config::Config::load_from(&root)
+            .map(|c| c.speech)
+            .unwrap_or_default();
+        // Voice mode also says when something needs you, as the desktop's speaker does
+        // (`twr speak --announce`): a fixed sentence with a thread's name.
+        if !config.read.contains(&twr_core::speech::ReadKind::Attention) {
+            config.read.push(twr_core::speech::ReadKind::Attention);
+        }
+        let store = remote::voice::state_store(&root.data_dir.join("mobile"), &self.device.id)?;
+        let (auth, device) = (server.auth.clone(), self.device.clone());
+        Ok(remote::voice::Start {
+            workspace: workspace.to_owned(),
+            name: remote::voice::speaker_name(&self.device.name),
+            store,
+            link: twr_speech::LinkSpec::Local {
+                paths,
+                workspaces: twr_speech::Workspaces::One(workspace.to_owned()),
+            },
+            config,
+            allowed: Arc::new(move || {
+                auth.current(&device) && remote::voice::allowed(&device).is_ok()
+            }),
+        })
     }
 }
 fn validate_args(args: &[String]) -> Result<()> {
@@ -1254,11 +1295,12 @@ async fn serve_socket(
                     connecting: Mutex::new(()),
                     bridge_generation,
                     terminals: Mutex::new(HashMap::new()),
-                    events: tx,
+                    events: tx.clone(),
                     terminal_events: terminal_tx,
                     uploads: Mutex::new(HashMap::new()),
                     upload_quota: std::sync::Mutex::new(remote::upload::Quota::default()),
                     latest_state: latest_state.clone(),
+                    voice: remote::voice::DeviceVoice::new(tx.clone()),
                 },
                 events,
                 terminal_events,
@@ -1324,6 +1366,8 @@ async fn serve_socket(
     slot.last_seen.store(remote::auth::now(), Ordering::SeqCst);
     let (mut sink, mut incoming) = socket.split();
     let mut rx = slot.events.subscribe();
+    // While it lives, the phone's speaker (if any) can reach it: utterances wait for one.
+    let _voice_socket = slot.session.voice.socket();
     let mut terminal_rx = slot.terminal_events.subscribe();
     let state_cache = slot.latest_state.clone();
     let (replies, mut response_rx) = mpsc::channel::<Value>(32);
@@ -1477,7 +1521,7 @@ async fn serve_socket(
                         },Ok(None)=>{let (sender,receiver)=tokio::sync::watch::channel(None);waiters.insert(receipt_key.clone(),receiver);completion=Some(sender);},Err(error)=>{drop(waiters);let _=task_replies.send(json!({"id":call.id,"error":error.to_string()})).await;return}}
                       }
                       let result=task_slot.session.call(&task_server,&call).await;
-                      if result.is_ok()&&call.method=="connect"{let workspace=task_slot.session.connection.read().await.workspace.clone();start_observer(task_server.clone(),workspace).await;}
+                      if result.is_ok()&&call.method=="connect"{let workspace=task_slot.session.connection.read().await.workspace.clone();task_slot.session.voice.workspace_changed(&workspace).await;start_observer(task_server.clone(),workspace).await;}
                       if result.is_ok()&&call.method=="rpc"&&call.params["method"]=="notify.looking"{task_slot.foreground.store(call.params["params"]["looking"].as_bool().unwrap_or(false),Ordering::SeqCst);}
                       let reply=match result{Ok(result)=>json!({"id":call.id,"result":result}),Err(error)=>json!({"id":call.id,"error":error.to_string()})};
                       if mutation{if let Err(error)=task_server.receipts.finish(&task_device.id,&call.id,&reply){crate::gateway_log!("Could not record request outcome: {error}");}}
@@ -1638,7 +1682,7 @@ async fn main() -> Result<()> {
         binary,
         companion,
         owner: Mutex::new(Some(local)),
-        auth,
+        auth: Arc::new(auth),
         slots: Arc::new(Semaphore::new(32)),
         development: args.development,
         sessions: Mutex::new(HashMap::new()),

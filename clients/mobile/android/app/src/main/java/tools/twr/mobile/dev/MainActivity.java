@@ -7,6 +7,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(TwrTransportPlugin.class);
         registerPlugin(TwrLayoutPlugin.class);
         registerPlugin(TwrOfflinePlugin.class);
+        registerPlugin(TwrVoicePlugin.class);
         super.onCreate(state);
         applyWebTextZoom();
     }

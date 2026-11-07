@@ -22,6 +22,7 @@ twr-tui = { path = "crates/twr-tui" }
 twr-docs = { path = "crates/twr-docs" }
 twr-avspeech = { path = "crates/twr-avspeech" }
 twr-speech = { path = "crates/twr-speech" }
+twr-voice = { path = "crates/twr-voice" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
