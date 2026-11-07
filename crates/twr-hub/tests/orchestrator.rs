@@ -19,7 +19,7 @@ use twr_core::config::Config;
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 use twr_hub::hub::ControlSubscription;
-use twr_hub::{Caller, Hub, HubOptions, NewThread, Relay};
+use twr_hub::{Caller, Hub, HubOptions, NewThread, Relay, SayOrigin};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -4172,14 +4172,19 @@ async fn a_suggested_message_is_never_applied_as_a_command() {
     for m in ["allow api", "set web to plan mode"] {
         let seen = hub.control_read(0, 1000).unwrap().1;
         let e = hub
-            .say_to_orchestrator_as(m, Some(seen), &tui(), true)
+            .say_to_orchestrator_as(m, Some(seen), &tui(), SayOrigin::Suggested)
             .unwrap_err();
         assert_eq!(e.code, codes::BAD_REQUEST, "{m}: {e:?}");
         assert!(e.message.contains("nothing was sent"), "{m}: {e:?}");
     }
     let seen = hub.control_read(0, 1000).unwrap().1;
     let r = hub
-        .say_to_orchestrator_as("and update the docs", Some(seen), &tui(), true)
+        .say_to_orchestrator_as(
+            "and update the docs",
+            Some(seen),
+            &tui(),
+            SayOrigin::Suggested,
+        )
         .unwrap();
     assert_eq!(r["action"], "delegate", "{r}");
     let (prompt, t) = rt.next_turn().await;
@@ -4191,7 +4196,7 @@ async fn a_suggested_message_is_never_applied_as_a_command() {
     for m in ["allow api", "set web to plan mode"] {
         let seen = hub.control_read(0, 1000).unwrap().1;
         let r = hub
-            .say_to_orchestrator_as(m, Some(seen), &tui(), false)
+            .say_to_orchestrator_as(m, Some(seen), &tui(), SayOrigin::Typed)
             .unwrap();
         assert_eq!(r["action"], "command", "{m}: {r}");
     }

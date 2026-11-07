@@ -220,6 +220,9 @@ pub struct Config {
     /// Reading messages aloud (`[speech]`): read by the speaker on the machine you listen on
     /// (`twr speak`, the TUI's own), not by the hub.
     pub speech: SpeechConfig,
+    /// Talking to the orchestrator (`[voice]`, `docs/voice.md`): how speech is turned into
+    /// text, read on the machine with the microphone (`twr voice`), not by the hub.
+    pub voice: VoiceConfig,
     /// Folders `thread.new` searches for a project given by its repository folder name (a
     /// plain name that is neither a configured project nor an absolute path): `<root>/<name>`
     /// and `<root>/*/<name>`, a git repository. A leading `~` is the home directory. `None`:
@@ -274,6 +277,7 @@ impl Default for Config {
             notify: NotifyConfig::default(),
             tui: TuiConfig::default(),
             speech: SpeechConfig::default(),
+            voice: VoiceConfig::default(),
             project_roots: None,
             accounts: BTreeMap::new(),
             account_policy: BTreeMap::new(),
@@ -629,6 +633,79 @@ impl SpeechConfig {
             .flatten()
         {
             anyhow::bail!(e);
+        }
+        Ok(())
+    }
+}
+
+/// `[voice] engine`: what turns speech into text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceEngine {
+    /// `whisper` when whisper.cpp's CLI and a model are there, else `command` when one is
+    /// set, else none.
+    #[default]
+    Auto,
+    /// whisper.cpp's CLI (`whisper-cli`), on this machine: no audio leaves it.
+    Whisper,
+    /// `[voice] command`: a program of yours, the recording (16 kHz mono WAV) on its stdin and
+    /// the text on its stdout. For a hosted recognizer through your own script.
+    Command,
+}
+
+/// `[voice]`: speech to text for talking to the orchestrator (`docs/voice.md`). Read on the
+/// machine with the microphone; the hub reads none of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VoiceConfig {
+    /// What recognizes ([`VoiceEngine`]).
+    pub engine: VoiceEngine,
+    /// whisper.cpp's CLI; empty: `whisper-cli` (or `whisper-cpp`) on `PATH`.
+    pub whisper: String,
+    /// The whisper model file (ggml); empty: `voice/ggml-base.en.bin` in twr's data directory.
+    pub model: String,
+    /// The language spoken, as whisper names it (`en`, `es`), or `auto`.
+    pub language: String,
+    /// `engine = "command"`: the program and its arguments, run without a shell.
+    pub command: Vec<String>,
+    /// How long recognizing one recording may take, in seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        VoiceConfig {
+            engine: VoiceEngine::Auto,
+            whisper: String::new(),
+            model: String::new(),
+            language: "en".into(),
+            command: Vec::new(),
+            timeout_secs: 60,
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// Checks what the types allow but a recognizer can't use.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.engine == VoiceEngine::Command
+            && self.command.first().is_none_or(|p| p.trim().is_empty())
+        {
+            anyhow::bail!("voice.command: engine = \"command\" needs a program to run");
+        }
+        let lang = self.language.as_str();
+        if !(lang == "auto"
+            || (2..=8).contains(&lang.len()) && lang.bytes().all(|b| b.is_ascii_lowercase()))
+        {
+            anyhow::bail!(
+                "voice.language: {lang:?} is not a language code (en, es, ...) or \"auto\""
+            );
+        }
+        if !(1..=600).contains(&self.timeout_secs) {
+            anyhow::bail!(
+                "voice.timeout_secs: {} is not 1 to 600 seconds",
+                self.timeout_secs
+            );
         }
         Ok(())
     }
@@ -1762,6 +1839,7 @@ impl Config {
             b.check(name)?;
         }
         self.speech.validate()?;
+        self.voice.validate()?;
         match parse_span(&self.tui.summary_every_span) {
             Some(d) if d >= MIN_SUMMARY_EVERY => {}
             _ => anyhow::bail!(

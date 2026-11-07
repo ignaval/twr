@@ -449,6 +449,12 @@ enum Cmd {
         #[arg(long, value_name = "MODE", value_parser = ["stdio"], conflicts_with = "print_service")]
         control: Option<String>,
     },
+    /// Speech to text for talking to the orchestrator (docs/voice.md): what the desktop app
+    /// runs on the machine with the microphone, with `[voice]` of this machine's config.
+    Voice {
+        #[command(subcommand)]
+        cmd: VoiceCmd,
+    },
     /// `mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak
     /// --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's
     /// data directory), stopped when the session ends.
@@ -832,6 +838,27 @@ enum Cmd {
         /// With --daemon: the file it logs to.
         #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
         log: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VoiceCmd {
+    /// Whether a recognizer is set up (`[voice]`), and how to set one up if not.
+    Status {
+        /// One JSON object: `{available, engine, local, problem}`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The text of one recording: a 16 kHz mono 16-bit WAV on stdin (at most two minutes),
+    /// its text on stdout (empty when nothing was said).
+    Transcribe {
+        /// One JSON object, `{"text": ...}`, rather than the text alone.
+        #[arg(long)]
+        json: bool,
+        /// Words to expect (thread names), space- or comma-separated: plain words of
+        /// `[A-Za-z0-9._-]` only, the rest left out.
+        #[arg(long, value_name = "WORDS")]
+        hint: Vec<String>,
     },
 }
 
@@ -1794,6 +1821,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             .await?;
             return Ok(ExitCode::SUCCESS);
         }
+        // The machine's own `[voice]` (the root's), as a speaker's `[speech]`: no hub. It
+        // records nothing (the app with the microphone does) and sends nothing anywhere: it
+        // turns a recording it is given into text, which an agent may do as well as you.
+        Some(Cmd::Voice { cmd }) => {
+            voice(cmd, &paths).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Some(Cmd::Remote {
             host,
             ssh,
@@ -1929,6 +1963,7 @@ async fn run_simple(
         | Cmd::Boxes { .. }
         | Cmd::Speech { .. }
         | Cmd::Speak { .. }
+        | Cmd::Voice { .. }
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
         | Cmd::Account { .. }
@@ -7556,6 +7591,52 @@ fn ws_new(paths: &Paths, name: &str) -> anyhow::Result<()> {
 /// this process refuses to when it is one ([`twr_hub::local_agent`]).
 fn refuse_agent() -> anyhow::Result<()> {
     refuse_agent_action("create or remove workspaces")
+}
+
+/// `twr voice`.
+async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    let root = paths.root();
+    let config = Config::load_from(&root)?;
+    let path = std::env::var_os("PATH");
+    match cmd {
+        VoiceCmd::Status { json } => {
+            let s = twr_voice::status(&config.voice, &root.data_dir, path.as_deref());
+            if json {
+                println!("{}", serde_json::to_string(&s)?);
+            } else if s.available {
+                println!(
+                    "voice: {} ({})",
+                    s.engine.as_deref().unwrap_or("?"),
+                    if s.local {
+                        "on this machine"
+                    } else {
+                        "your program: the audio goes where it sends it"
+                    }
+                );
+            } else {
+                println!("voice: {}", s.problem.as_deref().unwrap_or("unavailable"));
+            }
+        }
+        VoiceCmd::Transcribe { json, hint } => {
+            let kind = twr_voice::resolve(&config.voice, &root.data_dir, path.as_deref())?;
+            let mut recording = Vec::new();
+            std::io::stdin()
+                .lock()
+                .take(twr_voice::wav::MAX_BYTES as u64 + 1)
+                .read_to_end(&mut recording)
+                .context("reading the recording from stdin")?;
+            let timeout = std::time::Duration::from_secs(config.voice.timeout_secs);
+            let text = twr_voice::transcribe(&kind, &recording, timeout, &hint).await?;
+            let mut out = std::io::stdout().lock();
+            if json {
+                writeln!(out, "{}", serde_json::json!({ "text": text }))?;
+            } else {
+                writeln!(out, "{text}")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn refuse_agent_action(action: &str) -> anyhow::Result<()> {

@@ -3374,6 +3374,7 @@ dependencies = [
  "twr-runner",
  "twr-speech",
  "twr-tui",
+ "twr-voice",
 ]
 
 [[package]]
@@ -3512,6 +3513,20 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "twr-core",
+ "twr-speech",
+]
+
+[[package]]
+name = "twr-voice"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "twr-core",
  "twr-speech",
 ]
