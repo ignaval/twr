@@ -92,7 +92,7 @@ function rpc(workspace, method, params = {}) {
         JSON.stringify({
           id: 1,
           method: "hello",
-          params: { client: "inbox-qa", protocol: 1, user_token: token },
+          params: { client: "inbox-qa", protocol: 2, user_token: token },
         }) + "\n",
       ),
     );
