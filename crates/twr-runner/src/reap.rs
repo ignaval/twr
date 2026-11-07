@@ -1565,7 +1565,10 @@ pub enum ChainMarker {
 /// same-user ancestor's (`PR_SET_DUMPABLE` 0 hides `/proc/<pid>/environ` from the process's
 /// own user). With `ps` an environment it does not show for a process it lists counts as
 /// unreadable, an empty one too (`ps` shows nothing for it either), and only the effective
-/// user id is compared, and a process `ps` does not list is gone.
+/// user id is compared, and a process `ps` does not list is gone. Also with `ps`, a hidden
+/// environment of this user's below a process that shows one, does not carry the marker and is
+/// not a `twr` does not count ([`hidden_below`]): macOS 27 hides the environment of Apple's own
+/// programs, the user's `/bin/zsh` under tmux, an editor or the desktop app included.
 ///
 /// On Linux one `/proc/<pid>/environ` read per process, up to the first carrier (and the
 /// `status` of a process whose environment cannot be read, and of its parent; the `stat` of
@@ -1616,10 +1619,68 @@ pub fn first_agent_marker(pids: &[u32]) -> ChainMarker {
                 {
                     EnvRead::Skipped
                 }
-                None => EnvRead::Hidden,
+                None => hidden_below(pids, i, &listed, |pid| {
+                    may_mark(ps::cmdline(pid).as_deref())
+                }),
             },
         })
     }
+}
+
+/// With `ps`: whether the environment of `pids[i]`, a process of this user (not the peer) that
+/// `ps` does not show, counts ([`first_agent_marker`]), given what `ps` listed and whether a
+/// process may add the marker to what it starts (`marks`, [`may_mark`]).
+///
+/// It does not when the nearest process above it whose environment does show (past any others
+/// of this user that do not) is this user's, not init, does not carry [`AGENT_ENV`] and is not
+/// one that adds it to what it starts: an environment comes from the process that started it,
+/// so one that hides below such a process cannot carry the marker (unless that process added
+/// the variable itself, which only makes it an agent). macOS 27 shows no process the
+/// environment of Apple's own programs (`/bin/zsh`, `/bin/sh`): the user's shell under tmux, an
+/// editor or the desktop app is such a process. A shell the hub starts for a job or a hook, or
+/// that a runner or `twr attach` starts with the marker, still counts, and so does one whose
+/// parent is gone, init (it left the process that started it) or another user's.
+#[cfg(any(not(target_os = "linux"), test, twr_ps))]
+fn hidden_below(
+    pids: &[u32],
+    i: usize,
+    listed: &ps::ChainEnvirons,
+    marks: impl Fn(u32) -> bool,
+) -> EnvRead {
+    let mut child = pids[i];
+    for &pid in &pids[i + 1..] {
+        let parent_of_child = listed.procs.get(&child).map(|c| c.ppid);
+        let Some(p) = listed.procs.get(&pid) else {
+            return EnvRead::Hidden;
+        };
+        if parent_of_child != Some(pid) || pid <= 1 || p.uid != listed.uid {
+            return EnvRead::Hidden;
+        }
+        match &p.environ {
+            None => child = pid,
+            Some(environ) if environ_value(environ, AGENT_ENV).is_none() && !marks(pid) => {
+                return EnvRead::Skipped
+            }
+            Some(_) => return EnvRead::Hidden,
+        }
+    }
+    EnvRead::Hidden
+}
+
+/// Whether a process whose program (`argv[0]`, as `ps` shows it) is `program` may add
+/// [`AGENT_ENV`] to the processes it starts: `twr` (a hub, its runners, `twr attach`), and a
+/// program `ps` did not show. A macOS application's own executable is not, though the desktop
+/// app's is named `twr` too (`twr.app/Contents/MacOS/twr`): it starts the user's terminals.
+#[cfg(any(not(target_os = "linux"), test, twr_ps))]
+fn may_mark(program: Option<&[u8]>) -> bool {
+    let Some(program) = program else {
+        return true;
+    };
+    let base = program.rsplit(|b| *b == b'/').next().unwrap_or_default();
+    let bundled = program
+        .windows(b".app/Contents/MacOS/".len())
+        .any(|w| w == b".app/Contents/MacOS/");
+    base == b"twr" && !bundled
 }
 
 /// One process's environment as [`first_agent_marker`] sees it.
@@ -3169,6 +3230,183 @@ mod tests {
         assert_eq!(gone, ChainMarker::Gone { pid });
     }
 
+    /// With `ps`, a hidden environment of this user's counts unless the nearest process above
+    /// it that shows one is this user's, not init, unmarked and not a `twr` that marks what it
+    /// starts ([`hidden_below`]).
+    #[test]
+    fn a_hidden_shell_below_an_unmarked_process_hides_nothing() {
+        let me = 501;
+        let proc_ = |ppid: u32, uid: u32, environ: Option<&[u8]>| ps::Listed {
+            uid,
+            ppid,
+            environ: environ.map(<[u8]>::to_vec),
+        };
+        // peer 10 <- hidden shell 11 <- 12 <- 13 (pids nearest first).
+        let chain = |parent: ps::Listed, beyond: Option<ps::Listed>| {
+            let mut procs = std::collections::HashMap::from([
+                (10, proc_(11, me, Some(b"A=1"))),
+                (11, proc_(12, me, None)),
+                (12, parent),
+            ]);
+            if let Some(b) = beyond {
+                procs.insert(13, b);
+            }
+            ps::ChainEnvirons { uid: me, procs }
+        };
+        let pids = [10, 11, 12, 13];
+        let not_twr = |_: u32| false;
+        let twr = |_: u32| true;
+        let read = |l: &ps::ChainEnvirons, marks: &dyn Fn(u32) -> bool| {
+            matches!(hidden_below(&pids, 1, l, marks), EnvRead::Skipped)
+        };
+        // tmux, an editor or the desktop app above the user's shell: nothing hidden.
+        assert!(read(&chain(proc_(13, me, Some(b"TERM=x")), None), &not_twr));
+        // The hub (or a runner, or `twr attach`) started the shell: it may carry the marker.
+        assert!(!read(&chain(proc_(13, me, Some(b"TERM=x")), None), &twr));
+        // A marked parent: the shell inherited it.
+        assert!(!read(
+            &chain(proc_(13, me, Some(b"TWR_AGENT=01T:1")), None),
+            &not_twr
+        ));
+        // Init (it left its parent), another user's process, or gone: it counts.
+        let mut init = chain(proc_(13, me, Some(b"A=1")), None);
+        init.procs.get_mut(&11).unwrap().ppid = 1;
+        assert!(!matches!(
+            hidden_below(&[10, 11, 1], 1, &init, not_twr),
+            EnvRead::Skipped
+        ));
+        assert!(!read(&chain(proc_(13, 0, Some(b"A=1")), None), &not_twr));
+        assert!(!matches!(
+            hidden_below(&[10, 11, 99], 1, &chain(proc_(13, me, None), None), not_twr),
+            EnvRead::Skipped
+        ));
+        // A run of hidden processes of this user is passed until one shows.
+        assert!(read(
+            &chain(proc_(13, me, None), Some(proc_(14, me, Some(b"A=1")))),
+            &not_twr
+        ));
+        assert!(!read(
+            &chain(proc_(13, me, None), Some(proc_(14, me, Some(b"A=1")))),
+            &|pid| pid == 13
+        ));
+        // Nothing above it shows an environment: it counts.
+        assert!(!read(&chain(proc_(13, me, None), None), &not_twr));
+        // A chain whose parent links do not match what `ps` listed counts.
+        let mut moved = chain(proc_(13, me, Some(b"A=1")), None);
+        moved.procs.get_mut(&11).unwrap().ppid = 77;
+        assert!(!read(&moved, &not_twr));
+    }
+
+    #[test]
+    fn only_twr_itself_marks_what_it_starts() {
+        assert!(may_mark(Some(b"twr")));
+        assert!(may_mark(Some(
+            b"/Users/u/Library/Application Support/twr/engines/ab/twr"
+        )));
+        assert!(may_mark(Some(
+            b"/Applications/twr.app/Contents/Resources/bin/twr"
+        )));
+        assert!(may_mark(None));
+        assert!(!may_mark(Some(b"/Applications/twr.app/Contents/MacOS/twr")));
+        assert!(!may_mark(Some(b"tmux")));
+        assert!(!may_mark(Some(
+            b"/Applications/Visual Studio Code.app/Contents/MacOS/Electron"
+        )));
+        assert!(!may_mark(Some(b"twr-mobile-gateway")));
+    }
+
+    /// On a machine that hides the environment of Apple's own programs (macOS 27), the user's
+    /// shell under a process that is neither marked nor `twr` hides nothing, while the same
+    /// shell under a `twr` still counts. The readable processes are ad hoc signed copies of
+    /// `sleep` and `bash`, which the system shows like any other program.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_users_shell_under_tmux_is_not_an_agent_on_macos() {
+        if test_environs_hidden().is_none()
+            || environ_value(
+                &sys::environ(std::process::id()).unwrap_or_default(),
+                AGENT_ENV,
+            )
+            .is_some()
+        {
+            eprintln!("skipping: this machine shows every environment, or this run is marked");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = |from: &str, to: &str| {
+            let path = dir.path().join(to);
+            std::fs::copy(from, &path).unwrap();
+            let signed = std::process::Command::new("/usr/bin/codesign")
+                .args(["-f", "-s", "-"])
+                .arg(&path)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            signed.then_some(path)
+        };
+        let (Some(sleep), Some(tmux), Some(twr)) = (
+            copy("/bin/sleep", "sleep-copy"),
+            copy("/bin/bash", "tmux"),
+            copy("/bin/bash", "twr"),
+        ) else {
+            eprintln!("skipping: codesign could not sign the copies");
+            return;
+        };
+        let run = |parent: &std::path::Path| {
+            let script = format!("/bin/zsh -c '{} 30; :'; :", sleep.display());
+            let mut top = std::process::Command::new(parent)
+                .args(["-c", &script])
+                .env_remove(AGENT_ENV)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let chain = loop {
+                assert!(Instant::now() < deadline, "the chain never started");
+                let found = ps::chain_environs(&[top.id()]).and_then(|_| {
+                    let leaf = std::process::Command::new("/usr/bin/pgrep")
+                        .args(["-x", "sleep-copy"])
+                        .output()
+                        .ok()?;
+                    let leaf: u32 = String::from_utf8_lossy(&leaf.stdout)
+                        .lines()
+                        .filter_map(|l| l.trim().parse().ok())
+                        .find(|&pid| {
+                            pid != top.id() && ancestry(pid).chain.iter().any(|p| p.pid == top.id())
+                        })?;
+                    Some(
+                        ancestry(leaf)
+                            .chain
+                            .iter()
+                            .map(|p| p.pid)
+                            .collect::<Vec<_>>(),
+                    )
+                });
+                // The leaf, the hidden zsh and the readable parent all exec'd.
+                if let Some(chain) = found.filter(|c| {
+                    c.len() > 3
+                        && c[2] == top.id()
+                        && sys::environ(c[0]).is_ok()
+                        && sys::environ(top.id()).is_ok()
+                        && sys::environ(c[1]).is_err()
+                }) {
+                    break chain;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let found = first_agent_marker(&chain);
+            let _ = std::process::Command::new("/bin/kill")
+                .arg(chain[0].to_string())
+                .status();
+            let _ = top.kill();
+            let _ = top.wait();
+            (found, chain[1])
+        };
+        let (under_tmux, _) = run(&tmux);
+        let (under_twr, shell) = run(&twr);
+        assert_eq!(under_tmux, ChainMarker::Absent);
+        assert_eq!(under_twr, ChainMarker::Hidden { pid: shell });
+    }
+
     /// This test process's own chain (the terminal, multiplexer or session it runs in) hides
     /// nothing: whatever unreadable environments it has are another user's, older than this
     /// process, or a session's entry point.
@@ -3179,8 +3417,8 @@ mod tests {
         let pids: Vec<u32> = a.chain.iter().map(|p| p.pid).collect();
         let found = first_agent_marker(&pids);
         // On a machine that hides the environments of the system's own programs, a shell of
-        // this user in the chain (`/bin/zsh` under a terminal multiplexer or an editor, not
-        // `login`) hides its environment too.
+        // this user in the chain whose nearest readable ancestor is a `twr`, init or gone
+        // (not a terminal multiplexer or an editor: [`hidden_below`]) still counts.
         if let ChainMarker::Hidden { pid } = found {
             let test = format!(
                 "reap::tests::this_processs_own_chain_hides_nothing (pid {pid} of its chain, \
