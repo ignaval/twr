@@ -1194,14 +1194,19 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
 }
 impl Session {
     /// The phone's speaker for `workspace`: this machine's hub of it, the device's own state
-    /// file, `[speech]`'s choices of what is read (its engine settings are this machine's and
-    /// play no part: the phone speaks). It ends once the device is revoked or loses `read`.
+    /// file, `[speech]`'s choices of what is read and attention announcements (its engine
+    /// settings are this machine's and play no part: the phone speaks). It ends once the device is revoked or loses `read`.
     fn voice_start(&self, server: &Server, workspace: &str) -> Result<remote::voice::Start> {
         let paths = twr_core::paths::Paths::from_env_in(Some(workspace))?;
         let root = paths.root();
-        let config = twr_core::config::Config::load_from(&root)
+        let mut config = twr_core::config::Config::load_from(&root)
             .map(|c| c.speech)
             .unwrap_or_default();
+        // Voice mode also says when something needs you, as the desktop's speaker does
+        // (`twr speak --announce`): a fixed sentence with a thread's name.
+        if !config.read.contains(&twr_core::speech::ReadKind::Attention) {
+            config.read.push(twr_core::speech::ReadKind::Attention);
+        }
         let store = remote::voice::state_store(&root.data_dir.join("mobile"), &self.device.id)?;
         let (auth, device) = (server.auth.clone(), self.device.clone());
         Ok(remote::voice::Start {

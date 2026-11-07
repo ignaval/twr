@@ -1,6 +1,7 @@
 # Voice mode
 
-Talk to the orchestrator and hear its replies. The device you talk to records you, turns what
+Talk to the orchestrator and hear its replies, in the desktop app and on iOS and Android. The
+device you talk to records you, turns what
 you said into text and sends it to the orchestrator, as if you had typed it. The orchestrator's
 messages come back read aloud ([read-aloud.md](read-aloud.md)) on that same device.
 
@@ -133,6 +134,16 @@ stdin quits it.
 - **The echo filter only listens to this device.** It compares what it hears with what the app
   read aloud lately; it never sends audio or text anywhere to do so.
 
+## On a phone
+
+The iOS and Android apps have the same two buttons. Recognition is the platform's own (iOS's
+Speech framework, Android's `SpeechRecognizer`), on the device where the platform supports it,
+and the replies are said with the platform's voice. The phone can't run `twr speak`, so the
+mobile gateway runs a speaker for it on the hub's machine and sends it each sentence to say;
+pausing, skipping and stopping act on the phone at once. Voice works while the app is in the
+foreground. See [mobile.md](mobile.md#voice) for permissions, which platforms recognize on the
+device, and Android's limits on hands-free listening.
+
 ## Limits
 
 - One device at a time. Two devices listening in one workspace each send what they hear.
@@ -140,3 +151,4 @@ stdin quits it.
   headphones, a hands-free session may still hear twr now and then. Its own voice is dropped
   when recognized as such, but headphones are the reliable way.
 - The TUI has no microphone: voice mode is in the desktop and mobile apps.
+- Phones listen only in the foreground; locking the screen or switching apps ends the session.
