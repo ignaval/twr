@@ -208,6 +208,16 @@ async fn run_call(
         if call.method == "desktop.paths" {
             return Ok(json!({"config":paths.config_file,"data":paths.data_dir,"socket":socket,"workspace":paths.workspace_name(),"version":twr_core::version(),"fold":FOLD}));
         }
+        if call.method == "desktop.runner.use" || call.method == "desktop.runner.cancel" || call.method == "desktop.runner.status" {
+            anyhow::ensure!(tokio::task::spawn_blocking(||twr_hub::local_agent(std::process::id()).is_none()).await?,"Runner controls are user-only");
+            if call.method=="desktop.runner.use" {
+                let binary=PathBuf::from(call.params["binary"].as_str().context("Bundled executable required")?);
+                twr_link::bootstrap::start(&paths,&binary).await?;
+            }
+            let request=match call.method.as_str(){"desktop.runner.use"=>twr_link::service::Request::UseAsRunner,"desktop.runner.cancel"=>twr_link::service::Request::CancelPairing{session:call.params["session"].as_str().map(String::from)},_=>twr_link::service::Request::Status};
+            // These paths identify the desktop device, including while viewing a remote hub.
+            return twr_link::bootstrap::request(&paths,&request).await;
+        }
         if call.method == "desktop.ensure_hub" {
             let config = Config::load_from(&paths)?;
             anyhow::ensure!(config.socket_path(&paths) == socket, "Configuration changed the socket. Reconnect to the workspace to use it.");

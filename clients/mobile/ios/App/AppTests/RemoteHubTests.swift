@@ -289,6 +289,7 @@ final class RemoteHubTests: XCTestCase {
         let code = try XCTUnwrap(fixture["code"] as? String)
         let hubURL = try XCTUnwrap(fixture["url"] as? String)
         let repo = try XCTUnwrap(fixture["repo"] as? String)
+        let expectedCatalogIds = try XCTUnwrap(fixture["catalogIds"] as? [String])
         if fixture["foldable"] as? Bool == true {try await pose("closed")}
 
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub')")
@@ -377,8 +378,8 @@ final class RemoteHubTests: XCTestCase {
         try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed'))")
         _ = try await js("[...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')).click();return true")
         try await until("return window.__qaEvents.some(e=>e.type==='thread' && e.event?.kind==='agent.text' && e.event?.data?.text?.includes('IOS_ANSWERED'))")
-        let commandCount = try await js("return (await window.twr.catalog()).length") as? Int
-        XCTAssertEqual(commandCount, 71)
+        let commandIds = try await js("return (await window.twr.catalog()).map(command => command.id).sort()") as? [String]
+        XCTAssertEqual(commandIds, expectedCatalogIds.sorted(), "The mobile catalog must match the generated CLI commands")
         let sizeGuard = try await js("""
           try { await window.Capacitor.Plugins.TwrTransport.send({message:'界'.repeat(750000)}); return false }
           catch(error) { return error.code==='REQUEST_TOO_LARGE' }

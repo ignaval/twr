@@ -153,9 +153,20 @@ pub struct Confirm {
     pub offer: bool,
 }
 
+/// Private display state, never serialized into history or control events.
+#[derive(Clone, Default, PartialEq)]
+pub struct RunnerPanel(pub String);
+impl std::fmt::Debug for RunnerPanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RunnerPanel(<private>)")
+    }
+}
 /// Client-local view state. Nothing here is an event; pins in particular never leave the client.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ViewState {
+    pub runner: Option<RunnerPanel>,
+    pub runner_session: Option<String>,
+    pub runner_generation: u64,
     /// The selected card: a worker thread, [`HUB_THREAD`] for the hub's card, or the current
     /// orchestrator while its attention banner shows (in the stack view's main conversation
     /// only); `None` (as at start, or after Esc) selects nothing. Always something the current
@@ -1000,6 +1011,12 @@ pub const NOT_ON_SCREEN: &str =
 /// Something the IO loop must do on the hub's behalf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    Runner {
+        generation: u64,
+    },
+    CancelRunner {
+        session: Option<String>,
+    },
     /// A fresh orchestrator session, without a handoff (`/clear`).
     ResetOrchestrator,
     /// Leave the TUI.
@@ -1056,7 +1073,9 @@ pub enum Action {
     /// Stop `!` command `launch` once `shell.run` answered it (Ctrl-C before the answer):
     /// sent at once, after the run on the same ordered calls, so it stops the command even if
     /// the view that asked is gone when the answer comes.
-    ShellStopLaunch { launch: u64 },
+    ShellStopLaunch {
+        launch: u64,
+    },
     /// Move the orchestrator view's folder (`!cd`, `shell.cd`).
     ShellCd {
         /// The folder now (`None`: the orchestrator's).
@@ -1217,7 +1236,9 @@ pub enum Action {
     /// The answer to the Shift-Enter offer ([`AppState::terminal_offer`]): `yes` sets the
     /// terminal up (the IO loop edits its settings file), `no` leaves it; either is
     /// remembered.
-    TerminalSetup { yes: bool },
+    TerminalSetup {
+        yes: bool,
+    },
     /// The workspace sidebar shown (`true`) or hidden: the IO loop keeps that for the next
     /// runs (`tui-state.json`) and the next workspaces shown.
     WsSidebar(bool),
@@ -3503,6 +3524,23 @@ impl AppState {
     /// listing the items it names, and `y` purges exactly those, by id.
     pub fn apply_result(&mut self, method: &'static str, result: &Value) {
         match method {
+            "runner.local" => {
+                if self.view.runner.is_some() {
+                    self.view.runner_session = result["session"].as_str().map(String::from);
+                    let text = if let Some(code) = result["code"].as_str() {
+                        format!("Pairing code: {code}\n\nOn the other hub, choose Connect a runner or run:\n  twr box pair <name>\n\nThe code works once and expires in 15 minutes.\nThis terminal host must stay awake.\n\nEsc closes and cancels this code.")
+                    } else {
+                        format!(
+                            "Could not prepare pairing: {}\n\nEsc closes.",
+                            result["error"]
+                                .as_str()
+                                .unwrap_or("runner service unavailable")
+                        )
+                    };
+                    self.view.runner = Some(RunnerPanel(text));
+                }
+            }
+
             "say" | "thread.send" | "message.withdraw" | "shell.run" | "shell.cd"
             | "job.cancel"
                 if self.restoring.is_some() =>
@@ -5083,6 +5121,16 @@ impl AppState {
                     self.attach_via
                 ));
             }
+            Slash::Runner => {
+                self.view.runner = Some(RunnerPanel("Preparing a pairing code…".into()));
+                self.view.runner_generation += 1;
+                return (
+                    vec![Action::Runner {
+                        generation: self.view.runner_generation,
+                    }],
+                    true,
+                );
+            }
             Slash::Accounts => {
                 self.view.status = Some(if self.accounts.runtimes.is_empty() {
                     "no accounts known: the hub is older than accounts".into()
@@ -5643,6 +5691,16 @@ impl AppState {
         }
         // The help is drawn over the trash: it takes the key first. Both scroll with the
         // arrows, PgUp/PgDn and Home/End; any other key closes them.
+        if self.view.runner.is_some() {
+            if key.code == KeyCode::Esc {
+                self.view.runner = None;
+                self.view.runner_generation += 1;
+                return vec![Action::CancelRunner {
+                    session: self.view.runner_session.take(),
+                }];
+            }
+            return Vec::new();
+        }
         if self.view.help {
             if !overlay_scroll(
                 &mut self.view.help_scroll,

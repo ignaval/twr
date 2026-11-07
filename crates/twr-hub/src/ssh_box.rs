@@ -524,6 +524,7 @@ impl BoxLink {
     /// some (an SSH box; a token box's are for attach). `None` without either.
     pub fn of(cfg: &BoxConfig) -> Option<BoxLink> {
         match cfg.transport() {
+            BoxTransport::Link => None,
             BoxTransport::Command => cfg
                 .command
                 .clone()

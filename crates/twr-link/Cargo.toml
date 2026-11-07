@@ -1,0 +1,31 @@
+[package]
+name = "twr-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+twr-source.workspace = true
+twr-core.workspace = true
+twr-adapters.workspace = true
+twr-runner.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+ring.workspace = true
+hex.workspace = true
+libc.workspace = true
+tracing.workspace = true
+tempfile.workspace = true
+argon2 = "0.5"
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
+iroh-mainline-address-lookup = "=0.6.1"
+pkarr = { version = "=8.1.0", default-features = false, features = ["dht", "relays"] }
+
+[dev-dependencies]
+mainline = "=8.0.1"

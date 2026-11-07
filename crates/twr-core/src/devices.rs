@@ -321,6 +321,13 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "box.restart",
             "box.token",
             "box.add",
+            "thread.pull",
+            "runner.manage",
+            "runner.status",
+            "runner.connect",
+            "runner.recover",
+            "runner.revoke",
+            "runner.forget",
         ],
     ),
     (

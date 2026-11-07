@@ -397,6 +397,7 @@ pub struct DaemonOptions {
 /// Everything `twr runner` needs.
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
+    pub managed: Option<crate::managed::Managed>,
     /// `ws://host:port[/path]` or `wss://...`. A daemon's ([`RunnerOptions::for_daemon`]) is
     /// `ssh://<hub id>`, which only names the hub in its logs.
     pub hub_url: String,
@@ -458,6 +459,7 @@ impl RunnerOptions {
         data_dir: impl Into<PathBuf>,
     ) -> Self {
         RunnerOptions {
+            managed: None,
             hub_url: hub_url.into(),
             token,
             box_name: box_name.into(),
@@ -498,6 +500,7 @@ impl RunnerOptions {
     /// [`crate::BoxEnv::user`]).
     pub fn box_options(&self) -> LocalBoxOptions {
         let mut o = LocalBoxOptions::new(&self.data_dir, &self.box_name);
+        o.managed = self.managed.clone();
         o.machine_lock = match &self.daemon {
             Some(d) => Some(d.lock.clone()),
             None => machine_lock_path(&self.hub_url, &self.box_name),
@@ -844,7 +847,10 @@ pub async fn run_with(
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     use futures::FutureExt;
-    let mut shutdown = std::pin::pin!(shutdown);
+    let policy = opts.managed.clone();
+    let mut shutdown = std::pin::pin!(async move {
+        tokio::select! {_=shutdown=>{},_=crate::managed::revoked(policy)=>{}}
+    });
     if shutdown.as_mut().now_or_never().is_some() {
         stopped_before_start();
         return Ok(());

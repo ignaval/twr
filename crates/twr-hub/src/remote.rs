@@ -591,6 +591,9 @@ impl State {
 }
 
 impl RemoteBox {
+    pub fn new_linked(name: impl Into<String>) -> Self {
+        Self::with_transport(name.into(), BoxTransport::Link, Secret::default(), None)
+    }
     /// Token box `name`, whose runner authenticates with `token`; `ssh` is its `ssh`
     /// destination (for attach).
     pub fn new(name: impl Into<String>, token: Secret, ssh: Option<String>) -> Self {
@@ -1550,6 +1553,20 @@ impl RemoteBox {
         }
     }
 
+    fn cancel_admission(&self, thread: &str, run: Option<String>) {
+        if self.inner.transport != BoxTransport::Link {
+            return;
+        }
+        let this = self.clone();
+        let thread = thread.to_string();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                this.call(Op::Stop { thread, run }, Kind::Request),
+            )
+            .await;
+        });
+    }
     /// The session's forwarder: its first command, then the hub's commands in order.
     async fn forward(
         self,
@@ -1561,13 +1578,25 @@ impl RemoteBox {
     ) {
         if let Some(op) = first {
             let what = op.name();
-            let r = tokio::select! {
-                r = tokio::time::timeout(SPAWN_TIMEOUT, self.call(op, Kind::Session)) => r,
+            let waiting_run = match &op {
+                Op::Spawn { run, .. } | Op::Resume { run, .. } => run.clone(),
+                _ => None,
+            };
+            let r = loop {
+                let attempt = tokio::select! {
+                r = tokio::time::timeout(SPAWN_TIMEOUT, self.call(op.clone(), Kind::Session)) => r,
                 _ = cancelled.wait_for(|c| *c) => {
                     let ids = self.drain_ids(&thread, &mut cmds);
                     self.orphan(ids);
+                    self.cancel_admission(&thread,waiting_run.clone());
                     return;
                 }
+                };
+                if matches!(&attempt,Ok(Err(e)) if e.code==cmd_errors::BOX_FULL) {
+                    tokio::select! {_=tokio::time::sleep(Duration::from_secs(1))=>{},_=cancelled.wait_for(|c|*c)=>{let ids=self.drain_ids(&thread,&mut cmds);self.orphan(ids);self.cancel_admission(&thread,waiting_run.clone());return;}}
+                    continue;
+                }
+                break attempt;
             };
             let why = match r {
                 Ok(Ok(_)) => None,
@@ -1611,6 +1640,7 @@ impl RemoteBox {
                 continue;
             };
             let what = op.name();
+
             // (A session command is issued whatever the box's state: it waits for the box.)
             let (cmd_id, rx) = match self.begin(op, Kind::Session, None) {
                 Ok(c) => c,

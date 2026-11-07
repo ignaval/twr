@@ -1,4 +1,5 @@
 // Focused desktop layout, encrypted recovery, and outbox QA. All hub processes and SQLite rows are disposable.
+import { clientProtocol } from "./client-protocol.mjs";
 import { _electron as electron, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -92,7 +93,11 @@ function rpc(workspace, method, params = {}) {
         JSON.stringify({
           id: 1,
           method: "hello",
-          params: { client: "inbox-qa", protocol: 1, user_token: token },
+          params: {
+            client: "inbox-qa",
+            protocol: clientProtocol,
+            user_token: token,
+          },
         }) + "\n",
       ),
     );

@@ -6,6 +6,8 @@ mod accounts;
 mod boxes;
 mod dial_in;
 mod pretty;
+mod runner_link;
+mod runner_update;
 mod speech;
 #[cfg(test)]
 mod test_support;
@@ -564,6 +566,12 @@ enum Cmd {
     /// `[boxes.<name>] token`.
     #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Runner {
+        #[arg(long, hide = true, requires = "daemon")]
+        managed_root: Option<PathBuf>,
+        #[arg(long, hide = true, requires = "managed_root")]
+        resource_root: Option<PathBuf>,
+        #[arg(long, hide = true, requires = "managed_root")]
+        revocation_file: Option<PathBuf>,
         #[command(subcommand)]
         cmd: Option<RunnerCmd>,
         /// Hub URL: `wss://host:port`, or `ws://` to a loopback host (`localhost`, an address
@@ -868,6 +876,41 @@ enum VoiceCmd {
 
 #[derive(Debug, Subcommand)]
 enum RunnerCmd {
+    /// Reclaim unused compiled worker, source and hub build caches; retains work and trust.
+    Prune,
+    /// Limit resident runtimes across all linked hubs (1–64). Active work is never preempted.
+    Capacity { slots: u32 },
+    /// Allow macOS to sleep even while linked worker runtimes exist.
+    AllowSleep,
+    /// Keep macOS awake while linked worker runtimes exist (default).
+    KeepAwake,
+    #[command(hide = true)]
+    FetchService {
+        #[arg(long)]
+        slot: PathBuf,
+    },
+    /// Run the independent service and show a one-time code to pair from another hub.
+    Up,
+    /// Show this machine's runner service and saved links.
+    Status,
+    /// Stop the machine service. Worker data is retained.
+    Stop,
+    /// Enable or disable automatic runner service startup.
+    Enable {
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Revoke a paired hub's full machine public key.
+    Revoke { machine: String },
+    /// Cancel the current one-time pairing code.
+    CancelPairing,
+    #[command(hide = true)]
+    Service {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Print a new random token (32 bytes from the OS, hex): put it in the hub's
     /// `[boxes.<name>] token` and in the runner's `--token-file` (`chmod 600`).
     Token,
@@ -1206,6 +1249,8 @@ enum MemoryCmd {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum ThreadCmd {
+    /// Pull committed runner results into a separate ref, preserving your checkout.
+    Pull { thread: String },
     /// Create a thread on a project (a configured project name or a directory).
     New {
         /// Project name from the config, or a path.
@@ -1279,6 +1324,33 @@ enum ThreadCmd {
 }
 
 fn main() -> ExitCode {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--link-service-version"))
+    {
+        println!(
+            "{}",
+            serde_json::json!({"protocol":1,"state_schema":1,"worker_protocol":twr_core::runner::PROTOCOL_VERSION,"worker_features":twr_link::worker::REQUIRED_FEATURES})
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--export-worker-source"))
+    {
+        use std::io::Write;
+        let manifest = include_bytes!(concat!(env!("OUT_DIR"), "/worker-source.json"));
+        let bundle = include_bytes!(concat!(env!("OUT_DIR"), "/worker-source.bundle"));
+        let mut out = std::io::stdout().lock();
+        return if out
+            .write_all(&(manifest.len() as u32).to_be_bytes())
+            .and_then(|_| out.write_all(manifest))
+            .and_then(|_| out.write_all(bundle))
+            .is_ok()
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
     // A job's start gate (`twr_hub::job_gate`), as the hub runs it: before anything else, so
     // nothing of twr's (arguments, logging, a runtime) touches the job's process.
     if std::env::args_os().nth(1).as_deref() == Some(twr_hub::job_gate::GATE_ARG.as_ref()) {
@@ -1539,6 +1611,31 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // environment (the relay) or the relay (the daemon).
     let cli = match cli.cmd {
         Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::FetchService { slot }),
+            ..
+        }) => {
+            runner_update::fetch(&slot).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::Service { root, socket }),
+            ..
+        }) => {
+            let log = twr_core::paths::open_private_append(&root.join("machine/service.log"))?;
+            let _ = tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(log))
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .try_init();
+            twr_link::service::run(
+                root,
+                socket,
+                std::sync::Arc::new(|pid| twr_hub::local_agent(pid).is_none()),
+            )
+            .await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
             cmd: None,
             agents: true,
             ..
@@ -1647,6 +1744,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(Cmd::Runner {
             cmd: None,
             daemon: true,
+            managed_root,
+            resource_root,
+            revocation_file,
             box_name: Some(box_name),
             hub_key: Some(hub_key),
             daemon_socket: Some(socket),
@@ -1656,7 +1756,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             ..
         }) => {
             let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
-            let opts = twr_runner::RunnerOptions::for_daemon(
+            let mut opts = twr_runner::RunnerOptions::for_daemon(
                 box_name,
                 data_dir,
                 twr_runner::DaemonOptions {
@@ -1667,6 +1767,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     launch: Some(twr_runner::daemon::own_launch()),
                 },
             );
+            if let Some(root) = managed_root {
+                opts.managed = Some(twr_runner::managed::Managed {
+                    root,
+                    resources: resource_root.context("managed worker needs resource root")?,
+                    revocation: revocation_file.context("managed worker needs revocation fence")?,
+                });
+            }
             run_box_daemon(opts, &log).await?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -1699,6 +1806,39 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
     });
     let cli = match cli.cmd {
+        Some(Cmd::Runner {
+            cmd:
+                Some(
+                    cmd @ (RunnerCmd::Up
+                    | RunnerCmd::Status
+                    | RunnerCmd::Stop
+                    | RunnerCmd::Enable { .. }
+                    | RunnerCmd::Revoke { .. }
+                    | RunnerCmd::CancelPairing
+                    | RunnerCmd::AllowSleep
+                    | RunnerCmd::Capacity { .. }
+                    | RunnerCmd::Prune
+                    | RunnerCmd::KeepAwake),
+                ),
+            ..
+        }) => {
+            use twr_link::service::Request;
+            let request = match cmd {
+                RunnerCmd::Up => Request::UseAsRunner,
+                RunnerCmd::Status => Request::Status,
+                RunnerCmd::Stop => Request::Stop,
+                RunnerCmd::Enable { disable } => Request::SetEnabled { enabled: !disable },
+                RunnerCmd::Revoke { machine } => Request::Revoke { machine },
+                RunnerCmd::CancelPairing => Request::CancelPairing { session: None },
+                RunnerCmd::Prune => Request::Prune { aggressive: true },
+                RunnerCmd::Capacity { slots } => Request::SetCapacity { slots },
+                RunnerCmd::AllowSleep => Request::SetAllowSleep { allow: true },
+                RunnerCmd::KeepAwake => Request::SetAllowSleep { allow: false },
+                _ => unreachable!(),
+            };
+            runner_link::control(&paths, request).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Some(Cmd::Runner {
             cmd: Some(RunnerCmd::Token),
             ..
@@ -2057,6 +2197,16 @@ async fn run_simple(
         Cmd::Hub {
             cmd: Some(HubCmd::Stop { all: true, .. }),
         } => unreachable!("bulk stop handled before selecting a workspace"),
+        Cmd::Thread {
+            cmd: ThreadCmd::Pull { thread },
+        } => {
+            let result = connect(&socket)
+                .await?
+                .call("thread.pull", json!({"thread":thread}))
+                .await?;
+            outln!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         Cmd::Thread {
             cmd: ThreadCmd::List { all },
         } => thread_list(&socket, all).await,
@@ -3104,6 +3254,27 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         )
         .init();
     twr_core::paths::ensure_private_dir(&paths.data_dir)?;
+    let link_program = if test_token_trusted() {
+        None
+    } else {
+        match twr_link::bootstrap::snapshot_hub(&paths) {
+            Ok(program) => Some(program),
+            Err(e) => {
+                tracing::warn!("cannot retain this hub build for linked workers: {e:#}");
+                None
+            }
+        }
+    };
+    // A runner failure leaves the local hub available.
+    if let Some(program) = &link_program {
+        let service_paths = paths.clone();
+        let program = program.clone();
+        tokio::spawn(async move {
+            if let Err(e) = twr_link::bootstrap::ensure(&service_paths, &program).await {
+                tracing::warn!("runner service unavailable: {e:#}");
+            }
+        });
+    }
     // A named workspace's orchestrator works in a directory of its own (`Config::in_workspace`).
     if let Some(dir) = paths.orchestrator_dir() {
         twr_core::paths::ensure_private_dir(&dir)?;
@@ -3114,6 +3285,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     };
     twr_core::trace::mark("hub: config read");
     let mut opts = HubOptions::new(paths.db_file(), config);
+    opts.link_program = link_program;
     opts.boxes_lock = boxes_lock;
     opts.config_file = Some(paths.config_file.clone());
     opts.instance_name = paths.instance_name();
@@ -4042,12 +4214,20 @@ async fn fetch_release_archive(tag: &str, target: &str) -> anyhow::Result<(Vec<u
     let mirror = std::env::var(INSTALL_SCRIPT_URL_ENV)
         .ok()
         .filter(|u| !u.trim().is_empty());
+    fetch_release_archive_from(tag, target, &key, mirror).await
+}
+async fn fetch_release_archive_from(
+    tag: &str,
+    target: &str,
+    key: &[u8; 32],
+    mirror: Option<String>,
+) -> anyhow::Result<(Vec<u8>, String)> {
     let source = update_source(Some(tag), mirror).await?;
     let sums_url = format!("{}/sha256sums.txt", source.base);
     let sig_url = format!("{sums_url}.sig");
     let sums = fetch_release_file(&sums_url).await?;
     let signature = fetch_signature(&sig_url).await?;
-    check_signature(&key, &sums, &signature, &sums_url, &sig_url)?;
+    check_signature(key, &sums, &signature, &sums_url, &sig_url)?;
     sums_release(&source, &sums)?;
     let asset = format!("twr-{target}.tar.gz");
     let Some(want) = listed_sha256(&sums, &asset).map(str::to_ascii_lowercase) else {
@@ -8823,7 +9003,12 @@ mod tests {
         }
         // Hidden: the help shows none of them (as whole flags: `twr account remove --logout`
         // is not `--log`).
-        let help = cli_help_page().1;
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let help = command
+            .find_subcommand_mut("runner")
+            .unwrap()
+            .render_long_help()
+            .to_string();
         let shows = |flag: &str| {
             help.match_indices(flag).any(|(i, _)| {
                 !help[i + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')

@@ -340,6 +340,13 @@ path_advice() {
 }
 
 main() {
+    pair_after_install=0
+    case "${1:-}" in
+        --pair) pair_after_install=1; shift ;;
+        "") ;;
+        *) err "usage: install.sh [--pair]" ;;
+    esac
+    [ "$#" -eq 0 ] || err "usage: install.sh [--pair]"
     target=$(detect_target)
     version=${TWR_VERSION:-}
     case "$version" in
@@ -406,6 +413,10 @@ main() {
     mv -f "$staged" "$dir/twr" || err "could not install $dir/twr"
     staged=""
     say "Installed $installed to $dir/twr"
+    if [ "$pair_after_install" = 1 ]; then
+        "$dir/twr" runner up
+        return
+    fi
 
     case ":${PATH:-}:" in
         *":$dir:"*)

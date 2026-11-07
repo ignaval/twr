@@ -1,0 +1,49 @@
+[package]
+name = "twr-runner-link-spike"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.98"
+publish = false
+license = "Apache-2.0"
+description = "Isolated, non-shipping validation of twr's linked-runner design"
+
+# Keep experimental networking/PAKE dependencies out of the shipping workspace and lockfile.
+[workspace]
+
+[features]
+local-relay = ["dep:iroh-relay", "iroh-relay/server"]
+
+[[bin]]
+name = "nat_fixture"
+required-features = ["local-relay"]
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+hex = "0.4"
+iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"] }
+iroh-relay = { version = "=1.4.1", default-features = false, optional = true }
+pkarr = { version = "=8.1.0", default-features = false, features = ["dht", "relays"] }
+rand = "0.8"
+ring = "0.17.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+spake2 = "=0.4.0"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-util", "time", "net", "sync"] }
+
+[dev-dependencies]
+axum = "0.8"
+iroh-relay = { version = "=1.4.1", default-features = false, features = ["server"] }
+mainline = "=8.0.1"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[patch.crates-io]
+netwatch = { path = "../../compat/netwatch" }

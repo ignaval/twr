@@ -1377,6 +1377,20 @@ Behaviors worth knowing when you follow the stream:
 
 ## Runners and remote boxes
 
+Paired machines use `transport = "link"` in `boxes.toml`; see [runner-links.md](docs/runner-links.md). Linux/macOS local hubs start a private independent runner service by default. The CLI/TUI and desktop app expose “Use this machine as runner”; mobile clients manage their connected hub. Pairing and management are user-only and are unavailable to agents and the orchestrator.
+
+| Socket method | Params | Result |
+| --- | --- | --- |
+| `runner.status` | `{}` | Local service state, machine/endpoint, paired runners/owners, capacity and pending retirements |
+| `runner.connect` | `{name, code, replace?}` | Pairs/reuses machine trust, commits the receipt and registers the linked box; `replace` explicitly supersedes an unrecoverable active grant |
+| `runner.recover` | `{name}` | Recovers the saved receipt and idempotently registers its linked box |
+| `runner.manage` | `{name, admin}` | Runner access list or action: `admin.action` is `status`, `invite`, `cancel` (optional exact `session`) or `revoke` (full `machine` key) |
+| `runner.revoke` | `{machine}` | Durably revokes an incoming hub on this machine, stops its generation and retains data |
+| `runner.forget` | `{name}` | Idempotently forgets saved outgoing trust and queues receipt-bound remote retirement |
+| `thread.pull` | `{thread}` | Imports the linked thread's committed result under a separate ref; leaves checkout and index unchanged |
+
+Client protocol is 2. A resumable runtime stopped for global capacity records `thread.stopped` with `ext.twr.reason: "box_capacity"`; folding retains the resumable thread state and the next message restarts its session. Active turns, tasks, queued prompts, attention and lifecycle/repository operations prevent this retirement. Worker protocol 8 and its spool formats are inherited from the merged client baseline.
+
 A box other than `local` is a machine whose **runner** (`twr runner`) connects out to the hub
 over WebSocket and runs that box's threads: adapters, git worktrees and snapshots all happen
 on the box. The runner protocol is `twr_core::runner` (one JSON message per text frame, version

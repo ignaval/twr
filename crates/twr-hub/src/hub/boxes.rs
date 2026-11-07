@@ -219,6 +219,9 @@ pub(super) fn register_box(
 ) -> Result<(RemoteBox, Option<Arc<SshBox>>), AddBoxError> {
     let warning = admit_box(name, &cfg).map_err(AddBoxError::Refused)?;
     let rbox = match cfg.transport() {
+        BoxTransport::Link => {
+            RemoteBox::new_linked(name).with_branch_namespace(inner.worktree_namespace.clone())
+        }
         BoxTransport::Token => {
             let token = Secret::new(cfg.token.clone().unwrap_or_default());
             if token.is_empty() {
@@ -268,6 +271,9 @@ pub(super) fn register_box(
 /// Starts what a registered box runs: the settling of its orphaned commands
 /// ([`runners::settle_orphans`]) and, for a box the hub dials, its supervisor.
 pub(super) fn start_box(inner: &Arc<Inner>, rbox: RemoteBox, ssh: Option<Arc<SshBox>>) {
+    if rbox.transport() == BoxTransport::Link {
+        super::linked::start(inner, rbox.clone());
+    }
     tokio::spawn(runners::settle_orphans(
         Arc::downgrade(inner),
         rbox.clone(),
@@ -303,15 +309,6 @@ impl Hub {
                 "only the user adds boxes (`twr box add`)",
             ));
         }
-        if let Some(w) = &self.inner.workspace {
-            return Err(rpc(
-                codes::UNSUPPORTED,
-                format!(
-                    "boxes belong to the default workspace's hub, not workspace {w}'s: add it \
-                     without -w"
-                ),
-            ));
-        }
         let Some(file) = self.inner.config_file.clone() else {
             return Err(rpc(
                 codes::UNSUPPORTED,
@@ -341,6 +338,12 @@ impl Hub {
             ));
         };
         let transport = cfg.transport();
+        if self.inner.workspace.is_some() && transport != BoxTransport::Link {
+            return Err(rpc(
+                codes::UNSUPPORTED,
+                "SSH, command and token boxes belong to the default workspace",
+            ));
+        }
         let already = match add_box(&self.inner, name, cfg.clone()) {
             Ok(()) => {
                 tracing::info!(box_name = %name, ?transport, "box added");
@@ -350,8 +353,17 @@ impl Hub {
             // started, after `twr box add` wrote them, say): nothing to do. Other settings:
             // a conflict (the hub takes a box's new settings when it restarts).
             Err(AddBoxError::Conflict(n))
-                if self.inner.box_config(name).as_ref().map(without_build)
-                    == Some(without_build(&cfg)) =>
+                if self.inner.box_config(name).as_ref().map(|old| {
+                    if cfg.transport() == BoxTransport::Link {
+                        connection(old)
+                    } else {
+                        without_build(old)
+                    }
+                }) == Some(if cfg.transport() == BoxTransport::Link {
+                    connection(&cfg)
+                } else {
+                    without_build(&cfg)
+                }) =>
             {
                 tracing::debug!(box_name = %n, "box.add of a box the hub has as it is");
                 true
@@ -873,8 +885,26 @@ fn connection(c: &BoxConfig) -> BoxConfig {
 /// How `hub.info` and `box.add` name a transport.
 pub(super) fn transport_name(t: BoxTransport) -> &'static str {
     match t {
+        BoxTransport::Link => "link",
         BoxTransport::Token => "token",
         BoxTransport::Ssh => "ssh",
         BoxTransport::Command => "command",
+    }
+}
+
+impl Inner {
+    pub(super) fn set_link_project(
+        &self,
+        name: &str,
+        project: &str,
+        repo: std::path::PathBuf,
+    ) -> Result<(), RpcError> {
+        let mut boxes = self.boxes_mut();
+        let config = boxes
+            .configs
+            .get_mut(name)
+            .ok_or_else(|| rpc(codes::BOX_OFFLINE, "linked runner was removed"))?;
+        config.projects.entry(project.into()).or_default().repo = repo;
+        Ok(())
     }
 }

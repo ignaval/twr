@@ -1549,6 +1549,9 @@ export default function App({
         case "Decisions":
           setSection((old) => (old === "decisions" ? "chat" : "decisions"));
           break;
+        case "Runner":
+          setSection("boxes");
+          break;
         case "Accounts":
           setSection("accounts");
           break;

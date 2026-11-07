@@ -9,6 +9,8 @@ description = "Shared desktop application projection and authenticated hub compa
 
 [dependencies]
 twr-core.workspace = true
+twr-link.workspace = true
+twr-hub.workspace = true
 # A phone's own speaker, run by the gateway (`remote::voice`).
 twr-speech.workspace = true
 anyhow.workspace = true

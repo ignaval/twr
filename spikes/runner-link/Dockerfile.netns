@@ -1,0 +1,6 @@
+FROM ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
+RUN apt-get update -q && apt-get install -y --no-install-recommends iproute2 iptables iputils-ping python3 util-linux && rm -rf /var/lib/apt/lists/*
+COPY target/debug/nat_fixture /probe/nat_fixture
+COPY netns_probe.py /probe/netns_probe.py
+ENV TWR_LINK_NETNS_FIXTURE=1
+CMD ["python3", "/probe/netns_probe.py"]

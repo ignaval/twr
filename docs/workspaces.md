@@ -1,6 +1,6 @@
 # Workspaces
 
-A workspace is a separate twr on the same machine: its own hub, orchestrator conversation, threads, worktrees and trash. Use one per client, side project or experiment, and switch between them the way you switch tabs. `default` is the twr you already have; it stays exactly as it was.
+Workspaces run separate hubs on one machine. Each workspace has its own hub, orchestrator conversation, threads, worktrees and trash. Use one per client, side project or experiment, and switch between them the way you switch tabs. `default` is the twr you already have; it stays exactly as it was. Workspaces share the machine's runner service and paired machine trust; each keeps its own key and worker data on a linked runner.
 
 ```sh
 twr ws new client-x          # create a workspace

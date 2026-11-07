@@ -271,6 +271,16 @@ Build output means the git-ignored entries that match `[threads] park_disposable
 
 Limits: the deletion is safe against symbolic links and repositories that are there when it runs, not against another process writing into the worktree at the same time (a parent swapped for a link). twr has stopped the thread's runtime by then, but a process of yours, or one the agent left behind, could still write. On macOS twr lists a held directory's entries by path, so a writer that swaps one of its parents meanwhile can make the repository check look elsewhere.
 
+## Paired runner machines
+
+[Linked runners](runner-links.md) trust a paired hub to run code as the runner's OS user. Local hub startup starts or reuses a private service; it publishes a runner endpoint only for an explicit pairing window or saved incoming trust. Pairing and runner management are user-only on the hub, desktop bridge and service sockets; mobile clients manage their connected hub and cannot host a runner.
+
+A 60-bit, 15-minute code derives an Argon2id/HKDF locator and confirmation keys. The signed public locator is an offline code verifier. This is not a PAKE. Mutual HMAC confirmations bind the full machine/workspace/endpoint transcript, explicit replacement flag and actual QUIC exporter, with a fresh machine signature. Three admitted failures close the window. New connections require a signed workspace binding and the current durable grant receipt; their accepted workspace and epoch cannot change mid-connection. Worker traffic is sealed end to end with the workspace key.
+
+Revocation persists a permanent grant fence before acknowledgement. Late worker, source and repository publication rechecks authority, and startup reconciles fences after interrupted saves. Revocation stops the retired runtime/build generation while retaining work and results. Re-pairing requires explicit replacement if an existing active grant cannot be reused. Offline forgetting queues a receipt-bound retirement that cannot revoke a later grant.
+
+Source and Git transfers are bounded, verified and credential-free; result imports use separate refs without changing the user's checkout or index. Worker programs are separate from the shared transport service. Only the locally executed installation bootstraps that service; unattended updates accept signed newer official stable releases with a compatible state schema. Runtime leases, disk admission and immutable build caches coordinate trusted owners; they do not sandbox a hostile paired hub or cap arbitrary same-user agent writes. Agents retain the OS account's ordinary permissions.
+
 ## Remote runners
 
 A runner box connects out to the hub's listener over WebSocket ([runners.md](runners.md)). Hub and runner authenticate each other with the box's token, which never crosses the connection. The runner sends a random nonce, the hub answers with its own and an HMAC-SHA256 of the box and both nonces keyed with the token, and the runner checks that proof before it sends anything else. Then the runner proves the same with its own label, and only then does the hub take its inventory. A proof is bound to its direction and to both nonces, so neither side can replay one.

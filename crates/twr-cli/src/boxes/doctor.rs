@@ -2278,7 +2278,9 @@ const KEYCHAIN_NOTE: &str = "On a Mac, Claude Code keeps its login in the login 
 fn no_gui_login_note(name: &str, transport: BoxTransport) -> String {
     let restart = match transport {
         BoxTransport::Ssh | BoxTransport::Command => format!("`twr box restart {name}`"),
-        BoxTransport::Token => "restart the box's `twr runner` there".to_string(),
+        BoxTransport::Token | BoxTransport::Link => {
+            "restart the box's `twr runner` there".to_string()
+        }
     };
     format!(
         "No one is logged in at the Mac's screen: a login made now isn't readable by the box \
@@ -2451,7 +2453,7 @@ fn daemon_missing_note(transport: BoxTransport, name: &str, command: &str) -> St
             "run `twr box restart {name}` (it stops the daemon and its agents and starts a new \
              one; their next prompts resume them)"
         ),
-        BoxTransport::Token => {
+        BoxTransport::Token | BoxTransport::Link => {
             "restart the box's `twr runner` (its agents stop with it)".to_string()
         }
     };

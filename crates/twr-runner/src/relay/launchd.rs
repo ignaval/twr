@@ -963,6 +963,7 @@ exit 1
         let data = dir.join("data");
         std::fs::create_dir_all(&data).unwrap();
         RelayOptions {
+            managed: None,
             box_name: "gpu".into(),
             hub_key: KEY,
             replace: false,
