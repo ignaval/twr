@@ -123,7 +123,11 @@ impl Adapter for AcctAdapter {
 /// A scratch home: its project `api` (a plain folder with its own environment) and
 /// `acme-api`, the accounts' directories, and every start the runtimes saw.
 struct Env {
-    home: tempfile::TempDir,
+    /// Removed when the test ends.
+    _home: tempfile::TempDir,
+    /// `home` with its links resolved (macOS's temporary directory is under `/var`, a link
+    /// to `/private/var`): the hub records account directories resolved.
+    root: PathBuf,
     starts: Starts,
 }
 
@@ -135,19 +139,20 @@ impl Env {
             std::fs::create_dir_all(home.path().join(d)).unwrap();
         }
         Env {
-            home,
+            root: std::fs::canonicalize(home.path()).unwrap(),
+            _home: home,
             starts: Arc::default(),
         }
     }
 
     fn path(&self, p: &str) -> PathBuf {
-        self.home.path().join(p)
+        self.root.as_path().join(p)
     }
 
     /// The database's schema version (`PRAGMA user_version`): raised once account data is
     /// recorded (`twr_hub::store`).
     fn db_version(&self) -> i32 {
-        twr_hub::store::connect(&Paths::with_home(self.home.path()).db_file())
+        twr_hub::store::connect(&Paths::with_home(self.root.as_path()).db_file())
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap()
@@ -200,7 +205,7 @@ impl Env {
     }
 
     fn opts(&self, config: Config) -> HubOptions {
-        let paths = Paths::with_home(self.home.path());
+        let paths = Paths::with_home(self.root.as_path());
         let mut o = HubOptions::new(paths.db_file(), config);
         o.accounts_root = Some(paths.accounts_dir());
         let native = self.path("native");
@@ -399,7 +404,7 @@ fn add_side(env: &Env, hub: &Hub, user: &Caller) {
     let dir = PathBuf::from(r["dir"].as_str().unwrap());
     assert_eq!(
         dir,
-        Paths::with_home(env.home.path())
+        Paths::with_home(env.root.as_path())
             .accounts_dir()
             .join("claude-code/side")
     );
@@ -900,7 +905,7 @@ async fn a_recorded_account_in_a_runtimes_own_directory_is_refused_at_use() {
     assert_eq!(turn(&hub, &s).await.result, TurnResult::Completed);
     hub.shutdown().await;
     drop(hub);
-    let side = Paths::with_home(env.home.path())
+    let side = Paths::with_home(env.root.as_path())
         .accounts_dir()
         .join("claude-code/side");
     let opts = || {
@@ -1355,7 +1360,7 @@ async fn side_to_codex(env: &Env, hub: &Hub, user: &Caller, id: &str) {
     )
     .await
     .unwrap();
-    let dir = Paths::with_home(env.home.path())
+    let dir = Paths::with_home(env.root.as_path())
         .accounts_dir()
         .join("claude-code/side");
     hub.account_add(
@@ -1429,7 +1434,7 @@ async fn a_queued_job_moved_to_another_runtimes_account_in_its_directory_gets_it
     let b = queued["job"].as_str().unwrap();
     let evs = until(&hub, &m, |evs| job_end(evs, b).is_some()).await;
     assert_eq!(job_end(&evs, b).unwrap().1["outcome"], "exited");
-    let side = Paths::with_home(env.home.path())
+    let side = Paths::with_home(env.root.as_path())
         .accounts_dir()
         .join("claude-code/side");
     // (The project's `CLAUDE_CONFIG_DIR` is the project's own, not an account's.)

@@ -756,6 +756,11 @@ fn a_workers_shell_cannot_answer_for_the_user() {
 
 #[test]
 fn attach_hands_the_thread_to_the_runtime_cli_and_back() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "attach_hands_the_thread_to_the_runtime_cli_and_back",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
     let project = home.join("proj");
@@ -962,6 +967,11 @@ fn since_attached(home: &Path) -> Vec<Value> {
 /// restart, until that CLI exits; then the hub detaches and dispatches.
 #[test]
 fn a_killed_attach_client_leaves_the_thread_attached_while_its_cli_runs() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_killed_attach_client_leaves_the_thread_attached_while_its_cli_runs",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
     let hub = start_hub(home);
@@ -1042,6 +1052,11 @@ fn a_killed_attach_client_leaves_the_thread_attached_while_its_cli_runs() {
 /// CLI alone.
 #[test]
 fn sigterm_to_attach_reaches_its_cli_before_the_attach_ends() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "sigterm_to_attach_reaches_its_cli_before_the_attach_ends",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
     let _hub = start_hub(home);

@@ -157,7 +157,11 @@ impl Adapter for MoveAdapter {
 /// variable says at its next start). With `probe`, the hub checks logins: each account's
 /// answer by its directory's name (`native` for the native account's; default logged in).
 struct Env {
-    home: tempfile::TempDir,
+    /// Removed when the test ends.
+    _home: tempfile::TempDir,
+    /// `home` with its links resolved (macOS's temporary directory is under `/var`, a link
+    /// to `/private/var`): the hub records account directories resolved.
+    root: PathBuf,
     shared: Arc<Shared>,
     native: Mutex<String>,
     probe: AtomicBool,
@@ -178,7 +182,8 @@ impl Env {
             std::fs::create_dir_all(home.path().join(d)).unwrap();
         }
         Env {
-            home,
+            root: std::fs::canonicalize(home.path()).unwrap(),
+            _home: home,
             shared: Arc::default(),
             native: Mutex::new("native".into()),
             probe: AtomicBool::new(false),
@@ -218,7 +223,7 @@ impl Env {
     }
 
     fn path(&self, p: &str) -> PathBuf {
-        self.home.path().join(p)
+        self.root.as_path().join(p)
     }
 
     fn dir(&self, p: &str) -> String {
@@ -228,7 +233,7 @@ impl Env {
     /// The database's schema version (`PRAGMA user_version`): raised once account data is
     /// recorded (`twr_hub::store`).
     fn db_version(&self) -> i32 {
-        twr_hub::store::connect(&Paths::with_home(self.home.path()).db_file())
+        twr_hub::store::connect(&Paths::with_home(self.root.as_path()).db_file())
             .unwrap()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap()
@@ -273,7 +278,7 @@ impl Env {
     }
 
     fn opts(&self, config: Config) -> HubOptions {
-        let paths = Paths::with_home(self.home.path());
+        let paths = Paths::with_home(self.root.as_path());
         let mut o = HubOptions::new(paths.db_file(), config);
         o.accounts_root = Some(paths.accounts_dir());
         let native = self.path(&self.native.lock().unwrap());
@@ -2962,7 +2967,7 @@ async fn a_login_whose_check_cannot_tell_still_starts_a_new_session() {
 #[tokio::test]
 async fn a_login_in_another_workspace_starts_a_new_session() {
     let env = Env::new();
-    let root = Paths::with_home(env.home.path()).accounts_dir();
+    let root = Paths::with_home(env.root.as_path()).accounts_dir();
     let other_login = |dir: &str| twr_core::account::note_login(&root, &env.path(dir)).unwrap();
     let hub = env.open(env.config(None)).await;
     let w = create(
@@ -3191,7 +3196,7 @@ async fn a_native_session_resumes_only_in_the_store_its_environment_selects() {
 async fn a_resumed_session_keeps_the_login_it_began_under() {
     let env = Env::new();
     env.probe.store(true, Ordering::SeqCst);
-    let root = Paths::with_home(env.home.path()).accounts_dir();
+    let root = Paths::with_home(env.root.as_path()).accounts_dir();
     let hub = env.open(env.config(None)).await;
     let w = create(
         &hub,

@@ -3030,6 +3030,14 @@ mod tests {
     use super::*;
     use crate::test_support::install;
 
+    /// A temporary directory whose path has no links (macOS's temporary directory is under
+    /// `/var`, a link to `/private/var`): the box scripts report the paths they check
+    /// resolved, and refuse a link in the tree that they cannot resolve with the tools a case
+    /// leaves on `PATH`.
+    fn resolved_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
     /// Takes group and other write off `root` and everything under it (not following links):
     /// what a test made under a umask that leaves group write on, made as twr makes it.
     fn go_w_off(root: &std::path::Path) {
@@ -3421,7 +3429,7 @@ mod tests {
         let mode = |p: &std::path::Path, m: u32| {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = resolved_tempdir();
         let home = dir.path().join("home");
         let data = home.join(".local/share");
         let data_s = data.to_str().unwrap();
@@ -3701,7 +3709,7 @@ mod tests {
     /// `shasum` falls back to size and version (the hub's upload) or refuses (a release).
     #[test]
     fn a_failing_sha256_tool_refuses_the_upload() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = resolved_tempdir();
         let data = dir.path().join("data");
         let data_s = data.to_str().unwrap();
         let builds = data.join("twr/runner/builds");

@@ -1162,6 +1162,9 @@ async fn the_orchestrator_token_is_proven_against_the_current_runtime() {
 /// thread's agent: it, and what it starts, only read.
 #[tokio::test]
 async fn an_attached_process_only_reads() {
+    if twr_runner::reap::skip_if_test_environs_hidden("an_attached_process_only_reads") {
+        return;
+    }
     let th = start(None, tempfile::tempdir().unwrap()).await;
     let mut c = th.client("itest").await;
     let mut control = Client::subscribe_at(&th.socket, "control.subscribe", json!({"since": 0}))
@@ -1785,6 +1788,11 @@ async fn a_runtime_is_known_from_its_spawn_on() {
 /// the marker (the nearest carrier of its ancestry counts).
 #[tokio::test]
 async fn an_attached_process_restricts_before_it_is_reported() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "an_attached_process_restricts_before_it_is_reported",
+    ) {
+        return;
+    }
     let th = start(None, tempfile::tempdir().unwrap()).await;
     let mut c = th.client("itest").await;
     let mut control = Client::subscribe_at(&th.socket, "control.subscribe", json!({"since": 0}))
@@ -1870,6 +1878,9 @@ fn fake_hub_parent() {
 /// which carries no marker, is an agent here: it can read, not act.
 #[tokio::test]
 async fn a_process_under_another_hub_is_an_agent() {
+    if twr_runner::reap::skip_if_test_environs_hidden("a_process_under_another_hub_is_an_agent") {
+        return;
+    }
     use std::os::unix::process::CommandExt;
     let th = start(None, tempfile::tempdir().unwrap()).await;
     let client = AgentClient::new(th.dir.path(), "under-hub", &th.socket);
