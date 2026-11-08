@@ -23,10 +23,12 @@ import {
   Download,
 } from "lucide-react";
 import { numberSetting } from "./settings";
+import { modelChoices, type Choice } from "./models";
 import type { Json } from "./types";
 import {
   DataView,
   Empty,
+  ModelSelect,
   Spinner,
   formatNumber,
   Markdown,
@@ -808,6 +810,7 @@ function Settings({
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState<Json>();
+  const [catalog, setCatalog] = useState<Json>();
   useEffect(() => {
     if (!canAdmin) return;
     void hostApi
@@ -818,6 +821,10 @@ function Settings({
       })
       .catch(fail);
     void rpc("config.show").then(setLoaded).catch(fail);
+    // The default model's picker: an older hub has no list, and it stays free text.
+    void rpc("orchestrator.show")
+      .then((show) => setCatalog(show?.models))
+      .catch(() => {});
   }, [rpc, fail, canAdmin]);
   useEffect(() => {
     if (!config || text === config.content) return;
@@ -870,6 +877,7 @@ function Settings({
         {loaded && (
           <SettingControls
             loaded={config?.settings || loaded}
+            catalog={catalog}
             fail={fail}
             saved={() => {
               void hostApi
@@ -1056,7 +1064,7 @@ const scalarSettings: {
   table: string[];
   key: string;
   label: string;
-  kind: "string" | "number" | "boolean";
+  kind: "string" | "number" | "boolean" | "model";
   options?: string[];
 }[] = [
   {
@@ -1093,7 +1101,7 @@ const scalarSettings: {
     label: "Separate worktrees",
     kind: "boolean",
   },
-  { table: ["threads"], key: "model", label: "Default model", kind: "string" },
+  { table: ["threads"], key: "model", label: "Default model", kind: "model" },
   {
     table: ["threads"],
     key: "thinking",
@@ -1158,13 +1166,17 @@ const scalarSettings: {
 ];
 function SettingControls({
   loaded,
+  catalog,
   fail,
   saved,
 }: {
   loaded: Json;
+  catalog?: Json;
   fail: ManagerProps["fail"];
   saved: () => void;
 }) {
+  // `[threads] model` applies to threads of every runtime: the default runtime's models.
+  const models = modelChoices(catalog, loaded?.default_runtime);
   return (
     <div className="setting-controls">
       {scalarSettings.map((setting) => {
@@ -1175,6 +1187,7 @@ function SettingControls({
             key={setting.table.join(".") + setting.key}
             setting={setting}
             initial={value?.[setting.key]}
+            models={models}
             fail={fail}
             saved={saved}
           />
@@ -1186,11 +1199,13 @@ function SettingControls({
 function ScalarSetting({
   setting,
   initial,
+  models,
   fail,
   saved,
 }: {
   setting: (typeof scalarSettings)[number];
   initial: Json;
+  models: Choice[];
   fail: ManagerProps["fail"];
   saved: () => void;
 }) {
@@ -1246,6 +1261,16 @@ function ScalarSetting({
           checked={!!value}
           onChange={(e) => {
             setValue(e.target.checked);
+            setDone(false);
+          }}
+        />
+      ) : setting.kind === "model" && models.length ? (
+        <ModelSelect
+          label={setting.label}
+          value={value}
+          choices={models}
+          onChange={(v) => {
+            setValue(v);
             setDone(false);
           }}
         />

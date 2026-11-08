@@ -1844,6 +1844,7 @@ mod tests {
             default: "claude-code".into(),
             model: None,
             switch: false,
+            step: None,
         });
         assert!(st.picker_open());
         assert_eq!(

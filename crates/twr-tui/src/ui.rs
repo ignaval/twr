@@ -875,6 +875,9 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     let Some(p) = &state.view.picker else {
         return Vec::new();
     };
+    if let Some(m) = &p.step {
+        return model_lines(state, m, !p.runtimes.is_empty());
+    }
     let dim = Style::default().fg(Color::DarkGray);
     let shown: Vec<String> = p
         .runtimes
@@ -952,6 +955,112 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     out
 }
 
+/// The lines of the picker's model step ([`crate::app::ModelStep`]): what it sets, one row
+/// per model (or effort) with a few words on it, the one in effect marked `(current)`, the
+/// keys. `back`: Esc goes back to the runtimes.
+fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<Line<'static>> {
+    use crate::app::ModelRow;
+    let dim = Style::default().fg(Color::DarkGray);
+    let runtime = crate::app::orch_label(&m.runtime, &state.accounts);
+    let effort = m.chosen.is_some();
+    let (title, note) = match (&m.thread, effort) {
+        (None, _) => (
+            format!("Model for the orchestrator on {runtime}"),
+            "(the default is the one the runtime picks; /orch switches it later)".to_string(),
+        ),
+        (Some((_, name)), false) => (
+            format!("Model for {name} ({runtime})"),
+            "(its reasoning effort next)".to_string(),
+        ),
+        (Some((_, name)), true) => (
+            format!("Reasoning effort for {name} ({runtime})"),
+            match m.chosen.as_ref().and_then(Option::as_deref) {
+                Some(model) => format!("(with model {model})"),
+                None => "(with the runtime's default model)".to_string(),
+            },
+        ),
+    };
+    let label = |r: &ModelRow| match r {
+        ModelRow::Default => "default".to_string(),
+        ModelRow::Known(id, _) => id.clone(),
+        ModelRow::Custom => "custom…".to_string(),
+    };
+    let name_width = m
+        .rows
+        .iter()
+        .map(|r| label(r).chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(note, dim)),
+        Line::from(""),
+    ];
+    let current = m.current_value();
+    for (i, row) in m.rows.iter().enumerate() {
+        let chosen = i == m.selected;
+        let mut spans = vec![
+            Span::raw(if chosen { "› " } else { "  " }),
+            Span::styled(
+                if i < 9 {
+                    format!("{} ", i + 1)
+                } else {
+                    "  ".to_string()
+                },
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        let style = if chosen {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        match (row, &m.typed) {
+            (ModelRow::Custom, Some(typed)) if chosen => {
+                spans.push(Span::styled(format!("{typed}▏"), style));
+            }
+            _ => spans.push(Span::styled(
+                format!("{:<name_width$}  ", label(row)),
+                style,
+            )),
+        }
+        let about = match row {
+            ModelRow::Default if effort => "the runtime's default".to_string(),
+            ModelRow::Default => "the runtime's default model".to_string(),
+            ModelRow::Known(_, about) => about.clone(),
+            ModelRow::Custom if m.typed.is_some() && chosen => String::new(),
+            ModelRow::Custom => "type an id".to_string(),
+        };
+        if !about.is_empty() {
+            spans.push(Span::styled(about, dim));
+        }
+        let is_current = match row {
+            ModelRow::Default => current.is_none(),
+            ModelRow::Known(id, _) => current == Some(id.as_str()),
+            ModelRow::Custom => false,
+        };
+        if is_current {
+            spans.push(Span::styled("  (current)", dim));
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(""));
+    let keys = if m.typed.is_some() {
+        "type the id · Enter choose · Esc back to the list"
+    } else if back || effort {
+        "↑↓ or 1-9 pick · Enter choose · Esc back"
+    } else {
+        "↑↓ or 1-9 pick · Enter choose · Esc cancel"
+    };
+    out.push(Line::from(Span::styled(keys, dim)));
+    out
+}
+
 /// The orchestrator picker, centered over the view.
 fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     let lines = picker_lines(state);
@@ -961,7 +1070,7 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     let inner_w = usize::from(width.min(area.width).saturating_sub(2)).max(1);
     // On a phone each runtime is a menu choice, a band two rows tall ([`TAP_ROWS`]).
     let phone = state.compact();
-    let runtimes = state.view.picker.as_ref().map_or(0, |p| p.runtimes.len());
+    let runtimes = state.view.picker.as_ref().map_or(0, |p| p.rows_len());
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut spans = Vec::new();
     for (k, line) in lines.into_iter().enumerate() {
@@ -979,7 +1088,11 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     // runtime the window cuts is left blank, never drawn without its tap.
     let room = usize::from(area.height.saturating_sub(2));
     if phone && rows.len() > room && room > 0 {
-        let sel = state.view.picker.as_ref().map_or(0, |p| p.selected);
+        let sel = state
+            .view
+            .picker
+            .as_ref()
+            .map_or(0, |p| p.step.as_ref().map_or(p.selected, |m| m.selected));
         let off = spans.get(3 + sel).map_or(0, |s: &std::ops::Range<usize>| {
             s.end.saturating_sub(room).min(s.start)
         });
@@ -1008,14 +1121,18 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
             .saturating_add(2),
     );
     let switch = state.view.picker.as_ref().is_some_and(|p| p.switch);
+    let step = state.view.picker.as_ref().and_then(|p| p.step.as_ref());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Magenta))
-        .title(if switch {
-            " switch the orchestrator "
-        } else {
-            " choose the orchestrator "
+        .title(match step {
+            Some(m) if m.chosen.is_some() => " reasoning effort ",
+            Some(m) if m.thread.is_some() => " model ",
+            Some(_) if switch => " switch the orchestrator: model ",
+            Some(_) => " choose the orchestrator: model ",
+            None if switch => " switch the orchestrator ",
+            None => " choose the orchestrator ",
         })
         .title(close_title());
     let inner = block.inner(rect);
@@ -10377,6 +10494,7 @@ mod tests {
             default: "claude-code".into(),
             model: None,
             switch: false,
+            step: None,
         });
         let lines = draw(&st, 80, 6);
         assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));

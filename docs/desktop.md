@@ -42,7 +42,7 @@ control position, matching the TUI's relay semantics.
 | CLI capability | Desktop workflow |
 | --- | --- |
 | Conversations, send, orchestrator selection/reset | Conversation, explicit destination, orchestrator actions |
-| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms |
+| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
 | Stop, park/resume, compact, trim, delete | Inspector actions; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |

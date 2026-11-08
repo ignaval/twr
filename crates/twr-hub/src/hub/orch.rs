@@ -302,6 +302,26 @@ pub fn orchestrator_cwd(config: &Config) -> PathBuf {
     }
 }
 
+/// `orchestrator.show` `models`: what the model pickers (the TUI's, the desktop app's) offer
+/// for each built-in agent runtime, for the orchestrator and threads alike: `{<runtime>:
+/// {models: [{id, description}], efforts: [...]}}` ([`twr_adapters::models`],
+/// [`twr_adapters::efforts`]). A runtime it doesn't name has no list: its model is free text.
+pub fn model_choices() -> Value {
+    use twr_adapters::{claude_code, codex, grok_build};
+    let mut out = serde_json::Map::new();
+    for rt in [claude_code::NAME, codex::NAME, grok_build::NAME] {
+        let models: Vec<Value> = twr_adapters::models(rt)
+            .iter()
+            .map(|m| json!({"id": m.id, "description": m.description}))
+            .collect();
+        out.insert(
+            rt.to_string(),
+            json!({"models": models, "efforts": twr_adapters::efforts(rt).unwrap_or(&[])}),
+        );
+    }
+    Value::Object(out)
+}
+
 /// Whether `body` ends a turn `completed`, as the runtime reported it
 /// (`ext.twr.runtime_result` when the hub recorded the end otherwise: a turn taken back). Only
 /// that end shows the runtime got and worked through the turn's prompt; any other (an
@@ -3644,6 +3664,7 @@ impl Hub {
             })
             .collect();
         out["installed"] = Value::Object(installed);
+        out["models"] = model_choices();
         out
     }
 

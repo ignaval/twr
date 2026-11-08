@@ -90,6 +90,7 @@ import type {
   ViewState,
 } from "./types";
 import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
+import { effortChoices, formRuntime, modelChoices } from "./models";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { announcements, voiceHint } from "./voice";
@@ -516,9 +517,18 @@ export default function App({
     },
     [target?.worktree, target?.repo, target?.box_name, homePath],
   );
+  const infoRef = useRef(info);
+  infoRef.current = info;
   const action = useCallback(
     (id: string, initialValues: Json = {}) => {
       const command = commands.find((c) => c.id === id);
+      // Choosing the first orchestrator starts from the one the hub would start: its
+      // runtime, and the runtime's default model unless one is picked.
+      const o = infoRef.current?.orchestrator;
+      if (id === "orch" && !initialValues.runtime && o && !o.thread) {
+        const runtime = o.configured?.runtime || o.runtime;
+        if (runtime) initialValues = { ...initialValues, runtime };
+      }
       if (command) openOperation(command, initialValues);
     },
     [openOperation, commands],
@@ -546,6 +556,22 @@ export default function App({
     const value = await rpc("hub.info");
     setInfo(value);
   }, [rpc]);
+  // What the model pickers offer (`orchestrator.show` `models`), once per hub: a list that
+  // changes only with twr. An older hub has none, and its model fields stay free text.
+  const [modelCatalog, setModelCatalog] = useState<Json>();
+  useEffect(() => {
+    setModelCatalog(undefined);
+    if (!connected) return;
+    let live = true;
+    void rpc("orchestrator.show")
+      .then((show) => {
+        if (live) setModelCatalog(show?.models);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [connected, workspace, rpc]);
   const refreshWorkspaces = useCallback(async () => {
     const value = await hostApi.cli(["ws", "list", "--json"]);
     if (value.code !== 0) throw new Error(value.stderr || value.stdout);
@@ -3708,12 +3734,35 @@ export default function App({
                             ]),
                           ],
                         }
-                      : field.key === "mode" && !permitted("admin")
+                      : field.type === "model" || field.type === "effort"
                         ? {
                             ...field,
-                            options: ["manual", "plan", "read-only", "dontAsk"],
+                            choices: (field.type === "model"
+                              ? modelChoices
+                              : effortChoices)(
+                              modelCatalog,
+                              formRuntime(
+                                operation,
+                                values,
+                                view.threads,
+                                info?.orchestrator?.configured?.explicit ===
+                                  false
+                                  ? info.orchestrator.configured.runtime
+                                  : undefined,
+                              ),
+                            ),
                           }
-                        : field
+                        : field.key === "mode" && !permitted("admin")
+                          ? {
+                              ...field,
+                              options: [
+                                "manual",
+                                "plan",
+                                "read-only",
+                                "dontAsk",
+                              ],
+                            }
+                          : field
                   }
                   value={values[field.key]}
                   onChange={(value) =>

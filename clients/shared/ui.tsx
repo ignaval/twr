@@ -1,7 +1,7 @@
 import { useHostAPI } from "./host";
-import { memo, useId, useRef, type ReactNode } from "react";
+import { memo, useId, useRef, useState, type ReactNode } from "react";
 import { focusableWithin, useModal } from "./a11y";
-import { X, LoaderCircle, FolderOpen, Copy, Check } from "lucide-react";
+import { X, LoaderCircle, FolderOpen, Copy, Check, List } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Field } from "./commands";
@@ -104,6 +104,17 @@ export function FieldInput({
           checked={!!value}
           onChange={(e) => onChange(e.target.checked)}
         />
+      ) : (field.type === "model" || field.type === "effort") &&
+        field.choices?.length ? (
+        <ModelSelect
+          id={id}
+          value={value ?? ""}
+          onChange={onChange}
+          choices={field.choices}
+          keep={field.keep}
+          custom={field.type === "model"}
+          required={field.required}
+        />
       ) : field.type === "select" ? (
         <select
           id={id}
@@ -164,6 +175,86 @@ export function FieldInput({
       )}
       {field.description && <small>{field.description}</small>}
     </label>
+  );
+}
+const CUSTOM = "\u0000custom";
+/** A model (or effort) picker: the runtime's default first (or, with `keep`, keeping the
+ * current one, `default` clearing it), the catalog's choices, then (`custom`) a custom id,
+ * typed in a text box that a button turns back into the list. A value the list doesn't have
+ * shows as a custom id. */
+export function ModelSelect({
+  id,
+  value,
+  onChange,
+  choices,
+  keep = false,
+  custom = true,
+  required = false,
+  label,
+}: {
+  id?: string;
+  value: string;
+  onChange: (v: string) => void;
+  choices: { value: string; description?: string }[];
+  keep?: boolean;
+  custom?: boolean;
+  required?: boolean;
+  label?: string;
+}) {
+  const listed =
+    value === "" ||
+    (keep && value === "default") ||
+    choices.some((c) => c.value === value);
+  const [typing, setTyping] = useState(!listed);
+  if (custom && (typing || !listed))
+    return (
+      <div className="input-with-button">
+        <input
+          id={id}
+          aria-label={label}
+          aria-required={required || undefined}
+          type="text"
+          value={value}
+          placeholder="Model id, as the runtime names it"
+          onChange={(e) => onChange(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button
+          type="button"
+          aria-label="Choose from the list"
+          title="Choose from the list"
+          onClick={() => {
+            setTyping(false);
+            onChange("");
+          }}
+        >
+          <List size={16} />
+        </button>
+      </div>
+    );
+  return (
+    <select
+      id={id}
+      aria-label={label}
+      aria-required={required || undefined}
+      value={listed ? value : ""}
+      onChange={(e) => {
+        if (e.target.value === CUSTOM) {
+          setTyping(true);
+          onChange("");
+        } else onChange(e.target.value);
+      }}
+    >
+      <option value="">{keep ? "Keep current" : "Runtime default"}</option>
+      {keep && <option value="default">Runtime default</option>}
+      {choices.map((c) => (
+        <option key={c.value} value={c.value}>
+          {c.description ? `${c.value} — ${c.description}` : c.value}
+        </option>
+      ))}
+      {custom && <option value={CUSTOM}>Custom model id…</option>}
+    </select>
   );
 }
 export const Markdown = memo(function Markdown({ text }: { text: string }) {

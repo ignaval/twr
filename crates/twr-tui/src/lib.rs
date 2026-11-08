@@ -2733,6 +2733,7 @@ async fn drive(
     state.attach_via = selection;
     state.view.orch_runtimes = orch_runtimes;
     state.view.orch_installed = orch_installed;
+    state.view.model_choices = show["models"].clone();
     state.view.orch_default = orch_default;
     state.view.orch_default_account = show["account"].as_str().map(str::to_string);
     state.view.default_runtime = crate::app::default_runtime(&show);

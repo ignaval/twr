@@ -17,6 +17,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 - Desktop hub clients for Apple Silicon macOS and x86_64 Linux, with embedded terminals, generated CLI forms, shared thread and attention views, and Dark, Light and System appearance. Linux packages include AppImage, Debian and Arch/Omarchy builds. See [desktop.md](docs/desktop.md).
 - iOS and Android hub clients using the same interface, with responsive folding layouts, paired remote hubs, native credential storage, file uploads and optional APNs/FCM push delivery. The separate gateway enforces device scopes and revocation; notifications open requests without answering them. See [mobile.md](docs/mobile.md).
+- Model pickers. The TUI's orchestrator picker (first run and `/orch`) asks for the model after the runtime, and `/model <thread>` opens a picker of the thread's model and effort. The desktop app's orchestrator, new-thread, thread-settings and default-model forms pick from a list too. Each lists the runtime's default first, the models twr knows the runtime has, and a custom id; `orchestrator.show` reports them as `models`. See [tui.md](docs/tui.md#choosing-the-orchestrator).
 
 ### Changed
 
@@ -26,6 +27,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 ### Fixed
 
 - Voice mode no longer asks you to paste a `mkdir`/`curl` command when the speech model is missing: `twr voice setup` downloads it, and the desktop app offers **Download model** in its place. See [voice.md](docs/voice.md#setting-up-recognition).
+- A new workspace's orchestrator no longer starts on a mistyped model. The desktop app's "Choose your orchestrator" form asked for the model as free text, and a name Claude Code doesn't know (`opus-5.5`) failed every message; the form now starts on the configured runtime and the runtime's default model, and picks other models from a list.
 - macOS CI review installers retain valid ad hoc signatures in pull-request builds; packaged verification rejects invalid signatures before upload.
 - Finished jobs release their slots immediately, even while a child process briefly retains an inherited file descriptor before exec.
 - Files attached in the orchestrator's conversation upload into its working directory (`orchestrator.cwd`) instead of failing with "Thread has no working directory".
