@@ -9,15 +9,25 @@ messages come back read aloud ([read-aloud.md](read-aloud.md)) on that same devi
   down while you talk and let go to send. `Cmd-Shift-Space` (`Ctrl-Shift-Space` on Linux) does
   the same from the keyboard.
 - **Hands-free:** the waveform button beside it (`Cmd-Shift-L`) listens until you stop it.
-  Each thing you say is one message, sent once you pause. The orchestrator's replies are read
-  aloud as they come.
+  Each thing you say is one message, sent once you pause for two seconds (`[voice] pause_ms`),
+  so a pause to think mid-sentence doesn't send half of it. The orchestrator's replies are read
+  aloud as they come, and it stops listening while they are (below).
 
 The audio stays on your device. The hub gets the text, never a recording.
 
 ## What you hear and say
 
-While twr reads aloud, start talking: the voice stops at once, without waiting for the hub.
-What you said is recognized, and then:
+**Hands-free doesn't listen while twr reads a reply aloud,** nor for 0.8 s after it stops:
+what the microphone hears then is twr's own voice, and it would come back as a message. The
+voice bar says "Speaking · listening again when it ends". To cut a reply short, click
+**Quiet** (it stops reading, and listening starts again a moment later), or **Stop listening**.
+If you are already talking when a reply starts, the reply waits until what you said is sent,
+then is read in full.
+
+With headphones, where nothing comes back, you can talk over the voice instead:
+`listen_while_speaking = true` in `[voice]` keeps hands-free listening while it reads, as push
+to talk always does. Then start talking and the voice stops at once, without waiting for the
+hub. What you said is recognized, and then:
 
 - **A message.** It goes to the orchestrator, marked as spoken. The message that was being read
   is skipped, and the queue goes on.
@@ -32,7 +42,8 @@ What you said is recognized, and then:
   | "never mind", "cancel" | drop what is waiting for confirmation |
   | "stop listening", "voice off" | end the hands-free session |
 
-  "Stop the api worker" is a message: only the word alone is a control.
+  "Stop the api worker" is a message: only the word alone is a control. They work whenever
+  voice mode is listening; while hands-free waits for a reply to end, use the **Quiet** button.
 - **Nothing,** or twr's own voice heard back through the speakers: dropped, and the reading
   goes on. A transcript counts as an echo when most of its words, in order, are words of a
   message read aloud a moment ago.
@@ -85,7 +96,14 @@ model = ""             # empty: voice/ggml-base.en.bin in twr's data directory
 language = "en"        # as whisper names it (en, es, de...), or "auto"
 command = []           # engine = "command": a program and its arguments, run without a shell
 timeout_secs = 60
+pause_ms = 2000        # hands-free: the silence that ends a message (500-10000)
+listen_while_speaking = false  # hands-free listens while replies are read (headphones)
 ```
+
+`pause_ms` and `listen_while_speaking` are read by the desktop app each time voice mode turns
+on. A shorter pause sends sooner and cuts more sentences short; a longer one waits longer
+after you finish. Phones read no `[voice]`: they always pause for 2 s and stop listening
+while replies are read.
 
 `engine = "command"` runs your program instead, with no shell: the recording on its stdin (a
 16 kHz mono 16-bit WAV, at most two minutes), the text on its stdout, the expected words in
@@ -150,8 +168,11 @@ device, and Android's limits on hands-free listening.
 ## Limits
 
 - One device at a time. Two devices listening in one workspace each send what they hear.
-- Echo cancellation is the system's (the browser's on the desktop). With loud speakers and no
-  headphones, a hands-free session may still hear twr now and then. Its own voice is dropped
-  when recognized as such, but headphones are the reliable way.
+- Echo cancellation is the system's, and on the desktop it can't remove twr's voice: the
+  browser cancels only what it plays itself, and `twr speak` plays through the system. That is
+  why hands-free stops listening while a reply is read. With `listen_while_speaking`, or when
+  another speaker of this computer reads (the TUI's), so the app can't tell when it plays, a
+  hands-free session may hear twr: its own voice is dropped when recognized as such, but
+  headphones are the reliable way.
 - The TUI has no microphone: voice mode is in the desktop and mobile apps.
 - Phones listen only in the foreground; locking the screen or switching apps ends the session.

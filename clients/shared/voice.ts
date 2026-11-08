@@ -42,6 +42,10 @@ export interface VoiceCaptureStatus {
   problem?: string;
   /** Only the speech model is missing, and the host can download it (`voiceSetup`). */
   setup?: boolean;
+  /** `[voice] pause_ms`: the silence that ends a hands-free utterance (desktop). */
+  pauseMs?: number;
+  /** `[voice] listen_while_speaking`: hands-free keeps listening while replies are read. */
+  listenWhileSpeaking?: boolean;
 }
 
 export interface VoiceCapture {
@@ -58,6 +62,11 @@ export interface VoiceCapture {
   cancel(): Promise<void>;
   /** While the device's own voice plays, louder speech is needed to count (its echo). */
   setEchoGuard?(playing: boolean): void;
+  /**
+   * Hands-free stops hearing (what reaches the microphone is dropped, and an utterance under
+   * way with it) until called with false: the device's own voice is being read aloud.
+   */
+  setDeaf?(deaf: boolean): void;
 }
 
 /** What the device's own speaker does now (`twr speak --control stdio`'s lines, or the mobile one's). */
@@ -250,10 +259,25 @@ export interface VadOptions {
   preRollMs: number;
 }
 
+/**
+ * The silence that ends a hands-free utterance, in ms (`[voice] pause_ms`). Long enough for
+ * a pause to think mid-sentence; 900 ms cut messages off at a comma.
+ */
+export const PAUSE_MS = 2000;
+/** `[voice] pause_ms`'s bounds. */
+export const PAUSE_MS_MIN = 500;
+export const PAUSE_MS_MAX = 10_000;
+
+/**
+ * How long hands-free stays deaf after the device's own voice stops: the end of a sentence
+ * still in the speakers, the room's echo, a speaker's state reported a moment late.
+ */
+export const ECHO_TAIL_MS = 800;
+
 export const VAD_DEFAULTS: VadOptions = {
   frame: 320,
   startFrames: 4,
-  endSilenceMs: 900,
+  endSilenceMs: PAUSE_MS,
   maxMs: 30_000,
   preRollMs: 300,
 };
@@ -329,6 +353,12 @@ export class VoiceActivity {
   /** What was heard so far, as an utterance (hands-free stopped mid-sentence). */
   flush(): Float32Array | undefined {
     return this.active ? this.finish() : undefined;
+  }
+  /** Drops what was heard: the pre-roll, and an utterance under way. The floor stays. */
+  reset() {
+    this.finish();
+    this.pre = [];
+    this.pending = new Float32Array(0);
   }
   private finish() {
     const all = new Float32Array(this.length);
@@ -409,6 +439,8 @@ export function createWebCapture(
   let recordedLength = 0;
   let hints: string[] = [];
   let lastLevel = 0;
+  let pauseMs = PAUSE_MS;
+  let deaf = false;
   // Recognitions run one at a time, in order.
   let chain = Promise.resolve();
   const recognize = (samples: Float32Array) => {
@@ -434,13 +466,18 @@ export function createWebCapture(
     context = undefined;
   };
   return {
-    status,
+    async status() {
+      const s = await status();
+      if (s.pauseMs) pauseMs = clampPause(s.pauseMs);
+      return s;
+    },
     async start(nextMode, nextEvents, hint) {
       await release();
       mode = nextMode;
       events = nextEvents;
       hints = hint;
-      vad = new VoiceActivity();
+      // `deaf` is the session's to say, before or after the microphone opens.
+      vad = new VoiceActivity({ ...VAD_DEFAULTS, endSilenceMs: pauseMs });
       recorded = [];
       recordedLength = 0;
       stream = await navigator.mediaDevices.getUserMedia({
@@ -460,9 +497,10 @@ export function createWebCapture(
         let peak = 0;
         for (const s of samples) peak = Math.max(peak, Math.abs(s));
         const now = performance.now();
+        const handsFreeDeaf = deaf && mode === "hands-free";
         if (now - lastLevel > 100) {
           lastLevel = now;
-          events?.level?.(Math.min(1, peak * 2));
+          events?.level?.(handsFreeDeaf ? 0 : Math.min(1, peak * 2));
         }
         if (mode === "push") {
           if (recordedLength / 16000 < PUSH_MAX_SECONDS) {
@@ -471,6 +509,8 @@ export function createWebCapture(
           }
           return;
         }
+        // The device's own voice plays: nothing reaches the detector (its floor included).
+        if (handsFreeDeaf) return;
         for (const happened of vad.push(samples)) {
           if (happened.start) events?.speechStart();
           if (happened.utterance) recognize(happened.utterance);
@@ -508,7 +548,17 @@ export function createWebCapture(
     setEchoGuard(playing) {
       vad.guard = playing;
     },
+    setDeaf(on) {
+      if (on && !deaf) vad.reset();
+      deaf = on;
+    },
   };
+}
+
+/** A `pause_ms` within its bounds; anything else is the default. */
+export function clampPause(ms: number): number {
+  if (!Number.isFinite(ms)) return PAUSE_MS;
+  return Math.min(PAUSE_MS_MAX, Math.max(PAUSE_MS_MIN, Math.round(ms)));
 }
 
 // ---------------------------------------------------------------------------
@@ -549,13 +599,31 @@ export interface VoiceSessionState {
   confirm?: { text: string; reason: string };
   error?: string;
   speaker?: SpeakerState;
+  /**
+   * Hands-free is not listening now: the device's own voice is being read aloud (or just
+   * was), and what the microphone hears is its echo.
+   */
+  deaf?: boolean;
+}
+
+export interface VoiceSessionOptions {
+  /**
+   * Hands-free keeps listening while replies are read aloud, so talking interrupts them
+   * (`[voice] listen_while_speaking`). Off: it stops listening until they end.
+   */
+  listenWhileSpeaking: boolean;
+  /** How long it stays deaf after they end, in ms. */
+  echoTailMs: number;
 }
 
 /**
  * Voice mode's state machine. Push-to-talk: `press` starts recording, `release` sends it.
- * Hands-free: `begin` listens until `end`, one message per utterance. When speech starts, the
- * device's own voice is paused at once, without waiting for the hub. A transcript is a local
- * control (`quiet`, `skip`), the device's own echo (dropped), or a message.
+ * Hands-free: `begin` listens until `end`, one message per utterance. While the device's own
+ * voice reads a reply, and for `echoTailMs` after, hands-free does not listen (its echo would be
+ * sent as a message); a user already talking when a reply starts holds the reply until what
+ * they said is handled. With `listenWhileSpeaking`, and in push to talk, the device's own voice
+ * is paused at once when speech starts (barge-in), without waiting for the hub. A transcript is
+ * a local control (`quiet`, `skip`), the device's own echo (dropped), or a message.
  */
 export class VoiceSession {
   private s: VoiceSessionState = {
@@ -566,6 +634,17 @@ export class VoiceSession {
   };
   /** Whether this session paused the speaker (and so may resume it). */
   private held = false;
+  /** The hold is the user talking over the voice (barge-in): a message sent goes past it. */
+  private barged = false;
+  /** Utterances begun while deaf: their transcripts are dropped. */
+  private dropping = 0;
+  /** Deaf until this time (ms, `Date.now()`); Infinity while the voice plays. */
+  private deafUntil = 0;
+  private deafTimer?: ReturnType<typeof setTimeout>;
+  options: VoiceSessionOptions = {
+    listenWhileSpeaking: false,
+    echoTailMs: ECHO_TAIL_MS,
+  };
   /** Utterances begun (speech started) and not yet handled: the hold lasts until none is. */
   private pending = 0;
   /** A message was sent while the speaker was held: it goes past what it was reading. */
@@ -599,21 +678,91 @@ export class VoiceSession {
     this.deps.capture.setEchoGuard?.(
       Boolean(state.unknown) || (state.playing && !state.paused),
     );
+    this.updateDeaf();
+  }
+  /** Whether hands-free stops listening while the device's own voice plays. */
+  private get gated() {
+    return (
+      this.s.mode === "hands-free" &&
+      this.s.phase !== "off" &&
+      !this.options.listenWhileSpeaking
+    );
+  }
+  /**
+   * Hands-free goes deaf while this device's voice plays (one it can see: a speaker of this
+   * computer standing by can't tell, and the echo check stays its guard), and for the echo
+   * tail after. A user already talking when it starts holds it instead.
+   */
+  private updateDeaf() {
+    const sp = this.s.speaker;
+    const playing = Boolean(sp && !sp.unknown && sp.playing && !sp.paused);
+    if (!this.gated) {
+      this.listenAgain();
+      return;
+    }
+    if (playing) {
+      if (this.deafUntil === Infinity) return;
+      if (this.pending > 0) {
+        // The user spoke first: the reply waits until what they said is handled. (Deafening
+        // the microphone now would drop their utterance half heard.)
+        if (!this.held && this.deps.speaker) {
+          this.held = true;
+          this.barged = false;
+          void this.deps.speaker.control("pause").catch(() => {});
+        }
+        return;
+      }
+      clearTimeout(this.deafTimer);
+      this.deafTimer = undefined;
+      this.deafUntil = Infinity;
+      this.deps.capture.setDeaf?.(true);
+      if (!this.s.deaf) this.set({ deaf: true, partial: "" });
+      return;
+    }
+    if (this.deafUntil !== Infinity) return;
+    // It stopped: the end of its echo is still in the room.
+    const tail = Math.max(0, this.options.echoTailMs);
+    this.deafUntil = Date.now() + tail;
+    clearTimeout(this.deafTimer);
+    this.deafTimer = setTimeout(() => this.listenAgain(), tail);
+  }
+  /** Hands-free hears again. */
+  private listenAgain() {
+    clearTimeout(this.deafTimer);
+    this.deafTimer = undefined;
+    this.deafUntil = 0;
+    this.deps.capture.setDeaf?.(false);
+    if (this.s.deaf) this.set({ deaf: false });
+  }
+  private get deaf() {
+    return this.gated && Date.now() < this.deafUntil;
   }
   private events(): VoiceCaptureEvents {
     return {
       speechStart: () => this.speechStarted(),
-      partial: (text) => this.set({ partial: text }),
-      level: (level) => this.set({ level }),
+      partial: (text) => {
+        if (this.dropping === 0 && !this.deaf) this.set({ partial: text });
+      },
+      level: (level) => this.set({ level: this.deaf ? 0 : level }),
       final: (text) => {
+        // An utterance begun while deaf: the device's own voice, or the end of it.
+        if (this.dropping > 0) {
+          this.dropping--;
+          return;
+        }
         this.busy = this.busy.then(() => this.heard(text));
       },
       error: (message) => {
+        if (this.dropping > 0) this.dropping--;
         this.busy = this.busy.then(() => this.failed(message));
       },
     };
   }
   private speechStarted() {
+    if (this.deaf || this.dropping > 0) {
+      this.dropping++;
+      return;
+    }
     this.pending++;
     const sp = this.s.speaker;
     // A speaker this device can't see (another one of this computer speaks for it) may be
@@ -622,6 +771,7 @@ export class VoiceSession {
     if (playing) this.heardWhilePlaying = true;
     if (playing && !this.held && this.deps.speaker) {
       this.held = true;
+      this.barged = true;
       void this.deps.speaker.control("pause").catch(() => {});
     }
     this.set({ phase: "hearing", partial: "" });
@@ -640,6 +790,7 @@ export class VoiceSession {
       this.heardWhilePlaying = false;
     }
     this.set({ partial: "", ...patch, phase: patch.phase || this.after() });
+    if (this.s.phase === "off") this.listenAgain();
   }
   private async failed(message: string) {
     await this.done({ phase: "error", error: message });
@@ -674,8 +825,8 @@ export class VoiceSession {
         });
         return;
       }
-      // The message moves the conversation on: what was being read is not resumed.
-      this.sentWhileHeld = this.held;
+      // The message moves the conversation on: what the user talked over is not resumed.
+      this.sentWhileHeld = this.held && this.barged;
       await this.done({
         heard: { text, outcome: "sent" },
         confirm: undefined,
@@ -690,6 +841,7 @@ export class VoiceSession {
     // Each of these decides what the speaker does next: the hold is over.
     const own = () => {
       this.held = false;
+      this.barged = false;
       this.sentWhileHeld = false;
     };
     switch (control) {
@@ -728,6 +880,7 @@ export class VoiceSession {
   private async letGo(skip: boolean) {
     if (!this.held || !this.deps.speaker) return;
     this.held = false;
+    this.barged = false;
     if (skip) await this.deps.speaker.control("skip").catch(() => {});
     await this.deps.speaker.control("resume").catch(() => {});
   }
@@ -796,6 +949,8 @@ export class VoiceSession {
       error: undefined,
       partial: "",
     });
+    this.dropping = 0;
+    this.listenAgain();
     try {
       if (this.deps.prepare && !(await this.deps.prepare())) {
         this.set({ phase: "off" });
@@ -807,6 +962,8 @@ export class VoiceSession {
         this.events(),
         this.deps.hint(),
       );
+      // A reply may be read aloud already.
+      this.updateDeaf();
     } catch (error) {
       this.set({
         phase: "error",
@@ -821,9 +978,11 @@ export class VoiceSession {
     this.releaseWanted = false;
     await this.deps.capture.cancel();
     this.pending = 0;
+    this.dropping = 0;
     this.sentWhileHeld = false;
     await this.letGo(false);
     this.set({ phase: "off", level: 0, partial: "" });
+    this.listenAgain();
   }
   /** Drops the transcript waiting for confirmation. */
   dismissConfirm() {

@@ -148,6 +148,9 @@ export class DesktopVoice {
       engine: typeof value.engine === "string" ? value.engine : undefined,
       problem: typeof value.problem === "string" ? value.problem : undefined,
       setup: value.setup === true,
+      // `[voice]`'s listening settings; an older `twr` says none, and the defaults hold.
+      pauseMs: typeof value.pause_ms === "number" ? value.pause_ms : undefined,
+      listenWhileSpeaking: value.listen_while_speaking === true,
     };
   }
 

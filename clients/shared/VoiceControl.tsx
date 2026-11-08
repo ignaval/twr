@@ -205,9 +205,14 @@ export function VoiceControl(props: VoiceControlProps) {
     setStatus(s);
     setSetup((v) => (v === "ready" ? undefined : v));
     if (!s.available) return false;
+    if (session)
+      session.options = {
+        ...session.options,
+        listenWhileSpeaking: Boolean(s.listenWhileSpeaking),
+      };
     await host.voiceArm?.(true);
     return true;
-  }, [capture, host]);
+  }, [capture, host, session]);
   readyRef.current = ready;
 
   const downloadModel = useCallback(async () => {
@@ -317,9 +322,13 @@ export function VoiceControl(props: VoiceControlProps) {
   };
 
   const label =
-    state.phase === "listening" && speakerInfo?.playing && !speakerInfo.paused
-      ? "Speaking · talk to interrupt"
-      : PHASES[state.phase];
+    state.phase === "listening" && state.deaf
+      ? "Speaking · listening again when it ends"
+      : state.phase === "listening" &&
+          speakerInfo?.playing &&
+          !speakerInfo.paused
+        ? "Speaking · talk to interrupt"
+        : PHASES[state.phase];
 
   return (
     <>

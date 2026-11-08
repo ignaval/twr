@@ -10,7 +10,7 @@ import UIKit
 ///   (`requiresOnDeviceRecognition`); otherwise the audio goes to Apple's servers, and
 ///   `status` says so (`local: false`).
 /// - Push mode records until `stop`; hands-free keeps listening, ends an utterance after
-///   about 0.9 s of silence, and starts a new recognition task for the next (a task lasts
+///   2 s of silence (shared/voice.ts `PAUSE_MS`), and starts a new recognition task for the next (a task lasts
 ///   about a minute at most, so a long silence restarts it too).
 /// - The audio session is `.playAndRecord` in `.voiceChat` mode with voice processing on
 ///   the input: the system's echo cancellation keeps the phone's own voice out of what is
@@ -26,8 +26,9 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
         CAPPluginMethod(name: $0, returnType: CAPPluginReturnPromise)
     }
 
-    /// Silence that ends a hands-free utterance.
-    private static let endSilence: TimeInterval = 0.9
+    /// Silence that ends a hands-free utterance (shared/voice.ts `PAUSE_MS`): long enough for a
+    /// pause to think mid-sentence.
+    private static let endSilence: TimeInterval = 2.0
     /// A sound loud enough to count as speech that brings no words this soon (a cough, a door)
     /// ends its utterance empty: the phone's own voice, paused for it, goes on.
     private static let noWords: TimeInterval = 2.5

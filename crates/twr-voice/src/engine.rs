@@ -66,6 +66,10 @@ pub struct Status {
     /// is missing (the desktop app offers to download it).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub setup: bool,
+    /// `[voice] pause_ms`: what the app listening hands-free takes for the end of an utterance.
+    pub pause_ms: u64,
+    /// `[voice] listen_while_speaking`: whether hands-free listens while replies are read.
+    pub listen_while_speaking: bool,
 }
 
 /// The default model is not there yet: `twr voice setup` downloads it ([`MODEL_URL`]).
@@ -147,6 +151,8 @@ pub fn status(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> Statu
             local: k.local(),
             problem: None,
             setup: false,
+            pause_ms: cfg.pause_ms,
+            listen_while_speaking: cfg.listen_while_speaking,
         },
         Err(e) => Status {
             available: false,
@@ -154,6 +160,8 @@ pub fn status(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> Statu
             local: false,
             setup: e.downcast_ref::<MissingModel>().is_some(),
             problem: Some(format!("{e:#}")),
+            pause_ms: cfg.pause_ms,
+            listen_while_speaking: cfg.listen_while_speaking,
         },
     }
 }
@@ -454,6 +462,21 @@ mod tests {
         assert!(s.problem.unwrap().contains("mine.bin"));
         let json = serde_json::to_value(status(&cfg(), d.path(), Some(&path))).unwrap();
         assert_eq!(json["setup"], true, "{json}");
+    }
+
+    #[test]
+    fn status_tells_the_app_how_to_listen_hands_free() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().as_os_str().to_owned();
+        let json = serde_json::to_value(status(&cfg(), d.path(), Some(&path))).unwrap();
+        assert_eq!(json["pause_ms"], 2000, "{json}");
+        assert_eq!(json["listen_while_speaking"], false, "{json}");
+        let mut c = cfg();
+        c.pause_ms = 3500;
+        c.listen_while_speaking = true;
+        let json = serde_json::to_value(status(&c, d.path(), Some(&path))).unwrap();
+        assert_eq!(json["pause_ms"], 3500, "{json}");
+        assert_eq!(json["listen_while_speaking"], true, "{json}");
     }
 
     #[test]

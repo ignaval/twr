@@ -175,6 +175,8 @@ model = ""                        # the ggml model; empty = voice/ggml-base.en.b
 language = "en"                   # as whisper names it, or "auto"
 command = []                      # engine = "command": a program and its arguments (no shell), 16 kHz WAV on stdin, text on stdout
 timeout_secs = 60                 # how long one recording may take to recognize (1-600)
+pause_ms = 2000                   # hands-free: the silence that ends a message, in ms (500-10000)
+listen_while_speaking = false     # hands-free listens while replies are read aloud (talk over them; for headphones)
 
 [runtimes.gemini]                 # example: an ACP agent under a short name (--runtime gemini)
 acp = "gemini --experimental-acp"

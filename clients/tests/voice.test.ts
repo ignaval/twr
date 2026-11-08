@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+  PAUSE_MS,
+  VAD_DEFAULTS,
   VoiceActivity,
   VoiceSession,
+  clampPause,
   downsample,
   encodeWav,
   isLikelyEcho,
@@ -73,14 +76,15 @@ describe("voice activity", () => {
     const happened = [
       ...vad.push(quiet(1000)),
       ...vad.push(tone(800, 0.2)),
-      ...vad.push(quiet(1200)),
+      ...vad.push(quiet(2200)),
     ];
     expect(happened.filter((h) => h.start)).toHaveLength(1);
     const utterances = happened.filter((h) => h.utterance);
     expect(utterances).toHaveLength(1);
+    // Pre-roll, speech, and the pause that ended it.
     const seconds = utterances[0].utterance!.length / 16000;
-    expect(seconds).toBeGreaterThan(1.6);
-    expect(seconds).toBeLessThan(2.2);
+    expect(seconds).toBeGreaterThan(2.7);
+    expect(seconds).toBeLessThan(3.3);
   });
   it("needs louder speech while the device's own voice plays", () => {
     const vad = new VoiceActivity();
@@ -94,6 +98,41 @@ describe("voice activity", () => {
     vad.push(quiet(500));
     expect(vad.push(tone(40, 0.5)).some((h) => h.start)).toBe(false);
   });
+  it("keeps a sentence with a pause to think in it as one utterance", () => {
+    expect(PAUSE_MS).toBe(2000);
+    const vad = new VoiceActivity();
+    const happened = [
+      ...vad.push(quiet(500)),
+      ...vad.push(tone(1500, 0.2)),
+      // "...and the threads are" — a breath, a thought — "...waiting for review."
+      ...vad.push(quiet(1500)),
+      ...vad.push(tone(1000, 0.2)),
+    ];
+    expect(happened.filter((h) => h.utterance)).toHaveLength(0);
+    const ended = vad.push(quiet(2100)).filter((h) => h.utterance);
+    expect(ended).toHaveLength(1);
+    expect(ended[0].utterance!.length / 16000).toBeGreaterThan(5.5);
+  });
+  it("ends an utterance after the pause it is given", () => {
+    const vad = new VoiceActivity({ ...VAD_DEFAULTS, endSilenceMs: 900 });
+    vad.push(quiet(500));
+    vad.push(tone(800, 0.2));
+    expect(vad.push(quiet(1000)).some((h) => h.utterance)).toBe(true);
+  });
+  it("drops an utterance under way when reset", () => {
+    const vad = new VoiceActivity();
+    vad.push(quiet(500));
+    expect(vad.push(tone(800, 0.2)).some((h) => h.start)).toBe(true);
+    vad.reset();
+    expect(vad.flush()).toBeUndefined();
+    expect(vad.push(quiet(2500)).some((h) => h.utterance)).toBe(false);
+  });
+  it("keeps pause_ms within its bounds", () => {
+    expect(clampPause(3500)).toBe(3500);
+    expect(clampPause(10)).toBe(500);
+    expect(clampPause(600_000)).toBe(10_000);
+    expect(clampPause(NaN)).toBe(PAUSE_MS);
+  });
 });
 
 function rig(
@@ -104,6 +143,7 @@ function rig(
   } = {},
 ) {
   let events: VoiceCaptureEvents | undefined;
+  let isDeaf = false;
   const log: string[] = [];
   const sent: string[] = [];
   const states: VoiceSessionState[] = [];
@@ -123,6 +163,11 @@ function rig(
     },
     setEchoGuard(playing) {
       log.push("guard:" + playing);
+    },
+    setDeaf(deaf) {
+      // Logged only when it changes: the session says it again on every speaker state.
+      if (deaf !== isDeaf) log.push("deaf:" + deaf);
+      isDeaf = deaf;
     },
   };
   const session = new VoiceSession({
@@ -177,6 +222,7 @@ describe("voice session", () => {
   });
   it("keeps controls local and drops its own echo", async () => {
     const r = rig();
+    r.session.options.listenWhileSpeaking = true;
     await r.session.begin();
     expect(r.log).toEqual(["live:true", "start:hands-free"]);
     r.session.speakerState({ playing: true, paused: false, queued: 1 });
@@ -270,7 +316,7 @@ describe("desktop voice host", async () => {
       `#!/bin/sh
 echo "$*" >> "${log}"
 if [ "$2" = setup ]; then sleep 0.2; touch "${model}"; exit 0; fi
-if [ -f "${model}" ]; then echo '{"available":true,"engine":"whisper","local":true}';
+if [ -f "${model}" ]; then echo '{"available":true,"engine":"whisper","local":true,"pause_ms":3500,"listen_while_speaking":true}';
 else echo '{"available":false,"local":false,"problem":"no speech model yet","setup":true}'; fi
 `,
     );
@@ -285,7 +331,12 @@ else echo '{"available":false,"local":false,"problem":"no speech model yet","set
       setup: true,
     });
     const [a, b] = await Promise.all([voice.setup(), voice.setup()]);
-    expect(a).toMatchObject({ available: true, setup: false });
+    expect(a).toMatchObject({
+      available: true,
+      setup: false,
+      pauseMs: 3500,
+      listenWhileSpeaking: true,
+    });
     expect(b).toMatchObject({ available: true });
     const calls = readFileSync(log, "utf8").trim().split("\n");
     expect(calls.filter((c) => c === "voice setup")).toHaveLength(1);
@@ -338,6 +389,7 @@ describe("voice session races (review regressions)", () => {
     const r = rig(undefined, {
       submit: () => new Promise((resolve) => (finish = resolve)),
     });
+    r.session.options.listenWhileSpeaking = true;
     await r.session.begin();
     r.session.speakerState({ playing: true, paused: false, queued: 0 });
     r.events().speechStart();
@@ -425,5 +477,106 @@ describe("voice session races (review regressions)", () => {
     expect(failing.state.phase).toBe("listening");
     expect(failing.state.error).toMatch(/not read aloud/);
     void r;
+  });
+});
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("hands-free while its own voice reads", () => {
+  it("stops listening while a reply is read, and for a moment after", async () => {
+    const r = rig();
+    r.session.options.echoTailMs = 30;
+    await r.session.begin();
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    expect(r.log).toContain("deaf:true");
+    expect(r.session.state.deaf).toBe(true);
+    // Its own voice, heard back and recognized: never sent, and the reading goes on.
+    r.events().speechStart();
+    r.events().partial?.("the delete cards have already been approved");
+    expect(r.session.state.partial).toBe("");
+    await r.say("the delete cards have already been approved");
+    expect(r.sent).toEqual([]);
+    expect(r.log).not.toContain("speaker:pause");
+    expect(r.session.state.phase).toBe("listening");
+    // It ended: the end of its echo is still dropped.
+    r.session.speakerState({ playing: false, paused: false, queued: 0 });
+    expect(r.session.state.deaf).toBe(true);
+    r.events().speechStart();
+    await r.say("are waiting for review");
+    expect(r.sent).toEqual([]);
+    await wait(40);
+    expect(r.log.slice(-1)).toEqual(["deaf:false"]);
+    expect(r.session.state.deaf).toBe(false);
+    r.events().speechStart();
+    await r.say("Check on the api worker");
+    expect(r.sent).toEqual(["Check on the api worker"]);
+  });
+  it("listens again soon after the user stops the reading", async () => {
+    const r = rig();
+    r.session.options.echoTailMs = 30;
+    await r.session.begin();
+    r.session.speakerState({ playing: true, paused: false, queued: 2 });
+    // The Quiet button: the speaker stops and reports it.
+    r.session.speakerState({ playing: false, paused: false, queued: 0 });
+    await wait(40);
+    r.events().speechStart();
+    await r.say("what did the docs worker say");
+    expect(r.sent).toEqual(["what did the docs worker say"]);
+  });
+  it("is deaf at once when a session begins over a reply being read", async () => {
+    const r = rig();
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    expect(r.log).not.toContain("deaf:true");
+    await r.session.begin();
+    expect(r.log).toContain("deaf:true");
+    await r.session.end();
+    expect(r.log.slice(-1)).toEqual(["deaf:false"]);
+    expect(r.session.state.deaf).toBe(false);
+  });
+  it("holds a reply that starts while the user is talking, then reads it in full", async () => {
+    const r = rig();
+    await r.session.begin();
+    r.events().speechStart();
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    expect(r.log).toContain("speaker:pause");
+    expect(r.log).not.toContain("deaf:true");
+    r.session.speakerState({ playing: true, paused: true, queued: 0 });
+    await r.say("and the threads are waiting for review");
+    expect(r.sent).toEqual(["and the threads are waiting for review"]);
+    // What it was about to read is not skipped: the user did not talk over it.
+    expect(r.log.slice(-1)).toEqual(["speaker:resume"]);
+    expect(r.log).not.toContain("speaker:skip");
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    expect(r.log.slice(-1)).toEqual(["deaf:true"]);
+  });
+  it("never goes deaf in push to talk, nor for a speaker it can't see", async () => {
+    const r = rig();
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    await r.session.press();
+    expect(r.log).toContain("speaker:pause");
+    await r.say("Check on the api worker");
+    expect(r.sent).toEqual(["Check on the api worker"]);
+    expect(r.log).not.toContain("deaf:true");
+    const unseen = rig();
+    await unseen.session.begin();
+    unseen.session.speakerState({
+      playing: false,
+      paused: false,
+      queued: 0,
+      unknown: true,
+    });
+    expect(unseen.log).not.toContain("deaf:true");
+  });
+  it("talks over the reading with listen_while_speaking", async () => {
+    const r = rig();
+    r.session.options.listenWhileSpeaking = true;
+    await r.session.begin();
+    r.session.speakerState({ playing: true, paused: false, queued: 0 });
+    expect(r.log).not.toContain("deaf:true");
+    r.events().speechStart();
+    expect(r.log).toContain("speaker:pause");
+    await r.say("Stop the api worker");
+    expect(r.sent).toEqual(["Stop the api worker"]);
+    expect(r.log.slice(-2)).toEqual(["speaker:skip", "speaker:resume"]);
   });
 });
