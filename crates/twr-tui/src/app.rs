@@ -28026,7 +28026,6 @@ pub(crate) mod tests {
                 "OpenAI",
                 "claude-haiku-5-5",
                 "gpt-6-luna",
-                "$0.0002",
                 "Claude Code",
                 "/suggest off",
                 "suggest = false",
@@ -28034,6 +28033,7 @@ pub(crate) mod tests {
             ] {
                 assert!(notice.contains(says), "{says}");
             }
+            assert!(!notice.contains('$'), "no price: {notice}");
             assert_eq!(st.take_suggest_due(), None, "still not drawn");
             // Replaced before a frame showed it: shown again.
             st.view.status = Some("something else".into());
@@ -28046,7 +28046,7 @@ pub(crate) mod tests {
             assert!(!st.seen.suggest_notice, "under the help");
             assert_eq!(st.take_suggest_due(), None);
             st.view.help = false;
-            draw(&mut st, 30, 9);
+            draw(&mut st, 20, 7);
             st.note_drawn(Instant::now());
             assert!(!st.seen.suggest_notice, "cut short");
             // A terminal of one row has no room for the status bar at all.
@@ -28072,9 +28072,9 @@ pub(crate) mod tests {
         }
 
         /// On a compact terminal (40x20) the status bar has no room for the notice whole: it
-        /// draws the short form, which still says what is sent, to whom, what it costs and
-        /// how to turn them off, and that one drawn whole tells it. At a normal width the
-        /// whole one is drawn.
+        /// draws the short form, which still says what is sent, to whom and how to turn
+        /// them off (no price, as the whole one), and that one drawn whole tells it. At a
+        /// normal width the whole one is drawn.
         #[test]
         fn the_suggestion_notice_is_said_short_where_it_has_no_room() {
             let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -28090,11 +28090,11 @@ pub(crate) mod tests {
                 "prompt",
                 "8 KB",
                 "your login",
-                "$0.0002",
                 "/suggest off",
             ] {
                 assert!(short.contains(says), "{says}");
             }
+            assert!(!short.contains('$'), "no price: {short}");
             let notice = crate::firstrun::suggest_notice(&models);
             for (w, h, whole) in [(40, 20, false), (210, 40, true)] {
                 let (mut st, _) = ended(true);
@@ -28155,13 +28155,13 @@ pub(crate) mod tests {
         fn the_suggestion_notice_stays_until_dismissed_or_replaced() {
             let models = twr_core::config::SuggestModels::default();
             let short = crate::firstrun::suggest_notice_short(&models);
-            for (w, dismiss) in [(40, true), (40, false), (30, true), (30, false)] {
+            for (w, dismiss) in [(40, true), (40, false), (24, true), (24, false)] {
                 let (mut st, _) = ended(true);
                 st.seen.suggest_notice = false;
                 crowd(&mut st, true, true);
                 assert_eq!(st.take_suggest_due(), None);
                 let had = notice_stays_until_gone(&mut st, &short, w, 20, dismiss);
-                // At 30 columns its short form needs more than a third of the screen.
+                // At 24 columns its short form needs more than a third of the screen.
                 assert!(w == 40 || had > 20 / 3, "{w}x20: {had} rows");
                 assert!(st.seen.suggest_notice);
             }

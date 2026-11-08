@@ -2525,10 +2525,6 @@ meter::-webkit-meter-optimum-value {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.suggested-message kbd {
-  flex-shrink: 0;
-  font-size: 0.923077rem;
-}
 .routine-updates {
   font-size: 0.923077rem;
   color: var(--muted);

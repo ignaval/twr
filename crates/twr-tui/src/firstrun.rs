@@ -230,19 +230,19 @@ pub fn suggest_notice(models: &twr_core::config::SuggestModels) -> String {
     format!(
         "suggestions are on: after a turn of the thread you see ends, its prompt (2 KB) and the \
          end of its reply (6 KB) go to a small model with your own login, {} through Claude Code \
-         (to Anthropic) or {} through Codex (to OpenAI), the thread's own runtime first: about \
-         $0.0002 each at list price, counting toward your plan's usage · Tab or → takes one · \
-         /suggest off, or [tui] suggest = false, turns them off",
+         (to Anthropic) or {} through Codex (to OpenAI), the thread's own runtime first, \
+         counting toward your plan's usage · Tab or → takes one · /suggest off, or \
+         [tui] suggest = false, turns them off",
         models.claude_code, models.codex
     )
 }
 
 /// [`suggest_notice`] said short, for a status bar with no room for it whole (a compact
-/// terminal): still what is sent, to whom, what it costs and how to turn them off.
+/// terminal): still what is sent, to whom and how to turn them off.
 pub fn suggest_notice_short(models: &twr_core::config::SuggestModels) -> String {
     format!(
         "suggestions on: a turn's prompt and reply end (8 KB) go to {} (Claude Code, \
-         Anthropic) or {} (Codex, OpenAI) with your login, ~$0.0002 each · /suggest off",
+         Anthropic) or {} (Codex, OpenAI) with your login · /suggest off",
         models.claude_code, models.codex
     )
 }

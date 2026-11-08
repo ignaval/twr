@@ -592,9 +592,12 @@ try {
       exact: true,
     })
     .click();
+  const suggestedComposer = page.getByRole("textbox", {
+    name: "Message api directly",
+  });
+  // The suggestion is the empty box's placeholder, as the TUI's ghost text.
   await page
-    .locator(".suggested-message")
-    .filter({ hasText: "Add tests for the updated behavior" })
+    .locator('textarea[placeholder="Add tests for the updated behavior"]')
     .waitFor({ timeout: 30000 })
     .catch(async (error) => {
       const diagnostic = await page.evaluate(async () => {
@@ -621,10 +624,33 @@ try {
       console.error("Suggestion diagnostics:", JSON.stringify(diagnostic));
       throw error;
     });
-  const suggestedComposer = page.getByRole("textbox", {
-    name: "Message api directly",
-  });
+  await page.getByText("takes the suggestion").waitFor();
+  assert.equal(
+    await page.locator(".suggested-message").count(),
+    0,
+    "Desktop shows the suggestion in the box, not beside it",
+  );
   await suggestedComposer.focus();
+  // Typing types over it; with the box empty again it shows again.
+  await suggestedComposer.press("x");
+  assert.equal(await suggestedComposer.inputValue(), "x");
+  await suggestedComposer.press("Backspace");
+  await page
+    .locator('textarea[placeholder="Add tests for the updated behavior"]')
+    .waitFor({ timeout: 30000 });
+  // Tab or → takes it once it has been on screen a moment (300 ms, as the TUI).
+  await page.waitForTimeout(400);
+  await suggestedComposer.press("ArrowRight");
+  assert.equal(
+    await suggestedComposer.inputValue(),
+    "Add tests for the updated behavior",
+  );
+  await suggestedComposer.fill("");
+  await page
+    .locator('textarea[placeholder="Add tests for the updated behavior"]')
+    .waitFor({ timeout: 30000 });
+  // Tab or → takes it once it has been on screen a moment (300 ms, as the TUI).
+  await page.waitForTimeout(400);
   await suggestedComposer.press("Tab");
   assert.equal(
     await suggestedComposer.inputValue(),
@@ -664,13 +690,13 @@ try {
   await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   await page.waitForTimeout(1000);
-  assert.equal(
-    await page.locator(".suggested-message").count(),
-    0,
+  assert.notEqual(
+    await suggestedComposer.getAttribute("placeholder"),
+    "Add tests for the updated behavior",
     "Settings changes apply when returning to chat without reloading",
   );
   console.log(
-    "Small-model disclosure, provider stub, Tab acceptance and explicit send boundary passed",
+    "Small-model disclosure, provider stub, placeholder suggestion, Tab and → acceptance and explicit send boundary passed",
   );
   // Real configuration CAS and validation, with an external edit between read and save.
   const config = await page.evaluate(() => window.twr.configRead());

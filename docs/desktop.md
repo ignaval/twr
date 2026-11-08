@@ -75,7 +75,7 @@ control position, matching the TUI's relay semantics.
 | Boxes, SSH/container/dial-in setup, login, projects, tokens | Boxes page and generated interactive CLI forms |
 | Jobs, slots, timeouts, output and cancellation | Jobs table, launch form, live log and cancellation actions |
 | Usage and grouping/time windows | Usage meters and typed reporting form; CLI forms retain duration flags |
-| Next-message suggestions, routine summaries | Shared hub small-model calls, first-use disclosure, Tab to accept, expandable routine updates |
+| Next-message suggestions, routine summaries | Shared hub small-model calls (`suggest.next`, `summary.thread`), first-use disclosure, the suggestion as the empty message box's placeholder taken with Tab or → (tap it on a phone), expandable routine updates |
 | Context and memory | Revision-aware editors, note cards and standing-context editor |
 | Speech, remote sessions, speaker controls | Read-aloud page and embedded CLI forms |
 | Workspaces | Sidebar workspace tree (every workspace, its threads nested), creation and removal forms |
@@ -102,7 +102,10 @@ stay in memory across navigation, not in browser storage. Closing/reloading asks
 discarding them. Hub settings require a deliberate hub restart. Suggestions and summaries share `[tui]`
 preferences with the CLI and apply immediately on revisiting the conversation. Before the
 first provider call, an in-app notice explains the exact text sent, models, providers and
-usage cost. Only visible routine-update groups receive summaries; permission/question
+that calls count toward your plan's usage; it names no price. As in the TUI, a suggestion
+shows greyed as the empty message box's placeholder: `Tab` or `→` puts it in the box (once
+it has been on screen 300 ms, so a key pressed as it appears isn't taken for it), typing
+types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
 
 macOS uses Command shortcuts; Linux uses Control. Terminal keys pass to the terminal,

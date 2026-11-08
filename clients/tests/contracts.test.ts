@@ -21,8 +21,48 @@ import {
 import type { HubEvent } from "../shared/types";
 import { approvalShortcut } from "../shared/attention";
 import { numberSetting } from "../shared/settings";
-import { summaryDue, settledSummary } from "../shared/assistance";
+import {
+  summaryDue,
+  settledSummary,
+  takesSuggestion,
+  SUGGEST_SETTLE_MS,
+} from "../shared/assistance";
 import { localWorkingDirectory } from "../shared/paths";
+
+describe("reply suggestions", () => {
+  it("Tab or → takes a suggestion only from an empty box, as in the TUI", () => {
+    const shown = "run the tests";
+    expect(takesSuggestion({ key: "Tab" }, "", shown, 1000)).toBe(true);
+    expect(takesSuggestion({ key: "ArrowRight" }, "", shown, 1000)).toBe(true);
+    // Typed text, no suggestion, other keys, modifiers and IME composition leave it.
+    expect(takesSuggestion({ key: "Tab" }, "r", shown, 1000)).toBe(false);
+    expect(takesSuggestion({ key: "ArrowRight" }, "", "", 1000)).toBe(false);
+    expect(takesSuggestion({ key: "Enter" }, "", shown, 1000)).toBe(false);
+    expect(takesSuggestion({ key: "r" }, "", shown, 1000)).toBe(false);
+    expect(
+      takesSuggestion({ key: "Tab", shiftKey: true }, "", shown, 1000),
+    ).toBe(false);
+    for (const modifier of ["ctrlKey", "altKey", "metaKey"])
+      expect(
+        takesSuggestion(
+          { key: "ArrowRight", [modifier]: true },
+          "",
+          shown,
+          1000,
+        ),
+      ).toBe(false);
+    expect(
+      takesSuggestion({ key: "Tab", isComposing: true }, "", shown, 1000),
+    ).toBe(false);
+    // A key pressed as it appears was meant for what was there.
+    expect(
+      takesSuggestion({ key: "Tab" }, "", shown, SUGGEST_SETTLE_MS - 1),
+    ).toBe(false);
+    expect(
+      takesSuggestion({ key: "ArrowRight" }, "", shown, SUGGEST_SETTLE_MS),
+    ).toBe(true);
+  });
+});
 
 describe("review regressions", () => {
   it("never uses a remote runner's worktree as a local terminal working directory", () => {

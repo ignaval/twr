@@ -93,7 +93,12 @@ import type {
 } from "./types";
 import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
 import { effortChoices, formRuntime, modelChoices } from "./models";
-import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
+import {
+  AssistanceNotice,
+  takesSuggestion,
+  useAssistance,
+  type Summary,
+} from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { announcements, voiceHint } from "./voice";
 import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
@@ -2995,16 +3000,18 @@ export default function App({
                     </button>
                   </div>
                 )}
-                {!draft && assistance.suggestion && (
-                  <button
-                    className="suggested-message"
-                    onClick={acceptSuggestion}
-                  >
-                    <span className="visually-hidden">Suggested reply: </span>
-                    <span>{assistance.suggestion}</span>
-                    <kbd>Tab to use</kbd>
-                  </button>
-                )}
+                {!draft &&
+                  assistance.suggestion &&
+                  document.documentElement.dataset.mobile === "true" && (
+                    <button
+                      className="suggested-message"
+                      onClick={acceptSuggestion}
+                    >
+                      <span className="visually-hidden">Suggested reply: </span>
+                      <span>{assistance.suggestion}</span>
+                      <span className="visually-hidden">, tap to use</span>
+                    </button>
+                  )}
                 <form
                   className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
                   aria-label="Message composer"
@@ -3095,11 +3102,15 @@ export default function App({
                       setMentionIndex(0);
                     }}
                     placeholder={
-                      document.documentElement.dataset.mobile === "true"
-                        ? "Message…"
-                        : destination
-                          ? `Message ${target?.name} directly…`
-                          : "Ask your orchestrator to build something…"
+                      // A suggestion shows as the empty box's placeholder, as the TUI's
+                      // ghost text: Tab or → takes it, typing types over it.
+                      !draft && assistance.suggestion
+                        ? assistance.suggestion
+                        : document.documentElement.dataset.mobile === "true"
+                          ? "Message…"
+                          : destination
+                            ? `Message ${target?.name} directly…`
+                            : "Ask your orchestrator to build something…"
                     }
                     rows={Math.min(
                       6,
@@ -3114,7 +3125,14 @@ export default function App({
                     onKeyDown={(e) => {
                       if (e.nativeEvent.isComposing || e.keyCode === 229)
                         return;
-                      if (e.key === "Tab" && !draft && assistance.suggestion) {
+                      if (
+                        takesSuggestion(
+                          e,
+                          draft,
+                          assistance.suggestion,
+                          assistance.suggestionShownFor(),
+                        )
+                      ) {
                         e.preventDefault();
                         acceptSuggestion();
                         return;
@@ -3235,6 +3253,12 @@ export default function App({
                       <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd>{" "}
                       reference a thread <span>·</span> Shift Enter for a new
                       line
+                      {!draft && assistance.suggestion && (
+                        <span>
+                          {" "}
+                          · <kbd>Tab</kbd> or <kbd>→</kbd> takes the suggestion
+                        </span>
+                      )}
                       {assistance.stats && (
                         <small
                           title={`${assistance.stats.calls} calls · ${assistance.stats.failures} failed`}

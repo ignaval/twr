@@ -48,6 +48,40 @@ export function settledSummary(
   };
 }
 
+/** How long a suggestion is on screen before a key takes it (the TUI's `SUGGEST_SETTLE`):
+ * a key pressed as it appears was meant for what was there. */
+export const SUGGEST_SETTLE_MS = 300;
+
+/** Whether a key press in the composer takes the suggestion shown as its placeholder:
+ * `Tab` or `→`, as in the TUI, only while the box is empty, with no modifier, not while
+ * an input method composes, and only once it has been shown for `SUGGEST_SETTLE_MS`.
+ * Typing anything else types over it. */
+export function takesSuggestion(
+  key: {
+    key: string;
+    shiftKey?: boolean;
+    ctrlKey?: boolean;
+    altKey?: boolean;
+    metaKey?: boolean;
+    isComposing?: boolean;
+  },
+  draft: string,
+  suggestion: string,
+  shownForMs: number,
+): boolean {
+  return (
+    !!suggestion &&
+    shownForMs >= SUGGEST_SETTLE_MS &&
+    !draft &&
+    !key.isComposing &&
+    !key.shiftKey &&
+    !key.ctrlKey &&
+    !key.altKey &&
+    !key.metaKey &&
+    (key.key === "Tab" || key.key === "ArrowRight")
+  );
+}
+
 /** The hub owns the models, eligibility, cache, rate limits and billing statistics.
  * This hook schedules visible presentation work and discards replies after a switch. */
 export function useAssistance({
@@ -78,6 +112,11 @@ export function useAssistance({
     () => localStorage.getItem("twr.assistance.notice") || "",
   );
   const [suggestion, setSuggestion] = useState("");
+  const suggestionShownAt = useRef(0);
+  useEffect(() => {
+    // After the render that put it on screen.
+    suggestionShownAt.current = performance.now();
+  }, [suggestion]);
   const [summaries, setSummaries] = useState<Summary[]>([]);
   const [notice, setNotice] = useState("");
   const [stats, setStats] = useState<Json>();
@@ -202,7 +241,6 @@ export function useAssistance({
         .then((answer) => {
           if (!live || current.current !== scope) return;
           setSuggestion(answer.suggestion || "");
-          setStats({ ...answer.stats, source: "Suggestions" });
           if (answer.reason?.startsWith("retry:")) {
             // The hub intentionally tries only one runtime per ask. Its next ask may
             // use the other runtime; never reset the hub's unavailable-runtime cache.
@@ -333,6 +371,10 @@ export function useAssistance({
     notice,
     runs,
     needsDisclosure: !!enabled && !disclosed,
+    /** How long the current suggestion has been on screen, in milliseconds. */
+    suggestionShownFor() {
+      return performance.now() - suggestionShownAt.current;
+    },
     acknowledge() {
       localStorage.setItem("twr.assistance.notice", disclosureKey);
       setAcknowledged(disclosureKey);
@@ -375,10 +417,9 @@ export function AssistanceNotice({
         (3 KB), never attention requests or your messages. They use{" "}
         {settings?.suggest_model?.["claude-code"]} through Claude Code
         (Anthropic) or {settings?.suggest_model?.codex} through Codex (OpenAI),
-        with your login. Each call is about $0.0002 at list price and counts
-        toward your plan. Summaries run at most once per{" "}
-        {Math.round((settings?.summary_every_secs || 300) / 60)} minutes per
-        thread. You can turn either off in Settings.
+        with your login, and count toward your plan’s usage. Summaries run at
+        most once per {Math.round((settings?.summary_every_secs || 300) / 60)}{" "}
+        minutes per thread. You can turn either off in Settings.
       </p>
       <button onClick={acknowledge}>Continue with configured features</button>
       <button onClick={disable}>Turn both off</button>
