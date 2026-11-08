@@ -11,6 +11,7 @@ import { AttachmentManager } from "./AttachmentManager";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
+import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
 import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
@@ -72,6 +73,7 @@ import {
   EyeOff,
   Filter,
   AlertCircle,
+  FolderPlus,
 } from "lucide-react";
 import {
   commands as applicationCommands,
@@ -270,6 +272,24 @@ export default function App({
   const [hovering, setHovering] = useState(false);
   const [focus, setFocus] = useState(false);
   const [parked, setParked] = useState(false);
+  const [collapsed, setCollapsed] = useState<string[]>(() => {
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem("twr.sidebar.collapsed") || "[]",
+      );
+      return Array.isArray(saved)
+        ? saved.filter((v): v is string => typeof v === "string").slice(0, 256)
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const pendingOpen = useRef<{
+    workspace: string;
+    thread?: string;
+    talk: boolean;
+    then?: () => void;
+  }>(undefined);
   const [pins, setPins] = useState<string[]>(() =>
     JSON.parse(localStorage.getItem("twr.pins") || "[]"),
   );
@@ -579,37 +599,57 @@ export default function App({
     setWorkspaces(Array.isArray(parsed) ? parsed : parsed.workspaces || []);
   }, []);
   const inboxGeneration = useRef(0);
-  const refreshInboxSources = useCallback(async () => {
-    if (!hostApi.inboxSources) return;
-    const generation = ++inboxGeneration.current;
-    setInboxRefreshing(true);
-    try {
-      const sources = await hostApi.inboxSources();
-      if (generation === inboxGeneration.current)
-        setInboxSources(
-          sources.map((source) => ({
-            ...source,
-            updatedAt:
-              source.updatedAt ||
-              (!source.cached && !source.error && source.running !== false
-                ? Date.now()
-                : undefined),
-          })),
-        );
-    } catch (error) {
-      if (generation === inboxGeneration.current) {
-        setInboxSources((old) =>
-          old.map((source) => ({ ...source, cached: true })),
-        );
-        fail(error);
+  // `quiet`: the sidebar's background reads, which neither show progress nor report errors.
+  const refreshInboxSources = useCallback(
+    async (quiet = false) => {
+      if (!hostApi.inboxSources) return;
+      const generation = ++inboxGeneration.current;
+      if (!quiet) setInboxRefreshing(true);
+      try {
+        const sources = await hostApi.inboxSources();
+        if (generation === inboxGeneration.current)
+          setInboxSources(
+            sources.map((source) => ({
+              ...source,
+              updatedAt:
+                source.updatedAt ||
+                (!source.cached && !source.error && source.running !== false
+                  ? Date.now()
+                  : undefined),
+            })),
+          );
+      } catch (error) {
+        if (generation === inboxGeneration.current) {
+          setInboxSources((old) =>
+            old.map((source) => ({ ...source, cached: true })),
+          );
+          if (!quiet) fail(error);
+        }
+      } finally {
+        if (generation === inboxGeneration.current) setInboxRefreshing(false);
       }
-    } finally {
-      if (generation === inboxGeneration.current) setInboxRefreshing(false);
-    }
-  }, [hostApi, fail]);
+    },
+    [hostApi, fail],
+  );
   useEffect(() => {
     if (section === "attention" && connected) void refreshInboxSources();
   }, [section, connected, workspace, refreshInboxSources]);
+  // The sidebar lists every workspace's threads, as the TUI's does: while it shows, the other
+  // workspaces are re-read now and then over short-lived read-only connections.
+  const sidebarReads = sidebar && connected && workspaces.length > 1;
+  useEffect(() => {
+    if (!sidebarReads) return;
+    const read = () => {
+      if (document.visibilityState !== "hidden") void refreshInboxSources(true);
+    };
+    read();
+    const timer = setInterval(read, WORKSPACE_REFRESH_MS);
+    document.addEventListener("visibilitychange", read);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", read);
+    };
+  }, [sidebarReads, workspace, refreshInboxSources]);
   const openTerminal = useCallback(
     async (
       request: Parameters<typeof hostApi.terminalOpen>[0],
@@ -1867,6 +1907,80 @@ export default function App({
   );
   const attentionFor = (id: string) =>
     view.attention.filter((a) => a.thread === id);
+  // While a workspace connects, its entry keeps the rows it had (a double-click's second
+  // click lands on the row the first one chose).
+  const entries = workspaceEntries(
+    workspaces,
+    workspace,
+    hostId,
+    inboxSources,
+    connecting
+      ? undefined
+      : { threads: view.threads, attention: view.attention },
+  );
+  const toggleCollapsed = (name: string) =>
+    setCollapsed((old) => {
+      const next = old.includes(name)
+        ? old.filter((n) => n !== name)
+        : [...old, name];
+      try {
+        localStorage.setItem("twr.sidebar.collapsed", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  /**
+   * Opens a workspace's orchestrator (no `thread`) or one of its threads from the sidebar,
+   * switching to the workspace first when it is another one. `talk` makes the thread the
+   * message destination (a double-click); otherwise it is selected, opening its inspector.
+   * Clicks while the switch connects update the pending request instead of switching again.
+   * `then` runs once it is open (a new thread's form, the grid).
+   */
+  const openIn = (
+    name: string,
+    thread?: string,
+    talk = false,
+    then?: () => void,
+  ) => {
+    const show = (
+      id: string | undefined,
+      toThread: boolean,
+      after?: () => void,
+    ) => {
+      setSection("chat");
+      if (!id) {
+        setDestination(undefined);
+        setSelected(undefined);
+      } else if (toThread) {
+        setDestination(id);
+        setSelected(undefined);
+      } else setSelected(id);
+      after?.();
+    };
+    // `connect` names the new workspace at once: until it finishes, clicks there update
+    // what opens once it has.
+    const pending = pendingOpen.current;
+    if (pending?.workspace === name) {
+      pendingOpen.current = {
+        workspace: name,
+        thread,
+        talk: pending.thread === thread ? pending.talk || talk : talk,
+        then,
+      };
+      return;
+    }
+    if (name === workspace) return show(thread, talk, then);
+    pendingOpen.current = { workspace: name, thread, talk, then };
+    const switched = connect(name);
+    // A later switch (here, the workspaces dialog, `/ws`) supersedes this one.
+    const generation = connectGeneration.current;
+    void switched.then(() => {
+      const wanted = pendingOpen.current;
+      if (wanted?.workspace !== name) return;
+      pendingOpen.current = undefined;
+      if (generation === connectGeneration.current)
+        show(wanted.thread, wanted.talk, wanted.then);
+    });
+  };
   const respond = async (item: Attention, answer: string, message?: string) => {
     if (!connected || !liveView.current || !permitted("operate")) return;
     try {
@@ -1982,7 +2096,7 @@ export default function App({
           if (
             window.innerWidth <= 800 &&
             (event.target as HTMLElement).closest(
-              ".primary-nav button,.thread-card,.sidebar-secondary button,.sidebar-footer button",
+              ".primary-nav button,.thread-card,.workspace-orchestrator,.workspace-thread,.sidebar-secondary button,.sidebar-footer button",
             )
           )
             setSidebar(false);
@@ -2005,55 +2119,7 @@ export default function App({
             <PanelLeftClose size={16} />
           </button>
         </div>
-        <div className="workspace-picker">
-          <label htmlFor="workspace-select">Workspace</label>
-          <div>
-            <select
-              id="workspace-select"
-              value={workspace}
-              disabled={connecting}
-              onChange={(e) => void connect(e.target.value)}
-            >
-              {[
-                ...new Set([
-                  workspace,
-                  ...workspaces.map((w) =>
-                    typeof w === "string" ? w : w.name,
-                  ),
-                ]),
-              ]
-                .filter(Boolean)
-                .map((w) => (
-                  <option key={w} value={w}>
-                    {w}
-                  </option>
-                ))}
-            </select>
-            <button
-              className="icon-button"
-              aria-label="Manage workspaces"
-              title="Manage workspaces"
-              aria-haspopup="dialog"
-              onClick={() => setWorkspaceModal(true)}
-            >
-              <Plus size={16} />
-            </button>
-          </div>
-        </div>
         <nav className="primary-nav" aria-label="Primary">
-          <button
-            className={section === "chat" && !destination ? "active" : ""}
-            aria-current={
-              section === "chat" && !destination ? "page" : undefined
-            }
-            onClick={() => {
-              setSection("chat");
-              setDestination(undefined);
-            }}
-          >
-            <MessageSquare size={17} />
-            Orchestrator
-          </button>
           <button
             className={section === "attention" ? "active" : ""}
             aria-current={section === "attention" ? "page" : undefined}
@@ -2080,8 +2146,8 @@ export default function App({
           </button>
         </nav>
         <div className="threads-heading">
-          <span role="heading" aria-level={2} id="twr-threads-heading">
-            Threads
+          <span role="heading" aria-level={2} id="twr-workspaces-heading">
+            Workspaces
           </span>
           <div>
             <button
@@ -2095,58 +2161,219 @@ export default function App({
             </button>
             <button
               className="icon-button"
-              aria-label="New thread"
-              title="New thread"
-              disabled={!permitted("operate")}
-              onClick={() => action("new")}
+              aria-label="Manage workspaces"
+              title="New or remove workspaces"
+              aria-haspopup="dialog"
+              onClick={() => setWorkspaceModal(true)}
             >
-              <Plus size={16} />
+              <FolderPlus size={15} />
             </button>
           </div>
         </div>
         <div
-          className="thread-list"
-          role="list"
-          aria-labelledby="twr-threads-heading"
-          onMouseEnter={() => setHovering(true)}
-          onMouseLeave={() => setHovering(false)}
+          className="workspace-tree"
+          aria-labelledby="twr-workspaces-heading"
+          role="group"
         >
-          {visible.map((thread) => (
-            <ThreadCard
-              listItem
-              key={thread.id}
-              thread={thread}
-              items={attentionFor(thread.id)}
-              dived={destination === thread.id}
-              selected={selected === thread.id}
-              pinned={pins.includes(thread.id)}
-              onSelect={() => setSelected(thread.id)}
-              onOpen={() => {
-                setDestination(thread.id);
-                setSection("chat");
-                setSelected(undefined);
-              }}
-            />
-          ))}
-          {!visible.length && (
-            <p className="sidebar-empty" role="listitem">
-              {workers.length
-                ? "No threads match your filters."
-                : "Threads appear here as your agents start working."}
-            </p>
-          )}
-        </div>
-        {workers.some((t) => t.status === "parked") && (
+          {entries.map((entry) => {
+            const shut = collapsed.includes(entry.name);
+            const headingId = `twr-ws-${entry.name}`;
+            const status =
+              entry.running === false
+                ? "hub not running"
+                : [
+                    entry.waiting ? `${entry.waiting} waiting on you` : "",
+                    entry.working ? `${entry.working} working` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(", ") || (entry.stale ? "not refreshed" : "idle");
+            const talkingToOrchestrator =
+              entry.current && section === "chat" && !destination;
+            return (
+              <section
+                key={entry.name}
+                className={`workspace-entry ${entry.current ? "current" : ""} ${entry.running === false ? "stopped" : ""}`}
+                data-workspace={entry.name}
+                aria-labelledby={headingId}
+              >
+                <div className="workspace-entry-head">
+                  <button
+                    className="workspace-toggle"
+                    id={headingId}
+                    aria-expanded={!shut}
+                    aria-current={entry.current ? "true" : undefined}
+                    title={`${entry.name}: ${status}`}
+                    onClick={() => toggleCollapsed(entry.name)}
+                  >
+                    {shut ? (
+                      <ChevronRight size={14} aria-hidden="true" />
+                    ) : (
+                      <ChevronDown size={14} aria-hidden="true" />
+                    )}
+                    <span className="workspace-name">{entry.name}</span>
+                    <span className="visually-hidden">, {status}</span>
+                    <span className="workspace-badges" aria-hidden="true">
+                      {entry.running === false ? (
+                        <span className="workspace-stopped">○</span>
+                      ) : (
+                        <>
+                          {entry.waiting > 0 && (
+                            <span className="workspace-waiting">
+                              ⚠{entry.waiting}
+                            </span>
+                          )}
+                          {entry.working > 0 && (
+                            <span className="workspace-working">
+                              ●{entry.working}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </span>
+                  </button>
+                  <button
+                    className="icon-button"
+                    aria-label={
+                      entry.current
+                        ? "New thread"
+                        : `New thread in ${entry.name}`
+                    }
+                    title={`New thread in ${entry.name}`}
+                    disabled={!permitted("operate")}
+                    onClick={() =>
+                      openIn(entry.name, undefined, false, () =>
+                        actionRef.current("new"),
+                      )
+                    }
+                  >
+                    <Plus size={15} />
+                  </button>
+                </div>
+                {!shut && (
+                  <>
+                    <button
+                      className={`workspace-orchestrator ${talkingToOrchestrator ? "active" : ""}`}
+                      aria-current={talkingToOrchestrator ? "page" : undefined}
+                      onClick={() => openIn(entry.name)}
+                    >
+                      <MessageSquare size={15} />
+                      Orchestrator
+                    </button>
+                    {entry.current && !connecting ? (
+                      <>
+                        <div
+                          className="thread-list"
+                          role="list"
+                          aria-label={`Threads in ${entry.name}`}
+                          onMouseEnter={() => setHovering(true)}
+                          onMouseLeave={() => setHovering(false)}
+                        >
+                          {visible.map((thread) => (
+                            <ThreadCard
+                              listItem
+                              key={thread.id}
+                              thread={thread}
+                              items={attentionFor(thread.id)}
+                              dived={destination === thread.id}
+                              selected={selected === thread.id}
+                              pinned={pins.includes(thread.id)}
+                              onSelect={() => setSelected(thread.id)}
+                              onOpen={() => {
+                                setDestination(thread.id);
+                                setSection("chat");
+                                setSelected(undefined);
+                              }}
+                            />
+                          ))}
+                          {!visible.length && (
+                            <p className="sidebar-empty" role="listitem">
+                              {connecting
+                                ? "Connecting…"
+                                : workers.length
+                                  ? "No threads match your filters."
+                                  : "Threads appear here as your agents start working."}
+                            </p>
+                          )}
+                        </div>
+                        {workers.some((t) => t.status === "parked") && (
+                          <button
+                            className="parked-toggle"
+                            aria-pressed={parked}
+                            onClick={() => setParked((v) => !v)}
+                          >
+                            {parked
+                              ? "Hide parked"
+                              : `${workers.filter((t) => t.status === "parked").length} parked threads hidden`}
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <ul
+                        className="workspace-peek"
+                        aria-label={`Threads in ${entry.name}`}
+                      >
+                        {entry.threads.map((thread) => (
+                          <li key={thread.id}>
+                            <button
+                              className="workspace-thread"
+                              style={
+                                {
+                                  "--thread-color": thread.accent,
+                                } as CSSProperties
+                              }
+                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
+                              onClick={(event) =>
+                                openIn(entry.name, thread.id, event.detail > 1)
+                              }
+                            >
+                              {thread.accent && (
+                                <span
+                                  className="thread-color-dot"
+                                  aria-hidden="true"
+                                />
+                              )}
+                              <span className="workspace-thread-name">
+                                {thread.name}
+                              </span>
+                              <span className="visually-hidden">, </span>
+                              <span
+                                className={`thread-status status-${thread.status}`}
+                              >
+                                {thread.status_label || thread.status}
+                              </span>
+                            </button>
+                          </li>
+                        ))}
+                        {entry.more > 0 && (
+                          <li>
+                            <button
+                              className="workspace-thread workspace-more"
+                              onClick={() =>
+                                openIn(entry.name, undefined, false, () =>
+                                  setSection("grid"),
+                                )
+                              }
+                            >
+                              +{entry.more} more
+                            </button>
+                          </li>
+                        )}
+                      </ul>
+                    )}
+                  </>
+                )}
+              </section>
+            );
+          })}
           <button
-            className="parked-toggle"
-            aria-pressed={parked}
-            onClick={() => setParked((v) => !v)}
+            className="workspace-add"
+            aria-haspopup="dialog"
+            onClick={() => setWorkspaceModal(true)}
           >
-            {parked
-              ? "Hide parked"
-              : `${workers.filter((t) => t.status === "parked").length} parked threads hidden`}
+            <Plus size={14} />
+            New workspace
           </button>
-        )}
+        </div>
         <details className="sidebar-secondary manage-nav">
           <summary>Manage</summary>
           <nav aria-label="Manage">

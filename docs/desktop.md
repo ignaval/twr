@@ -27,6 +27,30 @@ The app recovers the login shell environment so that agents, git and developer t
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
 markers. A desktop app launched by a twr agent cannot turn itself into a user client.
 
+## Sidebar
+
+The sidebar lists every workspace of the hub, as the TUI's does: `default` first, each with
+`⚠` (requests waiting on you) and `●` (threads at work) counts, or `○` when its hub isn't
+running. Under each workspace are its **Orchestrator** and its threads. The current
+workspace shows its full thread cards (with the focus filter and parked toggle). Other
+workspaces list up to six threads that aren't parked, as their hub last reported them:
+those waiting on you first, then failed, then working, the last row `+N more` when there
+are more. While the sidebar shows, the app re-reads the other workspaces every 15 seconds
+over short-lived read-only connections; it never starts a stopped hub to read it.
+
+Choosing an orchestrator or a thread in another workspace switches to that workspace and
+opens it there, with no separate switch. A click selects a thread (its inspector), a
+double-click talks to it, and `+N more` opens that workspace's grid. Each workspace's
+`+` starts a new thread in it. Its name collapses or expands it, and the app remembers
+that on this device. **New workspace** at the end of the list, and the folder button
+beside the heading, create or remove workspaces. Needs you and the thread grid stay at
+the top.
+
+Drag the sidebar's right edge to resize it (200 to 440 px, default 260, and at most
+about a third of the window). Double-click the edge to reset it. With the edge focused,
+Left/Right change it by 10 px and Home/End jump to the limits. The width is saved with
+the other layout settings (Settings › Layout & text) and restored on the next launch.
+
 ## Workflows and CLI coverage
 
 The orchestrator conversation is primary. Selecting a thread opens its inspector; **Talk
@@ -54,7 +78,7 @@ control position, matching the TUI's relay semantics.
 | Next-message suggestions, routine summaries | Shared hub small-model calls, first-use disclosure, Tab to accept, expandable routine updates |
 | Context and memory | Revision-aware editors, note cards and standing-context editor |
 | Speech, remote sessions, speaker controls | Read-aloud page and embedded CLI forms |
-| Workspaces | Workspace selector, creation and removal forms |
+| Workspaces | Sidebar workspace tree (every workspace, its threads nested), creation and removal forms |
 | Trash list/restore/purge | Trash table and preview-first purge form |
 | Log statistics/archive/checkpoints, info, events/control | Hub & storage, diagnostics and generated CLI forms |
 | Runner provisioning and terminal setup | Advanced CLI forms; runner commands do not receive workspace flags |
@@ -291,7 +315,7 @@ the hub, so it requires a connection to that workspace.
 
 ## Layout and offline recovery
 
-Settings → Layout & text offers Compact and Comfortable density, independent interface and code text sizes, and sidebar/inspector width sliders. Drag the pane's header edge or focus its separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
+Settings → Layout & text offers Compact and Comfortable density, independent interface and code text sizes, and sidebar/inspector width sliders. Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
 
 Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings. Configuration/editor drafts stay in memory because they may contain credentials.
 

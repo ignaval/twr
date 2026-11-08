@@ -397,41 +397,11 @@ kbd {
   margin-left: auto;
   margin-right: 0;
 }
-.workspace-picker {
-  padding: 12px;
-}
-.workspace-picker > label {
-  font-size: 0.923077rem;
-  letter-spacing: 0;
-  color: var(--faint);
-  font-weight: 600;
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
-}
-.workspace-picker > div {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 0;
-}
-.workspace-picker select {
-  padding: 6px 8px;
-  background: transparent;
-  font-weight: 500;
-  font-size: 1rem;
-}
 .primary-nav {
   display: flex;
   flex-direction: column;
   border-bottom: 1px solid var(--border);
-  padding: 0 8px 12px;
+  padding: 12px 8px;
   gap: 2px;
 }
 .primary-nav > button,
@@ -491,12 +461,132 @@ kbd {
   display: flex;
   gap: 2px;
 }
-.thread-list {
+/* Every workspace, its threads nested under it (as in the TUI's sidebar); the tree scrolls. */
+.workspace-tree {
   overflow: auto;
   flex: 1;
   scrollbar-width: thin;
-  padding: 0 8px 8px;
+  padding: 0 4px 8px 8px;
+  /* Its scrollbar stays clear of the resize edge. */
+  margin-right: 6px;
   min-height: 48px;
+}
+.workspace-entry {
+  margin-bottom: 6px;
+}
+.workspace-entry-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.workspace-toggle,
+.workspace-orchestrator,
+.workspace-thread,
+.workspace-add {
+  border: 0;
+  background: none;
+  justify-content: flex-start;
+  text-align: left;
+}
+.workspace-toggle {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.workspace-toggle:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.workspace-entry.current .workspace-toggle {
+  color: var(--text);
+}
+.workspace-entry.stopped .workspace-toggle {
+  color: var(--faint);
+}
+.workspace-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.workspace-badges {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 0.846154rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.workspace-waiting {
+  color: var(--warning);
+}
+.workspace-working {
+  color: var(--accent);
+}
+.workspace-orchestrator,
+.workspace-thread,
+.workspace-add {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  gap: 8px;
+  padding: 4px 8px 4px 26px;
+  min-height: 28px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.workspace-orchestrator:hover,
+.workspace-thread:hover,
+.workspace-add:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.workspace-orchestrator.active,
+.workspace-orchestrator.active:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.workspace-entry .thread-list {
+  padding-left: 18px;
+  border-left: 1px solid var(--border);
+  margin-left: 12px;
+}
+.workspace-entry.current .thread-list {
+  border-left-color: var(--accent-soft);
+}
+.workspace-peek {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.workspace-thread-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  color: var(--text);
+}
+.workspace-thread > .thread-status {
+  margin-left: auto;
+  font-size: 0.846154rem;
+}
+.workspace-more {
+  color: var(--faint);
+}
+.workspace-add {
+  padding-left: 8px;
+  color: var(--faint);
+}
+.thread-list {
+  min-height: 0;
 }
 .thread-card {
   display: flex;
@@ -2849,7 +2939,7 @@ meter::-webkit-meter-optimum-value {
   .sidebar {
     overflow-y: auto;
   }
-  .thread-list {
+  .workspace-tree {
     flex: none;
     overflow: visible;
   }
@@ -2896,9 +2986,21 @@ meter::-webkit-meter-optimum-value {
   cursor: col-resize;
   touch-action: none;
   z-index: 5;
+  /* Over the title bar's drag region, the handle must still take the pointer. */
+  -webkit-app-region: no-drag;
 }
+/* The sidebar's whole right edge resizes it. */
 .pane-resize-sidebar {
   right: 0;
+  bottom: 0;
+  height: auto;
+  width: 6px;
+}
+.pane-resize-sidebar:hover,
+.pane-resize-sidebar:focus-visible {
+  background: var(--accent);
+  outline: 0;
+  opacity: 0.6;
 }
 .pane-resize-inspector {
   left: 0;

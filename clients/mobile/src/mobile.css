@@ -712,7 +712,7 @@ select {
 :root[data-mobile="true"].tiny-content .sidebar {
   overflow-y: auto;
 }
-:root[data-mobile="true"].tiny-content .thread-list {
+:root[data-mobile="true"].tiny-content .workspace-tree {
   flex: none;
   overflow: visible;
 }

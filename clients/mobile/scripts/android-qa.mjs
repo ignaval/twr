@@ -849,7 +849,9 @@ try {
     await foldDialog("horizontal");
     await page.evaluate(() => {
       const chat = [
-        ...document.querySelectorAll(".mobile-tabs button,.primary-nav button"),
+        ...document.querySelectorAll(
+          ".mobile-tabs button,.workspace-entry.current .workspace-orchestrator",
+        ),
       ].find(
         (e) =>
           e.getClientRects().length &&

@@ -49,16 +49,16 @@ pub const POPUP_ROWS: usize = 8;
 /// Shown when the hub has no worker threads.
 pub const EMPTY_STATE: &str = "no worker threads — /new <project>, or ask the orchestrator";
 
-/// Width of the sidebar's column of cards at terminal width `width`: three tenths of it, 34 to
-/// 48 columns, from [`SIDE_MIN_WIDTH`]; narrower, two fifths, 24 to 34, so the conversation
-/// keeps the rest.
+/// Width of the sidebar's column of cards at terminal width `width`: 28% of it, 32 to 44
+/// columns, from [`SIDE_MIN_WIDTH`]; narrower, 36%, 24 to 32, so the conversation keeps the
+/// rest.
 pub fn side_width(width: u16) -> u16 {
     let side = if width >= SIDE_MIN_WIDTH {
-        (u32::from(width) * 3 / 10).clamp(34, 48)
+        (u32::from(width) * 7 / 25).clamp(32, 44)
     } else {
-        (u32::from(width) * 2 / 5).clamp(24, 34)
+        (u32::from(width) * 9 / 25).clamp(24, 32)
     };
-    u16::try_from(side).unwrap_or(48)
+    u16::try_from(side).unwrap_or(44)
 }
 
 /// Draws the current view (stack, grid or decisions), the orchestrator picker, the help or
@@ -10679,7 +10679,7 @@ mod tests {
     fn three_threads_permission_is_first_with_card_text() {
         let mut st = three_threads();
         st.set_focus(Some("t-alpha".into()));
-        let lines = draw_panes(&mut st, 120, 40);
+        let lines = draw_panes(&mut st, 130, 40);
         let at = |id: &str| st.view.panes.get(&card(id)).unwrap().area;
         let (beta, alpha, gamma) = (at("t-beta"), at("t-alpha"), at("t-gamma"));
         assert!(beta.y < alpha.y && alpha.y < gamma.y, "{}", screen(&lines));
@@ -10696,7 +10696,7 @@ mod tests {
 
         let beta_card = pane_text(&st, &lines, &card("t-beta"));
         assert!(beta_card.contains("│waiting "), "{beta_card}");
-        // The title: the name, the model (the side column at 120 has no room for the project
+        // The title: the name, the model (the side column at 130 has no room for the project
         // and the runtime), the mode at the top right; none of it on a row of its own.
         assert!(
             beta_card.starts_with("┌ beta ──── default model ─ manual ┐"),
@@ -10731,7 +10731,7 @@ mod tests {
         assert!(alpha_card.starts_with('┏'), "{alpha_card}");
         let s = screen(&lines);
         assert!(
-            view_part(&st, 120, &lines[0])
+            view_part(&st, 130, &lines[0])
                 .starts_with(" ORCHESTRATOR  starts with your first message "),
             "{s}"
         );
@@ -11614,8 +11614,12 @@ mod tests {
         let lines = draw(&st, 60, 24);
         assert!(screen(&lines).contains(" gamma "), "{}", screen(&lines));
         assert_eq!(side_width(60), 24);
-        assert_eq!(side_width(99), 34);
-        assert_eq!(side_width(100), 34);
+        assert_eq!(side_width(80), 28);
+        assert_eq!(side_width(99), 32);
+        assert_eq!(side_width(100), 32);
+        assert_eq!(side_width(120), 33);
+        assert_eq!(side_width(160), 44);
+        assert_eq!(side_width(300), 44);
     }
 
     /// The side column shows the cards that fit, keeping the selected one in view, with
@@ -11636,7 +11640,7 @@ mod tests {
         assert!(!s.contains(" more┐") && !s.contains("↑ 3"), "{s}");
         st.set_focus(Some("t-eps".into()));
         let s = screen(&draw_panes(&mut st, 160, 12));
-        assert!(s.contains("┏ proj · eps "), "{s}");
+        assert!(s.contains("┏ eps "), "{s}");
         assert!(s.contains("↑ 3 more"), "{s}");
     }
 
@@ -12471,7 +12475,7 @@ mod tests {
     /// report, cut to the rows the card has. Never the activity next to a report of an
     /// earlier turn, never a report of an earlier turn while it works, never a `report:` label
     /// or a `›`. Who runs it is in the title. In the column
-    /// (34, 40 and 48 columns), the narrower one beside a narrow conversation (24 and 34), the
+    /// (32, 37 and 44 columns), the narrower one beside a narrow conversation (24 and 32), the
     /// grid, and the compact layout's Threads screen (40 columns).
     #[test]
     fn a_card_shows_one_section_for_each_state() {
@@ -12544,7 +12548,7 @@ mod tests {
             let lines = draw_panes(&mut st, w, 80);
             assert_eq!(
                 side_width(w) - 2,
-                [32, 38, 46][[100, 134, 160].iter().position(|x| *x == w).unwrap()]
+                [30, 35, 42][[100, 134, 160].iter().position(|x| *x == w).unwrap()]
             );
             for (name, ..) in &expect {
                 let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
@@ -12707,7 +12711,7 @@ mod tests {
             let lines = draw_panes(&mut st, w, 40);
             let text = pane_text(&st, &lines, &card("t-long"));
             assert!(text.contains("running the invoice"), "{w}:\n{text}");
-            let git: Vec<&str> = text.lines().filter(|l| l.contains("a-very-long")).collect();
+            let git: Vec<&str> = text.lines().filter(|l| l.contains("a-very-lon")).collect();
             assert_eq!(git.len(), 1, "{w}:\n{text}");
             // The branch is cut, not what it says after it; the card's last row.
             assert!(git[0].contains("… · changes made"), "{w}:\n{text}");
@@ -13774,7 +13778,7 @@ mod tests {
     /// · 2 behind`, the short form `+3/−2 vs dev` where that does not fit (then the branch cut
     /// or left out),
     /// nothing when it is even with its base or that is not known (a branch with no upstream
-    /// shows no `0`s either). In the column (34 and 48 columns), the narrower one beside a
+    /// shows no `0`s either). In the column (32 and 44 columns), the narrower one beside a
     /// narrow conversation (32 columns), the grid and the compact layout's Threads screen at
     /// 40x20.
     #[test]
@@ -13810,7 +13814,7 @@ mod tests {
                 false,
                 "twr/api · changes made · +3/−2 vs dev",
             ),
-            (80, 40, false, false, "changes made · +3/−2 vs dev"),
+            (89, 40, false, false, "changes made · +3/−2 vs dev"),
             (90, 40, true, false, "changes made · +3/−2 vs dev · 1 turn"),
             (40, 20, false, true, "twr/api · changes made · +3/−2 vs dev"),
         ];
@@ -14516,9 +14520,9 @@ mod tests {
         st.back();
         st.set_focus(Some("t-ops".into()));
 
-        // Narrow: a 30-column card (the sidebar beside a narrow conversation, 75 columns);
+        // Narrow: a 30-column card (the sidebar beside a narrow conversation, 84 columns);
         // its title drops the project and the runtime, keeps the model and the mode.
-        let lines = draw_panes(&mut st, 75, 24);
+        let lines = draw_panes(&mut st, 84, 24);
         let c = pane_text(&st, &lines, &card("t-ops"));
         let rows: Vec<&str> = c.lines().collect();
         assert_eq!(
@@ -14692,12 +14696,13 @@ mod tests {
         let mut heights = None;
         for (gpu, word) in box_cases() {
             let mut st = box_threads(gpu);
-            // Stack cards, wide: who runs it in the title.
+            // Stack cards, wide: who runs it in the title, the token first (on a 44-column
+            // card the model gives way to a long one).
             let title = |text: &str| text.lines().next().unwrap_or_default().to_string();
             let lines = draw_panes(&mut st, 160, 40);
             let c = pane_text(&st, &lines, &card("t-job"));
             assert!(has_token(&title(&c), "gpu", word), "{c}");
-            assert!(title(&c).contains("gpt"), "{c}");
+
             assert!(c.contains("idle · not started"), "{c}");
             let l = pane_text(&st, &lines, &card("t-loc"));
             assert!(title(&l).contains("claude-code · sonnet"), "{l}");
@@ -14909,7 +14914,8 @@ mod tests {
                 .to_string()
         };
         let c = title(&mut st);
-        assert!(c.contains("@gpu offline · gpt-5-codex"), "{c}");
+        // (The 44-column card cuts the model, never the token.)
+        assert!(c.contains("@gpu offline · gpt-5-cod…"), "{c}");
         let up = hub.event(EventBody::RunnerConnected(runner));
         control(&mut st, &[up]);
         let c = title(&mut st);
@@ -15145,17 +15151,18 @@ mod tests {
         use crate::accounts::tests::list;
         let mut st = account_threads(Some(list(true)));
         let lines = draw_panes(&mut st, 160, 40);
-        // (`ops`'s title has no room for its runtime beside its account and model.)
+        // (The claude-code titles have no room for the runtime beside the account and model
+        // on a 44-column card.)
         for (id, want) in [
             ("t-ops", "personal · opus-4-1"),
-            ("t-job", "claude-code:work · opus-4-1"),
+            ("t-job", "work · opus-4-1"),
             ("t-api", "codex · gpt-5-codex"),
-            ("t-web", "claude-code:personal · sonnet"),
+            ("t-web", "personal · sonnet"),
             ("t-sh", "pty · default model"),
         ] {
             let title = card_title(&st, &lines, id);
             assert!(title.contains(&format!(" {want} ")), "{title}");
-            if id == "t-ops" {
+            if ["t-ops", "t-job", "t-web"].contains(&id) {
                 assert!(!title.contains("claude-code"), "{title}");
             }
         }
@@ -15165,9 +15172,9 @@ mod tests {
             "{s}"
         );
         // Narrow cards: the account without the runtime, then without the model. (40
-        // columns in the sidebar at 134, 30 beside a narrow conversation at 75.)
+        // columns in the sidebar at 143, 30 beside a narrow conversation at 84.)
         st.set_focus(Some("t-job".into()));
-        let lines = draw_panes(&mut st, 134, 24);
+        let lines = draw_panes(&mut st, 143, 24);
         assert_eq!(
             card_title(&st, &lines, "t-job"),
             "┏ job ━━━━━━━ work · opus-4-1 ━ manual ┓",
@@ -15175,7 +15182,7 @@ mod tests {
             screen(&lines)
         );
         st.set_focus(Some("t-ops".into()));
-        let lines = draw_panes(&mut st, 75, 24);
+        let lines = draw_panes(&mut st, 84, 24);
         assert_eq!(
             card_title(&st, &lines, "t-ops"),
             "┏ ops ━━━━ personal ━ manual ┓",
@@ -15267,7 +15274,7 @@ mod tests {
         assert!(st.send_accounts(), "the event meanwhile asks again");
         st.apply_result("account.list", &list(true));
         assert!(!st.send_accounts());
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         assert!(title(&mut st, "t-ops").contains(" personal · opus-4-1 "));
         // An older hub's answer (null) keeps what was known; a failure keeps it too, and is
         // asked for again (`a_failed_account_list_is_asked_for_again_with_a_backoff`).
@@ -15275,7 +15282,7 @@ mod tests {
         crate::app::tests::control(&mut st, &[logout]);
         assert!(st.send_accounts());
         st.apply_result("account.list", &Value::Null);
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         st.accounts_due = true;
         assert!(st.send_accounts());
         st.apply_result("account.list", &list(false));
@@ -15335,14 +15342,14 @@ mod tests {
         assert_eq!(st.accounts_retry, None);
         // Answered: the labels are back, and nothing waits.
         st.accounts_answered(&list(true), secs(100));
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         assert_eq!((st.accounts_retry, st.accounts_failures), (None, 0));
         // A later failure keeps the labels and starts the backoff over (through
         // `apply_result`, as the calls' answers arrive).
         st.accounts_due = true;
         assert!(st.send_accounts());
         st.apply_result("account.list", &failed);
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         assert_eq!(st.accounts_failures, 1);
         let at = st.accounts_retry.expect("a retry");
         assert!(at <= std::time::Instant::now() + std::time::Duration::from_secs(5));
@@ -15854,7 +15861,8 @@ mod tests {
         st.set_focus(Some("t-web".into()));
         let lines = draw_panes(&mut st, 160, 40);
         let c = pane_text(&st, &lines, &card("t-web"));
-        assert!(c.contains("claude-code · sonnet · high"), "{c}");
+        // (The 44-column card leaves out the runtime, never the effort.)
+        assert!(c.contains(" sonnet · high "), "{c}");
         st.view.screen = Screen::Grid;
         let g = screen(&draw(&st, 180, 30));
         assert!(g.contains(" sonnet · high "), "{g}");
@@ -18959,7 +18967,7 @@ mod tests {
     }
 
     /// A finished thread's report takes the rows its title (who runs it is there now) and its
-    /// fixed height leave: 4 on a card in the column (32, 34 and 48 columns) and on the
+    /// fixed height leave: 4 on a card in the column (32 and 44 columns) and on the
     /// compact Threads screen at 40x20, 6 on a grid tile; its last row ends in `…`, the git
     /// line under it.
     #[test]
@@ -18993,7 +19001,7 @@ mod tests {
         for (w, h, grid, compact, rows) in [
             (100u16, 40u16, false, false, 4),
             (160, 40, false, false, 4),
-            (80, 40, false, false, 4),
+            (89, 40, false, false, 4),
             (40, 20, false, true, 4),
             (90, 40, true, false, 6),
         ] {

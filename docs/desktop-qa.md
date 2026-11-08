@@ -50,7 +50,7 @@ npm run test:qa:mac
 | Jobs | Launch, live output and cancellation |
 | Memory/context | Creation/editing, unsaved note retention across navigation, revision-aware saves |
 | Lifecycle | Rename, mode change, park/resume, hub-confirmed deletion, trash restoration |
-| Workspaces | Create/switch, preserved drafts, commands in an empty workspace, duplicate-submit protection |
+| Workspaces | Create, switch from the sidebar's workspace tree, preserved drafts, commands in an empty workspace, duplicate-submit protection |
 | Speech | A selected message reaches a real speaker process using a silent custom command engine |
 | CLI forms | Invalid-argument preflight keeps input, leading-dash values, subprocess arguments, remote workspace defaults |
 | Terminals | Native keyboard input, attach, login fixture, reload restoration, completed sessions do not consume active limit |

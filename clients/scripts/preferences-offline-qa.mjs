@@ -1053,8 +1053,7 @@ try {
       page.locator(".outbox-message").filter({ hasText: queuedText }),
     ).toContainText(queuedText);
     await page
-      .locator(".primary-nav")
-      .getByRole("button", { name: "Orchestrator", exact: true })
+      .locator(".workspace-entry.current .workspace-orchestrator")
       .click();
     await page.locator(".composer textarea").fill("yes");
     await page

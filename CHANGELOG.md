@@ -21,6 +21,9 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Changed
 
+- The desktop sidebar lists every workspace with its threads nested under it, as the TUI's does, instead of a workspace selector. Opening a thread or orchestrator in another workspace switches to it in one step; each workspace has its own Orchestrator and New thread entries. See [desktop.md](docs/desktop.md#sidebar).
+- The desktop sidebar resizes by dragging anywhere along its right edge (200–440 px, default 260, saved across restarts). The handle used to be a small strip at the top, inside the title bar's window-drag area.
+- The TUI's sidebar is a little narrower: its cards take 28% of the screen, 32 to 44 columns (were 30%, 34 to 48), and 36%, 24 to 32 below 100 columns (were 40%, 24 to 34). See [tui.md](docs/tui.md#workspaces).
 - Client protocol 2 requires updated CLI and native clients for resumable capacity retirement. Runner protocol 8 and its spool formats are inherited from the merged client baseline. The tested Rust compiler floor is 1.98.
 - Graphical clients and the TUI share command parsing, card ordering, configuration editing and routine-update handling. Hub RPC pooling, bounded message previews and executable hashing reduce startup allocation and streaming work. See [performance.md](docs/performance.md).
 
