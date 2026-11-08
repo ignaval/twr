@@ -16,6 +16,7 @@ const api: DesktopAPI = {
   setAppearance: (appearance) =>
     ipcRenderer.invoke("twr:set-appearance", appearance),
   voiceStatus: () => ipcRenderer.invoke("twr:voice-status"),
+  voiceSetup: () => ipcRenderer.invoke("twr:voice-setup"),
   voiceArm: (on) => ipcRenderer.invoke("twr:voice-arm", on),
   voiceTranscribe: (recording, hint) =>
     ipcRenderer.invoke("twr:voice-transcribe", recording, hint),

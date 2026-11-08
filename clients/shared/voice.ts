@@ -40,6 +40,8 @@ export interface VoiceCaptureStatus {
   local: boolean;
   engine?: string;
   problem?: string;
+  /** Only the speech model is missing, and the host can download it (`voiceSetup`). */
+  setup?: boolean;
 }
 
 export interface VoiceCapture {

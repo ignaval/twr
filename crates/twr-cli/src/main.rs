@@ -857,10 +857,13 @@ enum Cmd {
 enum VoiceCmd {
     /// Whether a recognizer is set up (`[voice]`), and how to set one up if not.
     Status {
-        /// One JSON object: `{available, engine, local, problem}`.
+        /// One JSON object: `{available, engine, local, problem, setup}`.
         #[arg(long)]
         json: bool,
     },
+    /// Download whisper.cpp's base.en model (148 MB) to `voice/ggml-base.en.bin` in twr's data
+    /// directory, the model `[voice] model` left empty means.
+    Setup,
     /// The text of one recording: a 16 kHz mono 16-bit WAV on stdin (at most two minutes),
     /// its text on stdout (empty when nothing was said).
     Transcribe {
@@ -7809,6 +7812,15 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
                 println!("voice: {}", s.problem.as_deref().unwrap_or("unavailable"));
             }
         }
+        VoiceCmd::Setup => {
+            voice_setup(&config.voice, &root.data_dir).await?;
+            let s = twr_voice::status(&config.voice, &root.data_dir, path.as_deref());
+            match (s.available, s.problem) {
+                (true, _) => println!("voice: ready"),
+                (false, Some(p)) => println!("voice: {p}"),
+                (false, None) => println!("voice: unavailable"),
+            }
+        }
         VoiceCmd::Transcribe { json, hint } => {
             let kind = twr_voice::resolve(&config.voice, &root.data_dir, path.as_deref())?;
             let mut recording = Vec::new();
@@ -7836,6 +7848,100 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] to the default model's place, through
+/// a private file beside it, renamed into place only once whole and a ggml model.
+async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_MAX_BYTES, MODEL_MIN_BYTES, MODEL_URL};
+    if !cfg.model.trim().is_empty() {
+        bail!(
+            "[voice] model names your own model ({}): `twr voice setup` only downloads the \
+             default one; leave [voice] model empty to use it",
+            cfg.model.trim()
+        );
+    }
+    let target = data_dir.join(DEFAULT_MODEL);
+    if std::fs::File::open(&target)
+        .and_then(|mut f| {
+            let mut head = [0u8; 4];
+            std::io::Read::read_exact(&mut f, &mut head).map(|_| head)
+        })
+        .is_ok_and(|head| is_model(&head))
+    {
+        eprintln!("twr: the model is already at {}", target.display());
+        return Ok(());
+    }
+    let dir = target.parent().context("the model's directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("setting up the HTTP client")?;
+    eprintln!("twr: downloading {MODEL_URL}");
+    let mut resp = client
+        .get(MODEL_URL)
+        .send()
+        .await
+        .with_context(|| format!("downloading {MODEL_URL}"))?;
+    if !resp.status().is_success() {
+        bail!("downloading {MODEL_URL} failed: HTTP {}", resp.status());
+    }
+    let total = resp.content_length().filter(|n| *n <= MODEL_MAX_BYTES);
+    let part = target.with_extension(format!("bin.part-{}", std::process::id()));
+    let download = async {
+        let mut file =
+            std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+        let mut got: u64 = 0;
+        let mut shown = 0;
+        let mut head = Vec::with_capacity(4);
+        let chunk_wait = std::time::Duration::from_secs(60);
+        while let Some(chunk) = tokio::time::timeout(chunk_wait, resp.chunk())
+            .await
+            .map_err(|_| anyhow!("the download stalled"))?
+            .context("downloading the model")?
+        {
+            if head.len() < 4 {
+                head.extend(chunk.iter().take(4 - head.len()));
+            }
+            got += chunk.len() as u64;
+            if got > MODEL_MAX_BYTES {
+                bail!("{MODEL_URL} is larger than a whisper model");
+            }
+            file.write_all(&chunk)
+                .with_context(|| format!("writing {}", part.display()))?;
+            if let Some(total) = total.filter(|t| *t > 0) {
+                let pct = got * 100 / total;
+                if pct >= shown + 10 {
+                    shown = pct - pct % 10;
+                    eprintln!("twr: {shown}%");
+                }
+            }
+        }
+        if got < MODEL_MIN_BYTES || !is_model(&head) || total.is_some_and(|t| t != got) {
+            bail!("{MODEL_URL} did not send a whole whisper model ({got} bytes)");
+        }
+        file.sync_all().context("writing the model")?;
+        std::fs::rename(&part, &target)
+            .with_context(|| format!("moving the model to {}", target.display()))?;
+        anyhow::Ok(())
+    };
+    // Stopped (Ctrl-C, or the desktop app giving up): the partial file goes too.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("handling SIGTERM")?;
+    let result = tokio::select! {
+        r = download => r,
+        _ = term.recv() => Err(anyhow!("download stopped")),
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("download stopped")),
+    };
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result?;
+    eprintln!("twr: the model is at {}", target.display());
     Ok(())
 }
 

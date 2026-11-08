@@ -62,7 +62,28 @@ pub struct Status {
     /// Why there is none, and how to set one up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    /// Whether `twr voice setup` sets it up: whisper.cpp is there and only the default model
+    /// is missing (the desktop app offers to download it).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub setup: bool,
 }
+
+/// The default model is not there yet: `twr voice setup` downloads it ([`MODEL_URL`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingModel(pub PathBuf);
+
+impl std::fmt::Display for MissingModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no speech model yet: `twr voice setup` downloads whisper's base.en ({MODEL_SIZE}) to \
+             {}, or name yours with [voice] model (docs/voice.md)",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for MissingModel {}
 
 /// The recognizer `cfg` names, with `data_dir` (twr's data directory: the default model) and
 /// `path` (`$PATH`). Fails, saying how to set one up, when there is none.
@@ -78,15 +99,19 @@ pub fn resolve(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> anyh
                 .ok_or_else(|| anyhow!("voice.whisper: {} not found", cfg.whisper))?
         };
         let model = if cfg.model.trim().is_empty() {
-            data_dir.join(DEFAULT_MODEL)
+            let model = data_dir.join(DEFAULT_MODEL);
+            if !model.is_file() {
+                return Err(MissingModel(model).into());
+            }
+            model
         } else {
             expand_home(cfg.model.trim())
         };
         if !model.is_file() {
             bail!(
-                "no whisper model at {}: {}",
-                model.display(),
-                model_hint(&model)
+                "no whisper model at {} ([voice] model): download one, or leave [voice] model \
+                 empty and run `twr voice setup` (docs/voice.md)",
+                model.display()
             );
         }
         Ok(Kind::Whisper {
@@ -121,11 +146,13 @@ pub fn status(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> Statu
             engine: Some(k.name().to_string()),
             local: k.local(),
             problem: None,
+            setup: false,
         },
         Err(e) => Status {
             available: false,
             engine: None,
             local: false,
+            setup: e.downcast_ref::<MissingModel>().is_some(),
             problem: Some(format!("{e:#}")),
         },
     }
@@ -136,15 +163,20 @@ const NO_WHISPER: &str = "no speech recognizer: install whisper.cpp (`brew insta
                           `whisper-cli` is on PATH, or set [voice] engine = \"command\" \
                           (docs/voice.md)";
 
-/// How to get the model at `model`.
-fn model_hint(model: &Path) -> String {
-    format!(
-        "download one (`mkdir -p {dir} && curl -L -o {file} \
-         https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin`) or name \
-         yours with [voice] model (docs/voice.md)",
-        dir = model.parent().unwrap_or(Path::new(".")).display(),
-        file = model.display(),
-    )
+/// Where `twr voice setup` downloads [`DEFAULT_MODEL`] from: whisper.cpp's own models.
+pub const MODEL_URL: &str =
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+/// Its size, as said to the user.
+pub const MODEL_SIZE: &str = "148 MB";
+/// Most bytes `twr voice setup` takes: base.en is 147,964,211.
+pub const MODEL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Fewest bytes of a model it keeps (an error page is not one).
+pub const MODEL_MIN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Whether `head`, a downloaded file's first bytes, starts a whisper.cpp model: ggml's magic,
+/// `0x67676d6c` little-endian.
+pub fn is_model(head: &[u8]) -> bool {
+    head.starts_with(&0x6767_6d6c_u32.to_le_bytes())
 }
 
 /// `~/x` as the home directory's `x`.
@@ -386,7 +418,9 @@ mod tests {
         let e = resolve(&cfg(), d.path(), Some(&path))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("no whisper model") && e.contains("curl"), "{e}");
+        assert!(e.contains("twr voice setup"), "{e}");
+        let s = status(&cfg(), d.path(), Some(&path));
+        assert!(!s.available && s.setup, "{s:?}");
         std::fs::create_dir_all(d.path().join("voice")).unwrap();
         std::fs::write(d.path().join(DEFAULT_MODEL), b"model").unwrap();
         let k = resolve(&cfg(), d.path(), Some(&path)).unwrap();
@@ -400,7 +434,33 @@ mod tests {
         );
         assert!(k.local());
         let s = status(&cfg(), d.path(), Some(&path));
-        assert!(s.available && s.local, "{s:?}");
+        assert!(s.available && s.local && !s.setup, "{s:?}");
+    }
+
+    #[test]
+    fn setup_is_offered_only_for_the_default_model() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = bin.as_os_str().to_owned();
+        // No whisper.cpp: a download would not help.
+        assert!(!status(&cfg(), d.path(), Some(&path)).setup);
+        script(&bin, "whisper-cli", "exit 0");
+        // A model of the user's that isn't there: theirs to fix.
+        let mut c = cfg();
+        c.model = d.path().join("mine.bin").to_string_lossy().into_owned();
+        let s = status(&c, d.path(), Some(&path));
+        assert!(!s.available && !s.setup, "{s:?}");
+        assert!(s.problem.unwrap().contains("mine.bin"));
+        let json = serde_json::to_value(status(&cfg(), d.path(), Some(&path))).unwrap();
+        assert_eq!(json["setup"], true, "{json}");
+    }
+
+    #[test]
+    fn a_model_starts_with_ggml_magic() {
+        assert!(is_model(b"lmgg\x00\x00"));
+        assert!(!is_model(b"<!DOCTYPE html>"));
+        assert!(!is_model(b"lm"));
     }
 
     #[test]

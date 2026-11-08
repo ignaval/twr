@@ -254,6 +254,52 @@ describe("desktop voice host", async () => {
     expect(run.code).toBe(0);
     expect(run.stdout.trim()).toBe("1234");
   });
+  it("downloads the speech model once with `twr voice setup`, then reports it ready", async () => {
+    const { DesktopVoice } = await import("../desktop/voice");
+    const { mkdtempSync, writeFileSync, chmodSync, readFileSync } =
+      await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(join(tmpdir(), "twr-voice-"));
+    const log = join(dir, "log");
+    const model = join(dir, "model");
+    const twr = join(dir, "twr");
+    // A stand-in `twr voice`: status says only the model is missing until setup made it.
+    writeFileSync(
+      twr,
+      `#!/bin/sh
+echo "$*" >> "${log}"
+if [ "$2" = setup ]; then sleep 0.2; touch "${model}"; exit 0; fi
+if [ -f "${model}" ]; then echo '{"available":true,"engine":"whisper","local":true}';
+else echo '{"available":false,"local":false,"problem":"no speech model yet","setup":true}'; fi
+`,
+    );
+    chmodSync(twr, 0o755);
+    const voice = new DesktopVoice(
+      () => twr,
+      () => process.env,
+      () => {},
+    );
+    expect(await voice.status()).toMatchObject({
+      available: false,
+      setup: true,
+    });
+    const [a, b] = await Promise.all([voice.setup(), voice.setup()]);
+    expect(a).toMatchObject({ available: true, setup: false });
+    expect(b).toMatchObject({ available: true });
+    const calls = readFileSync(log, "utf8").trim().split("\n");
+    expect(calls.filter((c) => c === "voice setup")).toHaveLength(1);
+  });
+  it("says why the download failed", async () => {
+    const { DesktopVoice } = await import("../desktop/voice");
+    const voice = new DesktopVoice(
+      () => "/bin/sh",
+      () => process.env,
+      () => {},
+    );
+    // `sh voice setup`: no such script, a nonzero exit with a line on stderr.
+    await expect(voice.setup()).rejects.toThrow(/voice/);
+  });
 });
 
 const tick = () => new Promise((r) => setTimeout(r, 0));

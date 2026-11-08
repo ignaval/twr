@@ -25,6 +25,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Fixed
 
+- Voice mode no longer asks you to paste a `mkdir`/`curl` command when the speech model is missing: `twr voice setup` downloads it, and the desktop app offers **Download model** in its place. See [voice.md](docs/voice.md#setting-up-recognition).
 - macOS CI review installers retain valid ad hoc signatures in pull-request builds; packaged verification rejects invalid signatures before upload.
 - Finished jobs release their slots immediately, even while a child process briefly retains an inherited file descriptor before exec.
 - Files attached in the orchestrator's conversation upload into its working directory (`orchestrator.cwd`) instead of failing with "Thread has no working directory".

@@ -62,13 +62,14 @@ on your machine:
 
 ```sh
 brew install whisper-cpp   # macOS; on Linux, whisper.cpp from your distribution or from source
-twr voice status           # names what is missing, with the command that downloads the model
+twr voice setup            # downloads the model whisper.cpp recognizes with (148 MB, once)
+twr voice status           # says `voice: whisper (on this machine)`, or what is still missing
 ```
 
-The model goes to `voice/ggml-base.en.bin` in twr's data directory, and `twr voice status`
-prints the `curl` command for it with the right path. Run it, then `twr voice status` again: it
-says `voice: whisper (on this machine)`. The app shows the same message when you turn voice on
-before recognition is set up. `base.en` is 148 MB and recognizes a
+`twr voice setup` puts whisper's `base.en` at `voice/ggml-base.en.bin` in twr's data directory,
+the model an empty `[voice] model` means. It downloads it from whisper.cpp's own models on
+Hugging Face over HTTPS, and keeps it only once it is whole. In the desktop app, turning voice on
+before the model is there offers **Download model**, which does the same. `base.en` recognizes a
 short message in well under a second on Apple silicon once loaded (the first one after a start
 takes a few seconds). For other languages use a multilingual model (`ggml-base.bin`) and set
 `language`. The names of your threads are passed to the recognizer as words to expect, so

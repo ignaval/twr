@@ -556,6 +556,7 @@ function register() {
   });
   voice = new DesktopVoice(() => binaries.twr, env, emit);
   handle("voice-status", () => voice!.status());
+  handle("voice-setup", () => voice!.setup());
   handle("voice-arm", async (on) => {
     microphoneArmed = z.boolean().parse(on);
     // Voice QA (scripts/voice-qa.mjs) plays a recording as the microphone in a development

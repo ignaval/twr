@@ -119,6 +119,8 @@ export interface DesktopAPI {
   ): Promise<import("./uploads").UploadCancelResult>;
   /** Voice mode (shared/voice.ts): desktop recognition through `twr voice`. */
   voiceStatus?(): Promise<import("./voice").VoiceCaptureStatus>;
+  /** Downloads the speech model (`twr voice setup`), when the status says it is `setup`. */
+  voiceSetup?(): Promise<import("./voice").VoiceCaptureStatus>;
   voiceArm?(on: boolean): Promise<void>;
   voiceTranscribe?(
     recording: Uint8Array,
