@@ -27,6 +27,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 - macOS CI review installers retain valid ad hoc signatures in pull-request builds; packaged verification rejects invalid signatures before upload.
 - Finished jobs release their slots immediately, even while a child process briefly retains an inherited file descriptor before exec.
+- Files attached in the orchestrator's conversation upload into its working directory (`orchestrator.cwd`) instead of failing with "Thread has no working directory".
 - Remote clients retain short bursts of live conversation events within byte and event-count limits, avoiding unnecessary resyncs during heavy tool output.
 
 ## [0.3.0] - 2026-10-30
