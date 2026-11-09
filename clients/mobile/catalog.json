@@ -3553,6 +3553,18 @@
     ]
   },
   {
+    "id": "cli:voice setup",
+    "title": "twr voice setup",
+    "description": "Download whisper.cpp's base.en model (148 MB) to `voice/ggml-base.en.bin` in twr's data directory, the model `[voice] model` left empty means",
+    "group": "CLI · voice",
+    "fields": [],
+    "cli": [
+      "voice",
+      "setup"
+    ],
+    "cliFields": []
+  },
+  {
     "id": "cli:voice status",
     "title": "twr voice status",
     "description": "Whether a recognizer is set up (`[voice]`), and how to set one up if not",
@@ -3562,7 +3574,7 @@
         "key": "json",
         "label": "json",
         "type": "boolean",
-        "description": "One JSON object: `{available, engine, local, problem}`",
+        "description": "One JSON object: `{available, engine, local, problem, setup}`",
         "advanced": true
       }
     ],
@@ -3712,7 +3724,7 @@
   {
     "id": "cli:ws rm",
     "title": "twr ws rm",
-    "description": "Remove a workspace's data: its log, orchestrator conversation and history. Refused while its hub runs, while it has threads (delete them first) or while its trash holds deleted threads (`twr -w <name> trash empty --all`). Branches stay in their repositories",
+    "description": "Remove a workspace's data for good: its log, orchestrator conversation and memory, and history. Refused while its hub runs, while it has threads (delete them first) or while its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and asks y/N on a terminal (without one, only with --yes). Branches stay in their repositories",
     "group": "CLI · ws",
     "fields": [
       {

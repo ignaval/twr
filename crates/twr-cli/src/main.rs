@@ -986,13 +986,17 @@ enum WsCmd {
         /// The workspace's name.
         name: String,
     },
-    /// Remove a workspace's data: its log, orchestrator conversation and history. Refused
-    /// while its hub runs, while it has threads (delete them first) or while its trash holds
-    /// deleted threads (`twr -w <name> trash empty --all`). Branches stay in their
+    /// Remove a workspace's data for good: its log, orchestrator conversation and memory, and
+    /// history. Refused while its hub runs, while it has threads (delete them first) or while
+    /// its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and
+    /// asks y/N on a terminal (without one, only with --yes). Branches stay in their
     /// repositories.
     Rm {
         /// The workspace's name.
         name: String,
+        /// Remove without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -7739,7 +7743,11 @@ async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
     match cmd {
         WsCmd::List { json } => ws_list(paths, json).await,
         WsCmd::New { name } => ws_new(paths, &name),
-        WsCmd::Rm { name } => ws_rm(paths, &name).await,
+        WsCmd::Rm { name, yes } => {
+            // As for `twr trash empty`: only a terminal can confirm, else --yes.
+            let mut ask = ask_on_stderr;
+            ws_rm(paths, &name, consent(yes, &mut ask)).await
+        }
     }
 }
 
@@ -8088,8 +8096,12 @@ fn create_workspace(root: &Paths, name: &str) -> anyhow::Result<Paths> {
 
 /// `twr ws rm`: removes a named workspace's data directory once nothing in it can be lost by
 /// accident: its hub is not running, it has no threads, and its trash is empty (a trash item's
-/// commits stay referenced in its repository until it is purged).
-async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
+/// commits stay referenced in its repository until it is purged), and `consent` allows it: what
+/// goes, the orchestrator's conversation and memory notes, the log and any worktree directories
+/// left behind ([`ws_rm_question`]), is listed and asked about on a terminal, else needs
+/// `--yes`. The workspace's lock is held from the checks through the removal, so no hub opens
+/// it while the question waits.
+async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Result<()> {
     if name == DEFAULT_WORKSPACE {
         bail!("the {DEFAULT_WORKSPACE} workspace cannot be removed");
     }
@@ -8111,7 +8123,7 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
         Some(lock) => lock,
         None => return Err(running()),
     };
-    let threads = ws_threads(&ws)?;
+    let (threads, conversation) = ws_threads(&ws)?;
     if !threads.is_empty() {
         bail!(
             "workspace {name} still has {} thread{} ({}): delete them first (`twr -w {name} \
@@ -8147,6 +8159,38 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
                 .count()
         })
         .unwrap_or(0);
+    let goes = WsRemoval {
+        conversation,
+        notes,
+        log_bytes: std::fs::read_dir(&ws.data_dir)
+            .with_context(|| format!("reading {}", ws.data_dir.display()))?
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("twr.db") || n.starts_with("archive.db")
+            })
+            .map(|e| tree_bytes(&e.path()))
+            .sum(),
+        worktrees: leftover_worktrees(&ws.worktrees_dir()),
+        worktree_bytes: tree_bytes(&ws.worktrees_dir()),
+        total_bytes: tree_bytes(&ws.data_dir),
+    };
+    match consent {
+        Consent::Yes => {}
+        Consent::Ask(ask) => {
+            let reply = ask(&ws_rm_question(name, &ws.data_dir, &goes))?;
+            if !matches!(reply.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                outln!("nothing removed");
+                return Ok(());
+            }
+        }
+        Consent::NoTerminal => bail!(
+            "not removing workspace {name} without confirmation (no terminal to ask on). {}Run \
+             `twr ws rm {name} --yes` to remove it",
+            ws_rm_listing(name, &ws.data_dir, &goes)
+        ),
+    }
     // Moved aside first (a name no workspace can have), so a half-removed directory is never
     // taken for the workspace.
     let doomed = ws
@@ -8207,21 +8251,139 @@ fn stop_workspace_lock(ws: &Paths) -> anyhow::Result<StopWorkspaceLock> {
 }
 
 /// The names of the worker threads in the stopped workspace's log (deleted ones are gone; the
-/// orchestrator does not count).
-fn ws_threads(ws: &Paths) -> anyhow::Result<Vec<String>> {
+/// orchestrator does not count), and the orchestrator threads' conversation: how many there
+/// are (one per runtime it ran on) and their turns in all.
+fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64))> {
     let db = ws.db_file();
     if !db.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), (0, 0)));
     }
     let store = twr_hub::store::Store::open(&db)?;
     let events = store.load_all()?;
     let registry = twr_core::reduce::Registry::from_events(&events);
-    Ok(registry
+    let (orchestrators, workers): (Vec<_>, Vec<_>) = registry
         .list()
         .into_iter()
-        .filter(|t| !t.is_orchestrator())
-        .map(|t| t.name.clone())
-        .collect())
+        .partition(|t| t.is_orchestrator());
+    Ok((
+        workers.into_iter().map(|t| t.name.clone()).collect(),
+        (
+            orchestrators.len(),
+            orchestrators.iter().map(|t| t.turns).sum(),
+        ),
+    ))
+}
+
+/// What `twr ws rm` removes with a workspace's data directory, for its question.
+#[derive(Debug, Default)]
+struct WsRemoval {
+    /// The orchestrator threads in its log and their turns ([`ws_threads`]).
+    conversation: (usize, u64),
+    /// The orchestrator's memory notes.
+    notes: usize,
+    /// `twr.db` and `archive.db` (with their journals).
+    log_bytes: u64,
+    /// Worktree directories still under its `worktrees/` ([`leftover_worktrees`]).
+    worktrees: Vec<String>,
+    worktree_bytes: u64,
+    /// The whole data directory.
+    total_bytes: u64,
+}
+
+/// The bytes of the files under `path` (or of `path`, a file), symlinks counted as themselves
+/// and never followed; what can't be read counts as nothing.
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|d| d.flatten().map(|e| tree_bytes(&e.path())).sum())
+        .unwrap_or(0)
+}
+
+/// The worktree directories left under a workspace's `worktrees/` (`<project>/<thread>`, as
+/// the hub makes them), when it has no threads: what a failed deletion or a crash left, files
+/// of which go with the workspace. Sorted.
+fn leftover_worktrees(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for project in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = project.path();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        for t in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+            found.push(format!(
+                "{}/{}",
+                project.file_name().to_string_lossy(),
+                t.file_name().to_string_lossy()
+            ));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One line per thing `twr ws rm` removes of workspace `name` (data directory `dir`).
+fn ws_rm_listing(name: &str, dir: &Path, goes: &WsRemoval) -> String {
+    let plural = |n: u64, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut out = format!("This removes workspace {name} for good:\n");
+    let (orchestrators, turns) = goes.conversation;
+    if orchestrators > 0 {
+        out.push_str(&format!(
+            "  its orchestrator's conversation ({}, {})\n",
+            plural(orchestrators as u64, "thread", "threads"),
+            plural(turns, "turn", "turns")
+        ));
+    }
+    if goes.notes > 0 {
+        out.push_str(&format!(
+            "  its orchestrator's {}\n",
+            plural(goes.notes as u64, "memory note", "memory notes")
+        ));
+    }
+    out.push_str(&format!(
+        "  its log ({})\n",
+        twr_core::git::human_bytes(goes.log_bytes)
+    ));
+    if !goes.worktrees.is_empty() {
+        let mut shown: Vec<String> = goes.worktrees.iter().take(5).cloned().collect();
+        if goes.worktrees.len() > 5 {
+            shown.push(format!("+{} more", goes.worktrees.len() - 5));
+        }
+        out.push_str(&format!(
+            "  {} left in its worktrees/ ({}, {}), files included\n",
+            plural(
+                goes.worktrees.len() as u64,
+                "worktree directory",
+                "worktree directories"
+            ),
+            shown.join(", "),
+            twr_core::git::human_bytes(goes.worktree_bytes)
+        ));
+    }
+    out.push_str(&format!(
+        "  everything else in {} ({} in all)\n",
+        dir.display(),
+        twr_core::git::human_bytes(goes.total_bytes)
+    ));
+    out
+}
+
+/// The question `twr ws rm` asks before removing workspace `name`.
+fn ws_rm_question(name: &str, dir: &Path, goes: &WsRemoval) -> String {
+    format!(
+        "{}Remove workspace {name}? This cannot be undone. [y/N] ",
+        ws_rm_listing(name, dir, goes)
+    )
 }
 
 /// What a probe of the hub socket found.
@@ -8555,6 +8717,39 @@ mod tests {
         );
     }
     use super::*;
+
+    /// `twr ws rm` asks before it removes anything, naming what goes: anything but y/yes keeps
+    /// the workspace.
+    #[tokio::test]
+    async fn ws_rm_asks_first() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::with_home(home.path());
+        let ws = paths.workspace("a").unwrap();
+        std::fs::create_dir_all(ws.data_dir.join(twr_hub::MEMORY_DIR)).unwrap();
+        std::fs::write(ws.data_dir.join(twr_hub::MEMORY_DIR).join("x.md"), "n").unwrap();
+        std::fs::write(ws.data_dir.join("twr.db-wal"), [0u8; 2048]).unwrap();
+        let mut asked = Vec::new();
+        for reply in ["", "n\n", "no\n", "yes please\n"] {
+            let mut ask = |q: &str| {
+                asked.push(q.to_string());
+                Ok(reply.to_string())
+            };
+            ws_rm(&paths, "a", Consent::Ask(&mut ask)).await.unwrap();
+            assert!(ws.data_dir.is_dir(), "{reply:?} removed it");
+        }
+        let q = &asked[0];
+        assert!(q.starts_with("This removes workspace a for good:\n"), "{q}");
+        assert!(q.contains("  its orchestrator's 1 memory note\n"), "{q}");
+        assert!(q.contains("  its log (2 KB)\n"), "{q}");
+        assert!(!q.contains("worktree"), "{q}");
+        assert!(
+            q.ends_with("Remove workspace a? This cannot be undone. [y/N] "),
+            "{q}"
+        );
+        let mut yes = |_: &str| Ok("Y\n".to_string());
+        ws_rm(&paths, "a", Consent::Ask(&mut yes)).await.unwrap();
+        assert!(!ws.data_dir.exists());
+    }
 
     /// A workspace that was present during discovery can be moved aside by ws rm before
     /// the stop opens its lock. Absence is not a stop failure; other open errors are.
