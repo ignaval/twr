@@ -297,8 +297,38 @@ try {
     .getByRole("button", { name: /api.*waiting/ })
     .first()
     .waitFor({ timeout: 30000 });
+  // An answer counts only once the options have been on screen for 600 ms, as in the
+  // TUI (shared/arming.ts): a click the moment the card appears answers nothing.
+  await page.evaluate(() => {
+    window.__earlyClick = new Promise((resolve) => {
+      const tryClick = () => {
+        const card = [...document.querySelectorAll(".manager .attention-card")]
+          .filter((node) => /Permission requested/.test(node.textContent || ""))
+          .at(0);
+        const options = card?.querySelector(".attention-options");
+        const allow = [
+          ...(card?.querySelectorAll(".attention-options button") || []),
+        ].find((button) => /allow/i.test(button.textContent || ""));
+        if (!allow) return false;
+        const armed = options?.getAttribute("data-armed") === "true";
+        allow.click();
+        observer.disconnect();
+        resolve(!armed);
+        return true;
+      };
+      const observer = new MutationObserver(tryClick);
+      observer.observe(document.body, { childList: true, subtree: true });
+      tryClick();
+    });
+  });
   await page.getByRole("button", { name: /Needs you/ }).click();
   await page.getByText("Permission requested", { exact: true }).waitFor();
+  const earlyClick = await within(
+    page.evaluate(() => window.__earlyClick),
+    10000,
+    "The permission card never showed an Allow button",
+  );
+  assert(earlyClick, "The early click must land before the options arm");
   console.log("Permission request rendered");
   const item = await page.evaluate(async () =>
     (await window.twr.rpc("attention.list", { all: true })).find(
@@ -317,35 +347,21 @@ try {
       item,
     ),
   );
-  // An answer counts only once the options have been on screen for 600 ms, as in the
-  // TUI (shared/arming.ts): a click before then answers nothing.
   const permissionCard = page
     .locator(".manager .attention-card")
     .filter({ hasText: "Permission requested" })
     .first();
-  const earlyClick = await permissionCard.evaluate((card) => {
-    const options = card.querySelector(".attention-options");
-    const allow = [...card.querySelectorAll(".attention-options button")].find(
-      (button) => /allow/.test(button.textContent || ""),
-    );
-    if (options?.getAttribute("data-armed") !== "false" || !allow) return false;
-    allow.click();
-    return true;
-  });
-  if (earlyClick) {
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    const still = await page.evaluate(
-      async (item) =>
-        (await window.twr.rpc("attention.list", { all: true })).some(
-          (a) => a.attn_id === item.attn_id && a.revision === item.revision,
-        ),
-      item,
-    );
-    assert(still, "A click before the options armed must answer nothing");
-    console.log(
-      "PASS: a click within 600 ms of a request appearing is ignored",
-    );
-  }
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const still = await page.evaluate(
+    async (item) =>
+      (await window.twr.rpc("attention.list", { all: true })).some(
+        (a) => a.attn_id === item.attn_id && a.revision === item.revision,
+      ),
+    item,
+  );
+  assert(still, "A click before the options armed must answer nothing");
+  assert.equal(await permissionCard.locator(".attention-sent").count(), 0);
+  console.log("PASS: a click the moment a request appears answers nothing");
   await permissionCard
     .locator('.attention-options[data-armed="true"]')
     .waitFor({ timeout: 5000 });

@@ -4628,12 +4628,14 @@ function AttentionCard({
   const response = useRef<HTMLDivElement>(null);
   const arming = useArming(response, item.attn_id + ":" + item.revision);
   const pending = useRef(false);
+  const answered = useRef(false);
   const settle = async (run: () => Promise<void>) => {
     // Clicks and keys that land before the options have been on screen for 600 ms were
     // meant for whatever was there before (a card that just slid away, the previous
     // revision): they answer nothing.
     if (
       pending.current ||
+      answered.current ||
       !canRespond(item, busy) ||
       !mayAnswer({
         arming: arming.state(),
@@ -4649,6 +4651,7 @@ function AttentionCard({
     setRequestError("");
     try {
       await run();
+      answered.current = true;
       setSent(true);
     } catch (e) {
       setRequestError(errorMessage(e));
