@@ -172,6 +172,9 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());
     }
+    if let Some(lost) = &state.view.hub_lost {
+        render_hub_lost(frame, area, lost, &mut panes);
+    }
     // Drawn in full color, then brought down to the colors the terminal has (`[tui] colors`).
     crate::color::degrade(frame.buffer_mut(), state.view.colors);
     // The clock ticks only for a moving cell still on screen once the overlays are drawn
@@ -180,6 +183,39 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     panes.moving.retain(|c| on(screen, *c));
     panes.animated = !panes.moving.is_empty();
     panes
+}
+
+/// The band across the top row while the hub's streams are gone ([`crate::app::HubLost`]):
+/// over whatever is there, so nothing hides it, and what it covers is not on screen (no key
+/// answers an item under it, no tap reaches a control there).
+fn render_hub_lost(frame: &mut Frame, area: Rect, lost: &crate::app::HubLost, panes: &mut Panes) {
+    let row = Rect::new(area.x, area.y, area.width, area.height.min(1));
+    if row.height == 0 || row.width == 0 {
+        return;
+    }
+    panes.cover(Some(row));
+    let style = if lost.refused {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let width = usize::from(row.width);
+    let text = truncate_cells(&format!(" ⚠ {}", lost.text), width);
+    let fill = width.saturating_sub(crate::edit::width(&text));
+    frame.render_widget(Clear, row);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{text}{}", " ".repeat(fill)),
+            style,
+        ))),
+        row,
+    );
 }
 
 /// The tab strip's control of the sidebar.
@@ -16974,6 +17010,43 @@ mod tests {
         let first = &lines[usize::from(pop.y)];
         let start: String = items[0].detail.chars().take(10).collect();
         assert!(first.contains(items[0].label.as_str()) && first.contains(&start));
+    }
+
+    /// While the hub's streams are gone, the band across the top row says so whatever the
+    /// status bar says, over every view and the compact layout; what it covers is no target.
+    #[test]
+    fn the_hub_lost_band_stays_on_the_top_row() {
+        let mut st = three_threads();
+        st.view.hub_lost = Some(crate::app::HubLost {
+            text: crate::HUB_LOST.into(),
+            refused: false,
+        });
+        st.view.status = Some("sent to the orchestrator".into());
+        for (w, compact) in [(120, false), (46, true)] {
+            st.view.compact = Some(compact);
+            let lines = draw_panes(&mut st, w, 30);
+            assert!(
+                lines[0].starts_with(" ⚠ hub connection lost"),
+                "{w}: {}",
+                screen(&lines)
+            );
+            assert!(st
+                .view
+                .panes
+                .targets
+                .iter()
+                .all(|(r, _)| r.y > 0 || r.height == 0));
+        }
+        st.view.compact = Some(false);
+        st.view.hub_lost = Some(crate::app::HubLost {
+            text: crate::HUB_REFUSES.into(),
+            refused: true,
+        });
+        let buf = crate::app::tests::draw(&mut st, 120, 30);
+        assert_eq!(buf[(1, 0)].bg, Color::Red);
+        st.view.hub_lost = None;
+        let lines = draw_panes(&mut st, 120, 30);
+        assert!(!screen(&lines).contains("hub connection lost"));
     }
 
     /// The popup lists the matching commands with their descriptions above the input line.

@@ -40,6 +40,16 @@ use crate::edit::LineInput;
 use crate::select::{Anchor, PaneId, Panes, Selection, Target};
 use crate::slash::{self, Slash, TrashCmd};
 
+/// The band of a TUI whose hub's streams ended ([`ViewState::hub_lost`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubLost {
+    /// What it says.
+    pub text: String,
+    /// The hub that answered refuses this TUI (it is older than the hub): connecting again
+    /// won't help, the TUI must be started again.
+    pub refused: bool,
+}
+
 /// The status bar after Ctrl-C emptied the input box into the history ([`AppState::clear_draft`]).
 pub const CTRL_C_KEPT: &str = "cleared the box (↑ brings it back) · Ctrl-C again quits";
 /// The same, for a box that held only spaces, or a history entry recalled over nothing typed.
@@ -169,6 +179,10 @@ impl std::fmt::Debug for RunnerPanel {
 /// Client-local view state. Nothing here is an event; pins in particular never leave the client.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ViewState {
+    /// The hub's streams ended and the TUI is connecting again, or the hub it found refuses
+    /// it: the band across the top row says so until a hub's streams are back
+    /// ([`crate::ui::render`]); no status replaces it.
+    pub hub_lost: Option<HubLost>,
     pub runner: Option<RunnerPanel>,
     pub runner_session: Option<String>,
     pub runner_generation: u64,
