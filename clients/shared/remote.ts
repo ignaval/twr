@@ -44,6 +44,10 @@ export interface RemoteServices {
   secureDelete?: DesktopAPI["secureDelete"];
   includeLocalInboxCache?: boolean;
 }
+/** Native transports report a revoked or unknown token (HTTP 401) this way; nothing else is a revocation. */
+export function isRevocationError(error: unknown) {
+  return /AUTH_REVOKED|credential.*revok|re-pair/i.test(String(error));
+}
 export class RemoteHost {
   private inboxRefresh?: Promise<import("./types").InboxSource[]>;
   private async cachedBootstrap() {
@@ -204,7 +208,7 @@ export class RemoteHost {
         }),
       ]);
     } catch (error) {
-      if (/AUTH_REVOKED|credential.*revok|re-pair/i.test(String(error))) {
+      if (isRevocationError(error)) {
         this.authenticationRevoked = true;
         clearTimeout(this.retryTimer);
         this.listeners.forEach((listener) =>
@@ -309,11 +313,7 @@ export class RemoteHost {
       this.readMethods = new Set(capabilities.read_methods || []);
       this.workspace = capabilities.workspace || "default";
     } catch (e) {
-      if (
-        this.stopped ||
-        /AUTH_REVOKED|credential.*revok|re-pair/i.test(String(e))
-      )
-        throw e;
+      if (this.stopped || isRevocationError(e)) throw e;
       const cached = await this.cachedBootstrap();
       if (!cached) {
         await this.listener.remove();

@@ -246,6 +246,75 @@ describe("mobile reconnect", () => {
       await host.stop();
     },
   );
+  it.each([
+    "Gateway refused the connection (403)",
+    "Gateway refused the connection (503)",
+    "Remote hub connection closed",
+  ])("keeps retrying after %s", async (refusal) => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((event) => events.push(event));
+      fake.connect.mockRejectedValue(new Error(refusal));
+      fake.listener({
+        message: { type: "transport-closed", connected: false, error: refusal },
+      });
+      await vi.advanceTimersByTimeAsync(1100);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(fake.connect).toHaveBeenCalledTimes(3);
+      fake.connect.mockResolvedValue(undefined);
+      await vi.advanceTimersByTimeAsync(4100);
+      expect(fake.connect).toHaveBeenCalledTimes(4);
+      await expect(host.api().rpc("hub.info")).resolves.toEqual({});
+      expect(events.some((event) => /AUTH_REVOKED/.test(event.error))).toBe(
+        false,
+      );
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("stops retrying once the gateway reports the token revoked (401)", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((event) => events.push(event));
+      fake.connect.mockRejectedValue(
+        new Error(
+          "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again.",
+        ),
+      );
+      fake.listener({ message: { type: "transport-closed" } });
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "connection",
+          connected: false,
+          error: expect.stringContaining("AUTH_REVOKED"),
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
   it("resyncs terminal views when the socket returns, even with no further output", async () => {
     const host = new RemoteHost(
       hub,

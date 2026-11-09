@@ -149,9 +149,12 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                         self.notifyListeners("message", data: ["message": message])
                     }
                 } catch {
+                    // Only 401 means the gateway no longer knows this token. A 403 and
+                    // 5xx are refusals the app retries like any other lost connection.
                     let status = (task.response as? HTTPURLResponse)?.statusCode
-                    let revoked = status == 401 || status == 403
-                    let message = revoked ? "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again." : "Remote hub connection closed"
+                    let revoked = status == 401
+                    let refused = !authenticated && status != nil && status != 101
+                    let message = revoked ? "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again." : refused ? "Gateway refused the connection (\(status!))" : "Remote hub connection closed"
                     if !authenticated { call.reject(message, revoked ? "AUTH_REVOKED" : nil) }
                     if self.socket === task { self.notifyListeners("message", data: ["message": ["type": "transport-closed", "connected": false, "error": message]]) }
                 }
