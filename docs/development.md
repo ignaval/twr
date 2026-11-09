@@ -279,4 +279,4 @@ The user asks for two threads, answers ratelimit's permission with "allow rateli
 python3 docs/tools/check-links.py
 ```
 
-[SKILL.md](../SKILL.md) stays at the repository root, where agents look for it. It's the reference for the socket API, events and MCP tools; keep it in step with the code.
+[SKILL.md](../SKILL.md) stays at the repository root, where agents look for it. It's the reference for the socket API, events and MCP tools; keep it in step with the code. `crates/twr-docs/tests/skill_drift.rs` checks that it names every socket method in `twr_hub::server::METHODS` and every MCP tool of `twr-mcp`, except the few it lists as not written up yet.
