@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SUMMARY_MAX_ITEMS } from "../shared/attentionSummary";
 export const workspaceSchema = z
   .string()
   .regex(/^(?:[a-z0-9]|[a-z0-9][a-z0-9-]{0,30}[a-z0-9])$/);
@@ -114,3 +115,38 @@ export const sizeSchema = z.object({
   cols: z.number().int().min(2).max(500),
   rows: z.number().int().min(1).max(300),
 });
+/** Labels in a summary are short; never reject a summary for their length. */
+const label = (max: number) =>
+  z.string().transform((value) => value.slice(0, max));
+/** `app-attention`: what waits on the user, in every workspace (shared/attentionSummary.ts). */
+export const attentionSummarySchema = z
+  .object({
+    count: z.number().int().min(0).max(100000),
+    items: z
+      .array(
+        z
+          .object({
+            workspace: z.string().min(1).max(64),
+            thread: z.string().max(200),
+            title: label(200),
+            summary: label(300),
+            id: z.string().min(1).max(200),
+            revision: z.number().int().min(0),
+            reason: z.string().max(40),
+            incomplete: z.boolean().optional(),
+          })
+          .strict(),
+      )
+      .max(SUMMARY_MAX_ITEMS),
+    workspaces: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1).max(64),
+            stream: z.string().max(200).optional(),
+          })
+          .strict(),
+      )
+      .max(256),
+  })
+  .strict();

@@ -278,7 +278,18 @@ try {
     await page.evaluate(() =>
       window.twrApp.setAttention({
         count: 2,
-        items: [{ thread: "packaged", title: "packaged", summary: "QA" }],
+        items: [
+          {
+            workspace: "default",
+            thread: "packaged",
+            title: "packaged",
+            summary: "QA",
+            id: "packaged-qa",
+            revision: 1,
+            reason: "permission",
+          },
+        ],
+        workspaces: [{ name: "default" }],
       }),
     );
     // Background mode: closing the window hides it and keeps the renderer live.

@@ -173,6 +173,7 @@ function Desktop() {
                       "menu-palette",
                       "menu-attention",
                       "menu-settings",
+                      "inbox-poll",
                       "theme",
                     ].includes(event.type)
                   )

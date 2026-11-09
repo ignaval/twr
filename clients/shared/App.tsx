@@ -12,6 +12,7 @@ import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
 import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
+import { attentionSummary } from "./attentionSummary";
 import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
@@ -315,6 +316,10 @@ export default function App({
     talk: boolean;
     then?: () => void;
   }>(undefined);
+  /** Opens Needs you at a thread's request, in its workspace (the tray, notifications). */
+  const openAttention = useRef<(workspace?: string, thread?: string) => void>(
+    () => {},
+  );
   const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
@@ -488,19 +493,42 @@ export default function App({
   const draftKey = workspace + ":" + (destination || "orchestrator");
   const draft = drafts[draftKey] || "";
   const selectedThread = view.threads.find((t) => t.id === selected);
-  // The desktop tray/menu bar and Dock badge mirror what needs the user.
+  // The desktop tray/menu bar, Dock badge and notifications mirror what needs the user in
+  // every workspace: this one's live view and the others' latest reads. The live view's
+  // stream starts over on each (re)connection and resync, so what it lists first is not
+  // taken for news (desktop/notify-state.ts).
+  const [resyncs, setResyncs] = useState(0);
+  const liveStream = useRef({ epoch: 0, connected: false, resyncs: 0 });
   useEffect(() => {
-    window.twrApp?.setAttention({
-      count: view.attention.length,
-      items: view.attention.slice(0, 5).map((item) => ({
-        thread: item.thread,
-        title: (
-          view.threads.find((t) => t.id === item.thread)?.name || item.thread
-        ).slice(0, 200),
-        summary: (item.summary || item.reason || "").slice(0, 300),
-      })),
-    });
-  }, [view.attention, view.threads]);
+    if (!window.twrApp) return;
+    const stream = liveStream.current;
+    if ((connected && !stream.connected) || resyncs !== stream.resyncs)
+      stream.epoch++;
+    stream.connected = connected;
+    stream.resyncs = resyncs;
+    window.twrApp.setAttention(
+      attentionSummary({
+        current: workspace,
+        hubId: hostId,
+        live: connecting
+          ? undefined
+          : { threads: view.threads, attention: view.attention },
+        liveStream: connected
+          ? `live:${hostId}:${workspace}:${stream.epoch}`
+          : undefined,
+        sources: inboxSources,
+      }),
+    );
+  }, [
+    view.threads,
+    view.attention,
+    inboxSources,
+    workspace,
+    hostId,
+    connected,
+    connecting,
+    resyncs,
+  ]);
   const [visibleRoutines, setVisibleRoutines] = useState<string[]>([]);
   const presentedEvents = useMemo(() => {
     const resolved = new Set(view.went_on || []);
@@ -679,6 +707,15 @@ export default function App({
       document.removeEventListener("visibilitychange", read);
     };
   }, [sidebarReads, workspace, refreshInboxSources]);
+  // The desktop also reads them on its main process's beat (`inbox-poll`), whatever the
+  // sidebar shows and while the window is hidden, so that its tray, badge and
+  // notifications cover every workspace. A shown sidebar reads on its own timer.
+  const inboxPoll = useRef(() => {});
+  inboxPoll.current = () => {
+    if (!connected || workspaces.length < 2) return;
+    if (sidebarReads && document.visibilityState !== "hidden") return;
+    void refreshInboxSources(true);
+  };
   const openTerminal = useCallback(
     async (
       request: Parameters<typeof hostApi.terminalOpen>[0],
@@ -802,8 +839,11 @@ export default function App({
     const unsubscribe = hostApi.onEvent((event) => {
       if (event.type === "resync" && event.scope !== "control")
         refreshTerminals();
-      if (event.type === "resync" && event.scope !== "terminal")
+      if (event.type === "resync" && event.scope !== "terminal") {
         setTranscriptRefresh((n) => n + 1);
+        setResyncs((n) => n + 1);
+      }
+      if (event.type === "inbox-poll") inboxPoll.current();
       if (event.type === "state" && event.state) {
         liveView.current = true;
         hasLiveSnapshot.current = true;
@@ -873,11 +913,8 @@ export default function App({
         setSection("settings");
         setSidebar(false);
       }
-      if (event.type === "menu-attention") {
-        setSection("attention");
-        setSidebar(false);
-        if (event.thread) setSelected(event.thread);
-      }
+      if (event.type === "menu-attention")
+        openAttention.current(event.workspace, event.thread);
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");
@@ -2093,6 +2130,16 @@ export default function App({
       if (generation === connectGeneration.current)
         show(wanted.thread, wanted.talk, wanted.then);
     });
+  };
+  // Another workspace's request switches to it first, as the sidebar does.
+  openAttention.current = (name, thread) => {
+    const show = () => {
+      setSection("attention");
+      setSidebar(false);
+      if (thread) setSelected(thread);
+    };
+    if (name && name !== workspace) openIn(name, thread, false, show);
+    else show();
   };
   // Every attention answer (conversation cards, Needs you, the inspector, mobile) goes
   // through here: only a live hub view, never a cached one, can authorize it.

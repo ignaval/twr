@@ -140,14 +140,19 @@ the client preference, which is restored on the next launch.
 ## Tray, login and background mode
 
 The app adds a menu bar item on macOS and a tray icon on Linux. It shows how many
-items need you, lists up to five of them (choose one to open it) and has quick
-actions for a new thread, Launch at Login, background mode, updates and Quit. The
-Dock icon (macOS) and Unity-style launchers (Linux) show the same count as a badge.
+items need you in every workspace of the connected hub, lists up to five of them (the
+shown workspace's first, under their workspace's name when there are several) and has
+quick actions for a new thread, Launch at Login, background mode, updates and Quit.
+Choosing an item shows the window, switches to its workspace and opens it in Needs you.
+The Dock icon (macOS) and Unity-style launchers (Linux) show the same count as a badge.
+The shown workspace's items are live; the others' are read every 15 seconds over
+short-lived read-only connections, as the sidebar reads them, also while the window is
+hidden. A stopped hub is not started to ask it.
 On Linux the icon needs a StatusNotifierItem host: Waybar's `tray` module on Omarchy,
 KDE Plasma, or GNOME with the AppIndicator extension. Without one, Settings says so
 and background mode stays off, so the window can always be brought back.
 
-Settings › Application has three switches:
+Settings › Application has four switches:
 
 - **Launch at login.** On macOS this registers a login item (macOS may ask you to
   allow it in System Settings › General › Login Items). On Linux it writes
@@ -155,6 +160,21 @@ Settings › Application has three switches:
   GNOME and KDE start at login. AppImages are started through the image itself. twr
   only removes an autostart entry that it created.
 - **Show in menu bar / Show tray icon.**
+- **Notify me of new requests** (on by default). A new permission or question in any
+  workspace posts a system notification while twr's window isn't in front: hidden in
+  background mode, minimized, or behind another app. It names the thread and the
+  workspace (`api · client-x`, *Asks for permission*), never what is asked. Clicking it
+  shows the window in that workspace at the request; it never answers it, and the
+  request's buttons wait 600 ms after the window shows, as always. A notification goes
+  away once its request is answered, anywhere, or when you bring the window to the front.
+  What waits when twr starts or reconnects is not news, nor is what comes while you look
+  at the window. Requests that come within a second go out together, and more than three
+  as one (*4 things need you*). The system's Do Not Disturb and Focus settings apply.
+  macOS asks whether twr may notify the first time it does (System Settings ›
+  Notifications changes the answer later); a build macOS won't let notify, such as some
+  ad hoc signed ones, shows nothing. The diagnostics log records the first notification
+  posted, a system without notification support and notifications that failed. How this relates to the hub's `[notify]`
+  command and the TUI's notifications: [notifications.md](notifications.md#the-desktop-app).
 - **Keep running when the window is closed.** Closing the window hides it instead,
   so terminals, the hub connection and the badge stay live. A login launch then starts
   hidden on Linux. macOS 13 and later do not always tell an app it was opened at login, so

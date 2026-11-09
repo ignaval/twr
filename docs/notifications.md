@@ -1,6 +1,6 @@
 # Notifications
 
-The TUI can alert the terminal it runs in ([tui.md](tui.md#notifications)), but only while it's open. The hub can also run a command of yours when something needs you, whether or not a TUI is open. That command can push to your phone, post to a chat or show a desktop notification. twr makes no network calls of its own: the command does.
+The TUI can alert the terminal it runs in ([tui.md](tui.md#notifications)), but only while it's open. The hub can also run a command of yours when something needs you, whether or not a TUI is open. That command can push to your phone, post to a chat or show a desktop notification. twr makes no network calls of its own: the command does. The desktop app notifies on its own while it runs ([below](#the-desktop-app)).
 
 ```toml
 [notify]
@@ -27,6 +27,18 @@ The hub decides what's worth telling you by the same rules the TUI uses, and `ev
 It waits two seconds before it notifies (five for a failure), and sends nothing for an item answered, or a failure retried, in that time. A report rewritten after its notification went out doesn't notify again, also after the hub restarted: what happened before it started is never news, but it remembers what was. What comes within five seconds of a notification goes out together after them, as one notification: `twr: 2 need you` / `api needs permission, web asks`. One command runs at a time.
 
 While you use a TUI connected to the hub, it sends nothing: a TUI tells its hub you're looking while its terminal has focus and you pressed a key, clicked or pasted in the last 30 seconds. The TUI's own `[tui.notify]` rules don't change this. Every hub of your home runs its own `[notify]`, since its workspaces share `config.toml`, and `{workspace}` says which one it was.
+
+## The desktop app
+
+The [desktop app](desktop.md#tray-login-and-background-mode) posts system notifications of its own, without any `[notify]` setting: a new permission or question, in any workspace of the hub it's connected to, while its window isn't in front. They stay on your computer and name only the thread, the workspace and the kind of request (`api · client-x`, *Asks for permission*), never what is asked, as the hub's notifications do without `detail` and as [mobile push](mobile.md#notifications) does. Settings › Application › **Notify me of new requests** turns them off.
+
+They don't replace the hub's command, and the two don't know of each other:
+
+- While the window has focus, the app tells the hub of the workspace it shows that you're looking, as a TUI does, so that hub's command stays quiet, and the app posts nothing either. The other workspaces' hubs aren't told: their commands still run.
+- While the window isn't in front, both notify. If your `command` is itself a desktop notifier on the same computer (the `notify-send` and `osascript` recipes below), you see each request twice: keep the command for somewhere else, such as your phone or a chat, or turn the app's notifications off.
+- The hub's command also covers failures, reviews, finished turns and replies (`events`); the app notifies only permissions and questions, and shows the rest in Needs you, the tray menu and the Dock badge.
+
+A TUI's `[tui.notify]` alerts go through its own terminal, whichever app is open: with a TUI and the desktop app both open, both can notify of the same request.
 
 ## What the command gets
 
