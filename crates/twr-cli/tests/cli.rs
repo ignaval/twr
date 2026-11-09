@@ -2520,6 +2520,63 @@ fn install_sh_keeps_the_old_twr_when_the_new_one_fails_to_run() {
     assert_eq!(left, ["twr"], "{left:?}");
 }
 
+/// `install.sh --pair` runs `twr runner up` from the twr it installed, and says clearly when
+/// that release has none (the script comes from main, which can be ahead of the latest
+/// release) instead of failing on a usage error.
+#[test]
+fn install_sh_pair_needs_a_twr_with_runner_up() {
+    for (twr, ok) in [
+        // A release without `runner up`: clap refuses the subcommand (exit 2).
+        (
+            "#!/bin/sh\ncase \"$*\" in --version) echo 'twr 0.3.0';; \
+             *) echo \"error: unrecognized subcommand 'up'\" >&2; exit 2;; esac\n",
+            false,
+        ),
+        // One with it: `--help` succeeds, then `runner up` runs.
+        (
+            "#!/bin/sh\ncase \"$*\" in --version) echo 'twr 9.9.9';; \
+             'runner up --help') echo help;; 'runner up') echo 'pairing...';; \
+             *) exit 2;; esac\n",
+            true,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release");
+        fake_release_of(&release, &tmp.path().join("stage"), twr);
+        let bin = tmp.path().join("bin");
+        let out = Command::new("sh")
+            .arg(install_sh())
+            .arg("--pair")
+            .env("HOME", tmp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("TWR_INSTALL_DIR", &bin)
+            .env("TWR_VERSION", "v9.9.9")
+            .env("TWR_DOWNLOAD_URL", format!("file://{}", release.display()))
+            .env("TWR_SHA256SUMS_FILE", release.join("sha256sums.txt"))
+            .env_remove("TWR_UPDATE")
+            .env_remove("TWR_REQUIRE_SIGNATURE")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.success(), ok, "{stdout}\n{stderr}");
+        assert!(bin.join("twr").exists(), "{stderr}");
+        if ok {
+            assert!(stdout.contains("pairing..."), "{stdout}");
+        } else {
+            assert!(
+                stderr.contains(
+                    "twr 0.3.0 has no `twr runner up`: pairing needs a twr newer than 0.3.0"
+                ),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
+        }
+    }
+}
+
 /// install.sh's advice for an install directory that is not on PATH works pasted as shown,
 /// whatever the directory's name holds (a space, quotes, `$`, a backquote, a backslash): for
 /// sh-family shells a line appended to the profile that puts the directory on PATH once
