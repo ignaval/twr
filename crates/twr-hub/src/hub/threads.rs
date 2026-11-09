@@ -884,6 +884,10 @@ impl Hub {
             let configured = project_runtime.unwrap_or(&cfg.default_runtime);
             orch::check_spawn_runtime(req.runtime.as_deref(), configured, cfg)?;
         }
+        // A device names a command line only with `terminal` (`hub::device_scope`).
+        if let Some(r) = &req.runtime {
+            self.inner.check_caller_runtime(caller, r)?;
+        }
         let spec = runtime_spec::resolve(&runtime, cfg)?;
         let runtime = spec.runtime.clone();
         if !host.has_runtime(&runtime) {
@@ -910,6 +914,13 @@ impl Hub {
     ) -> Result<thread_account::AccountChoice, RpcError> {
         let explicit =
             thread_account::explicit_pin(req.account.as_deref(), spec.account.as_deref())?;
+        if req.outside_pin {
+            self.inner.require_scope(
+                caller,
+                "open a thread on an account outside its project's pin",
+                "admin",
+            )?;
+        }
         // The box's configuration is read before the core is locked.
         let pins = thread_account::project_pins(&self.inner, project, box_name, &spec.runtime);
         let core = self.inner.core();
@@ -956,6 +967,14 @@ impl Hub {
                      threads use threads.default_mode ({default_mode:?}); omit mode"
                 ),
             ));
+        }
+        // A device without `admin` chooses only a mode that asks (`hub::device_scope`).
+        if let Some(m) = req_mode
+            .as_deref()
+            .filter(|m| !twr_core::devices::OPERATE_MODES.contains(m))
+        {
+            self.inner
+                .require_scope(caller, &format!("start a thread in {m} mode"), "admin")?;
         }
         Ok(match req_mode {
             Some(m) => m,

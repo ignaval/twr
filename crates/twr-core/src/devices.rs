@@ -258,10 +258,41 @@ impl Standing {
         self == Self::Revoked
     }
 }
+
+/// The permission modes a device without `admin` may give a new thread (`thread.new` /
+/// `thread.spawn` `mode`): every other one widens what the thread does without asking, and
+/// choosing it is a mode change, which needs `admin`.
+pub const OPERATE_MODES: &[&str] = &["manual", "plan", "read-only", "dontAsk"];
+
+/// Whether `scopes` (a device's grant) include `scope`.
+pub fn grants(scopes: &[String], scope: &str) -> bool {
+    scopes.iter().any(|s| s == scope)
+}
+
+/// Whether runtime spec `spec` is a command line (`pty:<command>`, `acp:<command>`, or the bare
+/// `pty` / `acp`), which runs a program of the caller's choosing on the host: a device needs
+/// `terminal` to name one. The hub checks the rest of the rule (an agent runtime or a
+/// configured preset only) against its configuration.
+pub fn is_command_runtime(spec: &str) -> bool {
+    let spec = spec.trim();
+    ["pty", "acp"].iter().any(|kind| {
+        spec.strip_prefix(kind)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    })
+}
+
 impl Device {
     pub fn allows(&self, method: &str) -> bool {
-        method_scope(method).is_some_and(|scope| self.scopes.iter().any(|s| s == scope))
+        method_scope(method).is_some_and(|scope| self.has(scope))
     }
+    /// Whether the device holds `scope`.
+    pub fn has(&self, scope: &str) -> bool {
+        grants(&self.scopes, scope)
+    }
+    /// [`Device::allows`], and the parameters that widen what a method does past its scope:
+    /// a new thread's mode outside [`OPERATE_MODES`] and `outside_pin` need `admin`; a command
+    /// line runtime ([`is_command_runtime`]) needs `terminal`. The hub applies the same rules,
+    /// and the rest of them (presets, moves, modes as canonicalized), where it decides.
     pub fn allows_params(&self, method: &str, params: &serde_json::Value) -> bool {
         if !self.allows(method) {
             return false;
@@ -271,12 +302,25 @@ impl Device {
         } else {
             params
         };
+        if !matches!(
+            method,
+            "thread.new" | "thread.spawn" | "thread.set_model" | "orchestrator.use"
+        ) {
+            return true;
+        }
         if matches!(method, "thread.new" | "thread.spawn")
             && request["mode"]
                 .as_str()
-                .is_some_and(|mode| !["manual", "plan", "read-only", "dontAsk"].contains(&mode))
+                .is_some_and(|mode| !OPERATE_MODES.contains(&mode))
+            && !self.has("admin")
         {
-            return self.scopes.iter().any(|s| s == "admin");
+            return false;
+        }
+        if request["outside_pin"].as_bool() == Some(true) && !self.has("admin") {
+            return false;
+        }
+        if request["runtime"].as_str().is_some_and(is_command_runtime) && !self.has("terminal") {
+            return false;
         }
         true
     }
@@ -452,6 +496,61 @@ mod tests {
         assert!(device.allows("thread.event_context"));
         assert!(!device.allows("attention.respond"));
         assert!(!device.allows("thread.send"));
+    }
+    fn device(scopes: &[&str]) -> Device {
+        Device {
+            id: "d".into(),
+            name: "phone".into(),
+            created: 0,
+            token_hash: String::new(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    #[test]
+    fn command_line_runtimes_need_terminal_and_widening_parameters_admin() {
+        use serde_json::json;
+        let operate = device(&["read", "operate"]);
+        let terminal = device(&["read", "operate", "terminal"]);
+        let admin = device(&["read", "operate", "admin"]);
+        for spec in [
+            "pty:/bin/sh -c id",
+            "acp:my-agent --flag",
+            " acp:x",
+            "pty",
+            "acp",
+        ] {
+            for (method, params) in [
+                ("thread.new", json!({"project": "p", "runtime": spec})),
+                (
+                    "thread.spawn",
+                    json!({"operation_id": "o", "request": {"project": "p", "runtime": spec}}),
+                ),
+                ("thread.set_model", json!({"thread": "t", "runtime": spec})),
+            ] {
+                assert!(!operate.allows_params(method, &params), "{method} {spec}");
+                assert!(!admin.allows_params(method, &params), "{method} {spec}");
+                assert!(terminal.allows_params(method, &params), "{method} {spec}");
+            }
+        }
+        for spec in ["claude-code", "codex:work", "my-preset", "acpx", "ptyhon"] {
+            let params = json!({"project": "p", "runtime": spec});
+            assert!(operate.allows_params("thread.new", &params), "{spec}");
+        }
+        let outside = json!({"thread": "t", "account": "work", "outside_pin": true});
+        assert!(!operate.allows_params("thread.set_model", &outside));
+        assert!(!terminal.allows_params("thread.set_model", &outside));
+        assert!(admin.allows_params("thread.set_model", &outside));
+        let outside = json!({"project": "p", "account": "work", "outside_pin": true});
+        assert!(!operate.allows_params("thread.new", &outside));
+        assert!(admin.allows_params("thread.new", &outside));
+        let bypass = json!({"project": "p", "mode": "bypassPermissions"});
+        assert!(!operate.allows_params("thread.new", &bypass));
+        assert!(admin.allows_params("thread.new", &bypass));
+        assert!(operate.allows_params("thread.new", &json!({"project": "p", "mode": "plan"})));
+        // `orchestrator.use` is admin's, and a command line there needs terminal too.
+        let acp = json!({"runtime": "acp:agent"});
+        assert!(!admin.allows_params("orchestrator.use", &acp));
+        assert!(device(&["admin", "terminal"]).allows_params("orchestrator.use", &acp));
     }
     #[test]
     fn pairing_is_one_use_and_revocation_is_immediate() {

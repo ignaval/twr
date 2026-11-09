@@ -388,6 +388,11 @@ struct OrchTurn {
     /// its message can no longer be taken back (`hub::withdraw`). Memory only: a hub restart
     /// ends the orchestrator's open turn anyway.
     acted: bool,
+    /// For a user turn: the client whose message started it (`turn.started`'s source), so a
+    /// mode change or runtime move relayed from a paired device's message is held to that
+    /// device's scopes ([`Core::relayed_for_admin`]).
+    #[serde(default)]
+    by: Option<String>,
 }
 
 /// One queued notice line.
@@ -1886,6 +1891,10 @@ impl Core {
                     proposals: Vec::new(),
                     arrived,
                     acted: false,
+                    by: match &ev.source {
+                        Source::User(c) if user => Some(c.clone()),
+                        _ => None,
+                    },
                 });
                 // Everything queued went out with this turn (not with a handoff's summary
                 // request: if the switch fails, the queue is still the old orchestrator's),
@@ -3236,6 +3245,28 @@ impl Core {
         })
     }
 
+    /// The orchestrator relays a mode change or a runtime move (`what`, for the message):
+    /// refused (`relay_forbidden`) when the message that started its turn came from a paired
+    /// device without `admin` (`hub::device_scope`), which could not make that change itself,
+    /// so neither directly nor on a confirm card. Any other turn is judged by the rest of the
+    /// `set_mode` gate ([`Core::mode_check`], [`Core::move_check`]).
+    pub(super) fn relayed_for_admin(&self, hub: &Inner, what: &str) -> Result<(), RpcError> {
+        let Some(by) = self.orch.turn.as_ref().and_then(|t| t.by.as_deref()) else {
+            return Ok(());
+        };
+        match hub.device_grant(by) {
+            Some(g) if !g.has("admin") => Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                format!(
+                    "the user's message came from a paired device without the admin \
+                     permission, so it cannot {what}; tell the user to do it on the computer \
+                     running the hub, or from a device paired with admin access"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// The `set_mode` gate's provenance for the orchestrator's move of `thread` to another
     /// runtime (`hub::model`), which then always goes on the confirm card: a user turn whose
     /// message is the user's latest, for a thread that existed (and the user had seen) when it
@@ -3421,30 +3452,64 @@ const ORCHESTRATOR_RUNTIMES: [&str; 3] = [
 ];
 
 /// Whether the orchestrator may choose runtime `requested` for a thread (`thread.new` /
-/// `thread.set_model` `runtime`): a built-in agent runtime (Claude Code, Codex, Grok Build) or
-/// a `[runtimes.<name>]` preset the user configured. Never a command line (`acp:...`,
-/// `pty:...`), `pty`, `acp` or `fake`: those would let it run arbitrary commands.
+/// `thread.set_model` `runtime`): [`check_chosen_runtime`] for it.
 pub(super) fn check_orchestrator_runtime(
     requested: &str,
     config: &twr_core::config::Config,
 ) -> Result<(), RpcError> {
+    check_chosen_runtime(requested, config, Chooser::Orchestrator)
+}
+
+/// Who chooses a runtime under [`check_chosen_runtime`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Chooser {
+    /// The orchestrator (refused: `bad_request`).
+    Orchestrator,
+    /// A paired device without the `terminal` scope (`hub::device_scope`; refused:
+    /// `unauthorized`).
+    Device,
+}
+
+/// Whether `who` may choose runtime `requested` (`thread.new` / `thread.spawn` /
+/// `thread.set_model` `runtime`, a device's `orchestrator.use`): a built-in agent runtime
+/// (Claude Code, Codex, Grok Build; `:<account>` too) or a `[runtimes.<name>]` preset the user
+/// configured. Never a command line (`acp:...`, `pty:...`), `pty`, `acp` or `fake`: those would
+/// let it run arbitrary commands.
+pub(super) fn check_chosen_runtime(
+    requested: &str,
+    config: &twr_core::config::Config,
+    who: Chooser,
+) -> Result<(), RpcError> {
     // Of `claude-code:work`, the runtime: the account is checked against the pins
     // (`hub::thread_account`).
     let (requested, _) = runtime_spec::split_account(requested)?;
-    if ORCHESTRATOR_RUNTIMES.contains(&requested) || config.runtimes.contains_key(requested) {
+    // A preset named like a command line would still be read as one (`runtime_spec`).
+    if !twr_core::devices::is_command_runtime(requested)
+        && (ORCHESTRATOR_RUNTIMES.contains(&requested) || config.runtimes.contains_key(requested))
+    {
         return Ok(());
     }
     let mut allowed: Vec<&str> = ORCHESTRATOR_RUNTIMES.to_vec();
     allowed.extend(config.runtimes.keys().map(String::as_str));
-    Err(rpc(
-        codes::BAD_REQUEST,
-        format!(
-            "the orchestrator cannot choose runtime {requested:?} for a thread: it may choose \
-             {} (an agent runtime or a configured [runtimes.<name>] preset), never a command \
-             line; ask the user to do it",
-            allowed.join(", ")
+    let allowed = allowed.join(", ");
+    Err(match who {
+        Chooser::Orchestrator => rpc(
+            codes::BAD_REQUEST,
+            format!(
+                "the orchestrator cannot choose runtime {requested:?} for a thread: it may \
+                 choose {allowed} (an agent runtime or a configured [runtimes.<name>] preset), \
+                 never a command line; ask the user to do it"
+            ),
         ),
-    ))
+        Chooser::Device => rpc(
+            codes::UNAUTHORIZED,
+            format!(
+                "This device may not choose runtime {requested:?}: it may choose {allowed} (an \
+                 agent runtime or a configured [runtimes.<name>] preset); a command line needs \
+                 the terminal permission, which it was not paired with"
+            ),
+        ),
+    })
 }
 
 /// File name prefix of the orchestrator's MCP config files in the data directory.
@@ -3726,6 +3791,8 @@ impl Hub {
         // configured one for a first orchestrator.
         let (runtime, model, from) = match choice {
             Some((runtime, model)) => {
+                // A device names a command line only with `terminal` (`hub::device_scope`).
+                self.inner.check_caller_runtime(caller, runtime.trim())?;
                 let (runtime, model) = self.check_switch(runtime, model, caller)?;
                 (runtime, model, OrchAccountFrom::Switch)
             }
@@ -4217,6 +4284,7 @@ mod tests {
             proposals: Vec::new(),
             arrived: None,
             acted: false,
+            by: None,
         };
         let mut o = OrchState {
             thread: Some("orch-a".into()),

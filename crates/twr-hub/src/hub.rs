@@ -131,6 +131,7 @@ mod context;
 /// a file that must be neither a symlink swapped in nor a FIFO that blocks the open.
 pub use context::OPEN_FLAGS as OPEN_NOFOLLOW_NONBLOCK;
 mod delete;
+mod device_scope;
 mod disk;
 mod drain;
 mod find_project;
@@ -2812,12 +2813,7 @@ fn spawn_config(
 
 impl Hub {
     pub(crate) fn device_auth(&self) -> anyhow::Result<twr_core::devices::Auth> {
-        let config = self
-            .inner
-            .config_file
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Device pairing requires a configured hub"))?;
-        twr_core::devices::Auth::open(&config.with_file_name("mobile"))
+        self.inner.device_auth()
     }
     /// How many times the store was synced to disk so far ([`store::Store::sync`]). For
     /// tests of what is durable when.

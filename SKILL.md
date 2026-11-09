@@ -104,7 +104,17 @@ orchestrator).
 A gateway companion authenticates with `hello {client, protocol, device_token}`. The token
 is a paired-device credential, not an orchestrator token or the debug-only `user_token`.
 The hub reports `user:device:<id>`, checks the device's `read`, `operate`, `terminal` and
-`admin` grants on every method, and refuses methods without a grant. Revocation closes
+`admin` grants on every method, and refuses methods without a grant. It also checks what a
+method's parameters or a later step would do, judged by the device it came from
+(`unauthorized`): a `pty:`/`acp:` command line runtime (`thread.new`, `thread.spawn`,
+`thread.set_model`, `orchestrator.use`) needs `terminal`, and without it a device names only
+a built-in agent runtime (`:<account>` too) or a `[runtimes.<name>]` preset, as the
+orchestrator may. Every mode change needs `admin`: `thread.set_mode`, a new thread's `mode`
+other than `manual`, `plan`, `read-only` or `dontAsk`, a short mode command in `say` (refused
+whole, nothing sent), a `set_mode` the orchestrator relays from that device's message
+(`relay_forbidden`), and Confirm on a card that changes a mode or moves a thread (the card
+stays open). So do moving a thread to another runtime (directly, relayed or on a card) and
+`outside_pin`. Revocation closes
 existing connections too; a device list the hub cannot read revokes nothing (`hello` with a
 device token then fails with `internal`, not `unauthorized`). An agent or orchestrator cannot present a device token to widen
 its authority, and a device connection cannot become an unrestricted local user.
