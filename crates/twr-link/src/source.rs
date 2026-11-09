@@ -62,13 +62,16 @@ pub async fn export(executable: &Path) -> Result<(Source, tempfile::TempDir, Pat
         |_| false,
     )
     .await;
+    let no_source =
+        "this hub build has no recorded source; rebuild with linked-worker source capture";
     let twr_adapters::process::Bounded::Exited(Some(0), bytes) = output else {
-        anyhow::bail!(
-            "this hub build has no recorded source; rebuild with linked-worker source capture"
-        )
+        anyhow::bail!(no_source)
     };
     ensure!(bytes.len() >= 4, "source export is truncated");
     let len = u32::from_be_bytes(bytes[..4].try_into()?) as usize;
+    // A build whose checkout the capture refused records an empty manifest (its build
+    // warned why).
+    ensure!(len > 0, no_source);
     ensure!(
         len <= crate::wire::MAX_CONTROL && bytes.len() >= 4 + len,
         "source manifest exceeds limit"
@@ -467,6 +470,24 @@ mod tests {
         assert!(unrelated.try_wait()?.is_none());
         unrelated.kill().await?;
         unrelated.wait().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn a_build_that_captured_no_source_says_so() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("twr");
+        // What a build whose checkout the capture refused prints: an empty manifest.
+        std::fs::write(&executable, "#!/bin/sh\nprintf '\\000\\000\\000\\000'\n")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let error = export(&executable)
+            .await
+            .err()
+            .context("export succeeded")?;
+        assert!(
+            format!("{error:#}").contains("no recorded source"),
+            "{error:#}"
+        );
         Ok(())
     }
     #[tokio::test]
