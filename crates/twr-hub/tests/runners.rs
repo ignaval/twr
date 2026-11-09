@@ -1169,7 +1169,25 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
     // The configured box's refusal is recorded for `twr info` (the unknown box's is not).
     let r = h.hub().box_refusal(BOX).expect("a refusal of the box");
     assert!(r.reason.contains("does not match"), "{}", r.reason);
+    // It says who could have caused it: no runner proved the token.
+    assert!(
+        r.reason.contains("an unauthenticated connection from"),
+        "{}",
+        r.reason
+    );
     assert!(h.hub().box_refusal("nope").is_none());
+    // A hello naming no valid box (a forged log line, 8 KiB of it) is refused as malformed,
+    // before anything looks the name up or logs it.
+    let forged = format!("{BOX}\nINFO forged-line {}", "x".repeat(8000));
+    for name in [forged.as_str(), "", ".gpu", "gpu box"] {
+        let mut ws = raw(&h.url).await;
+        let (_, m) = raw_hello_only(&mut ws, name, PROTOCOL_VERSION).await;
+        let message = expect_error(m, hub_errors::PROTOCOL);
+        assert!(message.contains("box name"), "{message}");
+        assert!(!message.contains("forged-line"), "{message}");
+    }
+    let logs = String::from_utf8(LOGS.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains("forged-line"), "the name was logged");
     // A runner that leaves after the challenge (it did not accept the hub's proof).
     let mut ws = raw(&h.url).await;
     let (_, m) = raw_hello_only(&mut ws, BOX, PROTOCOL_VERSION).await;

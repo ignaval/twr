@@ -680,10 +680,31 @@ where
             return Err(Refused::Other);
         }
     };
+    // A name no box can have is never looked up, logged or echoed (it may be 8 KiB of
+    // anything, before authentication).
+    if twr_core::runner::validate_box_name(&hello.box_name).is_err() {
+        tracing::warn!(
+            peer,
+            len = hello.box_name.len(),
+            "runner refused: its hello names no valid box"
+        );
+        let m = refuse(
+            hub_errors::PROTOCOL,
+            "malformed hello: its box name is not a valid box name".into(),
+        );
+        refuse_unauthenticated(ws, permit, Some(m)).await;
+        return Err(Refused::Other);
+    }
+    // What a refusal before authentication notes on the box it named: on a listener's
+    // connection anyone who reaches the listener may have sent it, which the note says.
+    let unauthenticated = |reason: String| match &bound {
+        None => format!("{reason} (an unauthenticated connection from {peer})"),
+        Some(_) => reason,
+    };
     // Before anything else: a runner of another version need not speak this handshake. One of
     // an older protocol the hub drains does (`DRAINABLE_PROTOCOLS`), and goes on.
     if hello.protocol != PROTOCOL_VERSION && !drainable(hello.protocol) {
-        tracing::warn!(peer, box_name = %hello.box_name, protocol = hello.protocol, "runner refused: protocol mismatch");
+        tracing::warn!(peer, box_name = ?hello.box_name, protocol = hello.protocol, "runner refused: protocol mismatch");
         let update = if hello.protocol < PROTOCOL_VERSION {
             format!("update twr on box `{}`", hello.box_name)
         } else {
@@ -693,11 +714,11 @@ where
             .remote(&hello.box_name)
             .filter(|b| bound.as_deref().is_none_or(|n| n == b.name()));
         if let Some(b) = named {
-            b.note_refusal(format!(
+            b.note_refusal(unauthenticated(format!(
                 "a runner speaking protocol {} was refused (the hub's is {PROTOCOL_VERSION}): \
                  {update}",
                 hello.protocol
-            ));
+            )));
         }
         let m = refuse(
             hub_errors::PROTOCOL,
@@ -719,7 +740,7 @@ where
         return Err(Refused::Other);
     }
     if let Some(b) = bound.as_deref().filter(|b| *b != hello.box_name) {
-        tracing::warn!(peer, box_name = %hello.box_name, bound = %b, "runner refused: a sealed connection named another box");
+        tracing::warn!(peer, box_name = ?hello.box_name, bound = %b, "runner refused: a sealed connection named another box");
         let m = refuse(
             hub_errors::UNAUTHORIZED,
             format!("this connection is box {b}'s"),
@@ -782,12 +803,13 @@ where
         }
         Next::Closed => {
             // A runner that did not accept the hub's proof leaves without a word.
-            tracing::warn!(peer, box_name = %hello.box_name, "runner left before it authenticated (did it refuse the hub's proof? its token may differ from the hub's)");
+            tracing::warn!(peer, box_name = ?hello.box_name, "runner left before it authenticated (did it refuse the hub's proof? its token may differ from the hub's)");
             if let (Some(b), None) = (&rbox, &bound) {
-                b.note_refusal(
+                b.note_refusal(unauthenticated(
                     "a runner left after the hub's challenge: it did not accept the hub's \
-                     proof, so its token likely differs from this box's token",
-                );
+                     proof, so its token likely differs from this box's token"
+                        .into(),
+                ));
             }
             return Err(Refused::Other);
         }
@@ -805,14 +827,18 @@ where
         };
         if !ok {
             b.note_refusal(match &bound {
-                None => "a runner was refused: its proof does not match this box's token",
-                Some(_) => "the box's runner was refused: it sent a proof on a sealed connection",
+                None => unauthenticated(
+                    "a runner was refused: its proof does not match this box's token".into(),
+                ),
+                Some(_) => {
+                    "the box's runner was refused: it sent a proof on a sealed connection".into()
+                }
             });
         }
         ok
     });
     let Some(rbox) = rbox else {
-        tracing::warn!(peer, box_name = %hello.box_name, "runner refused: unknown box or bad token");
+        tracing::warn!(peer, box_name = ?hello.box_name, "runner refused: unknown box or bad token");
         let m = refuse(hub_errors::UNAUTHORIZED, "unknown box or bad token".into());
         refuse_unauthenticated(ws, permit, Some(m)).await;
         return Err(Refused::Other);
