@@ -172,6 +172,9 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());
     }
+    if let Some(lost) = &state.view.hub_lost {
+        render_hub_lost(frame, area, lost, &mut panes);
+    }
     // Drawn in full color, then brought down to the colors the terminal has (`[tui] colors`).
     crate::color::degrade(frame.buffer_mut(), state.view.colors);
     // The clock ticks only for a moving cell still on screen once the overlays are drawn
@@ -180,6 +183,39 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     panes.moving.retain(|c| on(screen, *c));
     panes.animated = !panes.moving.is_empty();
     panes
+}
+
+/// The band across the top row while the hub's streams are gone ([`crate::app::HubLost`]):
+/// over whatever is there, so nothing hides it, and what it covers is not on screen (no key
+/// answers an item under it, no tap reaches a control there).
+fn render_hub_lost(frame: &mut Frame, area: Rect, lost: &crate::app::HubLost, panes: &mut Panes) {
+    let row = Rect::new(area.x, area.y, area.width, area.height.min(1));
+    if row.height == 0 || row.width == 0 {
+        return;
+    }
+    panes.cover(Some(row));
+    let style = if lost.refused {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let width = usize::from(row.width);
+    let text = truncate_cells(&format!(" ⚠ {}", lost.text), width);
+    let fill = width.saturating_sub(crate::edit::width(&text));
+    frame.render_widget(Clear, row);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{text}{}", " ".repeat(fill)),
+            style,
+        ))),
+        row,
+    );
 }
 
 /// The tab strip's control of the sidebar.
@@ -458,7 +494,8 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     ),
     (
         "Ctrl-C",
-        "stop the ! command you started on this thread while it runs, else quit (/quit)",
+        "stop the ! command you started on this thread while it runs; else, with text in the \
+         box, clear it (Up brings it back; Ctrl-C again quits); else quit (/quit)",
     ),
 ];
 
@@ -7951,6 +7988,10 @@ fn render_popup(
     let sel = state.popup_selected(s.items.len());
     let first = table_first_row(sel, fit);
     let inner_w = usize::from(width.saturating_sub(2));
+    // On a phone, where a row is two tall anyway, what doesn't fit beside its label goes on
+    // the row's second line, cut with `…` (else the second line would be empty and the
+    // description dropped).
+    let stacked = phone && label_w + detail_w + 3 > inner_w;
     let lines: Vec<Line> = s
         .items
         .iter()
@@ -7958,23 +7999,32 @@ fn render_popup(
         .skip(first)
         .take(fit)
         .flat_map(|(i, item)| {
-            let label = format!(" {:<label_w$} ", truncate(&item.label, label_w));
-            let detail = truncate(&item.detail, inner_w.saturating_sub(label_w + 3));
             let mut label_style = Style::default().fg(Color::Cyan);
             let mut detail_style = Style::default().fg(Color::DarkGray);
             if i == sel {
                 label_style = label_style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 detail_style = Style::default().add_modifier(Modifier::REVERSED);
             }
-            let line = Line::from(vec![
-                Span::styled(label, label_style),
-                Span::styled(format!(" {detail}"), detail_style),
-            ]);
+            let lines = if stacked {
+                let label = truncate(&item.label, inner_w.saturating_sub(2));
+                let detail = truncate(&item.detail, inner_w.saturating_sub(3));
+                vec![
+                    Line::from(Span::styled(format!(" {label} "), label_style)),
+                    Line::from(Span::styled(format!("   {detail}"), detail_style)),
+                ]
+            } else {
+                let label = format!(" {:<label_w$} ", truncate(&item.label, label_w));
+                let detail = truncate(&item.detail, inner_w.saturating_sub(label_w + 3));
+                vec![Line::from(vec![
+                    Span::styled(label, label_style),
+                    Span::styled(format!(" {detail}"), detail_style),
+                ])]
+            };
             if phone {
                 let bg = if i.is_multiple_of(2) { BAND } else { BAND_ALT };
-                tap_band(vec![line], inner_w, bg)
+                tap_band(lines, inner_w, bg)
             } else {
-                vec![line]
+                lines
             }
         })
         .collect();
@@ -8761,15 +8811,19 @@ fn popup_item_rows(
 /// Key help for what is on screen, most important first (the status bar cuts it from the
 /// right). A line break is Shift-Enter where it is known to arrive apart from Enter
 /// ([`crate::app::ViewState::shift_enter`]), Ctrl-J elsewhere.
+/// With text in the input box, Ctrl-C clears it rather than quitting
+/// ([`AppState::clear_draft`]), and the hint says so.
 pub fn hints(state: &AppState) -> std::borrow::Cow<'static, str> {
-    let hints = screen_hints(state);
-    if state.view.shift_enter {
-        hints.into()
-    } else {
-        hints
+    let mut hints: std::borrow::Cow<'static, str> = screen_hints(state).into();
+    if !state.view.shift_enter {
+        hints = hints
             .replace("Shift-Enter new line", "Ctrl-J new line")
-            .into()
+            .into();
     }
+    if !state.view.input.trim().is_empty() && !state.ctrl_c_stops() {
+        hints = hints.replace("Ctrl-C quit", "Ctrl-C clear").into();
+    }
+    hints
 }
 
 /// [`hints`], with Shift-Enter for a line break: one line for each view and what is selected
@@ -16920,6 +16974,79 @@ mod tests {
             buf[(input.x + 1, input.y - 1)].bg,
             target_fill(st.dived()).bg.unwrap()
         );
+    }
+
+    /// On a phone, where a command's description doesn't fit beside it, the description is the
+    /// second row of its two-row choice (that row was left empty), cut with `…`; the counter
+    /// still counts every command.
+    #[test]
+    fn the_compact_slash_popup_puts_descriptions_under_their_commands() {
+        let mut st = three_threads();
+        st.view.compact_width = 60;
+        st.handle_key(key(KeyCode::Char('/')));
+        let total = st.popup().unwrap().items.len();
+        let lines = draw_panes(&mut st, 46, 30);
+        let s = screen(&lines);
+        assert!(st.compact(), "{s}");
+        let pop = st.view.panes.get(&PaneId::Popup).unwrap().area;
+        let items = st.popup().unwrap().items.clone();
+        let fit = usize::from(pop.height / TAP_ROWS);
+        assert!(fit >= 2, "{s}");
+        for (k, item) in items.iter().take(fit).enumerate() {
+            let label = &lines[usize::from(pop.y) + 2 * k];
+            let detail = &lines[usize::from(pop.y) + 2 * k + 1];
+            let name: String = item.label.chars().take(12).collect();
+            assert!(label.contains(&name), "{k}: {s}");
+            let start: String = item.detail.chars().take(10).collect();
+            assert!(
+                detail.contains(&start),
+                "{k}: {start:?} under {label:?}: {s}"
+            );
+        }
+        assert!(s.contains(&format!(" 1/{total} ")), "{s}");
+        // Wide, the description stays beside its command.
+        let lines = draw_panes(&mut st, 120, 30);
+        let pop = st.view.panes.get(&PaneId::Popup).unwrap().area;
+        let first = &lines[usize::from(pop.y)];
+        let start: String = items[0].detail.chars().take(10).collect();
+        assert!(first.contains(items[0].label.as_str()) && first.contains(&start));
+    }
+
+    /// While the hub's streams are gone, the band across the top row says so whatever the
+    /// status bar says, over every view and the compact layout; what it covers is no target.
+    #[test]
+    fn the_hub_lost_band_stays_on_the_top_row() {
+        let mut st = three_threads();
+        st.view.hub_lost = Some(crate::app::HubLost {
+            text: crate::HUB_LOST.into(),
+            refused: false,
+        });
+        st.view.status = Some("sent to the orchestrator".into());
+        for (w, compact) in [(120, false), (46, true)] {
+            st.view.compact = Some(compact);
+            let lines = draw_panes(&mut st, w, 30);
+            assert!(
+                lines[0].starts_with(" ⚠ hub connection lost"),
+                "{w}: {}",
+                screen(&lines)
+            );
+            assert!(st
+                .view
+                .panes
+                .targets
+                .iter()
+                .all(|(r, _)| r.y > 0 || r.height == 0));
+        }
+        st.view.compact = Some(false);
+        st.view.hub_lost = Some(crate::app::HubLost {
+            text: crate::HUB_REFUSES.into(),
+            refused: true,
+        });
+        let buf = crate::app::tests::draw(&mut st, 120, 30);
+        assert_eq!(buf[(1, 0)].bg, Color::Red);
+        st.view.hub_lost = None;
+        let lines = draw_panes(&mut st, 120, 30);
+        assert!(!screen(&lines).contains("hub connection lost"));
     }
 
     /// The popup lists the matching commands with their descriptions above the input line.

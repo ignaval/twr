@@ -1258,9 +1258,38 @@ pub fn status_text(hub: TabHub, glance: Option<&Glance>) -> (String, Style) {
     }
 }
 
+/// Whether `line` is a table's delimiter row (`|---|:--:|`, `--- | ---`): left out of a
+/// preview.
+fn table_rule(line: &str) -> bool {
+    line.contains('-')
+        && (line.contains('|') || line.contains(':'))
+        && line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// The words of `line`, a table's row (`| a | b c |`) as its cells run together, `·` between
+/// them; any other line's words as they are.
+fn table_cells(line: &str) -> Vec<&str> {
+    if !(line.starts_with('|') && line.len() > 1) {
+        return line.split_whitespace().collect();
+    }
+    let mut words = Vec::new();
+    for cell in line
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        if !words.is_empty() {
+            words.push("·");
+        }
+        words.extend(cell.split_whitespace());
+    }
+    words
+}
+
 /// The start of a reply as a card shows it: its prose run together (the thread boxes'
-/// `<thread>` tags, Markdown's heading, quote and list marks, emphasis and code ticks left
-/// out), wrapped to `width` on at most `max` rows, the last one cut with `…` when there is
+/// `<thread>` tags, Markdown's heading, quote and list marks, a table's pipes and rule,
+/// emphasis and code ticks left out), wrapped to `width` on at most `max` rows, the last one cut with `…` when there is
 /// more.
 pub fn preview_rows(text: &str, width: usize, max: usize) -> Vec<String> {
     if width == 0 || max == 0 {
@@ -1271,10 +1300,13 @@ pub fn preview_rows(text: &str, width: usize, max: usize) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|l| {
-            !(l.starts_with("<thread") || l.starts_with("</thread") || l.starts_with("```"))
+            !(l.starts_with("<thread")
+                || l.starts_with("</thread")
+                || l.starts_with("```")
+                || table_rule(l))
         })
         .map(|l| l.trim_start_matches(['#', '>', '-', '*', '+', ' ']))
-        .flat_map(str::split_whitespace)
+        .flat_map(table_cells)
         .map(|w| w.replace("**", "").replace('`', ""))
         .filter(|w| !w.is_empty())
         .peekable();
@@ -3455,5 +3487,13 @@ pub(crate) mod tests {
         assert_eq!(preview_rows("", 20, 2), Vec::<String>::new());
         // A word wider than the row is cut.
         assert_eq!(preview_rows("abcdefghijklmnop", 6, 1), vec!["abcde…"]);
+        // A table: its cells run together, without its pipes or its rule.
+        let table = "Status:\n\n| Thread | State |\n|---|:--:|\n| api | running |\n| web | idle |";
+        assert_eq!(
+            preview_rows(table, 40, 2),
+            vec!["Status: Thread · State api · running web", "· idle"]
+        );
+        // A pipe in prose stays.
+        assert_eq!(preview_rows("a | b", 20, 1), vec!["a | b"]);
     }
 }

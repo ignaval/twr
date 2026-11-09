@@ -1,7 +1,7 @@
 //! Markdown in the main pane, drawn the way Claude Code draws a reply: `**bold**` bold,
 //! `` `code` `` in light blue without its backticks, headings bold without their `#`s, list
 //! items with their marker and a hanging indent, fenced code blocks without their fences, quotes
-//! after a dim bar, and rules as a dim line. Markers that open nothing (an unclosed `**`, a
+//! after a dim bar, rules as a dim line, and tables as aligned columns ([`table_rows`]). Markers that open nothing (an unclosed `**`, a
 //! lone backtick) stay as typed, so text still streaming in reads as written.
 //!
 //! [`rows`] wraps the result to a width, each row with how it continues the row above
@@ -82,8 +82,9 @@ pub fn rows(text: &str, width: usize, indent: usize) -> Vec<MdRow> {
         code: None,
         html: false,
         links: Vec::new(),
+        table: None,
     };
-    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
     for (ev, range) in Parser::new_ext(&text, opts).into_offset_iter() {
         match ev {
             Event::Start(tag) => match tag {
@@ -122,6 +123,20 @@ pub fn rows(text: &str, width: usize, indent: usize) -> Vec<MdRow> {
                         drawn: false,
                         start,
                     });
+                }
+                Tag::Table(aligns) => {
+                    r.block();
+                    r.table = Some(Table {
+                        aligns,
+                        rows: Vec::new(),
+                        row: Vec::new(),
+                    });
+                }
+                Tag::TableHead => r.push_style(|s| s.add_modifier(Modifier::BOLD)),
+                Tag::TableRow => {}
+                Tag::TableCell => {
+                    r.line.clear();
+                    r.line_bytes = 0;
                 }
                 Tag::Emphasis => r.push_style(|s| s.add_modifier(Modifier::ITALIC)),
                 Tag::Strong => r.push_style(|s| s.add_modifier(Modifier::BOLD)),
@@ -180,6 +195,28 @@ pub fn rows(text: &str, width: usize, indent: usize) -> Vec<MdRow> {
                         }
                     }
                 }
+                TagEnd::TableCell => {
+                    let cell = std::mem::take(&mut r.line);
+                    r.line_bytes = 0;
+                    if let Some(t) = r.table.as_mut() {
+                        t.row.push(cell);
+                    }
+                }
+                TagEnd::TableHead | TagEnd::TableRow => {
+                    if tag == TagEnd::TableHead {
+                        r.styles.pop();
+                    }
+                    if let Some(t) = r.table.as_mut() {
+                        let row = std::mem::take(&mut t.row);
+                        t.rows.push(row);
+                    }
+                }
+                TagEnd::Table => {
+                    if let Some(t) = r.table.take() {
+                        let rows = table_rows(&t, r.width, r.indent());
+                        r.emit(rows);
+                    }
+                }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     r.styles.pop();
                 }
@@ -209,6 +246,11 @@ pub fn rows(text: &str, width: usize, indent: usize) -> Vec<MdRow> {
                 }
             }
             Event::Html(t) | Event::InlineHtml(t) => r.text(&t),
+            // (A cell is one line: a break in it is a space.)
+            Event::SoftBreak | Event::HardBreak if r.table.is_some() => {
+                let style = r.style();
+                r.put(" ".into(), style);
+            }
             Event::SoftBreak | Event::HardBreak => r.flush(),
             Event::Rule => {
                 r.block();
@@ -303,6 +345,186 @@ struct Render {
     /// The open links (an image may sit in one): where each label starts in `line` (its span
     /// and the bytes before it), and its target.
     links: Vec<(usize, usize, String)>,
+    /// A table being read: its cells are built in `line`, one at a time.
+    table: Option<Table>,
+}
+
+/// A table as [`rows`] reads it: its columns' alignments, its rows (the header first), each a
+/// cell's styled text, and the row being read.
+struct Table {
+    aligns: Vec<pulldown_cmark::Alignment>,
+    rows: Vec<Vec<Vec<(String, Style)>>>,
+    row: Vec<Vec<(String, Style)>>,
+}
+
+/// Below this many cells of room, a table too wide for it is drawn as records
+/// ([`table_records`]): columns that narrow would cut every cell into slivers.
+const TABLE_RECORDS_BELOW: usize = 40;
+
+/// The narrowest a column is made to fit a table into its room ([`table_rows`]); a table that
+/// can't give each column this much is drawn as records.
+const TABLE_MIN_COLUMN: usize = 4;
+
+/// Between two columns.
+const TABLE_SEPARATOR: &str = " │ ";
+
+/// Table `t` laid out in `width` cells after `indent`: its header in bold, a dim rule under
+/// it, then its rows, each column as wide as its widest cell and aligned as the table says
+/// (`:--`, `:-:`, `--:`), dim bars between them. A table wider than its room has its widest
+/// columns narrowed until it fits, each cell wrapping onto as many rows as it needs (a word
+/// wider than its column cut between its characters), so nothing of it is lost; on a pane
+/// too narrow for that it is drawn as records ([`table_records`]). Each row is led by
+/// `indent` spaces (the containers around it are drawn there, [`Render::emit`]).
+fn table_rows(t: &Table, width: usize, indent: usize) -> Vec<MdRow> {
+    let lead = indent.min(width / 2);
+    let room = width.saturating_sub(lead).max(1);
+    let n = t
+        .aligns
+        .len()
+        .max(t.rows.iter().map(Vec::len).max().unwrap_or(0));
+    if n == 0 || t.rows.is_empty() {
+        return Vec::new();
+    }
+    let cell_width = |c: &[(String, Style)]| -> usize {
+        c.iter().map(|(text, _)| crate::edit::width(text)).sum()
+    };
+    let mut natural = vec![1; n];
+    for row in &t.rows {
+        for (i, cell) in row.iter().enumerate() {
+            natural[i] = natural[i].max(cell_width(cell));
+        }
+    }
+    let seps = crate::edit::width(TABLE_SEPARATOR) * (n - 1);
+    let widths = if natural.iter().sum::<usize>() + seps <= room {
+        natural
+    } else if room >= TABLE_RECORDS_BELOW && room >= seps + n * TABLE_MIN_COLUMN {
+        narrowed(&natural, room - seps)
+    } else {
+        return table_records(t, width, lead);
+    };
+    let dim = Style::default().fg(DIM);
+    let mut out = Vec::new();
+    for (r, row) in t.rows.iter().enumerate() {
+        // Each cell wrapped to its column: the row is as tall as its tallest cell.
+        let cells: Vec<Vec<MdRow>> = (0..n)
+            .map(|i| match row.get(i) {
+                Some(cell) if !cell.is_empty() => wrap(cell.clone(), widths[i], 0, 0),
+                _ => Vec::new(),
+            })
+            .collect();
+        let tall = cells.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        for k in 0..tall {
+            let mut spans = vec![Span::raw(" ".repeat(lead))];
+            for (i, cell) in cells.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::styled(TABLE_SEPARATOR, dim));
+                }
+                let content: Vec<Span<'static>> = cell
+                    .get(k)
+                    .map(|line| line.line.spans.iter().skip(1).cloned().collect())
+                    .unwrap_or_default();
+                let used: usize = content.iter().map(|s| s.width()).sum();
+                let pad = widths[i].saturating_sub(used);
+                let last = i + 1 == n;
+                let (before, after) = match t.aligns.get(i) {
+                    Some(pulldown_cmark::Alignment::Right) => (pad, 0),
+                    Some(pulldown_cmark::Alignment::Center) => (pad / 2, pad - pad / 2),
+                    _ => (0, pad),
+                };
+                if before > 0 {
+                    spans.push(Span::raw(" ".repeat(before)));
+                }
+                spans.extend(content);
+                // (The last column's padding would only be trailing spaces.)
+                if after > 0 && !last {
+                    spans.push(Span::raw(" ".repeat(after)));
+                }
+            }
+            out.push(MdRow {
+                line: Line::from(spans),
+                join: Join::Newline,
+                gutter: lead,
+            });
+        }
+        if r == 0 {
+            let rule = widths
+                .iter()
+                .map(|&w| "─".repeat(w))
+                .collect::<Vec<_>>()
+                .join("─┼─");
+            out.push(MdRow {
+                line: Line::from(vec![Span::raw(" ".repeat(lead)), Span::styled(rule, dim)]),
+                join: Join::Newline,
+                gutter: lead,
+            });
+        }
+    }
+    out
+}
+
+/// Column widths for a table whose columns want `natural` cells each, within `budget`: a
+/// column that fits in an even share of what is left keeps its width, the rest share what
+/// those leave (so a narrow column is never narrowed for a wide one).
+fn narrowed(natural: &[usize], budget: usize) -> Vec<usize> {
+    let mut widths = natural.to_vec();
+    let mut open: Vec<usize> = (0..natural.len()).collect();
+    let mut left = budget;
+    while !open.is_empty() {
+        let share = left / open.len();
+        let (fit, wide): (Vec<usize>, Vec<usize>) =
+            open.iter().partition(|&&i| natural[i] <= share);
+        if fit.is_empty() {
+            let extra = left % wide.len();
+            for (k, &i) in wide.iter().enumerate() {
+                widths[i] = share + usize::from(k < extra);
+            }
+            break;
+        }
+        for &i in &fit {
+            left -= natural[i];
+        }
+        open = wide;
+    }
+    widths
+}
+
+/// Table `t` on a pane too narrow for its columns: each row as a record, a line per cell
+/// (`header: value`, the header bold, wrapped under itself), records apart by a blank row. A
+/// table with no rows under its header shows the header's cells on a line, ` · ` between.
+fn table_records(t: &Table, width: usize, lead: usize) -> Vec<MdRow> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let plain = |cell: &[(String, Style)]| -> String {
+        cell.iter().map(|(text, _)| text.as_str()).collect()
+    };
+    let head = &t.rows[0];
+    let body = &t.rows[1..];
+    if body.is_empty() {
+        let names: Vec<String> = head.iter().map(|c| plain(c)).collect();
+        return wrap(vec![(names.join(" · "), bold)], width, lead, lead);
+    }
+    let mut out = Vec::new();
+    for (k, row) in body.iter().enumerate() {
+        if k > 0 {
+            out.push(MdRow {
+                line: Line::from(Span::raw(" ".repeat(lead))),
+                join: Join::Newline,
+                gutter: lead,
+            });
+        }
+        for (i, cell) in row.iter().enumerate() {
+            let name = head.get(i).map(|c| plain(c)).unwrap_or_default();
+            let mut spans = Vec::new();
+            if !name.trim().is_empty() {
+                spans.push((format!("{}: ", name.trim()), bold));
+            }
+            spans.extend(cell.iter().cloned());
+            if spans.is_empty() {
+                continue;
+            }
+            out.extend(wrap(spans, width, lead, lead + 2));
+        }
+    }
+    out
 }
 
 impl Render {
@@ -431,9 +653,9 @@ impl Render {
         }
     }
 
-    /// Ends the line being built: its rows.
+    /// Ends the line being built: its rows. (Not in a table, whose cells are taken whole.)
     fn flush(&mut self) {
-        if self.line.is_empty() {
+        if self.line.is_empty() || self.table.is_some() {
             return;
         }
         let spans = std::mem::take(&mut self.line);
@@ -742,6 +964,117 @@ mod tests {
             .add_modifier
             .contains(Modifier::BOLD));
         assert_eq!(styled(&r, "fn main() {").unwrap().style.fg, Some(CODE));
+    }
+
+    /// A GFM table: aligned columns, its header bold over a dim rule, cells keeping their
+    /// inline styles and each column's alignment, wide characters taking two cells.
+    #[test]
+    fn tables_are_drawn_as_aligned_columns() {
+        let md = "Threads:\n\n| Thread | State | Turns |\n|:--|:-:|--:|\n| **api** | `running` | 3 |\n| 日本 | idle | 12 |\n\nAfter.";
+        let r = rows(md, 80, 2);
+        assert_eq!(
+            texts(&r),
+            [
+                "  Threads:",
+                "",
+                "  Thread │  State  │ Turns",
+                "  ───────┼─────────┼──────",
+                "  api    │ running │     3",
+                "  日本   │  idle   │    12",
+                "",
+                "  After.",
+            ]
+        );
+        assert!(styled(&r, "Thread")
+            .unwrap()
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(styled(&r, "api")
+            .unwrap()
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(styled(&r, "running").unwrap().style.fg, Some(CODE));
+        assert_eq!(
+            styled(&r, "───────┼─────────┼──────").unwrap().style.fg,
+            Some(DIM)
+        );
+        // Rows copy as rows, without the indentation.
+        assert!(r[2..6]
+            .iter()
+            .all(|r| r.join == Join::Newline && r.gutter == 2));
+        // Inside a list item and a quote, the containers lead every row.
+        assert_eq!(
+            texts(&rows("- | a | b |\n  |---|---|\n  | 1 | 2 |", 40, 0)),
+            ["- a │ b", "  ──┼──", "  1 │ 2"]
+        );
+        assert_eq!(
+            texts(&rows("> | a | b |\n> |---|---|\n> | 1 | 2 |", 40, 0)),
+            ["│ a │ b", "│ ──┼──", "│ 1 │ 2"]
+        );
+    }
+
+    /// A table wider than the pane: its widest columns narrowed until it fits, their cells
+    /// wrapping (a long word cut), nothing lost and no row past the width; very narrow, each
+    /// row as a record of `header: value` lines.
+    #[test]
+    fn a_table_wider_than_the_pane_fits_it() {
+        let md = "| id | what | note |\n|---|---|---|\n| 1 | rewrite the scroll anchoring so long transcripts keep their place | ok |\n| 2 | 日本語のテキストがとても長い | supercalifragilisticexpialidocious |";
+        for width in [44, 52, 60] {
+            let r = rows(md, width, 2);
+            for row in &r {
+                assert!(row.line.width() <= width, "{width}: {:?}", texts(&r));
+            }
+            let all = texts(&r).concat();
+            for word in ["rewrite", "anchoring", "place", "ok", "日本語"] {
+                assert!(all.contains(word), "{width}: {word}: {:?}", texts(&r));
+            }
+            // The narrow id column keeps its width; the rule matches the columns.
+            assert!(texts(&r)[0].starts_with("  id │ what"), "{:?}", texts(&r));
+            assert!(texts(&r)[1].starts_with("  ───┼─"), "{:?}", texts(&r));
+        }
+        // Under 40 columns: records.
+        let r = rows(md, 30, 2);
+        assert_eq!(
+            texts(&r)[..5],
+            [
+                "  id: 1",
+                "  what: rewrite the scroll",
+                "    anchoring so long",
+                "    transcripts keep their",
+                "    place",
+            ]
+        );
+        assert!(
+            texts(&r).contains(&"  note: ok".to_string()),
+            "{:?}",
+            texts(&r)
+        );
+        assert!(
+            r.iter().all(|row| row.line.width() <= 30),
+            "{:?}",
+            texts(&r)
+        );
+        assert!(styled(&r, "what: ")
+            .unwrap()
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        // A table that fits stays a table, however narrow the pane.
+        assert_eq!(
+            texts(&rows("| a | b |\n|---|---|\n| 1 | 2 |", 12, 0)),
+            ["a │ b", "──┼──", "1 │ 2"]
+        );
+        // A header alone; a row short of cells.
+        assert_eq!(
+            texts(&rows("| a | b |\n|---|---|", 40, 0)),
+            ["a │ b", "──┼──"]
+        );
+        assert_eq!(
+            texts(&rows("| a | b |\n|---|---|\n| 1 |", 40, 0)),
+            ["a │ b", "──┼──", "1 │ "]
+        );
     }
 
     #[test]
