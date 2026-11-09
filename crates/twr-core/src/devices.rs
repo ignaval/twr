@@ -83,6 +83,11 @@ impl Auth {
                 .all(|s| ["read", "operate", "terminal", "admin"].contains(&s.as_str())),
             "Unknown device scope"
         );
+        // Admin writes configuration, which can name commands the hub runs.
+        anyhow::ensure!(
+            !scopes.iter().any(|s| s == "admin") || scopes.iter().any(|s| s == "terminal"),
+            "Admin access includes running commands; grant terminal access with it"
+        );
         let mut bytes = [0u8; 10];
         SystemRandom::new().fill(&mut bytes).expect("OS entropy");
         let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -424,6 +429,18 @@ mod tests {
         assert!(auth.cancel_pairing(&third).unwrap());
         assert!(!auth.cancel_pairing(&third).unwrap());
         assert!(auth.pair(&third, "reader").is_err());
+    }
+    #[test]
+    fn admin_invitations_include_terminal_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let error = auth
+            .begin(vec!["read".into(), "operate".into(), "admin".into()])
+            .unwrap_err();
+        assert!(error.to_string().contains("terminal"));
+        let scopes = ["read", "operate", "terminal", "admin"].map(String::from);
+        let code = auth.begin(scopes.to_vec()).unwrap();
+        assert_eq!(auth.pair(&code, "owner").unwrap().0.scopes, scopes);
     }
     #[test]
     fn read_only_history_access_cannot_answer_or_send() {

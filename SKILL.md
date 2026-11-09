@@ -430,7 +430,7 @@ MCP tool text:
 | method | params | result | notable errors |
 |---|---|---|---|
 | `hello` | `{client, token?, protocol?, user_token?, device_token?}` (`user_token`: tests only, see docs/development.md) | `{client, identity, workspace}` (`"user:<client>"` or `"orchestrator"`; the workspace the hub serves) | `bad_request`, `unauthorized`, `internal` (a device token when paired devices cannot be read), `unsupported` (a twr older than the hub) |
-| `device.pair_begin` | `{scopes?: [read, operate, terminal, admin]}` (default read + operate; local owner only) | `{code, expires_in: 300}`; a fresh code replaces the pending code | `bad_request`, `unauthorized` |
+| `device.pair_begin` | `{scopes?: [read, operate, terminal, admin]}` (default read + operate; `admin` only with `terminal`, since configuration can name commands; local owner only) | `{code, expires_in: 300}`; a fresh code replaces the pending code | `bad_request`, `unauthorized` |
 | `device.pair_complete` | `{code, name}` (local owner/gateway pairing path only) | `{id, name, scopes, token}`; the token is returned once and must be kept secret | `bad_request`, `unauthorized` |
 | `device.pair_cancel` | `{code}` (local owner only) | `{cancelled}`; cancels only the matching invitation, preserving a newer replacement | `bad_request`, `unauthorized` |
 | `device.list` | - (local owner or device with admin) | `[{id, name, created, scopes}]`; never token hashes | `unauthorized` |

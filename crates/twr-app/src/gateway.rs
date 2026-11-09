@@ -65,9 +65,12 @@ struct Args {
     /// Desktop launcher: bounded, private operational log.
     #[arg(long)]
     log_file: Option<PathBuf>,
+    /// Grant remote shells, attach, jobs and interactive CLI flows.
     #[arg(long)]
     allow_terminal: bool,
-    #[arg(long)]
+    /// Grant accounts, boxes, configuration and modes. Configuration can name commands the
+    /// hub runs, so admin includes command execution and needs --allow-terminal.
+    #[arg(long, requires = "allow_terminal")]
     allow_admin: bool,
     #[arg(long)]
     revoke: Option<String>,
@@ -199,6 +202,21 @@ mod socket_tests {
         assert!(Args::try_parse_from(["gateway", "--read-only"]).is_err());
         let args = Args::try_parse_from(["gateway", "--pair", "--allow-terminal"]).unwrap();
         assert_eq!(pairing_scopes(&args), vec!["read", "operate", "terminal"]);
+        // Admin can write configuration that names commands: it comes with terminal only.
+        let error = Args::try_parse_from(["gateway", "--pair", "--allow-admin"])
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--allow-terminal"));
+        let args = Args::try_parse_from(["gateway", "--pair", "--allow-admin", "--allow-terminal"])
+            .unwrap();
+        assert_eq!(
+            pairing_scopes(&args),
+            vec!["read", "operate", "terminal", "admin"]
+        );
     }
     fn bearer(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();

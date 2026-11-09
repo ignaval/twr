@@ -60,7 +60,8 @@ control grants nothing. Unknown methods are refused. Agents and the orchestrator
 use device credentials to gain user authority, and devices cannot pair more devices.
 
 Capabilities are authority over twr, not OS isolation: operate can direct agents using the
-hub's configured modes; terminal permits host commands. Store credentials in the native
+hub's configured modes; terminal permits host commands, and so does admin, whose configuration
+changes can name commands the hub runs: an invitation grants admin only with terminal. Store credentials in the native
 Keychain/Keystore, not the web renderer. The companion receives them over stdin. The host
 keeps token hashes in owner-private device state and checks revocation during connections.
 Same-user processes that can alter this state remain outside the boundary, like other
