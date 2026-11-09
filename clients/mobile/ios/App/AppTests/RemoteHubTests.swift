@@ -375,7 +375,8 @@ final class RemoteHubTests: XCTestCase {
           [...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
            .find(e=>e.getClientRects().length&&e.textContent.includes('Needs you')).click();return true;
           """)
-        try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed'))")
+        // A request's options answer only once they have been on screen for 600 ms (armed).
+        try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')&&e.closest('.attention-options')?.getAttribute('data-armed')==='true')")
         _ = try await js("[...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')).click();return true")
         try await until("return window.__qaEvents.some(e=>e.type==='thread' && e.event?.kind==='agent.text' && e.event?.data?.text?.includes('IOS_ANSWERED'))")
         let commandIds = try await js("return (await window.twr.catalog()).map(command => command.id).sort()") as? [String]
@@ -407,7 +408,7 @@ final class RemoteHubTests: XCTestCase {
         // Calling the host API alone intentionally leaves the terminal's UI history open.
         _ = try await js("document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]').click();return true")
         try await until("return !!document.querySelector('[role=dialog]')")
-        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(e=>e.textContent==='Continue').click();return true")
+        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(e=>['Close terminal','Remove tab'].includes(e.textContent.trim())).click();return true")
         try await until("return !document.querySelector('.terminal-dock')")
         _ = try await js("await window.Capacitor.Plugins.Keyboard.hide();return true")
         // Keep the socket active beyond the former 40 second resource timeout.
