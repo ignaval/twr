@@ -141,6 +141,14 @@ pub(super) struct Proposal {
 }
 
 impl Proposal {
+    /// Whether an action changes a thread's permission mode or moves it to another runtime
+    /// (what a device confirms only with `admin`, `hub::device_scope`).
+    pub(super) fn changes_settings(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|a| matches!(a, Proposed::Mode { .. } | Proposed::Move { .. }))
+    }
+
     /// From a confirm card's `attention.raised`.
     pub(super) fn from_raised(p: &AttentionRaised) -> Option<Proposal> {
         serde_json::from_value(twr_ext(&p.ext)?.get(PROPOSAL_KEY)?.clone()).ok()

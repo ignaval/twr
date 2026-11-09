@@ -287,7 +287,12 @@ impl Core {
             }
         };
         let runtime_changed = new.runtime != view.runtime || !same_agent;
-        // A device goes outside the pins only with `admin` (`hub::device_scope`).
+        // Runtimes differ in what one mode lets through: a device moves a thread to another
+        // only with `admin`, as it changes modes; and goes outside the pins only with it
+        // (`hub::device_scope`). A move between accounts within them is operate's.
+        if runtime_changed {
+            hub.require_scope(caller, &format!("move {name} to another runtime"), "admin")?;
+        }
         if outside_pin {
             hub.require_scope(
                 caller,

@@ -88,6 +88,14 @@ impl Core {
                     if canonical != mode {
                         return Ok(None);
                     }
+                    // A device changes a mode only with `admin` (`hub::device_scope`): the
+                    // command is refused whole, nothing recorded or sent, rather than handed to
+                    // the orchestrator, which could not relay it either.
+                    hub.require_scope(
+                        caller,
+                        &format!("change {}'s permission mode", view.name),
+                        "admin",
+                    )?;
                     descriptions.push(format!("{} → {canonical} mode", view.name));
                     modes.push(self.stage_mode(&mut batch, &id, &view, &canonical, caller, None));
                 }

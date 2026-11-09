@@ -276,6 +276,10 @@ impl Core {
             .filter(|s| s.runtime_changed && caller.is_orchestrator());
         if let Some(new) = runtime_move {
             if self.move_needs_card(&id, &new.spec.runtime) {
+                self.relayed_for_admin(
+                    hub,
+                    &format!("move {} to another runtime", self.thread_name(&id)),
+                )?;
                 self.move_check(&id, bound)?;
                 let spec = req.runtime.map(str::trim).unwrap_or_default();
                 // The card's move names the account it was checked with, as `<runtime>:<account>`.

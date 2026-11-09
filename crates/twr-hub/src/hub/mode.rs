@@ -60,7 +60,15 @@ impl Core {
         proposal: Option<&str>,
     ) -> Result<Value, RpcError> {
         let (id, view, canonical) = self.mode_target(query, mode)?;
+        // A device changes a mode only with `admin`; the orchestrator only in a turn of a
+        // message that could (`hub::device_scope`, `Core::relayed_for_admin`).
+        hub.require_scope(
+            caller,
+            &format!("change {}'s permission mode", view.name),
+            "admin",
+        )?;
         if caller.is_orchestrator() {
+            self.relayed_for_admin(hub, &format!("change {}'s permission mode", view.name))?;
             if let Gate::Propose(_) = self.mode_check(&id, &canonical)? {
                 let mut out = self.propose_mode(&id, &canonical);
                 if let Some(w) = self.start_warning(hub, &id) {

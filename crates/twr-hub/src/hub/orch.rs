@@ -388,6 +388,11 @@ struct OrchTurn {
     /// its message can no longer be taken back (`hub::withdraw`). Memory only: a hub restart
     /// ends the orchestrator's open turn anyway.
     acted: bool,
+    /// For a user turn: the client whose message started it (`turn.started`'s source), so a
+    /// mode change or runtime move relayed from a paired device's message is held to that
+    /// device's scopes ([`Core::relayed_for_admin`]).
+    #[serde(default)]
+    by: Option<String>,
 }
 
 /// One queued notice line.
@@ -1886,6 +1891,10 @@ impl Core {
                     proposals: Vec::new(),
                     arrived,
                     acted: false,
+                    by: match &ev.source {
+                        Source::User(c) if user => Some(c.clone()),
+                        _ => None,
+                    },
                 });
                 // Everything queued went out with this turn (not with a handoff's summary
                 // request: if the switch fails, the queue is still the old orchestrator's),
@@ -3236,6 +3245,28 @@ impl Core {
         })
     }
 
+    /// The orchestrator relays a mode change or a runtime move (`what`, for the message):
+    /// refused (`relay_forbidden`) when the message that started its turn came from a paired
+    /// device without `admin` (`hub::device_scope`), which could not make that change itself,
+    /// so neither directly nor on a confirm card. Any other turn is judged by the rest of the
+    /// `set_mode` gate ([`Core::mode_check`], [`Core::move_check`]).
+    pub(super) fn relayed_for_admin(&self, hub: &Inner, what: &str) -> Result<(), RpcError> {
+        let Some(by) = self.orch.turn.as_ref().and_then(|t| t.by.as_deref()) else {
+            return Ok(());
+        };
+        match hub.device_grant(by) {
+            Some(g) if !g.has("admin") => Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                format!(
+                    "the user's message came from a paired device without the admin \
+                     permission, so it cannot {what}; tell the user to do it on the computer \
+                     running the hub, or from a device paired with admin access"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// The `set_mode` gate's provenance for the orchestrator's move of `thread` to another
     /// runtime (`hub::model`), which then always goes on the confirm card: a user turn whose
     /// message is the user's latest, for a thread that existed (and the user had seen) when it
@@ -4253,6 +4284,7 @@ mod tests {
             proposals: Vec::new(),
             arrived: None,
             acted: false,
+            by: None,
         };
         let mut o = OrchState {
             thread: Some("orch-a".into()),
