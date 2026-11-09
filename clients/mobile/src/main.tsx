@@ -16,7 +16,14 @@ import {
   useEditorSessions,
 } from "../../shared/editors";
 import { RemoteHost, Transport, sweepExports, type Hub } from "./transport";
-import { linkState, type LinkState } from "./connection";
+import {
+  autoConnectTarget,
+  forgetLastHub,
+  linkState,
+  readLastHub,
+  rememberLastHub,
+  type LinkState,
+} from "./connection";
 import { mobileVoice } from "./voice";
 import { observeLayout } from "./layout";
 import { observeTextScale, secureDelete } from "./offline";
@@ -85,17 +92,34 @@ function Mobile() {
   const [readyHubId, setReadyHubId] = useState<string>();
   const [pendingNotification, setPendingNotification] =
     useState<Record<string, string>>();
+  const autoConnectTried = useRef(false);
   async function load() {
     try {
       const { hubs, notice } = await Transport.listHubs();
       setHubs(hubs);
       if (notice) setError(notice);
+      return hubs;
     } catch (e) {
       setError(errorMessage(e));
+      return undefined;
     }
   }
   useEffect(() => {
-    void load();
+    void load().then((hubs) => {
+      // Cold launch: back to the hub used last, once. Unreachable, it opens with its
+      // saved history like a tap on Connect; a failure leaves the hub list and its error.
+      const target = autoConnectTarget(
+        hubs || [],
+        readLastHub(),
+        autoConnectTried.current,
+      );
+      autoConnectTried.current = true;
+      if (target)
+        void queueSwitch(() =>
+          // A notification tap may have chosen a hub meanwhile.
+          activeHub.current ? Promise.resolve(false) : connectNow(target),
+        );
+    });
     // Exports a previous run left behind (the app was killed while sharing).
     void sweepExports();
     return () => {
@@ -209,7 +233,9 @@ function Mobile() {
       void listener.then((handle) => handle.remove());
     };
   }, []);
+  /** An explicit disconnect (Switch hub): the next launch opens the hub list. */
   async function disconnect() {
+    rememberLastHub(undefined);
     return queueSwitch(disconnectNow);
   }
   async function disconnectNow() {
@@ -237,6 +263,7 @@ function Mobile() {
     editors.forget(hub.id);
     localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
     localStorage.removeItem(pushPreferenceKey(hub.id));
+    forgetLastHub(hub.id);
   }
   async function forget(hub: Hub) {
     return queueSwitch(() => forgetNow(hub));
@@ -331,6 +358,7 @@ function Mobile() {
       document.documentElement.dataset.hub = hub.id;
       activeHub.current = hub;
       setActive(hub);
+      rememberLastHub(hub.id);
       return true;
     } catch (e) {
       await remote?.stop().catch(() => {});
