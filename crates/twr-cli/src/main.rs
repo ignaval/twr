@@ -9305,7 +9305,9 @@ mod tests {
         let c = Cli::try_parse_from(["twr", "--socket", "/tmp/s", "attention"]).unwrap();
         assert!(refuse_runner_socket(&c).is_ok());
         // The runner service is started with a `--socket` of its own: the one it listens on.
-        let service = ["twr", "runner", "service", "--root", "/tmp/r", "--socket", "/tmp/s"];
+        let service = [
+            "twr", "runner", "service", "--root", "/tmp/r", "--socket", "/tmp/s",
+        ];
         let c = Cli::try_parse_from(service).unwrap();
         assert!(refuse_runner_socket(&c).is_ok());
         let Some(Cmd::Runner {
