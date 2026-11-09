@@ -536,7 +536,9 @@ try {
     ).data.includes("ELECTRON_TERMINAL_UI_OK"),
   );
   await page.getByRole("button", { name: "Close Shell", exact: true }).click();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
+    .click();
   // Account login uses a disposable provider stub, not a real account or credential.
   execFileSync(
     join(bin, "twr"),
@@ -594,7 +596,9 @@ try {
   await page
     .getByRole("button", { name: "Close twr account login", exact: true })
     .click();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
+    .click();
   console.log(
     "Embedded terminal UI, shortcut handling, reload restore and interactive account login passed",
   );

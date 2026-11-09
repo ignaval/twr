@@ -4,19 +4,22 @@ import {
   type OfflineJournal,
   type OutboxMessage,
 } from "./offline";
-import type { Json } from "./types";
+import type { Json, Thread } from "./types";
 import { useHostAPI } from "./host";
 
 export function Outbox({
   journal,
   workspace,
   connected,
+  threads = [],
   onSent,
   onCopy,
 }: {
   journal?: OfflineJournal;
   workspace: string;
   connected: boolean;
+  /** To name a message's thread; an id it doesn't list shows as the id. */
+  threads?: Thread[];
   onSent(result: Json): void;
   onCopy(message: OutboxMessage): void;
 }) {
@@ -93,7 +96,10 @@ export function Outbox({
           )}
           <small>
             {message.method === "thread.send"
-              ? `To thread ${message.params.thread}`
+              ? `To ${
+                  threads.find((thread) => thread.id === message.params.thread)
+                    ?.name || `thread ${message.params.thread}`
+                }`
               : "To orchestrator"}{" "}
             · {new Date(message.createdAt).toLocaleString()}
           </small>

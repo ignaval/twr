@@ -52,7 +52,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
       await page
         .getByRole("dialog")
         .last()
-        .getByRole("button", { name: "Continue", exact: true })
+        .locator(".dialog-footer button.danger")
         .click();
     await dialog.locator(".operation-result").waitFor();
     await dialog.getByRole("button", { name: "Close", exact: true }).click();
@@ -507,7 +507,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   await page
     .getByRole("dialog")
     .last()
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   console.log(
     "QA: selecting one message reaches a real speaker process (silent command engine)",

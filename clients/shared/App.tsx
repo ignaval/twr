@@ -67,7 +67,6 @@ import {
   Check,
   CheckCircle2,
   Circle,
-  Copy,
   ExternalLink,
   Download,
   Paperclip,
@@ -112,7 +111,12 @@ import {
 } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { announcements, voiceHint } from "./voice";
-import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
+import {
+  blocksOf,
+  mergeEvents,
+  foldRoutineBlocks,
+  messageTime,
+} from "./transcript";
 import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
@@ -439,6 +443,10 @@ export default function App({
   const [confirmation, setConfirmation] = useState<{
     title: string;
     detail: string;
+    /** The confirming button's label: the action it takes. */
+    action: string;
+    /** Something stops, goes or is interrupted: the button says so in danger style. */
+    destructive?: boolean;
     run: () => void;
   }>();
   const [workspaceModal, setWorkspaceModal] = useState(false);
@@ -1151,7 +1159,7 @@ export default function App({
     })()
       .catch((e) => {
         if (generation === transcriptGeneration.current)
-          setTranscriptError(String(e));
+          setTranscriptError(errorMessage(e));
       })
       .finally(() => {
         if (generation === transcriptGeneration.current)
@@ -1411,6 +1419,8 @@ export default function App({
       setConfirmation({
         title: operation.title,
         detail: operation.confirm,
+        action: operationAction(operation, false),
+        destructive: true,
         run: () => void run(),
       });
     else await run();
@@ -1920,7 +1930,27 @@ export default function App({
       fail(error);
     }
   }
-  async function takeBack(message: Json) {
+  // A queued message's Take back / Send now run once at a time: its buttons are disabled
+  // while its request is in flight.
+  const [queueBusy, setQueueBusy] = useState<unknown[]>([]);
+  const queueInFlight = useRef(new Set<unknown>());
+  async function queueAction(message: Json, run: () => Promise<void>) {
+    const ref = message.ref;
+    if (queueInFlight.current.has(ref)) return;
+    queueInFlight.current.add(ref);
+    setQueueBusy([...queueInFlight.current]);
+    try {
+      await run();
+    } finally {
+      queueInFlight.current.delete(ref);
+      setQueueBusy([...queueInFlight.current]);
+    }
+  }
+  const takeBack = (message: Json) =>
+    queueAction(message, () => withdrawMessage(message));
+  const sendNow = (message: Json) =>
+    queueAction(message, () => sendMessageNow(message));
+  async function withdrawMessage(message: Json) {
     try {
       const response = await rpc("message.withdraw", {
         thread: target?.id,
@@ -1941,7 +1971,7 @@ export default function App({
       fail(error);
     }
   }
-  async function sendNow(message: Json) {
+  async function sendMessageNow(message: Json) {
     try {
       const response = await rpc("message.send_now", {
         thread: target?.id,
@@ -2957,6 +2987,7 @@ export default function App({
                   journal={journal}
                   workspace={workspace}
                   connected={connected}
+                  threads={view.threads}
                   onSent={(result) => {
                     setQueueRefresh((n) => n + 1);
                     for (const restored of [
@@ -3009,18 +3040,22 @@ export default function App({
                             JSON.stringify(message)}
                         </span>
                         <button
-                          disabled={!message.mine}
+                          disabled={
+                            !message.mine || queueBusy.includes(message.ref)
+                          }
                           onClick={() => void takeBack(message)}
                         >
                           Take back
                         </button>
                         <button
-                          disabled={i !== 0}
+                          disabled={i !== 0 || queueBusy.includes(message.ref)}
                           onClick={() => {
                             setConfirmation({
                               title: "Send this message now?",
                               detail:
                                 "The running turn will be interrupted so this message can start.",
+                              action: "Send now",
+                              destructive: true,
                               run: () => void sendNow(message),
                             });
                           }}
@@ -3870,6 +3905,8 @@ export default function App({
                         detail: t.exited
                           ? "Remove this terminal tab?"
                           : "Its interactive program will exit. The hub and other agents keep running.",
+                        action: t.exited ? "Remove tab" : "Close terminal",
+                        destructive: !t.exited,
                         run: () => {
                           terminalSnapshots.current.changed();
                           void hostApi
@@ -4218,14 +4255,14 @@ export default function App({
             <div>
               <button onClick={() => setConfirmation(undefined)}>Cancel</button>
               <button
-                className="primary"
+                className={confirmation.destructive ? "danger" : "primary"}
                 onClick={() => {
                   const run = confirmation.run;
                   setConfirmation(undefined);
                   run();
                 }}
               >
-                Continue
+                {confirmation.action}
               </button>
             </div>
           </footer>
@@ -5010,11 +5047,11 @@ function Conversation({
                           ? "twr"
                           : target?.name || "Agent"}
                 </b>
-                <time>
-                  {new Date(block.ts).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
+                <time
+                  dateTime={block.ts}
+                  title={new Date(block.ts).toLocaleString()}
+                >
+                  {messageTime(block.ts)}
                 </time>
                 {block.pending && <Spinner />}
                 {block.kind === "assistant" && !block.pending && target && (
@@ -5034,16 +5071,13 @@ function Conversation({
                     <Volume2 size={13} />
                   </button>
                 )}
-                <button
+                <CopyButton
                   className="icon-button copy-message"
-                  aria-label="Copy message"
-                  title="Copy message"
-                  onClick={() =>
-                    void hostApi.copyText(block.detail || block.text)
-                  }
-                >
-                  <Copy size={13} />
-                </button>
+                  label="Copy message"
+                  size={13}
+                  text={() => block.detail || block.text}
+                  onError={onError}
+                />
               </div>
               {block.children ? (
                 <details
@@ -5063,7 +5097,7 @@ function Conversation({
                   </summary>
                   {block.children.map((entry) => (
                     <div key={entry.id}>
-                      <time>{new Date(entry.ts).toLocaleTimeString()}</time>
+                      <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
                       <Markdown text={entry.text} />
                     </div>
                   ))}

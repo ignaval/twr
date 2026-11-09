@@ -27,6 +27,7 @@
   --warning-soft: rgb(224 180 92 / 13%);
   --danger: #f08a84;
   --danger-soft: rgb(240 138 132 / 12%);
+  --danger-fg: #1f0907;
   --success: #7cc79a;
   --focus: var(--accent);
   --scrim: rgb(0 0 0 / 60%);
@@ -308,6 +309,17 @@ kbd {
 }
 .danger-quiet {
   color: var(--danger);
+}
+/* The confirming button of a confirmation that stops, removes or interrupts something. */
+.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  font-weight: 600;
+  color: var(--danger-fg);
+}
+.danger:hover {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 88%, var(--text));
 }
 .app-crash {
   max-width: 640px;
@@ -2308,6 +2320,7 @@ meter::-webkit-meter-optimum-value {
   --warning-soft: rgb(138 92 0 / 10%);
   --danger: #b83a34;
   --danger-soft: rgb(184 58 52 / 9%);
+  --danger-fg: #ffffff;
   --success: #2b7449;
   --scrim: rgb(20 22 25 / 35%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
@@ -2335,6 +2348,7 @@ meter::-webkit-meter-optimum-value {
     --warning-soft: rgb(138 92 0 / 10%);
     --danger: #b83a34;
     --danger-soft: rgb(184 58 52 / 9%);
+    --danger-fg: #ffffff;
     --success: #2b7449;
     --scrim: rgb(20 22 25 / 35%);
     --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
@@ -2366,6 +2380,7 @@ meter::-webkit-meter-optimum-value {
   --warning-soft: color-mix(in srgb, var(--bg) 90%, var(--warning));
   --danger: var(--omarchy-danger, color-mix(in srgb, var(--text) 70%, #db4b4b));
   --danger-soft: color-mix(in srgb, var(--bg) 90%, var(--danger));
+  --danger-fg: var(--bg);
   --success: color-mix(in srgb, var(--text) 70%, #3b9c6e);
   --scrim: color-mix(in srgb, var(--bg) 75%, transparent);
   --shadow-color: color-mix(in srgb, var(--bg) 25%, #000);

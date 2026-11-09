@@ -930,7 +930,7 @@ try {
       .click();
     await page
       .getByRole("dialog", { name: "Close terminal?", exact: true })
-      .getByRole("button", { name: "Continue", exact: true })
+      .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
       .click();
     await expect(page.locator(".terminal-session")).toHaveCount(0);
     console.log(
@@ -1137,7 +1137,7 @@ try {
     .click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   await page.evaluate((id) => {
     const command =
@@ -1195,7 +1195,7 @@ try {
     .click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   console.log("PASS: Android to remote native PTY input and output");
   await terminalUIQA(page);

@@ -73,7 +73,7 @@ export async function terminalUIQA(page) {
     .click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   await expect(page.locator(".terminal-session")).toHaveCount(0);
   console.log(
