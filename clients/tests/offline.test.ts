@@ -6,6 +6,7 @@ import {
   forgetOfflineHost,
   offlineJournal,
   appendDraft,
+  recordSize,
 } from "../shared/offline";
 import { MessageReceipts } from "../desktop/message-receipts";
 import type { DesktopAPI } from "../shared/types";
@@ -428,6 +429,45 @@ describe("encrypted offline recovery", () => {
     expect(restored.snapshot.workspaces.default.view.head).toBe(4);
     await restored.clear();
     expect(disk.values.has("offline:hub")).toBe(false);
+  });
+});
+describe("offline size bounds", () => {
+  const view = (head: number) => ({
+    threads: [],
+    attention: [],
+    decisions: [],
+    decisions_seen: 0,
+    head,
+  });
+  const events = (count: number, size: number) =>
+    Array.from({ length: count }, (_, seq) => ({
+      id: String(seq),
+      seq,
+      thread: "orch",
+      kind: "agent.text",
+      ts: "2026-01-01T00:00:00Z",
+      data: { text: "x".repeat(size) },
+    })) as any[];
+  it("measures cached history close to its JSON size, each lane apart", async () => {
+    const journal = new OfflineJournal(storage() as unknown as DesktopAPI, "s");
+    await journal.cache("default", view(1), "orch", events(200, 1000));
+    await journal.drafts({ "default:orchestrator": "hello" });
+    const record = journal.snapshot;
+    const size = recordSize(record);
+    const exact = new TextEncoder().encode(JSON.stringify(record)).byteLength;
+    expect(Math.abs(size.total - exact) / exact).toBeLessThan(0.02);
+    expect(size.pending).toBeLessThan(200);
+    expect(size.history).toBeGreaterThan(200 * 1000);
+  });
+  it("still evicts the oldest workspace's history first, keeping drafts", async () => {
+    const disk = storage();
+    const journal = new OfflineJournal(disk as unknown as DesktopAPI, "e");
+    await journal.cache("old", view(1), "orch", events(500, 5000));
+    await journal.cache("new", view(2), "orch", events(500, 5000));
+    await journal.drafts({ "new:orchestrator": "keep me" });
+    expect(Object.keys(journal.snapshot.workspaces)).toEqual(["new"]);
+    expect(journal.snapshot.drafts["new:orchestrator"]).toBe("keep me");
+    expect(recordSize(journal.snapshot).total).toBeLessThan(4 * 1024 * 1024);
   });
 });
 describe("desktop message receipts", () => {
