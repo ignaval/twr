@@ -343,6 +343,23 @@ pub fn is_plist_of(name: &str, prefix: &str) -> bool {
         .is_some_and(|l| is_label_of(l, prefix))
 }
 
+/// The variables of `vars` a long-lived service started on the user's behalf gets on every
+/// platform: those a launchd job gets ([`ENV_NAMES`], [`ENV_PREFIXES`]), by name, whatever
+/// their value. The linked-runner service is started with these only (launchd, `systemd-run`
+/// or a session of its own), so an API key in the environment of whichever process first
+/// started a hub never reaches the agents it runs for paired hubs.
+pub fn service_env(
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    let mut kept: Vec<_> = vars
+        .into_iter()
+        .filter(|(name, _)| name.to_str().is_some_and(passed_on))
+        .collect();
+    kept.sort();
+    kept.dedup_by(|a, b| a.0 == b.0);
+    kept
+}
+
 /// Whether `name` is one of the variables the job gets ([`ENV_NAMES`], [`ENV_PREFIXES`]).
 fn passed_on(name: &str) -> bool {
     ENV_NAMES.contains(&name)

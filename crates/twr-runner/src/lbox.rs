@@ -846,6 +846,7 @@ impl LocalBox {
                 cfg.thread = thread.clone();
                 twr_adapters::resolve::with_login_path(&mut cfg.env, login);
                 self.start(&thread, &runtime, cfg, run, |a, cfg| a.spawn(cfg, prompt))
+                    .await
             }
             Op::Resume {
                 thread,
@@ -860,6 +861,7 @@ impl LocalBox {
                 self.start(&thread, &runtime, cfg, run, |a, cfg| {
                     a.resume(cfg, session_id)
                 })
+                .await
             }
             Op::Send {
                 thread,
@@ -914,10 +916,14 @@ impl LocalBox {
                 self.command(&thread, AdapterCmd::Respond { attn_id, answer })
             }
             Op::Stop { thread, run } => {
-                if let Some(managed) = &self.inner.managed {
-                    managed
-                        .cancel_admission(&thread, run.as_deref())
-                        .map_err(|e| CmdError::new(cmd_errors::FAILED, e.to_string()))?;
+                if let Some(managed) = self.inner.managed.clone() {
+                    let (cancelled, cancelled_run) = (thread.clone(), run.clone());
+                    tokio::task::spawn_blocking(move || {
+                        managed.cancel_admission(&cancelled, cancelled_run.as_deref())
+                    })
+                    .await
+                    .map_err(|e| CmdError::new(cmd_errors::FAILED, e.to_string()))?
+                    .map_err(|e| CmdError::new(cmd_errors::FAILED, e.to_string()))?;
                 }
                 let other_run = run.is_some_and(|r| {
                     self.inner
@@ -1158,7 +1164,7 @@ impl LocalBox {
     /// Spawns or resumes a session (`go` with `cfg`, marked for the thread and the new run,
     /// [`mark`]) and starts its pump. The run's id is `run` (the hub's) when given, else a
     /// fresh one.
-    fn start(
+    async fn start(
         &self,
         thread: &str,
         runtime: &str,
@@ -1175,30 +1181,51 @@ impl LocalBox {
         let cwd = cfg.cwd.clone();
         let adapter = self.adapter(runtime)?;
         let shared = &self.inner.shared;
-        let mut sessions = shared.sessions();
-        if sessions.contains_key(thread) {
-            return Err(CmdError::new(
+        let already = || {
+            CmdError::new(
                 cmd_errors::ALREADY_RUNNING,
                 format!("thread {thread} already has a running session on this box"),
-            ));
+            )
+        };
+        if shared.sessions().contains_key(thread) {
+            return Err(already());
         }
         let run = run.unwrap_or_else(twr_core::event::new_id);
-        let lease = self
-            .inner
-            .managed
-            .as_ref()
-            .map(|m| m.admit(thread, &run))
-            .transpose()
-            .map_err(|e| {
-                CmdError::new(
-                    if e.is::<crate::managed::Capacity>() {
-                        cmd_errors::BOX_FULL
-                    } else {
-                        cmd_errors::FAILED
-                    },
-                    e.to_string(),
-                )
-            })?;
+        // Admission takes machine-wide file locks other workers share and may retire an
+        // orphan runtime first: it runs on a blocking thread, before the session table is
+        // locked, so nothing else of this box waits for it. (Session ops reach a box in
+        // order, so a stop of this run arrives only after this start has returned.)
+        let lease = match self.inner.managed.clone() {
+            None => None,
+            Some(managed) => {
+                let (admitted, admitted_run) = (thread.to_string(), run.clone());
+                let lease =
+                    tokio::task::spawn_blocking(move || managed.admit(&admitted, &admitted_run))
+                        .await
+                        .map_err(|e| {
+                            CmdError::new(cmd_errors::FAILED, format!("runner admission: {e}"))
+                        })?
+                        .map_err(|e| {
+                            CmdError::new(
+                                if e.is::<crate::managed::Capacity>()
+                                    || e.is::<crate::managed::Busy>()
+                                {
+                                    cmd_errors::BOX_FULL
+                                } else {
+                                    cmd_errors::FAILED
+                                },
+                                e.to_string(),
+                            )
+                        })?;
+                Some(lease)
+            }
+        };
+        let mut sessions = shared.sessions();
+        // A start of the same thread that finished while this one was admitted: the lease
+        // just taken is released with it.
+        if sessions.contains_key(thread) {
+            return Err(already());
+        }
         if self.inner.managed.is_some() && self.spool().bytes() >= self.spool().max_bytes() * 8 / 10
         {
             return Err(CmdError::new(

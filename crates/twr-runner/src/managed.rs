@@ -288,6 +288,16 @@ impl std::fmt::Display for Capacity {
     }
 }
 impl std::error::Error for Capacity {}
+/// Another worker held the machine's admission lock for longer than admission waits
+/// ([`lock_bounded`]); like [`Capacity`], a reason to try again shortly.
+#[derive(Debug)]
+pub struct Busy;
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("runner admission is busy with another worker; retrying")
+    }
+}
+impl std::error::Error for Busy {}
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Queue {
     #[serde(default)]
@@ -324,10 +334,7 @@ impl Managed {
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(self.resources.join("admission.json"))?;
-        ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
-            "cannot lock runner admission"
-        );
+        lock_bounded(&file, "runner admission")?;
         let mut bytes = Vec::new();
         (&mut file).take(512 * 1024 + 1).read_to_end(&mut bytes)?;
         ensure!(
@@ -338,11 +345,13 @@ impl Managed {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as u64;
-        queue.tickets.retain(|t| {
-            now >= t.seen
-                && now.saturating_sub(t.seen) < 5_000
-                && crate::reap::process_liveness(t.pid, t.start) != crate::reap::Alive::No
-        });
+        queue
+            .tickets
+            .retain(|t| now >= t.seen && now.saturating_sub(t.seen) < 5_000);
+        let mut alive = ticket_liveness(&queue.tickets).into_iter();
+        queue
+            .tickets
+            .retain(|_| alive.next() != Some(crate::reap::Alive::No));
         let prefix = self
             .resources
             .parent()
@@ -429,10 +438,7 @@ impl Managed {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
-            "cannot lock runner admission"
-        );
+        lock_bounded(&file, "runner admission")?;
         let mut bytes = Vec::new();
         (&mut file).take(512 * 1024 + 1).read_to_end(&mut bytes)?;
         ensure!(bytes.len() <= 512 * 1024, "admission queue exceeds limit");
@@ -569,18 +575,19 @@ impl Managed {
         {
             return false;
         }
-        let Ok(queue) = serde_json::from_slice::<Queue>(&bytes) else {
+        let Ok(mut queue) = serde_json::from_slice::<Queue>(&bytes) else {
             return false;
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        queue.tickets.iter().any(|t| {
-            now >= t.seen
-                && now.saturating_sub(t.seen) < 5_000
-                && crate::reap::process_liveness(t.pid, t.start) != crate::reap::Alive::No
-        })
+        queue
+            .tickets
+            .retain(|t| now >= t.seen && now.saturating_sub(t.seen) < 5_000);
+        ticket_liveness(&queue.tickets)
+            .into_iter()
+            .any(|alive| alive != crate::reap::Alive::No)
     }
 }
 
@@ -629,11 +636,41 @@ struct LeaseMarker {
 pub fn admission_gate(resources: &Path) -> Result<Lease> {
     twr_core::paths::ensure_private_dir(resources)?;
     let file = twr_core::paths::open_private_append(&resources.join("slots.lock"))?;
-    ensure!(
-        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0,
-        "cannot lock admission probes"
-    );
+    lock_bounded(&file, "runner admission probes")?;
     Ok(Lease(file))
+}
+
+/// How long admission waits for a machine-wide admission lock another worker holds (it may
+/// be retiring an orphan runtime) before it answers [`Busy`], which the hub retries.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Takes an exclusive `flock` on `file` without waiting indefinitely: retried for at most
+/// [`LOCK_WAIT`], then [`Busy`]. Blocks the calling thread meanwhile: call it off the async
+/// runtime.
+fn lock_bounded(file: &std::fs::File, what: &str) -> Result<()> {
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) {
+            anyhow::bail!("cannot lock {what}: {error}");
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Busy.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Whether each ticket's daemon still runs, from one process-table read.
+fn ticket_liveness(tickets: &[Ticket]) -> Vec<crate::reap::Alive> {
+    let procs: Vec<_> = tickets.iter().map(|t| (t.pid, t.start)).collect();
+    crate::reap::processes_liveness(&procs)
 }
 
 /// A busy allocator must never block the service's expiry or control loop.
@@ -653,6 +690,12 @@ mod tests {
     #[test]
     fn revocation_reaps_an_orphan_generation_and_preserves_a_replacement() -> Result<()> {
         use std::os::unix::process::CommandExt;
+        // Revocation finds the runtimes by the markers in their environment.
+        if crate::reap::skip_if_test_environs_hidden(
+            "revocation_reaps_an_orphan_generation_and_preserves_a_replacement",
+        ) {
+            return Ok(());
+        }
         struct Reaped(std::process::Child);
         impl Drop for Reaped {
             fn drop(&mut self) {
@@ -755,6 +798,66 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn a_held_admission_lock_makes_admission_busy_not_blocked() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("hub");
+        let resources = temp.path().join("leases");
+        std::fs::create_dir(&root)?;
+        twr_core::paths::ensure_private_dir(&resources)?;
+        let managed = Managed {
+            root,
+            resources: resources.clone(),
+            revocation: temp.path().join("retired"),
+        };
+        for held in ["admission.json", "slots.lock"] {
+            // Another worker, mid-admission (retiring an orphan, say).
+            let other = twr_core::paths::open_private_append(&resources.join(held))?;
+            assert_eq!(
+                unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let started = std::time::Instant::now();
+            let error = managed
+                .admit("waiting", "run")
+                .err()
+                .expect("admission went ahead under another worker's lock");
+            assert!(error.is::<Busy>(), "{held}: {error:#}");
+            assert!(
+                started.elapsed() < LOCK_WAIT * 3,
+                "{held}: admission blocked"
+            );
+            drop(other);
+            drop(managed.admit("waiting", "run")?);
+        }
+        Ok(())
+    }
+    #[test]
+    fn batched_liveness_agrees_with_single_lookups() -> Result<()> {
+        let mut live = std::process::Command::new("sleep").arg("30").spawn()?;
+        let mut gone = std::process::Command::new("true").spawn()?;
+        let gone_pid = gone.id();
+        gone.wait()?;
+        let live_start = crate::reap::process_start_time(live.id());
+        let procs = [
+            (live.id(), live_start),
+            (gone_pid, None),
+            (live.id(), live_start.map(|s| s + 1)),
+            (std::process::id(), None),
+        ];
+        let batched = crate::reap::processes_liveness(&procs);
+        let single: Vec<_> = procs
+            .iter()
+            .map(|(pid, start)| crate::reap::process_liveness(*pid, *start))
+            .collect();
+        live.kill()?;
+        live.wait()?;
+        assert_eq!(batched, single);
+        assert_eq!(batched[0], crate::reap::Alive::Yes);
+        assert_eq!(batched[1], crate::reap::Alive::No);
+        assert_eq!(batched[2], crate::reap::Alive::No);
+        Ok(())
+    }
+    #[test]
     fn pending_owners_take_turns_and_fifo_survives_retries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let resources = temp.path().join("leases");
@@ -791,12 +894,14 @@ mod tests {
     #[test]
     fn confinement_and_global_leases_are_shared_across_workers() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let root = dir.path().join("hub");
+        // A managed root is a resolved path; macOS's $TMPDIR is under /var, a link.
+        let base = std::fs::canonicalize(dir.path())?;
+        let root = base.join("hub");
         std::fs::create_dir(&root)?;
         let managed = Managed {
             root: root.clone(),
-            resources: dir.path().join("leases"),
-            revocation: dir.path().join("revoked"),
+            resources: base.join("leases"),
+            revocation: base.join("revoked"),
         };
         assert!(managed.path(&root.join("new/child")).is_ok());
         assert!(managed.path(&root.join("../other")).is_err());

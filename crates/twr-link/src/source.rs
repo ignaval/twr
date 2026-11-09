@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 pub use twr_source::Source;
+/// How often a running native build re-checks the free-space reserve and owner budget. The
+/// build's own compiler scratch is not charged to the budget ([`twr_source::budget_bytes`]).
+const BUILD_BUDGET_CHECK: Duration = Duration::from_secs(15);
 pub fn host_target() -> &'static str {
     twr_core::build_target()
 }
@@ -59,13 +62,16 @@ pub async fn export(executable: &Path) -> Result<(Source, tempfile::TempDir, Pat
         |_| false,
     )
     .await;
+    let no_source =
+        "this hub build has no recorded source; rebuild with linked-worker source capture";
     let twr_adapters::process::Bounded::Exited(Some(0), bytes) = output else {
-        anyhow::bail!(
-            "this hub build has no recorded source; rebuild with linked-worker source capture"
-        )
+        anyhow::bail!(no_source)
     };
     ensure!(bytes.len() >= 4, "source export is truncated");
     let len = u32::from_be_bytes(bytes[..4].try_into()?) as usize;
+    // A build whose checkout the capture refused records an empty manifest (its build
+    // warned why).
+    ensure!(len > 0, no_source);
     ensure!(
         len <= crate::wire::MAX_CONTROL && bytes.len() >= 4 + len,
         "source manifest exceeds limit"
@@ -106,7 +112,7 @@ pub async fn cached(machine: &Machine, scope: &str, source: &Source) -> Result<O
         .join("output.json");
     if let Ok(bytes) = crate::state::read_private(&output, 4096) {
         let build: Build = serde_json::from_slice(&bytes)?;
-        if build.matches(&build.path(machine, scope)) {
+        if build.matches_async(&build.path(machine, scope)).await {
             return Ok(Some(build));
         }
     }
@@ -178,13 +184,13 @@ pub async fn build(
     let root = machine.dir.join("runner/hubs").join(scope);
     twr_core::paths::ensure_private_dir(&root)?;
     let owner_root = root.parent().context("source scope has no owner")?;
-    crate::bundle::reserve(owner_root, source.bundle.size)?;
+    crate::bundle::reserve(owner_root, source.bundle.size).await?;
     let cache = root.join("native").join(id);
     twr_core::paths::ensure_private_dir(&cache)?;
     let output = cache.join("output.json");
     if let Ok(bytes) = crate::state::read_private(&output, 4096) {
         let build: Build = serde_json::from_slice(&bytes)?;
-        if build.matches(&build.path(machine, scope)) {
+        if build.matches_async(&build.path(machine, scope)).await {
             return Ok(Native {
                 executable: build.path(machine, scope),
                 build,
@@ -282,7 +288,7 @@ pub async fn build(
         twr_adapters::process::run_bounded(cmd, Duration::from_secs(30 * 60), 64 * 1024, |_| false);
     tokio::pin!(run);
     loop {
-        tokio::select! {result=&mut run=>{match result {twr_adapters::process::Bounded::Exited(Some(0),_)=>{},twr_adapters::process::Bounded::Exited(_,bytes)=>{let tail=&bytes[bytes.len().saturating_sub(4096)..];anyhow::bail!("native worker build failed: {}",String::from_utf8_lossy(tail));},_=>anyhow::bail!("native worker build could not complete within its time/output limit; check the runner's toolchain and dependencies")};break},_=tokio::time::sleep(Duration::from_secs(1))=>{crate::bundle::reserve(owner_root,0)?;}}
+        tokio::select! {result=&mut run=>{match result {twr_adapters::process::Bounded::Exited(Some(0),_)=>{},twr_adapters::process::Bounded::Exited(_,bytes)=>{let tail=&bytes[bytes.len().saturating_sub(4096)..];anyhow::bail!("native worker build failed: {}",String::from_utf8_lossy(tail));},_=>anyhow::bail!("native worker build could not complete within its time/output limit; check the runner's toolchain and dependencies")};break},_=tokio::time::sleep(BUILD_BUDGET_CHECK)=>{crate::bundle::reserve(owner_root,0).await?;}}
     }
     verify_materialization(&materialized, &source.bundle.commit).await?;
     let executable = target_dir.join(&target).join(&source.profile).join("twr");
@@ -408,6 +414,12 @@ mod tests {
     }
     #[tokio::test]
     async fn crashed_build_cleanup_is_scoped_to_its_recorded_marker_and_epoch() -> Result<()> {
+        // Cleanup finds the build's processes by the marker in their environment.
+        if twr_runner::reap::skip_if_test_environs_hidden(
+            "crashed_build_cleanup_is_scoped_to_its_recorded_marker_and_epoch",
+        ) {
+            return Ok(());
+        }
         let temp = tempfile::tempdir()?;
         let machine = Machine {
             dir: temp.path().join("machine"),
@@ -458,6 +470,24 @@ mod tests {
         assert!(unrelated.try_wait()?.is_none());
         unrelated.kill().await?;
         unrelated.wait().await?;
+        Ok(())
+    }
+    #[tokio::test]
+    async fn a_build_that_captured_no_source_says_so() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let executable = temp.path().join("twr");
+        // What a build whose checkout the capture refused prints: an empty manifest.
+        std::fs::write(&executable, "#!/bin/sh\nprintf '\\000\\000\\000\\000'\n")?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+        let error = export(&executable)
+            .await
+            .err()
+            .context("export succeeded")?;
+        assert!(
+            format!("{error:#}").contains("no recorded source"),
+            "{error:#}"
+        );
         Ok(())
     }
     #[tokio::test]

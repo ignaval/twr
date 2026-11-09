@@ -1559,16 +1559,29 @@ pub fn systemd_run_args(
     out
 }
 
-/// Starts `program args` as the transient user service `unit` (`systemd-run --user`) with the
-/// relay's environment ([`systemd_run_args`]): an error with what `systemd-run` said when it
-/// fails or does not finish within [`PROBE_TIMEOUT`].
+/// The arguments of `systemd-run` for [`systemd_service_run`]: [`systemd_run_args`] with only
+/// the variables of `env` a service gets ([`launchd::service_env`]).
+pub fn systemd_service_args(
+    unit: &str,
+    program: &Path,
+    args: &[OsString],
+    env: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<OsString> {
+    let mut flags = systemd_run_args(unit, program, args, launchd::service_env(env));
+    flags.insert(0, "--property=KillMode=process".into());
+    flags
+}
+
+/// Starts the long-lived service `program args` as the transient user service `unit`
+/// (`systemd-run --user`) with the allowlisted part of this process's environment
+/// ([`systemd_service_args`]): an error when `systemd-run` fails or does not finish within
+/// [`PROBE_TIMEOUT`].
 pub async fn systemd_service_run(
     unit: &str,
     program: &Path,
     args: &[OsString],
 ) -> anyhow::Result<()> {
-    let mut flags = systemd_run_args(unit, program, args, std::env::vars_os());
-    flags.insert(0, "--property=KillMode=process".into());
+    let flags = systemd_service_args(unit, program, args, std::env::vars_os());
     let mut cmd = tokio::process::Command::new("systemd-run");
     cmd.args(flags);
     match twr_adapters::process::run_bounded(cmd, PROBE_TIMEOUT, 16 * 1024, |_| false).await {
@@ -2684,6 +2697,41 @@ mod tests {
     /// The real `systemd-run --user` with [`systemd_run_args`] hands the service its
     /// arguments as they are: `$`, `${...}`, `$$` and `%` unexpanded. Skipped where no user
     /// manager answers.
+    /// The linked-runner service started with `systemd-run` gets the launchd allowlist only:
+    /// no API key or workspace of the process that happened to start it.
+    #[test]
+    fn a_systemd_service_gets_only_the_allowlisted_environment() {
+        let env = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("LC_ALL", "C.UTF-8"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("TWR_CLAUDE_BIN", "/opt/claude"),
+            ("ANTHROPIC_API_KEY", "sk-secret"),
+            ("OPENAI_API_KEY", "sk-other"),
+            ("TWR_WORKSPACE", "work"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("LC_lower", "x"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let args = systemd_service_args("twr-runner-0", Path::new("/t/twr"), &[], env);
+        let set: Vec<String> = args
+            .iter()
+            .filter_map(|a| a.to_str()?.strip_prefix("--setenv=").map(String::from))
+            .collect();
+        assert_eq!(
+            set,
+            [
+                "HOME",
+                "LC_ALL",
+                "PATH",
+                "TWR_CLAUDE_BIN",
+                "XDG_RUNTIME_DIR"
+            ]
+        );
+        assert_eq!(args[0], "--property=KillMode=process");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn systemd_runs_the_daemon_with_its_arguments_unexpanded() {

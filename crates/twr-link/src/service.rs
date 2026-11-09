@@ -280,6 +280,16 @@ struct Service {
 }
 
 /// Foreground service entry point. The lifetime flock serializes state and identity creation.
+/// How often the service checks that its socket is still the one it listens on.
+const SOCKET_CHECK: Duration = Duration::from_secs(30);
+/// The device and inode of the socket at `path`, if one is there.
+fn socket_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_socket())
+        .map(|m| (m.dev(), m.ino()))
+}
 pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Result<()> {
     let root = std::fs::canonicalize(root)?;
     let machine = Machine {
@@ -305,6 +315,7 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
     }
     let listener = UnixListener::bind(&machine.socket)?;
     twr_core::paths::restrict_file(&machine.socket)?;
+    let bound = socket_identity(&machine.socket);
     ensure_private_dir(&machine.dir.join("identity"))?;
     let identity = HubKey::load_or_create(&machine.dir.join("identity/link-key"))?;
     let mut state = machine.load()?;
@@ -376,6 +387,7 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
     let mut next_update = std::time::Instant::now() + Duration::from_secs(6 * 60 * 60);
     let mut next_prune = std::time::Instant::now() + Duration::from_secs(60);
     let mut next_retirement = std::time::Instant::now();
+    let mut next_socket_check = std::time::Instant::now() + SOCKET_CHECK;
     let mut power = crate::power::Power::default();
     let shutdown = twr_runner::client::shutdown_signal();
     tokio::pin!(shutdown);
@@ -383,6 +395,16 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
         tokio::select! {
             _=service.stopping.notified()=>break,
             _=maintenance.tick()=>{
+                // A runtime directory removed at logout takes the socket with it: no client
+                // could reach this service, and its lifetime lock would keep a new one from
+                // starting. Its workers run on; the next client starts a service again.
+                if std::time::Instant::now()>=next_socket_check {
+                    next_socket_check=std::time::Instant::now()+SOCKET_CHECK;
+                    if bound.is_some() && socket_identity(&machine.socket)!=bound {
+                        tracing::warn!("the runner service socket was removed; stopping so a client can start the service again");
+                        break;
+                    }
+                }
                 service.expire_pairing().await;
                 service.retire_workspaces().await;
                 if std::time::Instant::now()>=next_prune {next_prune=std::time::Instant::now()+Duration::from_secs(6*60*60);let s=service.clone();service.spawn(async move {let _=s.control(Request::Prune{aggressive:false}).await;});}
@@ -1290,7 +1312,7 @@ impl Service {
                     .dir
                     .join("runner/hubs")
                     .join(&certificate.binding.machine);
-                crate::bundle::reserve(&hub_root, bundle.size)?;
+                crate::bundle::reserve(&hub_root, bundle.size).await?;
                 let incoming = root.parent().unwrap().join("incoming.bundle");
                 let file = crate::worker::Build {
                     sha256: bundle.sha256.clone(),
@@ -1386,7 +1408,7 @@ impl Service {
                     .join("runner/hubs")
                     .join(&certificate.binding.machine);
                 ensure_private_dir(&owner_root)?;
-                crate::bundle::reserve(&owner_root, source.bundle.size)?;
+                crate::bundle::reserve(&owner_root, source.bundle.size).await?;
                 let temporary = s
                     .machine
                     .dir
@@ -1439,7 +1461,7 @@ impl Service {
                 let (epoch, scope) = s.authorize_at(&certificate, c.remote_id(), epoch).await?;
                 build.validate()?;
                 let path = build.path(&s.machine, &scope);
-                if build.matches(&path) {
+                if build.matches_async(&path).await {
                     wire::write(
                         &mut send,
                         &Reply::Ok(json!({"ready":false,"installed":true,"usable":crate::worker::Build::executable(&path).await.is_ok_and(|b|b.protocol==build.protocol)})),
@@ -1454,7 +1476,7 @@ impl Service {
                     .join("runner/hubs")
                     .join(&certificate.binding.machine);
                 ensure_private_dir(&hub_root)?;
-                crate::bundle::reserve(&hub_root, build.size)?;
+                crate::bundle::reserve(&hub_root, build.size).await?;
                 wire::write(&mut send, &Reply::Ok(json!({"ready":true}))).await?;
                 let temp = crate::worker::receive(&mut recv, &path, &build).await?;
                 let state = s.state.lock().await;
@@ -1497,7 +1519,7 @@ impl Service {
                 build.validate()?;
                 let path = build.path(&s.machine, &scope);
                 ensure!(
-                    build.matches(&path),
+                    build.matches_async(&path).await,
                     "exact worker build is missing or changed"
                 );
                 let worker = Worker {
