@@ -22,6 +22,8 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - `--json` for `twr thread list` and `twr attention`; an attention item's `target` is the `<id>@<revision>` that `twr respond` takes.
 - `twr update --allow-downgrade`, with `--version`, for the rare install of an older release (below).
 - The mobile apps reconnect to the last hub on launch, and their header shows whether the hub is online, reconnecting or offline.
+- The desktop app's menu bar or tray icon and its Dock badge count and list what needs you in every workspace, grouped by workspace; choosing an item switches to it.
+- The desktop app posts a system notification for a new permission or question in any workspace while its window isn't in front. It names only the thread and the workspace, never the command or the question, and a click opens the request without answering it. Turn them off in Settings › Application. See [notifications.md](docs/notifications.md).
 - Right-click menus in the desktop app (Cut, Copy, Paste, Select All, Copy Link Address), and it remembers its window's size, position and maximized state.
 - `install.sh` and the release workflow can check a second, ECDSA P-256 signature of the checksums, for macOS's LibreSSL, which cannot verify Ed25519. It is off until a P-256 release key exists ([development.md](docs/development.md)).
 - CI type-checks, tests, format-checks and audits the desktop and mobile TypeScript on every pull request and builds the Android app; Dependabot now covers the clients' npm tree and the Android Gradle build.
