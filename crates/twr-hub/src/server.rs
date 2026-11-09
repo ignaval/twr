@@ -1015,7 +1015,7 @@ async fn connection(
             loop {
                 tokio::select! {
                     _ = device_tick.tick() => {
-                        if conn.device.as_ref().is_some_and(|d| !hub.device_auth().is_ok_and(|a|a.current(d))) {break None;}
+                        if conn.device.as_ref().is_some_and(|d| twr_core::devices::Standing::of(hub.device_auth(), d).revoked()) {break None;}
                     }
                     f = &mut read => break Some(f),
                     _ = wait_state(&mut state, |s| *s == HubState::Stopped) => {
@@ -1052,7 +1052,7 @@ async fn connection(
         };
         let id = req.id;
         if let Some(device) = &conn.device {
-            if !hub.device_auth().is_ok_and(|a| a.current(device)) {
+            if twr_core::devices::Standing::of(hub.device_auth(), device).revoked() {
                 break;
             }
             if !device.allows_params(&req.method, &req.params)
@@ -2587,7 +2587,8 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
         let device = hub
             .device_auth()
             .and_then(|a| a.authenticate(&token))
-            .map_err(|_| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
+            .map_err(|_| RpcError::new(codes::INTERNAL, "Paired devices could not be read"))?
+            .ok_or_else(|| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
         conn.client = format!("device:{}", device.id);
         conn.device = Some(device);
         return Ok(
@@ -3536,8 +3537,8 @@ mod tests {
         .await
         .is_err());
         auth.revoke(&device.id).unwrap();
-        assert!(!auth.current(local.device.as_ref().unwrap()));
-        assert!(auth.authenticate(&token).is_err());
+        assert!(auth.current(local.device.as_ref().unwrap()).revoked());
+        assert!(auth.authenticate(&token).unwrap().is_none());
     }
 
     /// A peer whose credentials cannot be read, or name no pid the hub can see, is no user: it
