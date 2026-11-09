@@ -384,7 +384,7 @@ try {
   await page.getByRole("button", { name: "Close Shell", exact: true }).click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   const terminal = await page.evaluate(() =>
     window.twr.terminalOpen({ shell: true, title: "Packaged terminal" }),

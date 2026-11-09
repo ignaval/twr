@@ -27,6 +27,7 @@
   --warning-soft: rgb(224 180 92 / 13%);
   --danger: #f08a84;
   --danger-soft: rgb(240 138 132 / 12%);
+  --danger-fg: #1f0907;
   --success: #7cc79a;
   --focus: var(--accent);
   --scrim: rgb(0 0 0 / 60%);
@@ -307,6 +308,34 @@ kbd {
   opacity: 0.45;
 }
 .danger-quiet {
+  color: var(--danger);
+}
+/* The confirming button of a confirmation that stops, removes or interrupts something. */
+.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  font-weight: 600;
+  color: var(--danger-fg);
+}
+.danger:hover {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 88%, var(--text));
+}
+.app-crash {
+  max-width: 640px;
+  margin: 12vh auto 0;
+  padding: 0 16px;
+  color: var(--text);
+}
+.app-crash pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--raised);
   color: var(--danger);
 }
 .error-text {
@@ -1039,6 +1068,44 @@ kbd {
   top: 4px;
   right: 4px;
   padding: 6px;
+}
+/* A link the app doesn't open (a path, another scheme): its text, and a copy button. */
+.link-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  max-width: 100%;
+}
+.link-text > code {
+  overflow-wrap: anywhere;
+}
+/* Small inside a line of text on the desktop; phones keep their 44 px targets. */
+:root:not([data-mobile="true"]) .link-text > .copy-link {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 3px;
+  align-self: center;
+}
+.link-confirm {
+  padding: 8px 24px 20px;
+  overflow: auto;
+}
+.link-confirm > p {
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.link-destination {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow: auto;
+  user-select: text;
 }
 .markdown table {
   border-collapse: collapse;
@@ -1906,6 +1973,24 @@ meter::-webkit-meter-optimum-value {
   color: var(--faint);
   font-size: 0.846154rem;
 }
+/* For 600 ms after the options come on screen they answer nothing (a click or key meant
+ * for what was there before): they show as not yet available. */
+.attention-options button[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: progress;
+}
+.attention-options button {
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    opacity 200ms ease;
+}
+.attention-sent {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--success);
+}
 .attention-options > form {
   display: flex;
   gap: 8px;
@@ -2235,6 +2320,7 @@ meter::-webkit-meter-optimum-value {
   --warning-soft: rgb(138 92 0 / 10%);
   --danger: #b83a34;
   --danger-soft: rgb(184 58 52 / 9%);
+  --danger-fg: #ffffff;
   --success: #2b7449;
   --scrim: rgb(20 22 25 / 35%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
@@ -2262,6 +2348,7 @@ meter::-webkit-meter-optimum-value {
     --warning-soft: rgb(138 92 0 / 10%);
     --danger: #b83a34;
     --danger-soft: rgb(184 58 52 / 9%);
+    --danger-fg: #ffffff;
     --success: #2b7449;
     --scrim: rgb(20 22 25 / 35%);
     --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
@@ -2293,6 +2380,7 @@ meter::-webkit-meter-optimum-value {
   --warning-soft: color-mix(in srgb, var(--bg) 90%, var(--warning));
   --danger: var(--omarchy-danger, color-mix(in srgb, var(--text) 70%, #db4b4b));
   --danger-soft: color-mix(in srgb, var(--bg) 90%, var(--danger));
+  --danger-fg: var(--bg);
   --success: color-mix(in srgb, var(--text) 70%, #3b9c6e);
   --scrim: color-mix(in srgb, var(--bg) 75%, transparent);
   --shadow-color: color-mix(in srgb, var(--bg) 25%, #000);

@@ -297,8 +297,38 @@ try {
     .getByRole("button", { name: /api.*waiting/ })
     .first()
     .waitFor({ timeout: 30000 });
+  // An answer counts only once the options have been on screen for 600 ms, as in the
+  // TUI (shared/arming.ts): a click the moment the card appears answers nothing.
+  await page.evaluate(() => {
+    window.__earlyClick = new Promise((resolve) => {
+      const tryClick = () => {
+        const card = [...document.querySelectorAll(".manager .attention-card")]
+          .filter((node) => /Permission requested/.test(node.textContent || ""))
+          .at(0);
+        const options = card?.querySelector(".attention-options");
+        const allow = [
+          ...(card?.querySelectorAll(".attention-options button") || []),
+        ].find((button) => /allow/i.test(button.textContent || ""));
+        if (!allow) return false;
+        const armed = options?.getAttribute("data-armed") === "true";
+        allow.click();
+        observer.disconnect();
+        resolve(!armed);
+        return true;
+      };
+      const observer = new MutationObserver(tryClick);
+      observer.observe(document.body, { childList: true, subtree: true });
+      tryClick();
+    });
+  });
   await page.getByRole("button", { name: /Needs you/ }).click();
   await page.getByText("Permission requested", { exact: true }).waitFor();
+  const earlyClick = await within(
+    page.evaluate(() => window.__earlyClick),
+    10000,
+    "The permission card never showed an Allow button",
+  );
+  assert(earlyClick, "The early click must land before the options arm");
   console.log("Permission request rendered");
   const item = await page.evaluate(async () =>
     (await window.twr.rpc("attention.list", { all: true })).find(
@@ -317,8 +347,26 @@ try {
       item,
     ),
   );
-  await page
-    .locator(".manager .attention-options button")
+  const permissionCard = page
+    .locator(".manager .attention-card")
+    .filter({ hasText: "Permission requested" })
+    .first();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const still = await page.evaluate(
+    async (item) =>
+      (await window.twr.rpc("attention.list", { all: true })).some(
+        (a) => a.attn_id === item.attn_id && a.revision === item.revision,
+      ),
+    item,
+  );
+  assert(still, "A click before the options armed must answer nothing");
+  assert.equal(await permissionCard.locator(".attention-sent").count(), 0);
+  console.log("PASS: a click the moment a request appears answers nothing");
+  await permissionCard
+    .locator('.attention-options[data-armed="true"]')
+    .waitFor({ timeout: 5000 });
+  await permissionCard
+    .locator(".attention-options button")
     .filter({ hasText: "allow" })
     .first()
     .click();
@@ -382,6 +430,10 @@ try {
     await deny.isVisible(),
     "The full request and Deny action must share one reachable scroll area",
   );
+  // Scrolled into view just now: its options arm 600 ms after they came on screen.
+  await longRequest
+    .locator('.attention-options[data-armed="true"]')
+    .waitFor({ timeout: 5000 });
   await deny.click();
   await longRequest.waitFor({ state: "hidden" });
   await page.setViewportSize(fullViewport);
@@ -500,7 +552,9 @@ try {
     ).data.includes("ELECTRON_TERMINAL_UI_OK"),
   );
   await page.getByRole("button", { name: "Close Shell", exact: true }).click();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
+    .click();
   // Account login uses a disposable provider stub, not a real account or credential.
   execFileSync(
     join(bin, "twr"),
@@ -558,7 +612,9 @@ try {
   await page
     .getByRole("button", { name: "Close twr account login", exact: true })
     .click();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
+    .click();
   console.log(
     "Embedded terminal UI, shortcut handling, reload restore and interactive account login passed",
   );

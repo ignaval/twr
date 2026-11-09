@@ -52,7 +52,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
       await page
         .getByRole("dialog")
         .last()
-        .getByRole("button", { name: "Continue", exact: true })
+        .locator(".dialog-footer button.danger")
         .click();
     await dialog.locator(".operation-result").waitFor();
     await dialog.getByRole("button", { name: "Close", exact: true }).click();
@@ -132,6 +132,8 @@ export async function runMacQA(page, { fixture, hubPids }) {
   const question = page
     .locator(".manager .attention-card")
     .filter({ hasText: "Continue with the QA test?" });
+  // Answers count once the options have been on screen for 600 ms (shared/arming.ts).
+  await question.locator('.attention-options[data-armed="true"]').waitFor();
   await question.getByRole("button", { name: /Proceed/ }).click();
   await question.waitFor({ state: "hidden" });
   await talk("qa-agent");
@@ -380,6 +382,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   const deleteCard = page
     .locator(".manager .attention-card")
     .filter({ hasText: "qa-agent" });
+  await deleteCard.locator('.attention-options[data-armed="true"]').waitFor();
   await deleteCard
     .locator(".attention-options button")
     .filter({ hasText: /^\s*(?:\d+\s*)?delete/i })
@@ -504,7 +507,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   await page
     .getByRole("dialog")
     .last()
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   console.log(
     "QA: selecting one message reaches a real speaker process (silent command engine)",

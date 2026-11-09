@@ -21,6 +21,7 @@ import {
   useId,
   useLayoutEffect,
   useMemo,
+  memo,
   useRef,
   useState,
   lazy,
@@ -28,6 +29,7 @@ import {
   type CSSProperties,
   type FormEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -63,9 +65,9 @@ import {
   Trash2,
   Volume2,
   Command as CommandIcon,
+  Check,
   CheckCircle2,
   Circle,
-  Copy,
   ExternalLink,
   Download,
   Paperclip,
@@ -91,7 +93,16 @@ import type {
   Thread,
   ViewState,
 } from "./types";
-import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
+import {
+  CopyButton,
+  DataView,
+  Dialog,
+  Empty,
+  FieldInput,
+  LinkConfirm,
+  Markdown,
+  Spinner,
+} from "./ui";
 import { effortChoices, formRuntime, modelChoices } from "./models";
 import {
   AssistanceNotice,
@@ -101,11 +112,17 @@ import {
 } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { announcements, voiceHint } from "./voice";
-import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
+import {
+  blocksOf,
+  mergeEvents,
+  foldRoutineBlocks,
+  messageTime,
+} from "./transcript";
 import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
+import { armed, armsIn, hidden, mayAnswer, shown, type Arming } from "./arming";
 import {
   announce,
   attentionAnnouncement,
@@ -120,6 +137,7 @@ const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
 
+const noAttention: Attention[] = [];
 const initial: ViewState = {
   threads: [],
   attention: [],
@@ -163,6 +181,17 @@ function operationAction(command: Command, again: boolean) {
   };
   const label = labels[command.id] || command.title.replace(/…$/, "");
   return again ? `${label} again` : label;
+}
+/** A list of strings saved in local storage; anything else there reads as empty. */
+function storedList(key: string): string[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "[]");
+    return Array.isArray(saved)
+      ? saved.filter((v): v is string => typeof v === "string").slice(0, 256)
+      : [];
+  } catch {
+    return [];
+  }
 }
 function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
   const root = document.documentElement;
@@ -277,27 +306,16 @@ export default function App({
   const [hovering, setHovering] = useState(false);
   const [focus, setFocus] = useState(false);
   const [parked, setParked] = useState(false);
-  const [collapsed, setCollapsed] = useState<string[]>(() => {
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem("twr.sidebar.collapsed") || "[]",
-      );
-      return Array.isArray(saved)
-        ? saved.filter((v): v is string => typeof v === "string").slice(0, 256)
-        : [];
-    } catch {
-      return [];
-    }
-  });
+  const [collapsed, setCollapsed] = useState<string[]>(() =>
+    storedList("twr.sidebar.collapsed"),
+  );
   const pendingOpen = useRef<{
     workspace: string;
     thread?: string;
     talk: boolean;
     then?: () => void;
   }>(undefined);
-  const [pins, setPins] = useState<string[]>(() =>
-    JSON.parse(localStorage.getItem("twr.pins") || "[]"),
-  );
+  const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
   const observedDestination = useRef<string | undefined>(undefined);
@@ -427,6 +445,10 @@ export default function App({
   const [confirmation, setConfirmation] = useState<{
     title: string;
     detail: string;
+    /** The confirming button's label: the action it takes. */
+    action: string;
+    /** Something stops, goes or is interrupted: the button says so in danger style. */
+    destructive?: boolean;
     run: () => void;
   }>();
   const [workspaceModal, setWorkspaceModal] = useState(false);
@@ -441,6 +463,8 @@ export default function App({
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
+  /** The conversation whose transcript on screen was loaded live from the hub. */
+  const liveTranscript = useRef<string | undefined>(undefined);
   const activeSubscription = useRef("");
   const pendingEvents = useRef<HubEvent[]>([]);
   const eventTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -999,15 +1023,30 @@ export default function App({
     activeThread.current = id;
     const generation = ++transcriptGeneration.current;
     const buffered = pendingEvents.current.splice(0);
+    const shownEvents = latestCache.current.events;
+    // Only a change of conversation clears the transcript.
+    const kept =
+      connected &&
+      id &&
+      previousThread === id &&
+      liveTranscript.current === id &&
+      shownEvents.length
+        ? mergeEvents(shownEvents, buffered)
+        : undefined;
+    // A disconnect keeps the live transcript on screen; its reconnect catches up.
+    if (previousThread !== id || !hasLiveSnapshot.current)
+      liveTranscript.current = undefined;
     setEvents((previous) =>
-      !connected && hasLiveSnapshot.current && previousThread === id
+      kept
         ? mergeEvents(previous, buffered)
-        : !connected && journal && id
-          ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
-          : [],
+        : !connected && hasLiveSnapshot.current && previousThread === id
+          ? mergeEvents(previous, buffered)
+          : !connected && journal && id
+            ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
+            : [],
     );
     setTranscriptError("");
-    setEarliestTurn(undefined);
+    if (!kept) setEarliestTurn(undefined);
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -1018,6 +1057,41 @@ export default function App({
     }
     setTranscriptLoading(true);
     void (async () => {
+      // The same conversation again (a reconnect, a resync, a retry after a transcript
+      // error): keep what is on screen and catch up from its last event, so the view,
+      // its older turns and its scroll position stay. Far behind, reload it instead.
+      if (kept?.length) {
+        const last = kept[kept.length - 1].seq;
+        let page = await rpc("thread.transcript", {
+          thread: id,
+          since_seq: last,
+          limit: 500,
+        });
+        const fresh: HubEvent[] = [...page.events];
+        for (let pages = 1; page.more && pages < 8; pages++) {
+          page = await rpc("thread.transcript", {
+            thread: id,
+            since_seq: page.next,
+            limit: 500,
+          });
+          if (generation !== transcriptGeneration.current) return;
+          fresh.push(...page.events);
+        }
+        if (generation !== transcriptGeneration.current) return;
+        if (!page.more) {
+          setEvents((old) => mergeEvents(old, fresh));
+          liveTranscript.current = id;
+          const subscription = String(generation);
+          activeSubscription.current = subscription;
+          await rpc("desktop.subscribe", {
+            thread: id,
+            since: page.next || last,
+            subscription,
+          });
+          return;
+        }
+        setEarliestTurn(undefined);
+      }
       let page: Json;
       try {
         page = await rpc("thread.transcript", { thread: id, limit: 500 });
@@ -1076,6 +1150,7 @@ export default function App({
       if (generation !== transcriptGeneration.current) return;
       setEarliestTurn(firstTurn);
       setEvents(all);
+      liveTranscript.current = id;
       const subscription = String(generation);
       activeSubscription.current = subscription;
       await rpc("desktop.subscribe", {
@@ -1086,7 +1161,7 @@ export default function App({
     })()
       .catch((e) => {
         if (generation === transcriptGeneration.current)
-          setTranscriptError(String(e));
+          setTranscriptError(errorMessage(e));
       })
       .finally(() => {
         if (generation === transcriptGeneration.current)
@@ -1346,6 +1421,8 @@ export default function App({
       setConfirmation({
         title: operation.title,
         detail: operation.confirm,
+        action: operationAction(operation, false),
+        destructive: true,
         run: () => void run(),
       });
     else await run();
@@ -1511,16 +1588,14 @@ export default function App({
   // What this device may have read aloud lately, for voice mode's echo check: the
   // orchestrator's last messages (kept while a worker's conversation is on screen) and the
   // sentences a speaker announces.
-  const orchestratorSaid = useRef<string[]>([]);
-  useEffect(() => {
-    if (destination || !orchestrator) return;
-    orchestratorSaid.current = blocksOf(events)
+  // Read only when voice checks an utterance: not folded again on every event batch.
+  const orchestratorEvents = useRef<HubEvent[]>([]);
+  if (!destination && orchestrator) orchestratorEvents.current = events;
+  const spokenLately = () => [
+    ...blocksOf(orchestratorEvents.current)
       .filter((b) => b.kind === "assistant")
       .slice(-3)
-      .map((b) => b.text);
-  }, [events, destination, orchestrator?.id]);
-  const spokenLately = () => [
-    ...orchestratorSaid.current,
+      .map((b) => b.text),
     ...announcements(view.threads),
   ];
   async function submitSlash(text: string) {
@@ -1855,7 +1930,27 @@ export default function App({
       fail(error);
     }
   }
-  async function takeBack(message: Json) {
+  // A queued message's Take back / Send now run once at a time: its buttons are disabled
+  // while its request is in flight.
+  const [queueBusy, setQueueBusy] = useState<unknown[]>([]);
+  const queueInFlight = useRef(new Set<unknown>());
+  async function queueAction(message: Json, run: () => Promise<void>) {
+    const ref = message.ref;
+    if (queueInFlight.current.has(ref)) return;
+    queueInFlight.current.add(ref);
+    setQueueBusy([...queueInFlight.current]);
+    try {
+      await run();
+    } finally {
+      queueInFlight.current.delete(ref);
+      setQueueBusy([...queueInFlight.current]);
+    }
+  }
+  const takeBack = (message: Json) =>
+    queueAction(message, () => withdrawMessage(message));
+  const sendNow = (message: Json) =>
+    queueAction(message, () => sendMessageNow(message));
+  async function withdrawMessage(message: Json) {
     try {
       const response = await rpc("message.withdraw", {
         thread: target?.id,
@@ -1876,7 +1971,7 @@ export default function App({
       fail(error);
     }
   }
-  async function sendNow(message: Json) {
+  async function sendMessageNow(message: Json) {
     try {
       const response = await rpc("message.send_now", {
         thread: target?.id,
@@ -1899,7 +1994,9 @@ export default function App({
       const next = old.includes(id)
         ? old.filter((p) => p !== id)
         : [...old, id];
-      localStorage.setItem("twr.pins", JSON.stringify(next));
+      try {
+        localStorage.setItem("twr.pins", JSON.stringify(next));
+      } catch {}
       return next;
     });
   const workers = view.threads.filter((t) => !t.is_orchestrator);
@@ -1910,8 +2007,19 @@ export default function App({
         ["running", "background", "waiting", "error"].includes(t.status) ||
         view.attention.some((a) => a.thread === t.id)),
   );
-  const attentionFor = (id: string) =>
-    view.attention.filter((a) => a.thread === id);
+  const attentionByThread = useMemo(() => {
+    const byThread = new Map<string, Attention[]>();
+    for (const item of view.attention)
+      byThread.set(item.thread, [...(byThread.get(item.thread) || []), item]);
+    return byThread;
+  }, [view.attention]);
+  const attentionFor = (id: string) => attentionByThread.get(id) || noAttention;
+  const selectThread = useCallback((id: string) => setSelected(id), []);
+  const openThread = useCallback((id: string) => {
+    setDestination(id);
+    setSection("chat");
+    setSelected(undefined);
+  }, []);
   // While a workspace connects, its entry keeps the rows it had (a double-click's second
   // click lands on the row the first one chose).
   const entries = workspaceEntries(
@@ -1986,33 +2094,54 @@ export default function App({
         show(wanted.thread, wanted.talk, wanted.then);
     });
   };
-  const respond = async (item: Attention, answer: string, message?: string) => {
-    if (!connected || !liveView.current || !permitted("operate")) return;
-    try {
+  // Every attention answer (conversation cards, Needs you, the inspector, mobile) goes
+  // through here: only a live hub view, never a cached one, can authorize it.
+  const liveAnswerCheck = useCallback(() => {
+    if (!connectionRef.current || !liveView.current)
+      throw new Error(
+        "Not connected to the live hub. Reconnect and review the current request.",
+      );
+    if (deviceScopes && !deviceScopes.includes("operate"))
+      throw new Error("This device has read-only access.");
+  }, [deviceScopes]);
+  const respond = useCallback(
+    async (item: Attention, answer: string, message?: string) => {
+      liveAnswerCheck();
       await rpc("attention.respond", {
         attn_id: item.attn_id,
         revision: item.revision,
         answer,
         ...(message ? { message } : {}),
       });
-    } catch (e) {
-      fail(e);
-    }
-  };
-  const earlier = async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !target || earlierBusy) return;
+    },
+    [liveAnswerCheck, rpc],
+  );
+  const dismissAttention = useCallback(
+    async (item: Attention) => {
+      liveAnswerCheck();
+      await rpc("attention.dismiss", {
+        attn_id: item.attn_id,
+        revision: item.revision,
+      });
+    },
+    [liveAnswerCheck, rpc],
+  );
+  const earlierTarget = target?.id;
+  const earlier = useCallback(async () => {
+    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+      return;
     const generation = transcriptGeneration.current;
     setEarlierBusy(true);
     try {
       let page = await rpc("thread.transcript", {
-        thread: target.id,
+        thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
-          thread: target.id,
+          thread: earlierTarget,
           turn: earliestTurn - 1,
           since_seq: page.next,
           limit: 500,
@@ -2027,7 +2156,8 @@ export default function App({
     } finally {
       setEarlierBusy(false);
     }
-  };
+  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   function chooseMention(thread: Thread) {
     setDrafts((old) => ({
       ...old,
@@ -2282,12 +2412,8 @@ export default function App({
                               dived={destination === thread.id}
                               selected={selected === thread.id}
                               pinned={pins.includes(thread.id)}
-                              onSelect={() => setSelected(thread.id)}
-                              onOpen={() => {
-                                setDestination(thread.id);
-                                setSection("chat");
-                                setSelected(undefined);
-                              }}
+                              onSelect={selectThread}
+                              onOpen={openThread}
                             />
                           ))}
                           {!visible.length && (
@@ -2821,6 +2947,7 @@ export default function App({
                         thread={view.threads.find((t) => t.id === item.thread)}
                         readOnly={!connected || !permitted("operate")}
                         onRespond={respond}
+                        onDismiss={dismissAttention}
                         rpc={rpc}
                         fail={fail}
                       />
@@ -2831,14 +2958,14 @@ export default function App({
                   events={presentedEvents}
                   showTools={showTools}
                   showThinking={showThinking}
-                  loading={transcriptLoading}
+                  loading={transcriptLoading && !presentedEvents.length}
                   error={transcriptError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
                   }
                   earlierBusy={earlierBusy}
                   target={target}
-                  onSetup={() => action("orch")}
+                  onSetup={setupOrchestrator}
                   connected={connected}
                   summaries={assistance.summaries}
                   onError={fail}
@@ -2870,6 +2997,7 @@ export default function App({
                   journal={journal}
                   workspace={workspace}
                   connected={connected}
+                  threads={view.threads}
                   onSent={(result) => {
                     setQueueRefresh((n) => n + 1);
                     for (const restored of [
@@ -2922,18 +3050,22 @@ export default function App({
                             JSON.stringify(message)}
                         </span>
                         <button
-                          disabled={!message.mine}
+                          disabled={
+                            !message.mine || queueBusy.includes(message.ref)
+                          }
                           onClick={() => void takeBack(message)}
                         >
                           Take back
                         </button>
                         <button
-                          disabled={i !== 0}
+                          disabled={i !== 0 || queueBusy.includes(message.ref)}
                           onClick={() => {
                             setConfirmation({
                               title: "Send this message now?",
                               detail:
                                 "The running turn will be interrupted so this message can start.",
+                              action: "Send now",
+                              destructive: true,
                               run: () => void sendNow(message),
                             });
                           }}
@@ -3435,12 +3567,8 @@ export default function App({
                       dived={destination === t.id}
                       selected={selected === t.id}
                       pinned={pins.includes(t.id)}
-                      onSelect={() => setSelected(t.id)}
-                      onOpen={() => {
-                        setDestination(t.id);
-                        setSection("chat");
-                        setSelected(undefined);
-                      }}
+                      onSelect={selectThread}
+                      onOpen={openThread}
                       large
                     />
                   ))}
@@ -3514,6 +3642,7 @@ export default function App({
                     )}
                     readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
@@ -3640,6 +3769,7 @@ export default function App({
                     thread={selectedThread}
                     readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
@@ -3781,6 +3911,8 @@ export default function App({
                         detail: t.exited
                           ? "Remove this terminal tab?"
                           : "Its interactive program will exit. The hub and other agents keep running.",
+                        action: t.exited ? "Remove tab" : "Close terminal",
+                        destructive: !t.exited,
                         run: () => {
                           terminalSnapshots.current.changed();
                           void hostApi
@@ -4129,14 +4261,14 @@ export default function App({
             <div>
               <button onClick={() => setConfirmation(undefined)}>Cancel</button>
               <button
-                className="primary"
+                className={confirmation.destructive ? "danger" : "primary"}
                 onClick={() => {
                   const run = confirmation.run;
                   setConfirmation(undefined);
                   run();
                 }}
               >
-                Continue
+                {confirmation.action}
               </button>
             </div>
           </footer>
@@ -4276,6 +4408,7 @@ export default function App({
           </button>
         </nav>
       )}
+      <LinkConfirm onError={fail} />
       <span id="twr-thread-open-hint" hidden>
         Details shown. Press Enter to open this conversation.
       </span>
@@ -4283,7 +4416,9 @@ export default function App({
   );
 }
 
-function ThreadCard({
+/** Memoized, with stable `onSelect`/`onOpen` taking the thread's id and `items` shared
+ * per thread: typing and streaming don't redraw every card. */
+const ThreadCard = memo(function ThreadCard({
   thread,
   items,
   selected,
@@ -4299,8 +4434,8 @@ function ThreadCard({
   selected: boolean;
   dived?: boolean;
   pinned: boolean;
-  onSelect: () => void;
-  onOpen: () => void;
+  onSelect: (id: string) => void;
+  onOpen: (id: string) => void;
   large?: boolean;
   listItem?: boolean;
 }) {
@@ -4311,8 +4446,8 @@ function ThreadCard({
       selected={selected}
       dived={dived}
       pinned={pinned}
-      onSelect={onSelect}
-      onOpen={onOpen}
+      onSelect={() => onSelect(thread.id)}
+      onOpen={() => onOpen(thread.id)}
       large={large}
     />
   );
@@ -4323,7 +4458,7 @@ function ThreadCard({
   ) : (
     card
   );
-}
+});
 function ThreadCardButton({
   thread,
   items,
@@ -4418,48 +4553,117 @@ function ThreadCardButton({
     </button>
   );
 }
+/** Tracks how long an attention card's options have been on screen: from mount, or from
+ * when they scroll into view, and again from zero after they leave it or the window is
+ * hidden. `identity` restarts it for a new item or revision. */
+function useArming(target: RefObject<HTMLElement | null>, identity: string) {
+  const state = useRef<Arming>({});
+  const [isArmed, setArmed] = useState(false);
+  useEffect(() => {
+    state.current = hidden();
+    setArmed(false);
+    const node = target.current;
+    const observable = !!node && typeof IntersectionObserver !== "undefined";
+    let onScreen = !observable;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const update = () => {
+      clearTimeout(timer);
+      const now = performance.now();
+      state.current =
+        onScreen && document.visibilityState !== "hidden"
+          ? shown(state.current, now)
+          : hidden();
+      setArmed(armed(state.current, now));
+      const wait = armsIn(state.current, now);
+      if (wait) timer = setTimeout(update, wait);
+    };
+    let observer: IntersectionObserver | undefined;
+    if (observable) {
+      observer = new IntersectionObserver((entries) => {
+        onScreen = entries[entries.length - 1].isIntersecting;
+        update();
+      });
+      observer.observe(node);
+    } else update();
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      clearTimeout(timer);
+      observer?.disconnect();
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [identity]);
+  return { armed: isArmed, state: () => state.current };
+}
 function AttentionCard({
   item,
   readOnly = false,
   thread,
   onRespond,
+  onDismiss,
   rpc,
   fail,
 }: {
   item: Attention;
   readOnly?: boolean;
   thread?: Thread;
+  /** Answers through App's live-view guard; rejects when it can't be answered now. */
   onRespond: (
     item: Attention,
     answer: string,
     message?: string,
   ) => Promise<void>;
+  onDismiss: (item: Attention) => Promise<void>;
   rpc: (method: string, params?: Json) => Promise<Json>;
   fail: (e: unknown) => void;
 }) {
   const [answer, setAnswer] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  // Once an answer is accepted the card stays answered until the next state removes it:
+  // a second click would only meet the stale revision.
+  const [sent, setSent] = useState(false);
   const [requestError, setRequestError] = useState("");
   const options = item.options || [];
   const ids = useId();
-  const respond = async (value: string) => {
-    if (readOnly || !canRespond(item, busy)) return;
+  const response = useRef<HTMLDivElement>(null);
+  const arming = useArming(response, item.attn_id + ":" + item.revision);
+  const pending = useRef(false);
+  const answered = useRef(false);
+  const settle = async (run: () => Promise<void>) => {
+    // Clicks and keys that land before the options have been on screen for 600 ms were
+    // meant for whatever was there before (a card that just slid away, the previous
+    // revision): they answer nothing.
+    if (
+      pending.current ||
+      answered.current ||
+      !canRespond(item, busy) ||
+      !mayAnswer({
+        arming: arming.state(),
+        now: performance.now(),
+        busy,
+        sent,
+        readOnly,
+      })
+    )
+      return;
+    pending.current = true;
     setBusy(true);
     setRequestError("");
     try {
-      await rpc("attention.respond", {
-        attn_id: item.attn_id,
-        revision: item.revision,
-        answer: value,
-        ...(message ? { message } : {}),
-      });
+      await run();
+      answered.current = true;
+      setSent(true);
     } catch (e) {
       setRequestError(errorMessage(e));
     } finally {
+      pending.current = false;
       setBusy(false);
     }
   };
+  const respond = (value: string) =>
+    settle(() => onRespond(item, value, message || undefined));
+  const locked = readOnly || busy || sent || !item.revision || item.incomplete;
+  const waiting = !locked && !arming.armed;
   return (
     <article
       className={`attention-card attention-${item.reason}`}
@@ -4474,10 +4678,7 @@ function AttentionCard({
       onKeyDown={(event) => {
         if (
           event.target !== event.currentTarget ||
-          readOnly ||
-          busy ||
-          item.incomplete ||
-          !item.revision ||
+          locked ||
           event.ctrlKey ||
           event.metaKey ||
           event.altKey
@@ -4543,19 +4744,23 @@ function AttentionCard({
         {item.note && <p className="attention-note">{item.note}</p>}
       </div>
       {readOnly && <p className="muted">This device has read-only access.</p>}
-      <div className="attention-response">
+      <div className="attention-response" ref={response}>
         <input
           aria-label="Optional message with your decision"
           aria-describedby={requestError ? `${ids}-error` : undefined}
           placeholder="Add a note (optional)…"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          disabled={readOnly || busy}
+          disabled={readOnly || busy || sent}
         />
-        <div className="attention-options">
+        <div
+          className={`attention-options ${waiting ? "arming" : ""}`}
+          data-armed={arming.armed && !locked ? "true" : "false"}
+        >
           {options.map((option, i) => (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
               key={option + ":" + i}
               aria-keyshortcuts={String(i + 1)}
               onClick={() => void respond(option)}
@@ -4584,16 +4789,11 @@ function AttentionCard({
                   value={answer}
                   onChange={(e) => setAnswer(e.target.value)}
                   placeholder="Your answer…"
-                  disabled={readOnly || busy}
+                  disabled={readOnly || busy || sent}
                 />
                 <button
-                  disabled={
-                    readOnly ||
-                    busy ||
-                    !answer.trim() ||
-                    !item.revision ||
-                    item.incomplete
-                  }
+                  disabled={locked || !answer.trim()}
+                  aria-disabled={waiting || undefined}
                 >
                   Answer
                 </button>
@@ -4601,21 +4801,20 @@ function AttentionCard({
             )}
           {!["permission", "question"].includes(item.reason) && (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
-              onClick={() => {
-                setBusy(true);
-                void rpc("attention.dismiss", {
-                  attn_id: item.attn_id,
-                  revision: item.revision,
-                })
-                  .catch(fail)
-                  .finally(() => setBusy(false));
-              }}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
+              onClick={() => void settle(() => onDismiss(item))}
             >
               Dismiss
             </button>
           )}
           {busy && <Spinner />}
+          {sent && (
+            <span className="attention-sent" role="status">
+              <Check size={14} aria-hidden="true" />
+              Sent
+            </span>
+          )}
         </div>
         {requestError && (
           <p role="alert" className="error-text" id={`${ids}-error`}>
@@ -4626,7 +4825,8 @@ function AttentionCard({
     </article>
   );
 }
-function Conversation({
+/** Memoized: typing in the composer doesn't redraw the transcript. */
+const Conversation = memo(function Conversation({
   events,
   showTools,
   showThinking,
@@ -4660,6 +4860,20 @@ function Conversation({
   const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
+  // Expanded messages and open tool details, by block: rows scrolled out of the virtual
+  // list unmount, and come back as they were left.
+  const [opened, setOpened] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
+  const setOpen = useCallback((key: string, open: boolean) => {
+    setOpened((old) => {
+      if ((old.get(key) ?? false) === open) return old;
+      const next = new Map(old);
+      if (open) next.set(key, true);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
   const blocks = useMemo(
     () =>
       foldRoutineBlocks(blocksOf(events), events, summaries).filter(
@@ -4845,11 +5059,11 @@ function Conversation({
                           ? "twr"
                           : target?.name || "Agent"}
                 </b>
-                <time>
-                  {new Date(block.ts).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
+                <time
+                  dateTime={block.ts}
+                  title={new Date(block.ts).toLocaleString()}
+                >
+                  {messageTime(block.ts)}
                 </time>
                 {block.pending && <Spinner />}
                 {block.kind === "assistant" && !block.pending && target && (
@@ -4869,19 +5083,22 @@ function Conversation({
                     <Volume2 size={13} />
                   </button>
                 )}
-                <button
+                <CopyButton
                   className="icon-button copy-message"
-                  aria-label="Copy message"
-                  title="Copy message"
-                  onClick={() =>
-                    void hostApi.copyText(block.detail || block.text)
-                  }
-                >
-                  <Copy size={13} />
-                </button>
+                  label="Copy message"
+                  size={13}
+                  text={() => block.detail || block.text}
+                  onError={onError}
+                />
               </div>
               {block.children ? (
-                <details className="routine-updates">
+                <details
+                  className="routine-updates"
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.text}
                     <span>
@@ -4892,22 +5109,35 @@ function Conversation({
                   </summary>
                   {block.children.map((entry) => (
                     <div key={entry.id}>
-                      <time>{new Date(entry.ts).toLocaleTimeString()}</time>
+                      <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
                       <Markdown text={entry.text} />
                     </div>
                   ))}
                 </details>
               ) : block.kind === "tool" ? (
-                <details>
+                <details
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.detail?.split("\n")[0] || "Tool call"}
                   </summary>
-                  <MessageBody text={block.detail || ""} mono />
+                  <MessageBody
+                    text={block.detail || ""}
+                    mono
+                    expanded={opened.get(block.id) ?? false}
+                    onExpandedChange={(open) => setOpen(block.id, open)}
+                  />
                 </details>
               ) : (
                 <MessageBody
                   text={block.text}
                   clamp={block.kind === "user" || block.kind === "notice"}
+                  streaming={block.kind === "assistant" && !!block.pending}
+                  expanded={opened.get(block.id) ?? false}
+                  onExpandedChange={(open) => setOpen(block.id, open)}
                 />
               )}
             </article>
@@ -4932,7 +5162,7 @@ function Conversation({
       )}
     </div>
   );
-}
+});
 function ContextEditor({
   value,
   project,
