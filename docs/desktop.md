@@ -26,6 +26,11 @@ three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remain
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
 markers. A desktop app launched by a twr agent cannot turn itself into a user client.
+The window opens first: reading the login shell (at most 8 seconds, with no input, so an
+rc file that prompts does not stall it) and staging the engines happen while it loads,
+and the hub connection, CLI forms, terminals and other programs wait for them. A login
+shell that fails or times out is recorded in the diagnostics log, and the app continues
+with the environment it was launched with.
 
 ## Sidebar
 
@@ -108,6 +113,8 @@ it has been on screen 300 ms, so a key pressed as it appears isn't taken for it)
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
 
+Right-click offers Cut, Copy, Paste and Select All in text fields, Copy for selected text,
+and Copy Link Address on a link (links are copied, not opened).
 macOS uses Command shortcuts; Linux uses Control. Terminal keys pass to the terminal,
 including Ctrl-K/Ctrl-W. Ctrl/Cmd-K opens the palette outside terminals; Ctrl/Cmd-B toggles
 the sidebar; Ctrl/Cmd-G toggles the grid. The focus filter is Cmd-Shift-F on macOS
@@ -166,6 +173,10 @@ twr keeps a local log (`twr-desktop.log`, rotated at 2 MiB) in the folder shown 
 **Help › Open Log Folder** and in Settings › Diagnostics (`~/Library/Logs/twr-desktop`
 on macOS; under the app's configuration folder on Linux). The log records startup, update checks, hub connection failures, renderer errors
 and crashed helper processes. Chromium crash reports are kept on disk and never uploaded.
+If the window's page ends unexpectedly (out of memory, a GPU failure), twr reloads it, up to
+three times in five minutes, then asks whether to reload or quit. A window that stops
+responding offers Wait or Reload; the question closes itself if the window recovers.
+Reloading keeps the hub, its agents and open terminals.
 **Settings › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
 version, install kind, platform and session details, GPU status, memory use and the recent
 log. Tokens, keys, URL credentials and your home folder path are removed first.
@@ -187,7 +198,10 @@ log. Tokens, keys, URL credentials and your home folder path are removed first.
 
 The bundled executables are copied to a content-addressed private engine directory before
 starting a hub. A hub therefore keeps a stable executable path after an AppImage mount or
-macOS translocated app disappears. Existing engine versions are retained while hubs may
+macOS translocated app disappears. Packaged builds ship the engines' SHA-256 digests in
+`resources/bin/digests.json` (written by `npm run build:rust`), so a launch does not hash
+the engines again, even from an AppImage's new mount path; each copy is verified against
+those digests, and a manifest that does not match its engines is ignored. Existing engine versions are retained while hubs may
 still use them. Restarting or updating the desktop never silently stops an existing hub.
 
 The iOS and Android clients share this React UI and Rust projection through an
@@ -299,6 +313,8 @@ Other workspaces show a summary with an Open action. Open the workspace before
 answering so the full live request and its current revision can be reviewed. Saved
 summaries for disconnected hubs are labeled; they cannot authorize a response.
 Refresh reads each running workspace without moving your active conversation.
+Only one refresh runs at a time. Listing the workspaces may take up to 5 seconds (it asks
+each hub in turn); if it takes longer or fails, the refresh uses the last list that worked.
 
 ### Search saved conversations
 
@@ -317,6 +333,11 @@ Use `twr events THREAD --hydrate` to read the full recorded data. Search runs on
 the hub, so it requires a connection to that workspace.
 
 ## Layout and offline recovery
+
+The window reopens with the size, position and maximized or full-screen state it had when
+it was last moved, resized or closed (saved in the app's `desktop.json`). It is moved and
+shrunk to fit the display that shows most of it; if that display is gone, it keeps its size
+and opens in the default place.
 
 Settings → Layout & text offers Compact and Comfortable density, independent interface and code text sizes, and sidebar/inspector width sliders. Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
 

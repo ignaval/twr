@@ -22,11 +22,17 @@ export class Updater {
   status: UpdateStatus;
   private checking?: Promise<UpdateStatus>;
   private wired = false;
+  private automatic = false;
+  private readonly ready: Promise<void>;
   constructor(
     private readonly options: {
       kind: InstallKind;
-      automatic: boolean;
-      manualReason?: string;
+      /**
+       * Whether this install replaces itself. On macOS that needs a code
+       * signature check, which runs after the window shows; checks and
+       * downloads wait for it.
+       */
+      mode: Promise<{ automatic: boolean; manualReason?: string }>;
       current: string;
       log: DiagnosticLog;
       onChange(status: UpdateStatus): void;
@@ -37,11 +43,20 @@ export class Updater {
   ) {
     this.status = {
       kind: options.kind,
-      automatic: options.automatic,
-      manualReason: options.manualReason,
+      automatic: false,
       state: "idle",
       current: options.current,
     };
+    this.ready = options.mode.then(
+      ({ automatic, manualReason }) => {
+        this.automatic = automatic;
+        this.set({ automatic, manualReason });
+      },
+      (error) => {
+        options.log.warn("updater", "Could not tell how to update", error);
+        this.set({ manualReason: "This build could not be checked." });
+      },
+    );
   }
   private set(update: Partial<UpdateStatus>) {
     this.status = { ...this.status, ...update };
@@ -86,7 +101,9 @@ export class Updater {
       this.status.state === "downloaded"
     )
       return Promise.resolve(this.status);
-    this.checking ??= this.run().finally(() => (this.checking = undefined));
+    this.checking ??= this.ready
+      .then(() => this.run())
+      .finally(() => (this.checking = undefined));
     return this.checking;
   }
   private async run(): Promise<UpdateStatus> {
@@ -136,7 +153,7 @@ export class Updater {
       }
       const metadata = updateMetadataName(kind);
       const selfUpdating =
-        this.options.automatic &&
+        this.automatic &&
         !!metadata &&
         assets.some((asset) => asset.name === metadata);
       if (!selfUpdating) {
@@ -144,7 +161,7 @@ export class Updater {
           ...base,
           state: "available",
           instructions:
-            this.options.automatic && !download
+            this.automatic && !download
               ? "This release's desktop installers are still being published. Check again shortly."
               : manualInstructions(kind, download),
         });
@@ -169,7 +186,7 @@ export class Updater {
     }
   }
   async download() {
-    if (!this.options.automatic || this.status.state !== "available")
+    if (!this.automatic || this.status.state !== "available")
       throw new Error("No automatic update is waiting to download");
     this.wire();
     this.set({ state: "downloading", progress: 0 });
