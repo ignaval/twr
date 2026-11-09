@@ -3,7 +3,7 @@ on:
   pull_request:
     paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
   push:
-    branches: [dev, "codex/twr-apps"]
+    branches: [dev]
     paths: ["clients/**", "crates/**", "Cargo.*", "rust-toolchain.toml", ".github/workflows/mobile.yml"]
   workflow_dispatch:
 permissions:
@@ -54,6 +54,15 @@ jobs:
       - name: Compile iOS native application
         working-directory: clients
         run: node mobile/scripts/ios-build.mjs
+      # ios-build.mjs builds Debug, which the QA runs; the Release configuration (no DEBUG
+      # condition, optimized Swift) is only compiled, once.
+      - name: Compile the iOS Release configuration
+        if: matrix.kind == 'phone'
+        working-directory: clients
+        run: |
+          xcodebuild -project mobile/ios/App/App.xcodeproj -scheme App -configuration Release \
+            -sdk iphonesimulator -derivedDataPath "$RUNNER_TEMP/ios-release" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=- build
       - name: Verify installed fold-control helper
         working-directory: clients
         run: node node_modules/agent-device/bin/agent-device.mjs --version
@@ -70,3 +79,47 @@ jobs:
             clients/test-results/ios/
             clients/test-results/performance-ios-*.json
             clients/mobile/ios/App/DerivedData/Build/Products/Debug-iphonesimulator/App.app
+
+  android:
+    # Compiles the Android app (its Java plugins: transport, credentials, storage, voice) with
+    # the web layer `cap sync` copies in, runs Android lint and the JVM unit tests. The
+    # emulator QA (mobile/scripts/android-qa.mjs) is not run here.
+    name: Android native build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # gradlew runs the committed gradle-wrapper.jar: it must be one Gradle published.
+      - uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build the mobile UI and sync it into the native projects
+        working-directory: clients
+        run: |
+          npm ci
+          npm run mobile:build
+      - name: Assemble the debug APK
+        working-directory: clients/mobile/android
+        run: ./gradlew --no-daemon assembleDebug
+      - name: Android lint
+        working-directory: clients/mobile/android
+        run: ./gradlew --no-daemon lint
+      - name: JVM unit tests
+        working-directory: clients/mobile/android
+        run: ./gradlew --no-daemon testDebugUnitTest
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: twr-android-build
+          path: |
+            clients/mobile/android/app/build/outputs/apk/debug/*.apk
+            clients/mobile/android/app/build/reports/

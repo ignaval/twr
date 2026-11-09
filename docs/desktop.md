@@ -157,7 +157,7 @@ Settings › Application has three switches:
 | macOS, ad hoc review build | Notifies and links the new disk image (macOS only swaps in signed updates) |
 | AppImage | Downloads in the background and replaces the AppImage file |
 | Debian/Ubuntu package | Notifies with the `sudo apt install ./…deb` command and a download link |
-| Arch / AUR (`twr-desktop-bin`) | Notifies; update with your AUR helper (`yay -Syu twr-desktop-bin`) |
+| Arch package, or AUR (`twr-desktop-bin`) once published | Notifies; update with `pacman -U` and the new package, or your AUR helper (`yay -Syu twr-desktop-bin`) |
 
 The app checks the latest GitHub release 45 seconds after launch and then every six
 hours. Turn this off, or check by hand, in Settings › Updates or Help › Check for Updates.
@@ -266,7 +266,9 @@ so a system Electron upgrade cannot change the app's ABI. The Arch package reuse
 the portable producer's native terminal module without recompiling it. Its launcher uses the stable
 `tools.twr.desktop` class for Hyprland rules. Chromium's sandbox stays enabled.
 
-The AUR package `twr-desktop-bin` installs the same files from the release's
+The AUR package `twr-desktop-bin` is not on the AUR yet: each release builds and checks it,
+and pushes it once the repository has the AUR key (`AUR_SSH_PRIVATE_KEY`, below). It installs
+the same files from the release's
 `twr-desktop-<version>-linux-x64.tar.gz`. `node scripts/aur.mjs <archive>` writes its
 `PKGBUILD` and `.SRCINFO`. CI builds that package from the identical archive, checks
 `.SRCINFO` against `makepkg --printsrcinfo`, and installs it over the release package.

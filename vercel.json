@@ -4,8 +4,20 @@
   "installCommand": "",
   "buildCommand": "sh site/build.sh",
   "outputDirectory": "site-dist",
-  "ignoreCommand": "[ \"$VERCEL_ENV\" != production ] || git diff --quiet HEAD^ HEAD -- site install.sh docs/img vercel.json .vercelignore || exit 1",
+  "ignoreCommand": "[ \"$VERCEL_ENV\" != production ] || git diff --quiet HEAD^ HEAD -- site install.sh docs/img clients/packaging/icon.png vercel.json .vercelignore || exit 1",
   "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'sha256-NPojXnuB4ZaRa0f3HM/lXBg1Oh5EfdnvdsqfQTaSMf0='; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        }
+      ]
+    },
     {
       "source": "/install.sh",
       "headers": [

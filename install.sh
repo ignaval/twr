@@ -12,22 +12,25 @@
 #
 # sha256sums.txt is signed (sha256sums.txt.sig, Ed25519, the key in the block below). When
 # openssl here can check Ed25519 signatures (OpenSSL 3.0 or newer; macOS's LibreSSL can't),
-# the signature must verify; otherwise the script says the checksums were not
-# signature-checked and goes on. `twr update` checks the signatures itself, with the key built
-# into twr. sha256sums.txt names its release on a signed line, `# twr release <tag>`, which
-# must be the TWR_VERSION asked for.
+# the signature must verify. Otherwise, when the P-256 block below holds a key, the ECDSA P-256
+# signature (sha256sums.txt.p256.sig), which LibreSSL checks, must verify instead; without
+# either the script says the checksums were not signature-checked and goes on. `twr update`
+# checks the signatures itself, with the key built into twr. sha256sums.txt names its release
+# on a signed line, `# twr release <tag>`, which must be the TWR_VERSION asked for.
 #
 # Environment:
 #   TWR_VERSION            the release to install, e.g. v0.2.0 (default: the latest)
 #   TWR_INSTALL_DIR        where to put `twr` (default: ~/.local/bin; a relative path is
 #                          taken from the current directory)
 #   TWR_DOWNLOAD_URL       fetch twr-<target>.tar.gz, sha256sums.txt and sha256sums.txt.sig
-#                          from this base URL instead of GitHub: any URL curl or wget can
-#                          fetch (http:// too: your choice), or file:///<dir> for a local
-#                          directory (copied, without curl or wget)
+#                          (or sha256sums.txt.p256.sig) from this base URL instead of
+#                          GitHub: any URL curl or wget can fetch (http:// too: your
+#                          choice), or file:///<dir> for a local directory (copied, without
+#                          curl or wget)
 #   TWR_REQUIRE_SIGNATURE  1: fail when the signature can't be checked (no openssl that
-#                          verifies Ed25519), except with TWR_SHA256SUMS_FILE, which the
-#                          caller (twr update) has verified
+#                          verifies Ed25519, nor P-256 when this script holds a P-256 key),
+#                          except with TWR_SHA256SUMS_FILE, which the caller (twr update)
+#                          has verified
 #   TWR_SHA256SUMS_FILE    use this sha256sums.txt instead of downloading it; its signature
 #                          is not checked here, even with TWR_REQUIRE_SIGNATURE=1: the caller
 #                          (`twr update`) passes the one it verified
@@ -50,6 +53,15 @@ MCowBQYDK2VwAyEAoEFCsIDDaJTSlpcteH2pp3aZpLQ+SB+18sUdZNqe9dg=
 PROBE_MESSAGE='twr signature probe'
 PROBE_SIGNATURE='fEAddJcpdHzHQJhiSd6QOtAlzR7Boxkn0wpZJBGVKdOUF06lnwox2LcTgjFSh9ygU9Yd9G73suI6hoL/+5xPCA=='
 # --- end release key ---
+
+# --- release key p256 ---
+# The ECDSA P-256 public key (release/signing-key-p256.pub) of sha256sums.txt.p256.sig, checked
+# where openssl can't check Ed25519 (macOS's LibreSSL), and PROBE_MESSAGE signed with it (base64
+# of the DER signature). Empty: releases have no P-256 signature yet, and such an openssl checks
+# nothing. docs/tools/make-signing-key.sh --p256 writes this block.
+RELEASE_KEY_P256=''
+PROBE_SIGNATURE_P256=''
+# --- end release key p256 ---
 
 # The staged binary next to the target, removed on every way out until it is renamed into place.
 staged=""
@@ -220,13 +232,15 @@ fetch() {
     err "could not download $1 from $base (is there such a release?)"
 }
 
-# fetch_signature DIR: puts sha256sums.txt.sig into DIR, from where sha256sums.txt came from.
+# fetch_signature DIR [NAME]: puts NAME (default sha256sums.txt.sig) into DIR, from where
+# sha256sums.txt came from.
 fetch_signature() {
+    name=${2:-sha256sums.txt.sig}
     if [ "$origin" = gh ]; then
-        gh release download ${version:+"$version"} -R "$GH_REPO_REF" -p sha256sums.txt.sig \
+        gh release download ${version:+"$version"} -R "$GH_REPO_REF" -p "$name" \
             -D "$1" --clobber > /dev/null 2>&1
     else
-        download "$origin/sha256sums.txt.sig" "$1/sha256sums.txt.sig" 2> /dev/null
+        download "$origin/$name" "$1/$name" 2> /dev/null
     fi
 }
 
@@ -253,11 +267,62 @@ signature() {
     [ "$(wc -c < "$2" | tr -d ' ')" = 64 ]
 }
 
+# has_p256_verifier: whether the P-256 block holds a key and openssl here checks ECDSA P-256
+# signatures with it: it must verify the probe signed with that key (LibreSSL does).
+has_p256_verifier() {
+    [ -n "$RELEASE_KEY_P256" ] || return 1
+    has openssl || return 1
+    printf '%s\n' "$RELEASE_KEY_P256" > "$tmp/release-key-p256.pem" || return 1
+    printf '%s' "$PROBE_MESSAGE" > "$tmp/probe.msg" || return 1
+    p256_signature "$PROBE_SIGNATURE_P256" "$tmp/probe-p256.sig" || return 1
+    openssl dgst -sha256 -verify "$tmp/release-key-p256.pem" -signature "$tmp/probe-p256.sig" \
+        "$tmp/probe.msg" > /dev/null 2>&1
+}
+
+# p256_signature TEXT FILE: decodes TEXT, the base64 of a DER ECDSA P-256 signature (at most
+# 72 bytes), into FILE; fails when TEXT is not that.
+p256_signature() {
+    case "$1" in
+        "" | *[!A-Za-z0-9+/=]*) return 1 ;;
+    esac
+    [ "${#1}" -le 96 ] || return 1
+    printf '%s' "$1" | openssl base64 -d -A > "$2" 2> /dev/null || return 1
+    bytes=$(wc -c < "$2" | tr -d ' ')
+    [ "$bytes" -ge 8 ] && [ "$bytes" -le 72 ]
+}
+
+# check_p256_signature DIR: checks DIR/sha256sums.txt against sha256sums.txt.p256.sig, after
+# has_p256_verifier. A missing or bad signature stops the install, as for Ed25519.
+check_p256_signature() {
+    if ! fetch_signature "$1" sha256sums.txt.p256.sig; then
+        err "could not download sha256sums.txt.p256.sig; nothing was installed (every twr release since the P-256 key was added is signed with it; to install an older one, use OpenSSL 3.0 or newer, see docs/install.md)"
+    fi
+    if ! p256_signature "$(cat "$1/sha256sums.txt.p256.sig")" "$1/sha256sums.p256.sig.bin"; then
+        err "sha256sums.txt.p256.sig is not an ECDSA P-256 signature; nothing was installed"
+    fi
+    if ! openssl dgst -sha256 -verify "$tmp/release-key-p256.pem" \
+        -signature "$1/sha256sums.p256.sig.bin" "$1/sha256sums.txt" > /dev/null 2>&1; then
+        err "the P-256 signature of sha256sums.txt does not verify with the release key; nothing was installed"
+    fi
+}
+
 # check_signature DIR: checks DIR/sha256sums.txt against the release's signature of it, when
-# openssl here can. A missing or bad signature always stops the install: every release is
-# signed, so its files were changed or are incomplete.
+# openssl here can: the Ed25519 one, else the P-256 one when this script holds that key. A
+# missing or bad signature always stops the install: every release is signed, so its files
+# were changed or are incomplete.
 check_signature() {
     if ! has_verifier; then
+        if has_p256_verifier; then
+            check_p256_signature "$1"
+            return 0
+        fi
+        if [ -n "$RELEASE_KEY_P256" ]; then
+            if [ "${TWR_REQUIRE_SIGNATURE:-}" = 1 ]; then
+                err "TWR_REQUIRE_SIGNATURE=1, but this machine has no openssl that checks Ed25519 or ECDSA P-256 signatures; nothing was installed"
+            fi
+            warn "the checksums were not signature-checked (no openssl that checks Ed25519 or P-256 signatures)"
+            return 0
+        fi
         if [ "${TWR_REQUIRE_SIGNATURE:-}" = 1 ]; then
             err "TWR_REQUIRE_SIGNATURE=1, but this machine has no openssl that checks Ed25519 signatures (OpenSSL 3.0 or newer); nothing was installed"
         fi
