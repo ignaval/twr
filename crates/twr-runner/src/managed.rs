@@ -690,6 +690,12 @@ mod tests {
     #[test]
     fn revocation_reaps_an_orphan_generation_and_preserves_a_replacement() -> Result<()> {
         use std::os::unix::process::CommandExt;
+        // Revocation finds the runtimes by the markers in their environment.
+        if crate::reap::skip_if_test_environs_hidden(
+            "revocation_reaps_an_orphan_generation_and_preserves_a_replacement",
+        ) {
+            return Ok(());
+        }
         struct Reaped(std::process::Child);
         impl Drop for Reaped {
             fn drop(&mut self) {
@@ -888,12 +894,14 @@ mod tests {
     #[test]
     fn confinement_and_global_leases_are_shared_across_workers() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let root = dir.path().join("hub");
+        // A managed root is a resolved path; macOS's $TMPDIR is under /var, a link.
+        let base = std::fs::canonicalize(dir.path())?;
+        let root = base.join("hub");
         std::fs::create_dir(&root)?;
         let managed = Managed {
             root: root.clone(),
-            resources: dir.path().join("leases"),
-            revocation: dir.path().join("revoked"),
+            resources: base.join("leases"),
+            revocation: base.join("revoked"),
         };
         assert!(managed.path(&root.join("new/child")).is_ok());
         assert!(managed.path(&root.join("../other")).is_err());

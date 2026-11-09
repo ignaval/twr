@@ -411,6 +411,12 @@ mod tests {
     }
     #[tokio::test]
     async fn crashed_build_cleanup_is_scoped_to_its_recorded_marker_and_epoch() -> Result<()> {
+        // Cleanup finds the build's processes by the marker in their environment.
+        if twr_runner::reap::skip_if_test_environs_hidden(
+            "crashed_build_cleanup_is_scoped_to_its_recorded_marker_and_epoch",
+        ) {
+            return Ok(());
+        }
         let temp = tempfile::tempdir()?;
         let machine = Machine {
             dir: temp.path().join("machine"),
