@@ -93,4 +93,16 @@ describe("long message rendering", () => {
       "<strong>hello</strong>",
     );
   });
+  it("names a web link's address and shows a path link as code to copy", () => {
+    const html = render(
+      "[docs](https://example.com/guide?q=1) and [App.tsx](clients/shared/App.tsx:42)",
+      { clamp: false },
+    );
+    expect(html).toContain('title="https://example.com/guide?q=1"');
+    expect(html).toContain(
+      '<code title="clients/shared/App.tsx:42">App.tsx</code>',
+    );
+    expect(html).toContain('aria-label="Copy clients/shared/App.tsx:42"');
+    expect(html).not.toContain('href="clients/shared/App.tsx:42"');
+  });
 });

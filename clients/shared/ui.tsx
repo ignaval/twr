@@ -1,6 +1,17 @@
 import { useHostAPI } from "./host";
-import { memo, useId, useRef, useState, type ReactNode } from "react";
-import { focusableWithin, useModal } from "./a11y";
+import {
+  isValidElement,
+  memo,
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { announce, focusableWithin, useModal } from "./a11y";
+import { errorMessage } from "./errors";
+import { externalLink, linkConfirmation } from "./links";
 import { X, LoaderCircle, FolderOpen, Copy, Check, List } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -257,45 +268,222 @@ export function ModelSelect({
     </select>
   );
 }
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
+/** A copy button that says it copied: its icon turns into a check for a moment and a
+ * screen reader hears "Copied". A failure goes to `onError` (or is announced). */
+export function CopyButton({
+  text,
+  label,
+  className = "icon-button",
+  size = 14,
+  onError,
+}: {
+  text: () => string;
+  label: string;
+  className?: string;
+  size?: number;
+  onError?: (error: unknown) => void;
+}) {
   const hostApi = useHostAPI();
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(timer);
+  }, [copied]);
+  return (
+    <button
+      type="button"
+      className={className}
+      aria-label={label}
+      title={copied ? "Copied" : label}
+      onClick={() =>
+        void hostApi
+          .copyText(text())
+          .then(() => {
+            setCopied(true);
+            announce("Copied");
+          })
+          .catch((error) => {
+            if (onError) onError(error);
+            else
+              announce("Could not copy: " + errorMessage(error), "assertive");
+          })
+      }
+    >
+      {copied ? (
+        <Check size={size} aria-hidden="true" />
+      ) : (
+        <Copy size={size} aria-hidden="true" />
+      )}
+    </button>
+  );
+}
+/** Opens a link from an agent's text or a terminal: at once when it is what it looks
+ * like, after a confirmation showing the full address when not (shared/links.ts). */
+type OpenLink = (href: string, text: string, terminal?: boolean) => void;
+/** The mounted `LinkConfirm` (the app has one), which shows the confirmation. */
+let confirmLinks: OpenLink | undefined;
+export function useOpenLink(): OpenLink {
+  const hostApi = useHostAPI();
+  return (href, text, terminal) => {
+    if (confirmLinks) return confirmLinks(href, text, terminal);
+    const url = externalLink(href);
+    if (!url) return;
+    const reason = linkConfirmation({ href, text, terminal });
+    if (reason && !window.confirm(reason + "\n\n" + url.href)) return;
+    void hostApi.openExternal(url.href).catch(() => {});
+  };
+}
+/** Asks before a link that needs it (`useOpenLink`) opens, showing its full address. */
+export function LinkConfirm({
+  onError,
+}: {
+  onError: (error: unknown) => void;
+}) {
+  const hostApi = useHostAPI();
+  const [pending, setPending] = useState<{
+    href: string;
+    reason: string;
+    openable: boolean;
+  }>();
+  const open = useCallback<OpenLink>(
+    (href, text, terminal = false) => {
+      const url = externalLink(href);
+      if (!url) {
+        setPending({
+          href,
+          reason:
+            "Only web and email links open from here. Copy this address to use it.",
+          openable: false,
+        });
+        return;
+      }
+      const reason = linkConfirmation({ href, text, terminal });
+      if (reason) setPending({ href: url.href, reason, openable: true });
+      else void hostApi.openExternal(url.href).catch(onError);
+    },
+    [hostApi, onError],
+  );
+  useEffect(() => {
+    confirmLinks = open;
+    return () => {
+      if (confirmLinks === open) confirmLinks = undefined;
+    };
+  }, [open]);
+  const close = () => setPending(undefined);
+  return (
+    <>
+      {pending && (
+        <Dialog
+          title={pending.openable ? "Open this link?" : "Link not opened"}
+          subtitle={pending.reason}
+          onClose={close}
+        >
+          <div className="link-confirm">
+            <p>{pending.openable ? "It opens:" : "Its address:"}</p>
+            <code className="link-destination">{pending.href}</code>
+          </div>
+          <footer className="dialog-footer">
+            <span />
+            <div>
+              <button type="button" onClick={close}>
+                Cancel
+              </button>
+              {pending.openable ? (
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => {
+                    close();
+                    void hostApi.openExternal(pending.href).catch(onError);
+                  }}
+                >
+                  Open link
+                </button>
+              ) : (
+                <CopyButton
+                  className="copy-address"
+                  text={() => pending.href}
+                  label="Copy address"
+                  onError={onError}
+                />
+              )}
+            </div>
+          </footer>
+        </Dialog>
+      )}
+    </>
+  );
+}
+function textOf(node: ReactNode): string {
+  if (node === null || node === undefined || typeof node === "boolean")
+    return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (isValidElement<{ children?: ReactNode }>(node))
+    return textOf(node.props.children);
+  return "";
+}
+/** A Markdown link: a web or email link opens (through `useOpenLink`) and names its
+ * address on hover; anything else (a path like `src/App.tsx:42`) is code to copy. */
+function MarkdownLink({
+  href,
+  children,
+}: {
+  href?: string;
+  children?: ReactNode;
+}) {
+  const open = useOpenLink();
+  const url = externalLink(href);
+  if (!url)
+    return (
+      <span className="link-text">
+        <code title={href || undefined}>{children}</code>
+        <CopyButton
+          className="icon-button copy-link"
+          size={12}
+          text={() => href || textOf(children)}
+          label={"Copy " + (href || textOf(children))}
+        />
+      </span>
+    );
+  return (
+    <a
+      href={url.href}
+      title={url.href}
+      onClick={(event) => {
+        event.preventDefault();
+        open(url.href, textOf(children));
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+const markdownComponents = {
+  a: ({ href, children }: { href?: string; children?: ReactNode }) => (
+    <MarkdownLink href={href}>{children}</MarkdownLink>
+  ),
+  img: ({ alt }: { alt?: string }) => (
+    <span className="muted">[Image: {alt || "attachment"}]</span>
+  ),
+  pre: ({ children }: { children?: ReactNode }) => (
+    <div className="code-block">
+      <pre>{children}</pre>
+      <CopyButton
+        className="copy-code"
+        label="Copy code"
+        text={() => textOf(children)}
+      />
+    </div>
+  ),
+};
+export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div className="markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              onClick={(e) => {
-                e.preventDefault();
-                if (href) void hostApi.openExternal(href).catch(() => {});
-              }}
-            >
-              {children}
-            </a>
-          ),
-          img: ({ alt }) => (
-            <span className="muted">[Image: {alt || "attachment"}]</span>
-          ),
-          pre: ({ children }) => (
-            <div className="code-block">
-              <pre>{children}</pre>
-              <button
-                className="copy-code"
-                aria-label="Copy code"
-                onClick={(e) =>
-                  void hostApi.copyText(
-                    e.currentTarget.parentElement?.querySelector("pre")
-                      ?.textContent || "",
-                  )
-                }
-              >
-                <Copy size={14} />
-              </button>
-            </div>
-          ),
-        }}
+        components={markdownComponents}
       >
         {text}
       </ReactMarkdown>

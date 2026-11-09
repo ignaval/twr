@@ -93,7 +93,16 @@ import type {
   Thread,
   ViewState,
 } from "./types";
-import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
+import {
+  CopyButton,
+  DataView,
+  Dialog,
+  Empty,
+  FieldInput,
+  LinkConfirm,
+  Markdown,
+  Spinner,
+} from "./ui";
 import { effortChoices, formRuntime, modelChoices } from "./models";
 import {
   AssistanceNotice,
@@ -4356,6 +4365,7 @@ export default function App({
           </button>
         </nav>
       )}
+      <LinkConfirm onError={fail} />
       <span id="twr-thread-open-hint" hidden>
         Details shown. Press Enter to open this conversation.
       </span>

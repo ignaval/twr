@@ -1057,6 +1057,44 @@ kbd {
   right: 4px;
   padding: 6px;
 }
+/* A link the app doesn't open (a path, another scheme): its text, and a copy button. */
+.link-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  max-width: 100%;
+}
+.link-text > code {
+  overflow-wrap: anywhere;
+}
+/* Small inside a line of text on the desktop; phones keep their 44 px targets. */
+:root:not([data-mobile="true"]) .link-text > .copy-link {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 3px;
+  align-self: center;
+}
+.link-confirm {
+  padding: 8px 24px 20px;
+  overflow: auto;
+}
+.link-confirm > p {
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.link-destination {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow: auto;
+  user-select: text;
+}
 .markdown table {
   border-collapse: collapse;
   display: block;
