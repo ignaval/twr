@@ -79,7 +79,10 @@ twr voice status           # says `voice: whisper (on this machine)`, or what is
 
 `twr voice setup` puts whisper's `base.en` at `voice/ggml-base.en.bin` in twr's data directory,
 the model an empty `[voice] model` means. It downloads it from whisper.cpp's own models on
-Hugging Face over HTTPS, and keeps it only once it is whole. In the desktop app, turning voice on
+Hugging Face over HTTPS, from one commit of that repository built into twr (not whatever the
+`main` branch holds now), and keeps it only once it is whole and its SHA-256 is the one built
+into twr too: a file that differs is never renamed into place, where whisper.cpp would load
+it. In the desktop app, turning voice on
 before the model is there offers **Download model**, which does the same. `base.en` recognizes a
 short message in well under a second on Apple silicon once loaded (the first one after a start
 takes a few seconds). For other languages use a multilingual model (`ggml-base.bin`) and set

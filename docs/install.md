@@ -182,6 +182,29 @@ RUSTFLAGS="-C target-feature=+crt-static" \
 
 A static glibc build still loads glibc's name-service libraries at runtime when it resolves a host name, as a runner does when it reaches its hub by name. If that matters, build for `x86_64-unknown-linux-musl` with `cargo build`, which needs `musl-gcc` for the bundled SQLite.
 
+## Shell completions
+
+`twr completions <shell>` prints a completion script for twr's commands and options, for
+`bash`, `zsh`, `fish`, `elvish` or `powershell`. It needs no hub. Write it where your shell
+looks, then open a new shell:
+
+```sh
+# bash (with the bash-completion package)
+mkdir -p ~/.local/share/bash-completion/completions
+twr completions bash > ~/.local/share/bash-completion/completions/twr
+
+# zsh: a directory on $fpath, before `compinit` in ~/.zshrc
+mkdir -p ~/.zfunc
+twr completions zsh > ~/.zfunc/_twr
+# and in ~/.zshrc, once: fpath=(~/.zfunc $fpath); autoload -Uz compinit; compinit
+
+# fish
+mkdir -p ~/.config/fish/completions
+twr completions fish > ~/.config/fish/completions/twr.fish
+```
+
+Run it again after `twr update` to pick up new commands.
+
 ## Where twr keeps things
 
 | What | Default | With `TWR_HOME=X` |

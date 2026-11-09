@@ -128,11 +128,16 @@ enum Cmd {
     /// directory this `twr` is in. Nothing runs unless both signatures verify and the checksums
     /// name the release asked for and list the installer. A running hub keeps its version
     /// until you restart it (`twr hub stop`, then `twr`). A `twr` installed by cargo is not
-    /// touched: update it with cargo.
+    /// touched: update it with cargo. A release older than this `twr` is refused, and the
+    /// same one says it is up to date.
     Update {
         /// The release to install, e.g. v0.2.0 (default: the latest).
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
+        /// Install the `--version` asked for even when it is older than this `twr`. An older
+        /// twr may refuse the database this one wrote.
+        #[arg(long, requires = "version")]
+        allow_downgrade: bool,
     },
     /// Show what the running hub reports about itself (`hub.info`): version, boxes,
     /// orchestrator, and warnings about the config it started with (a short box token, a
@@ -267,6 +272,10 @@ enum Cmd {
         /// Also list error, review and stalled items.
         #[arg(long)]
         all: bool,
+        /// Print the listed items as JSON, each as `attention.list` returns it plus `target`,
+        /// the `<attn_id>@<revision>` that `twr respond` and `twr attention dismiss` take.
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
         cmd: Option<AttentionCmd>,
     },
@@ -531,6 +540,14 @@ enum Cmd {
         /// Print the steps and change nothing (every terminal's when none is named or found).
         #[arg(long)]
         print: bool,
+    },
+    /// Print the shell completion script for twr's commands and options to stdout, e.g.
+    /// `twr completions zsh > ~/.zfunc/_twr` (docs/install.md says where each shell reads
+    /// it). Needs no hub.
+    Completions {
+        /// The shell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
     /// List, create or remove workspaces: separate hubs on this machine, each with its own
     /// orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name>
@@ -981,13 +998,17 @@ enum WsCmd {
         /// The workspace's name.
         name: String,
     },
-    /// Remove a workspace's data: its log, orchestrator conversation and history. Refused
-    /// while its hub runs, while it has threads (delete them first) or while its trash holds
-    /// deleted threads (`twr -w <name> trash empty --all`). Branches stay in their
+    /// Remove a workspace's data for good: its log, orchestrator conversation and memory, and
+    /// history. Refused while its hub runs, while it has threads (delete them first) or while
+    /// its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and
+    /// asks y/N on a terminal (without one, only with --yes). Branches stay in their
     /// repositories.
     Rm {
         /// The workspace's name.
         name: String,
+        /// Remove without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -1311,6 +1332,9 @@ enum ThreadCmd {
         /// Also list parked threads.
         #[arg(long, short)]
         all: bool,
+        /// Print the listed threads as JSON, each as `thread.list` returns it.
+        #[arg(long)]
+        json: bool,
     },
     /// Show what a thread has in flight now, as the hub reads it (`work` of `thread.get`): its
     /// reading (working, waiting on its background work, on a tool call, nothing in flight,
@@ -1610,6 +1634,12 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // From the command definition alone: no twr home, config or hub.
+    if let Some(Cmd::Completions { shell }) = &cli.cmd {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        clap_complete::generate(*shell, &mut command, "twr", &mut std::io::stdout());
+        return Ok(ExitCode::SUCCESS);
+    }
     // An SSH box's relay and daemon need no twr home: every path comes from the box's
     // environment (the relay) or the relay (the daemon).
     let cli = match cli.cmd {
@@ -1898,8 +1928,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         // Before the config is loaded: a config this twr cannot read must not stop an update
         // (the new one may read it).
-        Some(Cmd::Update { version }) => {
-            update(version, cli.socket, &paths).await?;
+        Some(Cmd::Update {
+            version,
+            allow_downgrade,
+        }) => {
+            update(version, allow_downgrade, cli.socket, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
         // About the terminal, not a hub: no config needed.
@@ -2120,6 +2153,7 @@ async fn run_simple(
         | Cmd::Voice { .. }
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
+        | Cmd::Completions { .. }
         | Cmd::Account { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
@@ -2136,7 +2170,11 @@ async fn run_simple(
             let mut ask = ask_on_stderr;
             respond(&socket, &target, &answer, message, consent(yes, &mut ask)).await
         }
-        Cmd::Attention { all, cmd: None } => attention(&socket, all).await,
+        Cmd::Attention {
+            all,
+            json,
+            cmd: None,
+        } => attention(&socket, all, json).await,
         Cmd::Attention {
             cmd: Some(AttentionCmd::Dismiss { target }),
             ..
@@ -2211,8 +2249,8 @@ async fn run_simple(
             Ok(())
         }
         Cmd::Thread {
-            cmd: ThreadCmd::List { all },
-        } => thread_list(&socket, all).await,
+            cmd: ThreadCmd::List { all, json },
+        } => thread_list(&socket, all, json).await,
         Cmd::Thread {
             cmd: ThreadCmd::Show { thread, json },
         } => thread_show(&socket, &thread, json).await,
@@ -3888,6 +3926,7 @@ async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
 /// how to restart it; it never restarts the hub itself (that stops every thread's runtime).
 async fn update(
     version: Option<String>,
+    allow_downgrade: bool,
     socket: Option<PathBuf>,
     paths: &Paths,
 ) -> anyhow::Result<()> {
@@ -3904,6 +3943,18 @@ async fn update(
     let (script, sums) = fetch_verified(&source, &key).await?;
     let tag = release_of(&source, &script, &sums)?;
     check_script(&source.script, &script)?;
+    let current = env!("CARGO_PKG_VERSION");
+    match update_plan(&tag, current, source.tag.is_some(), allow_downgrade)? {
+        UpdatePlan::UpToDate => {
+            outln!("twr {current} is up to date ({tag} is this release)");
+            return Ok(());
+        }
+        UpdatePlan::Downgrade => errln!(
+            "installing {tag}, older than this twr ({current}), as --allow-downgrade asks: an \
+             older twr may refuse the database this one wrote, as newer than itself"
+        ),
+        UpdatePlan::Install => {}
+    }
     let tmp = PrivateDir::create("twr-update")?;
     let script_file = tmp.write("install.sh", &script)?;
     let sums_file = tmp.write("sha256sums.txt", &sums)?;
@@ -3936,6 +3987,56 @@ async fn update(
     prewarm_installed(&dir.join("twr")).await;
     hub_version_note(&dir.join("twr"), socket, paths).await;
     Ok(())
+}
+
+/// What `twr update` does with the release it verified, from [`update_plan`].
+#[derive(Debug, PartialEq)]
+enum UpdatePlan {
+    /// It is newer than this twr: install it.
+    Install,
+    /// It is this twr's release: nothing to do.
+    UpToDate,
+    /// It is older, and `--version` with `--allow-downgrade` asked for it: install it, saying
+    /// what that risks.
+    Downgrade,
+}
+
+/// Whether `twr update` installs release `tag` over this twr (version `current`), in semantic
+/// versioning's order ([`runner_update::compare_versions`]: a prerelease comes before its
+/// release). The same release is up to date. An older one (the latest release, for a twr on a
+/// newer prerelease, since GitHub's latest leaves prereleases out; or what a mirror serves) is
+/// refused unless it was `asked` for by `--version` with `allow_downgrade`: an older twr may
+/// refuse the database this one wrote.
+fn update_plan(
+    tag: &str,
+    current: &str,
+    asked: bool,
+    allow_downgrade: bool,
+) -> anyhow::Result<UpdatePlan> {
+    use std::cmp::Ordering;
+    let Some(order) = runner_update::compare_versions(tag, current) else {
+        bail!("cannot compare release {tag} with this twr ({current}); nothing was run");
+    };
+    Ok(match order {
+        Ordering::Greater => UpdatePlan::Install,
+        Ordering::Equal => UpdatePlan::UpToDate,
+        Ordering::Less if asked && allow_downgrade => UpdatePlan::Downgrade,
+        Ordering::Less => {
+            let what = if asked {
+                format!("{tag} is older than this twr ({current})")
+            } else {
+                format!(
+                    "the release found, {tag}, is older than this twr ({current}) (GitHub's \
+                     latest release leaves out prereleases)"
+                )
+            };
+            bail!(
+                "{what}; nothing was run. An older twr may refuse the database this one wrote, \
+                 as newer than itself. To install it anyway, run `twr update --version {tag} \
+                 --allow-downgrade`"
+            )
+        }
+    })
 }
 
 /// Where `twr update` gets the release: `tag` (for install.sh's `TWR_VERSION`), the installer's
@@ -5352,7 +5453,7 @@ fn is_blocking(item: &Value) -> bool {
     matches!(item["reason"].as_str(), Some("permission" | "question"))
 }
 
-async fn attention(socket: &Path, all: bool) -> anyhow::Result<()> {
+async fn attention(socket: &Path, all: bool, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     // Every item: an empty default listing still says what `--all` would show.
     let items = c.call("attention.list", json!({ "all": true })).await?;
@@ -5362,6 +5463,20 @@ async fn attention(socket: &Path, all: bool) -> anyhow::Result<()> {
         .filter(|i| all || is_blocking(i))
         .cloned()
         .collect();
+    if json {
+        let items: Vec<Value> = items
+            .into_iter()
+            .map(|mut i| {
+                let target = revisioned_id(&i);
+                if let Some(o) = i.as_object_mut() {
+                    o.insert("target".into(), json!(target));
+                }
+                i
+            })
+            .collect();
+        outln!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
     if items.is_empty() {
         match every.len() {
             0 => outln!("nothing needs you"),
@@ -6795,10 +6910,15 @@ fn show_text(t: &Value) -> String {
     out.join("\n")
 }
 
-async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
+async fn thread_list(socket: &Path, all: bool, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let threads = c.call("thread.list", Value::Null).await?;
     let threads = threads.as_array().cloned().unwrap_or_default();
+    if json {
+        let (threads, _) = listed(threads, all);
+        outln!("{}", serde_json::to_string_pretty(&threads)?);
+        return Ok(());
+    }
     if threads.is_empty() {
         outln!(
             "no threads (create one with `twr{} thread new <project>`)",
@@ -7668,7 +7788,11 @@ async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
     match cmd {
         WsCmd::List { json } => ws_list(paths, json).await,
         WsCmd::New { name } => ws_new(paths, &name),
-        WsCmd::Rm { name } => ws_rm(paths, &name).await,
+        WsCmd::Rm { name, yes } => {
+            // As for `twr trash empty`: only a terminal can confirm, else --yes.
+            let mut ask = ask_on_stderr;
+            ws_rm(paths, &name, consent(yes, &mut ask)).await
+        }
     }
 }
 
@@ -7851,11 +7975,82 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] to the default model's place, through
-/// a private file beside it, renamed into place only once whole and a ggml model.
+/// What `twr voice setup` checks of the model as it downloads ([`ModelCheck::update`], each
+/// chunk before it is written) and once it has it all ([`ModelCheck::finish`], before the file
+/// is renamed into place): no more than `len` bytes, ggml's magic first, then exactly `len`
+/// bytes whose SHA-256 is `sha256` ([`twr_voice::engine::MODEL_SHA256`]). whisper.cpp's parser
+/// reads the file, so nothing else may reach its place.
+struct ModelCheck {
+    len: u64,
+    sha256: &'static str,
+    got: u64,
+    head: Vec<u8>,
+    digest: ring::digest::Context,
+}
+
+impl ModelCheck {
+    fn new(len: u64, sha256: &'static str) -> ModelCheck {
+        ModelCheck {
+            len,
+            sha256,
+            got: 0,
+            head: Vec::with_capacity(4),
+            digest: ring::digest::Context::new(&ring::digest::SHA256),
+        }
+    }
+
+    fn update(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        use twr_voice::engine::{is_model, MODEL_URL};
+        if self.head.len() < 4 {
+            self.head.extend(chunk.iter().take(4 - self.head.len()));
+            if self.head.len() == 4 && !is_model(&self.head) {
+                bail!("{MODEL_URL} did not send a whisper model; nothing was kept");
+            }
+        }
+        self.got += chunk.len() as u64;
+        if self.got > self.len {
+            bail!(
+                "{MODEL_URL} sent more than the model's {} bytes; nothing was kept",
+                self.len
+            );
+        }
+        self.digest.update(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        use twr_voice::engine::{is_model, MODEL_URL};
+        if self.got != self.len || !is_model(&self.head) {
+            bail!(
+                "{MODEL_URL} did not send a whole whisper model ({} of {} bytes); nothing was kept",
+                self.got,
+                self.len
+            );
+        }
+        let actual: String = self
+            .digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if actual != self.sha256 {
+            bail!(
+                "{MODEL_URL} is not the model twr expects: its SHA-256 is {actual}, not {}; \
+                 nothing was kept",
+                self.sha256
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] (pinned to a commit) to the default
+/// model's place, through a private file beside it, renamed into place only once whole and its
+/// SHA-256 the one twr expects ([`ModelCheck`]).
 async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> anyhow::Result<()> {
     use std::io::Write;
-    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_MAX_BYTES, MODEL_MIN_BYTES, MODEL_URL};
+    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_BYTES, MODEL_SHA256, MODEL_URL};
     if !cfg.model.trim().is_empty() {
         bail!(
             "[voice] model names your own model ({}): `twr voice setup` only downloads the \
@@ -7890,40 +8085,31 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
     if !resp.status().is_success() {
         bail!("downloading {MODEL_URL} failed: HTTP {}", resp.status());
     }
-    let total = resp.content_length().filter(|n| *n <= MODEL_MAX_BYTES);
+    if let Some(total) = resp.content_length().filter(|n| *n != MODEL_BYTES) {
+        bail!("{MODEL_URL} is {total} bytes, not the model's {MODEL_BYTES}; nothing was kept");
+    }
     let part = target.with_extension(format!("bin.part-{}", std::process::id()));
     let download = async {
         let mut file =
             std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-        let mut got: u64 = 0;
+        let mut check = ModelCheck::new(MODEL_BYTES, MODEL_SHA256);
         let mut shown = 0;
-        let mut head = Vec::with_capacity(4);
         let chunk_wait = std::time::Duration::from_secs(60);
         while let Some(chunk) = tokio::time::timeout(chunk_wait, resp.chunk())
             .await
             .map_err(|_| anyhow!("the download stalled"))?
             .context("downloading the model")?
         {
-            if head.len() < 4 {
-                head.extend(chunk.iter().take(4 - head.len()));
-            }
-            got += chunk.len() as u64;
-            if got > MODEL_MAX_BYTES {
-                bail!("{MODEL_URL} is larger than a whisper model");
-            }
+            check.update(&chunk)?;
             file.write_all(&chunk)
                 .with_context(|| format!("writing {}", part.display()))?;
-            if let Some(total) = total.filter(|t| *t > 0) {
-                let pct = got * 100 / total;
-                if pct >= shown + 10 {
-                    shown = pct - pct % 10;
-                    eprintln!("twr: {shown}%");
-                }
+            let pct = check.got * 100 / MODEL_BYTES;
+            if pct >= shown + 10 {
+                shown = pct - pct % 10;
+                eprintln!("twr: {shown}%");
             }
         }
-        if got < MODEL_MIN_BYTES || !is_model(&head) || total.is_some_and(|t| t != got) {
-            bail!("{MODEL_URL} did not send a whole whisper model ({got} bytes)");
-        }
+        check.finish()?;
         file.sync_all().context("writing the model")?;
         std::fs::rename(&part, &target)
             .with_context(|| format!("moving the model to {}", target.display()))?;
@@ -8017,8 +8203,12 @@ fn create_workspace(root: &Paths, name: &str) -> anyhow::Result<Paths> {
 
 /// `twr ws rm`: removes a named workspace's data directory once nothing in it can be lost by
 /// accident: its hub is not running, it has no threads, and its trash is empty (a trash item's
-/// commits stay referenced in its repository until it is purged).
-async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
+/// commits stay referenced in its repository until it is purged), and `consent` allows it: what
+/// goes, the orchestrator's conversation and memory notes, the log and any worktree directories
+/// left behind ([`ws_rm_question`]), is listed and asked about on a terminal, else needs
+/// `--yes`. The workspace's lock is held from the checks through the removal, so no hub opens
+/// it while the question waits.
+async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Result<()> {
     if name == DEFAULT_WORKSPACE {
         bail!("the {DEFAULT_WORKSPACE} workspace cannot be removed");
     }
@@ -8040,7 +8230,7 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
         Some(lock) => lock,
         None => return Err(running()),
     };
-    let threads = ws_threads(&ws)?;
+    let (threads, conversation) = ws_threads(&ws)?;
     if !threads.is_empty() {
         bail!(
             "workspace {name} still has {} thread{} ({}): delete them first (`twr -w {name} \
@@ -8076,6 +8266,38 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
                 .count()
         })
         .unwrap_or(0);
+    let goes = WsRemoval {
+        conversation,
+        notes,
+        log_bytes: std::fs::read_dir(&ws.data_dir)
+            .with_context(|| format!("reading {}", ws.data_dir.display()))?
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("twr.db") || n.starts_with("archive.db")
+            })
+            .map(|e| tree_bytes(&e.path()))
+            .sum(),
+        worktrees: leftover_worktrees(&ws.worktrees_dir()),
+        worktree_bytes: tree_bytes(&ws.worktrees_dir()),
+        total_bytes: tree_bytes(&ws.data_dir),
+    };
+    match consent {
+        Consent::Yes => {}
+        Consent::Ask(ask) => {
+            let reply = ask(&ws_rm_question(name, &ws.data_dir, &goes))?;
+            if !matches!(reply.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                outln!("nothing removed");
+                return Ok(());
+            }
+        }
+        Consent::NoTerminal => bail!(
+            "not removing workspace {name} without confirmation (no terminal to ask on). {}Run \
+             `twr ws rm {name} --yes` to remove it",
+            ws_rm_listing(name, &ws.data_dir, &goes)
+        ),
+    }
     // Moved aside first (a name no workspace can have), so a half-removed directory is never
     // taken for the workspace.
     let doomed = ws
@@ -8136,21 +8358,139 @@ fn stop_workspace_lock(ws: &Paths) -> anyhow::Result<StopWorkspaceLock> {
 }
 
 /// The names of the worker threads in the stopped workspace's log (deleted ones are gone; the
-/// orchestrator does not count).
-fn ws_threads(ws: &Paths) -> anyhow::Result<Vec<String>> {
+/// orchestrator does not count), and the orchestrator threads' conversation: how many there
+/// are (one per runtime it ran on) and their turns in all.
+fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64))> {
     let db = ws.db_file();
     if !db.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), (0, 0)));
     }
     let store = twr_hub::store::Store::open(&db)?;
     let events = store.load_all()?;
     let registry = twr_core::reduce::Registry::from_events(&events);
-    Ok(registry
+    let (orchestrators, workers): (Vec<_>, Vec<_>) = registry
         .list()
         .into_iter()
-        .filter(|t| !t.is_orchestrator())
-        .map(|t| t.name.clone())
-        .collect())
+        .partition(|t| t.is_orchestrator());
+    Ok((
+        workers.into_iter().map(|t| t.name.clone()).collect(),
+        (
+            orchestrators.len(),
+            orchestrators.iter().map(|t| t.turns).sum(),
+        ),
+    ))
+}
+
+/// What `twr ws rm` removes with a workspace's data directory, for its question.
+#[derive(Debug, Default)]
+struct WsRemoval {
+    /// The orchestrator threads in its log and their turns ([`ws_threads`]).
+    conversation: (usize, u64),
+    /// The orchestrator's memory notes.
+    notes: usize,
+    /// `twr.db` and `archive.db` (with their journals).
+    log_bytes: u64,
+    /// Worktree directories still under its `worktrees/` ([`leftover_worktrees`]).
+    worktrees: Vec<String>,
+    worktree_bytes: u64,
+    /// The whole data directory.
+    total_bytes: u64,
+}
+
+/// The bytes of the files under `path` (or of `path`, a file), symlinks counted as themselves
+/// and never followed; what can't be read counts as nothing.
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|d| d.flatten().map(|e| tree_bytes(&e.path())).sum())
+        .unwrap_or(0)
+}
+
+/// The worktree directories left under a workspace's `worktrees/` (`<project>/<thread>`, as
+/// the hub makes them), when it has no threads: what a failed deletion or a crash left, files
+/// of which go with the workspace. Sorted.
+fn leftover_worktrees(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for project in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = project.path();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        for t in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+            found.push(format!(
+                "{}/{}",
+                project.file_name().to_string_lossy(),
+                t.file_name().to_string_lossy()
+            ));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One line per thing `twr ws rm` removes of workspace `name` (data directory `dir`).
+fn ws_rm_listing(name: &str, dir: &Path, goes: &WsRemoval) -> String {
+    let plural = |n: u64, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut out = format!("This removes workspace {name} for good:\n");
+    let (orchestrators, turns) = goes.conversation;
+    if orchestrators > 0 {
+        out.push_str(&format!(
+            "  its orchestrator's conversation ({}, {})\n",
+            plural(orchestrators as u64, "thread", "threads"),
+            plural(turns, "turn", "turns")
+        ));
+    }
+    if goes.notes > 0 {
+        out.push_str(&format!(
+            "  its orchestrator's {}\n",
+            plural(goes.notes as u64, "memory note", "memory notes")
+        ));
+    }
+    out.push_str(&format!(
+        "  its log ({})\n",
+        twr_core::git::human_bytes(goes.log_bytes)
+    ));
+    if !goes.worktrees.is_empty() {
+        let mut shown: Vec<String> = goes.worktrees.iter().take(5).cloned().collect();
+        if goes.worktrees.len() > 5 {
+            shown.push(format!("+{} more", goes.worktrees.len() - 5));
+        }
+        out.push_str(&format!(
+            "  {} left in its worktrees/ ({}, {}), files included\n",
+            plural(
+                goes.worktrees.len() as u64,
+                "worktree directory",
+                "worktree directories"
+            ),
+            shown.join(", "),
+            twr_core::git::human_bytes(goes.worktree_bytes)
+        ));
+    }
+    out.push_str(&format!(
+        "  everything else in {} ({} in all)\n",
+        dir.display(),
+        twr_core::git::human_bytes(goes.total_bytes)
+    ));
+    out
+}
+
+/// The question `twr ws rm` asks before removing workspace `name`.
+fn ws_rm_question(name: &str, dir: &Path, goes: &WsRemoval) -> String {
+    format!(
+        "{}Remove workspace {name}? This cannot be undone. [y/N] ",
+        ws_rm_listing(name, dir, goes)
+    )
 }
 
 /// What a probe of the hub socket found.
@@ -8484,6 +8824,78 @@ mod tests {
         );
     }
     use super::*;
+
+    /// `twr voice setup` keeps only exactly the model it pinned: ggml's magic, its size and its
+    /// SHA-256, checked while it streams and before the rename.
+    #[test]
+    fn voice_setup_keeps_only_the_pinned_model() {
+        let model = b"lmggthe rest of a tiny model".to_vec();
+        let sha: &'static str = Box::leak(sha256_hex(&model).into_boxed_str());
+        let run = |chunks: &[&[u8]], len: u64| -> anyhow::Result<()> {
+            let mut check = ModelCheck::new(len, sha);
+            for c in chunks {
+                check.update(c)?;
+            }
+            check.finish()
+        };
+        let len = model.len() as u64;
+        // Whole, in any chunks.
+        run(&[&model], len).unwrap();
+        run(&[&model[..2], &model[2..3], &model[3..]], len).unwrap();
+        // Another file of the same size: refused at the end.
+        let mut other = model.clone();
+        *other.last_mut().unwrap() ^= 1;
+        let e = run(&[&other], len).unwrap_err().to_string();
+        assert!(
+            e.contains("is not the model twr expects") && e.contains(sha),
+            "{e}"
+        );
+        // Too short, too long, not a ggml file.
+        let e = run(&[&model[..10]], len).unwrap_err().to_string();
+        assert!(
+            e.contains("did not send a whole whisper model (10 of"),
+            "{e}"
+        );
+        let mut long = model.clone();
+        long.push(0);
+        let e = run(&[&long], len).unwrap_err().to_string();
+        assert!(e.contains("sent more than"), "{e}");
+        let e = run(&[b"<!doctype html>"], len).unwrap_err().to_string();
+        assert!(e.contains("did not send a whisper model"), "{e}");
+    }
+
+    /// `twr ws rm` asks before it removes anything, naming what goes: anything but y/yes keeps
+    /// the workspace.
+    #[tokio::test]
+    async fn ws_rm_asks_first() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::with_home(home.path());
+        let ws = paths.workspace("a").unwrap();
+        std::fs::create_dir_all(ws.data_dir.join(twr_hub::MEMORY_DIR)).unwrap();
+        std::fs::write(ws.data_dir.join(twr_hub::MEMORY_DIR).join("x.md"), "n").unwrap();
+        std::fs::write(ws.data_dir.join("twr.db-wal"), [0u8; 2048]).unwrap();
+        let mut asked = Vec::new();
+        for reply in ["", "n\n", "no\n", "yes please\n"] {
+            let mut ask = |q: &str| {
+                asked.push(q.to_string());
+                Ok(reply.to_string())
+            };
+            ws_rm(&paths, "a", Consent::Ask(&mut ask)).await.unwrap();
+            assert!(ws.data_dir.is_dir(), "{reply:?} removed it");
+        }
+        let q = &asked[0];
+        assert!(q.starts_with("This removes workspace a for good:\n"), "{q}");
+        assert!(q.contains("  its orchestrator's 1 memory note\n"), "{q}");
+        assert!(q.contains("  its log (2 KB)\n"), "{q}");
+        assert!(!q.contains("worktree"), "{q}");
+        assert!(
+            q.ends_with("Remove workspace a? This cannot be undone. [y/N] "),
+            "{q}"
+        );
+        let mut yes = |_: &str| Ok("Y\n".to_string());
+        ws_rm(&paths, "a", Consent::Ask(&mut yes)).await.unwrap();
+        assert!(!ws.data_dir.exists());
+    }
 
     /// A workspace that was present during discovery can be moved aside by ws rm before
     /// the stop opens its lock. Absence is not a stop failure; other open errors are.
@@ -9380,6 +9792,17 @@ mod tests {
                 .cmd,
             Some(Cmd::Attention {
                 all: true,
+                json: false,
+                cmd: None
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["twr", "attention", "--json"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::Attention {
+                all: false,
+                json: true,
                 cmd: None
             })
         ));
@@ -10284,7 +10707,7 @@ mod tests {
         ] {
             let c = Cli::try_parse_from(args).unwrap();
             assert!(
-                matches!(c.cmd, Some(Cmd::Thread { cmd: ThreadCmd::List { all } }) if all == want),
+                matches!(c.cmd, Some(Cmd::Thread { cmd: ThreadCmd::List { all, .. } }) if all == want),
                 "{args:?}"
             );
         }
@@ -11220,7 +11643,79 @@ mod tests {
             }
         }
         let update = Cli::try_parse_from(["twr", "update", "--version", "v0.2.0"]).unwrap();
-        assert!(matches!(update.cmd, Some(Cmd::Update { version: Some(v) }) if v == "v0.2.0"));
+        assert!(matches!(
+            update.cmd,
+            Some(Cmd::Update { version: Some(v), allow_downgrade: false }) if v == "v0.2.0"
+        ));
+        let update =
+            Cli::try_parse_from(["twr", "update", "--version", "v0.2.0", "--allow-downgrade"])
+                .unwrap();
+        assert!(matches!(
+            update.cmd,
+            Some(Cmd::Update {
+                allow_downgrade: true,
+                ..
+            })
+        ));
+        // A downgrade is only ever to a release named.
+        assert!(Cli::try_parse_from(["twr", "update", "--allow-downgrade"]).is_err());
+    }
+
+    /// `twr update` installs only a newer release, in semver order with prereleases: the same
+    /// one is up to date, and an older one (also the latest stable release under a newer
+    /// prerelease) is refused unless `--version` and `--allow-downgrade` ask for it.
+    #[test]
+    fn update_never_downgrades_unasked() {
+        use UpdatePlan::*;
+        // Newer.
+        assert_eq!(
+            update_plan("v0.4.0", "0.3.0", false, false).unwrap(),
+            Install
+        );
+        assert_eq!(
+            update_plan("v0.4.0", "0.3.0", true, false).unwrap(),
+            Install
+        );
+        // Equal.
+        assert_eq!(
+            update_plan("v0.3.0", "0.3.0", false, false).unwrap(),
+            UpToDate
+        );
+        assert_eq!(
+            update_plan("v0.3.0", "0.3.0", true, true).unwrap(),
+            UpToDate
+        );
+        // Prerelease to its release, and release to a later prerelease: newer.
+        assert_eq!(
+            update_plan("v0.4.0", "0.4.0-rc.1", false, false).unwrap(),
+            Install
+        );
+        assert_eq!(
+            update_plan("v0.4.0-rc.1", "0.3.0", true, false).unwrap(),
+            Install
+        );
+        // Release to its own prerelease, and a prerelease to the stable latest before it.
+        for (tag, current) in [("v0.4.0-rc.1", "0.4.0"), ("v0.3.2", "0.4.0-rc.1")] {
+            for (asked, allow) in [(false, false), (true, false), (false, true)] {
+                let e = update_plan(tag, current, asked, allow)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("nothing was run"), "{e}");
+                assert!(e.contains("may refuse the database"), "{e}");
+                assert!(
+                    e.contains(&format!("twr update --version {tag} --allow-downgrade")),
+                    "{e}"
+                );
+                assert_eq!(e.contains("leaves out prereleases"), !asked, "{e}");
+            }
+            assert_eq!(update_plan(tag, current, true, true).unwrap(), Downgrade);
+        }
+        // Older.
+        assert!(update_plan("v0.2.9", "0.3.0", false, false).is_err());
+        assert_eq!(
+            update_plan("v0.2.9", "0.3.0", true, true).unwrap(),
+            Downgrade
+        );
     }
 
     /// `twr update` installs into the executable's own directory, and refuses cargo's bin

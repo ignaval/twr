@@ -314,7 +314,29 @@ fn ws_rm_removes_an_empty_workspace_and_keeps_a_trash() {
         let _hub = start_hub(home, Some("b"));
     }
     assert!(b.db_file().exists());
-    assert_eq!(ok(home, &["ws", "rm", "b"]).trim(), "removed workspace b");
+    // Without a terminal to ask on, only with --yes: the refusal lists what would go.
+    std::fs::create_dir_all(b.data_dir.join("memory")).unwrap();
+    std::fs::write(b.data_dir.join("memory/short-replies.md"), "be brief\n").unwrap();
+    std::fs::create_dir_all(b.worktrees_dir().join("proj/old")).unwrap();
+    std::fs::write(b.worktrees_dir().join("proj/old/notes.txt"), "unsaved\n").unwrap();
+    let e = fails(home, &["ws", "rm", "b"]);
+    assert!(
+        e.contains("not removing workspace b without confirmation")
+            && e.contains("twr ws rm b --yes"),
+        "{e}"
+    );
+    assert!(e.contains("This removes workspace b for good"), "{e}");
+    assert!(e.contains("its orchestrator's 1 memory note"), "{e}");
+    assert!(e.contains("its log ("), "{e}");
+    assert!(
+        e.contains("1 worktree directory left in its worktrees/ (proj/old"),
+        "{e}"
+    );
+    assert!(b.db_file().exists());
+    assert_eq!(
+        ok(home, &["ws", "rm", "b", "--yes"]).trim(),
+        "removed workspace b, with its orchestrator's 1 memory note"
+    );
     assert!(!b.data_dir.exists());
     let names: Vec<Value> = workspaces(home).iter().map(|r| r["name"].clone()).collect();
     assert_eq!(names, ["default", "c"]);
@@ -603,7 +625,10 @@ fn ws_rm_refuses_a_hub_on_another_socket() {
     assert!(b.db_file().exists());
     let _ = hub.0.kill();
     let _ = hub.0.wait();
-    assert_eq!(ok(home, &["ws", "rm", "b"]).trim(), "removed workspace b");
+    assert_eq!(
+        ok(home, &["ws", "rm", "b", "-y"]).trim(),
+        "removed workspace b"
+    );
 }
 
 /// A `hub.socket` among the workspaces' sockets is refused where the default workspace uses

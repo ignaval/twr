@@ -479,6 +479,11 @@ main() {
     staged=""
     say "Installed $installed to $dir/twr"
     if [ "$pair_after_install" = 1 ]; then
+        # This script comes from main, which can be ahead of the latest release: v0.3.0 and
+        # older have no `twr runner up`.
+        if ! "$dir/twr" runner up --help > /dev/null 2>&1; then
+            err "$installed has no \`twr runner up\`: pairing needs a twr newer than 0.3.0. It is installed at $dir/twr; pair once a newer release is out (TWR_VERSION=<version> sh install.sh --pair)"
+        fi
         "$dir/twr" runner up
         return
     fi

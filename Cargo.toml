@@ -43,6 +43,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+# `twr completions`: shell completion scripts from the clap definition.
+clap_complete = "4"
 ratatui = "0.30"
 crossterm = "0.29"
 # The TUI's markdown (replies drawn as Claude Code draws them): the parser only, no HTML.
