@@ -21,7 +21,7 @@ The branch starts at the repository's `HEAD`, or at `--base <ref>`. If the insta
 
 A project that isn't a git repository runs in place, in its own directory.
 
-The TUI's cards and tiles show each thread's branch, `changes made` while its worktree has uncommitted changes (a submodule counts by its commit: changes inside its work tree don't show there, though parking and deleting still see them), and how far it is ahead of and behind its base: `twr/api · changes made · 4 ahead of dev · 12 behind`, or `+4/−12 vs dev` on a narrow card, and nothing when it is even with its base ([the git line](tui.md#the-git-line)). The hub takes a git snapshot after every turn and every 30 seconds, and records it when something changed.
+The TUI's cards and tiles show each thread's branch, `changes made` while its worktree has uncommitted changes (a submodule counts by its commit: changes inside its work tree don't show there, though parking and deleting still see them), and how far it is ahead of and behind its base: `twr/api · changes made · 4 ahead of dev · 12 behind`, or `+4/−12 vs dev` on a narrow card, and nothing when it is even with its base ([the git line](tui.md#the-git-line)). The hub takes a git snapshot after every turn and every 30 seconds, and records it when something changed. A thread that stays idle with nothing changing is snapshotted half as often each time, down to every 5 minutes, and every 30 seconds again once anything happens on it (a turn, an attach or detach, a job's end), so a change you make by hand in an idle thread's worktree can take up to 5 minutes to show.
 
 ### Merge readiness
 

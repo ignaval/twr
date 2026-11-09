@@ -1009,7 +1009,9 @@ Details:
 - **git.snapshot** `{branch, dirty_files, ahead, behind, base?, base_ahead?, base_behind?,
   conflicts?, conflict_count?}` (source `hub`, control stream) is appended after a turn ends
   and on a 30 s tick for threads that are not parked or stopped, only when one of those values
-  changed. `branch` is null on a detached `HEAD`; an untracked directory counts as one dirty
+  changed. A thread whose snapshot found nothing new and that has had no event since is
+  snapshotted half as often each time, down to every 5 minutes, and every 30 s again after
+  its next event. `branch` is null on a detached `HEAD`; an untracked directory counts as one dirty
   file. `base` (merge readiness, a thread with a worktree of its own): `[projects.<name>] base`,
   else what its worktree was made from, fully qualified (`ext.twr.base_ref`:
   `refs/heads/dev`, a remote branch, a tag, or the commit a base like `HEAD~1` named); a
