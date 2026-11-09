@@ -21,6 +21,7 @@ import {
   useId,
   useLayoutEffect,
   useMemo,
+  memo,
   useRef,
   useState,
   lazy,
@@ -136,6 +137,7 @@ const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
 
+const noAttention: Attention[] = [];
 const initial: ViewState = {
   threads: [],
   attention: [],
@@ -1586,16 +1588,14 @@ export default function App({
   // What this device may have read aloud lately, for voice mode's echo check: the
   // orchestrator's last messages (kept while a worker's conversation is on screen) and the
   // sentences a speaker announces.
-  const orchestratorSaid = useRef<string[]>([]);
-  useEffect(() => {
-    if (destination || !orchestrator) return;
-    orchestratorSaid.current = blocksOf(events)
+  // Read only when voice checks an utterance: not folded again on every event batch.
+  const orchestratorEvents = useRef<HubEvent[]>([]);
+  if (!destination && orchestrator) orchestratorEvents.current = events;
+  const spokenLately = () => [
+    ...blocksOf(orchestratorEvents.current)
       .filter((b) => b.kind === "assistant")
       .slice(-3)
-      .map((b) => b.text);
-  }, [events, destination, orchestrator?.id]);
-  const spokenLately = () => [
-    ...orchestratorSaid.current,
+      .map((b) => b.text),
     ...announcements(view.threads),
   ];
   async function submitSlash(text: string) {
@@ -2007,8 +2007,19 @@ export default function App({
         ["running", "background", "waiting", "error"].includes(t.status) ||
         view.attention.some((a) => a.thread === t.id)),
   );
-  const attentionFor = (id: string) =>
-    view.attention.filter((a) => a.thread === id);
+  const attentionByThread = useMemo(() => {
+    const byThread = new Map<string, Attention[]>();
+    for (const item of view.attention)
+      byThread.set(item.thread, [...(byThread.get(item.thread) || []), item]);
+    return byThread;
+  }, [view.attention]);
+  const attentionFor = (id: string) => attentionByThread.get(id) || noAttention;
+  const selectThread = useCallback((id: string) => setSelected(id), []);
+  const openThread = useCallback((id: string) => {
+    setDestination(id);
+    setSection("chat");
+    setSelected(undefined);
+  }, []);
   // While a workspace connects, its entry keeps the rows it had (a double-click's second
   // click lands on the row the first one chose).
   const entries = workspaceEntries(
@@ -2115,20 +2126,22 @@ export default function App({
     },
     [liveAnswerCheck, rpc],
   );
-  const earlier = async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !target || earlierBusy) return;
+  const earlierTarget = target?.id;
+  const earlier = useCallback(async () => {
+    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+      return;
     const generation = transcriptGeneration.current;
     setEarlierBusy(true);
     try {
       let page = await rpc("thread.transcript", {
-        thread: target.id,
+        thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
-          thread: target.id,
+          thread: earlierTarget,
           turn: earliestTurn - 1,
           since_seq: page.next,
           limit: 500,
@@ -2143,7 +2156,8 @@ export default function App({
     } finally {
       setEarlierBusy(false);
     }
-  };
+  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   function chooseMention(thread: Thread) {
     setDrafts((old) => ({
       ...old,
@@ -2398,12 +2412,8 @@ export default function App({
                               dived={destination === thread.id}
                               selected={selected === thread.id}
                               pinned={pins.includes(thread.id)}
-                              onSelect={() => setSelected(thread.id)}
-                              onOpen={() => {
-                                setDestination(thread.id);
-                                setSection("chat");
-                                setSelected(undefined);
-                              }}
+                              onSelect={selectThread}
+                              onOpen={openThread}
                             />
                           ))}
                           {!visible.length && (
@@ -2955,7 +2965,7 @@ export default function App({
                   }
                   earlierBusy={earlierBusy}
                   target={target}
-                  onSetup={() => action("orch")}
+                  onSetup={setupOrchestrator}
                   connected={connected}
                   summaries={assistance.summaries}
                   onError={fail}
@@ -3557,12 +3567,8 @@ export default function App({
                       dived={destination === t.id}
                       selected={selected === t.id}
                       pinned={pins.includes(t.id)}
-                      onSelect={() => setSelected(t.id)}
-                      onOpen={() => {
-                        setDestination(t.id);
-                        setSection("chat");
-                        setSelected(undefined);
-                      }}
+                      onSelect={selectThread}
+                      onOpen={openThread}
                       large
                     />
                   ))}
@@ -4410,7 +4416,9 @@ export default function App({
   );
 }
 
-function ThreadCard({
+/** Memoized, with stable `onSelect`/`onOpen` taking the thread's id and `items` shared
+ * per thread: typing and streaming don't redraw every card. */
+const ThreadCard = memo(function ThreadCard({
   thread,
   items,
   selected,
@@ -4426,8 +4434,8 @@ function ThreadCard({
   selected: boolean;
   dived?: boolean;
   pinned: boolean;
-  onSelect: () => void;
-  onOpen: () => void;
+  onSelect: (id: string) => void;
+  onOpen: (id: string) => void;
   large?: boolean;
   listItem?: boolean;
 }) {
@@ -4438,8 +4446,8 @@ function ThreadCard({
       selected={selected}
       dived={dived}
       pinned={pinned}
-      onSelect={onSelect}
-      onOpen={onOpen}
+      onSelect={() => onSelect(thread.id)}
+      onOpen={() => onOpen(thread.id)}
       large={large}
     />
   );
@@ -4450,7 +4458,7 @@ function ThreadCard({
   ) : (
     card
   );
-}
+});
 function ThreadCardButton({
   thread,
   items,
@@ -4814,7 +4822,8 @@ function AttentionCard({
     </article>
   );
 }
-function Conversation({
+/** Memoized: typing in the composer doesn't redraw the transcript. */
+const Conversation = memo(function Conversation({
   events,
   showTools,
   showThinking,
@@ -5150,7 +5159,7 @@ function Conversation({
       )}
     </div>
   );
-}
+});
 function ContextEditor({
   value,
   project,

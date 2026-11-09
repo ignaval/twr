@@ -1,5 +1,5 @@
 import { useHostAPI } from "./host";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { HubEvent, Json, Thread } from "./types";
 import { routineRuns } from "./transcript";
 
@@ -362,14 +362,12 @@ export function useAssistance({
     settingsReady,
     target?.is_orchestrator,
   ]);
-  const runs = useMemo(() => routineRuns(events), [events]);
   return {
     suggestion,
     summaries,
     settings,
     stats,
     notice,
-    runs,
     needsDisclosure: !!enabled && !disclosed,
     /** How long the current suggestion has been on screen, in milliseconds. */
     suggestionShownFor() {
