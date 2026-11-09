@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { MessageBody } from "../shared/MessageBody";
+import { MessageBody, streamingInterval } from "../shared/MessageBody";
 
 vi.mock("../shared/host", () => ({
   useHostAPI: () => ({
@@ -11,7 +11,12 @@ vi.mock("../shared/host", () => ({
 }));
 const render = (
   text: string,
-  options: { clamp?: boolean; mono?: boolean } = {},
+  options: {
+    clamp?: boolean;
+    mono?: boolean;
+    expanded?: boolean;
+    streaming?: boolean;
+  } = {},
 ) => renderToStaticMarkup(createElement(MessageBody, { text, ...options }));
 
 describe("long message rendering", () => {
@@ -68,5 +73,24 @@ describe("long message rendering", () => {
     expect(html).toContain("&lt;script&gt;");
     expect(html).toContain("</code></pre>");
     expect(html).not.toContain("<script>");
+  });
+  it("keeps a message expanded when the conversation says it was left open", () => {
+    const source = Array.from({ length: 40 }, (_, n) => `line ${n + 1}`).join(
+      "\n\n",
+    );
+    const html = render(source, { expanded: true });
+    expect(html).toContain("line 40");
+    expect(html).toContain('aria-expanded="true"');
+    expect(html).toContain("Show less");
+  });
+  it("parses a long streaming reply less often than a short one", () => {
+    expect(streamingInterval(0)).toBe(250);
+    expect(streamingInterval(16384)).toBe(250);
+    expect(streamingInterval(40 * 1024)).toBe(750);
+    expect(streamingInterval(10 * 1024 * 1024)).toBe(1000);
+    // Its first text is shown at once.
+    expect(render("**hello**", { clamp: false, streaming: true })).toContain(
+      "<strong>hello</strong>",
+    );
   });
 });

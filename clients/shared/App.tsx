@@ -4799,6 +4799,20 @@ function Conversation({
   const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
+  // Expanded messages and open tool details, by block: rows scrolled out of the virtual
+  // list unmount, and come back as they were left.
+  const [opened, setOpened] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
+  const setOpen = useCallback((key: string, open: boolean) => {
+    setOpened((old) => {
+      if ((old.get(key) ?? false) === open) return old;
+      const next = new Map(old);
+      if (open) next.set(key, true);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
   const blocks = useMemo(
     () =>
       foldRoutineBlocks(blocksOf(events), events, summaries).filter(
@@ -5020,7 +5034,13 @@ function Conversation({
                 </button>
               </div>
               {block.children ? (
-                <details className="routine-updates">
+                <details
+                  className="routine-updates"
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.text}
                     <span>
@@ -5037,16 +5057,29 @@ function Conversation({
                   ))}
                 </details>
               ) : block.kind === "tool" ? (
-                <details>
+                <details
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.detail?.split("\n")[0] || "Tool call"}
                   </summary>
-                  <MessageBody text={block.detail || ""} mono />
+                  <MessageBody
+                    text={block.detail || ""}
+                    mono
+                    expanded={opened.get(block.id) ?? false}
+                    onExpandedChange={(open) => setOpen(block.id, open)}
+                  />
                 </details>
               ) : (
                 <MessageBody
                   text={block.text}
                   clamp={block.kind === "user" || block.kind === "notice"}
+                  streaming={block.kind === "assistant" && !!block.pending}
+                  expanded={opened.get(block.id) ?? false}
+                  onExpandedChange={(open) => setOpen(block.id, open)}
                 />
               )}
             </article>
