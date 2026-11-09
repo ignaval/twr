@@ -313,6 +313,8 @@ Other workspaces show a summary with an Open action. Open the workspace before
 answering so the full live request and its current revision can be reviewed. Saved
 summaries for disconnected hubs are labeled; they cannot authorize a response.
 Refresh reads each running workspace without moving your active conversation.
+Only one refresh runs at a time. Listing the workspaces may take up to 5 seconds (it asks
+each hub in turn); if it takes longer or fails, the refresh uses the last list that worked.
 
 ### Search saved conversations
 

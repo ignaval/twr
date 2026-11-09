@@ -14,6 +14,31 @@ export function coalesceInboxSources(refresh: () => Promise<InboxSource[]>) {
         pending = undefined;
       }));
 }
+/**
+ * The workspace list for a refresh. `twr ws list` asks every hub in turn, so a
+ * single busy hub can make it slow: it gets one overall budget, and a listing
+ * that fails or runs out of time falls back to the last one that worked.
+ */
+export class WorkspaceListing {
+  private last?: unknown[];
+  constructor(
+    private readonly list: (timeoutMs: number) => Promise<unknown>,
+    private readonly budgetMs = 5000,
+  ) {}
+  async get(): Promise<unknown[]> {
+    try {
+      const value: any = await this.list(this.budgetMs);
+      const workspaces = Array.isArray(value) ? value : value?.workspaces;
+      if (!Array.isArray(workspaces))
+        throw new Error("Invalid workspace listing");
+      this.last = workspaces;
+      return workspaces;
+    } catch (error) {
+      if (this.last) return this.last;
+      throw error;
+    }
+  }
+}
 /** Short-lived read connections leave the active workspace and its terminals alone. */
 export async function localInboxSources(
   workspaces: unknown,

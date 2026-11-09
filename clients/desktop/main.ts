@@ -31,7 +31,11 @@ import { Bridge } from "./bridge";
 import { SecureStore } from "./secure-store";
 import { DesktopTransport } from "./remote-transport";
 import { GatewaySetup } from "./gateway-setup";
-import { coalesceInboxSources, localInboxSources } from "./inbox";
+import {
+  coalesceInboxSources,
+  localInboxSources,
+  WorkspaceListing,
+} from "./inbox";
 import { localUploadRequest } from "./upload-request";
 import {
   cliArgs,
@@ -491,18 +495,26 @@ function register() {
   handle("secure-delete", (key) =>
     offlineVault.delete(z.string().max(512).parse(key)),
   );
+  const workspaceListing = new WorkspaceListing(
+    async (timeout) =>
+      JSON.parse(
+        (
+          await exec(binaries.twr, ["ws", "list", "--json"], {
+            env: env(),
+            timeout,
+            maxBuffer: 1024 * 1024,
+          })
+        ).stdout,
+      ),
+    5000,
+  );
   handleWithEnvironment(
     "inbox-sources",
-    coalesceInboxSources(async () => {
-      const started = Date.now();
-      const { stdout } = await exec(binaries.twr, ["ws", "list", "--json"], {
-        env: env(),
-        timeout: 1000,
-        maxBuffer: 1024 * 1024,
-      });
-      const listing = JSON.parse(stdout);
-      return localInboxSources(
-        Array.isArray(listing) ? listing : listing.workspaces,
+    // One refresh at a time: a request during a refresh shares its result.
+    // The listing has its own 5 s budget; the summaries then get 4 s.
+    coalesceInboxSources(async () =>
+      localInboxSources(
+        await workspaceListing.get(),
         (name) =>
           new Bridge(
             binaries.bridge,
@@ -510,9 +522,9 @@ function register() {
             { ...env(), TWR_BRIDGE_READ_ONLY: "1" },
             () => {},
           ),
-        Math.max(0, 4000 - (Date.now() - started)),
-      );
-    }),
+        4000,
+      ),
+    ),
   );
   handle("remote-list", () => remoteTransport.listHubs());
   handle("remote-pair", (request) => remoteTransport.pair(request));
