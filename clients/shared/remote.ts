@@ -343,6 +343,7 @@ export class RemoteHost {
   }
   async stop() {
     this.stopped = true;
+    this.workspaceListeners.clear();
     clearInterval(this.heartbeatTimer);
     this.assembler.clear();
     clearTimeout(this.retryTimer);
@@ -380,7 +381,26 @@ export class RemoteHost {
     this.listeners.forEach((listener) =>
       listener({ type: "resync", scope: "terminal" }),
     );
+    this.workspaceListeners.forEach((listener) => {
+      try {
+        listener(workspace);
+      } catch {
+        /* A listener's failure must not fail the connection. */
+      }
+    });
     return result;
+  }
+  private workspaceListeners = new Set<(workspace: string) => void>();
+  /**
+   * Called after every successful workspace connection: the first one, a switch
+   * to another workspace and each reconnect. Mobile refreshes its push
+   * registration here, which the gateway keeps per device and workspace.
+   */
+  onWorkspaceConnected(listener: (workspace: string) => void) {
+    this.workspaceListeners.add(listener);
+    return () => {
+      this.workspaceListeners.delete(listener);
+    };
   }
   async resume() {
     if (this.stopped) return;

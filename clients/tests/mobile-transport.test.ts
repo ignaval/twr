@@ -281,6 +281,34 @@ describe("mobile reconnect", () => {
       vi.useRealTimers();
     }
   });
+  it("announces every successful workspace connection, switches and reconnects included", async () => {
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    const connected: string[] = [];
+    host.onWorkspaceConnected((workspace) => connected.push(workspace));
+    await host.api().connect("default");
+    await host.api().connect("work");
+    fake.listener({ message: { type: "transport-closed" } });
+    await host.resume();
+    expect(connected).toEqual(["default", "work", "work"]);
+    // A failed connection announces nothing.
+    fake.send.mockImplementation(async ({ message }) => {
+      const call = JSON.parse(message);
+      fake.listener({
+        message:
+          call.method === "connect"
+            ? { id: call.id, error: "No such workspace" }
+            : { id: call.id, result: {} },
+      });
+    });
+    await expect(host.api().connect("missing")).rejects.toThrow("workspace");
+    expect(connected).toEqual(["default", "work", "work"]);
+    await host.stop();
+  });
   it("stops retrying once the gateway reports the token revoked (401)", async () => {
     vi.useFakeTimers();
     const host = new RemoteHost(

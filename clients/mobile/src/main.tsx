@@ -293,9 +293,17 @@ function Mobile() {
       );
       await remote.start();
       host.current = remote;
+      const started = remote;
+      // The gateway registers push per device and workspace: refresh after the
+      // first connection, every in-app workspace switch and every reconnect.
+      started.onWorkspaceConnected(() => {
+        if (host.current === started && activeHub.current?.id === hub.id)
+          void refreshPush(started, hub.id).catch((error) => {
+            if (host.current === started) setNotice(errorMessage(error));
+          });
+      });
       const api = remote.api();
       // Voice mode where the app has the native recognizer and voice (docs/mobile.md).
-      const started = remote;
       voice.current = mobileVoice({
         request: (method, params, timeout) =>
           started.request(method, params, timeout),
@@ -363,14 +371,7 @@ function Mobile() {
             <span className="mobile-hub-name">{active.name}</span>
           </button>
         }
-        onReady={() => {
-          setReadyHubId(active.id);
-          const remote = host.current;
-          if (remote && activeHub.current?.id === active.id)
-            void refreshPush(remote, active.id).catch((error) =>
-              setNotice(errorMessage(error)),
-            );
-        }}
+        onReady={() => setReadyHubId(active.id)}
       />
 
       {hubSheet && (
