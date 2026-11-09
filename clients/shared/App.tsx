@@ -28,6 +28,7 @@ import {
   type CSSProperties,
   type FormEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -63,6 +64,7 @@ import {
   Trash2,
   Volume2,
   Command as CommandIcon,
+  Check,
   CheckCircle2,
   Circle,
   Copy,
@@ -106,6 +108,7 @@ import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
+import { armed, armsIn, hidden, mayAnswer, shown, type Arming } from "./arming";
 import {
   announce,
   attentionAnnouncement,
@@ -1986,19 +1989,38 @@ export default function App({
         show(wanted.thread, wanted.talk, wanted.then);
     });
   };
-  const respond = async (item: Attention, answer: string, message?: string) => {
-    if (!connected || !liveView.current || !permitted("operate")) return;
-    try {
+  // Every attention answer (conversation cards, Needs you, the inspector, mobile) goes
+  // through here: only a live hub view, never a cached one, can authorize it.
+  const liveAnswerCheck = useCallback(() => {
+    if (!connectionRef.current || !liveView.current)
+      throw new Error(
+        "Not connected to the live hub. Reconnect and review the current request.",
+      );
+    if (deviceScopes && !deviceScopes.includes("operate"))
+      throw new Error("This device has read-only access.");
+  }, [deviceScopes]);
+  const respond = useCallback(
+    async (item: Attention, answer: string, message?: string) => {
+      liveAnswerCheck();
       await rpc("attention.respond", {
         attn_id: item.attn_id,
         revision: item.revision,
         answer,
         ...(message ? { message } : {}),
       });
-    } catch (e) {
-      fail(e);
-    }
-  };
+    },
+    [liveAnswerCheck, rpc],
+  );
+  const dismissAttention = useCallback(
+    async (item: Attention) => {
+      liveAnswerCheck();
+      await rpc("attention.dismiss", {
+        attn_id: item.attn_id,
+        revision: item.revision,
+      });
+    },
+    [liveAnswerCheck, rpc],
+  );
   const earlier = async () => {
     if (!earliestTurn || earliestTurn <= 1 || !target || earlierBusy) return;
     const generation = transcriptGeneration.current;
@@ -2821,6 +2843,7 @@ export default function App({
                         thread={view.threads.find((t) => t.id === item.thread)}
                         readOnly={!connected || !permitted("operate")}
                         onRespond={respond}
+                        onDismiss={dismissAttention}
                         rpc={rpc}
                         fail={fail}
                       />
@@ -3514,6 +3537,7 @@ export default function App({
                     )}
                     readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
@@ -3640,6 +3664,7 @@ export default function App({
                     thread={selectedThread}
                     readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
@@ -4418,48 +4443,114 @@ function ThreadCardButton({
     </button>
   );
 }
+/** Tracks how long an attention card's options have been on screen: from mount, or from
+ * when they scroll into view, and again from zero after they leave it or the window is
+ * hidden. `identity` restarts it for a new item or revision. */
+function useArming(target: RefObject<HTMLElement | null>, identity: string) {
+  const state = useRef<Arming>({});
+  const [isArmed, setArmed] = useState(false);
+  useEffect(() => {
+    state.current = hidden();
+    setArmed(false);
+    const node = target.current;
+    const observable = !!node && typeof IntersectionObserver !== "undefined";
+    let onScreen = !observable;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const update = () => {
+      clearTimeout(timer);
+      const now = performance.now();
+      state.current =
+        onScreen && document.visibilityState !== "hidden"
+          ? shown(state.current, now)
+          : hidden();
+      setArmed(armed(state.current, now));
+      const wait = armsIn(state.current, now);
+      if (wait) timer = setTimeout(update, wait);
+    };
+    let observer: IntersectionObserver | undefined;
+    if (observable) {
+      observer = new IntersectionObserver((entries) => {
+        onScreen = entries[entries.length - 1].isIntersecting;
+        update();
+      });
+      observer.observe(node);
+    } else update();
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      clearTimeout(timer);
+      observer?.disconnect();
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [identity]);
+  return { armed: isArmed, state: () => state.current };
+}
 function AttentionCard({
   item,
   readOnly = false,
   thread,
   onRespond,
+  onDismiss,
   rpc,
   fail,
 }: {
   item: Attention;
   readOnly?: boolean;
   thread?: Thread;
+  /** Answers through App's live-view guard; rejects when it can't be answered now. */
   onRespond: (
     item: Attention,
     answer: string,
     message?: string,
   ) => Promise<void>;
+  onDismiss: (item: Attention) => Promise<void>;
   rpc: (method: string, params?: Json) => Promise<Json>;
   fail: (e: unknown) => void;
 }) {
   const [answer, setAnswer] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  // Once an answer is accepted the card stays answered until the next state removes it:
+  // a second click would only meet the stale revision.
+  const [sent, setSent] = useState(false);
   const [requestError, setRequestError] = useState("");
   const options = item.options || [];
   const ids = useId();
-  const respond = async (value: string) => {
-    if (readOnly || !canRespond(item, busy)) return;
+  const response = useRef<HTMLDivElement>(null);
+  const arming = useArming(response, item.attn_id + ":" + item.revision);
+  const pending = useRef(false);
+  const settle = async (run: () => Promise<void>) => {
+    // Clicks and keys that land before the options have been on screen for 600 ms were
+    // meant for whatever was there before (a card that just slid away, the previous
+    // revision): they answer nothing.
+    if (
+      pending.current ||
+      !canRespond(item, busy) ||
+      !mayAnswer({
+        arming: arming.state(),
+        now: performance.now(),
+        busy,
+        sent,
+        readOnly,
+      })
+    )
+      return;
+    pending.current = true;
     setBusy(true);
     setRequestError("");
     try {
-      await rpc("attention.respond", {
-        attn_id: item.attn_id,
-        revision: item.revision,
-        answer: value,
-        ...(message ? { message } : {}),
-      });
+      await run();
+      setSent(true);
     } catch (e) {
       setRequestError(errorMessage(e));
     } finally {
+      pending.current = false;
       setBusy(false);
     }
   };
+  const respond = (value: string) =>
+    settle(() => onRespond(item, value, message || undefined));
+  const locked = readOnly || busy || sent || !item.revision || item.incomplete;
+  const waiting = !locked && !arming.armed;
   return (
     <article
       className={`attention-card attention-${item.reason}`}
@@ -4474,10 +4565,7 @@ function AttentionCard({
       onKeyDown={(event) => {
         if (
           event.target !== event.currentTarget ||
-          readOnly ||
-          busy ||
-          item.incomplete ||
-          !item.revision ||
+          locked ||
           event.ctrlKey ||
           event.metaKey ||
           event.altKey
@@ -4543,19 +4631,23 @@ function AttentionCard({
         {item.note && <p className="attention-note">{item.note}</p>}
       </div>
       {readOnly && <p className="muted">This device has read-only access.</p>}
-      <div className="attention-response">
+      <div className="attention-response" ref={response}>
         <input
           aria-label="Optional message with your decision"
           aria-describedby={requestError ? `${ids}-error` : undefined}
           placeholder="Add a note (optional)…"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          disabled={readOnly || busy}
+          disabled={readOnly || busy || sent}
         />
-        <div className="attention-options">
+        <div
+          className={`attention-options ${waiting ? "arming" : ""}`}
+          data-armed={arming.armed && !locked ? "true" : "false"}
+        >
           {options.map((option, i) => (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
               key={option + ":" + i}
               aria-keyshortcuts={String(i + 1)}
               onClick={() => void respond(option)}
@@ -4584,16 +4676,11 @@ function AttentionCard({
                   value={answer}
                   onChange={(e) => setAnswer(e.target.value)}
                   placeholder="Your answer…"
-                  disabled={readOnly || busy}
+                  disabled={readOnly || busy || sent}
                 />
                 <button
-                  disabled={
-                    readOnly ||
-                    busy ||
-                    !answer.trim() ||
-                    !item.revision ||
-                    item.incomplete
-                  }
+                  disabled={locked || !answer.trim()}
+                  aria-disabled={waiting || undefined}
                 >
                   Answer
                 </button>
@@ -4601,21 +4688,20 @@ function AttentionCard({
             )}
           {!["permission", "question"].includes(item.reason) && (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
-              onClick={() => {
-                setBusy(true);
-                void rpc("attention.dismiss", {
-                  attn_id: item.attn_id,
-                  revision: item.revision,
-                })
-                  .catch(fail)
-                  .finally(() => setBusy(false));
-              }}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
+              onClick={() => void settle(() => onDismiss(item))}
             >
               Dismiss
             </button>
           )}
           {busy && <Spinner />}
+          {sent && (
+            <span className="attention-sent" role="status">
+              <Check size={14} aria-hidden="true" />
+              Sent
+            </span>
+          )}
         </div>
         {requestError && (
           <p role="alert" className="error-text" id={`${ids}-error`}>

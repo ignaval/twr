@@ -474,6 +474,8 @@ archive.commit()
   const live = page
     .locator(".needs-inbox .attention-card")
     .filter({ hasText: "OTHER_WORKSPACE_QUESTION" });
+  // Answers count once the options have been on screen for 600 ms (shared/arming.ts).
+  await live.locator('.attention-options[data-armed="true"]').waitFor();
   await live.getByRole("button", { name: /Later/ }).click();
   await expect
     .poll(

@@ -60,7 +60,13 @@ Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a l
 
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads
-cannot be answered from a preview. Orchestrator messages use `say` with the displayed
+cannot be answered from a preview. As in the TUI, a request's buttons and number keys answer
+only once its options have been on screen for 600 ms: from when the card appears, scrolls
+into view or the window is shown again, and from zero for a request raised again. Until then
+they show dimmed and a click or key does nothing, so the second click of a double click, or a
+key pressed as one card replaces another, can't answer the request that slid into place.
+After an answer is accepted the card shows **Sent** and its buttons stay disabled until it
+goes away. Answers need a live connection to the hub. Orchestrator messages use `say` with the displayed
 control position, matching the TUI's relay semantics.
 
 | CLI capability | Desktop workflow |
@@ -293,7 +299,7 @@ The Needs you inbox groups requests by hub and workspace. Filter it to permissio
 questions, completed work that needs review, or other issues. J/K and the up/down arrow
 keys move between current requests outside text fields and dialogs; Previous and Next provide
 the same controls on touch screens. Number keys answer only the focused request's
-current revision. Inputs keep their normal typing behavior.
+current revision, once it has been on screen for 600 ms. Inputs keep their normal typing behavior.
 
 Other workspaces show a summary with an Open action. Open the workspace before
 answering so the full live request and its current revision can be reviewed. Saved

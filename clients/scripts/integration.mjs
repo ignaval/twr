@@ -317,8 +317,40 @@ try {
       item,
     ),
   );
-  await page
-    .locator(".manager .attention-options button")
+  // An answer counts only once the options have been on screen for 600 ms, as in the
+  // TUI (shared/arming.ts): a click before then answers nothing.
+  const permissionCard = page
+    .locator(".manager .attention-card")
+    .filter({ hasText: "Permission requested" })
+    .first();
+  const earlyClick = await permissionCard.evaluate((card) => {
+    const options = card.querySelector(".attention-options");
+    const allow = [...card.querySelectorAll(".attention-options button")].find(
+      (button) => /allow/.test(button.textContent || ""),
+    );
+    if (options?.getAttribute("data-armed") !== "false" || !allow) return false;
+    allow.click();
+    return true;
+  });
+  if (earlyClick) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const still = await page.evaluate(
+      async (item) =>
+        (await window.twr.rpc("attention.list", { all: true })).some(
+          (a) => a.attn_id === item.attn_id && a.revision === item.revision,
+        ),
+      item,
+    );
+    assert(still, "A click before the options armed must answer nothing");
+    console.log(
+      "PASS: a click within 600 ms of a request appearing is ignored",
+    );
+  }
+  await permissionCard
+    .locator('.attention-options[data-armed="true"]')
+    .waitFor({ timeout: 5000 });
+  await permissionCard
+    .locator(".attention-options button")
     .filter({ hasText: "allow" })
     .first()
     .click();
@@ -382,6 +414,10 @@ try {
     await deny.isVisible(),
     "The full request and Deny action must share one reachable scroll area",
   );
+  // Scrolled into view just now: its options arm 600 ms after they came on screen.
+  await longRequest
+    .locator('.attention-options[data-armed="true"]')
+    .waitFor({ timeout: 5000 });
   await deny.click();
   await longRequest.waitFor({ state: "hidden" });
   await page.setViewportSize(fullViewport);

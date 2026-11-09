@@ -1,6 +1,6 @@
 # Mobile clients
 
-The iOS and Android apps reuse the desktop React interface, Rust presentation state and CLI command catalog. Capacitor provides the platform shell. The app is a client of a separately running hub; it never runs agents or the hub on the phone. Narrow windows use Chat, Needs you, Threads and More; wider windows retain the desktop sidebar and inspector. Native fold events preserve the current conversation, destination and drafts through display changes.
+The iOS and Android apps reuse the desktop React interface, Rust presentation state and CLI command catalog. Capacitor provides the platform shell. The app is a client of a separately running hub; it never runs agents or the hub on the phone. Narrow windows use Chat, Needs you, Threads and More; wider windows retain the desktop sidebar and inspector. Native fold events preserve the current conversation, destination and drafts through display changes. Request buttons behave as on the desktop: a tap answers only once the request's options have been on screen for 600 ms, including after the app returns to the foreground ([desktop workflows](desktop.md#workflows-and-cli-coverage)).
 
 Opening a terminal gives it the available work area on phones, tablets and unfolded foldables. Collapse it to return to the conversation without stopping the shell. A separating horizontal hinge keeps the terminal within its usable pane; controls and output also adapt when the keyboard reduces that space.
 
