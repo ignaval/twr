@@ -22,6 +22,7 @@ import { observeTextScale, secureDelete } from "./offline";
 import { parseInvitation } from "../../shared/connections";
 import {
   notificationListeners,
+  clearDeliveredNotifications,
   testNotification,
   enablePush,
   disablePush,
@@ -170,7 +171,9 @@ function Mobile() {
     return () => window.removeEventListener("twr:select-host", navigate);
   }, []);
   useEffect(() => {
+    void clearDeliveredNotifications();
     const listener = NativeApp.addListener("appStateChange", ({ isActive }) => {
+      if (isActive) void clearDeliveredNotifications();
       if (host.current) {
         host.current.setForeground(isActive);
         if (isActive) {

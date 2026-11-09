@@ -5,6 +5,8 @@ const sdk = vi.hoisted(() => ({
   permission: vi.fn(),
   prompt: vi.fn(),
   channel: vi.fn(async () => {}),
+  clearPush: vi.fn(async () => {}),
+  clearLocal: vi.fn(async () => {}),
 }));
 vi.mock("@capacitor/core", () => ({
   Capacitor: { getPlatform: () => "android" },
@@ -24,10 +26,18 @@ vi.mock("@capacitor/push-notifications", () => ({
     requestPermissions: sdk.prompt,
     register: sdk.register,
     createChannel: sdk.channel,
+    removeAllDeliveredNotifications: sdk.clearPush,
   },
 }));
 vi.mock("@capacitor/local-notifications", () => ({
-  LocalNotifications: { addListener: async () => ({ remove: async () => {} }) },
+  LocalNotifications: {
+    addListener: async (name: string, callback: (value: any) => void) => {
+      if (!sdk.listeners.has(name)) sdk.listeners.set(name, new Set());
+      sdk.listeners.get(name)!.add(callback);
+      return { remove: async () => {} };
+    },
+    removeAllDeliveredNotifications: sdk.clearLocal,
+  },
 }));
 import {
   enablePush,
@@ -35,6 +45,7 @@ import {
   refreshPush,
   pushEnabled,
   notificationListeners,
+  clearDeliveredNotifications,
   pushPreferenceKey,
 } from "../mobile/src/notifications";
 import type { RemoteHost } from "../mobile/src/transport";
@@ -153,5 +164,28 @@ describe("push token lifecycle", () => {
     ]);
     expect(sdk.prompt).toHaveBeenCalledTimes(1);
     expect(sdk.register).toHaveBeenCalledTimes(2);
+  });
+  it("clears delivered push and local notifications when one is tapped", async () => {
+    const opened: any[] = [];
+    const stop = await notificationListeners((data) => opened.push(data));
+    for (const callback of sdk.listeners.get(
+      "pushNotificationActionPerformed",
+    ) || [])
+      callback({ notification: { data: { twr: { workspace: "default" } } } });
+    expect(opened).toEqual([{ workspace: "default" }]);
+    expect(sdk.clearPush).toHaveBeenCalledTimes(1);
+    expect(sdk.clearLocal).toHaveBeenCalledTimes(1);
+    for (const callback of sdk.listeners.get(
+      "localNotificationActionPerformed",
+    ) || [])
+      callback({ notification: { extra: { event: "test" } } });
+    expect(opened).toEqual([{ workspace: "default" }, { event: "test" }]);
+    expect(sdk.clearPush).toHaveBeenCalledTimes(2);
+    stop();
+  });
+  it("clears delivered notifications even when one platform refuses", async () => {
+    sdk.clearPush.mockRejectedValueOnce(new Error("not implemented"));
+    await expect(clearDeliveredNotifications()).resolves.toBeUndefined();
+    expect(sdk.clearLocal).toHaveBeenCalled();
   });
 });
