@@ -16,6 +16,7 @@ import {
   useEditorSessions,
 } from "../../shared/editors";
 import { RemoteHost, Transport, type Hub } from "./transport";
+import { linkState, type LinkState } from "./connection";
 import { mobileVoice } from "./voice";
 import { observeLayout } from "./layout";
 import { observeTextScale, secureDelete } from "./offline";
@@ -61,6 +62,7 @@ function Mobile() {
     return () => clearInterval(timer);
   }, [pairing, scanned?.expiresAt]);
   const [hubSheet, setHubSheet] = useState(false);
+  const [link, setLink] = useState<LinkState>("reconnecting");
   const [notice, setNotice] = useState("");
   const [folder, setFolder] = useState<{
     path: string;
@@ -300,12 +302,18 @@ function Mobile() {
       // The gateway registers push per device and workspace: refresh after the
       // first connection, every in-app workspace switch and every reconnect.
       started.onWorkspaceConnected(() => {
+        if (host.current === started) setLink("online");
         if (host.current === started && activeHub.current?.id === hub.id)
           void refreshPush(started, hub.id).catch((error) => {
             if (host.current === started) setNotice(errorMessage(error));
           });
       });
       const api = remote.api();
+      setLink(started.socketConnected ? "online" : "reconnecting");
+      api.onEvent((event) => {
+        if (event.type !== "connection" || host.current !== started) return;
+        setLink(linkState(!!event.connected, started.revoked, event.error));
+      });
       // Voice mode where the app has the native recognizer and voice (docs/mobile.md).
       voice.current = mobileVoice({
         request: (method, params, timeout) =>
@@ -368,9 +376,9 @@ function Mobile() {
           <button
             className="mobile-hub-switch"
             onClick={() => setHubSheet(true)}
-            aria-label={`Remote hub settings: ${active.name}`}
+            aria-label={`Remote hub settings: ${active.name}${link === "online" ? "" : ` (${link})`}`}
           >
-            <span className="status-dot online" aria-hidden="true" />
+            <span className={`status-dot ${link}`} aria-hidden="true" />
             <span className="mobile-hub-name">{active.name}</span>
           </button>
         }

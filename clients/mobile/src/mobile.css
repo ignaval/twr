@@ -101,6 +101,9 @@ select {
 .mobile-hub-switch .status-dot {
   flex-shrink: 0;
 }
+.mobile-hub-switch .status-dot.reconnecting {
+  background: var(--warning);
+}
 [data-mobile="true"] .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

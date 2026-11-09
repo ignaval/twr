@@ -391,6 +391,14 @@ export class RemoteHost {
     return result;
   }
   private workspaceListeners = new Set<(workspace: string) => void>();
+  /** The native socket is authenticated (false while offline history is shown). */
+  get socketConnected() {
+    return this.nativeConnected && !this.stopped;
+  }
+  /** The gateway refused this device's token: it no longer reconnects. */
+  get revoked() {
+    return this.authenticationRevoked;
+  }
   /**
    * Called after every successful workspace connection: the first one, a switch
    * to another workspace and each reconnect. Mobile refreshes its push
