@@ -444,6 +444,8 @@ export default function App({
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
+  /** The conversation whose transcript on screen was loaded live from the hub. */
+  const liveTranscript = useRef<string | undefined>(undefined);
   const activeSubscription = useRef("");
   const pendingEvents = useRef<HubEvent[]>([]);
   const eventTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -1002,15 +1004,30 @@ export default function App({
     activeThread.current = id;
     const generation = ++transcriptGeneration.current;
     const buffered = pendingEvents.current.splice(0);
+    const shownEvents = latestCache.current.events;
+    // Only a change of conversation clears the transcript.
+    const kept =
+      connected &&
+      id &&
+      previousThread === id &&
+      liveTranscript.current === id &&
+      shownEvents.length
+        ? mergeEvents(shownEvents, buffered)
+        : undefined;
+    // A disconnect keeps the live transcript on screen; its reconnect catches up.
+    if (previousThread !== id || !hasLiveSnapshot.current)
+      liveTranscript.current = undefined;
     setEvents((previous) =>
-      !connected && hasLiveSnapshot.current && previousThread === id
+      kept
         ? mergeEvents(previous, buffered)
-        : !connected && journal && id
-          ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
-          : [],
+        : !connected && hasLiveSnapshot.current && previousThread === id
+          ? mergeEvents(previous, buffered)
+          : !connected && journal && id
+            ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
+            : [],
     );
     setTranscriptError("");
-    setEarliestTurn(undefined);
+    if (!kept) setEarliestTurn(undefined);
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -1021,6 +1038,41 @@ export default function App({
     }
     setTranscriptLoading(true);
     void (async () => {
+      // The same conversation again (a reconnect, a resync, a retry after a transcript
+      // error): keep what is on screen and catch up from its last event, so the view,
+      // its older turns and its scroll position stay. Far behind, reload it instead.
+      if (kept?.length) {
+        const last = kept[kept.length - 1].seq;
+        let page = await rpc("thread.transcript", {
+          thread: id,
+          since_seq: last,
+          limit: 500,
+        });
+        const fresh: HubEvent[] = [...page.events];
+        for (let pages = 1; page.more && pages < 8; pages++) {
+          page = await rpc("thread.transcript", {
+            thread: id,
+            since_seq: page.next,
+            limit: 500,
+          });
+          if (generation !== transcriptGeneration.current) return;
+          fresh.push(...page.events);
+        }
+        if (generation !== transcriptGeneration.current) return;
+        if (!page.more) {
+          setEvents((old) => mergeEvents(old, fresh));
+          liveTranscript.current = id;
+          const subscription = String(generation);
+          activeSubscription.current = subscription;
+          await rpc("desktop.subscribe", {
+            thread: id,
+            since: page.next || last,
+            subscription,
+          });
+          return;
+        }
+        setEarliestTurn(undefined);
+      }
       let page: Json;
       try {
         page = await rpc("thread.transcript", { thread: id, limit: 500 });
@@ -1079,6 +1131,7 @@ export default function App({
       if (generation !== transcriptGeneration.current) return;
       setEarliestTurn(firstTurn);
       setEvents(all);
+      liveTranscript.current = id;
       const subscription = String(generation);
       activeSubscription.current = subscription;
       await rpc("desktop.subscribe", {
@@ -2854,7 +2907,7 @@ export default function App({
                   events={presentedEvents}
                   showTools={showTools}
                   showThinking={showThinking}
-                  loading={transcriptLoading}
+                  loading={transcriptLoading && !presentedEvents.length}
                   error={transcriptError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
