@@ -66,15 +66,15 @@ into view or the window is shown again, and from zero for a request raised again
 they show dimmed and a click or key does nothing, so the second click of a double click, or a
 key pressed as one card replaces another, can't answer the request that slid into place.
 After an answer is accepted the card shows **Sent** and its buttons stay disabled until it
-goes away. Answers need a live connection to the hub.
+goes away. Answers need a live connection to the hub. Orchestrator messages use `say` with
+the displayed control position, matching the TUI's relay semantics.
 
 Links in messages name their full address on hover. Web and email links open in the
 system browser at once, unless their text names another host or address than the one they
 open, or they use plain `http:`: those first show the full address and ask. So does every
 terminal hyperlink (OSC 8) whose text differs from its address, since a program sets the
 two separately. A link to a path or another scheme (`[App.tsx](src/App.tsx:42)`) shows
-as code with a copy button instead of a link that does nothing. Orchestrator messages use `say` with the displayed
-control position, matching the TUI's relay semantics.
+as code with a copy button instead of a link that does nothing.
 
 | CLI capability | Desktop workflow |
 | --- | --- |
