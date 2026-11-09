@@ -1644,6 +1644,10 @@ struct Core {
     ///
     /// [`persist`]: supervisor::persist
     persist_retries: u64,
+    /// What [`Core::due_retry`] last read of a thread's failed turn from the log, while the
+    /// thread has no later event: so the ticker (`hub::background`) does not read it every
+    /// second for a failure that waits for the user (`hub::retry`).
+    retry_reads: retry::RetryReads,
     /// Orchestrator bookkeeping (rebuilt from the log; the token lives only here).
     orch: orch::OrchState,
     /// Hub questions (`attention.raised` on [`HUB_THREAD`] from `say`) still open, with the

@@ -174,6 +174,8 @@ impl Core {
             dropped_events: _,
             sanitized_events: _,
             persist_retries: _,
+            // Memory only: a cache of what the log says (`hub::retry`).
+            retry_reads: _,
             // Memory only: what the hub did not record of its adapters' task updates
             // (`hub::coalesce`).
             coalesced_events: _,
