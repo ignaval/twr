@@ -13,24 +13,113 @@ pub struct Machine {
     pub dir: PathBuf,
     pub socket: PathBuf,
 }
+/// The longest socket name the service directory holds: a worker daemon's
+/// (`lr/<20 hex>.sock`, [`crate::worker::options`]).
+const LONGEST_SOCKET: &str = "lr/0123456789abcdef0123.sock";
+
+/// Whether `path` is a directory of this user that no one else can enter (not a link).
+fn private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::fs::symlink_metadata(path).is_ok_and(|m| {
+        m.is_dir()
+            && m.uid() == twr_core::paths::effective_uid()
+            && m.permissions().mode() & 0o077 == 0
+    })
+}
+
+/// A directory only this user can write to, for the service's sockets, when the system
+/// has one: `$XDG_RUNTIME_DIR` (else `/run/user/<uid>`) on Linux, the per-user temporary
+/// directory on macOS. Unlike `/tmp`, no other local user can create the service's directory
+/// there first.
+fn runtime_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0 as libc::c_char; 1024];
+        let len =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+        if len == 0 || len > buf.len() {
+            return None;
+        }
+        let dir = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        use std::os::unix::ffi::OsStrExt;
+        let dir = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+        (dir.is_absolute() && private_dir(&dir)).then_some(dir)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .into_iter()
+            .chain([PathBuf::from(format!(
+                "/run/user/{}",
+                twr_core::paths::effective_uid()
+            ))])
+            .find(|dir| dir.is_absolute() && private_dir(dir))
+    }
+}
+
+/// The service directory earlier releases used (and still the fallback): under `/tmp`.
+fn legacy_dir(hash: &str) -> PathBuf {
+    PathBuf::from("/tmp").join(format!(
+        "twr-runner-{}-{}",
+        twr_core::paths::effective_uid(),
+        &hash[..24]
+    ))
+}
+
+/// The digest of the data directory that names its service's socket directory.
+fn data_hash(data: &Path) -> String {
+    hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        data.as_os_str().as_encoded_bytes(),
+    ))
+}
+
+/// The service's socket directory in `runtime` (for data hash `hash`), when every socket it
+/// will hold fits a Unix socket path.
+fn runtime_socket_dir(runtime: &Path, hash: &str) -> Option<PathBuf> {
+    let dir = runtime.join(format!("twr-{}", &hash[..16]));
+    (dir.join(LONGEST_SOCKET).as_os_str().len() <= twr_core::paths::MAX_SOCKET_PATH).then_some(dir)
+}
+
 impl Machine {
     pub fn of(paths: &Paths) -> Self {
         let root = paths.root();
         let data = twr_core::paths::resolve_lenient(&root.data_dir).unwrap_or(root.data_dir);
-        let hash = hex::encode(ring::digest::digest(
-            &ring::digest::SHA256,
-            data.as_os_str().as_encoded_bytes(),
-        ));
+        let hash = data_hash(&data);
+        let dir = runtime_dir()
+            .and_then(|runtime| runtime_socket_dir(&runtime, &hash))
+            .unwrap_or_else(|| legacy_dir(&hash));
         Self {
             dir: data.join("machine"),
-            socket: PathBuf::from("/tmp")
-                .join(format!(
-                    "twr-runner-{}-{}",
-                    twr_core::paths::effective_uid(),
-                    &hash[..24]
-                ))
-                .join("runner.sock"),
+            socket: dir.join("runner.sock"),
         }
+    }
+    /// Where a service an earlier release started listens, while it still does: its socket
+    /// directory under `/tmp`, when that is this user's and private and differs from
+    /// [`Machine::socket`]'s. A client reaches such a service there until it is replaced.
+    pub fn legacy_socket(&self) -> Option<PathBuf> {
+        let dir = legacy_dir(&data_hash(self.dir.parent()?));
+        let socket = dir.join("runner.sock");
+        (socket != self.socket && private_dir(&dir)).then_some(socket)
+    }
+    /// The directory of worker daemon sockets: next to the service socket, or, for a daemon
+    /// an earlier release started (its socket `name` still there), the legacy directory.
+    pub fn worker_sockets(&self, name: &str) -> Result<PathBuf> {
+        if let Some(legacy) = self.legacy_socket() {
+            let old = legacy
+                .parent()
+                .context("legacy socket has no parent")?
+                .join("lr");
+            if private_dir(&old) && std::fs::symlink_metadata(old.join(name)).is_ok() {
+                return Ok(old);
+            }
+        }
+        Ok(self
+            .socket
+            .parent()
+            .context("socket parent missing")?
+            .join("lr"))
     }
     pub fn init(&self) -> Result<()> {
         twr_core::paths::check_socket_path(&self.socket)?;
@@ -217,6 +306,60 @@ mod tests {
         assert!(machine.load()?.owners[&key].revoked);
         assert_eq!(machine.load()?.owners[&key].epoch, 8);
         assert!(machine.fence(&key, 7).exists());
+        Ok(())
+    }
+    #[test]
+    fn the_service_socket_prefers_a_private_runtime_directory() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data = std::fs::canonicalize(dir.path())?;
+        let paths = Paths {
+            data_dir: data.clone(),
+            socket: data.join("hub.sock"),
+            config_file: data.join("config.toml"),
+            workspace: None,
+        };
+        let machine = Machine::of(&paths);
+        let hash = data_hash(&data);
+        match runtime_dir() {
+            Some(runtime) => {
+                assert!(machine.socket.starts_with(&runtime), "{:?}", machine.socket);
+                assert!(!machine.socket.starts_with("/tmp"));
+            }
+            None => assert_eq!(machine.socket, legacy_dir(&hash).join("runner.sock")),
+        }
+        let socket_dir = machine.socket.parent().unwrap();
+        assert!(
+            socket_dir.join(LONGEST_SOCKET).as_os_str().len() <= twr_core::paths::MAX_SOCKET_PATH
+        );
+        // A base too long for a worker socket falls back to /tmp.
+        assert!(
+            runtime_socket_dir(&PathBuf::from(format!("/{}", "r".repeat(80))), &hash).is_none()
+        );
+        // A service an earlier release started stays reachable at its /tmp socket, and so do
+        // its worker daemons; new daemons go next to the new socket.
+        let legacy = legacy_dir(&hash);
+        if machine.socket.starts_with(&legacy) {
+            return Ok(());
+        }
+        assert_eq!(machine.legacy_socket(), None);
+        ensure_private_dir(&legacy)?;
+        ensure_private_dir(&legacy.join("lr"))?;
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(legacy.clone());
+        assert_eq!(machine.legacy_socket(), Some(legacy.join("runner.sock")));
+        let _old = std::os::unix::net::UnixListener::bind(legacy.join("lr/old.sock"))?;
+        assert_eq!(machine.worker_sockets("old.sock")?, legacy.join("lr"));
+        assert_eq!(machine.worker_sockets("new.sock")?, socket_dir.join("lr"));
+        // Another user's (or an open) /tmp directory is never trusted.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755))?;
+        assert_eq!(machine.legacy_socket(), None);
+        assert_eq!(machine.worker_sockets("old.sock")?, socket_dir.join("lr"));
         Ok(())
     }
     #[test]

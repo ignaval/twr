@@ -187,11 +187,7 @@ pub fn options(machine: &Machine, worker: &Worker) -> Result<twr_runner::relay::
         &ring::digest::SHA256,
         format!("{}\0{}\0{}", worker.scope, worker.box_name, worker.epoch).as_bytes(),
     ));
-    let sockets = machine
-        .socket
-        .parent()
-        .context("socket parent missing")?
-        .join("lr");
+    let sockets = machine.worker_sockets(&format!("{}.sock", &digest[..20]))?;
     twr_core::paths::ensure_private_dir(&sockets)?;
     let mut opts = twr_runner::relay::RelayOptions::new(&worker.box_name, key, false)?;
     opts.paths = twr_runner::relay::DaemonPaths {

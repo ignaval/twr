@@ -10,12 +10,24 @@ use std::{path::Path, time::Duration};
 use tokio::net::UnixStream;
 use twr_core::paths::{ensure_private_dir, Paths};
 
+/// Connects to the machine's runner service: at its socket, else at the `/tmp` socket of a
+/// service an earlier release started ([`Machine::legacy_socket`]), which serves until it is
+/// replaced (a new build stops it and starts the new one at the new socket).
+pub async fn connect(machine: &Machine) -> std::io::Result<UnixStream> {
+    match UnixStream::connect(&machine.socket).await {
+        Ok(stream) => Ok(stream),
+        Err(error) => match machine.legacy_socket() {
+            Some(legacy) => UnixStream::connect(legacy).await.map_err(|_| error),
+            None => Err(error),
+        },
+    }
+}
 pub async fn request(
     paths: &Paths,
     request: &crate::service::Request,
 ) -> Result<serde_json::Value> {
     let machine = Machine::of(paths);
-    let mut stream = UnixStream::connect(&machine.socket)
+    let mut stream = connect(&machine)
         .await
         .context("runner service is not running")?;
     wire::write(&mut stream, request).await?;
@@ -150,7 +162,7 @@ async fn replace_with_launcher(
 async fn stop_existing(paths: &Paths) -> Result<()> {
     request(paths, &crate::service::Request::Stop).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while UnixStream::connect(Machine::of(paths).socket).await.is_ok() {
+    while connect(&Machine::of(paths)).await.is_ok() {
         ensure!(
             tokio::time::Instant::now() < deadline,
             "old runner service did not stop for maintenance"
@@ -373,7 +385,7 @@ pub async fn open(
     executable: &Path,
     replace: bool,
 ) -> Result<(UnixStream, std::path::PathBuf, String)> {
-    let mut stream = UnixStream::connect(Machine::of(paths).socket).await?;
+    let mut stream = connect(&Machine::of(paths)).await?;
     wire::write(
         &mut stream,
         &crate::service::Request::Open {
