@@ -26,6 +26,7 @@ twr-tui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 hex.workspace = true
 # `term::read_hidden_line`: the terminal's settings (termios).
 libc.workspace = true

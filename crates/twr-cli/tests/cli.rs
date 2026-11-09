@@ -2125,6 +2125,54 @@ fn update_reinstalls_the_running_executable() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// `twr completions <shell>` prints the shell's completion script for twr's commands, from
+/// the command definition alone: no hub starts, nothing is written under `TWR_HOME`, and a
+/// workspace that doesn't exist or a config twr can't read doesn't stop it.
+#[test]
+fn completions_print_a_script_for_each_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), "this is = not [toml\n").unwrap();
+    for (shell, marker) in [
+        ("bash", "_twr()"),
+        ("zsh", "#compdef twr"),
+        ("fish", "complete -c twr"),
+        ("elvish", "edit:completion:arg-completer[twr]"),
+        ("powershell", "Register-ArgumentCompleter"),
+    ] {
+        let out = twr_cmd()
+            .args(["-w", "no-such-workspace", "completions", shell])
+            .env("TWR_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{shell}: {out:?}");
+        let script = String::from_utf8(out.stdout).unwrap();
+        assert!(script.contains(marker), "{shell}: no {marker:?}");
+        for word in [
+            "thread",
+            "attention",
+            "respond",
+            "completions",
+            "allow-downgrade",
+        ] {
+            assert!(script.contains(word), "{shell}: no {word}");
+        }
+    }
+    let left: Vec<_> = std::fs::read_dir(&home)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["config.toml"], "{left:?}");
+    let bad = twr_cmd()
+        .args(["completions", "tcsh"])
+        .env("TWR_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("possible values: bash"));
+}
+
 /// `twr update` never runs the installer of a release that is not newer than itself, even
 /// properly signed (a mirror's old release): the same release is up to date (exit 0), an older
 /// one is refused unless `--version` and `--allow-downgrade` name it.

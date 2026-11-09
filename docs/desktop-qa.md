@@ -13,9 +13,10 @@ against the generated form catalog. The desktop exposes 71 of those entries plus
 application actions. Counting entries alone is not proof of behavioral parity: regression
 tests also exercise argument preservation, target selection and actual hub operations.
 
-The three catalog exclusions are intentional: agent-only `mcp`, the foreground `hub`
-(the application starts an independent hub), and `update` (the desktop and its bundled
-engine update together through the application installer). Workspace selection replaces
+The catalog exclusions are intentional: agent-only `mcp`, the foreground `hub`
+(the application starts an independent hub), `update` (the desktop and its bundled
+engine update together through the application installer), and the terminal-only
+`completions` (a script for a shell's startup files). Workspace selection replaces
 global socket/workspace overrides. Generated forms retain interactive confirmations rather
 than offering an automatic `--yes`. Advanced operations, including SSH setup and account
 login, run the bundled CLI inside an embedded terminal rather than having bespoke screens.

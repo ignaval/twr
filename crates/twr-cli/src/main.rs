@@ -541,6 +541,14 @@ enum Cmd {
         #[arg(long)]
         print: bool,
     },
+    /// Print the shell completion script for twr's commands and options to stdout, e.g.
+    /// `twr completions zsh > ~/.zfunc/_twr` (docs/install.md says where each shell reads
+    /// it). Needs no hub.
+    Completions {
+        /// The shell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// List, create or remove workspaces: separate hubs on this machine, each with its own
     /// orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name>
     /// <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual
@@ -1626,6 +1634,12 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // From the command definition alone: no twr home, config or hub.
+    if let Some(Cmd::Completions { shell }) = &cli.cmd {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        clap_complete::generate(*shell, &mut command, "twr", &mut std::io::stdout());
+        return Ok(ExitCode::SUCCESS);
+    }
     // An SSH box's relay and daemon need no twr home: every path comes from the box's
     // environment (the relay) or the relay (the daemon).
     let cli = match cli.cmd {
@@ -2139,6 +2153,7 @@ async fn run_simple(
         | Cmd::Voice { .. }
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
+        | Cmd::Completions { .. }
         | Cmd::Account { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
