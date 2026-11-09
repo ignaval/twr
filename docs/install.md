@@ -22,6 +22,8 @@ The script picks the release build for your machine, checks it against the relea
 
 `sha256sums.txt` is signed. The script holds the release public key (the one in [`release/signing-key.pub`](../release/signing-key.pub)) and checks `sha256sums.txt.sig` with `openssl` when the `openssl` on your machine can verify Ed25519 signatures (OpenSSL 3.0 or newer). It tests that first on a signature built into the script. If it can, a missing or bad signature stops the install: every release is signed, so either means the release's files were changed or are incomplete. If it can't (macOS ships LibreSSL, which can't), the script prints `the checksums were not signature-checked` and goes on: the checksums then guard against a broken download, not against a changed release. `twr update` checks the signatures itself, with the key built into twr, whatever `openssl` you have.
 
+The script can also hold a second release key, ECDSA P-256 (`release/signing-key-p256.pub`), which LibreSSL can check; it holds none yet. Once it does, a release also carries `sha256sums.txt.p256.sig`, and where `openssl` can't verify Ed25519 the script checks that signature instead, the same way: a missing or bad one stops the install. An older release has no P-256 signature, so on a Mac without OpenSSL 3 the script then refuses it; install that one with OpenSSL 3 on your `PATH`, or by hand ([Release builds](#release-builds)).
+
 `sha256sums.txt` starts with a line naming its release, `# twr release v0.2.0`, signed with the rest. The script refuses checksums that name another release than the `TWR_VERSION` you asked for, so the signed files of an older release can't pass for the one you named. `twr update` checks the same, and also that the release's `install.sh` is the one `sha256sums.txt` lists.
 
 It reads these environment variables:
@@ -31,7 +33,7 @@ It reads these environment variables:
 | `TWR_VERSION` | the latest release | install this release, e.g. `v0.2.0`; needed for a prerelease |
 | `TWR_INSTALL_DIR` | `~/.local/bin` | where `twr` goes; a relative path is taken from the current directory. Write `$HOME`, not a quoted `~`, which the script refuses |
 | `TWR_DOWNLOAD_URL` | GitHub | a base URL with `twr-<target>.tar.gz`, `sha256sums.txt` and `sha256sums.txt.sig`, or `file:///tmp/release` for a local directory. Any scheme curl or wget fetches is used as you give it, `http://` included |
-| `TWR_REQUIRE_SIGNATURE` | unset | `1`: stop when the signature can't be checked (no `openssl` that verifies Ed25519), except with `TWR_SHA256SUMS_FILE`, which the caller (`twr update`) has verified |
+| `TWR_REQUIRE_SIGNATURE` | unset | `1`: stop when the signature can't be checked (no `openssl` that verifies Ed25519, nor P-256 when the script holds a P-256 key), except with `TWR_SHA256SUMS_FILE`, which the caller (`twr update`) has verified |
 | `TWR_SHA256SUMS_FILE` | unset | use this `sha256sums.txt` instead of downloading it, and skip the signature check, even with `TWR_REQUIRE_SIGNATURE=1`: the caller (`twr update`) passes the one it verified |
 | `TWR_UPDATE` | unset | `1` when `twr update` runs the script: it says "Updating" and leaves out the advice for a first install |
 
@@ -98,7 +100,15 @@ openssl pkeyutl -verify -rawin -pubin -inkey signing-key.pub \
   -sigfile sha256sums.txt.sig.bin -in sha256sums.txt
 ```
 
-It prints `Signature Verified Successfully`. `install.sh` and `install.sh.sig` check the same way. macOS's `openssl` is LibreSSL, which can't do this; install OpenSSL 3 (for example with Homebrew) or check on a Linux machine.
+It prints `Signature Verified Successfully`. `install.sh` and `install.sh.sig` check the same way. macOS's `openssl` is LibreSSL, which can't do this; install OpenSSL 3 (for example with Homebrew) or check on a Linux machine. A release that carries `sha256sums.txt.p256.sig` (none yet) can be checked with LibreSSL too, against `release/signing-key-p256.pub` saved as `signing-key-p256.pub`:
+
+```sh
+openssl base64 -d -A -in sha256sums.txt.p256.sig -out sha256sums.txt.p256.sig.bin
+openssl dgst -sha256 -verify signing-key-p256.pub \
+  -signature sha256sums.txt.p256.sig.bin sha256sums.txt
+```
+
+It prints `Verified OK`.
 
 The releases also carry build provenance attestations, from v0.2.0 on, so the GitHub CLI can check that an archive was built by the release workflow from this repository:
 

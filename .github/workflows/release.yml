@@ -403,14 +403,58 @@ jobs:
             fi
           done
 
+      # sha256sums.txt.p256.sig: an ECDSA P-256 signature of sha256sums.txt (base64 of the DER
+      # signature), for install.sh where openssl can't check Ed25519 (macOS's LibreSSL), with
+      # the second key (TWR_RELEASE_SIGNING_KEY_P256, docs/tools/make-signing-key.sh --p256).
+      # Optional until release/signing-key-p256.pub is committed; from then on a missing secret
+      # fails the release, since install.sh on macOS would refuse it.
+      - name: Sign the checksums with the P-256 key
+        shell: bash
+        env:
+          TWR_RELEASE_SIGNING_KEY_P256: ${{ secrets.TWR_RELEASE_SIGNING_KEY_P256 }}
+        run: |
+          pub=release/signing-key-p256.pub
+          if [ -z "$TWR_RELEASE_SIGNING_KEY_P256" ]; then
+            if [ -e "$pub" ]; then
+              echo "::error::$pub is committed, but the release environment has no TWR_RELEASE_SIGNING_KEY_P256 secret: install.sh would refuse this release where openssl can't check Ed25519"
+              exit 1
+            fi
+            echo "::notice::no P-256 release key yet (docs/development.md): sha256sums.txt has no P-256 signature"
+            exit 0
+          fi
+          if [ ! -f "$pub" ]; then
+            echo "::error::TWR_RELEASE_SIGNING_KEY_P256 is set, but the tagged commit has no $pub (docs/tools/make-signing-key.sh --p256 writes it)"
+            exit 1
+          fi
+          # In the directory the Ed25519 step made, which the cleanup step removes.
+          key="$TWR_SIGNING_DIR/key-p256.pem"
+          (umask 077 && set -C && printf '%s\n' "$TWR_RELEASE_SIGNING_KEY_P256" > "$key")
+          openssl dgst -sha256 -sign "$key" -out "$RUNNER_TEMP/sha256sums.p256.sig.bin" dist/sha256sums.txt
+          base64 -w0 "$RUNNER_TEMP/sha256sums.p256.sig.bin" > dist/sha256sums.txt.p256.sig
+          if ! openssl dgst -sha256 -verify "$pub" -signature "$RUNNER_TEMP/sha256sums.p256.sig.bin" \
+            dist/sha256sums.txt; then
+            echo "::error::the P-256 signature of sha256sums.txt does not verify with $pub: TWR_RELEASE_SIGNING_KEY_P256 is not the key's private half"
+            exit 1
+          fi
+          # The release's install.sh must hold the same public key in its P-256 block.
+          while IFS= read -r line; do
+            case "$line" in -----*) continue ;; esac
+            if ! grep -qxF -- "$line" dist/install.sh; then
+              echo "::error::install.sh's P-256 block does not hold $pub (docs/tools/make-signing-key.sh --p256 writes both)"
+              exit 1
+            fi
+          done < "$pub"
+
       - name: Remove the signing key
         if: always()
         run: |
           # Only the directory the signing step made (empty when it didn't get that far).
           if [ -n "${TWR_SIGNING_DIR:-}" ] && [ -d "$TWR_SIGNING_DIR" ] && [ ! -L "$TWR_SIGNING_DIR" ]; then
-            if [ -f "$TWR_SIGNING_DIR/key.pem" ] && [ ! -L "$TWR_SIGNING_DIR/key.pem" ]; then
-              shred -u "$TWR_SIGNING_DIR/key.pem" || rm -f "$TWR_SIGNING_DIR/key.pem"
-            fi
+            for k in key.pem key-p256.pem; do
+              if [ -f "$TWR_SIGNING_DIR/$k" ] && [ ! -L "$TWR_SIGNING_DIR/$k" ]; then
+                shred -u "$TWR_SIGNING_DIR/$k" || rm -f "$TWR_SIGNING_DIR/$k"
+              fi
+            done
             rm -rf "$TWR_SIGNING_DIR"
           fi
 
@@ -420,6 +464,7 @@ jobs:
           expected=$(
             for t in $targets; do echo "twr-$t.tar.gz"; done
             printf '%s\n' sha256sums.txt sha256sums.txt.sig install.sh install.sh.sig
+            if [ -e release/signing-key-p256.pub ]; then echo sha256sums.txt.p256.sig; fi
           )
           expected=$(sort <<< "$expected")
           actual=$(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)
@@ -488,7 +533,8 @@ jobs:
 
           \`twr update\` checks \`sha256sums.txt.sig\`, the signature of the checksums, with
           twr's release key before it installs anything, and \`install.sh\` does too where its
-          \`openssl\` can (OpenSSL 3; macOS's LibreSSL can't). To check by hand, see
+          \`openssl\` can (OpenSSL 3; macOS's LibreSSL can't, and checks
+          \`sha256sums.txt.p256.sig\` instead where a release has it). To check by hand, see
           [docs/install.md](https://github.com/ignaval/twr/blob/main/docs/install.md). Each
           archive also has a build provenance attestation, which the GitHub CLI checks:
 
