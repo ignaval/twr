@@ -15,7 +15,7 @@ import {
   EditorSessionsProvider,
   useEditorSessions,
 } from "../../shared/editors";
-import { RemoteHost, Transport, type Hub } from "./transport";
+import { RemoteHost, Transport, sweepExports, type Hub } from "./transport";
 import { linkState, type LinkState } from "./connection";
 import { mobileVoice } from "./voice";
 import { observeLayout } from "./layout";
@@ -94,6 +94,8 @@ function Mobile() {
   }
   useEffect(() => {
     void load();
+    // Exports a previous run left behind (the app was killed while sharing).
+    void sweepExports();
     return () => {
       void host.current?.stop();
     };
@@ -228,6 +230,7 @@ function Mobile() {
   }
   async function forgetLocal(hub: Hub) {
     await forgetOfflineHost(hub.id, { secureDelete });
+    await sweepExports();
     await Transport.removeHub({ id: hub.id });
     editors.forget(hub.id);
     localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
