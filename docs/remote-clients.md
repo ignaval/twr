@@ -46,7 +46,12 @@ encrypted native store. On Omarchy, the app selects GNOME Secret Service unless 
 Switching hosts fences old callbacks and removes their transport listeners.
 Switching hosts preserves local and remote terminals. Return to the original host to resume their views; quitting the desktop app still asks before closing its local terminals. Agents running in independent hubs continue. Permissions are
 checked by the hub for each operation; a read-only device cannot mutate threads,
-change settings or open a terminal. Forgetting a saved connection removes its
+change settings or open a terminal. Without terminal access a device cannot start or
+move a thread onto a command line runtime (`pty:` or `acp:`), only onto an agent
+runtime or a configured preset; without admin access it cannot change a thread's
+permission mode or move it to another runtime by any path, including a typed command,
+the orchestrator acting on its message, or confirming a card
+([mobile.md](mobile.md#remote-hubs)). Forgetting a saved connection removes its
 local credentials and encrypted offline state; revoke the device on the hub to
 remove its server-side access.
 

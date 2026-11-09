@@ -58,7 +58,18 @@ control grants nothing. Unknown methods are refused. Agents and the orchestrator
 use device credentials to gain user authority, and devices cannot pair more devices.
 
 Capabilities are authority over twr, not OS isolation: operate can direct agents using the
-hub's configured modes; terminal permits host commands. Store credentials in the native
+hub's configured modes; terminal permits host commands; admin permits mode changes and
+configuration. The hub checks them where it decides, by the device a request came from,
+not only by method: a thread whose runtime is a command line (`pty:`, `acp:`) needs
+terminal, and without it a device names only what the orchestrator may (a built-in agent
+runtime or a configured preset). A mode change needs admin however it arrives: `thread.set_mode`,
+a new thread's mode outside `manual`, `plan`, `read-only` and `dontAsk`, a short mode
+command in `say` (refused, nothing sent), the orchestrator relaying one from the device's
+message (`relay_forbidden`, directly or as a card), or Confirm on a card that holds one (the
+card stays open for you). A device's own move of a thread to another runtime, a move the
+orchestrator would put on a card from its message, and `outside_pin` are held to admin the
+same way (the orchestrator's own move of a thread in a restricted mode, which needs no card,
+is not a device's). A device revoked since its message arrived counts as holding nothing. Store credentials in the native
 Keychain/Keystore, not the web renderer. The companion receives them over stdin. The host
 keeps token hashes in owner-private device state and checks revocation during connections.
 Same-user processes that can alter this state remain outside the boundary, like other
