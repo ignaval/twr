@@ -233,7 +233,7 @@ Restart the hub (`twr hub stop`, then `twr`), and make the listener reachable fr
 2. Says what will happen and asks `Add box gpu? [y/N]` (`--yes` skips the question; without a terminal, `--yes` is required): where the runner connects, that a new token goes into `boxes.toml`, and which twr the box needs (the hub's version: `twr update --version v<version>` there; for a development hub, a build of its commit).
 3. Writes `[boxes.gpu]` with `transport = "token"` and a new token (32 random bytes, in hex) to `boxes.toml` (mode 0600), and adds the box to the running hub (`box.add`), starting the hub when none runs. A hub that started before `listen` was set says so: restart it.
 4. Prints the command to run on the box, `twr runner install-token gpu --hub <url>`, and, only when its output is a terminal, the token to paste there. Otherwise it says that `twr box token gpu` prints it.
-5. On a terminal, waits up to 10 minutes for the box's runner to connect, printing each state and each refusal with what to do: a refused proof is a bad paste (`twr box token gpu` prints the token again), a refused protocol means twr on the box needs updating. Ctrl-C stops the wait; the box stays added.
+5. On a terminal, waits up to 10 minutes for the box's runner to connect, printing each state and each refusal with what to do: a refused proof is a bad paste (`twr box token gpu` prints the token again), a refused protocol means twr on the box needs updating. Ctrl-C stops the wait; the box stays added. A refusal comes from a connection that has not proved the token, so anyone who reaches the listener can cause one: it says so, with the address the connection came from. A hello whose box name isn't a valid box name is refused without being noted on any box.
 
 ### On the box
 

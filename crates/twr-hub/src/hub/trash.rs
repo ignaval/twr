@@ -306,7 +306,17 @@ impl Core {
             ..Default::default()
         });
         match self.append(hub, HUB_THREAD, None, Source::Hub, body) {
-            Ok(_) => true,
+            Ok(_) => {
+                // Not restorable any more: a box's frames of it are strays acked without a
+                // watermark (`hub::runners`, `Core::tracks`), so its watermarks go. A failure
+                // only leaves rows nothing reads.
+                if self.deleted_rt.get(thread).is_some_and(|d| d.purged) {
+                    if let Err(e) = self.store.forget_runner_acks(thread) {
+                        tracing::warn!(thread, error = %format!("{e:#}"), "cannot forget a purged thread's runner watermarks");
+                    }
+                }
+                true
+            }
             Err(e) => {
                 tracing::warn!(item, thread, error = %format!("{e:#}"), "cannot record a purged trash item");
                 self.trash.remove(item);

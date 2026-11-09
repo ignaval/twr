@@ -677,6 +677,7 @@ impl Core {
             compact_rows: Default::default(),
             task_progress: coalesce::TaskProgress::default(),
             persist_retries: 0,
+            retry_reads: Default::default(),
             orch: orch::OrchState::default(),
             hub_questions: HashMap::new(),
             hub_cards: HashMap::new(),

@@ -77,7 +77,10 @@
 //! runner has confirmed a run the hub named (a frame of it), an exit naming none may still be
 //! the session's (a restarted runner's, for the run its predecessor left behind). A frame for a
 //! thread the hub runs no session for (a stray) is committed as a watermark only; after the
-//! replay the stray session is stopped. Events reach the log only
+//! replay the stray session is stopped. A stray of a thread the hub keeps no watermark of (one
+//! the log never had, one of another box deleted, one purged: `Core::tracks`) is acked without
+//! a commit or a classification, so nothing of a made-up thread is kept; a frame whose thread
+//! has no thread id's shape closes the connection. Events reach the log only
 //! here: the session's `AdapterHandle` carries commands out and never events in
 //! ([`crate::remote`]), so nothing is appended twice. A frame whose commit keeps failing
 //! closes the connection unacked (the runner sends it again), and so does any frame once the
@@ -167,7 +170,7 @@ use twr_core::runner::{
     Op, RunnerMsg, Secret, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
-use super::supervisor::{close_exited, give_up_runtime, persist, supervise, Closed};
+use super::supervisor::{close_exited, give_up_runtime, persist, supervise, sync_wal, Closed};
 use super::{box_switch, git, Batch, Core, Exit, Hub, HubState, Inner, Live, PendingExit};
 use crate::remote::{self, BoxToken, ConnTx, Connect, RemoteBox, SEND_QUEUE};
 use crate::store::{self, RunnerAck};
@@ -191,6 +194,24 @@ pub const ACK_BATCH_FRAMES: usize = 256;
 
 /// Longest a committed frame waits for its batch to be synced and acked.
 pub const ACK_BATCH_DELAY: Duration = Duration::from_millis(50);
+
+/// Longest thread id a runner frame may name: the hub's ids are ULIDs (26 characters).
+pub const MAX_THREAD_ID_BYTES: usize = 64;
+
+/// Most strays one connection remembers having stopped ([`Conn::stop_stray`]); past that it
+/// forgets them all (a stray seen again is told to stop again, which does nothing more).
+const MAX_STOPPED: usize = 1024;
+
+/// Whether `thread` has the shape of a thread id the hub makes (a ULID; at most
+/// [`MAX_THREAD_ID_BYTES`] ASCII letters, digits, `-` and `_`). A frame naming anything else
+/// closes its connection: nothing of it could be the hub's.
+fn thread_id_shaped(thread: &str) -> bool {
+    !thread.is_empty()
+        && thread.len() <= MAX_THREAD_ID_BYTES
+        && thread
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// A runner connection's right to commit: it holds while the connection is the box's current
 /// one. Checked under the core lock (where a newer connection replaces it, see [`serve`]),
@@ -307,6 +328,8 @@ struct Conn {
     ///
     /// [`HubOptions::ack_batch_delay`]: crate::HubOptions::ack_batch_delay
     batch_delay: Duration,
+    /// Syncs the store's write-ahead log without the core lock ([`flush_acks`]).
+    wal: store::WalSync,
 }
 
 impl Conn {
@@ -347,7 +370,13 @@ impl Conn {
     /// Stops run `run` of a stray session once per connection (only once the box is ready:
     /// before that, the reconciliation stops what is left).
     fn stop_stray(&mut self, thread: &str, run: Option<String>) {
-        if self.synced && self.stopped.insert((thread.to_string(), run.clone())) {
+        if !self.synced || self.stopped.contains(&(thread.to_string(), run.clone())) {
+            return;
+        }
+        if self.stopped.len() >= MAX_STOPPED {
+            self.stopped.clear();
+        }
+        if self.stopped.insert((thread.to_string(), run.clone())) {
             self.rbox.stop_stray(self.epoch, thread, run);
         }
     }
@@ -651,10 +680,31 @@ where
             return Err(Refused::Other);
         }
     };
+    // A name no box can have is never looked up, logged or echoed (it may be 8 KiB of
+    // anything, before authentication).
+    if twr_core::runner::validate_box_name(&hello.box_name).is_err() {
+        tracing::warn!(
+            peer,
+            len = hello.box_name.len(),
+            "runner refused: its hello names no valid box"
+        );
+        let m = refuse(
+            hub_errors::PROTOCOL,
+            "malformed hello: its box name is not a valid box name".into(),
+        );
+        refuse_unauthenticated(ws, permit, Some(m)).await;
+        return Err(Refused::Other);
+    }
+    // What a refusal before authentication notes on the box it named: on a listener's
+    // connection anyone who reaches the listener may have sent it, which the note says.
+    let unauthenticated = |reason: String| match &bound {
+        None => format!("{reason} (an unauthenticated connection from {peer})"),
+        Some(_) => reason,
+    };
     // Before anything else: a runner of another version need not speak this handshake. One of
     // an older protocol the hub drains does (`DRAINABLE_PROTOCOLS`), and goes on.
     if hello.protocol != PROTOCOL_VERSION && !drainable(hello.protocol) {
-        tracing::warn!(peer, box_name = %hello.box_name, protocol = hello.protocol, "runner refused: protocol mismatch");
+        tracing::warn!(peer, box_name = ?hello.box_name, protocol = hello.protocol, "runner refused: protocol mismatch");
         let update = if hello.protocol < PROTOCOL_VERSION {
             format!("update twr on box `{}`", hello.box_name)
         } else {
@@ -664,11 +714,11 @@ where
             .remote(&hello.box_name)
             .filter(|b| bound.as_deref().is_none_or(|n| n == b.name()));
         if let Some(b) = named {
-            b.note_refusal(format!(
+            b.note_refusal(unauthenticated(format!(
                 "a runner speaking protocol {} was refused (the hub's is {PROTOCOL_VERSION}): \
                  {update}",
                 hello.protocol
-            ));
+            )));
         }
         let m = refuse(
             hub_errors::PROTOCOL,
@@ -690,7 +740,7 @@ where
         return Err(Refused::Other);
     }
     if let Some(b) = bound.as_deref().filter(|b| *b != hello.box_name) {
-        tracing::warn!(peer, box_name = %hello.box_name, bound = %b, "runner refused: a sealed connection named another box");
+        tracing::warn!(peer, box_name = ?hello.box_name, bound = %b, "runner refused: a sealed connection named another box");
         let m = refuse(
             hub_errors::UNAUTHORIZED,
             format!("this connection is box {b}'s"),
@@ -753,12 +803,13 @@ where
         }
         Next::Closed => {
             // A runner that did not accept the hub's proof leaves without a word.
-            tracing::warn!(peer, box_name = %hello.box_name, "runner left before it authenticated (did it refuse the hub's proof? its token may differ from the hub's)");
+            tracing::warn!(peer, box_name = ?hello.box_name, "runner left before it authenticated (did it refuse the hub's proof? its token may differ from the hub's)");
             if let (Some(b), None) = (&rbox, &bound) {
-                b.note_refusal(
+                b.note_refusal(unauthenticated(
                     "a runner left after the hub's challenge: it did not accept the hub's \
-                     proof, so its token likely differs from this box's token",
-                );
+                     proof, so its token likely differs from this box's token"
+                        .into(),
+                ));
             }
             return Err(Refused::Other);
         }
@@ -776,14 +827,18 @@ where
         };
         if !ok {
             b.note_refusal(match &bound {
-                None => "a runner was refused: its proof does not match this box's token",
-                Some(_) => "the box's runner was refused: it sent a proof on a sealed connection",
+                None => unauthenticated(
+                    "a runner was refused: its proof does not match this box's token".into(),
+                ),
+                Some(_) => {
+                    "the box's runner was refused: it sent a proof on a sealed connection".into()
+                }
             });
         }
         ok
     });
     let Some(rbox) = rbox else {
-        tracing::warn!(peer, box_name = %hello.box_name, "runner refused: unknown box or bad token");
+        tracing::warn!(peer, box_name = ?hello.box_name, "runner refused: unknown box or bad token");
         let m = refuse(hub_errors::UNAUTHORIZED, "unknown box or bad token".into());
         refuse_unauthenticated(ws, permit, Some(m)).await;
         return Err(Refused::Other);
@@ -1057,6 +1112,7 @@ where
         batched: 0,
         batch_since: None,
         batch_delay: hub.ack_batch_delay,
+        wal: hub.core().store.wal_sync(),
     };
     let mut state = hub.state.subscribe();
     // Only protocol messages keep the connection open: WebSocket pings (answered by the
@@ -1220,6 +1276,17 @@ pub(super) fn set_box_token(hub: &Arc<Inner>, rbox: &RemoteBox, token: Secret) -
 /// Handles one message; `Err(reason)` closes the connection.
 async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(), String> {
     match msg {
+        // Before anything logs or keeps the name (a frame may be 16 MiB).
+        RunnerMsg::Event { thread, .. } | RunnerMsg::Exited { thread, .. }
+            if !thread_id_shaped(&thread) =>
+        {
+            let shown: String = thread.chars().take(MAX_THREAD_ID_BYTES).collect();
+            tracing::warn!(box_name = %conn.box_name(), thread = ?shown, len = thread.len(), "a runner frame naming no thread id; closing the connection");
+            return Err(format!(
+                "a frame naming no thread id ({} bytes)",
+                thread.len()
+            ));
+        }
         RunnerMsg::Event { thread, rseq, .. } | RunnerMsg::Exited { thread, rseq, .. }
             if rseq == 0 =>
         {
@@ -1467,16 +1534,18 @@ async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(),
 /// Ends the open ack batch of `conn`: syncs what its frames committed ([`store::Store::sync`])
 /// and then acks them (the highest rseq per thread). A sync that keeps failing closes the
 /// connection unacked (the runner sends the frames again; they are duplicates by then).
+///
+/// The frames were committed before this runs, so the sync needs no lock: it runs on a
+/// blocking thread while the hub serves everything else (an `F_FULLFSYNC` on macOS can take
+/// tens of milliseconds, and a streaming box flushes up to 20 times a second). Nothing is
+/// acked before it returns.
 async fn flush_acks(hub: &Arc<Inner>, conn: &mut Conn) -> Result<(), String> {
     conn.batched = 0;
     conn.batch_since = None;
     if conn.unacked.is_empty() {
         return Ok(());
     }
-    let synced = persist(hub, conn.box_name(), "syncing runner frames", |core| {
-        core.store.sync()
-    })
-    .await;
+    let synced = sync_wal(hub, conn.box_name(), "syncing runner frames", &conn.wal).await;
     if let Err(e) = synced {
         tracing::error!(box_name = %conn.box_name(), error = %format!("{e:#}"), "cannot sync runner frames; closing the connection (the runner sends them again)");
         return Err("store failure".into());
@@ -1858,6 +1927,22 @@ impl Core {
         })
     }
 
+    /// Whether the hub keeps a watermark of `ack`'s thread from `ack`'s box: the thread is one
+    /// the registry has (on any box: one of another box is refused as foreign, below), or one
+    /// of that box deleted and still restorable (its trash item not purged), whose frames a
+    /// restore must not take for a gap. A frame of any other thread (one the log never had, or
+    /// one purged) is a stray acked without being recorded or classified: nothing of it is
+    /// kept, so a runner cannot fill `runner_acks` with made-up threads.
+    fn tracks(&self, ack: &RunnerAck) -> bool {
+        if self.registry.get(&ack.thread).is_some() {
+            return true;
+        }
+        self.registry
+            .deleted_view(&ack.thread)
+            .is_some_and(|v| v.box_name == ack.box_name)
+            && !self.deleted_rt.get(&ack.thread).is_some_and(|d| d.purged)
+    }
+
     /// Whether `ack`'s thread is known and on another box than the frame's: then the frame is
     /// counted and logged (see the module docs).
     fn foreign(&self, ack: &RunnerAck, fence: &Fence) -> bool {
@@ -1909,6 +1994,9 @@ impl Core {
         }
         if !fence.holds() {
             return Ok(Ingested::Fenced);
+        }
+        if !self.tracks(ack) {
+            return Ok(Ingested::Stray);
         }
         match self.classify(ack)? {
             // A duplicate of another box's thread is refused like a new frame: nothing of the
@@ -2033,6 +2121,10 @@ impl Core {
         }
         if !fence.holds() {
             return Ok(Exited::Fenced);
+        }
+        // Nothing of the hub's ran it: acked, not recorded ([`Core::tracks`]).
+        if !self.tracks(ack) {
+            return Ok(Exited::Stray);
         }
         match self.classify(ack)? {
             Err((false, w)) if self.foreign(ack, fence) => return Ok(Exited::Foreign(w)),
@@ -2677,6 +2769,173 @@ mod tests {
             batched: 0,
             batch_since: None,
             batch_delay: ACK_BATCH_DELAY,
+            wal: store::WalSync::none(),
+        }
+    }
+
+    /// Closing an ack batch syncs the store without the core lock: while another task holds
+    /// the lock, the batch is synced and acked all the same (and only once synced). On several
+    /// workers: the hub's own tasks may wait for the lock meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ack_batch_is_synced_without_the_core_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (close, _close_rx) = watch::channel(None);
+        conn.tx = ConnTx::new(tx, close);
+        conn.wal = inner.core().store.wal_sync();
+        conn.ack(t, 3);
+        let syncs = hub.store_syncs();
+
+        // Another task holds the core lock (for up to 10 s, or until told to let go).
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (locked_tx, locked) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let (inner, released) = (Arc::clone(&inner), Arc::clone(&released));
+            std::thread::spawn(move || {
+                let _core = inner.core();
+                locked_tx.send(()).unwrap();
+                let _ = held.recv_timeout(Duration::from_secs(10));
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        locked.recv().unwrap();
+        flush_acks(&inner, &mut conn).await.unwrap();
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the flush waited for the core lock"
+        );
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(hub.store_syncs() > syncs, "acked without a sync");
+        match rx.try_recv() {
+            Ok(HubMsg::Ack { thread, rseq }) => assert_eq!((thread.as_str(), rseq), (t, 3)),
+            other => panic!("{other:?}"),
+        }
+        assert!(conn.unacked.is_empty());
+    }
+
+    fn frame_of(thread: &str, rseq: u64) -> RunnerMsg {
+        RunnerMsg::Event {
+            thread: thread.into(),
+            rseq,
+            turn: None,
+            body: EventBody::ThreadStarted(SessionPayload {
+                session_id: Some("s".into()),
+                ..Default::default()
+            }),
+            raw: None,
+            run: None,
+            at_ms: None,
+        }
+    }
+
+    /// A frame of a thread the log never had is a stray acked as it comes (nothing of it is
+    /// classified: no gap either) and leaves no watermark; a thread the hub has gets its
+    /// watermark as before. A frame naming no thread id closes the connection.
+    #[tokio::test]
+    async fn frames_of_made_up_threads_leave_no_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        for i in 0..50u64 {
+            let made_up = format!("01JMADEUP{i:017}");
+            // Any rseq: nothing is kept to compare it with.
+            handle(&inner, &mut conn, frame_of(&made_up, 1 + i * 7))
+                .await
+                .unwrap();
+            assert_eq!(conn.unacked.get(&made_up), Some(&(1 + i * 7)));
+        }
+        let made_up = "01JMADEUP00000000000000000";
+        handle(&inner, &mut conn, frame_of(made_up, 1000))
+            .await
+            .unwrap();
+        assert_eq!(conn.unacked.get(made_up), Some(&1000));
+        assert_eq!(conn.stopped.len(), 50, "each stray told to stop once");
+        let rows = || inner.core().store.runner_watermarks("gpu").unwrap();
+        assert!(rows().is_empty(), "{:?}", rows());
+        handle(&inner, &mut conn, frame_of(t, 1)).await.unwrap();
+        assert_eq!(rows(), BTreeMap::from([(t.to_string(), 1)]));
+
+        let long = "0".repeat(MAX_THREAD_ID_BYTES + 1);
+        for bad in [
+            "",
+            "01J TEST",
+            "01J\nforged log line",
+            "thréad",
+            long.as_str(),
+        ] {
+            let r = handle(&inner, &mut conn, frame_of(bad, 2)).await;
+            assert!(r.is_err(), "{bad:?}: {r:?}");
+            let exited = RunnerMsg::Exited {
+                thread: bad.into(),
+                rseq: 2,
+                code: None,
+                stderr_tail: String::new(),
+                run: None,
+                at_ms: None,
+            };
+            assert!(handle(&inner, &mut conn, exited).await.is_err(), "{bad:?}");
+        }
+        assert!(thread_id_shaped(&"0".repeat(MAX_THREAD_ID_BYTES)));
+        assert_eq!(rows().len(), 1);
+    }
+
+    /// A deleted thread of the box keeps its watermark while it can be restored (a restore
+    /// must not see the runner's next frame as a gap), and loses it once its trash item is
+    /// purged: its frames are strays then, acked and not recorded.
+    #[tokio::test]
+    async fn a_purged_thread_keeps_no_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        handle(&inner, &mut conn, frame_of(t, 1)).await.unwrap();
+        {
+            let mut core = inner.core();
+            core.rt(t).live = None;
+            let deleted = EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                name: "remote".into(),
+                trash: Some("item-1".into()),
+                ..Default::default()
+            });
+            core.append(&inner, t, None, Source::Hub, deleted).unwrap();
+        }
+        let rows = || inner.core().store.runner_watermarks("gpu").unwrap();
+        // Deleted, restorable: a stray of a thread the hub keeps the watermark of.
+        handle(&inner, &mut conn, frame_of(t, 2)).await.unwrap();
+        assert_eq!(rows().get(t), Some(&2));
+        assert!(inner.core().record_purged(&inner, "item-1", t, false));
+        assert!(inner.core().deleted_rt[t].purged);
+        assert!(rows().is_empty(), "{:?}", rows());
+        handle(&inner, &mut conn, frame_of(t, 9)).await.unwrap();
+        assert_eq!(conn.unacked.get(t), Some(&9));
+        assert!(rows().is_empty(), "{:?}", rows());
+    }
+
+    /// A connection remembers at most [`MAX_STOPPED`] strays it stopped.
+    #[tokio::test]
+    async fn the_strays_a_connection_stopped_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        for i in 0..MAX_STOPPED * 2 + 3 {
+            conn.stop_stray(&format!("01JSTRAY{i:018}"), None);
+            assert!(conn.stopped.len() <= MAX_STOPPED);
         }
     }
 

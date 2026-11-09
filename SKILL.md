@@ -1021,7 +1021,9 @@ Details:
 - **git.snapshot** `{branch, dirty_files, ahead, behind, base?, base_ahead?, base_behind?,
   conflicts?, conflict_count?}` (source `hub`, control stream) is appended after a turn ends
   and on a 30 s tick for threads that are not parked or stopped, only when one of those values
-  changed. `branch` is null on a detached `HEAD`; an untracked directory counts as one dirty
+  changed. A thread whose snapshot found nothing new and that has had no event since is
+  snapshotted half as often each time, down to every 5 minutes, and every 30 s again after
+  its next event. `branch` is null on a detached `HEAD`; an untracked directory counts as one dirty
   file. `base` (merge readiness, a thread with a worktree of its own): `[projects.<name>] base`,
   else what its worktree was made from, fully qualified (`ext.twr.base_ref`:
   `refs/heads/dev`, a remote branch, a tag, or the commit a base like `HEAD~1` named); a
@@ -1488,7 +1490,10 @@ can access it (`chmod 600`).
   kept after the thread's previous event and never later than now, so a replayed backlog keeps
   its original times (and the stall timer reads them). A dropped
   connection, a runner restart or a hub crash replays what was not acked; duplicates are
-  dropped by watermark; a gap closes the connection. Commands to the box carry an id that the
+  dropped by watermark; a gap closes the connection. A frame of a thread the hub never had, or
+  whose trash item is purged, is acked and not recorded, with no watermark kept (its session is
+  told to stop); a frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
+  and `_`) closes the connection. Commands to the box carry an id that the
   runner deduplicates, so a command sent again after a lost connection runs once; a command
   cut short by a runner crash answers `interrupted` and is never retried (a spawn then fails
   the thread's turn).

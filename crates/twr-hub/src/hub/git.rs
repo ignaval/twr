@@ -49,8 +49,11 @@
 //! **Snapshots.** After an adapter ends a turn, and on a tick (30 s by default) for threads
 //! that are not parked or stopped, the hub runs `git status --porcelain=v2 --branch` in the
 //! thread's directory and appends `git.snapshot{branch, dirty_files, ahead, behind}` (source
-//! hub, no turn) only when one of those changed since the thread's last snapshot. Failures are
-//! logged at debug level; non-git threads and the orchestrator are skipped.
+//! hub, no turn) only when one of those changed since the thread's last snapshot. The tick
+//! backs off a thread whose snapshot found nothing new and that had no event since: twice the
+//! wait each time, up to ten ticks (5 minutes by default), and every tick again after any
+//! event of it (`Quiet`, memory only). Failures are logged at debug level; non-git threads
+//! and the orchestrator are skipped.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -1051,11 +1054,61 @@ pub(super) fn snapshot_soon(hub: &Arc<Inner>, thread: &str) {
     tokio::spawn(async move { snapshot(&hub, &thread).await });
 }
 
+/// How much longer than the tick's period the tick may leave an idle thread unsnapshotted
+/// ([`Quiet`]): 30 s doubling up to 5 minutes by default.
+const QUIET_MAX_TICKS: u32 = 10;
+
+/// When the tick snapshots a thread again, as of its last snapshot (memory only): a thread
+/// whose snapshot found nothing new and that had no event since the one before waits twice
+/// as long each time, up to [`QUIET_MAX_TICKS`] periods; any event of the thread (a turn's
+/// start or end, an attach, a detach, a job's end, a snapshot recorded) brings it back to
+/// every period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Quiet {
+    /// The thread's latest event (its seq) after that snapshot.
+    seq: u64,
+    /// The wait before the next one.
+    every: Duration,
+    /// When the next one is due.
+    due: std::time::Instant,
+}
+
+impl Quiet {
+    /// Whether the tick at `now` (every `period`) snapshots a thread whose latest event is
+    /// `seq`: a tick within half a period of the due time takes it.
+    fn due(q: Option<&Quiet>, seq: u64, now: std::time::Instant, period: Duration) -> bool {
+        q.is_none_or(|q| q.seq != seq || now + period / 2 >= q.due)
+    }
+
+    /// After a snapshot by the tick at `now` of a thread whose latest event was `before`
+    /// (and is `after` once it ran), `prev` its state until then.
+    fn after(
+        prev: Option<Quiet>,
+        before: u64,
+        after: u64,
+        now: std::time::Instant,
+        period: Duration,
+    ) -> Quiet {
+        let every = match prev {
+            Some(p) if before == after && p.seq == before => {
+                (p.every * 2).min(period * QUIET_MAX_TICKS)
+            }
+            _ => period,
+        };
+        Quiet {
+            seq: after,
+            every,
+            due: now + every,
+        }
+    }
+}
+
 /// The snapshot tick: every `period` until the hub stops or is dropped, snapshots every
-/// thread that qualifies (one at a time).
+/// thread that qualifies and is due ([`Quiet`]), one at a time.
 pub(super) async fn git_ticker(hub: Weak<Inner>, period: Duration) {
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut quiet: std::collections::HashMap<String, Quiet> = Default::default();
     loop {
         tick.tick().await;
         let Some(h) = hub.upgrade() else {
@@ -1064,17 +1117,64 @@ pub(super) async fn git_ticker(hub: Weak<Inner>, period: Duration) {
         if *h.state.borrow() != HubState::Running {
             return;
         }
-        let threads: Vec<String> = {
+        let now = std::time::Instant::now();
+        let seq_of = |core: &Core, t: &str| core.seqs.get(t).copied().unwrap_or(0);
+        let threads: Vec<(String, u64)> = {
             let core = h.core();
-            core.registry
+            let threads: Vec<(String, u64)> = core
+                .registry
                 .list()
                 .into_iter()
                 .filter(|v| core.snapshot_dir(&v.id).is_some())
-                .map(|v| v.id.clone())
+                .map(|v| (v.id.clone(), seq_of(&core, &v.id)))
+                .collect();
+            quiet.retain(|t, _| threads.iter().any(|(x, _)| x == t));
+            threads
+                .into_iter()
+                .filter(|(t, seq)| Quiet::due(quiet.get(t), *seq, now, period))
                 .collect()
         };
-        for thread in threads {
+        for (thread, before) in threads {
             snapshot(&h, &thread).await;
+            let after = seq_of(&h.core(), &thread);
+            let prev = quiet.get(&thread).copied();
+            quiet.insert(thread, Quiet::after(prev, before, after, now, period));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An idle thread whose snapshots find nothing new is snapshotted half as often each
+    /// time, down to [`QUIET_MAX_TICKS`] periods; any event of it brings it back to every
+    /// tick, and so does a snapshot that recorded something.
+    #[test]
+    fn the_tick_backs_off_a_quiet_thread_until_its_next_event() {
+        let period = Duration::from_secs(30);
+        let t0 = std::time::Instant::now();
+        // Ticks every period: which ones snapshot a thread whose latest event stays 7.
+        let mut q: Option<Quiet> = None;
+        let mut taken = Vec::new();
+        for i in 0..40u32 {
+            let now = t0 + period * i;
+            if Quiet::due(q.as_ref(), 7, now, period) {
+                taken.push(i);
+                q = Some(Quiet::after(q, 7, 7, now, period));
+            }
+        }
+        // 30 s, 30 s, then 1, 2, 4, 8 minutes capped at 5 (10 ticks).
+        assert_eq!(taken, [0, 1, 3, 7, 15, 25, 35]);
+        assert_eq!(q.unwrap().every, period * QUIET_MAX_TICKS);
+        // An event of the thread: the next tick takes it, and the wait starts over.
+        let now = t0 + period * 36;
+        assert!(Quiet::due(q.as_ref(), 8, now, period));
+        let next = Quiet::after(q, 8, 8, now, period);
+        assert_eq!(next.every, period);
+        // A snapshot that recorded something (its seq moved while it ran): every tick.
+        let moved = Quiet::after(Some(next), 8, 9, now + period, period);
+        assert_eq!(moved.every, period);
+        assert!(Quiet::due(Some(&moved), 9, now + period * 2, period));
     }
 }
