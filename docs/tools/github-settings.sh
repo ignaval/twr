@@ -52,6 +52,7 @@ for branch in main dev; do
       { "context": "reap tests with the ps backend (linux)", "app_id": 15368 },
       { "context": "cargo deny", "app_id": 15368 },
       { "context": "actionlint", "app_id": 15368 },
+      { "context": "clients (typecheck, tests, format, audit)", "app_id": 15368 },
       { "context": "real systemd (linux)", "app_id": 15368 }
     ]
   },

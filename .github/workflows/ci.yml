@@ -182,6 +182,34 @@ jobs:
           command -v shellcheck > /dev/null || { echo "::error::no shellcheck on this runner"; exit 1; }
           "$RUNNER_TEMP/actionlint" -color
 
+  clients:
+    # The desktop and mobile apps' TypeScript (clients/), on every push and pull request:
+    # desktop.yml and mobile.yml build the apps only when their paths change, and are not
+    # required checks. `catalog:check` needs a built twr, so it stays in desktop.yml.
+    name: clients (typecheck, tests, format, audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: clients
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      - run: npm run format:check
+      # Known advisories of high or critical severity, in the whole tree: Electron and the
+      # Capacitor runtime ship in the apps but are devDependencies (electron-builder and
+      # Capacitor want them there), so `--omit=dev` would skip them.
+      - run: npm audit --audit-level=high
+
   real-systemd:
     # The rest of the suite replaces systemd-run and systemctl with stand-ins
     # (crates/twr-hub/tests/limits.rs). This job starts a systemd user manager for the runner's
