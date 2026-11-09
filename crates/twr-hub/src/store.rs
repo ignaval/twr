@@ -442,8 +442,61 @@ pub struct QueuedPrompt {
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
-    /// Successful [`Store::sync`] calls (for tests: what was made durable when).
-    syncs: std::sync::atomic::AtomicU64,
+    /// Syncs the write-ahead log ([`Store::sync`]), also from outside the hub's lock.
+    wal: WalSync,
+}
+
+/// What [`Store::sync`] does, apart from the [`Store`]: syncing the write-ahead log needs no
+/// connection, so a runner connection syncs the frames it committed without holding the
+/// hub's lock (`hub::runners`). Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct WalSync {
+    /// The database's write-ahead log (`None`: an in-memory database, nothing to sync).
+    wal: Option<String>,
+    /// Successful syncs (for tests: what was made durable when).
+    syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WalSync {
+    fn of(conn: &Connection) -> WalSync {
+        WalSync {
+            wal: conn
+                .path()
+                .filter(|p| !p.is_empty())
+                .map(|db| format!("{db}-wal")),
+            syncs: Default::default(),
+        }
+    }
+
+    /// One that syncs nothing (for tests without a database).
+    #[cfg(test)]
+    pub fn none() -> WalSync {
+        WalSync {
+            wal: None,
+            syncs: Default::default(),
+        }
+    }
+
+    /// [`Store::sync`]. Every commit made before the call is durable once it returns: SQLite
+    /// writes a commit to the log file before the commit returns, a checkpoint syncs the log
+    /// before it copies it into the database and the database after, and syncing the file
+    /// through any descriptor makes its writes durable. Needs no lock: commits made meanwhile
+    /// are synced too, or not, and were not asked about.
+    pub fn sync(&self) -> anyhow::Result<()> {
+        let Some(wal) = &self.wal else {
+            return Ok(());
+        };
+        match std::fs::File::open(wal) {
+            Ok(f) => f.sync_all().with_context(|| format!("syncing {wal}"))?,
+            // No log: everything is in the database file, synced by the checkpoint that
+            // emptied it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {wal}"))),
+        }
+        self.syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// Extra writes committed together with an appended event.
@@ -563,8 +616,8 @@ impl Store {
         migrate(&mut conn)?;
         restrict_db_files(path)?;
         Ok(Store {
+            wal: WalSync::of(&conn),
             conn,
-            syncs: Default::default(),
         })
     }
 
@@ -572,9 +625,10 @@ impl Store {
     /// migrated already: for a replay in the background that writes nothing but a checkpoint
     /// (`hub::checkpoint`).
     pub fn open_existing(path: &Path) -> anyhow::Result<Store> {
+        let conn = connect(path)?;
         Ok(Store {
-            conn: connect(path)?,
-            syncs: Default::default(),
+            wal: WalSync::of(&conn),
+            conn,
         })
     }
 
@@ -777,25 +831,17 @@ impl Store {
     /// and only then are they acknowledged. SQLite writes a commit to the log file before the
     /// commit returns; syncing the file through any descriptor makes those writes durable.
     pub fn sync(&self) -> anyhow::Result<()> {
-        let Some(db) = self.conn.path().filter(|p| !p.is_empty()) else {
-            return Ok(());
-        };
-        let wal = format!("{db}-wal");
-        match std::fs::File::open(&wal) {
-            Ok(f) => f.sync_all().with_context(|| format!("syncing {wal}"))?,
-            // No log: everything is in the database file, synced by the checkpoint that
-            // emptied it.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {wal}"))),
-        }
-        self.syncs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        self.wal.sync()
     }
 
-    /// How many [`Store::sync`] calls succeeded so far.
+    /// [`Store::sync`] for use without the store, or the lock that guards it.
+    pub fn wal_sync(&self) -> WalSync {
+        self.wal.clone()
+    }
+
+    /// How many [`Store::sync`] (and [`WalSync::sync`]) calls succeeded so far.
     pub fn sync_count(&self) -> u64 {
-        self.syncs.load(std::sync::atomic::Ordering::Relaxed)
+        self.wal.syncs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The committed watermark of `thread` from box `box_name` (0: nothing yet).

@@ -918,6 +918,33 @@ pub(super) async fn persist<T>(
     }
 }
 
+/// [`persist`] of a sync of the store's write-ahead log ([`crate::store::WalSync`]), which
+/// needs no lock: it runs on a blocking thread, and only a retry's count takes the core
+/// lock. Returns once every commit made before the call is durable, or with the last error.
+pub(super) async fn sync_wal(
+    hub: &Inner,
+    thread: &str,
+    what: &str,
+    wal: &crate::store::WalSync,
+) -> anyhow::Result<()> {
+    let mut delays = PERSIST_RETRY.iter();
+    loop {
+        let w = wal.clone();
+        let e = match tokio::task::spawn_blocking(move || w.sync()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => e,
+            Err(e) => anyhow::anyhow!("the sync did not finish: {e}"),
+        };
+        let delay = match delays.next() {
+            Some(d) if hub.fatal().is_none() => *d,
+            _ => return Err(e),
+        };
+        hub.core().persist_retries += 1;
+        tracing::warn!(thread, error = %format!("{e:#}"), ?delay, "{what} failed; retrying");
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// The store cannot record what the hub must record: stops serving (the server shuts the hub
 /// down and exits with this error) instead of running on with state the log does not have.
 pub(super) fn fail_hub(hub: &Inner, msg: String) {

@@ -167,7 +167,7 @@ use twr_core::runner::{
     Op, RunnerMsg, Secret, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
-use super::supervisor::{close_exited, give_up_runtime, persist, supervise, Closed};
+use super::supervisor::{close_exited, give_up_runtime, persist, supervise, sync_wal, Closed};
 use super::{box_switch, git, Batch, Core, Exit, Hub, HubState, Inner, Live, PendingExit};
 use crate::remote::{self, BoxToken, ConnTx, Connect, RemoteBox, SEND_QUEUE};
 use crate::store::{self, RunnerAck};
@@ -307,6 +307,8 @@ struct Conn {
     ///
     /// [`HubOptions::ack_batch_delay`]: crate::HubOptions::ack_batch_delay
     batch_delay: Duration,
+    /// Syncs the store's write-ahead log without the core lock ([`flush_acks`]).
+    wal: store::WalSync,
 }
 
 impl Conn {
@@ -1057,6 +1059,7 @@ where
         batched: 0,
         batch_since: None,
         batch_delay: hub.ack_batch_delay,
+        wal: hub.core().store.wal_sync(),
     };
     let mut state = hub.state.subscribe();
     // Only protocol messages keep the connection open: WebSocket pings (answered by the
@@ -1467,16 +1470,18 @@ async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(),
 /// Ends the open ack batch of `conn`: syncs what its frames committed ([`store::Store::sync`])
 /// and then acks them (the highest rseq per thread). A sync that keeps failing closes the
 /// connection unacked (the runner sends the frames again; they are duplicates by then).
+///
+/// The frames were committed before this runs, so the sync needs no lock: it runs on a
+/// blocking thread while the hub serves everything else (an `F_FULLFSYNC` on macOS can take
+/// tens of milliseconds, and a streaming box flushes up to 20 times a second). Nothing is
+/// acked before it returns.
 async fn flush_acks(hub: &Arc<Inner>, conn: &mut Conn) -> Result<(), String> {
     conn.batched = 0;
     conn.batch_since = None;
     if conn.unacked.is_empty() {
         return Ok(());
     }
-    let synced = persist(hub, conn.box_name(), "syncing runner frames", |core| {
-        core.store.sync()
-    })
-    .await;
+    let synced = sync_wal(hub, conn.box_name(), "syncing runner frames", &conn.wal).await;
     if let Err(e) = synced {
         tracing::error!(box_name = %conn.box_name(), error = %format!("{e:#}"), "cannot sync runner frames; closing the connection (the runner sends them again)");
         return Err("store failure".into());
@@ -2677,7 +2682,56 @@ mod tests {
             batched: 0,
             batch_since: None,
             batch_delay: ACK_BATCH_DELAY,
+            wal: store::WalSync::none(),
         }
+    }
+
+    /// Closing an ack batch syncs the store without the core lock: while another task holds
+    /// the lock, the batch is synced and acked all the same (and only once synced). On several
+    /// workers: the hub's own tasks may wait for the lock meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ack_batch_is_synced_without_the_core_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (close, _close_rx) = watch::channel(None);
+        conn.tx = ConnTx::new(tx, close);
+        conn.wal = inner.core().store.wal_sync();
+        conn.ack(t, 3);
+        let syncs = hub.store_syncs();
+
+        // Another task holds the core lock (for up to 10 s, or until told to let go).
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (locked_tx, locked) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let (inner, released) = (Arc::clone(&inner), Arc::clone(&released));
+            std::thread::spawn(move || {
+                let _core = inner.core();
+                locked_tx.send(()).unwrap();
+                let _ = held.recv_timeout(Duration::from_secs(10));
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        locked.recv().unwrap();
+        flush_acks(&inner, &mut conn).await.unwrap();
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the flush waited for the core lock"
+        );
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(hub.store_syncs() > syncs, "acked without a sync");
+        match rx.try_recv() {
+            Ok(HubMsg::Ack { thread, rseq }) => assert_eq!((thread.as_str(), rseq), (t, 3)),
+            other => panic!("{other:?}"),
+        }
+        assert!(conn.unacked.is_empty());
     }
 
     /// The `thread.crashed` events of `t` so far.
