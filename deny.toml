@@ -46,7 +46,7 @@ deny = [
     { crate = "axum", wrappers = ["twr-app"], reason = "HTTP listener in the application gateway only" },
     { crate = "axum-server", wrappers = ["twr-app"], reason = "TLS listener in the application gateway only" },
     { crate = "hyper-rustls", wrappers = ["reqwest"], reason = "HTTP TLS through reqwest only" },
-    { crate = "hyper-util", wrappers = ["hyper-rustls", "reqwest", "axum", "axum-server", "iroh-relay"], reason = "HTTP in the updater and application gateway only" },
+    { crate = "hyper-util", wrappers = ["hyper-rustls", "reqwest", "axum", "axum-server", "iroh-relay", "twr-app"], reason = "HTTP in the updater and application gateway only" },
     { crate = "hyper", wrappers = ["hyper-rustls", "hyper-util", "reqwest", "axum", "axum-server", "iroh-relay"], reason = "HTTP in the updater and application gateway only" },
 ]
 

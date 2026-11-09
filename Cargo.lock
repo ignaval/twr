@@ -4984,6 +4984,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "hyper-util",
  "jsonwebtoken",
  "libc",
  "portable-pty",

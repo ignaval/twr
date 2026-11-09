@@ -52,7 +52,9 @@ the hub and its agents running.
 The optional mobile gateway adds a network trust boundary. Production connections require
 HTTPS/WSS with a certificate the device trusts. A local owner grants a short-lived,
 one-use pairing code and chooses device capabilities: read and operate, with terminal and
-admin access separately granted. A bearer credential is checked before WebSocket upgrade;
+admin access separately granted. A bearer credential is checked before WebSocket upgrade,
+and connections that have not authenticated, pairing attempts and refused tokens are
+bounded per source address under a global ceiling ([mobile.md](mobile.md#local-development));
 the hub also validates the paired identity and method scope, so bypassing a hidden UI
 control grants nothing. Unknown methods are refused. Agents and the orchestrator cannot
 use device credentials to gain user authority, and devices cannot pair more devices.
