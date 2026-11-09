@@ -772,6 +772,21 @@ const ACTIVITY_EVERY: Duration = Duration::from_secs(2);
 /// [`speech`]): the status bar's note and the conversation's `▶` follow it.
 pub const SPEECH_EVERY: Duration = Duration::from_secs(2);
 
+/// How often [`ACTIVITY_EVERY`]'s and [`SPEECH_EVERY`]'s polls ask while the terminal has no
+/// focus (it said so: [`notify::Notifier::unfocused`]): what they show matters less, and an
+/// idle TUI in a background tab need not wake the hub every two seconds.
+const UNFOCUSED_EVERY: Duration = Duration::from_secs(10);
+
+/// When a poll that asks every `every` asks next: [`UNFOCUSED_EVERY`] from now at the soonest
+/// while the terminal has no focus.
+fn next_poll(every: Duration, unfocused: bool) -> tokio::time::Instant {
+    let every = match unfocused {
+        true => every.max(UNFOCUSED_EVERY),
+        false => every,
+    };
+    tokio::time::Instant::now() + every
+}
+
 /// How long quitting waits for the input history's last lines to be written.
 const HISTORY_FLUSH: Duration = Duration::from_secs(2);
 
@@ -1392,8 +1407,9 @@ fn handle_terminal_event(
 /// A terminal event and when the input thread read it.
 type Stamped = (std::time::Instant, std::io::Result<TermEvent>);
 
-/// How long the input thread waits for an event before it checks whether to stop.
-const INPUT_POLL: Duration = Duration::from_millis(50);
+/// How long the input thread waits for an event before it checks whether to stop. Only
+/// stopping waits on it: an event is read as soon as it comes, whatever this is.
+const INPUT_POLL: Duration = Duration::from_millis(250);
 
 /// The terminal's reader: a thread of its own, the only reader, handing each event over with
 /// the time it was read. Whether a key was typed ahead of the first frame goes by that time,
@@ -2877,11 +2893,11 @@ async fn drive(
         history_writer = writer;
         tx
     });
-    let mut activity_poll = tokio::time::interval(ACTIVITY_EVERY);
-    activity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // What this hub's speakers read: asked now, then every [`SPEECH_EVERY`].
-    let mut speech_poll = tokio::time::interval(SPEECH_EVERY);
-    speech_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // What the threads are doing, and what this hub's speakers read: asked now, then every
+    // [`ACTIVITY_EVERY`] and [`SPEECH_EVERY`], or [`UNFOCUSED_EVERY`] while the terminal has
+    // no focus ([`next_poll`]); at once when it gets it back.
+    let mut activity_at = tokio::time::Instant::now();
+    let mut speech_at = tokio::time::Instant::now();
     // The other workspaces' tabs: asked now, then every [`TABS_EVERY`].
     let mut tab_poll = tokio::time::interval(TABS_EVERY);
     tab_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3151,7 +3167,12 @@ async fn drive(
                 key = input.rx.recv() => {
                     if let Some((at, Ok(event))) = &key {
                         match event {
-                            TermEvent::FocusGained => notifier.focus(true),
+                            TermEvent::FocusGained => {
+                                notifier.focus(true);
+                                // What the polls left alone meanwhile, at once.
+                                activity_at = activity_at.min(tokio::time::Instant::now());
+                                speech_at = speech_at.min(tokio::time::Instant::now());
+                            }
                             TermEvent::FocusLost => {
                                 notifier.focus(false);
                                 // The pointer may have left with the focus: it holds nothing.
@@ -3437,7 +3458,8 @@ async fn drive(
                 }
                 // The working icon's next frame: loop to draw it.
                 _ = sleep_opt(tick) => {}
-                _ = activity_poll.tick() => {
+                _ = tokio::time::sleep_until(activity_at) => {
+                    activity_at = next_poll(ACTIVITY_EVERY, notifier.unfocused());
                     if !state.activity_pending {
                         state.activity_pending = true;
                         let _ = call_tx.send(("thread.activity", Value::Null));
@@ -3445,7 +3467,8 @@ async fn drive(
                 }
                 // Not asked of a hub from before reading aloud, until a `/read` it answers;
                 // never by a thread's agent's TUI, which the hub refuses `speech.*`.
-                _ = speech_poll.tick(), if !state.speech.unsupported && state.agent.is_none() => {
+                _ = tokio::time::sleep_until(speech_at), if !state.speech.unsupported && state.agent.is_none() => {
+                    speech_at = next_poll(SPEECH_EVERY, notifier.unfocused());
                     if !state.speech.pending {
                         state.speech.pending = true;
                         let _ = call_tx.send(("speech.status", json!({})));
@@ -3628,6 +3651,30 @@ async fn drive(
 #[cfg(test)]
 mod asks_tests {
     use super::*;
+
+    /// The activity and speech polls ask every two seconds while the terminal has focus (or
+    /// never said), and every ten once it said it lost it.
+    #[tokio::test(start_paused = true)]
+    async fn polls_back_off_while_the_terminal_is_unfocused() {
+        let mut n = notify::Notifier::new(
+            &twr_core::config::TuiNotifyConfig::default(),
+            notify::Multiplexer::None,
+        );
+        let now = tokio::time::Instant::now();
+        assert!(!n.unfocused());
+        assert_eq!(
+            next_poll(ACTIVITY_EVERY, n.unfocused()) - now,
+            ACTIVITY_EVERY
+        );
+        n.focus(false);
+        assert!(n.unfocused());
+        assert_eq!(
+            next_poll(SPEECH_EVERY, n.unfocused()) - now,
+            UNFOCUSED_EVERY
+        );
+        n.focus(true);
+        assert_eq!(next_poll(SPEECH_EVERY, n.unfocused()) - now, SPEECH_EVERY);
+    }
 
     /// A SIGHUP (a closing SSH session) or SIGTERM (`kill`) ends the wait the loop selects on,
     /// instead of killing the process with the terminal in raw mode.
