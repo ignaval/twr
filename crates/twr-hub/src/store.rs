@@ -1044,6 +1044,14 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Forgets every box's watermark of `thread` (it can never run again: its trash item is
+    /// purged). Returns how many there were.
+    pub fn forget_runner_acks(&self, thread: &str) -> anyhow::Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM runner_acks WHERE thread = ?1", [thread])?)
+    }
+
     /// Every event in append order.
     pub fn load_all(&self) -> anyhow::Result<Vec<Event>> {
         let mut st = self

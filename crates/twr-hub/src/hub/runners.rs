@@ -77,7 +77,10 @@
 //! runner has confirmed a run the hub named (a frame of it), an exit naming none may still be
 //! the session's (a restarted runner's, for the run its predecessor left behind). A frame for a
 //! thread the hub runs no session for (a stray) is committed as a watermark only; after the
-//! replay the stray session is stopped. Events reach the log only
+//! replay the stray session is stopped. A stray of a thread the hub keeps no watermark of (one
+//! the log never had, one of another box deleted, one purged: `Core::tracks`) is acked without
+//! a commit or a classification, so nothing of a made-up thread is kept; a frame whose thread
+//! has no thread id's shape closes the connection. Events reach the log only
 //! here: the session's `AdapterHandle` carries commands out and never events in
 //! ([`crate::remote`]), so nothing is appended twice. A frame whose commit keeps failing
 //! closes the connection unacked (the runner sends it again), and so does any frame once the
@@ -191,6 +194,24 @@ pub const ACK_BATCH_FRAMES: usize = 256;
 
 /// Longest a committed frame waits for its batch to be synced and acked.
 pub const ACK_BATCH_DELAY: Duration = Duration::from_millis(50);
+
+/// Longest thread id a runner frame may name: the hub's ids are ULIDs (26 characters).
+pub const MAX_THREAD_ID_BYTES: usize = 64;
+
+/// Most strays one connection remembers having stopped ([`Conn::stop_stray`]); past that it
+/// forgets them all (a stray seen again is told to stop again, which does nothing more).
+const MAX_STOPPED: usize = 1024;
+
+/// Whether `thread` has the shape of a thread id the hub makes (a ULID; at most
+/// [`MAX_THREAD_ID_BYTES`] ASCII letters, digits, `-` and `_`). A frame naming anything else
+/// closes its connection: nothing of it could be the hub's.
+fn thread_id_shaped(thread: &str) -> bool {
+    !thread.is_empty()
+        && thread.len() <= MAX_THREAD_ID_BYTES
+        && thread
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// A runner connection's right to commit: it holds while the connection is the box's current
 /// one. Checked under the core lock (where a newer connection replaces it, see [`serve`]),
@@ -349,7 +370,13 @@ impl Conn {
     /// Stops run `run` of a stray session once per connection (only once the box is ready:
     /// before that, the reconciliation stops what is left).
     fn stop_stray(&mut self, thread: &str, run: Option<String>) {
-        if self.synced && self.stopped.insert((thread.to_string(), run.clone())) {
+        if !self.synced || self.stopped.contains(&(thread.to_string(), run.clone())) {
+            return;
+        }
+        if self.stopped.len() >= MAX_STOPPED {
+            self.stopped.clear();
+        }
+        if self.stopped.insert((thread.to_string(), run.clone())) {
             self.rbox.stop_stray(self.epoch, thread, run);
         }
     }
@@ -1223,6 +1250,17 @@ pub(super) fn set_box_token(hub: &Arc<Inner>, rbox: &RemoteBox, token: Secret) -
 /// Handles one message; `Err(reason)` closes the connection.
 async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(), String> {
     match msg {
+        // Before anything logs or keeps the name (a frame may be 16 MiB).
+        RunnerMsg::Event { thread, .. } | RunnerMsg::Exited { thread, .. }
+            if !thread_id_shaped(&thread) =>
+        {
+            let shown: String = thread.chars().take(MAX_THREAD_ID_BYTES).collect();
+            tracing::warn!(box_name = %conn.box_name(), thread = ?shown, len = thread.len(), "a runner frame naming no thread id; closing the connection");
+            return Err(format!(
+                "a frame naming no thread id ({} bytes)",
+                thread.len()
+            ));
+        }
         RunnerMsg::Event { thread, rseq, .. } | RunnerMsg::Exited { thread, rseq, .. }
             if rseq == 0 =>
         {
@@ -1863,6 +1901,22 @@ impl Core {
         })
     }
 
+    /// Whether the hub keeps a watermark of `ack`'s thread from `ack`'s box: the thread is one
+    /// the registry has (on any box: one of another box is refused as foreign, below), or one
+    /// of that box deleted and still restorable (its trash item not purged), whose frames a
+    /// restore must not take for a gap. A frame of any other thread (one the log never had, or
+    /// one purged) is a stray acked without being recorded or classified: nothing of it is
+    /// kept, so a runner cannot fill `runner_acks` with made-up threads.
+    fn tracks(&self, ack: &RunnerAck) -> bool {
+        if self.registry.get(&ack.thread).is_some() {
+            return true;
+        }
+        self.registry
+            .deleted_view(&ack.thread)
+            .is_some_and(|v| v.box_name == ack.box_name)
+            && !self.deleted_rt.get(&ack.thread).is_some_and(|d| d.purged)
+    }
+
     /// Whether `ack`'s thread is known and on another box than the frame's: then the frame is
     /// counted and logged (see the module docs).
     fn foreign(&self, ack: &RunnerAck, fence: &Fence) -> bool {
@@ -1914,6 +1968,9 @@ impl Core {
         }
         if !fence.holds() {
             return Ok(Ingested::Fenced);
+        }
+        if !self.tracks(ack) {
+            return Ok(Ingested::Stray);
         }
         match self.classify(ack)? {
             // A duplicate of another box's thread is refused like a new frame: nothing of the
@@ -2038,6 +2095,10 @@ impl Core {
         }
         if !fence.holds() {
             return Ok(Exited::Fenced);
+        }
+        // Nothing of the hub's ran it: acked, not recorded ([`Core::tracks`]).
+        if !self.tracks(ack) {
+            return Ok(Exited::Stray);
         }
         match self.classify(ack)? {
             Err((false, w)) if self.foreign(ack, fence) => return Ok(Exited::Foreign(w)),
@@ -2732,6 +2793,124 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(conn.unacked.is_empty());
+    }
+
+    fn frame_of(thread: &str, rseq: u64) -> RunnerMsg {
+        RunnerMsg::Event {
+            thread: thread.into(),
+            rseq,
+            turn: None,
+            body: EventBody::ThreadStarted(SessionPayload {
+                session_id: Some("s".into()),
+                ..Default::default()
+            }),
+            raw: None,
+            run: None,
+            at_ms: None,
+        }
+    }
+
+    /// A frame of a thread the log never had is a stray acked as it comes (nothing of it is
+    /// classified: no gap either) and leaves no watermark; a thread the hub has gets its
+    /// watermark as before. A frame naming no thread id closes the connection.
+    #[tokio::test]
+    async fn frames_of_made_up_threads_leave_no_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        for i in 0..50u64 {
+            let made_up = format!("01JMADEUP{i:017}");
+            // Any rseq: nothing is kept to compare it with.
+            handle(&inner, &mut conn, frame_of(&made_up, 1 + i * 7))
+                .await
+                .unwrap();
+            assert_eq!(conn.unacked.get(&made_up), Some(&(1 + i * 7)));
+        }
+        let made_up = "01JMADEUP00000000000000000";
+        handle(&inner, &mut conn, frame_of(made_up, 1000))
+            .await
+            .unwrap();
+        assert_eq!(conn.unacked.get(made_up), Some(&1000));
+        assert_eq!(conn.stopped.len(), 50, "each stray told to stop once");
+        let rows = || inner.core().store.runner_watermarks("gpu").unwrap();
+        assert!(rows().is_empty(), "{:?}", rows());
+        handle(&inner, &mut conn, frame_of(t, 1)).await.unwrap();
+        assert_eq!(rows(), BTreeMap::from([(t.to_string(), 1)]));
+
+        let long = "0".repeat(MAX_THREAD_ID_BYTES + 1);
+        for bad in [
+            "",
+            "01J TEST",
+            "01J\nforged log line",
+            "thréad",
+            long.as_str(),
+        ] {
+            let r = handle(&inner, &mut conn, frame_of(bad, 2)).await;
+            assert!(r.is_err(), "{bad:?}: {r:?}");
+            let exited = RunnerMsg::Exited {
+                thread: bad.into(),
+                rseq: 2,
+                code: None,
+                stderr_tail: String::new(),
+                run: None,
+                at_ms: None,
+            };
+            assert!(handle(&inner, &mut conn, exited).await.is_err(), "{bad:?}");
+        }
+        assert!(thread_id_shaped(&"0".repeat(MAX_THREAD_ID_BYTES)));
+        assert_eq!(rows().len(), 1);
+    }
+
+    /// A deleted thread of the box keeps its watermark while it can be restored (a restore
+    /// must not see the runner's next frame as a gap), and loses it once its trash item is
+    /// purged: its frames are strays then, acked and not recorded.
+    #[tokio::test]
+    async fn a_purged_thread_keeps_no_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        handle(&inner, &mut conn, frame_of(t, 1)).await.unwrap();
+        {
+            let mut core = inner.core();
+            core.rt(t).live = None;
+            let deleted = EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                name: "remote".into(),
+                trash: Some("item-1".into()),
+                ..Default::default()
+            });
+            core.append(&inner, t, None, Source::Hub, deleted).unwrap();
+        }
+        let rows = || inner.core().store.runner_watermarks("gpu").unwrap();
+        // Deleted, restorable: a stray of a thread the hub keeps the watermark of.
+        handle(&inner, &mut conn, frame_of(t, 2)).await.unwrap();
+        assert_eq!(rows().get(t), Some(&2));
+        assert!(inner.core().record_purged(&inner, "item-1", t, false));
+        assert!(inner.core().deleted_rt[t].purged);
+        assert!(rows().is_empty(), "{:?}", rows());
+        handle(&inner, &mut conn, frame_of(t, 9)).await.unwrap();
+        assert_eq!(conn.unacked.get(t), Some(&9));
+        assert!(rows().is_empty(), "{:?}", rows());
+    }
+
+    /// A connection remembers at most [`MAX_STOPPED`] strays it stopped.
+    #[tokio::test]
+    async fn the_strays_a_connection_stopped_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        for i in 0..MAX_STOPPED * 2 + 3 {
+            conn.stop_stray(&format!("01JSTRAY{i:018}"), None);
+            assert!(conn.stopped.len() <= MAX_STOPPED);
+        }
     }
 
     /// The `thread.crashed` events of `t` so far.
