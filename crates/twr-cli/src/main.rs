@@ -1521,8 +1521,18 @@ fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
 
 /// Refuses `--socket` and `--workspace` with `twr runner`: a runner never uses the hub's
 /// socket (it connects to `--hub`) and serves whichever hub that is, so the flags would be
-/// silently ignored.
+/// silently ignored. Not for the hidden `twr runner service`, whose own `--socket` (where the
+/// runner service listens) has the global flag's name, so clap fills both from it.
 fn refuse_runner_socket(cli: &Cli) -> anyhow::Result<()> {
+    if matches!(
+        cli.cmd,
+        Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::Service { .. }),
+            ..
+        })
+    ) {
+        return Ok(());
+    }
     if matches!(cli.cmd, Some(Cmd::Runner { .. })) {
         if cli.socket.is_some() {
             bail!("--socket does not apply to `twr runner`: it connects to the hub at --hub");
@@ -9294,6 +9304,18 @@ mod tests {
         assert!(refuse_runner_socket(&c).is_ok());
         let c = Cli::try_parse_from(["twr", "--socket", "/tmp/s", "attention"]).unwrap();
         assert!(refuse_runner_socket(&c).is_ok());
+        // The runner service is started with a `--socket` of its own: the one it listens on.
+        let service = ["twr", "runner", "service", "--root", "/tmp/r", "--socket", "/tmp/s"];
+        let c = Cli::try_parse_from(service).unwrap();
+        assert!(refuse_runner_socket(&c).is_ok());
+        let Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::Service { socket, .. }),
+            ..
+        }) = c.cmd
+        else {
+            panic!("not the runner service");
+        };
+        assert_eq!(socket, PathBuf::from("/tmp/s"));
     }
 
     /// `twr runner token` needs neither --hub nor --box, and takes no runner flag; `twr
