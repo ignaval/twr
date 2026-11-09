@@ -227,7 +227,8 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
     cmd.args(["-c", "\"$@\" &", "twr-service-launch"])
         .arg(program)
         .args(args)
-        .env_remove("TWR_WORKSPACE")
+        .env_clear()
+        .envs(fallback_env(std::env::vars_os()))
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -245,6 +246,20 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
         let _ = child.wait();
     });
     Ok(())
+}
+/// The environment of a service started in a session of its own: what launchd and
+/// `systemd-run` give it ([`twr_runner::relay::launchd::service_env`]), plus two test knobs
+/// that hold no secret: how it starts its workers (`TWR_BOX_LAUNCHER`, which forces this
+/// start too) and whether they offer the fake adapter.
+fn fallback_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let vars: Vec<_> = vars.into_iter().collect();
+    let mut env = twr_runner::relay::launchd::service_env(vars.iter().cloned());
+    env.extend(vars.into_iter().filter(|(name, _)| {
+        name == twr_runner::relay::LAUNCHER_ENV || name == twr_adapters::ENABLE_FAKE_ENV
+    }));
+    env
 }
 fn install(machine: &Machine, binary: &Path) -> Result<std::path::PathBuf> {
     let program = copy_executable(&machine.dir.join("service"), binary)?;
@@ -391,6 +406,33 @@ pub async fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_detached_service_gets_the_allowlist_and_test_knobs_only() {
+        let env = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("XDG_DATA_HOME", "/home/u/data"),
+            ("ANTHROPIC_API_KEY", "sk-secret"),
+            ("TWR_WORKSPACE", "work"),
+            (twr_runner::relay::LAUNCHER_ENV, "setsid"),
+            (twr_adapters::ENABLE_FAKE_ENV, "1"),
+        ]
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
+        let mut names: Vec<_> = fallback_env(env)
+            .into_iter()
+            .map(|(k, _)| k.into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut expected = vec![
+            "HOME",
+            "PATH",
+            "XDG_DATA_HOME",
+            twr_runner::relay::LAUNCHER_ENV,
+            twr_adapters::ENABLE_FAKE_ENV,
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
     struct MockLauncher {
         good: String,
         stopped_bad: std::sync::Arc<std::sync::atomic::AtomicUsize>,
