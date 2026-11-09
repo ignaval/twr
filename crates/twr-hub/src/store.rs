@@ -311,6 +311,9 @@ pub fn connect(path: &Path) -> anyhow::Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("opening database {}", path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    // Room for every statement the writer prepares cached (its commits' and its lookups'):
+    // the default of 16 would evict the ones each commit runs.
+    conn.set_prepared_statement_cache_capacity(64);
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(conn)
@@ -708,14 +711,16 @@ impl Store {
         data: Vec<String>,
     ) -> anyhow::Result<BatchCommit> {
         let tx = conn.transaction()?;
+        // Every statement here runs on most commits: prepared once per connection.
+        let exec = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.prepare_cached(sql)?.execute(p);
         for (r, bytes) in batch.blobs {
-            tx.execute(
+            exec(
                 "INSERT OR IGNORE INTO blobs (hash, bytes) VALUES (?1, ?2)",
                 params![r, bytes],
             )?;
         }
         if let Some(id) = batch.dequeue {
-            let n = tx.execute("DELETE FROM pending_prompts WHERE id = ?1", params![id])?;
+            let n = exec("DELETE FROM pending_prompts WHERE id = ?1", params![id])?;
             if n != 1 {
                 bail!("pending prompt {id} is gone");
             }
@@ -727,13 +732,13 @@ impl Store {
         }
         let mut out = BatchCommit::default();
         for thread in batch.drop_queues {
-            out.dropped += tx.execute(
+            out.dropped += exec(
                 "DELETE FROM pending_prompts WHERE thread = ?1",
                 params![thread],
             )?;
         }
         for ((ev, control), data) in batch.events.iter().zip(data) {
-            tx.execute(
+            exec(
                 "INSERT INTO events (thread, seq, id, v, ts, turn, source, kind, data, raw)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
@@ -750,7 +755,7 @@ impl Store {
                 ],
             )?;
             let gseq = if *control {
-                tx.execute(
+                exec(
                     "INSERT INTO control (thread, seq) VALUES (?1, ?2)",
                     params![ev.thread, to_i64(ev.seq)?],
                 )?;
@@ -760,17 +765,17 @@ impl Store {
             };
             out.gseqs.push(gseq);
             if CLOSING_KINDS.contains(&ev.kind()) {
-                tx.execute(
+                exec(
                     "DELETE FROM stop_requests WHERE thread = ?1",
                     params![ev.thread],
                 )?;
-                tx.execute(
+                exec(
                     "DELETE FROM spawn_intents WHERE thread = ?1",
                     params![ev.thread],
                 )?;
             }
             if ATTACH_KINDS.contains(&ev.kind()) {
-                tx.execute(
+                exec(
                     "DELETE FROM attach_processes WHERE thread = ?1",
                     params![ev.thread],
                 )?;
@@ -782,7 +787,7 @@ impl Store {
                 .push(insert_prompt(&tx, p, p.said_after.unwrap_or(head), head)?);
         }
         if let Some(a) = batch.runner_ack {
-            tx.execute(
+            exec(
                 "INSERT INTO runner_acks (box, thread, rseq) VALUES (?1, ?2, ?3)
                  ON CONFLICT(box, thread) DO UPDATE SET rseq = MAX(rseq, excluded.rseq)",
                 params![a.box_name, a.thread, to_i64(a.rseq)?],
@@ -791,7 +796,7 @@ impl Store {
         if !batch.remote_cmds.is_empty() {
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
             for c in batch.remote_cmds {
-                tx.execute(
+                exec(
                     "INSERT OR IGNORE INTO remote_outbox (box, cmd_id, thread, turn, op, created)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
@@ -806,13 +811,13 @@ impl Store {
             }
         }
         for (box_name, cmd_id) in batch.remote_done {
-            tx.execute(
+            exec(
                 "DELETE FROM remote_outbox WHERE box = ?1 AND cmd_id = ?2",
                 params![box_name, cmd_id],
             )?;
         }
         for thread in batch.stop_requests {
-            tx.execute(
+            exec(
                 "INSERT OR REPLACE INTO stop_requests (thread, ts) VALUES (?1, ?2)",
                 params![
                     thread,
