@@ -11729,7 +11729,7 @@ pub(crate) mod tests {
     fn slash_commands_run_locally_and_never_as_messages() {
         let mut st = five_threads();
         st.set_focus(Some("t-gamma".into()));
-        // /orch (and /orchestrator): the same confirmation as `o`.
+        // /orch (and /orchestrator): it asks to confirm the switch.
         assert!(type_line(&mut st, "/orchestrator codex o5").is_empty());
         assert!(st.view.input.is_empty());
         assert_eq!(

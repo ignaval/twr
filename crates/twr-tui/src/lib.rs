@@ -438,7 +438,7 @@ pub fn transient_status(method: &str, result: &Value) -> bool {
 /// orchestrator that cannot run, which says what to do from the TUI.
 pub fn error_status(method: &str, error: &str) -> String {
     if method == "say" && error.contains("no orchestrator is available") {
-        return "no orchestrator can run: nothing was sent. Switch it with o or /orch".into();
+        return "no orchestrator can run: nothing was sent. Switch it with /orch".into();
     }
     format!("{method}: {error}")
 }
@@ -5804,7 +5804,7 @@ mod tests {
                 "say",
                 "conflict: no orchestrator is available (runtime \"codex\" is not available)"
             ),
-            "no orchestrator can run: nothing was sent. Switch it with o or /orch"
+            "no orchestrator can run: nothing was sent. Switch it with /orch"
         );
         assert_eq!(
             error_status("thread.stop", "not_found: x"),
