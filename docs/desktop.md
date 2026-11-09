@@ -26,6 +26,11 @@ three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remain
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
 markers. A desktop app launched by a twr agent cannot turn itself into a user client.
+The window opens first: reading the login shell (at most 8 seconds, with no input, so an
+rc file that prompts does not stall it) and staging the engines happen while it loads,
+and the hub connection, CLI forms, terminals and other programs wait for them. A login
+shell that fails or times out is recorded in the diagnostics log, and the app continues
+with the environment it was launched with.
 
 ## Sidebar
 
@@ -187,7 +192,10 @@ log. Tokens, keys, URL credentials and your home folder path are removed first.
 
 The bundled executables are copied to a content-addressed private engine directory before
 starting a hub. A hub therefore keeps a stable executable path after an AppImage mount or
-macOS translocated app disappears. Existing engine versions are retained while hubs may
+macOS translocated app disappears. Packaged builds ship the engines' SHA-256 digests in
+`resources/bin/digests.json` (written by `npm run build:rust`), so a launch does not hash
+the engines again, even from an AppImage's new mount path; each copy is verified against
+those digests, and a manifest that does not match its engines is ignored. Existing engine versions are retained while hubs may
 still use them. Restarting or updating the desktop never silently stops an existing hub.
 
 The iOS and Android clients share this React UI and Rust projection through an

@@ -139,13 +139,25 @@ export class AppServices {
     );
   }
 
-  /** Before any window exists: decide whether this launch starts hidden. */
+  private startedHidden = false;
+
+  /**
+   * Before any window exists: decide whether this launch starts hidden. On
+   * Linux the tray host is checked only after the window exists, so a login
+   * launch that would hide starts hidden and `probe` shows the window when
+   * there turns out to be no tray to bring it back from.
+   */
   get startHidden() {
     const atLogin =
       process.argv.includes(AUTOSTART_ARG) ||
       (process.platform === "darwin" &&
         app.getLoginItemSettings().wasOpenedAtLogin === true);
-    return atLogin && this.background;
+    this.startedHidden =
+      atLogin &&
+      (process.platform === "linux"
+        ? this.host.settings().background === true && this.trayEnabled
+        : this.background);
+    return this.startedHidden;
   }
 
   get trayEnabled() {
@@ -161,31 +173,22 @@ export class AppServices {
     );
   }
 
-  async start() {
+  private settleUpdateMode!: (
+    mode: Promise<{ automatic: boolean; manualReason?: string }>,
+  ) => void;
+
+  /** Everything that needs no subprocess; runs before the window is created. */
+  start() {
     this.log.info(
       "app",
       `twr ${app.getVersion()} starting (${this.kind}, Electron ${process.versions.electron}, ${process.platform} ${release()})`,
     );
-    let automatic = this.kind === "appimage";
-    let manualReason: string | undefined;
-    if (this.kind === "mac") {
-      automatic = await macDeveloperIdSigned();
-      if (!automatic)
-        manualReason =
-          "This build is not signed with a Developer ID, which macOS requires to replace the app automatically.";
-    } else if (this.kind === "deb")
-      manualReason = "Debian packages are updated through apt.";
-    else if (this.kind === "pacman")
-      manualReason =
-        "Arch packages are updated through pacman or your AUR helper.";
-    else if (this.kind === "portable")
-      manualReason = "This portable copy is replaced by hand.";
-    else if (this.kind === "development")
-      manualReason = "Development builds are not updated.";
+    const mode = new Promise<{ automatic: boolean; manualReason?: string }>(
+      (resolve) => (this.settleUpdateMode = resolve),
+    );
     this.updater = new Updater({
       kind: this.kind,
-      automatic,
-      manualReason,
+      mode,
       current: app.getVersion(),
       log: this.log,
       autoDownload: () => this.autoUpdate,
@@ -199,16 +202,6 @@ export class AppServices {
       },
     });
     this.refreshAutostart(linuxLaunchCommand(process.env, process.execPath));
-    this.trayAvailable = await statusNotifierAvailable();
-    if (!this.trayAvailable) {
-      this.log.info(
-        "tray",
-        "No StatusNotifier host yet; checking again while the session starts.",
-      );
-      // At login, uwsm can start twr before Waybar registers its tray.
-      void this.waitForTray();
-    }
-    this.applyTray();
     // Automated QA never reaches the network on its own schedule.
     const scheduled =
       this.kind !== "development" &&
@@ -236,6 +229,29 @@ export class AppServices {
           `${details.type} exited: ${details.reason} (code ${details.exitCode})`,
         );
     });
+  }
+
+  /**
+   * The subprocess checks (the macOS code signature, the Linux tray host), run
+   * once the window exists so they never delay it.
+   */
+  async probe() {
+    this.settleUpdateMode(updateMode(this.kind));
+    this.trayAvailable = await statusNotifierAvailable();
+    if (!this.trayAvailable) {
+      this.log.info(
+        "tray",
+        "No StatusNotifier host yet; checking again while the session starts.",
+      );
+      // At login, uwsm can start twr before Waybar registers its tray.
+      void this.waitForTray();
+    }
+    this.applyTray();
+    // Hidden at login with no tray to come back from: show the window.
+    if (this.startedHidden && !this.background) {
+      this.log.info("window", "No tray host; showing the window");
+      this.host.showWindow();
+    }
   }
 
   get autoUpdate() {
@@ -471,6 +487,31 @@ function readPackageType() {
   } catch {
     return undefined;
   }
+}
+
+async function updateMode(
+  kind: AppServices["kind"],
+): Promise<{ automatic: boolean; manualReason?: string }> {
+  if (kind === "appimage") return { automatic: true };
+  if (kind === "mac")
+    return (await macDeveloperIdSigned())
+      ? { automatic: true }
+      : {
+          automatic: false,
+          manualReason:
+            "This build is not signed with a Developer ID, which macOS requires to replace the app automatically.",
+        };
+  const manualReason =
+    kind === "deb"
+      ? "Debian packages are updated through apt."
+      : kind === "pacman"
+        ? "Arch packages are updated through pacman or your AUR helper."
+        : kind === "portable"
+          ? "This portable copy is replaced by hand."
+          : kind === "development"
+            ? "Development builds are not updated."
+            : undefined;
+  return { automatic: false, manualReason };
 }
 
 function macDeveloperIdSigned(): Promise<boolean> {

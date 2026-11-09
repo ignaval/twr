@@ -1,5 +1,7 @@
 import { createHash, type Hash } from "node:crypto";
 import {
+  createReadStream,
+  type Stats,
   openSync,
   readSync,
   closeSync,
@@ -44,6 +46,16 @@ export function fileDigest(path: string, aggregate?: Hash): string {
   return digest.digest("hex");
 }
 
+/** The same digest as fileDigest, read in the background so the window keeps painting. */
+export async function streamDigest(path: string): Promise<string> {
+  const digest = createHash("sha256");
+  for await (const chunk of createReadStream(path, {
+    highWaterMark: 1024 * 1024,
+  }))
+    digest.update(chunk as Buffer);
+  return digest.digest("hex");
+}
+
 // ctime changes on writes even when a caller restores mtime. Reuse a digest only
 // while the file's full identity and metadata remain unchanged.
 export class EngineDigests {
@@ -57,21 +69,15 @@ export class EngineDigests {
       }
     } catch {}
   }
-  digest(path: string): string {
-    const stat = statSync(path);
-    const stamp = [
-      stat.dev,
-      stat.ino,
-      stat.size,
-      stat.mtimeMs,
-      stat.ctimeMs,
-      stat.mode,
-    ].join(":");
+  async digest(path: string): Promise<string> {
+    const stamp = fileStamp(await fs.stat(path));
     const saved = this.entries[path];
     if (saved?.stamp === stamp && /^[a-f0-9]{64}$/.test(saved.hash))
       return saved.hash;
-    const hash = fileDigest(path);
-    this.entries[path] = { stamp, hash };
+    const hash = await streamDigest(path);
+    // A file that changed while it was read gets no cached digest.
+    if (fileStamp(await fs.stat(path)) === stamp)
+      this.entries[path] = { stamp, hash };
     return hash;
   }
   save() {
@@ -83,6 +89,108 @@ export class EngineDigests {
       renameSync(scratch, this.index);
     } catch {}
   }
+}
+
+function fileStamp(stat: Stats) {
+  return [
+    stat.dev,
+    stat.ino,
+    stat.size,
+    stat.mtimeMs,
+    stat.ctimeMs,
+    stat.mode,
+  ].join(":");
+}
+
+/** The manifest scripts/build-rust.mjs writes beside a build's engines. */
+export const SHIPPED_DIGESTS = "digests.json";
+
+/** The digests a packaged build ships beside its engines, if present and well formed. */
+export function readShippedDigests(
+  directory: string,
+): Map<string, string> | undefined {
+  try {
+    const path = join(directory, SHIPPED_DIGESTS);
+    if (statSync(path).size > 64 * 1024) return undefined;
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    const digests = new Map<string, string>();
+    for (const name of ENGINE_BINARIES) {
+      const digest = value?.[name];
+      if (typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest))
+        return undefined;
+      digests.set(name, digest);
+    }
+    return digests;
+  } catch {
+    return undefined;
+  }
+}
+
+class EngineMismatch extends Error {}
+
+/**
+ * Copies the engines in `source` into `root/<digest>`, a directory named by the
+ * SHA-256 of its contents, and returns that directory. A packaged build passes
+ * `trustShipped` to take the source digests from its own manifest: an AppImage
+ * mounts at a new path on every launch, so a path-keyed cache would never hit.
+ * Every copy is verified against its expected digest before it is moved into
+ * place, and a manifest that does not match its engines is ignored.
+ */
+export async function stageEngines(
+  source: string,
+  root: string,
+  trustShipped = false,
+): Promise<string> {
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  const cache = new EngineDigests(join(root, "digests.json"));
+  const shipped = trustShipped ? readShippedDigests(source) : undefined;
+  try {
+    return await stage(source, root, cache, shipped);
+  } catch (error) {
+    if (!(error instanceof EngineMismatch) || !shipped) throw error;
+    return await stage(source, root, cache, undefined);
+  } finally {
+    cache.save();
+  }
+}
+
+async function stage(
+  source: string,
+  root: string,
+  cache: EngineDigests,
+  shipped: Map<string, string> | undefined,
+) {
+  const expected = new Map<string, string>();
+  for (const name of ENGINE_BINARIES)
+    expected.set(
+      name,
+      shipped?.get(name) ?? (await cache.digest(join(source, name))),
+    );
+  const digest = createHash("sha256")
+    .update(JSON.stringify([...expected]))
+    .digest("hex");
+  const stable = join(root, digest);
+  await fs.mkdir(stable, { recursive: true, mode: 0o700 });
+  for (const name of ENGINE_BINARIES) {
+    const target = join(stable, name);
+    if (
+      existsSync(target) &&
+      (await cache.digest(target)) === expected.get(name)
+    )
+      continue;
+    const scratch = join(stable, `.${name}-${randomUUID()}`);
+    try {
+      await fs.copyFile(join(source, name), scratch);
+      await fs.chmod(scratch, 0o755);
+      if ((await streamDigest(scratch)) !== expected.get(name))
+        throw new EngineMismatch(`${name} does not match its expected digest`);
+      await fs.rename(scratch, target);
+    } finally {
+      await fs.rm(scratch, { force: true });
+    }
+    await cache.digest(target);
+  }
+  return stable;
 }
 
 export function pruneEngines(

@@ -18,15 +18,12 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
-  copyFileSync,
-  chmodSync,
   renameSync,
-  statSync,
 } from "node:fs";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
 import { z } from "zod";
 import { Bridge } from "./bridge";
@@ -44,7 +41,8 @@ import {
   workspaceSchema,
 } from "./validation";
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
-import { ENGINE_BINARIES, EngineDigests, cleanupEngines } from "./engines";
+import { ENGINE_BINARIES, cleanupEngines, stageEngines } from "./engines";
+import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
@@ -191,17 +189,36 @@ function trusted(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent) {
   )
     throw new Error("Untrusted desktop page");
 }
-function handle(channel: string, callback: (...args: any[]) => any) {
-  ipcMain.handle(`twr:${channel}`, (event, ...args) => {
+// The login environment and the staged engines. The window opens before they are
+// ready; every handler that runs a program or uses its PATH waits for them, so
+// nothing ever runs with the launch environment by mistake.
+let markEnvReady!: () => void;
+let failEnv!: (error: unknown) => void;
+const envReady = new Promise<void>((resolve, reject) => {
+  markEnvReady = resolve;
+  failEnv = reject;
+});
+envReady.catch(() => {});
+function handle(
+  channel: string,
+  callback: (...args: any[]) => any,
+  needsEnvironment = false,
+) {
+  ipcMain.handle(`twr:${channel}`, async (event, ...args) => {
     trusted(event);
+    if (needsEnvironment) await envReady;
     return callback(...args);
   });
 }
+const handleWithEnvironment = (
+  channel: string,
+  callback: (...args: any[]) => any,
+) => handle(channel, callback, true);
 function companion() {
   if (!bridge) throw new Error("Connect to a workspace first");
   return bridge;
 }
-function findBinaries() {
+async function findBinaries() {
   const dirs = app.isPackaged
     ? [join(process.resourcesPath, "bin")]
     : ([
@@ -219,31 +236,9 @@ function findBinaries() {
     );
   // Persistent hubs must never depend on an AppImage mount or macOS app translocation.
   const root = join(app.getPath("userData"), "engines");
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  const cache = new EngineDigests(join(root, "digests.json"));
-  const sourceHashes = new Map(
-    ENGINE_BINARIES.map((name) => [name, cache.digest(join(dir, name))]),
-  );
-  const digest = createHash("sha256")
-    .update(JSON.stringify([...sourceHashes]))
-    .digest("hex");
-  const stable = join(app.getPath("userData"), "engines", digest);
-  mkdirSync(stable, { recursive: true, mode: 0o700 });
-  for (const name of ENGINE_BINARIES) {
-    const target = join(stable, name);
-    const source = join(dir, name);
-    if (
-      !existsSync(target) ||
-      cache.digest(target) !== sourceHashes.get(name)
-    ) {
-      const scratch = join(stable, `.${name}-${randomUUID()}`);
-      copyFileSync(source, scratch);
-      chmodSync(scratch, 0o755);
-      renameSync(scratch, target);
-      cache.digest(target);
-    }
-  }
-  cache.save();
+  // A packaged build ships its engines' digests; a development checkout's
+  // binaries change under it, so they are always hashed.
+  const stable = await stageEngines(dir, root, app.isPackaged);
   setTimeout(
     () =>
       void cleanupEngines(
@@ -274,36 +269,38 @@ function findBinaries() {
 async function loadLoginEnvironment() {
   if (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA) return;
   const program = process.env.SHELL || "/bin/sh";
-  if (!isAbsolute(program) || !existsSync(program)) return;
-  try {
-    const { stdout } = await exec(
-      program,
-      ["-ilc", "printf '\\0TWR_DESKTOP_ENV\\0'; /usr/bin/env -0"],
-      { timeout: 8000, maxBuffer: 4 * 1024 * 1024 },
+  if (!isAbsolute(program) || !existsSync(program)) {
+    services?.log.warn(
+      "environment",
+      `Login shell ${program} was not found; using the launch environment`,
     );
-    const marker = "\0TWR_DESKTOP_ENV\0";
-    const start = stdout.indexOf(marker);
-    if (start < 0) return;
-    for (const entry of stdout.slice(start + marker.length).split("\0")) {
-      const equals = entry.indexOf("=");
-      if (equals <= 0) continue;
-      const key = entry.slice(0, equals);
-      // Preserve identity and harness controls; never turn an agent-launched process into a user.
-      if (
-        /^(?:TWR_AGENT$|TWR_ORCH_TOKEN|TWR_TEST_USER_TOKEN_FILE$|TWR_DESKTOP_|ELECTRON_|NODE_OPTIONS$|NODE_PATH$)/.test(
-          key,
-        )
-      )
-        continue;
-      if (
-        ["TWR_HOME", "TWR_WORKSPACE"].includes(key) &&
-        process.env[key] !== undefined
-      )
-        continue;
-      loginEnv[key] = entry.slice(equals + 1);
+    return;
+  }
+  const started = Date.now();
+  try {
+    const values = parseLoginEnvironment(
+      await runLoginShell(program),
+      process.env,
+    );
+    if (!values) {
+      services?.log.warn(
+        "environment",
+        `${program} printed no environment; using the launch environment`,
+      );
+      return;
     }
-  } catch {
-    /* A broken login shell does not prevent opening settings or diagnosing it. */
+    Object.assign(loginEnv, values);
+    services?.log.info(
+      "environment",
+      `Read the login environment from ${program} in ${Date.now() - started} ms`,
+    );
+  } catch (error) {
+    // A broken login shell does not prevent opening settings or diagnosing it.
+    services?.log.warn(
+      "environment",
+      `Could not read the login environment from ${program}; using the launch environment`,
+      error,
+    );
   }
 }
 async function cli(args: unknown) {
@@ -335,7 +332,10 @@ async function cli(args: unknown) {
 async function connect(name: unknown) {
   const next = workspaceSchema.parse(name);
   const generation = localGeneration;
-  const task = connectTail.then(() => {
+  // The generation is taken before waiting, so leaving the local hub while the
+  // environment loads still cancels this connection.
+  const task = connectTail.then(async () => {
+    await envReady;
     if (generation !== localGeneration)
       throw new Error("This hub connection was closed");
     return connectWorkspace(next, generation);
@@ -432,14 +432,17 @@ function register() {
     },
     !app.isPackaged,
   );
-  const gateway = new GatewaySetup(
-    binaries.gateway,
-    env,
-    join(app.getPath("userData"), "gateway.log"),
-    (url, timeout) => remoteTransport.check(url, timeout),
-    (settings) => saveDesktopSettings({ gateway: settings }),
-    desktopSettings.gateway,
-  );
+  // Created once the engines are staged; every gateway handler waits for them.
+  let gatewaySetup: GatewaySetup | undefined;
+  const gateway = () =>
+    (gatewaySetup ||= new GatewaySetup(
+      binaries.gateway,
+      env,
+      join(app.getPath("userData"), "gateway.log"),
+      (url, timeout) => remoteTransport.check(url, timeout),
+      (settings) => saveDesktopSettings({ gateway: settings }),
+      desktopSettings.gateway,
+    ));
   const messageReceipts = new MessageReceipts(
     new SecureStore(join(app.getPath("userData"), "secure", "receipts")),
   );
@@ -479,7 +482,7 @@ function register() {
   handle("secure-delete", (key) =>
     offlineVault.delete(z.string().max(512).parse(key)),
   );
-  handle(
+  handleWithEnvironment(
     "inbox-sources",
     coalesceInboxSources(async () => {
       const started = Date.now();
@@ -509,14 +512,20 @@ function register() {
   handle("remote-disconnect", () => remoteTransport.disconnect());
   handle("remote-remove", (request) => remoteTransport.removeHub(request));
   handle("remote-reset", () => remoteTransport.resetSavedHubs());
-  handle("gateway-status", () => gateway.status());
-  handle("gateway-cancel-invitation", () => gateway.cancelInvitation());
-  handle("gateway-stop", () => gateway.stop());
-  handle("gateway-settings", () => gateway.saved());
+  handleWithEnvironment("gateway-status", () => gateway().status());
+  handleWithEnvironment("gateway-cancel-invitation", () =>
+    gateway().cancelInvitation(),
+  );
+  handleWithEnvironment("gateway-stop", () => gateway().stop());
+  handleWithEnvironment("gateway-settings", () => gateway().saved());
   handle("gateway-check", (request) => remoteTransport.check(request.url));
-  handle("gateway-setup", (request) => gateway.setup(request));
-  handle("gateway-restart", (request) => gateway.restart(request));
-  handle("gateway-invite", (request) => gateway.invite(request));
+  handleWithEnvironment("gateway-setup", (request) => gateway().setup(request));
+  handleWithEnvironment("gateway-restart", (request) =>
+    gateway().restart(request),
+  );
+  handleWithEnvironment("gateway-invite", (request) =>
+    gateway().invite(request),
+  );
   handle("deactivate-local", async () => {
     ++localGeneration;
     workspaceReady = false;
@@ -555,8 +564,8 @@ function register() {
     app.quit();
   });
   voice = new DesktopVoice(() => binaries.twr, env, emit);
-  handle("voice-status", () => voice!.status());
-  handle("voice-setup", () => voice!.setup());
+  handleWithEnvironment("voice-status", () => voice!.status());
+  handleWithEnvironment("voice-setup", () => voice!.setup());
   handle("voice-arm", async (on) => {
     microphoneArmed = z.boolean().parse(on);
     // Voice QA (scripts/voice-qa.mjs) plays a recording as the microphone in a development
@@ -578,12 +587,12 @@ function register() {
       }
     }
   });
-  handle("voice-transcribe", (recording, hint) =>
+  handleWithEnvironment("voice-transcribe", (recording, hint) =>
     voice!.transcribe(recording, hint),
   );
-  handle("voice-speaker", (op) => voice!.speakerControl(op));
+  handleWithEnvironment("voice-speaker", (op) => voice!.speakerControl(op));
   let catalog: ReturnType<typeof discoverCatalog> | undefined;
-  handle(
+  handleWithEnvironment(
     "catalog",
     () =>
       (catalog ||= discoverCatalog(
@@ -658,7 +667,7 @@ function register() {
       throw new Error("Request too large");
     return companion().call(method, params);
   });
-  handle("cli", cli);
+  handleWithEnvironment("cli", cli);
   handle("config-read", () => companion().call("desktop.config.read"));
   handle("config-save", (content, hash) =>
     companion().call("desktop.config.save", {
@@ -707,7 +716,7 @@ function register() {
     if (!result.canceled && result.filePath)
       writeFileSync(result.filePath, text, { mode: 0o600 });
   });
-  handle("terminal-open", async (request) => {
+  handleWithEnvironment("terminal-open", async (request) => {
     if (!workspaceReady)
       throw new Error("Connect to the workspace before starting a terminal");
     const terminalWorkspace = workspace;
@@ -1092,10 +1101,27 @@ else {
           ? join(app.getPath("userData"), "logs")
           : app.getPath("logs"),
       );
-      await loadLoginEnvironment();
-      binaries = findBinaries();
+      services.start();
+      // The login shell and the engine copy run while the window opens.
+      void (async () => {
+        await loadLoginEnvironment();
+        binaries = await findBinaries();
+      })().then(
+        () => {
+          services?.log.info(
+            "app",
+            `Environment and engines ready ${Math.round(process.uptime() * 1000)} ms after launch`,
+          );
+          markEnvReady();
+        },
+        (error) => {
+          failEnv(error);
+          services?.log.error("app", "Startup failed", error);
+          dialog.showErrorBox("Could not open twr", String(error));
+          app.quit();
+        },
+      );
       register();
-      await services.start();
       if (process.platform === "linux") {
         let previous = JSON.stringify(omarchyTheme());
         const timer = setInterval(() => {
@@ -1192,6 +1218,15 @@ else {
           if (window && !window.isDestroyed()) window.close();
         });
       await createWindow(services.startHidden);
+      services.log.info(
+        "app",
+        `Window loaded ${Math.round(process.uptime() * 1000)} ms after launch`,
+      );
+      void services
+        .probe()
+        .catch((error) =>
+          services?.log.warn("app", "Startup checks failed", error),
+        );
       app.on("activate", () => {
         services?.log.info("window", "Activated; showing the window");
         showWindow();
