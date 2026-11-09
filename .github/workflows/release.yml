@@ -496,6 +496,10 @@ jobs:
           gh attestation verify twr-<target>.tar.gz --repo ignaval/twr \\
             --signer-workflow ignaval/twr/.github/workflows/release.yml
           \`\`\`
+
+          The desktop installers of a stable release, attached once built, are listed in
+          \`desktop-sha256sums.txt\`, signed in \`desktop-sha256sums.txt.sig\` with the same key,
+          and have attestations too.
           NOTES
           gh release create "$TAG" --verify-tag --title "twr $TAG" --generate-notes \
             --notes-file notes.md "${flags[@]}" dist/*
@@ -520,9 +524,29 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: release
+    # The release (contents), and the installers' build provenance (an OIDC token for Sigstore,
+    # and the attestations), as in the release job.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
+      # The tagged commit, for the public key the checksums' signature is checked against. In
+      # src/, apart from the downloaded installers.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: src
+          persist-credentials: false
+      - name: Check that the checkout is the tagged commit
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          head=$(git -C src rev-parse HEAD)
+          if [ -z "$SHA" ] || [ "$head" != "$SHA" ]; then
+            echo "::error::checked out $head, but refs/tags/$TAG is ${SHA:-unresolved}"
+            exit 1
+          fi
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: twr-desktop-release-macos
@@ -558,6 +582,58 @@ jobs:
           if [ -f desktop/latest-mac.yml ]; then grep -qx "version: $version" desktop/latest-mac.yml; fi
           (cd desktop && printf '# twr desktop release %s\n' "$TAG" > desktop-sha256sums.txt && sha256sum -- * | grep -v desktop-sha256sums >> desktop-sha256sums.txt)
           cat desktop/desktop-sha256sums.txt
+          # The same list without its first line, for the provenance step.
+          grep -v '^#' desktop/desktop-sha256sums.txt > "$RUNNER_TEMP/desktop-subjects.txt"
+
+      # Build provenance for every file desktop-sha256sums.txt lists: `gh attestation verify
+      # <file> --repo ignaval/twr --signer-workflow ignaval/twr/.github/workflows/release.yml`.
+      # Only on a tag push, for the reason the release job gives.
+      - if: github.event_name == 'push' && needs.resolve.outputs.sha == github.sha
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/desktop-subjects.txt
+      - if: github.event_name != 'push' || needs.resolve.outputs.sha != github.sha
+        run: |
+          echo "::notice::no desktop provenance, because this run's commit is not the tag's (a manual rebuild runs from main)"
+
+      # desktop-sha256sums.txt.sig: the Ed25519 signature of the desktop checksums with the
+      # release key (base64 of the raw 64 bytes), made and checked against
+      # release/signing-key.pub as the release job does for sha256sums.txt.
+      - name: Sign the desktop checksums
+        shell: bash
+        env:
+          TWR_RELEASE_SIGNING_KEY: ${{ secrets.TWR_RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$TWR_RELEASE_SIGNING_KEY" ]; then
+            echo "::error::the release environment has no TWR_RELEASE_SIGNING_KEY secret (see docs/tools/make-signing-key.sh); releases are signed"
+            exit 1
+          fi
+          # In a private directory this step makes, recorded for the cleanup step.
+          keydir=$(mktemp -d "$RUNNER_TEMP/signing.XXXXXXXX")
+          echo "TWR_SIGNING_DIR=$keydir" >> "$GITHUB_ENV"
+          key="$keydir/key.pem"
+          (umask 077 && set -C && printf '%s\n' "$TWR_RELEASE_SIGNING_KEY" > "$key")
+          f=desktop/desktop-sha256sums.txt
+          openssl pkeyutl -sign -rawin -inkey "$key" -in "$f" | base64 -w0 > "$f.sig"
+          base64 -d "$f.sig" > "$RUNNER_TEMP/desktop-sha256sums.sig.bin"
+          if [ "$(wc -c < "$RUNNER_TEMP/desktop-sha256sums.sig.bin")" != 64 ] ||
+            ! openssl pkeyutl -verify -rawin -pubin -inkey src/release/signing-key.pub \
+              -sigfile "$RUNNER_TEMP/desktop-sha256sums.sig.bin" -in "$f"; then
+            echo "::error::the signature of $f does not verify with release/signing-key.pub: TWR_RELEASE_SIGNING_KEY is not the key's private half"
+            exit 1
+          fi
+
+      - name: Remove the signing key
+        if: always()
+        run: |
+          # Only the directory the signing step made (empty when it didn't get that far).
+          if [ -n "${TWR_SIGNING_DIR:-}" ] && [ -d "$TWR_SIGNING_DIR" ] && [ ! -L "$TWR_SIGNING_DIR" ]; then
+            if [ -f "$TWR_SIGNING_DIR/key.pem" ] && [ ! -L "$TWR_SIGNING_DIR/key.pem" ]; then
+              shred -u "$TWR_SIGNING_DIR/key.pem" || rm -f "$TWR_SIGNING_DIR/key.pem"
+            fi
+            rm -rf "$TWR_SIGNING_DIR"
+          fi
+
       - name: Attach to the release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -107,6 +107,19 @@ gh attestation verify twr-x86_64-unknown-linux-musl.tar.gz --repo ignaval/twr \
   --signer-workflow ignaval/twr/.github/workflows/release.yml
 ```
 
+The desktop files are covered the same way from the first release after v0.3.0. `desktop-sha256sums.txt` starts with `# twr desktop release <tag>` and is signed with the same key, in `desktop-sha256sums.txt.sig`; each installer it lists has a build provenance attestation:
+
+```sh
+openssl base64 -d -A -in desktop-sha256sums.txt.sig -out desktop-sha256sums.txt.sig.bin
+openssl pkeyutl -verify -rawin -pubin -inkey signing-key.pub \
+  -sigfile desktop-sha256sums.txt.sig.bin -in desktop-sha256sums.txt
+sha256sum -c desktop-sha256sums.txt --ignore-missing
+gh attestation verify twr-<version>.AppImage --repo ignaval/twr \
+  --signer-workflow ignaval/twr/.github/workflows/release.yml
+```
+
+On macOS, check the disk image with `grep ' twr-<version>-arm64.dmg$' desktop-sha256sums.txt | shasum -a 256 -c`.
+
 ## From source
 
 You need a stable Rust toolchain, 1.98 or newer, and git. The repository's `rust-toolchain.toml` pins the Rust that CI and the releases use (1.98.1). With rustup, cargo installs that version and uses it in the repository. To build with another toolchain, run `cargo +<toolchain> ...`.
