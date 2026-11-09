@@ -87,7 +87,9 @@ function Mobile() {
     useState<Record<string, string>>();
   async function load() {
     try {
-      setHubs((await Transport.listHubs()).hubs);
+      const { hubs, notice } = await Transport.listHubs();
+      setHubs(hubs);
+      if (notice) setError(notice);
     } catch (e) {
       setError(errorMessage(e));
     }

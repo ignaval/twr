@@ -21,7 +21,8 @@ export interface PairRequest {
 }
 /** Native code owns credentials, TLS and exactly one active socket. */
 export interface NativeTransport {
-  listHubs(): Promise<{ hubs: Hub[] }>;
+  /** `notice`: saved hubs were dropped (Android: undecryptable after a device transfer). */
+  listHubs(): Promise<{ hubs: Hub[]; notice?: string }>;
   pair(request: PairRequest): Promise<Hub>;
   connect(request: { id: string }): Promise<void>;
   send(request: { message: string }): Promise<void>;

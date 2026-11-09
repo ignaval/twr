@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Nothing of twr's leaves the phone in a backup or a device-to-device transfer
+  (Android 12+; allowBackup="false" covers older versions and cloud backup).
+  Saved hubs (shared_prefs/twr-private.xml) are encrypted with an Android
+  Keystore key that never moves: on a new phone they could not be decrypted.
+  The WebView's storage (drafts, local preferences) is under the root domain;
+  encrypted offline history is in the no-backup directory already.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="twr-private.xml" />
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="twr-private.xml" />
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
+    </device-transfer>
+</data-extraction-rules>

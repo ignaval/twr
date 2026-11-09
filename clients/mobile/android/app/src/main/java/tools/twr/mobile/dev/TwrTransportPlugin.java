@@ -34,9 +34,26 @@ public class TwrTransportPlugin extends Plugin {
     private final java.util.concurrent.atomic.AtomicLong connectionGeneration=new java.util.concurrent.atomic.AtomicLong();
     private String activeHub;
     private final java.util.concurrent.ExecutorService worker=java.util.concurrent.Executors.newSingleThreadExecutor();
+    private static final String VAULT_RESET="Saved hubs couldn't be restored on this device; pair again.";
+    /** The saved hubs could not be decrypted and were dropped: listHubs says so once. */
+    private boolean vaultReset=false;
+    /** A Keystore key that is gone or unusable, or data a different key encrypted. */
+    private static boolean unrecoverable(Throwable error) {
+        for(Throwable cause=error;cause!=null;cause=cause.getCause()) {
+            if(cause instanceof javax.crypto.AEADBadTagException||cause instanceof java.security.UnrecoverableKeyException||cause instanceof android.security.keystore.KeyPermanentlyInvalidatedException)return true;
+        }
+        return false;
+    }
     private SecretKey key() throws Exception {
         KeyStore store=KeyStore.getInstance("AndroidKeyStore");store.load(null);
-        if(store.containsAlias(KEY)) return (SecretKey)store.getKey(KEY,null);
+        if(store.containsAlias(KEY)) {
+            try {
+                return (SecretKey)store.getKey(KEY,null);
+            } catch(java.security.UnrecoverableKeyException unusable) {
+                // What it encrypted can't be read any more: start again with a new key.
+                store.deleteEntry(KEY);
+            }
+        }
         KeyGenerator generator=KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES,"AndroidKeyStore");
         generator.init(new KeyGenParameterSpec.Builder(KEY,KeyProperties.PURPOSE_ENCRYPT|KeyProperties.PURPOSE_DECRYPT).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build());
         return generator.generateKey();
@@ -45,8 +62,17 @@ public class TwrTransportPlugin extends Plugin {
     private synchronized JSONObject vault() throws Exception {
         String encoded=prefs().getString("hubs",null);if(encoded==null)return new JSONObject();
         byte[] bytes=Base64.decode(encoded,Base64.NO_WRAP);
-        Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,bytes,0,12));
-        return new JSONObject(new String(cipher.doFinal(bytes,12,bytes.length-12),java.nio.charset.StandardCharsets.UTF_8));
+        try {
+            Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,bytes,0,12));
+            return new JSONObject(new String(cipher.doFinal(bytes,12,bytes.length-12),java.nio.charset.StandardCharsets.UTF_8));
+        } catch(Exception error) {
+            // Restored from another phone, or its Keystore key was lost: the tokens can never
+            // be decrypted here. Drop them so pairing works again instead of failing forever.
+            if(!unrecoverable(error))throw error;
+            if(!prefs().edit().remove("hubs").commit())throw new Exception(VAULT_RESET,error);
+            vaultReset=true;
+            return new JSONObject();
+        }
     }
     private synchronized void save(JSONObject data) throws Exception {
         Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,key());
@@ -90,7 +116,7 @@ public class TwrTransportPlugin extends Plugin {
         if(text.length()>2048){call.reject("Scan a twr pairing invitation");return;}
         call.resolve(new JSObject().put("invitation",text));
     }
-    @PluginMethod public void listHubs(PluginCall call){try{JSONObject data=vault();JSArray hubs=new JSArray();java.util.Iterator<String> keys=data.keys();while(keys.hasNext()){String id=keys.next();hubs.put(metadata(id,data.getJSONObject(id)));}JSObject value=new JSObject();value.put("hubs",hubs);call.resolve(value);}catch(Exception e){call.reject("Could not read paired hubs",e);}}
+    @PluginMethod public void listHubs(PluginCall call){try{JSONObject data=vault();JSArray hubs=new JSArray();java.util.Iterator<String> keys=data.keys();while(keys.hasNext()){String id=keys.next();hubs.put(metadata(id,data.getJSONObject(id)));}JSObject value=new JSObject();value.put("hubs",hubs);synchronized(this){if(vaultReset){vaultReset=false;value.put("notice",VAULT_RESET);}}call.resolve(value);}catch(Exception e){call.reject("Could not read paired hubs",e);}}
     @PluginMethod public void pair(PluginCall call){worker.execute(()->{try{
         String url=endpoint(call.getString("url",""));JSONObject body=new JSONObject();body.put("code",call.getString("code",""));body.put("name",call.getString("name",""));
         try(Response health=http.newCall(new Request.Builder().url(url+"/health").build()).execute()) {
@@ -113,7 +139,7 @@ public class TwrTransportPlugin extends Plugin {
             }
             JSONObject record=new JSONObject(responseText);String id=java.util.UUID.randomUUID().toString();record.put("url",url);record.put("name",call.getString("hubName","My hub"));
             if(record.getString("token").length()!=64)throw new Exception("Invalid hub credentials");
-            JSONObject all=vault();all.put(id,record);save(all);call.resolve(metadata(id,record));
+            JSONObject all=vault();all.put(id,record);save(all);synchronized(this){vaultReset=false;}call.resolve(metadata(id,record));
         }
     }catch(Exception e){call.reject(e.getMessage(),e);}});}
     @PluginMethod public void connect(PluginCall call){try{
