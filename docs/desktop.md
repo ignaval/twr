@@ -171,6 +171,10 @@ twr keeps a local log (`twr-desktop.log`, rotated at 2 MiB) in the folder shown 
 **Help › Open Log Folder** and in Settings › Diagnostics (`~/Library/Logs/twr-desktop`
 on macOS; under the app's configuration folder on Linux). The log records startup, update checks, hub connection failures, renderer errors
 and crashed helper processes. Chromium crash reports are kept on disk and never uploaded.
+If the window's page ends unexpectedly (out of memory, a GPU failure), twr reloads it, up to
+three times in five minutes, then asks whether to reload or quit. A window that stops
+responding offers Wait or Reload; the question closes itself if the window recovers.
+Reloading keeps the hub, its agents and open terminals.
 **Settings › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
 version, install kind, platform and session details, GPU status, memory use and the recent
 log. Tokens, keys, URL credentials and your home folder path are removed first.

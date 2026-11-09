@@ -46,6 +46,7 @@ import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
+import { RendererRecovery } from "./crash-recovery";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
@@ -910,6 +911,54 @@ function showWindow() {
   window.show();
   window.focus();
 }
+const rendererRecovery = new RendererRecovery();
+let reloadRequested = false;
+let crashDialogOpen = false;
+function loadApp(target: BrowserWindow) {
+  return devUrl ? target.loadURL(devUrl) : target.loadFile(appFile);
+}
+async function recoverRenderer(target: BrowserWindow, reason: string) {
+  const requested = reloadRequested;
+  reloadRequested = false;
+  const action = rendererRecovery.gone(reason, {
+    quitting: quitting || quitRequested || target.isDestroyed(),
+    requested,
+  });
+  if (action === "ignore") return;
+  const reload = () => {
+    if (!target.isDestroyed())
+      loadApp(target).catch((error) =>
+        services?.log.error("renderer", "Could not reload the window", error),
+      );
+  };
+  if (action === "reload") {
+    services?.log.warn("renderer", `Reloading the window (${reason})`);
+    reload();
+    return;
+  }
+  if (crashDialogOpen) return;
+  crashDialogOpen = true;
+  try {
+    services?.log.error(
+      "renderer",
+      `The window ended repeatedly (${reason}); asking before reloading`,
+    );
+    // A question on a hidden background window would never be seen.
+    if (!target.isVisible()) target.show();
+    const { response } = await dialog.showMessageBox(target, {
+      type: "error",
+      message: "twr's window keeps stopping",
+      detail: `The window ended unexpectedly (${reason}) several times in the last few minutes. The hub, its agents and open terminals keep running. Help › Copy Diagnostics records what happened.`,
+      buttons: ["Reload", "Quit twr"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (response === 1) app.quit();
+    else reload();
+  } finally {
+    crashDialogOpen = false;
+  }
+}
 async function createWindow(hidden = false) {
   quitting = false;
   applyNativeAppearance();
@@ -938,9 +987,42 @@ async function createWindow(hidden = false) {
       if (mainFrame) void remoteTransport?.disconnect();
     },
   );
-  window.webContents.on("render-process-gone", () => {
+  const current = window;
+  window.webContents.on("render-process-gone", (_event, details) => {
     void remoteTransport?.disconnect();
+    void recoverRenderer(current, details.reason);
   });
+  let hang: AbortController | undefined;
+  window.on("unresponsive", async () => {
+    if (hang || current.isDestroyed()) return;
+    services?.log.warn("renderer", "The window stopped responding");
+    hang = new AbortController();
+    const signal = hang.signal;
+    try {
+      if (!current.isVisible()) current.show();
+      const { response } = await dialog.showMessageBox(current, {
+        type: "warning",
+        message: "twr is not responding",
+        detail:
+          "You can wait for the window to respond or reload it. The hub, its agents and open terminals keep running.",
+        buttons: ["Wait", "Reload"],
+        defaultId: 0,
+        cancelId: 0,
+        signal,
+      });
+      if (response === 1 && !signal.aborted && !current.isDestroyed()) {
+        services?.log.warn("renderer", "Reloading the unresponsive window");
+        // A hung renderer cannot reload itself: end it, and the
+        // render-process-gone handler loads the page again.
+        reloadRequested = true;
+        current.webContents.forcefullyCrashRenderer();
+      }
+    } finally {
+      hang = undefined;
+    }
+  });
+  // The dialog closes on its own once the window answers again.
+  window.on("responsive", () => hang?.abort());
   window.webContents.on("will-navigate", (event, url) => {
     if (url !== (devUrl || pathToFileURL(appFile).href)) event.preventDefault();
   });
@@ -1040,8 +1122,7 @@ async function createWindow(hidden = false) {
       if (!session.exited) session.process.kill();
     terminals.clear();
   });
-  if (devUrl) await window.loadURL(devUrl);
-  else await window.loadFile(appFile);
+  await loadApp(window);
 }
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
