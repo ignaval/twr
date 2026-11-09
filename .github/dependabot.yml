@@ -1,14 +1,33 @@
 # Weekly dependency updates, proposed as pull requests against dev (the default branch).
+#
+# No `swift` entry: clients/mobile/ios/App/CapApp-SPM/Package.swift is written by `cap sync`
+# (Capacitor's "DO NOT MODIFY"), its one remote package (capacitor-swift-pm) is pinned to the
+# version of the npm package @capacitor/ios, which the npm entry updates, and its other packages
+# are paths into clients/node_modules, which Dependabot's checkout does not have.
 version: 2
 updates:
+  # The desktop app and the mobile app's web layer and Capacitor plugins (clients/package-lock.json).
   - package-ecosystem: npm
-    directory: /desktop
+    directory: /clients
     target-branch: dev
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      desktop-minor-and-patch:
+      clients-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+  # The Android app's Gradle plugins and libraries (build.gradle, app/build.gradle,
+  # variables.gradle).
+  - package-ecosystem: gradle
+    directory: /clients/mobile/android
+    target-branch: dev
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      android-minor-and-patch:
         update-types:
           - minor
           - patch
