@@ -47,6 +47,7 @@ import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
 import { RendererRecovery } from "./crash-recovery";
+import { contextMenuTemplate } from "./context-menu";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
@@ -988,6 +989,21 @@ async function createWindow(hidden = false) {
     },
   );
   const current = window;
+  // Electron has no default right-click menu; a page that handles the event
+  // itself (preventDefault) does not get this one.
+  window.webContents.on("context-menu", (_event, params) => {
+    const template = contextMenuTemplate(params, {
+      copyText: (text) => clipboard.writeText(text),
+      replaceMisspelling: (word) =>
+        current.webContents.replaceMisspelling(word),
+    });
+    if (template.length)
+      Menu.buildFromTemplate(template).popup({
+        window: current,
+        x: params.x,
+        y: params.y,
+      });
+  });
   window.webContents.on("render-process-gone", (_event, details) => {
     void remoteTransport?.disconnect();
     void recoverRenderer(current, details.reason);

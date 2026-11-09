@@ -113,6 +113,8 @@ it has been on screen 300 ms, so a key pressed as it appears isn't taken for it)
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
 
+Right-click offers Cut, Copy, Paste and Select All in text fields, Copy for selected text,
+and Copy Link Address on a link (links are copied, not opened).
 macOS uses Command shortcuts; Linux uses Control. Terminal keys pass to the terminal,
 including Ctrl-K/Ctrl-W. Ctrl/Cmd-K opens the palette outside terminals; Ctrl/Cmd-B toggles
 the sidebar; Ctrl/Cmd-G toggles the grid. The focus filter is Cmd-Shift-F on macOS
