@@ -105,7 +105,8 @@ A gateway companion authenticates with `hello {client, protocol, device_token}`.
 is a paired-device credential, not an orchestrator token or the debug-only `user_token`.
 The hub reports `user:device:<id>`, checks the device's `read`, `operate`, `terminal` and
 `admin` grants on every method, and refuses methods without a grant. Revocation closes
-existing connections too. An agent or orchestrator cannot present a device token to widen
+existing connections too; a device list the hub cannot read revokes nothing (`hello` with a
+device token then fails with `internal`, not `unauthorized`). An agent or orchestrator cannot present a device token to widen
 its authority, and a device connection cannot become an unrestricted local user.
 Pairing is local-owner-only; a device cannot create or complete another pairing even with
 `admin`. Treat the token as a secret: native clients keep it outside the renderer, and the
@@ -428,7 +429,7 @@ MCP tool text:
 
 | method | params | result | notable errors |
 |---|---|---|---|
-| `hello` | `{client, token?, protocol?, user_token?, device_token?}` (`user_token`: tests only, see docs/development.md) | `{client, identity, workspace}` (`"user:<client>"` or `"orchestrator"`; the workspace the hub serves) | `bad_request`, `unauthorized`, `unsupported` (a twr older than the hub) |
+| `hello` | `{client, token?, protocol?, user_token?, device_token?}` (`user_token`: tests only, see docs/development.md) | `{client, identity, workspace}` (`"user:<client>"` or `"orchestrator"`; the workspace the hub serves) | `bad_request`, `unauthorized`, `internal` (a device token when paired devices cannot be read), `unsupported` (a twr older than the hub) |
 | `device.pair_begin` | `{scopes?: [read, operate, terminal, admin]}` (default read + operate; local owner only) | `{code, expires_in: 300}`; a fresh code replaces the pending code | `bad_request`, `unauthorized` |
 | `device.pair_complete` | `{code, name}` (local owner/gateway pairing path only) | `{id, name, scopes, token}`; the token is returned once and must be kept secret | `bad_request`, `unauthorized` |
 | `device.pair_cancel` | `{code}` (local owner only) | `{cancelled}`; cancels only the matching invitation, preserving a newer replacement | `bad_request`, `unauthorized` |

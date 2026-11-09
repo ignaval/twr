@@ -194,29 +194,63 @@ impl Auth {
         self.save(&db)?;
         Ok((device, token))
     }
-    pub fn authenticate(&self, token: &str) -> Result<Device> {
-        anyhow::ensure!(token.len() == 64, "Unauthorized");
-        self.read()?
+    /// The device this token belongs to. `Ok(None)` means definitely no paired device has it
+    /// (never paired, revoked or replaced); `Err` means the device list could not be read,
+    /// which says nothing about the token and must not be reported as a revocation.
+    pub fn authenticate(&self, token: &str) -> Result<Option<Device>> {
+        if token.len() != 64 {
+            return Ok(None);
+        }
+        Ok(self
+            .read()?
             .devices
             .into_iter()
-            .find(|d| matches(&d.token_hash, token))
-            .context("Unauthorized")
+            .find(|d| matches(&d.token_hash, token)))
     }
     pub fn devices(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!(self.read()?.devices.into_iter().map(|d|serde_json::json!({"id":d.id,"name":d.name,"created":d.created,"scopes":d.scopes})).collect::<Vec<_>>()))
     }
-    pub fn current(&self, device: &Device) -> bool {
-        self.read().is_ok_and(|db| {
-            db.devices
-                .iter()
-                .any(|d| d.id == device.id && d.token_hash == device.token_hash)
-        })
+    /// Whether `device` is still paired with the same credential. Only
+    /// [`Standing::Revoked`] is a reason to disconnect it.
+    pub fn current(&self, device: &Device) -> Standing {
+        match self.read() {
+            Ok(db)
+                if db
+                    .devices
+                    .iter()
+                    .any(|d| d.id == device.id && d.token_hash == device.token_hash) =>
+            {
+                Standing::Current
+            }
+            Ok(_) => Standing::Revoked,
+            Err(_) => Standing::Unknown,
+        }
     }
     pub fn revoke(&self, id: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut db = self.read()?;
         db.devices.retain(|d| d.id != id);
         self.save(&db)
+    }
+}
+/// A paired device's standing, from a fresh read of the device list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Still paired with the same credential.
+    Current,
+    /// Definitely gone: revoked, or paired again with another credential.
+    Revoked,
+    /// The device list could not be read (an I/O error, no free file descriptor, a damaged
+    /// file). Nothing is known: keep the connection, refuse new work until it reads again.
+    Unknown,
+}
+impl Standing {
+    /// The standing of `device` through `auth`, which itself failed to open when `Err`.
+    pub fn of(auth: Result<Auth>, device: &Device) -> Self {
+        auth.map_or(Self::Unknown, |auth| auth.current(device))
+    }
+    pub fn revoked(self) -> bool {
+        self == Self::Revoked
     }
 }
 impl Device {
@@ -409,11 +443,42 @@ mod tests {
         let code = a.begin(vec!["read".into(), "operate".into()]).unwrap();
         assert!(a.pair("wrong", "phone").is_err());
         let (d, t) = a.pair(&code, "phone").unwrap();
-        assert_eq!(a.authenticate(&t).unwrap().id, d.id);
+        assert_eq!(a.authenticate(&t).unwrap().unwrap().id, d.id);
         assert!(a.pair(&code, "second").is_err());
         assert!(!d.allows("shell.run"));
         assert!(d.allows("thread.send"));
+        assert_eq!(a.current(&d), Standing::Current);
         a.revoke(&d.id).unwrap();
-        assert!(a.authenticate(&t).is_err());
+        assert!(a.authenticate(&t).unwrap().is_none());
+        assert_eq!(a.current(&d), Standing::Revoked);
+    }
+    #[test]
+    fn an_unreadable_device_list_is_not_a_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Auth::open(dir.path()).unwrap();
+        let code = a.begin(vec!["read".into()]).unwrap();
+        let (device, token) = a.pair(&code, "phone").unwrap();
+        // A token of the wrong shape is unknown without reading anything.
+        assert!(a.authenticate("short").unwrap().is_none());
+        let path = dir.path().join("devices.json");
+        let saved = std::fs::read(&path).unwrap();
+        for broken in [b"{\"devices\":[".as_slice(), b"".as_slice()] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(a.authenticate(&token).is_err());
+            assert!(a.authenticate(&"0".repeat(64)).is_err());
+            assert_eq!(a.current(&device), Standing::Unknown);
+            assert!(!a.current(&device).revoked());
+        }
+        std::fs::write(&path, &saved).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(a.current(&device), Standing::Unknown);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            Standing::of(Err(anyhow::anyhow!("no free descriptor")), &device),
+            Standing::Unknown
+        );
+        assert_eq!(a.authenticate(&token).unwrap().unwrap().id, device.id);
+        assert_eq!(a.current(&device), Standing::Current);
+        assert!(a.authenticate(&"0".repeat(64)).unwrap().is_none());
     }
 }

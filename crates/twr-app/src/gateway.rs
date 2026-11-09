@@ -14,7 +14,7 @@ use axum::{
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use remote::{
-    auth::{Auth, Device},
+    auth::{Auth, Device, Standing},
     companion::Companion,
     terminal::Terminal,
 };
@@ -195,6 +195,60 @@ mod socket_tests {
         assert!(Args::try_parse_from(["gateway", "--read-only"]).is_err());
         let args = Args::try_parse_from(["gateway", "--pair", "--allow-terminal"]).unwrap();
         assert_eq!(pairing_scopes(&args), vec!["read", "operate", "terminal"]);
+    }
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+    #[test]
+    fn only_an_unknown_token_is_refused_as_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let (device, token) = auth.pair(&code, "phone").unwrap();
+        let (found, presented) = authorize_upgrade(&auth, &bearer(&token), false).unwrap();
+        assert_eq!(
+            (found.id.as_str(), presented.as_str()),
+            (device.id.as_str(), token.as_str())
+        );
+        for unknown in ["", "short", &"0".repeat(64)] {
+            assert_eq!(
+                authorize_upgrade(&auth, &bearer(unknown), false).err(),
+                Some(StatusCode::UNAUTHORIZED)
+            );
+        }
+        let mut foreign = bearer(&token);
+        foreign.insert("origin", "https://example.com".parse().unwrap());
+        assert_eq!(
+            authorize_upgrade(&auth, &foreign, false).err(),
+            Some(StatusCode::FORBIDDEN)
+        );
+        // A device list that cannot be read is no revocation: 503, and the session stays.
+        let path = dir.path().join("devices.json");
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"{\"devices\":[").unwrap();
+        for token in [token.as_str(), &"0".repeat(64)] {
+            assert_eq!(
+                authorize_upgrade(&auth, &bearer(token), false).err(),
+                Some(StatusCode::SERVICE_UNAVAILABLE)
+            );
+        }
+        assert_eq!(auth.current(&device), Standing::Unknown);
+        let paired = paired_ids(&auth);
+        assert!(paired.is_none());
+        assert!(keep_session(&device.id, 100, paired.as_ref(), 200));
+        assert!(!keep_session(&device.id, 100, paired.as_ref(), 100 + 1800));
+        std::fs::write(&path, saved).unwrap();
+        let paired = paired_ids(&auth);
+        assert!(keep_session(&device.id, 100, paired.as_ref(), 200));
+        auth.revoke(&device.id).unwrap();
+        let paired = paired_ids(&auth);
+        assert!(!keep_session(&device.id, 100, paired.as_ref(), 200));
+        assert_eq!(
+            authorize_upgrade(&auth, &bearer(&token), false).err(),
+            Some(StatusCode::UNAUTHORIZED)
+        );
     }
     #[test]
     fn stopped_inbox_sources_require_a_typed_socket_error() {
@@ -445,6 +499,33 @@ struct DeviceSession {
     foreground: AtomicBool,
 }
 type Shared = Arc<Server>;
+/// The paired device ids, or `None` when the list cannot be read.
+fn paired_ids(auth: &Auth) -> Option<std::collections::HashSet<String>> {
+    match auth.devices() {
+        Ok(devices) => Some(
+            devices
+                .as_array()?
+                .iter()
+                .filter_map(|d| d["id"].as_str().map(str::to_owned))
+                .collect(),
+        ),
+        Err(error) => {
+            crate::gateway_log!("Paired devices could not be read; sessions are kept: {error:#}");
+            None
+        }
+    }
+}
+/// A device session (its PTYs and pending uploads) ends when its device is no longer paired
+/// or it has gone unseen for 30 minutes. A device list that cannot be read (`None`) proves no
+/// revocation, so it ends nothing early.
+fn keep_session(
+    id: &str,
+    last_seen: u64,
+    paired: Option<&std::collections::HashSet<String>>,
+    now: u64,
+) -> bool {
+    paired.is_none_or(|paired| paired.contains(id)) && now.saturating_sub(last_seen) < 1800
+}
 fn operation_slots(
     method: &str,
     uploads: &Arc<Semaphore>,
@@ -509,11 +590,14 @@ async fn pair(State(server): State<Shared>, Json(p): Json<Pair>) -> impl IntoRes
         ),
     }
 }
-async fn upgrade(
-    State(server): State<Shared>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> axum::response::Response {
+/// The device a socket upgrade belongs to, or the status it is refused with. Clients take 401
+/// as a revocation and stop reconnecting, so it means only a token no paired device has. A
+/// device list that cannot be read is 503 (try again); a foreign web origin is 403.
+fn authorize_upgrade(
+    auth: &Auth,
+    headers: &HeaderMap,
+    development: bool,
+) -> Result<(Device, String), StatusCode> {
     if let Some(origin) = headers.get("origin") {
         let origin = origin.to_str().unwrap_or("");
         if ![
@@ -522,11 +606,11 @@ async fn upgrade(
             "https://localhost",
         ]
         .contains(&origin)
-            && !(server.development
+            && !(development
                 && (origin.starts_with("http://127.0.0.1:")
                     || origin.starts_with("http://localhost:")))
         {
-            return StatusCode::FORBIDDEN.into_response();
+            return Err(StatusCode::FORBIDDEN);
         }
     }
     let token = headers
@@ -534,10 +618,26 @@ async fn upgrade(
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
         .unwrap_or("");
-    let Ok(device) = server.auth.authenticate(token) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    match auth.authenticate(token) {
+        Ok(Some(device)) => Ok((device, token.to_owned())),
+        Ok(None) => Err(StatusCode::UNAUTHORIZED),
+        Err(error) => {
+            crate::gateway_log!("Paired devices could not be read: {error:#}");
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+/// Said to a device whose standing cannot be checked: its socket stays, its request waits for it.
+const STANDING_UNKNOWN: &str = "The hub could not read its paired devices. Try again in a moment.";
+async fn upgrade(
+    State(server): State<Shared>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> axum::response::Response {
+    let (device, token) = match authorize_upgrade(&server.auth, &headers, server.development) {
+        Ok(found) => found,
+        Err(status) => return status.into_response(),
     };
-    let token = token.to_owned();
     let fragmented = headers.get("x-twr-framing").and_then(|v| v.to_str().ok()) == Some("1");
     let Ok(slot) = server.slots.clone().try_acquire_owned() else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
@@ -1219,7 +1319,7 @@ impl Session {
             },
             config,
             allowed: Arc::new(move || {
-                auth.current(&device) && remote::voice::allowed(&device).is_ok()
+                !auth.current(&device).revoked() && remote::voice::allowed(&device).is_ok()
             }),
         })
     }
@@ -1317,10 +1417,18 @@ async fn serve_socket(
                     else {
                         break;
                     };
-                    if slot.generation.load(Ordering::SeqCst) != generation
-                        || !server.auth.current(&slot.session.device)
-                    {
+                    if slot.generation.load(Ordering::SeqCst) != generation {
                         continue;
+                    }
+                    match server.auth.current(&slot.session.device) {
+                        Standing::Current => {}
+                        Standing::Revoked => continue,
+                        Standing::Unknown => {
+                            let _ = replies
+                                .send(json!({"id":call.id,"error":STANDING_UNKNOWN}))
+                                .await;
+                            continue;
+                        }
                     }
                     if call.method == "inbox-sources" {
                         if slot.session.inbox_reading.swap(true, Ordering::SeqCst) {
@@ -1335,7 +1443,7 @@ async fn serve_socket(
                             .await;
                             slot.session.inbox_reading.store(false, Ordering::SeqCst);
                             if slot.generation.load(Ordering::SeqCst) != generation
-                                || !server.auth.current(&slot.session.device)
+                                || server.auth.current(&slot.session.device).revoked()
                             {
                                 return;
                             }
@@ -1474,14 +1582,14 @@ async fn serve_socket(
     loop {
         tokio::select! {
                   _=tick.tick()=>{
-                    if !alive.load(Ordering::SeqCst)||!server.auth.current(&device)||slot.generation.load(Ordering::SeqCst)!=generation||last_activity.elapsed()>Duration::from_secs(45){break}
+                    if !alive.load(Ordering::SeqCst)||server.auth.current(&device).revoked()||slot.generation.load(Ordering::SeqCst)!=generation||last_activity.elapsed()>Duration::from_secs(45){break}
                     slot.last_seen.store(remote::auth::now(),Ordering::SeqCst);
                     if heartbeat.elapsed()>Duration::from_secs(15){if heartbeat_tx.is_closed(){break}let _=heartbeat_tx.try_send(json!({"type":"heartbeat"}));heartbeat=tokio::time::Instant::now();}
                   }
                   message=incoming.next()=>{
                     let Some(Ok(message))=message else{break};
                     last_activity=tokio::time::Instant::now();
-                    if !server.auth.current(&device)||slot.generation.load(Ordering::SeqCst)!=generation{break}
+                    if server.auth.current(&device).revoked()||slot.generation.load(Ordering::SeqCst)!=generation{break}
                     let Message::Text(text)=message else{continue};
                     let Ok(call)=serde_json::from_str::<Call>(&text)else{let _=replies.try_send(json!({"type":"error","error":"Invalid request"}));continue};
                     if uuid::Uuid::parse_str(&call.id).is_err()||call.method.len()>80 {let _=replies.try_send(json!({"type":"error","error":"Invalid request ID or method"}));continue}
@@ -1502,7 +1610,8 @@ async fn serve_socket(
                     let task_server=server.clone();let task_slot=slot.clone();let task_device=device.clone();let task_replies=replies.clone();
                     tokio::spawn(async move{
                       let _permit=permit;
-                      if !task_server.auth.current(&task_device)||task_slot.generation.load(Ordering::SeqCst)!=generation{return}
+                      if task_slot.generation.load(Ordering::SeqCst)!=generation{return}
+                      match task_server.auth.current(&task_device){Standing::Current=>{},Standing::Revoked=>return,Standing::Unknown=>{let _=task_replies.send(json!({"id":call.id,"error":STANDING_UNKNOWN})).await;return}}
                       let mutation=remote::receipts::mutation(&call.method,&call.params);
                       let workspace=call.workspace.clone().unwrap_or(task_slot.session.connection.read().await.workspace.clone());
                       let receipt_key=format!("{}:{}",task_device.id,call.id);
@@ -1711,20 +1820,15 @@ async fn main() -> Result<()> {
                     keep
                 });
             }
+            let paired = paired_ids(&cleanup.auth);
             let mut sessions = cleanup.sessions.lock().await;
             sessions.retain(|id, slot| {
-                let valid = cleanup
-                    .auth
-                    .devices()
-                    .ok()
-                    .and_then(|v| {
-                        v.as_array()
-                            .map(|a| a.iter().any(|d| d["id"].as_str() == Some(id)))
-                    })
-                    .unwrap_or(false);
-                valid
-                    && remote::auth::now().saturating_sub(slot.last_seen.load(Ordering::SeqCst))
-                        < 1800
+                keep_session(
+                    id,
+                    slot.last_seen.load(Ordering::SeqCst),
+                    paired.as_ref(),
+                    remote::auth::now(),
+                )
             });
         }
     });
