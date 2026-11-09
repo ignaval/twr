@@ -2377,6 +2377,39 @@ struct Shared {
     /// The TUI's own speaker, once per process whichever workspace shows
     /// ([`speaker::OwnSpeaker`]).
     speaker: speaker::OwnSpeaker,
+    /// SIGTERM, SIGHUP, SIGQUIT and SIGINT: each ends the TUI as quitting does ([`Signals`]).
+    signals: Signals,
+}
+
+/// The signals that would otherwise kill the TUI with the terminal still in its hands (raw
+/// mode, the alternate screen, mouse, focus and paste reporting, the keyboard protocol's
+/// flags): `kill`, `pkill twr`, `timeout`, a closing SSH session (SIGHUP). Each ends the loop
+/// as quitting does, so [`TerminalGuard`] gives the terminal back; after SIGHUP there may be no
+/// terminal left to give it back to, and writing to it fails quietly. (In raw mode Ctrl-C is a
+/// key, not SIGINT: SIGINT only comes from `kill -INT`.)
+struct Signals(Vec<tokio::signal::unix::Signal>);
+
+impl Signals {
+    /// Listens for them; one that can't be listened for keeps its default action.
+    fn listen() -> Signals {
+        use tokio::signal::unix::{signal, SignalKind};
+        let kinds = [
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+            SignalKind::quit(),
+            SignalKind::interrupt(),
+        ];
+        Signals(kinds.into_iter().filter_map(|k| signal(k).ok()).collect())
+    }
+
+    /// Waits for the next of them (forever, when none could be listened for).
+    async fn recv(&mut self) {
+        if self.0.is_empty() {
+            return std::future::pending().await;
+        }
+        let waits = self.0.iter_mut().map(|s| Box::pin(s.recv()));
+        let _ = futures::future::select_all(waits).await;
+    }
 }
 
 /// The suggestion asks on their way (`suggest.next`, each on a connection of its own), or the
@@ -2446,6 +2479,8 @@ pub async fn run_with(
     let mut session =
         Session::connect(&socket, switching.as_ref().map(|s| s.current.as_str())).await?;
 
+    // Listened for before the terminal is taken: from then on a `kill` gives it back.
+    let signals = Signals::listen();
     let mut terminal = ratatui::try_init().context("initializing the terminal")?;
     twr_core::trace::mark("tui: terminal initialized");
     let guard = TerminalGuard;
@@ -2539,6 +2574,7 @@ pub async fn run_with(
         asking: Asks::default(),
         summarizing: Asks::default(),
         speaker,
+        signals,
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -3290,6 +3326,9 @@ async fn drive(
                     } else {state.apply_result(method,&result);}
                 },
                 Some((method, result)) = followed_rx.recv() => state.apply_result(method, &result),
+                // SIGTERM, SIGHUP, SIGQUIT, SIGINT: ended as quitting is, so the terminal is
+                // given back ([`Signals`]).
+                () = ctx.signals.recv() => return Ok(End::Quit),
                 // A transient status is due to clear.
                 _ = sleep_opt(state.status_deadline()) => {
                     state.expire_status(std::time::Instant::now());
@@ -3532,6 +3571,21 @@ async fn drive(
 #[cfg(test)]
 mod asks_tests {
     use super::*;
+
+    /// A SIGHUP (a closing SSH session) or SIGTERM (`kill`) ends the wait the loop selects on,
+    /// instead of killing the process with the terminal in raw mode.
+    #[tokio::test]
+    async fn a_signal_ends_the_tui_as_quitting_does() {
+        let mut signals = Signals::listen();
+        assert_eq!(signals.0.len(), 4);
+        for sig in [libc::SIGHUP, libc::SIGTERM] {
+            // SAFETY: signals this process now handles itself (tokio's handler).
+            assert_eq!(unsafe { libc::kill(libc::getpid(), sig) }, 0);
+            tokio::time::timeout(Duration::from_secs(5), signals.recv())
+                .await
+                .expect("the signal was not seen");
+        }
+    }
 
     /// Asks on their way stay while suggestions are on, and all go, of every workspace, once
     /// they are off.

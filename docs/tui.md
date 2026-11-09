@@ -1,6 +1,6 @@
 # The TUI
 
-`twr` with no arguments opens the TUI, and starts the hub in the background if it isn't running. Quit with Ctrl-C or `/quit`; the hub and its threads keep running.
+`twr` with no arguments opens the TUI, and starts the hub in the background if it isn't running. Quit with Ctrl-C or `/quit`; the hub and its threads keep running. A `kill` (SIGTERM, SIGQUIT, SIGINT) or the terminal closing (SIGHUP, an SSH session that ends) quits it the same way, so the shell gets its terminal back as it was.
 
 ## Choosing the orchestrator
 
