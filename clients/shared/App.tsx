@@ -167,6 +167,17 @@ function operationAction(command: Command, again: boolean) {
   const label = labels[command.id] || command.title.replace(/…$/, "");
   return again ? `${label} again` : label;
 }
+/** A list of strings saved in local storage; anything else there reads as empty. */
+function storedList(key: string): string[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "[]");
+    return Array.isArray(saved)
+      ? saved.filter((v): v is string => typeof v === "string").slice(0, 256)
+      : [];
+  } catch {
+    return [];
+  }
+}
 function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
   const root = document.documentElement;
   root.dataset.omarchy = theme ? "true" : "false";
@@ -280,27 +291,16 @@ export default function App({
   const [hovering, setHovering] = useState(false);
   const [focus, setFocus] = useState(false);
   const [parked, setParked] = useState(false);
-  const [collapsed, setCollapsed] = useState<string[]>(() => {
-    try {
-      const saved = JSON.parse(
-        localStorage.getItem("twr.sidebar.collapsed") || "[]",
-      );
-      return Array.isArray(saved)
-        ? saved.filter((v): v is string => typeof v === "string").slice(0, 256)
-        : [];
-    } catch {
-      return [];
-    }
-  });
+  const [collapsed, setCollapsed] = useState<string[]>(() =>
+    storedList("twr.sidebar.collapsed"),
+  );
   const pendingOpen = useRef<{
     workspace: string;
     thread?: string;
     talk: boolean;
     then?: () => void;
   }>(undefined);
-  const [pins, setPins] = useState<string[]>(() =>
-    JSON.parse(localStorage.getItem("twr.pins") || "[]"),
-  );
+  const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
   const observedDestination = useRef<string | undefined>(undefined);
@@ -1955,7 +1955,9 @@ export default function App({
       const next = old.includes(id)
         ? old.filter((p) => p !== id)
         : [...old, id];
-      localStorage.setItem("twr.pins", JSON.stringify(next));
+      try {
+        localStorage.setItem("twr.pins", JSON.stringify(next));
+      } catch {}
       return next;
     });
   const workers = view.threads.filter((t) => !t.is_orchestrator);

@@ -309,6 +309,23 @@ kbd {
 .danger-quiet {
   color: var(--danger);
 }
+.app-crash {
+  max-width: 640px;
+  margin: 12vh auto 0;
+  padding: 0 16px;
+  color: var(--text);
+}
+.app-crash pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--danger);
+}
 .error-text {
   color: var(--danger);
   font-size: 0.923077rem;

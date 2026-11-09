@@ -11,6 +11,7 @@ import { Dialog as NativeDialog } from "@capacitor/dialog";
 import { App as NativeApp } from "@capacitor/app";
 import App from "../../shared/App";
 import { Dialog } from "../../shared/ui";
+import { ErrorBoundary } from "../../shared/ErrorBoundary";
 import {
   EditorSessionsProvider,
   useEditorSessions,
@@ -705,7 +706,9 @@ initializeAppearance();
 const stopAppearance = observeNativeAppearance();
 import.meta.hot?.dispose(stopAppearance);
 createRoot(document.getElementById("root")!).render(
-  <EditorSessionsProvider>
-    <Mobile />
-  </EditorSessionsProvider>,
+  <ErrorBoundary>
+    <EditorSessionsProvider>
+      <Mobile />
+    </EditorSessionsProvider>
+  </ErrorBoundary>,
 );
