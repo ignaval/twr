@@ -128,11 +128,16 @@ enum Cmd {
     /// directory this `twr` is in. Nothing runs unless both signatures verify and the checksums
     /// name the release asked for and list the installer. A running hub keeps its version
     /// until you restart it (`twr hub stop`, then `twr`). A `twr` installed by cargo is not
-    /// touched: update it with cargo.
+    /// touched: update it with cargo. A release older than this `twr` is refused, and the
+    /// same one says it is up to date.
     Update {
         /// The release to install, e.g. v0.2.0 (default: the latest).
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
+        /// Install the `--version` asked for even when it is older than this `twr`. An older
+        /// twr may refuse the database this one wrote.
+        #[arg(long, requires = "version")]
+        allow_downgrade: bool,
     },
     /// Show what the running hub reports about itself (`hub.info`): version, boxes,
     /// orchestrator, and warnings about the config it started with (a short box token, a
@@ -1898,8 +1903,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         // Before the config is loaded: a config this twr cannot read must not stop an update
         // (the new one may read it).
-        Some(Cmd::Update { version }) => {
-            update(version, cli.socket, &paths).await?;
+        Some(Cmd::Update {
+            version,
+            allow_downgrade,
+        }) => {
+            update(version, allow_downgrade, cli.socket, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
         // About the terminal, not a hub: no config needed.
@@ -3888,6 +3896,7 @@ async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
 /// how to restart it; it never restarts the hub itself (that stops every thread's runtime).
 async fn update(
     version: Option<String>,
+    allow_downgrade: bool,
     socket: Option<PathBuf>,
     paths: &Paths,
 ) -> anyhow::Result<()> {
@@ -3904,6 +3913,18 @@ async fn update(
     let (script, sums) = fetch_verified(&source, &key).await?;
     let tag = release_of(&source, &script, &sums)?;
     check_script(&source.script, &script)?;
+    let current = env!("CARGO_PKG_VERSION");
+    match update_plan(&tag, current, source.tag.is_some(), allow_downgrade)? {
+        UpdatePlan::UpToDate => {
+            outln!("twr {current} is up to date ({tag} is this release)");
+            return Ok(());
+        }
+        UpdatePlan::Downgrade => errln!(
+            "installing {tag}, older than this twr ({current}), as --allow-downgrade asks: an \
+             older twr may refuse the database this one wrote, as newer than itself"
+        ),
+        UpdatePlan::Install => {}
+    }
     let tmp = PrivateDir::create("twr-update")?;
     let script_file = tmp.write("install.sh", &script)?;
     let sums_file = tmp.write("sha256sums.txt", &sums)?;
@@ -3936,6 +3957,56 @@ async fn update(
     prewarm_installed(&dir.join("twr")).await;
     hub_version_note(&dir.join("twr"), socket, paths).await;
     Ok(())
+}
+
+/// What `twr update` does with the release it verified, from [`update_plan`].
+#[derive(Debug, PartialEq)]
+enum UpdatePlan {
+    /// It is newer than this twr: install it.
+    Install,
+    /// It is this twr's release: nothing to do.
+    UpToDate,
+    /// It is older, and `--version` with `--allow-downgrade` asked for it: install it, saying
+    /// what that risks.
+    Downgrade,
+}
+
+/// Whether `twr update` installs release `tag` over this twr (version `current`), in semantic
+/// versioning's order ([`runner_update::compare_versions`]: a prerelease comes before its
+/// release). The same release is up to date. An older one (the latest release, for a twr on a
+/// newer prerelease, since GitHub's latest leaves prereleases out; or what a mirror serves) is
+/// refused unless it was `asked` for by `--version` with `allow_downgrade`: an older twr may
+/// refuse the database this one wrote.
+fn update_plan(
+    tag: &str,
+    current: &str,
+    asked: bool,
+    allow_downgrade: bool,
+) -> anyhow::Result<UpdatePlan> {
+    use std::cmp::Ordering;
+    let Some(order) = runner_update::compare_versions(tag, current) else {
+        bail!("cannot compare release {tag} with this twr ({current}); nothing was run");
+    };
+    Ok(match order {
+        Ordering::Greater => UpdatePlan::Install,
+        Ordering::Equal => UpdatePlan::UpToDate,
+        Ordering::Less if asked && allow_downgrade => UpdatePlan::Downgrade,
+        Ordering::Less => {
+            let what = if asked {
+                format!("{tag} is older than this twr ({current})")
+            } else {
+                format!(
+                    "the release found, {tag}, is older than this twr ({current}) (GitHub's \
+                     latest release leaves out prereleases)"
+                )
+            };
+            bail!(
+                "{what}; nothing was run. An older twr may refuse the database this one wrote, \
+                 as newer than itself. To install it anyway, run `twr update --version {tag} \
+                 --allow-downgrade`"
+            )
+        }
+    })
 }
 
 /// Where `twr update` gets the release: `tag` (for install.sh's `TWR_VERSION`), the installer's
@@ -11220,7 +11291,79 @@ mod tests {
             }
         }
         let update = Cli::try_parse_from(["twr", "update", "--version", "v0.2.0"]).unwrap();
-        assert!(matches!(update.cmd, Some(Cmd::Update { version: Some(v) }) if v == "v0.2.0"));
+        assert!(matches!(
+            update.cmd,
+            Some(Cmd::Update { version: Some(v), allow_downgrade: false }) if v == "v0.2.0"
+        ));
+        let update =
+            Cli::try_parse_from(["twr", "update", "--version", "v0.2.0", "--allow-downgrade"])
+                .unwrap();
+        assert!(matches!(
+            update.cmd,
+            Some(Cmd::Update {
+                allow_downgrade: true,
+                ..
+            })
+        ));
+        // A downgrade is only ever to a release named.
+        assert!(Cli::try_parse_from(["twr", "update", "--allow-downgrade"]).is_err());
+    }
+
+    /// `twr update` installs only a newer release, in semver order with prereleases: the same
+    /// one is up to date, and an older one (also the latest stable release under a newer
+    /// prerelease) is refused unless `--version` and `--allow-downgrade` ask for it.
+    #[test]
+    fn update_never_downgrades_unasked() {
+        use UpdatePlan::*;
+        // Newer.
+        assert_eq!(
+            update_plan("v0.4.0", "0.3.0", false, false).unwrap(),
+            Install
+        );
+        assert_eq!(
+            update_plan("v0.4.0", "0.3.0", true, false).unwrap(),
+            Install
+        );
+        // Equal.
+        assert_eq!(
+            update_plan("v0.3.0", "0.3.0", false, false).unwrap(),
+            UpToDate
+        );
+        assert_eq!(
+            update_plan("v0.3.0", "0.3.0", true, true).unwrap(),
+            UpToDate
+        );
+        // Prerelease to its release, and release to a later prerelease: newer.
+        assert_eq!(
+            update_plan("v0.4.0", "0.4.0-rc.1", false, false).unwrap(),
+            Install
+        );
+        assert_eq!(
+            update_plan("v0.4.0-rc.1", "0.3.0", true, false).unwrap(),
+            Install
+        );
+        // Release to its own prerelease, and a prerelease to the stable latest before it.
+        for (tag, current) in [("v0.4.0-rc.1", "0.4.0"), ("v0.3.2", "0.4.0-rc.1")] {
+            for (asked, allow) in [(false, false), (true, false), (false, true)] {
+                let e = update_plan(tag, current, asked, allow)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("nothing was run"), "{e}");
+                assert!(e.contains("may refuse the database"), "{e}");
+                assert!(
+                    e.contains(&format!("twr update --version {tag} --allow-downgrade")),
+                    "{e}"
+                );
+                assert_eq!(e.contains("leaves out prereleases"), !asked, "{e}");
+            }
+            assert_eq!(update_plan(tag, current, true, true).unwrap(), Downgrade);
+        }
+        // Older.
+        assert!(update_plan("v0.2.9", "0.3.0", false, false).is_err());
+        assert_eq!(
+            update_plan("v0.2.9", "0.3.0", true, true).unwrap(),
+            Downgrade
+        );
     }
 
     /// `twr update` installs into the executable's own directory, and refuses cargo's bin

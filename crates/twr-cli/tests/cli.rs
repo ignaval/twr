@@ -2100,6 +2100,94 @@ fn update_reinstalls_the_running_executable() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// `twr update` never runs the installer of a release that is not newer than itself, even
+/// properly signed (a mirror's old release): the same release is up to date (exit 0), an older
+/// one is refused unless `--version` and `--allow-downgrade` name it.
+#[test]
+fn update_refuses_an_older_or_the_same_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    if std::fs::hard_link(TWR, bin.join("twr")).is_err() {
+        cp(Path::new(TWR), &bin.join("twr"));
+    }
+    let marker = tmp.path().join("ran");
+    let script = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+    let signer = test_signer();
+    // A signed mirror release `tag` whose installer leaves `marker`.
+    let release = |tag: &str| {
+        let d = tmp.path().join(tag);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("install.sh"), &script).unwrap();
+        std::fs::write(
+            d.join("sha256sums.txt"),
+            format!(
+                "# twr release {tag}\n{}  install.sh\n",
+                sha256_hex(script.as_bytes())
+            ),
+        )
+        .unwrap();
+        sign_file(&signer, &d.join("install.sh"));
+        sign_file(&signer, &d.join("sha256sums.txt"));
+        d.join("install.sh")
+    };
+    let update = |installer: &Path, args: &[&str]| {
+        Command::new(bin.join("twr"))
+            .arg("update")
+            .args(args)
+            .env("TWR_HOME", &home)
+            .env("TMPDIR", tmp.path())
+            .env(
+                "TWR_INSTALL_SCRIPT_URL",
+                format!("file://{}", installer.display()),
+            )
+            .env("TWR_TEST_RELEASE_KEY_FILE", signing_fixture("test-key.pub"))
+            .env("https_proxy", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env_remove("TWR_VERSION")
+            .env_remove("RUST_LOG")
+            .output()
+            .unwrap()
+    };
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let current = env!("CARGO_PKG_VERSION");
+
+    // The same release: up to date, nothing run.
+    let same = release(&format!("v{current}"));
+    let out = update(&same, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text(&out.stdout).contains("is up to date"), "{out:?}");
+    assert!(!marker.exists());
+
+    // An older one: refused, with or without --version, and with --allow-downgrade only
+    // together with the --version it names.
+    let old = release("v0.0.1");
+    for args in [&[][..], &["--version", "v0.0.1"]] {
+        let out = update(&old, args);
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        let e = text(&out.stderr);
+        assert!(
+            e.contains(&format!("is older than this twr ({current})")),
+            "{e}"
+        );
+        assert!(e.contains("may refuse the database"), "{e}");
+        assert!(
+            e.contains("twr update --version v0.0.1 --allow-downgrade"),
+            "{e}"
+        );
+        assert!(!marker.exists(), "{args:?}: the installer ran");
+    }
+    let out = update(&old, &["--allow-downgrade"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!marker.exists());
+    let out = update(&old, &["--version", "v0.0.1", "--allow-downgrade"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text(&out.stderr).contains("older than this twr"), "{out:?}");
+    assert!(marker.exists(), "the installer did not run");
+}
+
 /// install.sh checks sha256sums.txt against its signature when openssl here can: run against a
 /// file:// release signed with the test key, by a copy of install.sh whose release key block
 /// holds the test key. Skipped where openssl can't verify Ed25519.
