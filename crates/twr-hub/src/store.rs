@@ -1381,25 +1381,58 @@ pub fn search_candidates(
     before: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<Event>> {
-    let mut st = conn.prepare_cached(&format!(
-        "SELECT {EVENT_COLS} FROM events WHERE id < ?1 {}
-         AND kind IN ('turn.started','agent.text','agent.tool_call','agent.tool_result',
-                      'decision.made','conversation.update','report.ready')
-         AND (kind != 'agent.text' OR coalesce(json_extract(data,'$.delta'),0) != 1 OR json_extract(data,'$.final') = 1)
-         ORDER BY id DESC LIMIT ?3",
-        if thread.is_some() {
-            "AND thread = ?2"
-        } else {
-            "AND ?2 IS NULL"
-        }
-    ))?;
+    let sql = if thread.is_some() {
+        SEARCH_THREAD
+    } else {
+        SEARCH_ALL
+    };
+    let mut st = conn.prepare_cached(sql)?;
     let rows = st.query_map(params![before, thread, limit as i64], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
 }
 
+/// The searchable kinds and the filter that drops streamed text deltas. The `+` keeps the
+/// planner off `events_kind_turn` for the kinds: walking that index reads every matching
+/// row of the log (with its data) and sorts them all by id for a `LIMIT` of a few hundred,
+/// where walking the id index backwards stops after the limit.
+macro_rules! search_filter {
+    () => {
+        " AND +kind IN ('turn.started','agent.text','agent.tool_call','agent.tool_result',
+                        'decision.made','conversation.update','report.ready')
+         AND (kind != 'agent.text' OR coalesce(json_extract(data,'$.delta'),0) != 1
+              OR json_extract(data,'$.final') = 1)
+         ORDER BY id DESC LIMIT ?3"
+    };
+}
+
+/// Search across every thread: walks the id index backwards from the cursor.
+const SEARCH_ALL: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE id < ?1 AND ?2 IS NULL",
+    search_filter!()
+);
+
+/// Search in one thread: walks `events_thread_id` backwards from the cursor.
+const SEARCH_THREAD: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE id < ?1 AND thread = ?2",
+    search_filter!()
+);
+
+/// The name a thread was created with or last renamed to, read off `events_kind_turn`
+/// (`+seq` keeps the planner from walking the thread's whole primary key backwards).
+const LATEST_THREAD_NAME: &str = "SELECT json_extract(data, '$.name') FROM events
+     WHERE thread = ?1 AND kind IN ('thread.created','thread.renamed')
+     ORDER BY +seq DESC LIMIT 1";
+
 /// A deleted thread still has its creation/rename event even after its live view is gone.
 pub fn latest_thread_name(conn: &Connection, thread: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn.query_row("SELECT json_extract(data, '$.name') FROM events WHERE thread=?1 AND kind IN ('thread.created','thread.renamed') ORDER BY seq DESC LIMIT 1",[thread],|row|row.get(0)).optional()?)
+    Ok(conn
+        .prepare_cached(LATEST_THREAD_NAME)?
+        .query_row([thread], |row| row.get(0))
+        .optional()?)
 }
 
 /// One exact event, scoped to its recorded thread (also in an archive).
@@ -2414,6 +2447,11 @@ pub fn next_final_text(
     row.map(|r| r.into_event()).transpose()
 }
 
+/// Read off `events_kind_turn`: `+seq` keeps the planner from walking the thread's whole
+/// primary key backwards (with every event's data) to find the newest `turn.started`.
+const TURN_OF_MESSAGE: &str = "SELECT turn FROM events WHERE kind = 'turn.started' AND thread = ?1
+     AND json_extract(data, '$.ext.twr.ref') = ?2 ORDER BY +seq DESC LIMIT 1";
+
 /// The turn of `thread` that message `msg_ref` started (its `turn.started` `ext.twr.ref`),
 /// if one did.
 pub fn turn_of_message(
@@ -2422,10 +2460,7 @@ pub fn turn_of_message(
     msg_ref: i64,
 ) -> anyhow::Result<Option<u64>> {
     let turn: Option<i64> = conn
-        .prepare_cached(
-            "SELECT turn FROM events WHERE kind = 'turn.started' AND thread = ?1
-             AND json_extract(data, '$.ext.twr.ref') = ?2 ORDER BY seq DESC LIMIT 1",
-        )?
+        .prepare_cached(TURN_OF_MESSAGE)?
         .query_row(params![thread, msg_ref], |r| r.get(0))
         .optional()?
         .flatten();
@@ -3062,6 +3097,59 @@ mod tests {
                     "{sql}:\n{plan}"
                 );
             }
+        }
+    }
+
+    fn query_plan(conn: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> String {
+        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = st
+            .query_map(args, |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        plan.join("\n")
+    }
+
+    /// A search across threads walks the id index backwards from its cursor and stops at its
+    /// limit; one in a thread walks `events_thread_id`. Neither reads every event of the
+    /// searched kinds and sorts them, as a plan through `events_kind_turn` would.
+    #[test]
+    fn search_walks_the_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let none: Option<&str> = None;
+        let all = query_plan(s.conn(), SEARCH_ALL, &[&"z", &none, &513]);
+        assert!(
+            all.contains("USING INDEX sqlite_autoindex_events_1 (id<?)"),
+            "{all}"
+        );
+        assert!(!all.contains("TEMP B-TREE"), "{all}");
+        assert!(!all.contains("events_kind_turn"), "{all}");
+        let one = query_plan(s.conn(), SEARCH_THREAD, &[&"z", &"t", &513]);
+        assert!(
+            one.contains("USING INDEX events_thread_id (thread=? AND id<?)"),
+            "{one}"
+        );
+        assert!(!one.contains("TEMP B-TREE"), "{one}");
+    }
+
+    /// A thread's latest name and the turn a message started are read off
+    /// `events_kind_turn`, never by walking the thread's whole primary key backwards.
+    #[test]
+    fn name_and_message_turn_use_the_kind_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("twr.db")).unwrap();
+        for (sql, args) in [
+            (LATEST_THREAD_NAME, &[&"t" as &dyn rusqlite::ToSql][..]),
+            (TURN_OF_MESSAGE, &[&"t" as &dyn rusqlite::ToSql, &1][..]),
+        ] {
+            let plan = query_plan(s.conn(), sql, args);
+            assert!(
+                plan.contains("USING INDEX events_kind_turn (kind=? AND thread=?)"),
+                "{sql}:\n{plan}"
+            );
+            assert!(!plan.contains("PRIMARY KEY"), "{sql}:\n{plan}");
+            assert!(!plan.contains("SCAN "), "{sql}:\n{plan}");
         }
     }
 
