@@ -2,6 +2,7 @@ import { app, Menu, nativeImage, Tray } from "electron";
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import type { AttentionSummary } from "../shared/types";
+import { attentionKey } from "./tray-state";
 
 export interface TrayActions {
   open(): void;
@@ -60,6 +61,11 @@ export function truncate(text: string, length: number) {
 export class AppTray {
   private tray?: Tray;
   private attention: AttentionSummary = { count: 0, items: [] };
+  private attentionShown = attentionKey(this.attention);
+  private badge = 0;
+  private images = new Map<string, Electron.NativeImage>();
+  /** Whether the Linux icon currently shows its attention variant. */
+  private imageAttention?: boolean;
   constructor(
     private readonly iconDirectory: string,
     private readonly actions: TrayActions,
@@ -71,6 +77,7 @@ export class AppTray {
   show() {
     if (this.active) return;
     this.tray = new Tray(this.image(false));
+    this.imageAttention = false;
     this.tray.setToolTip("twr");
     if (process.platform === "darwin")
       this.tray.setIgnoreDoubleClickEvents(true);
@@ -87,7 +94,13 @@ export class AppTray {
   setAttention(summary: AttentionSummary) {
     this.attention = summary;
     // Dock (macOS) and Unity launcher (Linux) badges.
-    app.setBadgeCount(summary.count);
+    if (summary.count !== this.badge) {
+      this.badge = summary.count;
+      app.setBadgeCount(summary.count);
+    }
+    const key = attentionKey(summary);
+    if (key === this.attentionShown) return;
+    this.attentionShown = key;
     this.render();
   }
   render() {
@@ -97,20 +110,27 @@ export class AppTray {
     tray.setToolTip(count ? `twr — ${trayLabel(count)}` : "twr");
     if (process.platform === "darwin")
       tray.setTitle(count ? String(count) : "");
-    else tray.setImage(this.image(count > 0));
+    // Each new image is a DBus round trip on Linux: send it only on a change.
+    else if (this.imageAttention !== count > 0) {
+      this.imageAttention = count > 0;
+      tray.setImage(this.image(count > 0));
+    }
     tray.setContextMenu(this.menu(count, items));
   }
   private image(attention: boolean) {
-    if (process.platform === "darwin") {
-      const image = nativeImage.createFromPath(
-        join(this.iconDirectory, "trayTemplate.png"),
-      );
-      image.setTemplateImage(true);
-      return image;
+    const name =
+      process.platform === "darwin"
+        ? "trayTemplate.png"
+        : attention
+          ? "tray-attention.png"
+          : "tray.png";
+    let image = this.images.get(name);
+    if (!image) {
+      image = nativeImage.createFromPath(join(this.iconDirectory, name));
+      if (process.platform === "darwin") image.setTemplateImage(true);
+      this.images.set(name, image);
     }
-    return nativeImage.createFromPath(
-      join(this.iconDirectory, attention ? "tray-attention.png" : "tray.png"),
-    );
+    return image;
   }
   private menu(count: number, items: AttentionSummary["items"]) {
     const state = this.state();
