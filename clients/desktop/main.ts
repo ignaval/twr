@@ -1168,6 +1168,7 @@ async function createWindow(hidden = false) {
     }
   });
   window.on("focus", () => {
+    services?.focused();
     if (workspaceReady)
       void bridge?.call("notify.looking", { looking: true }).catch(() => {});
   });
@@ -1204,7 +1205,7 @@ async function createWindow(hidden = false) {
     }
   });
   window.on("closed", () => {
-    services?.setAttention({ count: 0, items: [] });
+    services?.closed();
     ++localGeneration;
     workspaceReady = false;
     void remoteTransport.disconnect();

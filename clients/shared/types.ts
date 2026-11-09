@@ -60,6 +60,8 @@ export interface DesktopEvent {
   connected?: boolean;
   error?: string;
   thread?: string;
+  /** `menu-attention`: the workspace to open it in, when it is not the one shown. */
+  workspace?: string;
   subscription?: string;
   sequence?: number;
   id?: string;
@@ -182,10 +184,39 @@ export interface DesktopAPI {
   exportText(name: string, content: string): Promise<void>;
   onEvent(callback: (event: DesktopEvent) => void): () => void;
 }
-/** Items the host app shows in its tray/menu bar and dock badge. */
+/** One request waiting on the user, in a summary for the host app. */
+export interface AttentionSummaryItem {
+  workspace: string;
+  thread: string;
+  /** The thread's name. */
+  title: string;
+  /** What is asked, for the tray menu. Never put in an OS notification. */
+  summary: string;
+  /** The attention item (`attn_id`) and its revision: a new revision is a new request. */
+  id: string;
+  revision: number;
+  /** `permission`, `question`, `confirm`, `review`… */
+  reason: string;
+  /** Still being raised: not notified until it is complete. */
+  incomplete?: boolean;
+}
+/**
+ * What waits on the user in every workspace of the connected hub, for the host app's
+ * tray/menu bar, Dock badge and notifications (shared/attentionSummary.ts).
+ */
 export interface AttentionSummary {
+  /** Everything waiting, in every workspace; `items` may list fewer. */
   count: number;
-  items: { thread: string; title: string; summary: string }[];
+  /** The shown workspace's items first, then the others'. */
+  items: AttentionSummaryItem[];
+  /**
+   * The workspaces the summary covers. `stream` names where a workspace's items come from
+   * while they are current: the live view of one connection, or the periodic reads. It is
+   * absent while they are not (connecting, disconnected, a saved or failed read), and it
+   * changes when the source starts over (a reconnect, a resync, a switch of workspace), so
+   * what the new source lists first is never taken for news.
+   */
+  workspaces: { name: string; stream?: string }[];
 }
 export type InstallKind =
   "development" | "mac" | "appimage" | "deb" | "pacman" | "portable";
@@ -215,6 +246,8 @@ export interface UpdateStatus {
 export interface DesktopAppSettings {
   login: { supported: boolean; enabled: boolean; detail?: string };
   tray: { enabled: boolean; available: boolean };
+  /** OS notifications for new permissions and questions (desktop/notifier.ts). */
+  notifications: { enabled: boolean; supported: boolean };
   background: boolean;
   autoUpdate: boolean;
   update: UpdateStatus;
@@ -225,6 +258,7 @@ export interface DesktopAppAPI {
   settings(): Promise<DesktopAppSettings>;
   setLaunchAtLogin(enabled: boolean): Promise<DesktopAppSettings>;
   setTray(enabled: boolean): Promise<DesktopAppSettings>;
+  setNotifications(enabled: boolean): Promise<DesktopAppSettings>;
   setBackground(enabled: boolean): Promise<DesktopAppSettings>;
   setAutoUpdate(enabled: boolean): Promise<DesktopAppSettings>;
   checkForUpdates(): Promise<UpdateStatus>;

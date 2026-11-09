@@ -92,6 +92,8 @@ const application: DesktopAppAPI = {
   settings: () => ipcRenderer.invoke("twr:app-settings"),
   setLaunchAtLogin: (enabled) => ipcRenderer.invoke("twr:app-login", enabled),
   setTray: (enabled) => ipcRenderer.invoke("twr:app-tray", enabled),
+  setNotifications: (enabled) =>
+    ipcRenderer.invoke("twr:app-notifications", enabled),
   setBackground: (enabled) => ipcRenderer.invoke("twr:app-background", enabled),
   setAutoUpdate: (enabled) =>
     ipcRenderer.invoke("twr:app-auto-update", enabled),

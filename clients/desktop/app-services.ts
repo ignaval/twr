@@ -18,7 +18,10 @@ import {
   countCrashReports,
   diagnosticsReport,
 } from "./diagnostics";
+import { Notifier, type Post } from "./notifier";
 import { AppTray, statusNotifierAvailable } from "./tray";
+import { attentionSummarySchema } from "./validation";
+import { WORKSPACE_REFRESH_MS } from "../shared/workspaceTree";
 import {
   FIRST_UPDATE_CHECK_DELAY,
   UPDATE_CHECK_INTERVAL,
@@ -32,23 +35,6 @@ import type {
   DesktopEvent,
 } from "../shared/types";
 
-const attentionSchema = z
-  .object({
-    count: z.number().int().min(0).max(100000),
-    items: z
-      .array(
-        z
-          .object({
-            // Menu labels are short; never reject a summary for its length.
-            thread: z.string().max(200),
-            title: z.string().transform((value) => value.slice(0, 200)),
-            summary: z.string().transform((value) => value.slice(0, 300)),
-          })
-          .strict(),
-      )
-      .max(5),
-  })
-  .strict();
 const errorSchema = z
   .object({
     message: z.string().max(4000),
@@ -82,10 +68,12 @@ export class AppServices {
   });
   updater!: Updater;
   private tray: AppTray;
+  private notifier: Notifier;
   private trayAvailable = process.platform !== "linux";
   private errors = new RateLimiter(30, 60_000);
   private rejected = new RateLimiter(10, 60_000);
   private timer?: ReturnType<typeof setInterval>;
+  private poll?: ReturnType<typeof setInterval>;
   private autostartFile = autostartPath(process.env, homedir());
   constructor(
     private readonly host: AppServiceHost,
@@ -102,9 +90,9 @@ export class AppServices {
           host.showWindow();
           host.emit({ type: "menu-new" });
         },
-        openAttention: (thread) => {
+        openAttention: (thread, workspace) => {
           host.showWindow();
-          host.emit({ type: "menu-attention", thread });
+          host.emit({ type: "menu-attention", thread, workspace });
         },
         checkUpdates: () => {
           host.showWindow();
@@ -136,6 +124,23 @@ export class AppServices {
             ? this.updater.status.latest
             : undefined,
       }),
+    );
+    const automation = process.env.TWR_DESKTOP_TEST_AUTOMATION === "1";
+    this.notifier = new Notifier(
+      {
+        enabled: () => this.notificationsEnabled,
+        attended: () => {
+          const window = host.window();
+          return !!window && window.isVisible() && window.isFocused();
+        },
+        open: (target) => {
+          host.showWindow();
+          host.emit({ type: "menu-attention", ...target });
+        },
+        log: this.log,
+      },
+      // Automated QA records what would be posted instead of posting it.
+      automation ? { post: testPost(), supported: true } : {},
     );
   }
 
@@ -215,7 +220,17 @@ export class AppServices {
       if (scheduled && this.autoUpdate) void this.updater.check();
     }, UPDATE_CHECK_INTERVAL);
     this.timer.unref();
-    app.on("will-quit", () => this.timer && clearInterval(this.timer));
+    // Other workspaces are read on this beat (shared/App.tsx), also while the window is
+    // hidden, when the page's own timers are throttled.
+    this.poll = setInterval(
+      () => this.host.emit({ type: "inbox-poll" }),
+      WORKSPACE_REFRESH_MS,
+    );
+    this.poll.unref();
+    app.on("will-quit", () => {
+      if (this.timer) clearInterval(this.timer);
+      if (this.poll) clearInterval(this.poll);
+    });
     app.on("render-process-gone", (_event, _contents, details) =>
       this.log.error(
         "renderer",
@@ -298,6 +313,23 @@ export class AppServices {
 
   setAttention(summary: AttentionSummary) {
     this.tray.setAttention(summary);
+    this.notifier.update(summary);
+    if (testState) testState.attention = summary;
+  }
+
+  /** The window came to the front. */
+  focused() {
+    this.notifier.attend();
+  }
+
+  /** The window is gone (not hidden): nothing it could open is left to notify about. */
+  closed() {
+    this.notifier.clear();
+    this.setAttention({ count: 0, items: [], workspaces: [] });
+  }
+
+  get notificationsEnabled() {
+    return this.host.settings().notifications !== false;
   }
 
   login(): DesktopAppSettings["login"] {
@@ -346,6 +378,10 @@ export class AppServices {
     return {
       login: this.login(),
       tray: { enabled: this.trayEnabled, available: this.trayAvailable },
+      notifications: {
+        enabled: this.notificationsEnabled,
+        supported: this.notifier.supported,
+      },
       background: this.background,
       autoUpdate: this.autoUpdate,
       update: this.updater.status,
@@ -416,6 +452,10 @@ export class AppServices {
             }
           : undefined,
       tray: { enabled: this.trayEnabled, available: this.trayAvailable },
+      notifications: {
+        enabled: this.notificationsEnabled,
+        supported: this.notifier.supported,
+      },
       background: this.background,
       launchAtLogin: this.login().enabled,
       memoryMB: Math.round(
@@ -446,6 +486,13 @@ export class AppServices {
       this.applyTray();
       return this.snapshot();
     });
+    handle("app-notifications", (enabled) => {
+      const value = z.boolean().parse(enabled);
+      this.host.save({ notifications: value });
+      if (!value) this.notifier.clear();
+      this.log.info("notify", `Notifications ${value ? "on" : "off"}`);
+      return this.snapshot();
+    });
     handle("app-background", (enabled) => {
       this.host.save({ background: z.boolean().parse(enabled) });
       this.tray.render();
@@ -464,7 +511,7 @@ export class AppServices {
       if (error) throw new Error(error);
     });
     listen("app-attention", (summary) =>
-      this.setAttention(attentionSchema.parse(summary)),
+      this.setAttention(attentionSummarySchema.parse(summary)),
     );
     listen("app-error", (report) => {
       if (!this.errors.allow()) return;
@@ -476,6 +523,38 @@ export class AppServices {
       );
     });
   }
+}
+
+/**
+ * What automated QA reads of the notifications and the tray (scripts/integration.mjs, in
+ * the main process): what was posted, closed and clicked, and the latest summary.
+ */
+interface TestState {
+  attention?: AttentionSummary;
+  notifications: {
+    title: string;
+    body: string;
+    target: object;
+    closed: boolean;
+    click(): void;
+  }[];
+}
+let testState: TestState | undefined;
+function testPost(): Post {
+  const state: TestState = { notifications: [] };
+  testState = state;
+  (globalThis as { __twrTest?: TestState }).__twrTest = state;
+  return (notice, handlers) => {
+    const record = {
+      title: notice.title,
+      body: notice.body,
+      target: notice.target,
+      closed: false,
+      click: () => handlers.click(),
+    };
+    state.notifications.push(record);
+    return { close: () => (record.closed = true) };
+  };
 }
 
 function readPackageType() {
