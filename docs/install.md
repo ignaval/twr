@@ -85,10 +85,25 @@ Stable releases also carry the desktop app, built from the same commit:
 | `twr-desktop_<version>_amd64.deb` | Debian, Ubuntu 22.04 or newer |
 | `twr-desktop-<version>-1-x86_64.pkg.tar.zst` | Arch Linux, Omarchy |
 
-On Arch and Omarchy, install from the AUR with `yay -S twr-desktop-bin` (or your AUR
-helper), so updates come with the rest of your system. `desktop-sha256sums.txt` lists
-the desktop files' checksums. The app updates itself or tells you how to, depending on how
-it was installed. See [desktop updates](desktop.md#updates).
+On Linux, the AppImage runs on any distribution and updates itself; the `.deb` and the Arch
+package install with your package manager (`sudo apt install ./twr-desktop_<version>_amd64.deb`,
+`sudo pacman -U twr-desktop-<version>-1-x86_64.pkg.tar.zst`). An AUR package,
+`twr-desktop-bin`, is built and checked with each release and will be published to the AUR
+with them once the maintainer registers it; until then, use the AppImage or the Arch package.
+`desktop-sha256sums.txt` lists the desktop files' checksums. The app updates itself or tells
+you how to, depending on how it was installed. See [desktop updates](desktop.md#updates).
+
+The Mac disk image is signed ad hoc, not with an Apple Developer ID, and not notarized
+(releases are, once the maintainer has the Apple credentials: [desktop.md](desktop.md#releases)).
+So:
+
+- Gatekeeper blocks the app the first time you open it. Open it once, then choose
+  **Open Anyway** in System Settings › Privacy & Security, or remove the quarantine flag
+  after copying the app to Applications: `xattr -dr com.apple.quarantine /Applications/twr.app`.
+- It doesn't update itself: macOS only swaps in updates signed by the same Developer ID. It
+  tells you when a new release is out and links its disk image; install that the same way.
+- Each such build has a signature of its own, so after a manual update macOS may ask again
+  for the microphone (voice mode) and the other permissions you gave it.
 
 ### Checking the signature
 
@@ -138,7 +153,7 @@ You need a stable Rust toolchain, 1.98 or newer, and git. The repository's `rust
 cargo install --locked --git https://github.com/ignaval/twr twr-cli
 ```
 
-builds the latest commit of the default branch, `dev`, where development happens. Add `--tag v0.2.0` (or another release tag) to build a release, or `--branch main` for the latest one. From a clone of the repository:
+builds the latest commit of the default branch, `dev`, where development happens. Add `--tag v0.2.0` (or another release tag) to build a release. (`--branch main` builds `main`, which can be ahead of the latest release with site and installer changes.) From a clone of the repository:
 
 ```sh
 git clone https://github.com/ignaval/twr

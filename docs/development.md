@@ -191,7 +191,7 @@ Every job uses the Rust version pinned in `rust-toolchain.toml`. The `release-bu
 
 ## Branches
 
-Work lands on `dev` through pull requests. `main` moves only for a release, through a pull request from `dev` merged with a merge commit, whose tree is that of the `dev` commit being released, so `main` is always the latest release. twr.tools deploys from `main` (see [Website](#website)), so site and `install.sh` changes go live with the next release too.
+Work lands on `dev` through pull requests. `main` moves through pull requests from `dev` merged with a merge commit: for a release, whose tree is that of the `dev` commit being released, and in between for changes to the site or `install.sh` that should go live before the next release. So `main` can be ahead of the latest release tag; `cargo install --branch main` builds `main`, not necessarily a release. twr.tools deploys from `main` (see [Website](#website)): it serves `main`'s `install.sh`, which installs the latest *release* (or the `TWR_VERSION` you name), never `main`'s code.
 
 ## Releases
 
