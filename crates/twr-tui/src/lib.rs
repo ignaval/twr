@@ -898,17 +898,44 @@ fn on_path(program: &str) -> bool {
 /// needs `set -g set-clipboard on`), and, when the session has a local clipboard command
 /// ([`select::clipboard_command`]), pipes it there on a task of its own, killed after
 /// [`CLIPBOARD_TIMEOUT`]. A failing command is reported on `status`.
-fn copy_text(text: String, status: StatusOut) {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out
-        .write_all(select::osc52(&text).as_bytes())
-        .and_then(|()| out.flush());
-    let Some((program, args)) = select::clipboard_command(
+///
+/// OSC 52 is written on a thread of its own, holding [`TERMINAL_OUT`]: the loop draws no frame
+/// meanwhile (a frame's bytes inside the sequence would spoil both) and is told on `written`
+/// when it may again. A text over [`select::OSC52_MAX`] is not sent that way at all: terminals
+/// and tmux drop such a sequence without a word, so the status bar says so instead.
+fn copy_text(text: String, status: StatusOut, written: mpsc::UnboundedSender<()>) {
+    let local = select::clipboard_command(
         |k| std::env::var(k).ok(),
         on_path,
         cfg!(target_os = "macos"),
-    ) else {
+    );
+    if text.len() > select::OSC52_MAX {
+        status.send((
+            select::too_large(&text, local.map(|(program, _)| program)),
+            false,
+        ));
+    } else {
+        let sequence = select::osc52(&text);
+        let spawned = std::thread::Builder::new()
+            .name("twr-clipboard".into())
+            .spawn(move || {
+                use std::io::Write;
+                let held = terminal_out();
+                let mut out = std::io::stdout();
+                let _ = out
+                    .write_all(sequence.as_bytes())
+                    .and_then(|()| out.flush());
+                drop(held);
+                let _ = written.send(());
+            });
+        if spawned.is_err() {
+            status.send((
+                "copying: could not start the clipboard writer".into(),
+                false,
+            ));
+        }
+    }
+    let Some((program, args)) = local else {
         return;
     };
     tokio::spawn(async move {
@@ -938,6 +965,26 @@ fn copy_text(text: String, status: StatusOut) {
         };
         status.send((format!("copying with {program}: {why}"), false));
     });
+}
+
+/// Held while something other than a frame writes to the terminal (an OSC 52 copy, a
+/// notification), and while a frame is drawn: neither lands inside the other's bytes.
+static TERMINAL_OUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`TERMINAL_OUT`], waited for.
+fn terminal_out() -> std::sync::MutexGuard<'static, ()> {
+    TERMINAL_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`TERMINAL_OUT`] if nothing holds it (`None`: a copy is being written: the frame waits).
+fn terminal_out_now() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match TERMINAL_OUT.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 /// A status-bar line from a task off the input loop, and whether it is transient (what a
@@ -2899,6 +2946,8 @@ async fn drive(
     // The decisions older than a snapshot's (`decisions.list`), read once on a connection of
     // its own.
     let (dec_tx, mut dec_rx) = mpsc::unbounded_channel::<Value>();
+    // An OSC 52 copy written to the terminal ([`copy_text`]): the frame it held up is due.
+    let (written_tx, mut written_rx) = mpsc::unbounded_channel::<()>();
 
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
@@ -2949,7 +2998,12 @@ async fn drive(
                 }
                 loading_drawn = Some(std::time::Instant::now());
             }
-            if !std::mem::take(&mut replaying) && !replaying_control {
+            // No frame while a copy is written to the terminal ([`copy_text`]): drawn once it
+            // is (`written_rx`).
+            let held = (!std::mem::take(&mut replaying) && !replaying_control)
+                .then(terminal_out_now)
+                .flatten();
+            if let Some(_held) = held {
                 // The grid's Shift-arrows need the column count the grid is drawn with, the
                 // input box the height it may grow in.
                 let size = terminal.size()?;
@@ -3154,7 +3208,7 @@ async fn drive(
                                 continue;
                             }
                             Action::Copy { text } => {
-                                copy_text(text, status.clone());
+                                copy_text(text, status.clone(), written_tx.clone());
                                 continue;
                             }
                             Action::Mouse(on) => {
@@ -3348,6 +3402,7 @@ async fn drive(
                 }
                 Some(r) = sug_rx.recv() => state.apply_result("suggest.next", &r),
                 Some(r) = dec_rx.recv() => state.older_decisions_came(&r),
+                Some(()) = written_rx.recv() => {}
                 Some((thread, ask, answer)) = sum_rx.recv() => {
                     state.summary_result(&thread, ask, answer, std::time::Instant::now());
                 }
@@ -3363,6 +3418,7 @@ async fn drive(
                     );
                     if let Some(bytes) = alert {
                         use std::io::Write;
+                        let _held = terminal_out();
                         let mut out = std::io::stdout();
                         // A failed write shows in the status bar; nothing else depends on it.
                         if let Err(e) = out.write_all(bytes.as_bytes()).and_then(|()| out.flush()) {
@@ -3463,6 +3519,7 @@ async fn drive(
                     );
                     for bytes in alerts {
                         use std::io::Write;
+                        let _held = terminal_out();
                         let mut out = std::io::stdout();
                         if let Err(e) = out.write_all(bytes.as_bytes()).and_then(|()| out.flush()) {
                             state.view.status = Some(format!("notification: {e}"));
