@@ -7960,11 +7960,82 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] to the default model's place, through
-/// a private file beside it, renamed into place only once whole and a ggml model.
+/// What `twr voice setup` checks of the model as it downloads ([`ModelCheck::update`], each
+/// chunk before it is written) and once it has it all ([`ModelCheck::finish`], before the file
+/// is renamed into place): no more than `len` bytes, ggml's magic first, then exactly `len`
+/// bytes whose SHA-256 is `sha256` ([`twr_voice::engine::MODEL_SHA256`]). whisper.cpp's parser
+/// reads the file, so nothing else may reach its place.
+struct ModelCheck {
+    len: u64,
+    sha256: &'static str,
+    got: u64,
+    head: Vec<u8>,
+    digest: ring::digest::Context,
+}
+
+impl ModelCheck {
+    fn new(len: u64, sha256: &'static str) -> ModelCheck {
+        ModelCheck {
+            len,
+            sha256,
+            got: 0,
+            head: Vec::with_capacity(4),
+            digest: ring::digest::Context::new(&ring::digest::SHA256),
+        }
+    }
+
+    fn update(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        use twr_voice::engine::{is_model, MODEL_URL};
+        if self.head.len() < 4 {
+            self.head.extend(chunk.iter().take(4 - self.head.len()));
+            if self.head.len() == 4 && !is_model(&self.head) {
+                bail!("{MODEL_URL} did not send a whisper model; nothing was kept");
+            }
+        }
+        self.got += chunk.len() as u64;
+        if self.got > self.len {
+            bail!(
+                "{MODEL_URL} sent more than the model's {} bytes; nothing was kept",
+                self.len
+            );
+        }
+        self.digest.update(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        use twr_voice::engine::{is_model, MODEL_URL};
+        if self.got != self.len || !is_model(&self.head) {
+            bail!(
+                "{MODEL_URL} did not send a whole whisper model ({} of {} bytes); nothing was kept",
+                self.got,
+                self.len
+            );
+        }
+        let actual: String = self
+            .digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if actual != self.sha256 {
+            bail!(
+                "{MODEL_URL} is not the model twr expects: its SHA-256 is {actual}, not {}; \
+                 nothing was kept",
+                self.sha256
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] (pinned to a commit) to the default
+/// model's place, through a private file beside it, renamed into place only once whole and its
+/// SHA-256 the one twr expects ([`ModelCheck`]).
 async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> anyhow::Result<()> {
     use std::io::Write;
-    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_MAX_BYTES, MODEL_MIN_BYTES, MODEL_URL};
+    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_BYTES, MODEL_SHA256, MODEL_URL};
     if !cfg.model.trim().is_empty() {
         bail!(
             "[voice] model names your own model ({}): `twr voice setup` only downloads the \
@@ -7999,40 +8070,31 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
     if !resp.status().is_success() {
         bail!("downloading {MODEL_URL} failed: HTTP {}", resp.status());
     }
-    let total = resp.content_length().filter(|n| *n <= MODEL_MAX_BYTES);
+    if let Some(total) = resp.content_length().filter(|n| *n != MODEL_BYTES) {
+        bail!("{MODEL_URL} is {total} bytes, not the model's {MODEL_BYTES}; nothing was kept");
+    }
     let part = target.with_extension(format!("bin.part-{}", std::process::id()));
     let download = async {
         let mut file =
             std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-        let mut got: u64 = 0;
+        let mut check = ModelCheck::new(MODEL_BYTES, MODEL_SHA256);
         let mut shown = 0;
-        let mut head = Vec::with_capacity(4);
         let chunk_wait = std::time::Duration::from_secs(60);
         while let Some(chunk) = tokio::time::timeout(chunk_wait, resp.chunk())
             .await
             .map_err(|_| anyhow!("the download stalled"))?
             .context("downloading the model")?
         {
-            if head.len() < 4 {
-                head.extend(chunk.iter().take(4 - head.len()));
-            }
-            got += chunk.len() as u64;
-            if got > MODEL_MAX_BYTES {
-                bail!("{MODEL_URL} is larger than a whisper model");
-            }
+            check.update(&chunk)?;
             file.write_all(&chunk)
                 .with_context(|| format!("writing {}", part.display()))?;
-            if let Some(total) = total.filter(|t| *t > 0) {
-                let pct = got * 100 / total;
-                if pct >= shown + 10 {
-                    shown = pct - pct % 10;
-                    eprintln!("twr: {shown}%");
-                }
+            let pct = check.got * 100 / MODEL_BYTES;
+            if pct >= shown + 10 {
+                shown = pct - pct % 10;
+                eprintln!("twr: {shown}%");
             }
         }
-        if got < MODEL_MIN_BYTES || !is_model(&head) || total.is_some_and(|t| t != got) {
-            bail!("{MODEL_URL} did not send a whole whisper model ({got} bytes)");
-        }
+        check.finish()?;
         file.sync_all().context("writing the model")?;
         std::fs::rename(&part, &target)
             .with_context(|| format!("moving the model to {}", target.display()))?;
@@ -8747,6 +8809,45 @@ mod tests {
         );
     }
     use super::*;
+
+    /// `twr voice setup` keeps only exactly the model it pinned: ggml's magic, its size and its
+    /// SHA-256, checked while it streams and before the rename.
+    #[test]
+    fn voice_setup_keeps_only_the_pinned_model() {
+        let model = b"lmggthe rest of a tiny model".to_vec();
+        let sha: &'static str = Box::leak(sha256_hex(&model).into_boxed_str());
+        let run = |chunks: &[&[u8]], len: u64| -> anyhow::Result<()> {
+            let mut check = ModelCheck::new(len, sha);
+            for c in chunks {
+                check.update(c)?;
+            }
+            check.finish()
+        };
+        let len = model.len() as u64;
+        // Whole, in any chunks.
+        run(&[&model], len).unwrap();
+        run(&[&model[..2], &model[2..3], &model[3..]], len).unwrap();
+        // Another file of the same size: refused at the end.
+        let mut other = model.clone();
+        *other.last_mut().unwrap() ^= 1;
+        let e = run(&[&other], len).unwrap_err().to_string();
+        assert!(
+            e.contains("is not the model twr expects") && e.contains(sha),
+            "{e}"
+        );
+        // Too short, too long, not a ggml file.
+        let e = run(&[&model[..10]], len).unwrap_err().to_string();
+        assert!(
+            e.contains("did not send a whole whisper model (10 of"),
+            "{e}"
+        );
+        let mut long = model.clone();
+        long.push(0);
+        let e = run(&[&long], len).unwrap_err().to_string();
+        assert!(e.contains("sent more than"), "{e}");
+        let e = run(&[b"<!doctype html>"], len).unwrap_err().to_string();
+        assert!(e.contains("did not send a whisper model"), "{e}");
+    }
 
     /// `twr ws rm` asks before it removes anything, naming what goes: anything but y/yes keeps
     /// the workspace.

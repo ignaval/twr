@@ -171,15 +171,20 @@ const NO_WHISPER: &str = "no speech recognizer: install whisper.cpp (`brew insta
                           `whisper-cli` is on PATH, or set [voice] engine = \"command\" \
                           (docs/voice.md)";
 
-/// Where `twr voice setup` downloads [`DEFAULT_MODEL`] from: whisper.cpp's own models.
-pub const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+/// The commit of whisper.cpp's model repository on Hugging Face (`ggerganov/whisper.cpp`)
+/// that [`MODEL_URL`] is pinned to, so the file can't change under the same URL.
+pub const MODEL_COMMIT: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+/// Where `twr voice setup` downloads [`DEFAULT_MODEL`] from: whisper.cpp's own models, at
+/// [`MODEL_COMMIT`].
+pub const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/\
+                             5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin";
+/// The SHA-256 of `ggml-base.en.bin` at [`MODEL_COMMIT`] (its Git LFS `oid`, checked against
+/// a download): `twr voice setup` keeps no file with another.
+pub const MODEL_SHA256: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
+/// Its size in bytes.
+pub const MODEL_BYTES: u64 = 147_964_211;
 /// Its size, as said to the user.
 pub const MODEL_SIZE: &str = "148 MB";
-/// Most bytes `twr voice setup` takes: base.en is 147,964,211.
-pub const MODEL_MAX_BYTES: u64 = 256 * 1024 * 1024;
-/// Fewest bytes of a model it keeps (an error page is not one).
-pub const MODEL_MIN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Whether `head`, a downloaded file's first bytes, starts a whisper.cpp model: ggml's magic,
 /// `0x67676d6c` little-endian.
@@ -393,6 +398,24 @@ mod tests {
     use super::*;
     use crate::wav::{encode, RATE};
     use std::os::unix::fs::PermissionsExt;
+
+    /// The model is downloaded from one commit of its repository, never a branch, and is
+    /// checked against a whole SHA-256.
+    #[test]
+    fn the_model_url_is_pinned_to_a_commit() {
+        assert_eq!(MODEL_COMMIT.len(), 40);
+        assert!(MODEL_COMMIT.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            MODEL_URL,
+            format!(
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/{MODEL_COMMIT}/ggml-base.en.bin"
+            )
+        );
+        assert_eq!(MODEL_SHA256.len(), 64);
+        assert!(MODEL_SHA256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
