@@ -309,6 +309,94 @@ describe("mobile reconnect", () => {
     expect(connected).toEqual(["default", "work", "work"]);
     await host.stop();
   });
+  it("closes the socket 30 s into the background and sends pending mutations once on resume", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((event) => events.push(event));
+      const original = fake.send.getMockImplementation()!;
+      const sends: any[] = [];
+      let replyToSend = false;
+      fake.send.mockImplementation(async (payload) => {
+        const call = JSON.parse(payload.message);
+        sends.push(call);
+        if (call.method === "rpc" && call.params.method === "thread.send") {
+          if (replyToSend) reply(call.id, { sent: true });
+          return;
+        }
+        await original(payload);
+      });
+      // A mutation whose reply is lost when the app leaves.
+      const pending = host.request("rpc", {
+        method: "thread.send",
+        params: { thread: "worker", prompt: "once" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      host.setForeground(false);
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(fake.disconnect).not.toHaveBeenCalled();
+      // Within the grace period the gateway's heartbeats are still answered.
+      fake.listener({ message: { type: "heartbeat" } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sends.at(-1).method).toBe("heartbeat");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "connection", connected: false }),
+      );
+      const sent = sends.length;
+      fake.listener({ message: { type: "heartbeat" } });
+      await vi.advanceTimersByTimeAsync(120_000);
+      // Parked: no heartbeat answers, no client heartbeats, no reconnects.
+      expect(sends.length).toBe(sent);
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      replyToSend = true;
+      host.setForeground(true);
+      await host.resume();
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      expect(await pending).toEqual({ sent: true });
+      const mutations = sends.filter(
+        (call) => call.method === "rpc" && call.params.method === "thread.send",
+      );
+      expect(new Set(mutations.map((call) => call.id)).size).toBe(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("keeps the socket when the app returns within the grace period", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      host.setForeground(false);
+      await vi.advanceTimersByTimeAsync(20_000);
+      host.setForeground(true);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fake.disconnect).not.toHaveBeenCalled();
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      host.setForeground(false);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
   it("stops retrying once the gateway reports the token revoked (401)", async () => {
     vi.useFakeTimers();
     const host = new RemoteHost(
