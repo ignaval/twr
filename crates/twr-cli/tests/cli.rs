@@ -234,6 +234,12 @@ fn hub_thread_send_events() {
     );
     let activity = row.rsplit("  ").next().unwrap();
     assert!(activity.starts_with("done"), "{list}");
+    // --json: the same threads, as thread.list returns them.
+    let listed: Vec<Value> =
+        serde_json::from_str(&ok(home, &["thread", "list", "--json"])).unwrap();
+    let t1 = listed.iter().find(|t| t["name"] == "t1").unwrap();
+    assert_eq!(t1["status"], "done", "{t1}");
+    assert!(row.contains(t1["id"].as_str().unwrap()), "{list}");
     // Threads run in twr's default mode, `auto`, until `twr mode` changes it.
     assert!(list.lines().next().unwrap().contains(" MODE "), "{list}");
     assert!(row.contains(" auto "), "{list}");
@@ -498,6 +504,7 @@ fn respond_and_attention_work_without_a_screen() {
     );
     assert!(created.contains("model=opus-x"), "{created}");
     assert_eq!(ok(home, &["attention"]).trim(), "nothing needs you");
+    assert_eq!(ok(home, &["attention", "--json"]).trim(), "[]");
 
     // A permission, answered by number on the thread.
     ok(home, &["send", "t1", "!perm Bash ls"]);
@@ -523,6 +530,16 @@ fn respond_and_attention_work_without_a_screen() {
         "{err}"
     );
     assert!(ok(home, &["attention"]).contains(listed_id));
+    // --json: the items listed, each with the target `twr respond` takes.
+    let items: Vec<Value> = serde_json::from_str(&ok(home, &["attention", "--json"])).unwrap();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["target"], listed_id);
+    assert_eq!(items[0]["thread_name"], "t1");
+    assert_eq!(items[0]["reason"], "permission");
+    assert!(
+        listed_id.starts_with(items[0]["attn_id"].as_str().unwrap()),
+        "{items:?}"
+    );
     // --yes: the question it answers is shown first (with its revision), then answered.
     let answered = ok(home, &["respond", "t1", "1", "--yes"]);
     let shown = answered.lines().next().unwrap();
@@ -1338,6 +1355,14 @@ fn park_and_resume_free_and_recreate_the_worktree() {
     );
     let all = ok(home, &["thread", "list", "--all"]);
     assert!(all.contains("parked") && !all.contains("hidden"), "{all}");
+    // So does --json.
+    assert_eq!(ok(home, &["thread", "list", "--json"]).trim(), "[]");
+    let all: Vec<Value> =
+        serde_json::from_str(&ok(home, &["thread", "list", "--all", "--json"])).unwrap();
+    assert!(
+        all.iter().any(|t| t["name"] == "wt" && t["parked"] == true),
+        "{all:?}"
+    );
     // Parking twice is a conflict.
     let again = twr(home, &["park", "wt"]);
     assert!(!again.status.success());

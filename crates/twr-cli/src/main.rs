@@ -272,6 +272,10 @@ enum Cmd {
         /// Also list error, review and stalled items.
         #[arg(long)]
         all: bool,
+        /// Print the listed items as JSON, each as `attention.list` returns it plus `target`,
+        /// the `<attn_id>@<revision>` that `twr respond` and `twr attention dismiss` take.
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
         cmd: Option<AttentionCmd>,
     },
@@ -1320,6 +1324,9 @@ enum ThreadCmd {
         /// Also list parked threads.
         #[arg(long, short)]
         all: bool,
+        /// Print the listed threads as JSON, each as `thread.list` returns it.
+        #[arg(long)]
+        json: bool,
     },
     /// Show what a thread has in flight now, as the hub reads it (`work` of `thread.get`): its
     /// reading (working, waiting on its background work, on a tool call, nothing in flight,
@@ -2148,7 +2155,11 @@ async fn run_simple(
             let mut ask = ask_on_stderr;
             respond(&socket, &target, &answer, message, consent(yes, &mut ask)).await
         }
-        Cmd::Attention { all, cmd: None } => attention(&socket, all).await,
+        Cmd::Attention {
+            all,
+            json,
+            cmd: None,
+        } => attention(&socket, all, json).await,
         Cmd::Attention {
             cmd: Some(AttentionCmd::Dismiss { target }),
             ..
@@ -2223,8 +2234,8 @@ async fn run_simple(
             Ok(())
         }
         Cmd::Thread {
-            cmd: ThreadCmd::List { all },
-        } => thread_list(&socket, all).await,
+            cmd: ThreadCmd::List { all, json },
+        } => thread_list(&socket, all, json).await,
         Cmd::Thread {
             cmd: ThreadCmd::Show { thread, json },
         } => thread_show(&socket, &thread, json).await,
@@ -5427,7 +5438,7 @@ fn is_blocking(item: &Value) -> bool {
     matches!(item["reason"].as_str(), Some("permission" | "question"))
 }
 
-async fn attention(socket: &Path, all: bool) -> anyhow::Result<()> {
+async fn attention(socket: &Path, all: bool, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     // Every item: an empty default listing still says what `--all` would show.
     let items = c.call("attention.list", json!({ "all": true })).await?;
@@ -5437,6 +5448,20 @@ async fn attention(socket: &Path, all: bool) -> anyhow::Result<()> {
         .filter(|i| all || is_blocking(i))
         .cloned()
         .collect();
+    if json {
+        let items: Vec<Value> = items
+            .into_iter()
+            .map(|mut i| {
+                let target = revisioned_id(&i);
+                if let Some(o) = i.as_object_mut() {
+                    o.insert("target".into(), json!(target));
+                }
+                i
+            })
+            .collect();
+        outln!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
     if items.is_empty() {
         match every.len() {
             0 => outln!("nothing needs you"),
@@ -6870,10 +6895,15 @@ fn show_text(t: &Value) -> String {
     out.join("\n")
 }
 
-async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
+async fn thread_list(socket: &Path, all: bool, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let threads = c.call("thread.list", Value::Null).await?;
     let threads = threads.as_array().cloned().unwrap_or_default();
+    if json {
+        let (threads, _) = listed(threads, all);
+        outln!("{}", serde_json::to_string_pretty(&threads)?);
+        return Ok(());
+    }
     if threads.is_empty() {
         outln!(
             "no threads (create one with `twr{} thread new <project>`)",
@@ -9646,6 +9676,17 @@ mod tests {
                 .cmd,
             Some(Cmd::Attention {
                 all: true,
+                json: false,
+                cmd: None
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["twr", "attention", "--json"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::Attention {
+                all: false,
+                json: true,
                 cmd: None
             })
         ));
@@ -10550,7 +10591,7 @@ mod tests {
         ] {
             let c = Cli::try_parse_from(args).unwrap();
             assert!(
-                matches!(c.cmd, Some(Cmd::Thread { cmd: ThreadCmd::List { all } }) if all == want),
+                matches!(c.cmd, Some(Cmd::Thread { cmd: ThreadCmd::List { all, .. } }) if all == want),
                 "{args:?}"
             );
         }

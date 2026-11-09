@@ -437,6 +437,13 @@
         "type": "boolean",
         "description": "Also list error, review and stalled items",
         "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the listed items as JSON, each as `attention.list` returns it plus `target`, the `<attn_id>@<revision>` that `twr respond` and `twr attention dismiss` take",
+        "advanced": true
       }
     ],
     "cli": [
@@ -446,6 +453,12 @@
       {
         "key": "all",
         "flag": "--all",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
         "many": false,
         "separator": false
       }
@@ -3084,6 +3097,13 @@
         "type": "boolean",
         "description": "Also list parked threads",
         "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the listed threads as JSON, each as `thread.list` returns it",
+        "advanced": true
       }
     ],
     "cli": [
@@ -3094,6 +3114,12 @@
       {
         "key": "all",
         "flag": "--all",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
         "many": false,
         "separator": false
       }

@@ -43,7 +43,7 @@ twr thread new ~/code/api --name gem --runtime 'acp:gemini --experimental-acp'
 twr thread new ~/code/api --name aider --runtime 'pty:aider --model sonnet'
 ```
 
-`twr thread list` shows every thread with its status, runtime, permission mode, model, project, turns, what its turns spent (`SPENT`: `1.2M tok $3.40`, see [Subscription usage](#subscription-usage)), how much disk its worktree takes (`DISK`, [worktrees.md](worktrees.md#disk-use)), open items, queued prompts and, last, its activity: one line on what it is doing now, such as `implementing scroll anchoring · running tests` or `waiting for permission: Bash: git push` ([tui.md](tui.md#the-activity-line)), cut to 60 characters. Parked threads are left out, and a line under the table names them (`2 parked threads hidden: old, older (twr thread list --all)`). `--all` (`-a`) lists them too.
+`twr thread list` shows every thread with its status, runtime, permission mode, model, project, turns, what its turns spent (`SPENT`: `1.2M tok $3.40`, see [Subscription usage](#subscription-usage)), how much disk its worktree takes (`DISK`, [worktrees.md](worktrees.md#disk-use)), open items, queued prompts and, last, its activity: one line on what it is doing now, such as `implementing scroll anchoring · running tests` or `waiting for permission: Bash: git push` ([tui.md](tui.md#the-activity-line)), cut to 60 characters. Parked threads are left out, and a line under the table names them (`2 parked threads hidden: old, older (twr thread list --all)`). `--all` (`-a`) lists them too. `--json` prints the threads it lists (the same rule for parked ones) as a JSON array, each as the hub's `thread.list` returns it, for scripts.
 
 ### Change a thread's mode
 
@@ -172,9 +172,10 @@ twr respond 01J...:1:perm-3@42 deny   # answer that revision of an item
 twr respond 01J...:1:q-1@57 2 -m "use the staging DB"   # option 2, with a message
 twr attention --all                   # also reviews, errors, stalled notices, routing questions
 twr attention dismiss 01J...@57       # close one of those without answering it (dismiss in the TUI's popup)
+twr attention --json                  # for scripts: each item, with "target": "<attn_id>@<revision>"
 ```
 
-An answer is an option label (`allow`, `deny`) or its number. A question without options takes free text.
+An answer is an option label (`allow`, `deny`) or its number. A question without options takes free text. `twr attention --json` (with `--all` too) prints the items it would list as a JSON array, each as the hub's `attention.list` returns it plus `target`, the `<attn_id>@<revision>` to pass to `twr respond` or `twr attention dismiss`.
 
 `twr say` never answers a permission or question. It can't tell which ones you had seen. A message that looks like an answer ("yes", "allow", "2", "allow both", "@api yes, @web no", "allow api and then summarize") while one is pending isn't sent anywhere either, not even to the orchestrator. `say` lists what's pending and the `twr respond <id>@<rev>` that answers it. The TUI's input line does answer the card on screen, because the TUI tells the hub what you had seen.
 
