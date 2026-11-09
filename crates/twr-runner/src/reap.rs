@@ -1368,6 +1368,46 @@ pub fn process_liveness(pid: u32, start_time: Option<u64>) -> Alive {
     alive_of(read_stat(pid), start_time)
 }
 
+/// [`process_liveness`] of each `(pid, start_time)` in `procs`, in order, from one read of the
+/// process table: on Linux one `/proc/<pid>/stat` read each, with `ps` (macOS) one call for
+/// all of them rather than one each. A batched call that fails falls back to one call each, so
+/// one unreadable process never makes the others unknown. Blocks.
+pub fn processes_liveness(procs: &[(u32, Option<u64>)]) -> Vec<Alive> {
+    #[cfg(all(target_os = "linux", not(twr_ps)))]
+    {
+        let table = sys::Table::default();
+        procs
+            .iter()
+            .map(|(pid, start)| alive_of(sys::stat_in(*pid, &table), *start))
+            .collect()
+    }
+    #[cfg(any(not(target_os = "linux"), twr_ps))]
+    {
+        if procs.len() <= 1 {
+            return procs
+                .iter()
+                .map(|(pid, start)| process_liveness(*pid, *start))
+                .collect();
+        }
+        let mut pids: Vec<u32> = procs.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        match ps::table_of(&pids) {
+            Some(table) => procs
+                .iter()
+                .map(|(pid, start)| {
+                    let look = table.get(pid).map_or(Lookup::Gone, |s| Lookup::Found(*s));
+                    alive_of(look, *start)
+                })
+                .collect(),
+            None => procs
+                .iter()
+                .map(|(pid, start)| process_liveness(*pid, *start))
+                .collect(),
+        }
+    }
+}
+
 /// [`process_liveness`] of what the process table said.
 fn alive_of(look: Lookup, start_time: Option<u64>) -> Alive {
     match look {
