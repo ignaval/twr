@@ -1290,7 +1290,7 @@ impl Service {
                     .dir
                     .join("runner/hubs")
                     .join(&certificate.binding.machine);
-                crate::bundle::reserve(&hub_root, bundle.size)?;
+                crate::bundle::reserve(&hub_root, bundle.size).await?;
                 let incoming = root.parent().unwrap().join("incoming.bundle");
                 let file = crate::worker::Build {
                     sha256: bundle.sha256.clone(),
@@ -1386,7 +1386,7 @@ impl Service {
                     .join("runner/hubs")
                     .join(&certificate.binding.machine);
                 ensure_private_dir(&owner_root)?;
-                crate::bundle::reserve(&owner_root, source.bundle.size)?;
+                crate::bundle::reserve(&owner_root, source.bundle.size).await?;
                 let temporary = s
                     .machine
                     .dir
@@ -1454,7 +1454,7 @@ impl Service {
                     .join("runner/hubs")
                     .join(&certificate.binding.machine);
                 ensure_private_dir(&hub_root)?;
-                crate::bundle::reserve(&hub_root, build.size)?;
+                crate::bundle::reserve(&hub_root, build.size).await?;
                 wire::write(&mut send, &Reply::Ok(json!({"ready":true}))).await?;
                 let temp = crate::worker::receive(&mut recv, &path, &build).await?;
                 let state = s.state.lock().await;

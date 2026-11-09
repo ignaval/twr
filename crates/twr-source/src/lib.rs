@@ -488,6 +488,38 @@ impl Repository {
     }
 }
 pub fn directory_bytes(root: &Path, cap: u64) -> Result<u64> {
+    walk_bytes(root, cap, |_| true)
+}
+
+/// The per-owner runner budget for transfers and builds.
+pub const OWNER_BUDGET: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Whether `relative` (a path below an owner's `runner/hubs/<machine>` directory) holds
+/// transfer or build data the owner budget counts. Laid out as `<workspace>/builds`,
+/// `<workspace>/native/<id>/…`, `<workspace>/native-incoming` and
+/// `<workspace>/boxes/<box>/repos`, plus result-export scratch at the top. Not counted:
+/// the rest of a box's data directory (agent worktrees, trash, spool, logs), whose growth is
+/// agent work rather than what a hub transferred, and a native build's compiler scratch
+/// (`native/<id>/target`), which is removed after publication and bounded by the build's time
+/// limit and the free-space reserve instead.
+fn budgeted(relative: &Path) -> bool {
+    let parts: Vec<_> = relative.components().map(|c| c.as_os_str()).collect();
+    match parts.as_slice() {
+        [_, boxes, _, entry, ..] if *boxes == "boxes" => *entry == "repos",
+        [_, native, _, entry, ..] if *native == "native" => *entry != "target",
+        _ => true,
+    }
+}
+
+/// The bytes an owner's runner directory `root` charges to its budget ([`budgeted`]), or a
+/// value above `cap` once that is exceeded.
+pub fn budget_bytes(root: &Path, cap: u64) -> Result<u64> {
+    walk_bytes(root, cap, |path| {
+        path.strip_prefix(root).map_or(true, budgeted)
+    })
+}
+
+fn walk_bytes(root: &Path, cap: u64, counted: impl Fn(&Path) -> bool) -> Result<u64> {
     let mut stack = vec![root.to_path_buf()];
     let mut size = 0u64;
     let mut entries = 0usize;
@@ -503,6 +535,10 @@ pub fn directory_bytes(root: &Path, cap: u64) -> Result<u64> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e.into()),
             };
+            let path = entry.path();
+            if !counted(&path) {
+                continue;
+            }
             entries += 1;
             ensure!(
                 entries < 1_000_000,
@@ -514,7 +550,7 @@ pub fn directory_bytes(root: &Path, cap: u64) -> Result<u64> {
                 Err(e) => return Err(e.into()),
             };
             if kind.is_dir() {
-                stack.push(entry.path());
+                stack.push(path);
             } else if kind.is_file() {
                 let metadata = match entry.metadata() {
                     Ok(value) => value,
@@ -531,8 +567,16 @@ pub fn directory_bytes(root: &Path, cap: u64) -> Result<u64> {
     Ok(size)
 }
 
+/// Admits `additional` transfer/build bytes for the owner whose runner directory is `root`:
+/// the filesystem keeps its free-space reserve and the owner stays within [`OWNER_BUDGET`]
+/// ([`budget_bytes`]). The walk runs on a blocking thread.
+pub async fn reserve(root: &Path, additional: u64) -> Result<()> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || reserve_blocking(&root, additional)).await?
+}
+
 #[allow(clippy::unnecessary_cast)] // statvfs field widths differ on supported Unix targets.
-pub fn reserve(root: &Path, additional: u64) -> Result<()> {
+pub fn reserve_blocking(root: &Path, additional: u64) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(root.as_os_str().as_bytes())?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -549,8 +593,8 @@ pub fn reserve(root: &Path, additional: u64) -> Result<()> {
         "runner free-space reserve reached; reclaim disk space before admitting work"
     );
     ensure!(
-        directory_bytes(root, 10 * 1024 * 1024 * 1024)? + additional <= 10 * 1024 * 1024 * 1024,
-        "this hub's runner disk budget is full"
+        budget_bytes(root, OWNER_BUDGET)?.saturating_add(additional) <= OWNER_BUDGET,
+        "this hub's runner transfer/build budget is full; run `twr runner prune` on the runner"
     );
     Ok(())
 }
@@ -607,6 +651,46 @@ mod tests {
             assert!(directory_bytes(&root, 1024 * 1024)? <= 1024 * 1024);
         }
         writer.join().unwrap();
+        Ok(())
+    }
+    #[test]
+    fn owner_budget_counts_transfers_and_builds_but_not_agent_work() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let owner = temp.path();
+        let sparse = |path: &Path, len: u64| -> Result<()> {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::File::create(path)?.set_len(len)?;
+            Ok(())
+        };
+        let ws = owner.join("cd".repeat(16));
+        // Agent work: one worktree's Rust target alone exceeds the budget.
+        sparse(
+            &ws.join("boxes/desk/worktrees/api/target/debug/big"),
+            OWNER_BUDGET + 1,
+        )?;
+        sparse(&ws.join("boxes/desk/trash/old/blob"), OWNER_BUDGET)?;
+        sparse(&ws.join("boxes/desk/runner-desk.db"), 1 << 30)?;
+        for i in 0..2000 {
+            sparse(
+                &ws.join(format!(
+                    "boxes/desk/worktrees/web/node_modules/m{}/f{i}",
+                    i % 50
+                )),
+                1,
+            )?;
+        }
+        // The in-progress build's compiler scratch.
+        sparse(&ws.join("native/abc/target/debug/twr"), OWNER_BUDGET)?;
+        assert_eq!(budget_bytes(owner, OWNER_BUDGET)?, 0);
+        // Transfers and builds.
+        sparse(&ws.join("boxes/desk/repos/p/.git/objects/pack/a.pack"), 100)?;
+        sparse(&ws.join("builds/ef/twr"), 20)?;
+        sparse(&ws.join("native/abc/objects/pack/b.pack"), 3)?;
+        sparse(&ws.join("native-incoming/source.bundle"), 4)?;
+        sparse(&owner.join(".tmpexport/results.bundle"), 5)?;
+        assert_eq!(budget_bytes(owner, OWNER_BUDGET)?, 132);
+        sparse(&ws.join("builds/ff/twr"), OWNER_BUDGET)?;
+        assert!(budget_bytes(owner, OWNER_BUDGET)? > OWNER_BUDGET);
         Ok(())
     }
     #[tokio::test]

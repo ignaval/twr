@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 pub use twr_source::Source;
+/// How often a running native build re-checks the free-space reserve and owner budget. The
+/// build's own compiler scratch is not charged to the budget ([`twr_source::budget_bytes`]).
+const BUILD_BUDGET_CHECK: Duration = Duration::from_secs(15);
 pub fn host_target() -> &'static str {
     twr_core::build_target()
 }
@@ -178,7 +181,7 @@ pub async fn build(
     let root = machine.dir.join("runner/hubs").join(scope);
     twr_core::paths::ensure_private_dir(&root)?;
     let owner_root = root.parent().context("source scope has no owner")?;
-    crate::bundle::reserve(owner_root, source.bundle.size)?;
+    crate::bundle::reserve(owner_root, source.bundle.size).await?;
     let cache = root.join("native").join(id);
     twr_core::paths::ensure_private_dir(&cache)?;
     let output = cache.join("output.json");
@@ -282,7 +285,7 @@ pub async fn build(
         twr_adapters::process::run_bounded(cmd, Duration::from_secs(30 * 60), 64 * 1024, |_| false);
     tokio::pin!(run);
     loop {
-        tokio::select! {result=&mut run=>{match result {twr_adapters::process::Bounded::Exited(Some(0),_)=>{},twr_adapters::process::Bounded::Exited(_,bytes)=>{let tail=&bytes[bytes.len().saturating_sub(4096)..];anyhow::bail!("native worker build failed: {}",String::from_utf8_lossy(tail));},_=>anyhow::bail!("native worker build could not complete within its time/output limit; check the runner's toolchain and dependencies")};break},_=tokio::time::sleep(Duration::from_secs(1))=>{crate::bundle::reserve(owner_root,0)?;}}
+        tokio::select! {result=&mut run=>{match result {twr_adapters::process::Bounded::Exited(Some(0),_)=>{},twr_adapters::process::Bounded::Exited(_,bytes)=>{let tail=&bytes[bytes.len().saturating_sub(4096)..];anyhow::bail!("native worker build failed: {}",String::from_utf8_lossy(tail));},_=>anyhow::bail!("native worker build could not complete within its time/output limit; check the runner's toolchain and dependencies")};break},_=tokio::time::sleep(BUILD_BUDGET_CHECK)=>{crate::bundle::reserve(owner_root,0).await?;}}
     }
     verify_materialization(&materialized, &source.bundle.commit).await?;
     let executable = target_dir.join(&target).join(&source.profile).join("twr");
