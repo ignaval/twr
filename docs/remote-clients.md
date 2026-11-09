@@ -48,7 +48,10 @@ Switching hosts preserves local and remote terminals. Return to the original hos
 checked by the hub for each operation; a read-only device cannot mutate threads,
 change settings or open a terminal. Forgetting a saved connection removes its
 local credentials and encrypted offline state; revoke the device on the hub to
-remove its server-side access.
+remove its server-side access. A client stops reconnecting and asks you to pair
+again only when the gateway answers 401 (it no longer knows the device's token).
+Any other refusal (403, a 5xx while the hub is busy) and network loss keep
+retrying with backoff, up to 30 seconds apart.
 
 Validation: `npm test -- tests/connections.test.ts tests/desktop-remote.test.ts
  tests/gateway-setup.test.ts tests/desktop-inbox.test.ts tests/mobile-transport.test.ts`.

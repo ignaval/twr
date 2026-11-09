@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { DesktopTransport } from "../desktop/remote-transport";
+import { isRevocationError } from "../shared/remote";
 import type { AddressInfo } from "node:net";
 const token = "a".repeat(64);
 const gateway = "gateway-test";
@@ -217,8 +218,24 @@ describe("native desktop gateway adapter", () => {
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(f.events).toHaveLength(before);
   });
-  it.each([401, 403])(
-    "marks HTTP %i as revoked access instead of a retryable network loss",
+  it("marks HTTP 401 as revoked access instead of a retryable network loss", async () => {
+    const f = await fixture();
+    const hub = await f.native.pair({
+      url: f.url,
+      code: "one-use",
+      name: "Desktop",
+      hubName: "Test",
+    });
+    f.rejectStatus(401);
+    await expect(f.native.connect({ id: hub.id })).rejects.toThrow(
+      "AUTH_REVOKED",
+    );
+    expect(f.events.some((event) => event.type === "authenticated")).toBe(
+      false,
+    );
+  });
+  it.each([403, 500, 503])(
+    "reports HTTP %i as a refusal to retry, not a revocation",
     async (status) => {
       const f = await fixture();
       const hub = await f.native.pair({
@@ -228,12 +245,21 @@ describe("native desktop gateway adapter", () => {
         hubName: "Test",
       });
       f.rejectStatus(status);
-      await expect(f.native.connect({ id: hub.id })).rejects.toThrow(
-        "AUTH_REVOKED",
+      const error = await f.native.connect({ id: hub.id }).catch((e) => e);
+      expect(String(error)).toContain(`refused the connection (${status})`);
+      expect(isRevocationError(error)).toBe(false);
+      await vi.waitFor(() =>
+        expect(f.events).toContainEqual(
+          expect.objectContaining({ type: "transport-closed" }),
+        ),
       );
-      expect(f.events.some((event) => event.type === "authenticated")).toBe(
-        false,
-      );
+      expect(
+        f.events.some((event) => isRevocationError(event.error ?? "")),
+      ).toBe(false);
+      // The same saved credential connects once the gateway accepts it again.
+      f.rejectStatus(0);
+      await f.native.connect({ id: hub.id });
+      expect(f.events).toContainEqual({ type: "authenticated", framing: true });
     },
   );
   it("does not create a socket when credential reading finishes after disconnect", async () => {

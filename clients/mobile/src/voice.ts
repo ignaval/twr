@@ -31,6 +31,8 @@ export interface VoicePluginEvent {
   id?: number;
   /** The error came from the app leaving the foreground: voice mode ends. */
   background?: boolean;
+  /** iOS: a call, Siri or another app's audio interrupted listening and the voice. */
+  interrupted?: boolean;
 }
 
 /** The native plugin: TwrVoicePlugin.swift (iOS), TwrVoicePlugin.java (Android). */

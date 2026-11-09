@@ -37,14 +37,41 @@ export class RemoteHost extends SharedRemoteHost {
         await Dialog.alert({ title: "Path on your hub", message: path });
       },
       exportText: async (name, content) => {
+        const path = `${EXPORTS}/${name}`;
         const file = await Filesystem.writeFile({
-          path: name,
+          path,
           directory: Directory.Cache,
           encoding: Encoding.UTF8,
           data: content,
+          recursive: true,
         });
-        await Share.share({ title: name, url: file.uri });
+        try {
+          await Share.share({ title: name, url: file.uri });
+        } finally {
+          // The transcript is plaintext: it lives only as long as the share needs it.
+          // Android hands the receiving app a content URI it may read just after the
+          // chooser returns, so the file outlives the sheet there for a minute.
+          const remove = () =>
+            void Filesystem.deleteFile({
+              path,
+              directory: Directory.Cache,
+            }).catch(() => {});
+          if (navigator.userAgent.includes("Android"))
+            setTimeout(remove, 60_000);
+          else remove();
+        }
       },
     });
   }
+}
+
+/** Cache folder of transcript exports waiting for the share sheet (docs/mobile.md). */
+const EXPORTS = "exports";
+/** Deletes every export left behind: at startup, and when a hub is forgotten. */
+export async function sweepExports() {
+  await Filesystem.rmdir({
+    path: EXPORTS,
+    directory: Directory.Cache,
+    recursive: true,
+  }).catch(() => {});
 }

@@ -28,6 +28,17 @@ export const pushEnabled = (id: string) =>
 export async function refreshPush(host: RemoteHost, id: string) {
   if (pushEnabled(id)) await enablePush(host, id, false);
 }
+/**
+ * Removes the push and local notifications twr has delivered. Called when the app
+ * becomes active and when a notification is tapped: Needs you shows what they were
+ * about, so a stack of identical "Your agents have an update" helps no one.
+ */
+export async function clearDeliveredNotifications() {
+  await Promise.all([
+    PushNotifications.removeAllDeliveredNotifications().catch(() => {}),
+    LocalNotifications.removeAllDeliveredNotifications().catch(() => {}),
+  ]);
+}
 export async function notificationListeners(
   open: (data: Record<string, string>) => void,
   currentPushHost: () => RemoteHost | undefined = () => undefined,
@@ -61,12 +72,19 @@ export async function notificationListeners(
           }).catch(() => {});
       },
     ),
-    PushNotifications.addListener("pushNotificationActionPerformed", (event) =>
-      open(event.notification.data?.twr || event.notification.data || {}),
+    PushNotifications.addListener(
+      "pushNotificationActionPerformed",
+      (event) => {
+        void clearDeliveredNotifications();
+        open(event.notification.data?.twr || event.notification.data || {});
+      },
     ),
     LocalNotifications.addListener(
       "localNotificationActionPerformed",
-      (event) => open(event.notification.extra || {}),
+      (event) => {
+        void clearDeliveredNotifications();
+        open(event.notification.extra || {});
+      },
     ),
   ]);
   return () => {
