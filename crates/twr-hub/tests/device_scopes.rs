@@ -166,14 +166,32 @@ impl Env {
     }
 
     /// Pairs a device with `scopes` through the gateway's records, as `twr-mobile-gateway
-    /// --pair` does.
+    /// --pair` does. An invitation grants `admin` only with `terminal`, so a device with
+    /// `admin` alone is one paired before that rule: paired with both, then `terminal` taken
+    /// out of its record.
     fn pair(&self, scopes: &[&str]) -> Caller {
-        let auth =
-            twr_core::devices::Auth::open(&self.config_file().with_file_name("mobile")).unwrap();
-        let code = auth
-            .begin(scopes.iter().map(|s| s.to_string()).collect())
-            .unwrap();
+        let dir = self.config_file().with_file_name("mobile");
+        let auth = twr_core::devices::Auth::open(&dir).unwrap();
+        let legacy = scopes.contains(&"admin") && !scopes.contains(&"terminal");
+        let mut granted: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        if legacy {
+            granted.push("terminal".into());
+        }
+        let code = auth.begin(granted).unwrap();
         let (device, _) = auth.pair(&code, "phone").unwrap();
+        if legacy {
+            let path = dir.join("devices.json");
+            let mut db: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let record = db["devices"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|d| d["id"] == device.id.as_str())
+                .unwrap();
+            record["scopes"] = serde_json::json!(scopes);
+            std::fs::write(&path, serde_json::to_vec(&db).unwrap()).unwrap();
+        }
         Caller::user(format!("device:{}", device.id))
     }
 
