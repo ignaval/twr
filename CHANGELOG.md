@@ -18,6 +18,13 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Desktop hub clients for Apple Silicon macOS and x86_64 Linux, with embedded terminals, generated CLI forms, shared thread and attention views, and Dark, Light and System appearance. Linux packages include AppImage, Debian and Arch/Omarchy builds. See [desktop.md](docs/desktop.md).
 - iOS and Android hub clients using the same interface, with responsive folding layouts, paired remote hubs, native credential storage, file uploads and optional APNs/FCM push delivery. The separate gateway enforces device scopes and revocation; notifications open requests without answering them. See [mobile.md](docs/mobile.md).
 - Model pickers. The TUI's orchestrator picker (first run and `/orch`) asks for the model after the runtime, and `/model <thread>` opens a picker of the thread's model and effort. The desktop app's orchestrator, new-thread, thread-settings and default-model forms pick from a list too. Each lists the runtime's default first, the models twr knows the runtime has, and a custom id; `orchestrator.show` reports them as `models`. See [tui.md](docs/tui.md#choosing-the-orchestrator).
+- `twr completions <bash|zsh|fish|elvish|powershell>` prints a shell completion script. See [install.md](docs/install.md).
+- `--json` for `twr thread list` and `twr attention`; an attention item's `target` is the `<id>@<revision>` that `twr respond` takes.
+- `twr update --allow-downgrade`, with `--version`, for the rare install of an older release (below).
+- The mobile apps reconnect to the last hub on launch, and their header shows whether the hub is online, reconnecting or offline.
+- Right-click menus in the desktop app (Cut, Copy, Paste, Select All, Copy Link Address), and it remembers its window's size, position and maximized state.
+- `install.sh` and the release workflow can check a second, ECDSA P-256 signature of the checksums, for macOS's LibreSSL, which cannot verify Ed25519. It is off until a P-256 release key exists ([development.md](docs/development.md)).
+- CI type-checks, tests, format-checks and audits the desktop and mobile TypeScript on every pull request and builds the Android app; Dependabot now covers the clients' npm tree and the Android Gradle build.
 
 ### Changed
 
@@ -28,6 +35,19 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - The first-use notice for suggestions, in the TUI and the desktop app, no longer quotes a price per call, and the desktop app no longer shows a running cost of suggestions beside the message box. It still says what is sent, where, and that calls count toward your plan's usage; [tui.md](docs/tui.md#suggestions) keeps the list prices.
 - Client protocol 2 requires updated CLI and native clients for resumable capacity retirement. Runner protocol 8 and its spool formats are inherited from the merged client baseline. The tested Rust compiler floor is 1.98.
 - Graphical clients and the TUI share command parsing, card ordering, configuration editing and routine-update handling. Hub RPC pooling, bounded message previews and executable hashing reduce startup allocation and streaming work. See [performance.md](docs/performance.md).
+- `twr update` installs only a newer release: the same release says so and exits 0, and an older one (a prerelease user offered the last stable release, or a mirror serving an old one) is refused unless you pass `--version V --allow-downgrade`.
+- `twr ws rm` lists what it removes (the orchestrator's conversation, memory notes, log, leftover worktrees) and asks y/N; without a terminal it needs `--yes`.
+- In the TUI, Ctrl-C with text in the input box clears it into the input history (Up brings it back) and says `Ctrl-C again quits`; with an empty box it quits as before.
+- The TUI draws Markdown tables as aligned columns (records on a narrow pane), and the phone-width slash-command popup shows each command's description.
+- In the desktop and mobile apps, a request's buttons and number keys answer only once its options have been on screen for 600 ms, as in the TUI, and an answered card shows `Sent`. A click or key meant for the item that was there a moment ago no longer answers the next one.
+- Links in agent output show their address; a link whose text names another host, a plain `http:` link and a terminal hyperlink whose text differs from its address ask before opening, and a path link is shown as copyable code instead of a dead link.
+- The desktop window opens at once; the login shell, the signature probe and the engine copy finish in the background.
+- `--allow-admin` on the mobile gateway now requires `--allow-terminal`: admin can change configuration that names commands the hub runs.
+- The mobile apps close their hub connection 30 s after leaving the foreground instead of answering heartbeats until the system stops them, and clear delivered notifications when opened; a new push replaces the one still shown.
+- On Linux the linked-runner service starts with the same environment allowlist as on macOS, instead of everything in the environment of the shell that first started a hub.
+- Idle threads are git-snapshotted less often (30 s doubling to 5 minutes) until something happens on them: a hand edit in an idle thread's worktree can take up to 5 minutes to show on its card.
+- `twr voice setup` downloads the speech model from a pinned revision and checks its SHA-256 before using it.
+- The runner service's sockets live in a private per-user directory (`$XDG_RUNTIME_DIR`, macOS's per-user temporary directory) instead of a predictable `/tmp` path.
 
 ### Fixed
 
@@ -39,6 +59,34 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Finished jobs release their slots immediately, even while a child process briefly retains an inherited file descriptor before exec.
 - Files attached in the orchestrator's conversation upload into its working directory (`orchestrator.cwd`) instead of failing with "Thread has no working directory".
 - Remote clients retain short bursts of live conversation events within byte and event-count limits, avoiding unnecessary resyncs during heavy tool output.
+- The linked-runner service starts again: every launch of `twr runner service` exited at once with "--socket does not apply to twr runner", because its own `--socket` was taken for the hub's.
+- The TUI reconnects after its hub is stopped, restarted or updated, with a band saying so meanwhile. It used to keep sending what you typed while showing no replies, cards or permission requests.
+- The TUI restores the terminal when it is killed (SIGTERM, SIGHUP, SIGQUIT), and a copy too large for the terminal's clipboard says so instead of silently failing.
+- Agent worktrees, the trash and a running native build's output no longer count against a linked runner's 10 GiB per-hub budget, which stopped new linked threads once one worktree had a large build directory.
+- Linked-runner admission no longer blocks a box, and the other workers of the machine, while one worker retires an orphan runtime.
+- twr builds from a sparse checkout or one with skip-worktree or assume-unchanged entries; such a build records no linked-worker source instead of failing.
+- A reconnect or resync keeps the conversation on screen in the desktop and mobile apps and catches up, instead of reloading it and losing earlier turns and the scroll position.
+- Expanded messages and tool details stay open when scrolled away, and long streaming replies no longer lag the desktop and mobile apps.
+- A render error or a damaged saved setting shows a Reload screen in the desktop and mobile apps instead of a blank window; the desktop app also reloads its window after a renderer crash.
+- The mobile gateway no longer unpairs every device and closes their terminals when it cannot read its device list: it answers 503 and clients retry. Clients take only a 401 as revoked.
+- Switching workspace in the mobile app registers it for push notifications.
+- iOS voice mode gives audio back to other apps when it stops, and handles calls, Siri and route changes.
+- Android: the saved-hub vault is excluded from backups and device transfers, and one that cannot be decrypted on a new phone resets with a notice instead of blocking pairing.
+- Cross-thread search, a thread's latest name and a message's turn read through the right index instead of scanning and sorting the log.
+- A streaming remote box no longer stalls every other request: a runner's ack batch is synced outside the hub's lock.
+- The desktop's workspace list tolerates a slow hub and keeps the last good list, and its tray is rebuilt only when what it shows changes.
+- `install.sh --pair` says so when the installed release is too old to pair, instead of failing on an unknown command.
+- The committed mobile command catalog matches the CLI again (`twr voice setup` was missing).
+
+### Security
+
+- A paired device without terminal access can no longer start or move a thread, or the orchestrator, onto a `pty:` or `acp:` command line: only onto an agent runtime or a configured preset, as the orchestrator may.
+- A paired device without admin access can no longer change a thread's mode or move it to another runtime by any route: a typed command, the orchestrator acting on its message, or Confirm on a card. `outside_pin` needs admin too.
+- The mobile gateway limits unauthenticated connections per address and in total and times them out, and rate-limits pairing and refused tokens per address, so one source cannot exhaust it or block pairing.
+- A runner's frames for thread ids the hub never had keep no watermark, and a malformed thread id closes the connection, so an authenticated runner cannot grow the hub's database without bound. A `hello` with an invalid box name is refused, and refusal notes say when they came from an unauthenticated connection.
+- The desktop installers' checksums are signed (`desktop-sha256sums.txt.sig`), each installer has a build provenance attestation, and desktop release builds use no CI caches.
+- twr.tools sends a Content-Security-Policy, `X-Frame-Options`, `X-Content-Type-Options` and `Referrer-Policy`.
+- The mobile apps delete transcript exports after sharing them.
 
 ## [0.3.0] - 2026-10-30
 
