@@ -9,6 +9,7 @@ import {
   clipboard,
   crashReporter,
   nativeTheme,
+  screen,
   systemPreferences,
 } from "electron";
 import { spawn, execFile } from "node:child_process";
@@ -48,6 +49,12 @@ import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
 import { RendererRecovery } from "./crash-recovery";
 import { contextMenuTemplate } from "./context-menu";
+import {
+  MIN_WINDOW,
+  restoreWindow,
+  windowStateSchema,
+  type RestoredWindow,
+} from "./window-state";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
@@ -960,15 +967,71 @@ async function recoverRenderer(target: BrowserWindow, reason: string) {
     crashDialogOpen = false;
   }
 }
+/** Restores maximized/full-screen state and saves the window's placement as it changes. */
+function rememberPlacement(
+  target: BrowserWindow,
+  placement: RestoredWindow,
+  hidden: boolean,
+) {
+  const restoreState = () => {
+    if (placement.fullscreen) target.setFullScreen(true);
+    else if (placement.maximized) target.maximize();
+  };
+  // maximize() would also show a window that starts hidden.
+  if (hidden) target.once("show", restoreState);
+  else restoreState();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const save = () => {
+    clearTimeout(timer);
+    timer = undefined;
+    if (target.isDestroyed() || target.isMinimized()) return;
+    const state = {
+      ...target.getNormalBounds(),
+      maximized: target.isMaximized(),
+      fullscreen: target.isFullScreen(),
+    };
+    const parsed = windowStateSchema.safeParse(state);
+    if (
+      parsed.success &&
+      JSON.stringify(parsed.data) !== JSON.stringify(desktopSettings.window)
+    )
+      try {
+        saveDesktopSettings({ window: parsed.data });
+      } catch (error) {
+        services?.log.warn("window", "Could not save the window size", error);
+      }
+  };
+  const later = () => {
+    clearTimeout(timer);
+    timer = setTimeout(save, 500);
+  };
+  for (const name of [
+    "resize",
+    "move",
+    "maximize",
+    "unmaximize",
+    "enter-full-screen",
+    "leave-full-screen",
+  ] as const)
+    target.on(name as "resize", later);
+  target.on("close", save);
+}
 async function createWindow(hidden = false) {
   quitting = false;
   applyNativeAppearance();
+  const primary = screen.getPrimaryDisplay();
+  const placement = restoreWindow(desktopSettings.window, [
+    primary.workArea,
+    ...screen
+      .getAllDisplays()
+      .filter((display) => display.id !== primary.id)
+      .map((display) => display.workArea),
+  ]);
   window = new BrowserWindow({
     show: !hidden,
-    width: 1360,
-    height: 900,
-    minWidth: 420,
-    minHeight: 480,
+    ...placement.bounds,
+    minWidth: MIN_WINDOW.width,
+    minHeight: MIN_WINDOW.height,
     title: "twr",
     backgroundColor: appearance.background,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
@@ -982,6 +1045,7 @@ async function createWindow(hidden = false) {
     },
   });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  rememberPlacement(window, placement, hidden);
   window.webContents.on(
     "did-start-navigation",
     (_event, _url, _inPlace, mainFrame) => {

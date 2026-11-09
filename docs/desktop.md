@@ -332,6 +332,11 @@ the hub, so it requires a connection to that workspace.
 
 ## Layout and offline recovery
 
+The window reopens with the size, position and maximized or full-screen state it had when
+it was last moved, resized or closed (saved in the app's `desktop.json`). It is moved and
+shrunk to fit the display that shows most of it; if that display is gone, it keeps its size
+and opens in the default place.
+
 Settings → Layout & text offers Compact and Comfortable density, independent interface and code text sizes, and sidebar/inspector width sliders. Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
 
 Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings. Configuration/editor drafts stay in memory because they may contain credentials.
