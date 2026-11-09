@@ -458,7 +458,8 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     ),
     (
         "Ctrl-C",
-        "stop the ! command you started on this thread while it runs, else quit (/quit)",
+        "stop the ! command you started on this thread while it runs; else, with text in the \
+         box, clear it (Up brings it back; Ctrl-C again quits); else quit (/quit)",
     ),
 ];
 
@@ -8761,15 +8762,19 @@ fn popup_item_rows(
 /// Key help for what is on screen, most important first (the status bar cuts it from the
 /// right). A line break is Shift-Enter where it is known to arrive apart from Enter
 /// ([`crate::app::ViewState::shift_enter`]), Ctrl-J elsewhere.
+/// With text in the input box, Ctrl-C clears it rather than quitting
+/// ([`AppState::clear_draft`]), and the hint says so.
 pub fn hints(state: &AppState) -> std::borrow::Cow<'static, str> {
-    let hints = screen_hints(state);
-    if state.view.shift_enter {
-        hints.into()
-    } else {
-        hints
+    let mut hints: std::borrow::Cow<'static, str> = screen_hints(state).into();
+    if !state.view.shift_enter {
+        hints = hints
             .replace("Shift-Enter new line", "Ctrl-J new line")
-            .into()
+            .into();
     }
+    if !state.view.input.trim().is_empty() && !state.ctrl_c_stops() {
+        hints = hints.replace("Ctrl-C quit", "Ctrl-C clear").into();
+    }
+    hints
 }
 
 /// [`hints`], with Shift-Enter for a line break: one line for each view and what is selected

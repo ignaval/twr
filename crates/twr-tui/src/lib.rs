@@ -1375,7 +1375,8 @@ fn handle_terminal_event(
 
     // Discard input until the replayed state has actually been shown. Buffering a command
     // or its confirmation would let it run later without the user seeing what it answers.
-    // Only quitting works: Ctrl-C (a typed `q` is a letter).
+    // Only quitting works: Ctrl-C (a typed `q` is a letter); with a draft kept from an earlier
+    // view of the workspace, the first one clears it into the history, as it does once drawn.
     if !has_drawn || state.catch_up.is_some() {
         return match event {
             TermEvent::Key(k)
@@ -1383,7 +1384,10 @@ fn handle_terminal_event(
                     && k.code == KeyCode::Char('c')
                     && k.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                vec![Action::Quit]
+                match state.clear_draft() {
+                    true => Vec::new(),
+                    false => vec![Action::Quit],
+                }
             }
             _ => Vec::new(),
         };
@@ -5135,6 +5139,19 @@ mod tests {
                 assert!(state.view.input.is_empty());
             }
         }
+        // A draft kept from an earlier view of the workspace: the first Ctrl-C clears it into
+        // the history, the next quits.
+        let mut state = AppState::new();
+        state.begin_catch_up(1);
+        state.view.input.set("kept draft");
+        let c = TermEvent::Key(ctrl('c'));
+        assert!(handle_terminal_event(&mut state, c.clone(), &screen, false).is_empty());
+        assert!(state.view.input.is_empty());
+        assert_eq!(state.view.history, ["kept draft"]);
+        assert_eq!(
+            handle_terminal_event(&mut state, c, &screen, false),
+            [Action::Quit]
+        );
     }
 
     /// Feeds `events`, read at the given times, through `typed_ahead` and the state as the

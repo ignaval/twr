@@ -40,6 +40,11 @@ use crate::edit::LineInput;
 use crate::select::{Anchor, PaneId, Panes, Selection, Target};
 use crate::slash::{self, Slash, TrashCmd};
 
+/// The status bar after Ctrl-C emptied the input box into the history ([`AppState::clear_draft`]).
+pub const CTRL_C_KEPT: &str = "cleared the box (↑ brings it back) · Ctrl-C again quits";
+/// The same, for a box that held only spaces, or a history entry recalled over nothing typed.
+pub const CTRL_C_CLEARED: &str = "cleared the box · Ctrl-C again quits";
+
 /// The status bar after a middle click: the terminal pastes only on Shift + middle click while
 /// the TUI has the mouse.
 pub const MIDDLE_CLICK_HINT: &str =
@@ -7682,6 +7687,32 @@ impl AppState {
         v.history_new.push(text.to_string());
     }
 
+    /// Ctrl-C with text in the input box: empties it, and keeps what was typed as the newest
+    /// history entry (`↑` brings it back), whatever its size and however many lines it has.
+    /// While a recalled entry shows, what was typed before recalling it is what is kept. The
+    /// status bar says the next Ctrl-C quits. `false`: the box was empty, nothing done.
+    pub(crate) fn clear_draft(&mut self) -> bool {
+        // Only spaces: nothing to keep, and Ctrl-C quits at once, as from an empty box.
+        if self.view.input.trim().is_empty() {
+            return false;
+        }
+        let draft = match self.browsing() {
+            Some(_) => std::mem::take(&mut self.view.history_draft),
+            None => self.view.input.as_str().to_string(),
+        };
+        self.view.input.clear();
+        self.view.popup_sel = 0;
+        self.view.history_draft.clear();
+        self.view.history_pos = None;
+        self.view.status = Some(if draft.trim().is_empty() {
+            CTRL_C_CLEARED.into()
+        } else {
+            self.keep_taken_back(&draft);
+            CTRL_C_KEPT.into()
+        });
+        true
+    }
+
     /// Puts the history from an earlier session first (oldest first), keeping the newest
     /// [`HISTORY_MAX`] entries.
     pub fn load_history(&mut self, mut earlier: Vec<String>) {
@@ -11978,6 +12009,60 @@ pub(crate) mod tests {
         assert!(st.view.status.as_deref().unwrap().contains("nothing"));
     }
 
+    /// Ctrl-C never loses a draft: with text in the box, the first one empties it into the
+    /// history (Up brings it back, several lines whole) and says the next one quits; with the
+    /// box empty it quits at once. The same in a dive and on the compact layout.
+    #[test]
+    fn ctrl_c_clears_a_draft_before_it_quits() {
+        let mut st = five_threads();
+        (st.view.width, st.view.height) = (120, 40);
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        for c in "first line".chars() {
+            st.handle_key(key(KeyCode::Char(c)));
+        }
+        st.handle_paste("\nsecond line");
+        assert!(crate::ui::hints(&st).contains("Ctrl-C clear"));
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert!(st.view.input.is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(CTRL_C_KEPT));
+        assert_eq!(
+            st.view.history_new.last().map(String::as_str),
+            Some("first line\nsecond line")
+        );
+        assert!(crate::ui::hints(&st).contains("Ctrl-C quit"));
+        st.handle_key(key(KeyCode::Up));
+        assert_eq!(st.view.input, "first line\nsecond line");
+        // A recalled entry over nothing typed: cleared, nothing kept twice.
+        let kept = st.view.history.len();
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert!(st.view.input.is_empty());
+        assert_eq!(st.view.history.len(), kept);
+        assert_eq!(st.view.status.as_deref(), Some(CTRL_C_CLEARED));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        // Recalling over a draft keeps the draft, not the entry shown.
+        for c in "draft".chars() {
+            st.handle_key(key(KeyCode::Char(c)));
+        }
+        st.handle_key(key(KeyCode::Up));
+        assert_eq!(st.view.input, "first line\nsecond line");
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert_eq!(st.view.history.last().map(String::as_str), Some("draft"));
+        // In a dive, and on the compact layout.
+        st.dive("t-beta");
+        st.handle_key(key(KeyCode::Char('x')));
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        st.view.compact = Some(true);
+        st.handle_key(key(KeyCode::Char('y')));
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert_eq!(st.view.history.last().map(String::as_str), Some("y"));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        // Only spaces: nothing to keep, it quits at once.
+        st.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+    }
+
     /// Typing always edits the input line, a card selected or not: digits and `q` are text,
     /// never commands. Enter sends it.
     #[test]
@@ -12995,6 +13080,8 @@ pub(crate) mod tests {
         assert_eq!(st.view.screen, Screen::Stack);
         assert_eq!(st.view.input, "df");
         assert_eq!(st.view.decision_filter, DecisionFilter::default());
+        // Ctrl-C clears the draft first, then quits.
+        assert!(st.handle_key(ctrl('c')).is_empty());
         assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
     }
 

@@ -1,6 +1,6 @@
 # The TUI
 
-`twr` with no arguments opens the TUI, and starts the hub in the background if it isn't running. Quit with Ctrl-C or `/quit`; the hub and its threads keep running. A `kill` (SIGTERM, SIGQUIT, SIGINT) or the terminal closing (SIGHUP, an SSH session that ends) quits it the same way, so the shell gets its terminal back as it was.
+`twr` with no arguments opens the TUI, and starts the hub in the background if it isn't running. Quit with Ctrl-C or `/quit`; the hub and its threads keep running. With text in the input box, the first Ctrl-C clears it instead and keeps it in the input history (`↑` brings it back), and the status bar says `Ctrl-C again quits`. A `kill` (SIGTERM, SIGQUIT, SIGINT) or the terminal closing (SIGHUP, an SSH session that ends) quits it the same way, so the shell gets its terminal back as it was.
 
 ## Choosing the orchestrator
 
@@ -405,7 +405,7 @@ A line that starts with `!` is a shell command of yours, run without leaving the
 - **Where it runs.** In a dive, in the thread's worktree. A thread on a remote box can't run one: run it there with `twr attach` or ssh. In the orchestrator conversation, in a folder of yours, at first the orchestrator's (`[orchestrator] cwd`, else your home directory); `!cd <folder>` moves it (relative to where it is, `~` for home; `!cd` alone goes back), for this TUI until you quit. Each command runs in a shell of its own, so a `cd` inside a longer command (`!cd src && make`) moves nothing after it. In a dive, `!cd` alone says so.
 - **Who runs it.** You do: the hub runs it as a [job](usage.md#jobs) of the thread, `$SHELL -c <command>`, with the environment the thread's runtime gets, in any mode. No agent and not the orchestrator can run one ([security-model.md](security-model.md#shell-commands-from-the-tui)). It has no terminal: a command that asks for a password or opens a pager gets an error. A `twr` it runs counts as the thread's agent: it reads, but changes nothing in the hub.
 - **What you see.** The command shows in the conversation with how it went: `⏵ running · Ctrl-C stops it` while it runs (`⏵ running` alone for one this TUI didn't start, which `■ stop` stops), then `✓ exit 0 · 1.2s`, `✗ exit 101 · 14m 2s`, `■ stopped`, with the folder, and the end of what it printed under it, colours and progress-bar redraws left out. The last 6 lines show; `Ctrl-O` shows the rest (up to the last 400 lines or 64 KiB of it) and folds it again. The TUI reads the output every half second while the command runs. The whole output is in the job's log (`twr job log <id>`).
-- **Stopping it.** `Ctrl-C` stops the newest command this TUI started on the thread you see, while it runs (the status bar says `Ctrl-C again quits`); with none running, `Ctrl-C` quits as always. A tap on `■ stop` on its status row stops it too, whichever TUI started it. Commands never block the TUI: you can type, send and run more while one runs.
+- **Stopping it.** `Ctrl-C` stops the newest command this TUI started on the thread you see, while it runs (the status bar says `Ctrl-C again quits`); with none running, `Ctrl-C` clears the input box when it has text (`↑` brings it back), else quits. A tap on `■ stop` on its status row stops it too, whichever TUI started it. Commands never block the TUI: you can type, send and run more while one runs.
 - **Who sees it.** `!` shows it to you only: nothing reaches the orchestrator's or the thread's turn. `!!` runs it the same way and, when it ends, sends the thread (or the orchestrator) the command, where it ran, how it ended and the end of its output (8 KiB), as a turn of its own marked as your command's output, not your message: it can't stand in for you to answer a permission or change a mode. The title says `!! shell … then sends its output to <thread>`. Either way the command, how it ended and the last 4 KiB of its output are recorded in the thread's log, in every TUI's conversation and in the history, and agents can read what is recorded.
 - **Starting a message with `!`.** Start it with `\!`: `\!important: ...` sends `!important: ...`.
 
@@ -519,7 +519,7 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Ctrl-R | while a speaker [reads aloud](read-aloud.md): stop, as `/read stop`; otherwise it says how to start (`/read on`, `/read N`) |
 | Alt-1..9, Ctrl-PgUp, Ctrl-PgDn | with more than one [workspace](#workspaces): switch to the workspace at that place, or the previous / next one |
 | ? | typed on an empty line: help, commands and keys (and what a card's rows say), wrapped to the screen's width (below 70 columns each command or key on a row of its own, what it does indented under it). Taller than the screen, it scrolls with ↑↓, PgUp/PgDn, Home/End and the wheel, and its bottom border says `↓ more` while there is more below; Esc or any other key closes it, and so does a click outside it or on the `✕` of its top border. After text, `?` is a character |
-| Ctrl-C | stop the newest [`!` command](#shell-commands) you started on the thread you see, while one runs; otherwise quit (also `/quit`); the TUI clears the screen it drew on |
+| Ctrl-C | stop the newest [`!` command](#shell-commands) you started on the thread you see, while one runs; otherwise, with text in the input box, clear it and keep it in the history (`↑` brings it back, the hint reads `Ctrl-C clear`); otherwise quit (also `/quit`); the TUI clears the screen it drew on |
 
 The decision table, pins, parking, stopping and the parked threads have no keys of their own: `/decisions`, the action popup or `/pin`, `/park`, `/resume`, `/stop` and `/parked`. A grid tile with an open item shows its options in place of the last report.
 
@@ -703,7 +703,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/spaces [on\|off]` | the same as `/sidebar` |
 | `/settings` | the [settings](#settings) |
 | `/help` | commands and keys, as `?` on an empty line |
-| `/quit` | quit, as Ctrl-C does |
+| `/quit` | quit, as Ctrl-C on an empty box does |
 
 The TUI can't hand its terminal over to another program while it runs, which is why `/attach` prints the command instead of running it.
 

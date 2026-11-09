@@ -421,8 +421,22 @@ impl AppState {
         }
     }
 
+    /// Whether Ctrl-C would stop a `!` command now: one this TUI started on the main pane's
+    /// thread still runs (or is on its way) and isn't being stopped.
+    pub(crate) fn ctrl_c_stops(&self) -> bool {
+        let main = self.main_thread();
+        self.shell_launching
+            .iter()
+            .any(|l| l.thread == main && !l.cancel)
+            || self
+                .shell_jobs
+                .iter()
+                .any(|s| Some(&s.thread) == main.as_ref() && !s.stopping)
+    }
+
     /// Ctrl-C: stops the newest command this TUI started on the main pane's thread that still
-    /// runs and isn't being stopped; with none, quits.
+    /// runs and isn't being stopped; with none, clears what the input box holds
+    /// ([`AppState::clear_draft`]); with nothing there either, quits.
     pub(crate) fn ctrl_c(&mut self) -> Vec<Action> {
         let main = self.main_thread();
         // A stop asked for before the command's job is known: quitting now would leave it
@@ -431,14 +445,11 @@ impl AppState {
         if !stop_pending {
             self.shell_quit_armed = false;
         }
-        let fresh = self
-            .shell_launching
-            .iter()
-            .any(|l| l.thread == main && !l.cancel)
-            || self
-                .shell_jobs
-                .iter()
-                .any(|s| Some(&s.thread) == main.as_ref() && !s.stopping);
+        let fresh = self.ctrl_c_stops();
+        // A draft is never lost to Ctrl-C: the first one clears it into the history.
+        if !fresh && self.clear_draft() {
+            return Vec::new();
+        }
         if stop_pending && !fresh {
             if std::mem::replace(&mut self.shell_quit_armed, true) {
                 return vec![Action::Quit];
