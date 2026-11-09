@@ -1439,7 +1439,7 @@ impl Service {
                 let (epoch, scope) = s.authorize_at(&certificate, c.remote_id(), epoch).await?;
                 build.validate()?;
                 let path = build.path(&s.machine, &scope);
-                if build.matches(&path) {
+                if build.matches_async(&path).await {
                     wire::write(
                         &mut send,
                         &Reply::Ok(json!({"ready":false,"installed":true,"usable":crate::worker::Build::executable(&path).await.is_ok_and(|b|b.protocol==build.protocol)})),
@@ -1497,7 +1497,7 @@ impl Service {
                 build.validate()?;
                 let path = build.path(&s.machine, &scope);
                 ensure!(
-                    build.matches(&path),
+                    build.matches_async(&path).await,
                     "exact worker build is missing or changed"
                 );
                 let worker = Worker {

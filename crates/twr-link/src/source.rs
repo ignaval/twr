@@ -112,7 +112,7 @@ pub async fn cached(machine: &Machine, scope: &str, source: &Source) -> Result<O
         .join("output.json");
     if let Ok(bytes) = crate::state::read_private(&output, 4096) {
         let build: Build = serde_json::from_slice(&bytes)?;
-        if build.matches(&build.path(machine, scope)) {
+        if build.matches_async(&build.path(machine, scope)).await {
             return Ok(Some(build));
         }
     }
@@ -190,7 +190,7 @@ pub async fn build(
     let output = cache.join("output.json");
     if let Ok(bytes) = crate::state::read_private(&output, 4096) {
         let build: Build = serde_json::from_slice(&bytes)?;
-        if build.matches(&build.path(machine, scope)) {
+        if build.matches_async(&build.path(machine, scope)).await {
             return Ok(Native {
                 executable: build.path(machine, scope),
                 build,
