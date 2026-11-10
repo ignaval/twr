@@ -203,6 +203,7 @@ pub use config_view::config_view;
 pub use context::{injection, CONTEXT_DIR, CONTEXT_FILE, INJECT_MAX, SET_MAX};
 pub(crate) use device_scope::devices_unreadable;
 pub use disk::{DISK_TICK, NOT_NOW as DISK_NOT_NOW, TRIM as DISK_TRIM};
+pub(crate) use drain::to_hub_version;
 pub use git::{ParkOutcome, ResumeOutcome, GIT_TICK};
 pub use handoff::{
     is_handoff, SwitchOptions, CONVERSATION_MAX, HANDOFF_REPLY_TIMEOUT, SUMMARY_WAIT,
@@ -1621,8 +1622,10 @@ struct Core {
     /// before it, [`Core::event_time`]).
     last_ts: HashMap<String, DateTime<Utc>>,
     gseq: u64,
-    /// Every attn_id ever raised (to tell "already resolved" from "unknown").
-    known_attn: HashSet<String>,
+    /// Every attn_id ever raised (to tell "already resolved" from "unknown"), but those of a
+    /// thread purged from the trash, in its namespace (`<thread>:<id>`), which no one answers
+    /// again.
+    known_attn: std::collections::BTreeSet<String>,
     /// Open attention items raised by an adapter (answers are forwarded to it), with the
     /// turn of the event that raised it (last) ([`AdapterScope`]).
     adapter_attn: HashMap<String, Option<u64>>,

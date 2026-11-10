@@ -677,7 +677,7 @@ impl Core {
             seqs: HashMap::new(),
             last_ts: HashMap::new(),
             gseq,
-            known_attn: HashSet::new(),
+            known_attn: std::collections::BTreeSet::new(),
             adapter_attn: HashMap::new(),
             rt: HashMap::new(),
             generation: 0,

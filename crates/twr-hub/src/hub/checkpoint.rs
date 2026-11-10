@@ -57,8 +57,10 @@ use crate::store::{self, CheckpointMeta, NewCheckpoint, Store};
 
 /// The version of [`FoldSnapshot`]'s serialization. A checkpoint of another one is not used.
 /// (2: the state a client keeps of the control stream, `client`; 3: the account events and
-/// whether the log has account data, `account_events` and `account_data`.)
-pub(super) const FORMAT: i64 = 3;
+/// whether the log has account data, `account_events` and `account_data`; 4: purged threads
+/// kept as who they were, `registry.purged`, and the last delete's trash item of each deleted
+/// thread, `registry.deleted_items`.)
+pub(super) const FORMAT: i64 = 4;
 
 /// How many events must come after the newest checkpoint (or be in the log, without one) before
 /// another one is written.
@@ -103,8 +105,7 @@ pub(super) struct FoldSnapshot {
     last_ts: HashMap<String, DateTime<Utc>>,
     /// The control position of the checkpoint's last event.
     gseq: u64,
-    #[serde(serialize_with = "twr_core::sorted::set")]
-    known_attn: HashSet<String>,
+    known_attn: std::collections::BTreeSet<String>,
     adapter_attn: HashMap<String, Option<u64>>,
     rt: HashMap<String, ThreadRt>,
     orch: orch::OrchState,
@@ -1949,7 +1950,7 @@ pub(super) mod tests {
         let other_gseq = poisoned(&good, Some(meta.gseq + 1));
         type Change = Box<dyn FnOnce(&mut CheckpointMeta)>;
         let cases: Vec<(&str, Change, &[u8])> = vec![
-            ("format 1, not 3", Box::new(|m| m.format = 1), &poison[..]),
+            ("format 1, not 4", Box::new(|m| m.format = 1), &poison[..]),
             (
                 "written by 0.0.0 0",
                 Box::new(|m| m.build = "0.0.0 0".into()),

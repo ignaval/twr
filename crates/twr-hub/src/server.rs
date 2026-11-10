@@ -2563,8 +2563,10 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             codes::UNSUPPORTED,
             format!(
                 "this twr is older than the hub (protocol {}, the hub's is {PROTOCOL_VERSION}): \
-                 update it with `twr update` and start it again",
-                p.protocol.unwrap_or(0)
+                 update it to the hub's twr {} ({}) and start it again",
+                p.protocol.unwrap_or(0),
+                twr_core::version(),
+                crate::hub::to_hub_version()
             ),
         ));
     }

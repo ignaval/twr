@@ -1967,7 +1967,7 @@ impl Core {
         self.registry
             .deleted_view(thread)
             .is_some_and(|v| v.box_name == box_name)
-            && !self.deleted_rt.get(thread).is_some_and(|d| d.purged)
+            && !self.registry.is_purged(thread)
     }
 
     /// Forgets, as the hub opens (the log folded), the watermarks it keeps no longer
@@ -2969,7 +2969,7 @@ mod tests {
         handle(&inner, &mut conn, frame_of(t, 2)).await.unwrap();
         assert_eq!(rows().get(t), Some(&2));
         assert!(inner.core().record_purged(&inner, "item-1", t, false));
-        assert!(inner.core().deleted_rt[t].purged);
+        assert!(inner.core().registry.is_purged(t) && !inner.core().deleted_rt.contains_key(t));
         assert!(rows().is_empty(), "{:?}", rows());
         handle(&inner, &mut conn, frame_of(t, 9)).await.unwrap();
         assert_eq!(conn.unacked.get(t), Some(&9));

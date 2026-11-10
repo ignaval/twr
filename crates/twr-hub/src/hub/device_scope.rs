@@ -17,7 +17,12 @@
 //! - `admin`: every permission mode change (`thread.set_mode`, a short mode command in `say`,
 //!   the orchestrator's relayed `set_mode` and confirm cards that carry one), a new thread in a
 //!   mode outside [`twr_core::devices::OPERATE_MODES`], moving a thread to another runtime
-//!   (directly, relayed or on a card), and `outside_pin`.
+//!   (directly, relayed or on a card), `outside_pin`, and a new thread where the orchestrator
+//!   may not start one (`thread.new`, `thread.spawn`, a `new <dir>: ...` in `say`: not a
+//!   configured project, nor a git repository clear of the home folder, twr's data and the
+//!   credentials folders; `Hub::refuse_barred_dir`). What the orchestrator does on a device's
+//!   message, and a hub question's `new thread` (which hands the message to it), are held to
+//!   that as the orchestrator's own.
 //!
 //! The local user (any other client) is never limited here.
 

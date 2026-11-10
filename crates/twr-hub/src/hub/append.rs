@@ -355,14 +355,25 @@ impl Core {
                 {
                     self.trash.remove(&p.item);
                 }
-                if self.registry.is_deleted(&p.thread) {
-                    if let Some(d) = self
-                        .deleted_rt
-                        .get_mut(&p.thread)
-                        .filter(|d| d.item.as_deref() == Some(p.item.as_str()))
-                    {
-                        d.purged = true;
-                        self.activity.remove(&p.thread);
+                // The item of its last delete: the thread can never come back
+                // (`Registry::is_purged`), so nothing set aside for a restore is kept.
+                if self
+                    .deleted_rt
+                    .get(&p.thread)
+                    .is_some_and(|d| d.item.as_deref() == Some(p.item.as_str()))
+                {
+                    self.deleted_rt.remove(&p.thread);
+                    self.activity.remove(&p.thread);
+                    // Its requests (`<thread>:<id>`) are answered by no one again.
+                    let prefix = format!("{}:", p.thread);
+                    let gone: Vec<String> = self
+                        .known_attn
+                        .range(prefix.clone()..)
+                        .take_while(|a| a.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    for a in gone {
+                        self.known_attn.remove(&a);
                     }
                 }
             }
