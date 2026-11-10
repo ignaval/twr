@@ -52,7 +52,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
       await page
         .getByRole("dialog")
         .last()
-        .getByRole("button", { name: "Continue", exact: true })
+        .locator(".dialog-footer button.danger")
         .click();
     await dialog.locator(".operation-result").waitFor();
     await dialog.getByRole("button", { name: "Close", exact: true }).click();
@@ -132,6 +132,9 @@ export async function runMacQA(page, { fixture, hubPids }) {
   const question = page
     .locator(".manager .attention-card")
     .filter({ hasText: "Continue with the QA test?" });
+  // Answers count once the options have been on screen for 600 ms (shared/arming.ts).
+  await question.locator(".attention-options").scrollIntoViewIfNeeded();
+  await question.locator('.attention-options[data-armed="true"]').waitFor();
   await question.getByRole("button", { name: /Proceed/ }).click();
   await question.waitFor({ state: "hidden" });
   await talk("qa-agent");
@@ -318,7 +321,11 @@ export async function runMacQA(page, { fixture, hubPids }) {
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
     .waitFor();
-  await page.locator("#workspace-select").selectOption("qa-space");
+  await page
+    .locator(
+      '.workspace-entry[data-workspace="qa-space"] .workspace-orchestrator',
+    )
+    .click();
   await expect
     .poll(
       () => page.evaluate(async () => (await window.twr.bootstrap()).workspace),
@@ -330,7 +337,11 @@ export async function runMacQA(page, { fixture, hubPids }) {
     .filter({ hasText: "Hub connected" })
     .waitFor();
   hubPids.add((await rpc("hub.info")).pid);
-  await page.locator("#workspace-select").selectOption("default");
+  await page
+    .locator(
+      '.workspace-entry[data-workspace="default"] .workspace-orchestrator',
+    )
+    .click();
   await expect
     .poll(
       () => page.evaluate(async () => (await window.twr.bootstrap()).workspace),
@@ -344,12 +355,20 @@ export async function runMacQA(page, { fixture, hubPids }) {
   await talk("qa-agent");
   // Renderer reload intentionally starts fresh chat drafts; switching workspaces must not.
   await composer.fill("PRESERVE_DURING_SWITCH");
-  await page.locator("#workspace-select").selectOption("qa-space");
+  await page
+    .locator(
+      '.workspace-entry[data-workspace="qa-space"] .workspace-orchestrator',
+    )
+    .click();
   await page
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
     .waitFor();
-  await page.locator("#workspace-select").selectOption("default");
+  await page
+    .locator(
+      '.workspace-entry[data-workspace="default"] .workspace-orchestrator',
+    )
+    .click();
   await page
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
@@ -364,6 +383,8 @@ export async function runMacQA(page, { fixture, hubPids }) {
   const deleteCard = page
     .locator(".manager .attention-card")
     .filter({ hasText: "qa-agent" });
+  await deleteCard.locator(".attention-options").scrollIntoViewIfNeeded();
+  await deleteCard.locator('.attention-options[data-armed="true"]').waitFor();
   await deleteCard
     .locator(".attention-options button")
     .filter({ hasText: /^\s*(?:\d+\s*)?delete/i })
@@ -382,8 +403,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
 
   await rpc("say", { message: "QA_ORCHESTRATOR_SEED", to: "orchestrator" });
   await page
-    .locator(".primary-nav")
-    .getByRole("button", { name: /Orchestrator/ })
+    .locator(".workspace-entry.current .workspace-orchestrator")
     .click();
   const orchestrator = page.getByRole("textbox", {
     name: "Message orchestrator",
@@ -489,7 +509,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   await page
     .getByRole("dialog")
     .last()
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   console.log(
     "QA: selecting one message reaches a real speaker process (silent command engine)",
@@ -541,9 +561,9 @@ export async function runMacQA(page, { fixture, hubPids }) {
   console.log(
     "QA: slash workspace creation and switching from an empty workspace",
   );
-  await page.waitForFunction(
-    () => !document.querySelector("#workspace-select")?.disabled,
-  );
+  await page
+    .locator('.workspace-entry.current[data-workspace="default"]')
+    .waitFor();
 
   // Reserve terminal slots before asynchronous CLI planning/validation.
   const capacity = await page.evaluate(async () => {

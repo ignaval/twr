@@ -187,6 +187,16 @@ fn missing_fix() -> String {
 /// 1.0.44, verified 2026-10-03; any other is refused by grok and fails the session).
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 
+/// The models twr's pickers offer for Grok Build ([`crate::models`]): those `grok models`
+/// listed on 2026-11-07 (grok 1.0.70; `grok-4.7` its default). An id grok doesn't know fails
+/// the session, so a custom one is the user's to check.
+pub const MODELS: &[crate::KnownModel] = &[
+    crate::KnownModel::new("grok-4.7", "grok's default"),
+    crate::KnownModel::new("grok-4.7-build-fast", "faster, for simpler tasks"),
+    crate::KnownModel::new("grok-4.6", "the previous model"),
+    crate::KnownModel::new("grok-4.5", "an older model"),
+];
+
 /// grok's own `--permission-mode` ids, passed as written (another spelling of one, such as
 /// `dont-ask`, is passed as the id; another known mode maps by its level, see
 /// [`permission_mode`]).

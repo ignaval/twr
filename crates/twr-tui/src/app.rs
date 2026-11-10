@@ -40,6 +40,21 @@ use crate::edit::LineInput;
 use crate::select::{Anchor, PaneId, Panes, Selection, Target};
 use crate::slash::{self, Slash, TrashCmd};
 
+/// The band of a TUI whose hub's streams ended ([`ViewState::hub_lost`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubLost {
+    /// What it says.
+    pub text: String,
+    /// The hub that answered refuses this TUI (it is older than the hub): connecting again
+    /// won't help, the TUI must be started again.
+    pub refused: bool,
+}
+
+/// The status bar after Ctrl-C emptied the input box into the history ([`AppState::clear_draft`]).
+pub const CTRL_C_KEPT: &str = "cleared the box (↑ brings it back) · Ctrl-C again quits";
+/// The same, for a box that held only spaces, or a history entry recalled over nothing typed.
+pub const CTRL_C_CLEARED: &str = "cleared the box · Ctrl-C again quits";
+
 /// The status bar after a middle click: the terminal pastes only on Shift + middle click while
 /// the TUI has the mouse.
 pub const MIDDLE_CLICK_HINT: &str =
@@ -164,6 +179,10 @@ impl std::fmt::Debug for RunnerPanel {
 /// Client-local view state. Nothing here is an event; pins in particular never leave the client.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ViewState {
+    /// The hub's streams ended and the TUI is connecting again, or the hub it found refuses
+    /// it: the band across the top row says so until a hub's streams are back
+    /// ([`crate::ui::render`]); no status replaces it.
+    pub hub_lost: Option<HubLost>,
     pub runner: Option<RunnerPanel>,
     pub runner_session: Option<String>,
     pub runner_generation: u64,
@@ -268,6 +287,9 @@ pub struct ViewState {
     /// Whether each orchestrator runtime is installed, as `orchestrator.show` said (`/orch`
     /// suggestions).
     pub orch_installed: Vec<(String, bool)>,
+    /// What the model pickers offer per runtime (`orchestrator.show` `models`: `{<runtime>:
+    /// {models: [{id, description}], efforts}}`); null until it arrives, or from an older hub.
+    pub model_choices: Value,
     /// Ctrl-O: open tool-call and bookkeeping groups. Long messages within them have
     /// their own expansion controls in the orchestrator conversation.
     pub expand_all: bool,
@@ -575,9 +597,137 @@ pub struct Picker {
     pub model: Option<String>,
     /// Opened by `/orch` to switch the orchestrator, not to choose its first one.
     pub switch: bool,
+    /// The model step ([`ModelStep`]): after a runtime is chosen, or the whole picker for a
+    /// thread's `/model` (then `runtimes` is empty). `None`: the runtimes are shown.
+    pub step: Option<ModelStep>,
+}
+
+/// A row of a model picker ([`ModelStep`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRow {
+    /// The runtime's own default: no model (or effort) set.
+    Default,
+    /// A model (or effort) the hub's catalog lists, or the current one it doesn't: its id
+    /// and a few words on it (empty for an effort).
+    Known(String, String),
+    /// An id of your own, typed on the row ([`ModelStep::typed`]).
+    Custom,
+}
+
+/// The model step of the [`Picker`]: the models `orchestrator.show` `models` lists for the
+/// runtime ([`model_rows`]), the runtime's default first and a custom id last; for a thread,
+/// its reasoning efforts next. Up/Down, 1-9 and Enter as for the runtimes; Enter on the
+/// custom row types an id there (Enter takes it, Esc goes back to the rows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelStep {
+    /// The runtime spec it is for: the one chosen for the orchestrator (`claude-code:work`),
+    /// or the thread's runtime.
+    pub runtime: String,
+    /// The thread it sets, `(id, name)`; `None`: the orchestrator.
+    pub thread: Option<(String, String)>,
+    /// The rows shown: the models, or once one is chosen ([`ModelStep::chosen`]) the efforts.
+    pub rows: Vec<ModelRow>,
+    /// The highlighted row.
+    pub selected: usize,
+    /// The model in effect (`None`: the runtime's default), marked `(current)`.
+    pub current: Option<String>,
+    /// The id being typed on the custom row; `None` while the rows are picked.
+    pub typed: Option<String>,
+    /// The efforts the thread's runtime takes, picked after the model (empty: no effort
+    /// step, as for the orchestrator, whose effort is the config's).
+    pub efforts: Vec<String>,
+    /// The thread's effort in effect (`None`: the runtime's default).
+    pub current_effort: Option<String>,
+    /// The model chosen, while the effort is picked (`Some(None)`: the runtime's default).
+    pub chosen: Option<Option<String>>,
+}
+
+impl ModelStep {
+    /// The step for `runtime` (a spec: its account part is ignored) with `current` in effect,
+    /// from `orchestrator.show` `models` (`choices`; null from an older hub: the default and
+    /// a custom id only); the current model highlighted, else the default.
+    pub fn new(
+        choices: &Value,
+        runtime: &str,
+        thread: Option<(String, String)>,
+        current: Option<String>,
+    ) -> ModelStep {
+        let rows = model_rows(choices, runtime, current.as_deref());
+        let selected = current
+            .as_deref()
+            .and_then(|c| {
+                rows.iter()
+                    .position(|r| matches!(r, ModelRow::Known(id, _) if id == c))
+            })
+            .unwrap_or(0);
+        ModelStep {
+            runtime: runtime.to_string(),
+            thread,
+            rows,
+            selected,
+            current,
+            typed: None,
+            efforts: Vec::new(),
+            current_effort: None,
+            chosen: None,
+        }
+    }
+
+    /// While the effort is picked: the effort rows' current value; else the model's.
+    pub fn current_value(&self) -> Option<&str> {
+        if self.chosen.is_some() {
+            self.current_effort.as_deref()
+        } else {
+            self.current.as_deref()
+        }
+    }
+}
+
+/// The rows of a model picker for `runtime` (a spec, `claude-code:work`: the runtime part
+/// counts): the runtime's default, the models `choices` (`orchestrator.show` `models`) lists
+/// for it in their order, `current` when it is none of them (a custom id in effect), and a
+/// custom id.
+pub fn model_rows(choices: &Value, runtime: &str, current: Option<&str>) -> Vec<ModelRow> {
+    let base = twr_core::account::split_runtime(runtime).0;
+    let mut rows = vec![ModelRow::Default];
+    for m in choices[base]["models"].as_array().into_iter().flatten() {
+        if let Some(id) = m["id"].as_str() {
+            let about = m["description"].as_str().unwrap_or_default();
+            rows.push(ModelRow::Known(id.to_string(), about.to_string()));
+        }
+    }
+    if let Some(c) = current {
+        if !rows
+            .iter()
+            .any(|r| matches!(r, ModelRow::Known(id, _) if id == c))
+        {
+            rows.push(ModelRow::Known(c.to_string(), "set now".into()));
+        }
+    }
+    rows.push(ModelRow::Custom);
+    rows
+}
+
+/// The efforts `choices` (`orchestrator.show` `models`) lists for `runtime` (a spec).
+pub fn effort_choices(choices: &Value, runtime: &str) -> Vec<String> {
+    let base = twr_core::account::split_runtime(runtime).0;
+    choices[base]["efforts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 impl Picker {
+    /// The rows it shows: the model step's, else the runtimes.
+    pub fn rows_len(&self) -> usize {
+        self.step
+            .as_ref()
+            .map_or(self.runtimes.len(), |m| m.rows.len())
+    }
+
     /// The picker an `orchestrator.show` result asks for, or `None` when an orchestrator was
     /// chosen already (or the hub is too old to say whether the config chose one). Its
     /// default row is the configured runtime with the configured account
@@ -616,6 +766,7 @@ impl Picker {
             default,
             model: configured["model"].as_str().map(str::to_string),
             switch: false,
+            step: None,
         })
     }
 }
@@ -3593,6 +3744,9 @@ impl AppState {
                     self.view.orch_default_account = result["account"].as_str().map(str::to_string);
                     self.view.default_runtime = default_runtime(result);
                 }
+                if result["models"].is_object() {
+                    self.view.model_choices = result["models"].clone();
+                }
             }
             // A failed poll arrives as null: nothing changes but the next poll.
             "hub.info" => {
@@ -5016,10 +5170,14 @@ impl AppState {
                 };
                 let view = self.registry.get(&thread);
                 if model.is_none() && effort.is_none() && runtime.is_none() {
+                    // What it runs now, in the status bar, and the picker to change it.
                     self.view.status = Some(match view {
                         Some(t) => model_show(t, self.account_label(t).as_deref()),
                         None => format!("no thread {thread}"),
                     });
+                    if let Some(t) = view.filter(|t| !t.is_orchestrator()).cloned() {
+                        self.open_model_picker(&t);
+                    }
                     return (Vec::new(), true);
                 }
                 let name = view.map_or(thread.clone(), |t| t.name.clone());
@@ -5555,6 +5713,7 @@ impl AppState {
             default,
             model: None,
             switch: true,
+            step: None,
         });
     }
 
@@ -7141,13 +7300,16 @@ impl AppState {
     }
 
     /// Keys of the orchestrator picker: Up/Down (or k/j) and 1-9 pick a runtime, Enter chooses
-    /// it (the first-run choice at once, a switch once confirmed), Esc leaves the choice for
-    /// later (a switch: for good). Anything else only says so: the picker is modal, nothing
-    /// typed meanwhile goes anywhere.
+    /// it and goes on to its model ([`AppState::model_key`]), Esc leaves the choice for later
+    /// (a switch: for good). Anything else only says so: the picker is modal, nothing typed
+    /// meanwhile goes anywhere.
     fn picker_key(&mut self, key: KeyEvent) -> Vec<Action> {
         let Some(p) = self.view.picker.as_mut() else {
             return Vec::new();
         };
+        if p.step.is_some() {
+            return self.model_key(key);
+        }
         let n = p.runtimes.len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => p.selected = p.selected.saturating_sub(1),
@@ -7155,29 +7317,30 @@ impl AppState {
             KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => {
                 p.selected = c as usize - '1' as usize;
             }
-            KeyCode::Enter if p.switch => {
+            KeyCode::Enter => {
                 let runtime = p.runtimes[p.selected].0.clone();
-                self.view.picker = None;
-                let shown = orch_label(&runtime, &self.accounts);
-                self.confirm_switch(runtime, &shown, None);
+                // The model in effect for that runtime: a switch's current orchestrator's, the
+                // first choice's configured one with the configured runtime; else the
+                // runtime's default.
+                let current = if p.switch {
+                    self.orchestrator()
+                        .filter(|o| {
+                            twr_core::account::split_runtime(&o.runtime).0
+                                == twr_core::account::split_runtime(&runtime).0
+                        })
+                        .and_then(|o| o.model.clone())
+                } else {
+                    p.model.clone().filter(|_| runtime == p.default)
+                };
+                let step = ModelStep::new(&self.view.model_choices, &runtime, None, current);
+                if let Some(p) = self.view.picker.as_mut() {
+                    p.step = Some(step);
+                }
+                self.view.status = None;
             }
             KeyCode::Esc if p.switch => {
                 self.view.picker = None;
                 self.view.status = None;
-            }
-            KeyCode::Enter => {
-                let runtime = p.runtimes[p.selected].0.clone();
-                let model = p.model.clone().filter(|_| runtime == p.default);
-                self.view.picker = None;
-                self.view.status = Some(format!(
-                    "choosing {} for the orchestrator: waiting for the hub",
-                    orch_label(&runtime, &self.accounts)
-                ));
-                return vec![Action::UseOrchestrator {
-                    runtime,
-                    model,
-                    summary: false,
-                }];
             }
             KeyCode::Esc => {
                 let default = orch_label(&p.default, &self.accounts);
@@ -7202,6 +7365,194 @@ impl AppState {
             }
         }
         Vec::new()
+    }
+
+    /// Keys of the picker's model step ([`ModelStep`]): Up/Down (or k/j) and 1-9 pick a row,
+    /// Enter chooses it (the custom row: type an id, Enter takes it, Esc goes back to the
+    /// rows). For the orchestrator the choice ends the picker: a switch asks to confirm it
+    /// ([`AppState::confirm_switch`]), the first choice is made at once. For a thread the
+    /// effort comes next, then `thread.set_model` with what changed. Esc goes back a step:
+    /// to the runtimes, from the effort to the model, else closes the picker.
+    fn model_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let Some(p) = self.view.picker.as_mut() else {
+            return Vec::new();
+        };
+        let switch = p.switch;
+        let has_runtimes = !p.runtimes.is_empty();
+        let Some(m) = p.step.as_mut() else {
+            return Vec::new();
+        };
+        let n = m.rows.len();
+        if let Some(typed) = m.typed.as_mut() {
+            match key.code {
+                KeyCode::Char(c) if !c.is_control() && typed.len() < 128 => typed.push(c),
+                KeyCode::Backspace => {
+                    typed.pop();
+                }
+                KeyCode::Esc => m.typed = None,
+                KeyCode::Enter => {
+                    let id = typed.trim().to_string();
+                    if id.is_empty() {
+                        self.view.status = Some("type a model id, or Esc".into());
+                        return Vec::new();
+                    }
+                    m.typed = None;
+                    return self.model_chosen(Some(id));
+                }
+                _ => {}
+            }
+            return Vec::new();
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => m.selected = m.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => m.selected = (m.selected + 1).min(n - 1),
+            KeyCode::Char(c @ '1'..='9') if (c as usize - '1' as usize) < n => {
+                m.selected = c as usize - '1' as usize;
+            }
+            KeyCode::Enter => match m.rows[m.selected].clone() {
+                ModelRow::Default => return self.model_chosen(None),
+                ModelRow::Known(id, _) => return self.model_chosen(Some(id)),
+                ModelRow::Custom => m.typed = Some(String::new()),
+            },
+            KeyCode::Esc => {
+                if let Some(model) = m.chosen.take() {
+                    // Back from the effort to the model, as it was chosen.
+                    let thread = m.thread.clone();
+                    let mut back = ModelStep::new(
+                        &self.view.model_choices,
+                        &m.runtime,
+                        thread,
+                        m.current.clone(),
+                    );
+                    back.efforts = std::mem::take(&mut m.efforts);
+                    back.current_effort = m.current_effort.take();
+                    if let Some(i) = back.rows.iter().position(|r| match (r, &model) {
+                        (ModelRow::Default, None) => true,
+                        (ModelRow::Known(id, _), Some(c)) => id == c,
+                        _ => false,
+                    }) {
+                        back.selected = i;
+                    }
+                    *m = back;
+                } else if has_runtimes {
+                    p.step = None;
+                } else {
+                    self.view.picker = None;
+                }
+                self.view.status = None;
+            }
+            _ => {
+                self.view.status = Some(if switch {
+                    "pick a model: ↑↓ or 1-9, Enter to choose, Esc to go back".into()
+                } else {
+                    "pick the orchestrator's model: ↑↓ or 1-9, Enter to choose, Esc to go back"
+                        .into()
+                });
+            }
+        }
+        Vec::new()
+    }
+
+    /// The model step chose `value` (`None`: the runtime's default): the model, or while the
+    /// effort is picked the effort. Returns what to run.
+    fn model_chosen(&mut self, value: Option<String>) -> Vec<Action> {
+        let Some(p) = self.view.picker.as_mut() else {
+            return Vec::new();
+        };
+        let switch = p.switch;
+        let Some(m) = p.step.as_mut() else {
+            return Vec::new();
+        };
+        let Some((thread, name)) = m.thread.clone() else {
+            // The orchestrator: its runtime and model are chosen.
+            let runtime = m.runtime.clone();
+            self.view.picker = None;
+            let shown = orch_label(&runtime, &self.accounts);
+            if switch {
+                self.confirm_switch(runtime, &shown, value);
+                return Vec::new();
+            }
+            let with = value.as_deref().map_or_else(
+                || ", its default model".to_string(),
+                |v| format!(", model {v}"),
+            );
+            self.view.status = Some(format!(
+                "choosing {shown}{with} for the orchestrator: waiting for the hub"
+            ));
+            return vec![Action::UseOrchestrator {
+                runtime,
+                model: value,
+                summary: false,
+            }];
+        };
+        if m.chosen.is_none() && !m.efforts.is_empty() {
+            // The effort next: the runtime's default, then each one it takes.
+            m.chosen = Some(value);
+            m.rows = std::iter::once(ModelRow::Default)
+                .chain(
+                    m.efforts
+                        .iter()
+                        .map(|e| ModelRow::Known(e.clone(), String::new())),
+                )
+                .collect();
+            m.selected = m
+                .current_effort
+                .as_deref()
+                .and_then(|c| {
+                    m.rows
+                        .iter()
+                        .position(|r| matches!(r, ModelRow::Known(id, _) if id == c))
+                })
+                .unwrap_or(0);
+            self.view.status = None;
+            return Vec::new();
+        }
+        let (model, effort) = match m.chosen.take() {
+            Some(model) => (model, value),
+            None => (value, m.current_effort.clone()),
+        };
+        // Only what changed is sent: keeping a setting never asks the hub to clear it (which a
+        // resumed session may refuse).
+        let model = (model != m.current).then(|| model.unwrap_or_else(|| "default".into()));
+        let effort =
+            (effort != m.current_effort).then(|| effort.unwrap_or_else(|| "default".into()));
+        self.view.picker = None;
+        if model.is_none() && effort.is_none() {
+            self.view.status = Some(format!("{name}: model and effort unchanged"));
+            return Vec::new();
+        }
+        let what: Vec<String> = [("model", &model), ("effort", &effort)]
+            .into_iter()
+            .filter_map(|(k, v)| v.as_deref().map(|v| format!("{k} {v}")))
+            .collect();
+        self.view.status = Some(format!("{name} → {}: waiting for the hub", what.join(", ")));
+        vec![Action::SetModel {
+            thread,
+            model,
+            effort,
+            runtime: None,
+        }]
+    }
+
+    /// `/model <thread>` (in a dive, `/model`): the picker of the thread's model, then its
+    /// effort ([`ModelStep`]), the ones in effect highlighted.
+    fn open_model_picker(&mut self, thread: &ThreadView) {
+        let mut step = ModelStep::new(
+            &self.view.model_choices,
+            &thread.runtime,
+            Some((thread.id.clone(), thread.name.clone())),
+            thread.model.clone(),
+        );
+        step.efforts = effort_choices(&self.view.model_choices, &thread.runtime);
+        step.current_effort = thread.effort.clone();
+        self.view.picker = Some(Picker {
+            runtimes: Vec::new(),
+            selected: 0,
+            default: String::new(),
+            model: None,
+            switch: true,
+            step: Some(step),
+        });
     }
 
     /// Columns of the input line's box (as last drawn; while it is not drawn, from the
@@ -7348,6 +7699,32 @@ impl AppState {
         let over = v.history.len().saturating_sub(HISTORY_MAX);
         v.history.drain(..over);
         v.history_new.push(text.to_string());
+    }
+
+    /// Ctrl-C with text in the input box: empties it, and keeps what was typed as the newest
+    /// history entry (`↑` brings it back), whatever its size and however many lines it has.
+    /// While a recalled entry shows, what was typed before recalling it is what is kept. The
+    /// status bar says the next Ctrl-C quits. `false`: the box was empty, nothing done.
+    pub(crate) fn clear_draft(&mut self) -> bool {
+        // Only spaces: nothing to keep, and Ctrl-C quits at once, as from an empty box.
+        if self.view.input.trim().is_empty() {
+            return false;
+        }
+        let draft = match self.browsing() {
+            Some(_) => std::mem::take(&mut self.view.history_draft),
+            None => self.view.input.as_str().to_string(),
+        };
+        self.view.input.clear();
+        self.view.popup_sel = 0;
+        self.view.history_draft.clear();
+        self.view.history_pos = None;
+        self.view.status = Some(if draft.trim().is_empty() {
+            CTRL_C_CLEARED.into()
+        } else {
+            self.keep_taken_back(&draft);
+            CTRL_C_KEPT.into()
+        });
+        true
     }
 
     /// Puts the history from an earlier session first (oldest first), keeping the newest
@@ -8213,9 +8590,13 @@ impl AppState {
                 }
             }
             Target::Runtime(i) => {
-                if let Some(p) = self.view.picker.as_mut().filter(|p| i < p.runtimes.len()) {
-                    if p.selected != i {
-                        p.selected = i;
+                if let Some(p) = self.view.picker.as_mut().filter(|p| i < p.rows_len()) {
+                    let selected = match p.step.as_mut() {
+                        Some(m) => &mut m.selected,
+                        None => &mut p.selected,
+                    };
+                    if *selected != i {
+                        *selected = i;
                         return Vec::new();
                     }
                     return self.picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -8820,6 +9201,21 @@ impl AppState {
     /// answers nothing, a pasted line break sends nothing. The decisions overlay has no input
     /// box: a paste there does nothing.
     pub fn handle_paste(&mut self, text: &str) {
+        // A model id typed on a model picker's custom row takes a paste (its first line).
+        if let Some(typed) = self
+            .view
+            .picker
+            .as_mut()
+            .and_then(|p| p.step.as_mut())
+            .and_then(|m| m.typed.as_mut())
+        {
+            let line = text.lines().next().unwrap_or_default();
+            typed.extend(line.chars().filter(|c| !c.is_control()));
+            while typed.len() > 128 {
+                typed.pop();
+            }
+            return;
+        }
         if self.picker_open() || self.view.settings.is_some() {
             return;
         }
@@ -10986,6 +11382,9 @@ pub(crate) mod tests {
         assert!(st.view.input.is_empty() && st.picker_open());
         st.handle_key(key(KeyCode::Down));
         assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        // Then the model: the runtime's default is selected.
+        assert!(st.view.picker.as_ref().unwrap().step.is_some());
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
         assert!(!st.picker_open());
         let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
         assert!(
@@ -11012,6 +11411,7 @@ pub(crate) mod tests {
         type_line(&mut st, "/orch");
         st.handle_key(key(KeyCode::Char('3')));
         st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Enter));
         assert_eq!(
             st.handle_key(key(KeyCode::Char('s'))),
             [Action::UseOrchestrator {
@@ -11025,6 +11425,7 @@ pub(crate) mod tests {
         st.handle_key(key(KeyCode::Esc));
         assert!(!st.picker_open() && st.view.confirm.is_none());
         type_line(&mut st, "/orch");
+        st.handle_key(key(KeyCode::Enter));
         st.handle_key(key(KeyCode::Enter));
         assert!(st.handle_key(key(KeyCode::Char('n'))).is_empty());
         assert_eq!(st.view.status.as_deref(), Some("cancelled"));
@@ -11373,7 +11774,7 @@ pub(crate) mod tests {
     fn slash_commands_run_locally_and_never_as_messages() {
         let mut st = five_threads();
         st.set_focus(Some("t-gamma".into()));
-        // /orch (and /orchestrator): the same confirmation as `o`.
+        // /orch (and /orchestrator): it asks to confirm the switch.
         assert!(type_line(&mut st, "/orchestrator codex o5").is_empty());
         assert!(st.view.input.is_empty());
         assert_eq!(
@@ -11620,6 +12021,60 @@ pub(crate) mod tests {
         popup_open(&mut st);
         assert!(st.handle_key(key(KeyCode::Char('1'))).is_empty());
         assert!(st.view.status.as_deref().unwrap().contains("nothing"));
+    }
+
+    /// Ctrl-C never loses a draft: with text in the box, the first one empties it into the
+    /// history (Up brings it back, several lines whole) and says the next one quits; with the
+    /// box empty it quits at once. The same in a dive and on the compact layout.
+    #[test]
+    fn ctrl_c_clears_a_draft_before_it_quits() {
+        let mut st = five_threads();
+        (st.view.width, st.view.height) = (120, 40);
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        for c in "first line".chars() {
+            st.handle_key(key(KeyCode::Char(c)));
+        }
+        st.handle_paste("\nsecond line");
+        assert!(crate::ui::hints(&st).contains("Ctrl-C clear"));
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert!(st.view.input.is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(CTRL_C_KEPT));
+        assert_eq!(
+            st.view.history_new.last().map(String::as_str),
+            Some("first line\nsecond line")
+        );
+        assert!(crate::ui::hints(&st).contains("Ctrl-C quit"));
+        st.handle_key(key(KeyCode::Up));
+        assert_eq!(st.view.input, "first line\nsecond line");
+        // A recalled entry over nothing typed: cleared, nothing kept twice.
+        let kept = st.view.history.len();
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert!(st.view.input.is_empty());
+        assert_eq!(st.view.history.len(), kept);
+        assert_eq!(st.view.status.as_deref(), Some(CTRL_C_CLEARED));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        // Recalling over a draft keeps the draft, not the entry shown.
+        for c in "draft".chars() {
+            st.handle_key(key(KeyCode::Char(c)));
+        }
+        st.handle_key(key(KeyCode::Up));
+        assert_eq!(st.view.input, "first line\nsecond line");
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert_eq!(st.view.history.last().map(String::as_str), Some("draft"));
+        // In a dive, and on the compact layout.
+        st.dive("t-beta");
+        st.handle_key(key(KeyCode::Char('x')));
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        st.view.compact = Some(true);
+        st.handle_key(key(KeyCode::Char('y')));
+        assert!(st.handle_key(ctrl('c')).is_empty());
+        assert_eq!(st.view.history.last().map(String::as_str), Some("y"));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
+        // Only spaces: nothing to keep, it quits at once.
+        st.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
     }
 
     /// Typing always edits the input line, a card selected or not: digits and `q` are text,
@@ -12639,6 +13094,8 @@ pub(crate) mod tests {
         assert_eq!(st.view.screen, Screen::Stack);
         assert_eq!(st.view.input, "df");
         assert_eq!(st.view.decision_filter, DecisionFilter::default());
+        // Ctrl-C clears the draft first, then quits.
+        assert!(st.handle_key(ctrl('c')).is_empty());
         assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
     }
 
@@ -14011,13 +14468,17 @@ pub(crate) mod tests {
             effort: effort.map(str::to_string),
             runtime: None,
         };
-        // Showing changes nothing and clears the line.
+        // Showing changes nothing and clears the line; the picker it opens (modal) closes
+        // with Esc.
         assert!(type_line(&mut st, "/model beta").is_empty());
         assert_eq!(
             st.view.status.as_deref(),
             Some("beta: model default, effort default")
         );
         assert_eq!(st.view.input, "");
+        assert!(st.picker_open());
+        st.handle_key(key(KeyCode::Esc));
+        assert!(!st.picker_open());
         let actions = type_line(&mut st, "/model beta claude-fable-5-1 --effort high");
         assert_eq!(
             actions,
@@ -14091,6 +14552,7 @@ pub(crate) mod tests {
             st.view.status.as_deref(),
             Some("gamma: model default, effort default")
         );
+        st.handle_key(key(KeyCode::Esc));
         assert_eq!(
             type_line(&mut st, "/model beta sonnet"),
             [set("t-beta", Some("sonnet"), None)]
@@ -14187,6 +14649,7 @@ pub(crate) mod tests {
             status(&st),
             "job: account work, model default, effort default"
         );
+        st.handle_key(key(KeyCode::Esc));
         assert!(type_line(&mut st, "/accounts").is_empty());
         assert_eq!(
             status(&st),
@@ -15319,6 +15782,230 @@ pub(crate) mod tests {
         assert_eq!(p.runtimes[0].1, None);
     }
 
+    /// A catalog as `orchestrator.show` `models` gives it: the test threads' `fake` runtime
+    /// and Claude Code.
+    fn catalog() -> Value {
+        serde_json::json!({
+            "fake": {
+                "models": [{"id": "m1", "description": "one"}, {"id": "m2", "description": "two"}],
+                "efforts": ["low", "high"],
+            },
+            "claude-code": {
+                "models": [{"id": "opus", "description": "the latest Opus"}],
+                "efforts": ["low"],
+            },
+        })
+    }
+
+    /// After the runtime, the first-run picker asks for the model: the runtime's default
+    /// selected, so Enter twice starts the runtime's own default; the catalog's models and a
+    /// custom id below it. Esc goes back to the runtimes.
+    #[test]
+    fn the_first_choice_asks_for_the_model_with_the_default_selected() {
+        let mut st = three_threads();
+        st.view.model_choices = catalog();
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
+        st.handle_key(key(KeyCode::Char('1')));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        let m = st.view.picker.as_ref().unwrap().step.clone().unwrap();
+        assert_eq!(m.runtime, "claude-code");
+        assert_eq!(
+            m.rows,
+            [
+                ModelRow::Default,
+                ModelRow::Known("opus".into(), "the latest Opus".into()),
+                ModelRow::Custom,
+            ]
+        );
+        assert_eq!(m.selected, 0);
+        let s = crate::ui::picker_lines(&st)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            s.contains("Model for the orchestrator on claude-code")
+                && s.contains("default")
+                && s.contains("opus")
+                && s.contains("the latest Opus")
+                && s.contains("custom…"),
+            "{s}"
+        );
+        // Esc: back to the runtimes, where it was.
+        st.handle_key(key(KeyCode::Esc));
+        let p = st.view.picker.as_ref().unwrap();
+        assert!(p.step.is_none() && p.selected == 0);
+        st.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::UseOrchestrator {
+                runtime: "claude-code".into(),
+                model: None,
+                summary: false,
+            }]
+        );
+        assert!(!st.picker_open());
+        // A model of the list.
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
+        st.handle_key(key(KeyCode::Char('1')));
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Down));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::UseOrchestrator {
+                runtime: "claude-code".into(),
+                model: Some("opus".into()),
+                summary: false,
+            }]
+        );
+    }
+
+    /// The custom row takes a typed (or pasted) id: Enter chooses it, an empty one is
+    /// refused, Esc goes back to the rows.
+    #[test]
+    fn a_custom_model_id_is_typed_on_its_row() {
+        let mut st = three_threads();
+        st.view.model_choices = catalog();
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
+        st.handle_key(key(KeyCode::Char('1')));
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Char('3')));
+        st.handle_key(key(KeyCode::Enter));
+        let typed = |st: &AppState| {
+            st.view
+                .picker
+                .as_ref()
+                .unwrap()
+                .step
+                .as_ref()
+                .unwrap()
+                .typed
+                .clone()
+        };
+        assert_eq!(typed(&st).as_deref(), Some(""));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(st.picker_open());
+        // j and k are letters here, not moves.
+        for c in "claude-jk".chars() {
+            st.handle_key(key(KeyCode::Char(c)));
+        }
+        st.handle_key(key(KeyCode::Backspace));
+        st.handle_key(key(KeyCode::Backspace));
+        st.handle_paste("x-1\nignored");
+        assert_eq!(typed(&st).as_deref(), Some("claude-x-1"));
+        assert!(st.view.input.is_empty());
+        let s = crate::ui::picker_lines(&st)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            s.contains("claude-x-1▏") && s.contains("Esc back to the list"),
+            "{s}"
+        );
+        st.handle_key(key(KeyCode::Esc));
+        assert_eq!(typed(&st), None);
+        assert!(st.picker_open());
+        st.handle_key(key(KeyCode::Enter));
+        for c in " my-model ".chars() {
+            st.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::UseOrchestrator {
+                runtime: "claude-code".into(),
+                model: Some("my-model".into()),
+                summary: false,
+            }]
+        );
+    }
+
+    /// `/model <thread>` says what it runs and opens the picker of its model, then its
+    /// effort, those in effect selected and marked; only what changed is sent.
+    #[test]
+    fn model_opens_a_picker_of_the_threads_model_and_effort() {
+        let mut st = AppState::new();
+        let mut a = ThreadScript::new("t-alpha");
+        let changed = a.event(EventBody::ThreadModelChanged(
+            twr_core::event::ThreadModelChanged {
+                model: Some("m2".into()),
+                effort: Some("high".into()),
+                ..Default::default()
+            },
+        ));
+        control(&mut st, &[a.created("alpha"), changed]);
+        st.view.model_choices = catalog();
+        type_line(&mut st, "/model alpha");
+        assert!(st.view.status.as_deref().unwrap().contains("alpha"));
+        let step = |st: &AppState| st.view.picker.as_ref().unwrap().step.clone().unwrap();
+        let m = step(&st);
+        assert_eq!(m.thread, Some(("t-alpha".into(), "alpha".into())));
+        assert_eq!(m.selected, 2, "m2, in effect");
+        let s = crate::ui::picker_lines(&st)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            s.contains("Model for alpha") && s.contains("(current)"),
+            "{s}"
+        );
+        // Model m1, then the effort: high is in effect.
+        st.handle_key(key(KeyCode::Up));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        let m = step(&st);
+        assert_eq!(m.chosen, Some(Some("m1".into())));
+        assert_eq!(
+            m.rows,
+            [
+                ModelRow::Default,
+                ModelRow::Known("low".into(), String::new()),
+                ModelRow::Known("high".into(), String::new()),
+            ]
+        );
+        assert_eq!(m.selected, 2);
+        // Esc goes back to the model, m1 still picked.
+        st.handle_key(key(KeyCode::Esc));
+        assert_eq!(step(&st).selected, 1);
+        assert!(step(&st).chosen.is_none());
+        st.handle_key(key(KeyCode::Enter));
+        // The effort kept: only the model is sent.
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::SetModel {
+                thread: "t-alpha".into(),
+                model: Some("m1".into()),
+                effort: None,
+                runtime: None,
+            }]
+        );
+        assert!(!st.picker_open());
+        // The default effort, the model kept: `default` for the effort alone.
+        type_line(&mut st, "/model alpha");
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::SetModel {
+                thread: "t-alpha".into(),
+                model: None,
+                effort: Some("default".into()),
+                runtime: None,
+            }]
+        );
+        // Both as they were: nothing sent. Esc on the model closes it.
+        type_line(&mut st, "/model alpha");
+        st.handle_key(key(KeyCode::Enter));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(st.view.status.as_deref().unwrap().contains("unchanged"));
+        type_line(&mut st, "/model alpha");
+        st.handle_key(key(KeyCode::Esc));
+        assert!(!st.picker_open());
+        // With a model on the line, no picker: it is set as typed.
+        type_line(&mut st, "/model alpha custom-x");
+        assert!(!st.picker_open());
+    }
+
     #[test]
     fn the_picker_chooses_with_enter_and_waits_with_esc() {
         let mut st = AppState::new();
@@ -15338,14 +16025,15 @@ pub(crate) mod tests {
             .contains("Esc to decide later"));
         st.handle_paste("hello");
         assert!(st.view.input.is_empty());
-        // Up/Down and digits move; Enter chooses the highlighted one (with the configured
-        // model only for the configured runtime).
+        // Up/Down and digits move; Enter chooses the highlighted one, then its model (the
+        // configured one selected only for the configured runtime).
         st.handle_key(key(KeyCode::Down));
         st.handle_key(key(KeyCode::Down));
         assert_eq!(st.view.picker.as_ref().unwrap().selected, 2);
         st.handle_key(key(KeyCode::Char('9')));
         assert_eq!(st.view.picker.as_ref().unwrap().selected, 2);
         st.handle_key(key(KeyCode::Char('1')));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
         assert_eq!(
             st.handle_key(key(KeyCode::Enter)),
             [Action::UseOrchestrator {
@@ -15370,6 +16058,7 @@ pub(crate) mod tests {
         );
         let mut st = three_threads();
         st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
         assert_eq!(
             st.handle_key(key(KeyCode::Enter)),
             [Action::UseOrchestrator {
@@ -15459,6 +16148,8 @@ pub(crate) mod tests {
             "{said}"
         );
         st.view.picker = Some(p);
+        // The runtime, then its configured model, selected.
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
         assert_eq!(
             st.handle_key(key(KeyCode::Enter)),
             [Action::UseOrchestrator {
@@ -15520,6 +16211,7 @@ pub(crate) mod tests {
                 .any(|l| l.contains("claude-code:personal") && !l.contains("(default)")),
             "{lines:?}"
         );
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
         assert_eq!(
             st.handle_key(key(KeyCode::Enter)),
             [Action::UseOrchestrator {
@@ -15603,6 +16295,7 @@ pub(crate) mod tests {
         assert_eq!((p.default.as_str(), p.selected), ("claude-code:work", 1));
         st.handle_key(key(KeyCode::Up));
         st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Enter));
         assert_eq!(
             st.handle_key(key(KeyCode::Char('s'))),
             [Action::UseOrchestrator {
@@ -15646,6 +16339,7 @@ pub(crate) mod tests {
                 .any(|l| l.contains("1 claude-code ") && l.contains("(current)")),
             "{lines:?}"
         );
+        st.handle_key(key(KeyCode::Enter));
         st.handle_key(key(KeyCode::Enter));
         let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
         assert!(
@@ -23217,6 +23911,23 @@ pub(crate) mod tests {
             wheel_at(&mut st, 100, 30, inner.x + 1, inner.y + 1, false);
             assert_eq!(st.view.picker.as_ref().unwrap().selected, 1);
             tap(&mut st, 100, 30, Target::Runtime(0));
+            // A tap on the picked runtime chooses it; then its models, the default picked,
+            // where a tap on a row picks it and one on the picked row chooses it.
+            assert!(tap(&mut st, 100, 30, Target::Runtime(0)).is_empty());
+            assert!(st.view.picker.as_ref().unwrap().step.is_some());
+            tap(&mut st, 100, 30, Target::Runtime(1));
+            assert_eq!(
+                st.view
+                    .picker
+                    .as_ref()
+                    .unwrap()
+                    .step
+                    .as_ref()
+                    .unwrap()
+                    .selected,
+                1
+            );
+            tap(&mut st, 100, 30, Target::Runtime(0));
             assert_eq!(
                 tap(&mut st, 100, 30, Target::Runtime(0)),
                 [Action::UseOrchestrator {
@@ -23894,6 +24605,7 @@ pub(crate) mod tests {
                 default: "claude-code".into(),
                 model: None,
                 switch: false,
+                step: None,
             });
             frame(&mut st, 40, 24);
             as_drawn(&st, "picker");
@@ -23916,6 +24628,7 @@ pub(crate) mod tests {
                 default: "claude-code".into(),
                 model: None,
                 switch: false,
+                step: None,
             });
             for h in [8u16, 9, 10] {
                 for sel in [0, 1] {
@@ -27414,7 +28127,6 @@ pub(crate) mod tests {
                 "OpenAI",
                 "claude-haiku-5-5",
                 "gpt-6-luna",
-                "$0.0002",
                 "Claude Code",
                 "/suggest off",
                 "suggest = false",
@@ -27422,6 +28134,7 @@ pub(crate) mod tests {
             ] {
                 assert!(notice.contains(says), "{says}");
             }
+            assert!(!notice.contains('$'), "no price: {notice}");
             assert_eq!(st.take_suggest_due(), None, "still not drawn");
             // Replaced before a frame showed it: shown again.
             st.view.status = Some("something else".into());
@@ -27434,7 +28147,7 @@ pub(crate) mod tests {
             assert!(!st.seen.suggest_notice, "under the help");
             assert_eq!(st.take_suggest_due(), None);
             st.view.help = false;
-            draw(&mut st, 30, 9);
+            draw(&mut st, 20, 7);
             st.note_drawn(Instant::now());
             assert!(!st.seen.suggest_notice, "cut short");
             // A terminal of one row has no room for the status bar at all.
@@ -27460,9 +28173,9 @@ pub(crate) mod tests {
         }
 
         /// On a compact terminal (40x20) the status bar has no room for the notice whole: it
-        /// draws the short form, which still says what is sent, to whom, what it costs and
-        /// how to turn them off, and that one drawn whole tells it. At a normal width the
-        /// whole one is drawn.
+        /// draws the short form, which still says what is sent, to whom and how to turn
+        /// them off (no price, as the whole one), and that one drawn whole tells it. At a
+        /// normal width the whole one is drawn.
         #[test]
         fn the_suggestion_notice_is_said_short_where_it_has_no_room() {
             let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -27478,11 +28191,11 @@ pub(crate) mod tests {
                 "prompt",
                 "8 KB",
                 "your login",
-                "$0.0002",
                 "/suggest off",
             ] {
                 assert!(short.contains(says), "{says}");
             }
+            assert!(!short.contains('$'), "no price: {short}");
             let notice = crate::firstrun::suggest_notice(&models);
             for (w, h, whole) in [(40, 20, false), (210, 40, true)] {
                 let (mut st, _) = ended(true);
@@ -27543,13 +28256,13 @@ pub(crate) mod tests {
         fn the_suggestion_notice_stays_until_dismissed_or_replaced() {
             let models = twr_core::config::SuggestModels::default();
             let short = crate::firstrun::suggest_notice_short(&models);
-            for (w, dismiss) in [(40, true), (40, false), (30, true), (30, false)] {
+            for (w, dismiss) in [(40, true), (40, false), (24, true), (24, false)] {
                 let (mut st, _) = ended(true);
                 st.seen.suggest_notice = false;
                 crowd(&mut st, true, true);
                 assert_eq!(st.take_suggest_due(), None);
                 let had = notice_stays_until_gone(&mut st, &short, w, 20, dismiss);
-                // At 30 columns its short form needs more than a third of the screen.
+                // At 24 columns its short form needs more than a third of the screen.
                 assert!(w == 40 || had > 20 / 3, "{w}x20: {had} rows");
                 assert!(st.seen.suggest_notice);
             }

@@ -1704,6 +1704,34 @@ async fn show_says_whether_the_runtime_was_configured_and_what_is_installed() {
         "{o}"
     );
     assert!(o["thread"].is_null() && o["retired"] == json!(0), "{o}");
+    // What the model pickers offer: each built-in runtime's models and efforts, Claude Code's
+    // aliases first.
+    let models = &o["models"];
+    assert_eq!(
+        models["claude-code"]["models"][0]["id"],
+        json!("opus"),
+        "{o}"
+    );
+    assert_eq!(
+        models["claude-code"]["efforts"],
+        json!(["low", "medium", "high", "xhigh", "max"]),
+        "{o}"
+    );
+    assert_eq!(
+        models["codex"]["models"][0]["id"],
+        json!("gpt-6.1-sol"),
+        "{o}"
+    );
+    assert_eq!(
+        models["grok-build"]["models"][0]["id"],
+        json!("grok-4.7"),
+        "{o}"
+    );
+    assert!(models["claude-code"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["description"].is_string()));
     hub.shutdown().await;
     drop(hub);
 

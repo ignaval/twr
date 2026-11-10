@@ -7,3 +7,8 @@
 !/docs
 /docs/*
 !/docs/img
+!/clients
+/clients/*
+!/clients/packaging
+/clients/packaging/*
+!/clients/packaging/icon.png

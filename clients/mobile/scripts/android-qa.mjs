@@ -1,4 +1,5 @@
 import { _android, expect } from "@playwright/test";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createServer, connect as connectTCP } from "node:net";
 import { Transform } from "node:stream";
@@ -849,7 +850,9 @@ try {
     await foldDialog("horizontal");
     await page.evaluate(() => {
       const chat = [
-        ...document.querySelectorAll(".mobile-tabs button,.primary-nav button"),
+        ...document.querySelectorAll(
+          ".mobile-tabs button,.workspace-entry.current .workspace-orchestrator",
+        ),
       ].find(
         (e) =>
           e.getClientRects().length &&
@@ -928,7 +931,7 @@ try {
       .click();
     await page
       .getByRole("dialog", { name: "Close terminal?", exact: true })
-      .getByRole("button", { name: "Continue", exact: true })
+      .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
       .click();
     await expect(page.locator(".terminal-session")).toHaveCount(0);
     console.log(
@@ -1135,7 +1138,7 @@ try {
     .click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   await page.evaluate((id) => {
     const command =
@@ -1193,7 +1196,7 @@ try {
     .click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   console.log("PASS: Android to remote native PTY input and output");
   await terminalUIQA(page);
@@ -1892,6 +1895,7 @@ try {
     } catch {}
   }
   await new Promise((r) => setTimeout(r, 1500));
+  stopFixture(join(bin, "twr"), env);
   rmSync(fixture, {
     recursive: true,
     force: true,

@@ -693,6 +693,26 @@ fn row_text(buf: &Buffer, pane: &Pane, y: u16, x0: u16, x1: u16) -> String {
     out
 }
 
+/// The most text (in bytes) copied with OSC 52: about 137 KB once in base64. Terminals and
+/// tmux drop a longer sequence without a word (several terminals stop at 100 KB or less), and
+/// writing megabytes to the terminal would hold everything else up.
+pub const OSC52_MAX: usize = 100 * 1024;
+
+/// The status line for a copy of `text`, over [`OSC52_MAX`]: copied with the local clipboard
+/// command `local` when there is one, else not at all.
+pub fn too_large(text: &str, local: Option<&str>) -> String {
+    let n = text.chars().count();
+    match local {
+        Some(program) => {
+            format!("copied {n} characters with {program}: too large for the terminal clipboard")
+        }
+        None => format!(
+            "not copied: {n} characters is too large for the terminal clipboard (at most {} KB)",
+            OSC52_MAX / 1024
+        ),
+    }
+}
+
 /// The OSC 52 sequence that asks the terminal to put `text` on the clipboard.
 pub fn osc52(text: &str) -> String {
     format!("\x1b]52;c;{}\x07", twr_core::b64::encode(text.as_bytes()))
@@ -874,6 +894,27 @@ mod tests {
         assert_eq!(twr_core::b64::encode(&[0xff, 0xfe, 0x00]), "//4A");
         assert_eq!(twr_core::b64::encode("é".as_bytes()), "w6k=");
         assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    /// A copy too large for OSC 52 says so: copied with the local command, or not at all.
+    #[test]
+    fn a_copy_too_large_for_the_terminal_says_so() {
+        // At the cap the sequence stays under what terminals take.
+        assert!(osc52(&"x".repeat(OSC52_MAX)).len() < 140 * 1024);
+        let big = "é".repeat(OSC52_MAX);
+        assert_eq!(
+            too_large(&big, Some("pbcopy")),
+            format!(
+                "copied {OSC52_MAX} characters with pbcopy: too large for the terminal clipboard"
+            )
+        );
+        assert_eq!(
+            too_large(&big, None),
+            format!(
+                "not copied: {OSC52_MAX} characters is too large for the terminal clipboard \
+                 (at most 100 KB)"
+            )
+        );
     }
 
     #[test]

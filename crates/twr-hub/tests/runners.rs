@@ -1169,7 +1169,25 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
     // The configured box's refusal is recorded for `twr info` (the unknown box's is not).
     let r = h.hub().box_refusal(BOX).expect("a refusal of the box");
     assert!(r.reason.contains("does not match"), "{}", r.reason);
+    // It says who could have caused it: no runner proved the token.
+    assert!(
+        r.reason.contains("an unauthenticated connection from"),
+        "{}",
+        r.reason
+    );
     assert!(h.hub().box_refusal("nope").is_none());
+    // A hello naming no valid box (a forged log line, 8 KiB of it) is refused as malformed,
+    // before anything looks the name up or logs it.
+    let forged = format!("{BOX}\nINFO forged-line {}", "x".repeat(8000));
+    for name in [forged.as_str(), "", ".gpu", "gpu box"] {
+        let mut ws = raw(&h.url).await;
+        let (_, m) = raw_hello_only(&mut ws, name, PROTOCOL_VERSION).await;
+        let message = expect_error(m, hub_errors::PROTOCOL);
+        assert!(message.contains("box name"), "{message}");
+        assert!(!message.contains("forged-line"), "{message}");
+    }
+    let logs = String::from_utf8(LOGS.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains("forged-line"), "the name was logged");
     // A runner that leaves after the challenge (it did not accept the hub's proof).
     let mut ws = raw(&h.url).await;
     let (_, m) = raw_hello_only(&mut ws, BOX, PROTOCOL_VERSION).await;
@@ -1251,6 +1269,67 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
     let mut ws = raw(&h.url).await;
     raw_hello(&mut ws, self::hello(TOKEN)).await;
     wait_for("the refusal cleared", || h.hub().box_refusal(BOX).is_none()).await;
+    h.shutdown().await;
+}
+
+/// An inventory naming a session or spooled frames of something with no thread id's shape
+/// (too long, empty, or with characters a thread id never has) is refused before the welcome,
+/// as a frame naming one closes its connection; nothing of it is taken over or recorded, and
+/// a runner whose inventory names thread ids is welcomed afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inventory_naming_no_thread_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let long = "0".repeat(65);
+    for bad in [
+        "",
+        "01J TEST",
+        "01J\nforged log line",
+        "thréad",
+        long.as_str(),
+    ] {
+        for spooled in [false, true] {
+            let mut ws = raw(&h.url).await;
+            let mut hi = hello(TOKEN);
+            if spooled {
+                hi.acks_needed.insert(bad.to_string(), 3);
+            } else {
+                hi.running = vec![RunningSession {
+                    thread: bad.into(),
+                    runtime: "fake".into(),
+                    ..Default::default()
+                }];
+            }
+            raw_hello(&mut ws, hi).await;
+            match raw_expect(&mut ws).await {
+                Some(HubMsg::Error { code, message }) => {
+                    assert_eq!(code, hub_errors::PROTOCOL, "{bad:?}");
+                    assert!(message.contains("no thread id"), "{message}");
+                }
+                other => panic!("{bad:?} (spooled: {spooled}): {other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        log(h.hub(), HUB_THREAD)
+            .iter()
+            .filter(|e| e.kind() == "runner.connected")
+            .count(),
+        0
+    );
+    let mut ws = raw(&h.url).await;
+    let mut hi = hello(TOKEN);
+    hi.running = vec![RunningSession {
+        thread: "0".repeat(64),
+        runtime: "fake".into(),
+        ..Default::default()
+    }];
+    raw_hello(&mut ws, hi).await;
+    let welcome = raw_expect(&mut ws).await;
+    assert!(
+        matches!(welcome, Some(HubMsg::Welcome { .. })),
+        "{welcome:?}"
+    );
     h.shutdown().await;
 }
 

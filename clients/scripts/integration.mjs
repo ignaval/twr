@@ -1,6 +1,7 @@
 // Real Electron + real Rust hub + twr's deterministic test adapter. No provider account,
 // user's config, network agent, or existing workspace is touched.
 import { performanceAudit } from "./performance.mjs";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, chromium } from "@playwright/test";
 import { createServer } from "node:net";
 import { spawn, execFileSync } from "node:child_process";
@@ -118,6 +119,7 @@ let packagedProcess;
 let applicationProcess;
 let packagedLog = "";
 let hub;
+let sideWorkspace = false;
 const errors = [];
 try {
   hub = spawn(join(bin, "twr"), ["hub"], {
@@ -175,7 +177,8 @@ try {
     }
     assert(
       browser,
-      "Packaged app must expose its test Chromium port: " + packagedLog,
+      "Packaged app must expose its test Chromium port (a packaged build honours TWR_DESKTOP_TEST_AUTOMATION only with resources/twr-qa-automation in its install; docs/desktop-qa.md): " +
+        packagedLog,
     );
     const context = browser.contexts()[0];
     assert(context, "Packaged application must expose its browser context");
@@ -297,8 +300,38 @@ try {
     .getByRole("button", { name: /api.*waiting/ })
     .first()
     .waitFor({ timeout: 30000 });
+  // An answer counts only once the options have been on screen for 600 ms, as in the
+  // TUI (shared/arming.ts): a click the moment the card appears answers nothing.
+  await page.evaluate(() => {
+    window.__earlyClick = new Promise((resolve) => {
+      const tryClick = () => {
+        const card = [...document.querySelectorAll(".manager .attention-card")]
+          .filter((node) => /Permission requested/.test(node.textContent || ""))
+          .at(0);
+        const options = card?.querySelector(".attention-options");
+        const allow = [
+          ...(card?.querySelectorAll(".attention-options button") || []),
+        ].find((button) => /allow/i.test(button.textContent || ""));
+        if (!allow) return false;
+        const armed = options?.getAttribute("data-armed") === "true";
+        allow.click();
+        observer.disconnect();
+        resolve(!armed);
+        return true;
+      };
+      const observer = new MutationObserver(tryClick);
+      observer.observe(document.body, { childList: true, subtree: true });
+      tryClick();
+    });
+  });
   await page.getByRole("button", { name: /Needs you/ }).click();
   await page.getByText("Permission requested", { exact: true }).waitFor();
+  const earlyClick = await within(
+    page.evaluate(() => window.__earlyClick),
+    10000,
+    "The permission card never showed an Allow button",
+  );
+  assert(earlyClick, "The early click must land before the options arm");
   console.log("Permission request rendered");
   const item = await page.evaluate(async () =>
     (await window.twr.rpc("attention.list", { all: true })).find(
@@ -317,8 +350,26 @@ try {
       item,
     ),
   );
-  await page
-    .locator(".manager .attention-options button")
+  const permissionCard = page
+    .locator(".manager .attention-card")
+    .filter({ hasText: "Permission requested" })
+    .first();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  const still = await page.evaluate(
+    async (item) =>
+      (await window.twr.rpc("attention.list", { all: true })).some(
+        (a) => a.attn_id === item.attn_id && a.revision === item.revision,
+      ),
+    item,
+  );
+  assert(still, "A click before the options armed must answer nothing");
+  assert.equal(await permissionCard.locator(".attention-sent").count(), 0);
+  console.log("PASS: a click the moment a request appears answers nothing");
+  await permissionCard
+    .locator('.attention-options[data-armed="true"]')
+    .waitFor({ timeout: 5000 });
+  await permissionCard
+    .locator(".attention-options button")
     .filter({ hasText: "allow" })
     .first()
     .click();
@@ -382,6 +433,10 @@ try {
     await deny.isVisible(),
     "The full request and Deny action must share one reachable scroll area",
   );
+  // Scrolled into view just now: its options arm 600 ms after they came on screen.
+  await longRequest
+    .locator('.attention-options[data-armed="true"]')
+    .waitFor({ timeout: 5000 });
   await deny.click();
   await longRequest.waitFor({ state: "hidden" });
   await page.setViewportSize(fullViewport);
@@ -500,7 +555,9 @@ try {
     ).data.includes("ELECTRON_TERMINAL_UI_OK"),
   );
   await page.getByRole("button", { name: "Close Shell", exact: true }).click();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
+    .click();
   // Account login uses a disposable provider stub, not a real account or credential.
   execFileSync(
     join(bin, "twr"),
@@ -558,7 +615,9 @@ try {
   await page
     .getByRole("button", { name: "Close twr account login", exact: true })
     .click();
-  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
+    .click();
   console.log(
     "Embedded terminal UI, shortcut handling, reload restore and interactive account login passed",
   );
@@ -592,9 +651,12 @@ try {
       exact: true,
     })
     .click();
+  const suggestedComposer = page.getByRole("textbox", {
+    name: "Message api directly",
+  });
+  // The suggestion is the empty box's placeholder, as the TUI's ghost text.
   await page
-    .locator(".suggested-message")
-    .filter({ hasText: "Add tests for the updated behavior" })
+    .locator('textarea[placeholder="Add tests for the updated behavior"]')
     .waitFor({ timeout: 30000 })
     .catch(async (error) => {
       const diagnostic = await page.evaluate(async () => {
@@ -621,10 +683,33 @@ try {
       console.error("Suggestion diagnostics:", JSON.stringify(diagnostic));
       throw error;
     });
-  const suggestedComposer = page.getByRole("textbox", {
-    name: "Message api directly",
-  });
+  await page.getByText("takes the suggestion").waitFor();
+  assert.equal(
+    await page.locator(".suggested-message").count(),
+    0,
+    "Desktop shows the suggestion in the box, not beside it",
+  );
   await suggestedComposer.focus();
+  // Typing types over it; with the box empty again it shows again.
+  await suggestedComposer.press("x");
+  assert.equal(await suggestedComposer.inputValue(), "x");
+  await suggestedComposer.press("Backspace");
+  await page
+    .locator('textarea[placeholder="Add tests for the updated behavior"]')
+    .waitFor({ timeout: 30000 });
+  // Tab or → takes it once it has been on screen a moment (300 ms, as the TUI).
+  await page.waitForTimeout(400);
+  await suggestedComposer.press("ArrowRight");
+  assert.equal(
+    await suggestedComposer.inputValue(),
+    "Add tests for the updated behavior",
+  );
+  await suggestedComposer.fill("");
+  await page
+    .locator('textarea[placeholder="Add tests for the updated behavior"]')
+    .waitFor({ timeout: 30000 });
+  // Tab or → takes it once it has been on screen a moment (300 ms, as the TUI).
+  await page.waitForTimeout(400);
   await suggestedComposer.press("Tab");
   assert.equal(
     await suggestedComposer.inputValue(),
@@ -664,13 +749,13 @@ try {
   await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   await page.waitForTimeout(1000);
-  assert.equal(
-    await page.locator(".suggested-message").count(),
-    0,
+  assert.notEqual(
+    await suggestedComposer.getAttribute("placeholder"),
+    "Add tests for the updated behavior",
     "Settings changes apply when returning to chat without reloading",
   );
   console.log(
-    "Small-model disclosure, provider stub, Tab acceptance and explicit send boundary passed",
+    "Small-model disclosure, provider stub, placeholder suggestion, Tab and → acceptance and explicit send boundary passed",
   );
   // Real configuration CAS and validation, with an external edit between read and save.
   const config = await page.evaluate(() => window.twr.configRead());
@@ -786,6 +871,233 @@ try {
     exact: true,
   });
   if (await dismissError.isVisible()) await dismissError.click();
+  // Every workspace in the tray and badge, and OS notifications while the window is
+  // hidden. Automation records what would be posted (desktop/app-services.ts testPost)
+  // instead of relying on the system, which may not let a development build notify.
+  if (!packagedProcess) {
+    await page.setViewportSize(fullViewport);
+    const twr = join(bin, "twr");
+    const side = (...args) =>
+      execFileSync(twr, ["-w", "side", ...args], {
+        env,
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+    execFileSync(twr, ["ws", "new", "side"], { env, stdio: "pipe" });
+    sideWorkspace = true;
+    // The app starts this workspace's hub itself. That hub must keep nothing of the app's:
+    // on macOS it once inherited the crash reporter's exception ports, which kept
+    // Electron's crash handler, and with it this runner's pipes, open past the app's exit,
+    // so that closing the app below never finished.
+    const send = (event) =>
+      application.evaluate(
+        ({ BrowserWindow }, event) =>
+          BrowserWindow.getAllWindows()[0].webContents.send("twr:event", event),
+        event,
+      );
+    const showing = async (name) => {
+      await page
+        .locator(".workspace-breadcrumb")
+        .filter({ hasText: new RegExp(`^${name}$`) })
+        .waitFor({ state: "attached", timeout: 30000 });
+      await page
+        .locator(".connection-status")
+        .filter({ hasText: "Hub connected" })
+        .waitFor({ state: "attached", timeout: 30000 });
+    };
+    // Visiting the new workspace once starts its hub and lists it in the window.
+    await send({ type: "menu-attention", workspace: "side" });
+    await showing("side");
+    side("thread", "new", "demo", "--runtime", "fake", "--name", "side-api");
+    await send({ type: "menu-attention", workspace: "default" });
+    await showing("default");
+    const recorded = () =>
+      application.evaluate(() => {
+        const state = globalThis.__twrTest;
+        return {
+          attention: state.attention,
+          notifications: state.notifications.map(
+            ({ title, body, target, closed }) => ({
+              title,
+              body,
+              target,
+              closed,
+            }),
+          ),
+        };
+      });
+    const until = async (check, message) => {
+      const deadline = Date.now() + 30000;
+      for (;;) {
+        // The main process's beat for reading the other workspaces, sooner.
+        await send({ type: "inbox-poll" });
+        const value = await recorded();
+        if (check(value)) return value;
+        if (Date.now() > deadline)
+          throw new Error(`${message}: ${JSON.stringify(value)}`);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    };
+    // Background mode hides the window; its badge and notifications stay live.
+    await application.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].hide(),
+    );
+    await until(
+      (state) =>
+        state.attention?.workspaces.some((w) => w.name === "side" && w.stream),
+      "The side workspace was never read",
+    );
+    const before = (await recorded()).notifications.length;
+    side("send", "side-api", "!perm Bash printf SIDE_SECRET_COMMAND");
+    let state = await until(
+      (state) =>
+        state.notifications.length > before &&
+        state.attention.items.some((i) => i.workspace === "side"),
+      "No notification for a permission in the other workspace",
+    );
+    const notice = state.notifications.at(-1);
+    assert.equal(notice.title, "side-api · side");
+    assert.equal(notice.body, "Asks for permission");
+    assert.equal(notice.target.workspace, "side");
+    assert.equal(state.notifications.length, before + 1);
+    assert(
+      !JSON.stringify(state.notifications).includes("SIDE_SECRET_COMMAND"),
+      "A notification must not carry what is asked",
+    );
+    const sideItem = state.attention.items.find((i) => i.workspace === "side");
+    assert.equal(sideItem.reason, "permission");
+    assert.equal(state.attention.count, state.attention.items.length);
+    assert(state.attention.count >= 1);
+    if (process.platform === "darwin")
+      assert.equal(
+        await application.evaluate(({ app }) => app.getBadgeCount()),
+        state.attention.count,
+        "The Dock badge counts every workspace",
+      );
+    side("respond", "side-api", "allow", "--yes");
+    await until(
+      (state) => state.notifications.at(-1).closed,
+      "The notification stayed after its request was answered",
+    );
+    // A click shows the window in that workspace at the request; it answers nothing.
+    side("send", "side-api", "!perm Bash printf SIDE_SECOND");
+    state = await until(
+      (state) => state.notifications.length > before + 1,
+      "No notification for the second permission",
+    );
+    await application.evaluate(() =>
+      globalThis.__twrTest.notifications.at(-1).click(),
+    );
+    await showing("side");
+    assert(
+      await application.evaluate(({ BrowserWindow }) =>
+        BrowserWindow.getAllWindows()[0].isVisible(),
+      ),
+    );
+    await page
+      .locator(".manager .attention-card")
+      .filter({ hasText: "Permission requested" })
+      .filter({ hasText: "side-api" })
+      .first()
+      .waitFor({ timeout: 15000 });
+    assert(
+      JSON.parse(side("attention", "--json")).some(
+        (item) => item.reason === "permission",
+      ),
+      "Opening a notification must not answer its request",
+    );
+    side("respond", "side-api", "allow", "--yes");
+    await send({ type: "menu-attention", workspace: "default" });
+    await showing("default");
+    console.log(
+      "PASS: tray and badge count every workspace; a hidden window notifies of another workspace's permission without its text, removes it once answered, and a click opens it there",
+    );
+    // The hub's delete card notifies too, saying it is a deletion, without the threads.
+    await application.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].hide(),
+    );
+    // Back in default, the side workspace's first read again lists what it has as known:
+    // the card must come after it.
+    await until(
+      (state) =>
+        state.attention?.workspaces.some((w) => w.name === "side" && w.stream),
+      "The side workspace was never read again",
+    );
+    const posted = (await recorded()).notifications.length;
+    const deleting = spawn(twr, ["-w", "side", "delete", "side-api"], {
+      env,
+      stdio: "ignore",
+    });
+    try {
+      state = await until(
+        (state) =>
+          state.notifications.length > posted &&
+          state.notifications.at(-1).target.thread === "hub",
+        "No notification for the delete card",
+      ).catch(async (error) => {
+        const history = await application.evaluate(() =>
+          globalThis.__twrTest.history.slice(-30),
+        );
+        throw new Error(
+          `${error.message}\nSummaries: ${JSON.stringify(history)}`,
+        );
+      });
+      const card = state.notifications.at(-1);
+      assert.equal(card.title, "twr · side");
+      assert.equal(card.body, "Asks you to confirm a deletion");
+      assert.equal(card.target.workspace, "side");
+      assert.equal(state.notifications.length, posted + 1);
+      assert(
+        !JSON.stringify(card).includes("side-api"),
+        "A delete card's notification must not list the threads",
+      );
+      // Read again and again (the poll beat): still one notification.
+      await send({ type: "inbox-poll" });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      assert.equal((await recorded()).notifications.length, posted + 1);
+      await application.evaluate(() =>
+        globalThis.__twrTest.notifications.at(-1).click(),
+      );
+      await showing("side");
+      const open = JSON.parse(side("attention", "--json")).find(
+        (item) => item.thread === "hub",
+      );
+      assert(open, "Opening the notification must not answer the delete card");
+      side("respond", open.target, "Cancel");
+    } finally {
+      if (deleting.exitCode === null) deleting.kill("SIGTERM");
+    }
+    assert(
+      JSON.parse(side("thread", "list", "--json")).some(
+        (thread) => thread.name === "side-api",
+      ),
+      "Cancel keeps the thread",
+    );
+    await send({ type: "menu-attention", workspace: "default" });
+    await showing("default");
+    console.log(
+      "PASS: a delete card in another workspace notifies once as a deletion, without its threads, and a click opens it there without answering it",
+    );
+  }
+  if (!packagedProcess) {
+    // Help › Third-Party Licences; automation records the file instead of opening it.
+    const opened = await application.evaluate(({ Menu }) => {
+      const help = Menu.getApplicationMenu().items.find(
+        (item) => item.label === "Help",
+      );
+      help.submenu.items
+        .find((item) => item.label === "Third-Party Licences")
+        .click();
+      return globalThis.__twrOpenedNotices;
+    });
+    assert.equal(
+      opened?.path,
+      resolve("dist-notices/THIRD-PARTY-LICENSES.html"),
+    );
+    console.log(
+      `PASS: Help › Third-Party Licences opens the generated notices${opened.exists ? "" : " (not generated in this checkout: node scripts/notices.mjs)"}`,
+    );
+  }
   if (errors.length) throw new Error(errors.join("\n"));
   if (process.env.TWR_PERF === "1")
     await performanceAudit(
@@ -824,6 +1136,7 @@ try {
     `PASS: ${catalog.length} CLI workflows, real approvals, transcript streaming, embedded attach + input, config CAS, memory, IPC boundaries, narrow layout, independent hub lifecycle.`,
   );
 } catch (error) {
+  console.error("Failed:", error);
   if (application) {
     const page = await application.firstWindow();
     console.error("Renderer errors:", errors);
@@ -861,6 +1174,14 @@ try {
       "Test application cleanup timed out",
     ).catch(() => {});
   }
+  if (sideWorkspace)
+    try {
+      execFileSync(join(bin, "twr"), ["-w", "side", "hub", "stop"], {
+        env,
+        stdio: "ignore",
+        timeout: 15000,
+      });
+    } catch {}
   try {
     execFileSync(join(bin, "twr"), ["hub", "stop"], {
       env,
@@ -875,6 +1196,8 @@ try {
       new Promise((resolve) => hub.once("exit", resolve)),
       new Promise((resolve) => setTimeout(resolve, 5000)),
     ]);
+  // The hubs are stopped; then the runner service of this home, if a hub started one.
+  stopFixture(join(bin, "twr"), env, { workspaces: [] });
   rmSync(home, {
     recursive: true,
     force: true,

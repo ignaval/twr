@@ -41,6 +41,46 @@ export { RECEIPT_WINDOW } from "./offline-constants";
 const HISTORY_WINDOW = 7 * 24 * 60 * 60 * 1000;
 const bytes = (value: unknown) =>
   new TextEncoder().encode(JSON.stringify(value)).byteLength;
+// Saved objects are replaced, never changed in place: sizes are measured once per object.
+const sizes = new WeakMap<object, number>();
+function sized(value: unknown): number {
+  if (!value || typeof value !== "object") return bytes(value ?? null);
+  let size = sizes.get(value);
+  if (size === undefined) {
+    size = Array.isArray(value)
+      ? 2 + value.reduce((sum: number, item) => sum + sized(item) + 1, 0)
+      : bytes(value);
+    sizes.set(value, size);
+  }
+  return size;
+}
+/** Approximate JSON size of a cached workspace, from the cached sizes of its parts. */
+function workspaceSize(entry: CachedWorkspace): number {
+  let size = sizes.get(entry);
+  if (size === undefined) {
+    size =
+      64 +
+      sized(entry.view) +
+      sized(entry.transcriptTimes || {}) +
+      Object.entries(entry.transcripts).reduce(
+        (sum, [id, events]) => sum + id.length + 4 + sized(events),
+        0,
+      );
+    sizes.set(entry, size);
+  }
+  return size;
+}
+/** The size checks below: each lane is measured by itself, history from cached sizes. */
+export function recordSize(record: OfflineRecord) {
+  const pending = bytes({ drafts: record.drafts, outbox: record.outbox });
+  const history = Object.entries(record.workspaces).reduce(
+    (sum, [key, entry]) => sum + key.length + 4 + workspaceSize(entry),
+    0,
+  );
+  return { pending, history, total: pending + history };
+}
+export const HISTORY_BOUND = 4 * 1024 * 1024;
+export const RECORD_BOUND = 6 * 1024 * 1024;
 export function messageOnlyParams(
   method: DurableMessage["method"],
   params: Json,
@@ -275,8 +315,11 @@ export class OfflineJournal {
           );
         let next = change(this.record);
         // Preserve drafts and queued messages first. Evict oldest history until bounded.
+        // Drafts are saved as you type: only that lane is serialized for its size, the
+        // cached history's size comes from sizes measured when it was saved.
+        let size = recordSize(next);
         while (
-          bytes(next) > 4 * 1024 * 1024 &&
+          size.total > HISTORY_BOUND &&
           Object.keys(next.workspaces).length
         ) {
           const oldest = Object.entries(next.workspaces).sort(
@@ -284,8 +327,9 @@ export class OfflineJournal {
           )[0][0];
           const { [oldest]: _, ...workspaces } = next.workspaces;
           next = { ...next, workspaces };
+          size = recordSize(next);
         }
-        if (bytes(next) > 6 * 1024 * 1024)
+        if (size.total > RECORD_BOUND)
           throw new Error(
             "Offline drafts and messages are full. Remove an outbox item before adding more.",
           );
@@ -332,7 +376,7 @@ export class OfflineJournal {
         transcriptTimes[thread] = Date.now();
         transcripts[thread] = events
           .slice(-500)
-          .filter((event) => bytes(event) <= 128 * 1024);
+          .filter((event) => sized(event) <= 128 * 1024);
         for (const id of Object.keys(transcripts)
           .sort((a, b) => (transcriptTimes[a] || 0) - (transcriptTimes[b] || 0))
           .slice(0, Math.max(0, Object.keys(transcripts).length - 8)))
@@ -342,11 +386,11 @@ export class OfflineJournal {
       const compact: ViewState = {
         ...view,
         threads: view.threads
-          .filter((item) => bytes(item) <= 128 * 1024)
+          .filter((item) => sized(item) <= 128 * 1024)
           .slice(0, 200),
-        attention: view.attention.filter((item) => bytes(item) <= 128 * 1024),
+        attention: view.attention.filter((item) => sized(item) <= 128 * 1024),
         decisions: view.decisions
-          .filter((item) => bytes(item) <= 64 * 1024)
+          .filter((item) => sized(item) <= 64 * 1024)
           .slice(-40),
       };
       return {

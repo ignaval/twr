@@ -1,4 +1,5 @@
 import { clientProtocol } from "../../scripts/client-protocol.mjs";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
@@ -64,22 +65,82 @@ const deviceKind = (device) =>
       : device.name.includes("iPhone")
         ? "phone"
         : undefined;
+const usableRuntimes = iosRuntimes.filter(
+  (runtime) => runtime.isAvailable === true,
+);
+const hasDevice = (runtime, family) =>
+  available.some(
+    (device) =>
+      device.runtime === runtime.identifier && deviceKind(device) === family,
+  );
+// The general runtime (`iOS-27-2`), not a device-specific one (`iOS-27-2-iPhone19-4`).
+const isPlain = (runtime) =>
+  /^com\.apple\.CoreSimulator\.SimRuntime\.iOS-\d+-\d+$/.test(
+    runtime.identifier,
+  );
+const newestFirst = (a, b) => {
+  const [x, y] = [a, b].map((r) => r.version.split(".").map(Number));
+  for (let i = 0; i < Math.max(x.length, y.length); i++)
+    if ((y[i] || 0) !== (x[i] || 0)) return (y[i] || 0) - (x[i] || 0);
+  return 0;
+};
+/**
+ * The one runtime among `candidates` for `family`: one with a device of that kind,
+ * preferring the plain runtime for phone and tablet when several share a version
+ * (Xcode 27.2 installs `iOS-27-2` and the Duo's `iOS-27-2-iPhone19-4`, both 27.2).
+ */
+const runtimeFor = (family, candidates) => {
+  const withDevice = candidates.filter((runtime) => hasDevice(runtime, family));
+  const plain = withDevice.filter(isPlain);
+  return family !== "fold" && plain.length >= 1 && withDevice.length > 1
+    ? plain
+    : withDevice;
+};
 // Runtime/device-type compatibility is not interchangeable: the fold runtime
 // can reject phone and tablet types. Validate every requested family up front.
 const selected = requestedKinds.map((family) => {
-  const requestedRuntime = runtimeOverride || defaultRuntimes[family];
-  const matchingRuntimes = iosRuntimes.filter(
-    (runtime) =>
-      runtime.isAvailable === true &&
-      (runtime.identifier === requestedRuntime ||
-        runtime.version === requestedRuntime),
-  );
-  assert.equal(
-    matchingRuntimes.length,
-    1,
-    `Requested ${family} iOS Simulator runtime '${requestedRuntime}' must identify exactly one installed, available runtime. Install it in Xcode Settings > Components, or explicitly set TWR_IOS_RUNTIME to an installed iOS runtime identifier/version. Inspect: xcrun simctl list runtimes --json. No alternate runtime will be selected.`,
-  );
-  const runtime = matchingRuntimes[0];
+  let runtime;
+  if (runtimeOverride?.startsWith("com.apple.CoreSimulator.SimRuntime.")) {
+    // An explicit identifier is taken as it is, or the run fails.
+    runtime = usableRuntimes.find((r) => r.identifier === runtimeOverride);
+    assert(
+      runtime,
+      `TWR_IOS_RUNTIME '${runtimeOverride}' is not an installed, available runtime. Install it in Xcode Settings > Components. Inspect: xcrun simctl list runtimes --json. No alternate runtime will be selected.`,
+    );
+  } else {
+    const version = runtimeOverride || defaultRuntimes[family];
+    const matching = runtimeFor(
+      family,
+      usableRuntimes.filter((r) => r.version === version),
+    );
+    if (runtimeOverride)
+      assert.equal(
+        matching.length,
+        1,
+        `TWR_IOS_RUNTIME version '${runtimeOverride}' must identify exactly one installed, available runtime with a ${family} Simulator device. Set it to a runtime identifier instead, or install one in Xcode Settings > Components. Inspect: xcrun simctl list runtimes --json and xcrun simctl list devices available --json.`,
+      );
+    runtime = matching[0];
+    if (!runtime) {
+      // The default is not installed (Xcode installs only its own runtimes):
+      // the newest installed runtime with a device of this kind.
+      const newest = usableRuntimes
+        .filter((r) => hasDevice(r, family))
+        .sort(newestFirst)[0];
+      runtime =
+        newest &&
+        runtimeFor(
+          family,
+          usableRuntimes.filter((r) => r.version === newest.version),
+        )[0];
+      assert(
+        runtime,
+        `No installed iOS Simulator runtime has a ${family} device. Install one in Xcode Settings > Components. Inspect: xcrun simctl list runtimes --json and xcrun simctl list devices available --json.`,
+      );
+      console.log(
+        `iOS runtime ${version} for ${family} is not installed; using the newest installed runtime with a ${family} device: ${runtime.identifier} (${runtime.version}). Set TWR_IOS_RUNTIME to choose another.`,
+      );
+    }
+  }
   console.log(
     "IOS_SIMULATOR_RUNTIME_SELECTED",
     JSON.stringify({ kind: family, ...runtimeDescription(runtime) }),
@@ -647,6 +708,7 @@ for (const [
       stdio: "ignore",
     });
     await delay(250);
+    stopFixture(join(bin, "twr"), env);
     rmSync(fixture, { recursive: true, force: true });
   }
 }

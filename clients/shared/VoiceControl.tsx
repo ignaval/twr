@@ -3,7 +3,14 @@
 // transcript the hub handed back for confirmation. Recognition and playback stay on this
 // device; the text goes to the orchestrator through `say` with `voice: true`.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AudioLines, Mic, MicOff, Square, VolumeX } from "lucide-react";
+import {
+  AudioLines,
+  Download,
+  Mic,
+  MicOff,
+  Square,
+  VolumeX,
+} from "lucide-react";
 import type { DesktopAPI, Json } from "./types";
 import {
   VoiceSession,
@@ -70,6 +77,8 @@ export function VoiceControl(props: VoiceControlProps) {
     partial: "",
   });
   const [status, setStatus] = useState<VoiceCaptureStatus>();
+  /** Downloading the speech model (`twr voice setup`), or just done. */
+  const [setup, setSetup] = useState<"downloading" | "ready">();
   const [speakerInfo, setSpeakerInfo] = useState<
     SpeakerState & {
       running?: boolean;
@@ -194,11 +203,35 @@ export function VoiceControl(props: VoiceControlProps) {
       problem: String(error),
     }));
     setStatus(s);
+    setSetup((v) => (v === "ready" ? undefined : v));
     if (!s.available) return false;
+    if (session)
+      session.options = {
+        ...session.options,
+        listenWhileSpeaking: Boolean(s.listenWhileSpeaking),
+      };
     await host.voiceArm?.(true);
     return true;
-  }, [capture, host]);
+  }, [capture, host, session]);
   readyRef.current = ready;
+
+  const downloadModel = useCallback(async () => {
+    if (!host.voiceSetup) return;
+    setSetup("downloading");
+    try {
+      const s = await host.voiceSetup();
+      setStatus(s.available ? undefined : s);
+      setSetup(s.available ? "ready" : undefined);
+    } catch (error) {
+      setSetup(undefined);
+      setStatus({
+        available: false,
+        local: false,
+        setup: true,
+        problem: `The speech model did not download: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }, [host]);
 
   // The microphone is granted while something is recorded or a session listens, and taken
   // back once push to talk has sent (or dropped) its recording.
@@ -289,15 +322,34 @@ export function VoiceControl(props: VoiceControlProps) {
   };
 
   const label =
-    state.phase === "listening" && speakerInfo?.playing && !speakerInfo.paused
-      ? "Speaking · talk to interrupt"
-      : PHASES[state.phase];
+    state.phase === "listening" && state.deaf
+      ? "Speaking · listening again when it ends"
+      : state.phase === "listening" &&
+          speakerInfo?.playing &&
+          !speakerInfo.paused
+        ? "Speaking · talk to interrupt"
+        : PHASES[state.phase];
 
   return (
     <>
-      {(on || status?.problem || state.confirm) && (
+      {(on || status?.problem || state.confirm || setup) && (
         <div className="voice-bar" role="status" aria-live="polite">
-          {status && !status.available ? (
+          {setup === "downloading" ? (
+            <span className="voice-phase">
+              <Download size={14} /> Downloading the speech model (148 MB)…
+            </span>
+          ) : setup === "ready" && !on ? (
+            <span className="voice-phase">
+              <Mic size={14} /> Voice is ready: click the microphone to talk.
+            </span>
+          ) : status && !status.available && status.setup && host.voiceSetup ? (
+            <span className="voice-problem voice-setup">
+              <MicOff size={14} />
+              {status.problem?.startsWith("The speech model did not download")
+                ? status.problem
+                : "Voice needs a speech model: whisper’s base.en, 148 MB, downloaded once and kept on this computer."}
+            </span>
+          ) : status && !status.available ? (
             <span className="voice-problem">
               <MicOff size={14} /> {status.problem}
             </span>
@@ -348,8 +400,23 @@ export function VoiceControl(props: VoiceControlProps) {
               <Square size={12} /> Stop listening
             </button>
           )}
-          {!on && status?.problem && (
-            <button type="button" onClick={() => setStatus(undefined)}>
+          {!on &&
+            !setup &&
+            status?.setup &&
+            !status.available &&
+            host.voiceSetup && (
+              <button type="button" onClick={() => void downloadModel()}>
+                <Download size={14} /> Download model
+              </button>
+            )}
+          {!on && setup !== "downloading" && (status?.problem || setup) && (
+            <button
+              type="button"
+              onClick={() => {
+                setStatus(undefined);
+                setSetup(undefined);
+              }}
+            >
               Dismiss
             </button>
           )}

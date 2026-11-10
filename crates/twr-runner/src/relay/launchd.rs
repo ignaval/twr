@@ -23,7 +23,8 @@
 //!    created exclusively), bootstrapped (`launchctl bootstrap gui/<uid> <plist>`), and
 //!    removed (launchd keeps the job's definition), whatever happened. It holds the daemon's
 //!    command line and the part of the relay's environment the daemon needs ([`job_env`]: an
-//!    allowlist, so no secret is ever written there).
+//!    allowlist, a proxy's user name and password removed, so no secret is ever written
+//!    there).
 //! 4. A failed or timed-out bootstrap may still have loaded the job: it is inspected
 //!    ([`after_failed_bootstrap`]): loaded, the relay waits for the daemon; not loaded, it
 //!    falls back; when that can't be told, the job is booted out and must then be gone before
@@ -80,9 +81,12 @@ pub const CALLS_BUDGET: Duration = Duration::from_secs(
 );
 
 /// The variables of the relay's environment the job gets (a launchd job does not get the ssh
-/// session's environment): these, and those starting with [`ENV_PREFIXES`]. No other is ever
+/// session's environment): these, [`NETWORK_ENV`] (a proxy's without its credentials:
+/// [`without_credentials`]) and those starting with [`ENV_PREFIXES`]. No other is ever
 /// written into the plist, so an API key in the ssh session's environment does not reach a
-/// daemon launchd starts (on a Mac the agents use their keychain or file logins).
+/// daemon launchd starts (on a Mac the agents use their keychain or file logins). Each one
+/// says where something is, or how to reach the network: a location or a setting, never a
+/// credential, and none that loads code into a process (`LD_*`, `DYLD_*`, `NODE_OPTIONS`).
 const ENV_NAMES: &[&str] = &[
     "PATH",
     "HOME",
@@ -92,11 +96,54 @@ const ENV_NAMES: &[&str] = &[
     "LANG",
     "TMPDIR",
     "TZ",
+    // Where the toolchains and the agents' logins are: without these, a runner whose user
+    // moved them builds with another toolchain, and its agents find no login.
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GROK_HOME",
     twr_adapters::claude_code::BIN_ENV,
     twr_adapters::codex::BIN_ENV,
     twr_adapters::grok_build::BIN_ENV,
     crate::agents::BOX_PROBE_ENV,
     "TWR_AGENT_PROBE",
+];
+
+/// The variables that say how to reach the network, which a runner behind a proxy, or one
+/// that trusts a CA of its own, needs to reach the agents' APIs (and a native build, the
+/// crates it fetches): [`PROXY_NAMES`], the hosts reached without one, and the CA bundles.
+/// A service gets them ([`service_env`]), and so does a linked runner's native build.
+pub const NETWORK_ENV: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "CARGO_HTTP_CAINFO",
+];
+
+/// The variables of [`NETWORK_ENV`] that hold a proxy's URL, which may hold a user name and
+/// password (`http://user:pass@proxy:3128`): those are removed before the value goes on
+/// ([`without_credentials`]), so a service's environment (a plist, a transient unit) never
+/// holds a credential.
+pub const PROXY_NAMES: &[&str] = &[
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
 ];
 
 /// Prefixes of the variables the job gets too ([`ENV_NAMES`]): `LC_*`, `XDG_*`.
@@ -343,9 +390,92 @@ pub fn is_plist_of(name: &str, prefix: &str) -> bool {
         .is_some_and(|l| is_label_of(l, prefix))
 }
 
-/// Whether `name` is one of the variables the job gets ([`ENV_NAMES`], [`ENV_PREFIXES`]).
+/// The environment a long-lived service started on the user's behalf gets ([`service_env`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServiceEnv {
+    /// The variables it gets, sorted by name.
+    pub vars: Vec<(OsString, OsString)>,
+    /// The proxy variables whose user name and password were removed
+    /// ([`without_credentials`]), by name: each is worth a warning ([`credentials_note`]).
+    pub stripped: Vec<String>,
+}
+
+/// The variables of `vars` a long-lived service started on the user's behalf gets on every
+/// platform: those a launchd job gets ([`ENV_NAMES`], [`NETWORK_ENV`], [`ENV_PREFIXES`]), by
+/// name, whatever their value but a proxy's credentials ([`without_credentials`]). The
+/// linked-runner service is started with these only (launchd, `systemd-run` or a session of
+/// its own), so an API key in the environment of whichever process first started a hub never
+/// reaches the agents it runs for paired hubs.
+pub fn service_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> ServiceEnv {
+    let mut env = allowed(vars);
+    env.vars.sort();
+    env.vars.dedup_by(|a, b| a.0 == b.0);
+    env
+}
+
+/// [`service_env`] before it is sorted and a name given twice is taken once: in `vars`'
+/// order, every one, so [`job_env`] sees each value.
+fn allowed(vars: impl IntoIterator<Item = (OsString, OsString)>) -> ServiceEnv {
+    use std::os::unix::ffi::OsStringExt;
+    let mut kept = Vec::new();
+    let mut stripped = Vec::new();
+    for (name, value) in vars {
+        let Some(n) = name.to_str().filter(|n| passed_on(n)) else {
+            continue;
+        };
+        match without_credentials(n, value.as_encoded_bytes()) {
+            Some(clean) => {
+                stripped.push(n.to_string());
+                kept.push((name, OsString::from_vec(clean)));
+            }
+            None => kept.push((name, value)),
+        }
+    }
+    stripped.sort();
+    stripped.dedup();
+    ServiceEnv {
+        vars: kept,
+        stripped,
+    }
+}
+
+/// The value `value` of variable `name` without the user name and password it holds, when it
+/// is a proxy's URL ([`PROXY_NAMES`]) with them: what comes before the last `@` of its
+/// authority (the part after `scheme://`, or from its start without a scheme, up to the first
+/// `/`, `?` or `#`) is removed, so `http://me:secret@proxy:3128/` becomes
+/// `http://proxy:3128/`. `None` when there is nothing to remove (or `name` is no proxy's).
+pub fn without_credentials(name: &str, value: &[u8]) -> Option<Vec<u8>> {
+    if !PROXY_NAMES.contains(&name) {
+        return None;
+    }
+    let start = value
+        .windows(3)
+        .position(|w| w == b"://")
+        .map_or(0, |i| i + 3);
+    let rest = &value[start..];
+    let end = rest
+        .iter()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    let at = rest[..end].iter().rposition(|&b| b == b'@')?;
+    Some([&value[..start], &rest[at + 1..]].concat())
+}
+
+/// The warning when the proxy variable `name` held a user name or password, which a service
+/// does not get ([`without_credentials`]): it gets the proxy without them. Never the value.
+pub fn credentials_note(name: &str) -> String {
+    format!(
+        "twr-box: warning: {name} names a proxy with a user name or password: passed on without \
+         them (twr writes no credential into a service's environment); give the agents a proxy \
+         that needs them with the hub's `[threads] env`"
+    )
+}
+
+/// Whether `name` is one of the variables the job gets ([`ENV_NAMES`], [`NETWORK_ENV`],
+/// [`ENV_PREFIXES`]).
 fn passed_on(name: &str) -> bool {
     ENV_NAMES.contains(&name)
+        || NETWORK_ENV.contains(&name)
         || ENV_PREFIXES.iter().any(|p| {
             name.len() > p.len()
                 && name.starts_with(p)
@@ -389,26 +519,32 @@ pub struct JobEnv {
     pub vars: Vec<(String, String)>,
     /// Those left out because their value cannot be written in a plist, by name.
     pub skipped: Vec<String>,
+    /// The proxy variables whose user name and password were removed, by name
+    /// ([`ServiceEnv::stripped`]).
+    pub stripped: Vec<String>,
 }
 
-/// The job's environment from `vars` (the relay's): the variables [`passed_on`], sorted, and
-/// the names of those skipped because their value cannot be written in a plist (not UTF-8, or
-/// not [`representable`]). An error when that is so of one of [`ENV_REQUIRED`]. Never a value
-/// in a message.
+/// The job's environment from `vars` (the relay's): the variables a service gets
+/// ([`service_env`]: a proxy's without its credentials), sorted, and the names of those
+/// skipped because their value cannot be written in a plist (not UTF-8, or not
+/// [`representable`]). An error when that is so of one of [`ENV_REQUIRED`]. Never a value in
+/// a message.
 pub fn job_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> anyhow::Result<JobEnv> {
+    let ServiceEnv { vars, stripped } = allowed(vars);
     let mut kept = Vec::new();
     let mut skipped = Vec::new();
     for (name, value) in vars {
-        let Some(name) = name.to_str().filter(|n| passed_on(n)) else {
+        // `allowed` keeps UTF-8 names only.
+        let Ok(name) = name.into_string() else {
             continue;
         };
         match value.into_string() {
-            Ok(v) if representable(&v) => kept.push((name.to_string(), v)),
-            _ if ENV_REQUIRED.contains(&name) => bail!(
+            Ok(v) if representable(&v) => kept.push((name, v)),
+            _ if ENV_REQUIRED.contains(&name.as_str()) => bail!(
                 "the value of {name} can't be written in a launchd job's plist (it is not UTF-8 \
                  text, or holds a character XML can't)"
             ),
-            _ => skipped.push(name.to_string()),
+            _ => skipped.push(name),
         }
     }
     kept.sort();
@@ -418,6 +554,7 @@ pub fn job_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> anyhow::
     Ok(JobEnv {
         vars: kept,
         skipped,
+        stripped,
     })
 }
 
@@ -676,7 +813,14 @@ async fn submit(
     env: Vec<(OsString, OsString)>,
     note: &mut (dyn FnMut(&str) + Send),
 ) -> Result<(), Submit> {
-    let JobEnv { vars, skipped } = job_env(env).map_err(Submit::NotSubmitted)?;
+    let JobEnv {
+        vars,
+        skipped,
+        stripped,
+    } = job_env(env).map_err(Submit::NotSubmitted)?;
+    for name in stripped {
+        note(&credentials_note(&name));
+    }
     for name in skipped {
         note(&format!(
             "twr-box: not passing {name} on to the box daemon's launchd job: its value can't be \
@@ -816,6 +960,18 @@ mod tests {
                 ("TMPDIR", "/var/folders/x/T/"),
                 ("XPC_SERVICE_NAME", "0"),
                 ("INVOCATION_ID", "abc"),
+                ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
+                ("LD_PRELOAD", "/tmp/evil.so"),
+                ("NODE_OPTIONS", "--require /tmp/x.js"),
+                ("GITHUB_TOKEN", "ghp_x"),
+                ("HTTPS_PROXY", "http://me:hunter2@proxy.corp:3128"),
+                ("http_proxy", "http://proxy.corp:3128"),
+                ("NO_PROXY", "localhost,.corp"),
+                ("SSL_CERT_FILE", "/etc/corp-ca.pem"),
+                ("REQUESTS_CA_BUNDLE", "/etc/corp-ca.pem"),
+                ("CARGO_HOME", "/opt/cargo"),
+                ("CLAUDE_CONFIG_DIR", "/Users/u/.config/claude"),
+                ("CODEX_HOME", "/Users/u/.config/codex"),
             ]
             .into_iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
@@ -825,6 +981,7 @@ mod tests {
         let JobEnv {
             vars: kept,
             skipped,
+            stripped,
         } = job_env(vars(vec![
             ("LANG".into(), OsString::from_vec(b"en\xff".to_vec())),
             ("TZ".into(), "a\u{1}b".into()),
@@ -834,16 +991,35 @@ mod tests {
         assert_eq!(
             names,
             [
+                "CARGO_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "CODEX_HOME",
                 "HOME",
+                "HTTPS_PROXY",
                 "LC_ALL",
+                "NO_PROXY",
                 "PATH",
+                "REQUESTS_CA_BUNDLE",
+                "SSL_CERT_FILE",
                 "TMPDIR",
                 "TWR_BOX_PROBE",
                 "TWR_CLAUDE_BIN",
-                "XDG_DATA_HOME"
+                "XDG_DATA_HOME",
+                "http_proxy",
             ]
         );
         assert_eq!(skipped, ["LANG", "TZ"]);
+        // The proxy's credentials are gone, and only the variable is named.
+        assert_eq!(stripped, ["HTTPS_PROXY"]);
+        let value = |n: &str| kept.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str());
+        assert_eq!(value("HTTPS_PROXY"), Some("http://proxy.corp:3128"));
+        assert_eq!(value("http_proxy"), Some("http://proxy.corp:3128"));
+        assert!(!kept.iter().any(|(_, v)| v.contains("hunter2")));
+        let note = credentials_note("HTTPS_PROXY");
+        assert!(
+            note.contains("HTTPS_PROXY") && note.contains("[threads] env"),
+            "{note}"
+        );
         for bad in [
             ("PATH", OsString::from_vec(b"/bin\xff".to_vec())),
             ("HOME", OsString::from("/Users/\u{0}u")),
@@ -856,6 +1032,47 @@ mod tests {
                 "{e}"
             );
         }
+    }
+
+    /// A proxy URL loses its user name and password, whatever its scheme (or none), and keeps
+    /// its host, port and path; one without them, or a variable that is no proxy's, is left
+    /// as it is.
+    #[test]
+    fn a_proxys_credentials_are_removed() {
+        let strip = |name: &str, v: &str| {
+            without_credentials(name, v.as_bytes()).map(|b| String::from_utf8(b).unwrap())
+        };
+        for (from, to) in [
+            ("http://me:secret@proxy:3128", "http://proxy:3128"),
+            ("http://me:secret@proxy:3128/", "http://proxy:3128/"),
+            ("https://tok@proxy.corp", "https://proxy.corp"),
+            ("socks5h://a:b@[::1]:1080", "socks5h://[::1]:1080"),
+            ("me:p@ss@proxy:8080", "proxy:8080"),
+            (
+                "http://me:p%40ss@proxy:8080/x?y#z",
+                "http://proxy:8080/x?y#z",
+            ),
+        ] {
+            for name in PROXY_NAMES {
+                assert_eq!(strip(name, from).as_deref(), Some(to), "{name} {from}");
+            }
+        }
+        for clean in [
+            "http://proxy:3128",
+            "proxy:3128",
+            "",
+            "http://proxy/path@x",
+            "http://proxy?u=a@b",
+        ] {
+            assert_eq!(strip("HTTPS_PROXY", clean), None, "{clean}");
+        }
+        assert_eq!(strip("NO_PROXY", "me@host"), None);
+        assert_eq!(strip("PATH", "http://a:b@c"), None);
+        // Not UTF-8: still removed, the rest kept byte for byte.
+        assert_eq!(
+            without_credentials("ALL_PROXY", b"http://\xff:x@p\xfe:1"),
+            Some(b"http://p\xfe:1".to_vec())
+        );
     }
 
     /// The plist: every string escaped, the daemon's command line and environment, started at
@@ -989,6 +1206,21 @@ exit 1
             ("HOME".into(), "/Users/u".into()),
             ("ANTHROPIC_API_KEY".into(), "sk-secret".into()),
         ]
+    }
+
+    /// [`env`] with a proxy (its credentials in it), a CA bundle and a moved Claude login.
+    fn proxied_env() -> Vec<(OsString, OsString)> {
+        let mut env = env();
+        env.extend([
+            (
+                "HTTPS_PROXY".into(),
+                "http://me:hunter2@proxy.corp:3128".into(),
+            ),
+            ("NO_PROXY".into(), "localhost".into()),
+            ("SSL_CERT_FILE".into(), "/etc/corp-ca.pem".into()),
+            ("CLAUDE_CONFIG_DIR".into(), "/Users/u/.config/claude".into()),
+        ]);
+        env
     }
 
     /// Runs [`start`] with the fake `launchctl` of `dir`: its result and notes.
@@ -1161,6 +1393,53 @@ exit 1
         assert!(submitted.contains("<string>--box=gpu</string>"));
         assert!(submitted.contains("<key>PATH</key>"));
         assert!(!submitted.contains("sk-secret") && !submitted.contains("ANTHROPIC"));
+    }
+
+    /// The submitted plist holds the proxy without its credentials (with a note that names
+    /// the variable, never its value), the CA bundle and the moved Claude login, and still no
+    /// API key.
+    #[tokio::test]
+    async fn a_submitted_job_gets_the_network_without_credentials() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        std::fs::write(dir.join("gui"), "").unwrap();
+        std::fs::write(dir.join("bootstrap"), "ok").unwrap();
+        let o = opts(dir);
+        let mut notes = Vec::new();
+        let r = start(
+            &o,
+            &o.daemon_args(),
+            false,
+            &fake(dir),
+            proxied_env(),
+            &mut |l: &str| notes.push(l.to_string()),
+        )
+        .await;
+        assert!(r.unwrap(), "{notes:?}");
+        assert_eq!(notes, [credentials_note("HTTPS_PROXY")]);
+        let submitted = std::fs::read_to_string(dir.join("submitted")).unwrap();
+        for want in [
+            "<key>HTTPS_PROXY</key>\n\t\t<string>http://proxy.corp:3128</string>",
+            "<key>NO_PROXY</key>\n\t\t<string>localhost</string>",
+            "<key>SSL_CERT_FILE</key>\n\t\t<string>/etc/corp-ca.pem</string>",
+            "<key>CLAUDE_CONFIG_DIR</key>\n\t\t<string>/Users/u/.config/claude</string>",
+        ] {
+            assert!(submitted.contains(want), "{want}\nin\n{submitted}");
+        }
+        for never in ["hunter2", "me:", "sk-secret", "ANTHROPIC"] {
+            assert!(!submitted.contains(never), "{never}\nin\n{submitted}");
+            assert!(!notes[0].contains(never), "{never} in {notes:?}");
+        }
+        // On a Mac, the plist is one launchd reads.
+        let plutil = Path::new("/usr/bin/plutil");
+        if plutil.exists() {
+            let lint = std::process::Command::new(plutil)
+                .arg("-lint")
+                .arg(dir.join("submitted"))
+                .output()
+                .unwrap();
+            assert!(lint.status.success(), "{lint:?}");
+        }
     }
 
     /// The plist is created 0600 and exclusively: never over what is there.

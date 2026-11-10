@@ -10,6 +10,10 @@ use std::{
 };
 use tokio::sync::Mutex;
 
+/// Every push says only this: what changed is read from the hub once the app opens.
+const TITLE: &str = "twr";
+const BODY: &str = "Your agents have an update";
+
 #[derive(Default, Deserialize)]
 pub struct Config {
     pub apns: Option<Apns>,
@@ -40,6 +44,24 @@ pub struct Push {
     http: reqwest::Client,
     oauth: Mutex<Option<(u64, String)>>,
     apns_jwt: Mutex<Option<(u64, String)>>,
+}
+/// TLS for APNs and FCM: rustls with ring, trusting the Mozilla roots of `webpki-roots` and
+/// nothing from the system, offering HTTP/2 (APNs requires it) and HTTP/1.1. reqwest 0.13's
+/// own rustls setup verifies with the platform's verifier (and defaults to aws-lc-rs), so the
+/// configuration is built here.
+fn push_tls() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports TLS 1.2 and 1.3")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls
 }
 fn private_file(path: &Path) -> Result<Vec<u8>> {
     let meta = std::fs::symlink_metadata(path)?;
@@ -94,6 +116,7 @@ impl Push {
             path,
             test_log,
             http: reqwest::Client::builder()
+                .tls_backend_preconfigured(push_tls())
                 .timeout(std::time::Duration::from_secs(20))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
@@ -189,6 +212,7 @@ impl Push {
                 continue;
             }
             let data = json!({"gateway_id":self.gateway_id,"workspace":workspace,"event":kind,"key":auth::digest(&key),"count":due.len().to_string()});
+            let group = self.group(workspace);
             if let Some(path) = &self.test_log {
                 use std::io::Write;
                 let mut file = std::fs::OpenOptions::new()
@@ -200,16 +224,16 @@ impl Push {
                 writeln!(
                     file,
                     "{}",
-                    json!({"device":recipient.device,"data":data,"title":"twr","body":"Your agents have an update"})
+                    json!({"device":recipient.device,"data":data,"group":group,"title":TITLE,"body":BODY})
                 )?;
             }
             let result = match recipient.platform.as_str() {
                 "ios" => match &self.config.apns {
-                    Some(config) => self.apns(config, &recipient.token, &data).await,
+                    Some(config) => self.apns(config, &recipient.token, &data, &group).await,
                     None => Ok(true),
                 },
                 "android" => match &self.config.fcm_service_account {
-                    Some(path) => self.fcm(path, &recipient.token, &data).await,
+                    Some(path) => self.fcm(path, &recipient.token, &data, &group).await,
                     None => Ok(true),
                 },
                 _ => Ok(true),
@@ -227,7 +251,34 @@ impl Push {
         }
         Ok(())
     }
-    async fn apns(&self, config: &Apns, token: &str, data: &Value) -> Result<bool> {
+    /// One notification group per gateway and workspace, content free: a new push replaces
+    /// the one still shown (APNs `apns-collapse-id`, FCM `tag`) and groups with it
+    /// (`thread-id`). A hash, so it stays well under APNs' 64-byte collapse-id limit.
+    fn group(&self, workspace: &str) -> String {
+        let hash = auth::digest(&format!("{}\n{workspace}", self.gateway_id));
+        format!("twr-{}", &hash[..32])
+    }
+    fn apns_headers<'a>(config: &'a Apns, group: &'a str) -> [(&'static str, &'a str); 4] {
+        [
+            ("apns-topic", config.topic.as_str()),
+            ("apns-push-type", "alert"),
+            ("apns-priority", "10"),
+            ("apns-collapse-id", group),
+        ]
+    }
+    fn apns_payload(data: &Value, group: &str) -> Value {
+        json!({"aps":{"alert":{"title":TITLE,"body":BODY},"sound":"default","thread-id":group},"twr":data})
+    }
+    fn fcm_message(token: &str, data: &Value, group: &str) -> Value {
+        let values = data
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        json!({"message":{"token":token,"notification":{"title":TITLE,"body":BODY},"data":values,"android":{"priority":"high","notification":{"channel_id":"twr-attention","tag":group}}}})
+    }
+    async fn apns(&self, config: &Apns, token: &str, data: &Value, group: &str) -> Result<bool> {
         anyhow::ensure!(
             token.len() <= 256 && token.bytes().all(|b| b.is_ascii_hexdigit()),
             "Invalid APNs device token"
@@ -253,7 +304,18 @@ impl Push {
         } else {
             "api.push.apple.com"
         };
-        let response=self.http.post(format!("https://{host}/3/device/{token}")).version(reqwest::Version::HTTP_2).bearer_auth(jwt).header("apns-topic",&config.topic).header("apns-push-type","alert").header("apns-priority","10").json(&json!({"aps":{"alert":{"title":"twr","body":"Your agents have an update"},"sound":"default"},"twr":data})).send().await?;
+        let mut request = self
+            .http
+            .post(format!("https://{host}/3/device/{token}"))
+            .version(reqwest::Version::HTTP_2)
+            .bearer_auth(jwt);
+        for (name, value) in Self::apns_headers(config, group) {
+            request = request.header(name, value);
+        }
+        let response = request
+            .json(&Self::apns_payload(data, group))
+            .send()
+            .await?;
         if response.status() == reqwest::StatusCode::GONE {
             return Ok(false);
         }
@@ -264,7 +326,7 @@ impl Push {
         );
         Ok(true)
     }
-    async fn fcm(&self, path: &Path, token: &str, data: &Value) -> Result<bool> {
+    async fn fcm(&self, path: &Path, token: &str, data: &Value, group: &str) -> Result<bool> {
         let account: Value = serde_json::from_slice(&private_file(path)?)?;
         let project = account["project_id"]
             .as_str()
@@ -314,13 +376,15 @@ impl Push {
         }
         let access = oauth.as_ref().unwrap().1.clone();
         drop(oauth);
-        let values = data
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_owned()))
-            .collect::<std::collections::HashMap<_, _>>();
-        let response=self.http.post(format!("https://fcm.googleapis.com/v1/projects/{project}/messages:send")).bearer_auth(access).json(&json!({"message":{"token":token,"notification":{"title":"twr","body":"Your agents have an update"},"data":values,"android":{"priority":"high","notification":{"channel_id":"twr-attention"}}}})).send().await?;
+        let response = self
+            .http
+            .post(format!(
+                "https://fcm.googleapis.com/v1/projects/{project}/messages:send"
+            ))
+            .bearer_auth(access)
+            .json(&Self::fcm_message(token, data, group))
+            .send()
+            .await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(false);
         }
@@ -501,7 +565,53 @@ mod tests {
         let record: Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(record["data"]["event"], "digest");
         assert_eq!(record["data"]["count"], "2");
+        assert_eq!(record["group"], push.group("default"));
         assert!(!text.contains("private"));
         assert!(!text.contains("sensitive"));
+    }
+    #[test]
+    fn pushes_collapse_per_gateway_and_workspace_without_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let push = Push::new(dir.path(), None, None).unwrap();
+        let group = push.group("default");
+        // Stable across gateway restarts, distinct per workspace and per gateway.
+        assert_eq!(
+            Push::new(dir.path(), None, None).unwrap().group("default"),
+            group
+        );
+        assert_ne!(push.group("other"), group);
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert_ne!(
+            Push::new(elsewhere.path(), None, None)
+                .unwrap()
+                .group("default"),
+            group
+        );
+        assert!(group.len() <= 64 && group.starts_with("twr-"));
+        assert!(!group.contains("default") && !group.contains(&push.gateway_id));
+        let config = Apns {
+            key_file: "/unused".into(),
+            key_id: "key".into(),
+            team_id: "team".into(),
+            topic: "tools.twr.mobile.dev".into(),
+            sandbox: true,
+        };
+        let headers = Push::apns_headers(&config, &group);
+        assert!(headers.contains(&("apns-collapse-id", group.as_str())));
+        assert!(headers.contains(&("apns-topic", "tools.twr.mobile.dev")));
+        let data = json!({"gateway_id":push.gateway_id,"workspace":"default","event":"question","key":"k","count":"1"});
+        let payload = Push::apns_payload(&data, &group);
+        assert_eq!(payload["aps"]["thread-id"], group.as_str());
+        assert_eq!(payload["aps"]["alert"]["body"], BODY);
+        let message = Push::fcm_message("token", &data, &group);
+        assert_eq!(
+            message["message"]["android"]["notification"]["tag"],
+            group.as_str()
+        );
+        assert_eq!(
+            message["message"]["android"]["notification"]["channel_id"],
+            "twr-attention"
+        );
+        assert_eq!(message["message"]["data"]["count"], "1");
     }
 }

@@ -992,7 +992,7 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, dialed: bool) {
                     } else {
                         format!(
                             "on the box: {}, then restart its runner ({})",
-                            super::token::update_hint(&hub.version),
+                            super::token::update_hint(&hub.version, b["version"].as_str()),
                             super::token::restart_hint(name)
                         )
                     }),
@@ -2975,7 +2975,18 @@ mod tests {
             c[1].fix
                 .as_deref()
                 .unwrap()
-                .contains("on the box: twr 0.2.0 (`twr update --version v0.2.0`"),
+                .contains("on the box: twr 0.2.0 (`twr update --version v0.2.0` there, or"),
+            "{c:?}"
+        );
+        // A box newer than the hub: bringing it to the hub's version is a downgrade.
+        let c =
+            view(json!({"name": "lab", "state": "online", "version": "0.3.0", "refused": null}));
+        assert_eq!(c[1].result, Mark::Warn);
+        assert!(
+            c[1].fix.as_deref().unwrap().contains(
+                "on the box: twr 0.2.0 (`twr update --version v0.2.0 --allow-downgrade` there, \
+                 since the box's twr 0.3.0 is newer"
+            ),
             "{c:?}"
         );
 

@@ -11,17 +11,27 @@ import { Dialog as NativeDialog } from "@capacitor/dialog";
 import { App as NativeApp } from "@capacitor/app";
 import App from "../../shared/App";
 import { Dialog } from "../../shared/ui";
+import { ErrorBoundary } from "../../shared/ErrorBoundary";
 import {
   EditorSessionsProvider,
   useEditorSessions,
 } from "../../shared/editors";
-import { RemoteHost, Transport, type Hub } from "./transport";
+import { RemoteHost, Transport, sweepExports, type Hub } from "./transport";
+import {
+  autoConnectTarget,
+  forgetLastHub,
+  linkState,
+  readLastHub,
+  rememberLastHub,
+  type LinkState,
+} from "./connection";
 import { mobileVoice } from "./voice";
 import { observeLayout } from "./layout";
 import { observeTextScale, secureDelete } from "./offline";
 import { parseInvitation } from "../../shared/connections";
 import {
   notificationListeners,
+  clearDeliveredNotifications,
   testNotification,
   enablePush,
   disablePush,
@@ -60,6 +70,7 @@ function Mobile() {
     return () => clearInterval(timer);
   }, [pairing, scanned?.expiresAt]);
   const [hubSheet, setHubSheet] = useState(false);
+  const [link, setLink] = useState<LinkState>("reconnecting");
   const [notice, setNotice] = useState("");
   const [folder, setFolder] = useState<{
     path: string;
@@ -82,15 +93,36 @@ function Mobile() {
   const [readyHubId, setReadyHubId] = useState<string>();
   const [pendingNotification, setPendingNotification] =
     useState<Record<string, string>>();
+  const autoConnectTried = useRef(false);
   async function load() {
     try {
-      setHubs((await Transport.listHubs()).hubs);
+      const { hubs, notice } = await Transport.listHubs();
+      setHubs(hubs);
+      if (notice) setError(notice);
+      return hubs;
     } catch (e) {
       setError(errorMessage(e));
+      return undefined;
     }
   }
   useEffect(() => {
-    void load();
+    void load().then((hubs) => {
+      // Cold launch: back to the hub used last, once. Unreachable, it opens with its
+      // saved history like a tap on Connect; a failure leaves the hub list and its error.
+      const target = autoConnectTarget(
+        hubs || [],
+        readLastHub(),
+        autoConnectTried.current,
+      );
+      autoConnectTried.current = true;
+      if (target)
+        void queueSwitch(() =>
+          // A notification tap may have chosen a hub meanwhile.
+          activeHub.current ? Promise.resolve(false) : connectNow(target),
+        );
+    });
+    // Exports a previous run left behind (the app was killed while sharing).
+    void sweepExports();
     return () => {
       void host.current?.stop();
     };
@@ -170,7 +202,9 @@ function Mobile() {
     return () => window.removeEventListener("twr:select-host", navigate);
   }, []);
   useEffect(() => {
+    void clearDeliveredNotifications();
     const listener = NativeApp.addListener("appStateChange", ({ isActive }) => {
+      if (isActive) void clearDeliveredNotifications();
       if (host.current) {
         host.current.setForeground(isActive);
         if (isActive) {
@@ -200,7 +234,9 @@ function Mobile() {
       void listener.then((handle) => handle.remove());
     };
   }, []);
+  /** An explicit disconnect (Switch hub): the next launch opens the hub list. */
   async function disconnect() {
+    rememberLastHub(undefined);
     return queueSwitch(disconnectNow);
   }
   async function disconnectNow() {
@@ -223,10 +259,12 @@ function Mobile() {
   }
   async function forgetLocal(hub: Hub) {
     await forgetOfflineHost(hub.id, { secureDelete });
+    await sweepExports();
     await Transport.removeHub({ id: hub.id });
     editors.forget(hub.id);
     localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
     localStorage.removeItem(pushPreferenceKey(hub.id));
+    forgetLastHub(hub.id);
   }
   async function forget(hub: Hub) {
     return queueSwitch(() => forgetNow(hub));
@@ -293,9 +331,23 @@ function Mobile() {
       );
       await remote.start();
       host.current = remote;
-      const api = remote.api();
-      // Voice mode where the app has the native recognizer and voice (docs/mobile.md).
       const started = remote;
+      // The gateway registers push per device and workspace: refresh after the
+      // first connection, every in-app workspace switch and every reconnect.
+      started.onWorkspaceConnected(() => {
+        if (host.current === started) setLink("online");
+        if (host.current === started && activeHub.current?.id === hub.id)
+          void refreshPush(started, hub.id).catch((error) => {
+            if (host.current === started) setNotice(errorMessage(error));
+          });
+      });
+      const api = remote.api();
+      setLink(started.socketConnected ? "online" : "reconnecting");
+      api.onEvent((event) => {
+        if (event.type !== "connection" || host.current !== started) return;
+        setLink(linkState(!!event.connected, started.revoked, event.error));
+      });
+      // Voice mode where the app has the native recognizer and voice (docs/mobile.md).
       voice.current = mobileVoice({
         request: (method, params, timeout) =>
           started.request(method, params, timeout),
@@ -307,6 +359,7 @@ function Mobile() {
       document.documentElement.dataset.hub = hub.id;
       activeHub.current = hub;
       setActive(hub);
+      rememberLastHub(hub.id);
       return true;
     } catch (e) {
       await remote?.stop().catch(() => {});
@@ -357,20 +410,13 @@ function Mobile() {
           <button
             className="mobile-hub-switch"
             onClick={() => setHubSheet(true)}
-            aria-label={`Remote hub settings: ${active.name}`}
+            aria-label={`Remote hub settings: ${active.name}${link === "online" ? "" : ` (${link})`}`}
           >
-            <span className="status-dot online" aria-hidden="true" />
+            <span className={`status-dot ${link}`} aria-hidden="true" />
             <span className="mobile-hub-name">{active.name}</span>
           </button>
         }
-        onReady={() => {
-          setReadyHubId(active.id);
-          const remote = host.current;
-          if (remote && activeHub.current?.id === active.id)
-            void refreshPush(remote, active.id).catch((error) =>
-              setNotice(errorMessage(error)),
-            );
-        }}
+        onReady={() => setReadyHubId(active.id)}
       />
 
       {hubSheet && (
@@ -705,7 +751,9 @@ initializeAppearance();
 const stopAppearance = observeNativeAppearance();
 import.meta.hot?.dispose(stopAppearance);
 createRoot(document.getElementById("root")!).render(
-  <EditorSessionsProvider>
-    <Mobile />
-  </EditorSessionsProvider>,
+  <ErrorBoundary>
+    <EditorSessionsProvider>
+      <Mobile />
+    </EditorSessionsProvider>
+  </ErrorBoundary>,
 );

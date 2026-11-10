@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import App from "../shared/App";
 import "../shared/style.css";
 import { EditorSessionsProvider } from "../shared/editors";
+import { ErrorBoundary } from "../shared/ErrorBoundary";
 import { RemoteHost, type Hub } from "../shared/remote";
 import type { DesktopAPI } from "../shared/types";
 import type {} from "../shared/connections";
@@ -172,6 +173,7 @@ function Desktop() {
                       "menu-palette",
                       "menu-attention",
                       "menu-settings",
+                      "inbox-poll",
                       "theme",
                     ].includes(event.type)
                   )
@@ -370,7 +372,9 @@ function Desktop() {
   );
 }
 createRoot(document.getElementById("root")!).render(
-  <EditorSessionsProvider>
-    <Desktop />
-  </EditorSessionsProvider>,
+  <ErrorBoundary>
+    <EditorSessionsProvider>
+      <Desktop />
+    </EditorSessionsProvider>
+  </ErrorBoundary>,
 );

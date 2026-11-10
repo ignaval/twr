@@ -54,6 +54,19 @@ export function AppOptions() {
           onChange={(value) => change(() => app.setTray(value))}
         />
         <Toggle
+          label="Notify me of new requests"
+          detail={
+            settings.notifications.supported
+              ? "A permission or question in any workspace, while twr isn't in front. Notifications name the thread and workspace, never what is asked."
+              : "This system doesn't support notifications."
+          }
+          checked={
+            settings.notifications.enabled && settings.notifications.supported
+          }
+          disabled={!settings.notifications.supported}
+          onChange={(value) => change(() => app.setNotifications(value))}
+        />
+        <Toggle
           label="Keep running when the window is closed"
           detail={
             linux && !(settings.tray.enabled && settings.tray.available)

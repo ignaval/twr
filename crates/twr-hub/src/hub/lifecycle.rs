@@ -93,6 +93,18 @@ impl Hub {
         )
         .unwrap_or(chrono::Duration::MAX);
         twr_core::trace::mark("hub: log replayed");
+        // Before any runner connects: watermarks of threads the hub keeps none of go
+        // (`Core::sweep_runner_acks`). A failure leaves them, as they were.
+        match core.sweep_runner_acks() {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                watermarks = n,
+                "forgot runner watermarks of threads the log does not keep"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot forget stale runner watermarks")
+            }
+        }
         let intents = core.store.spawn_intents()?;
         let cap = opts.broadcast_capacity.max(1);
         let (control_tx, _) = broadcast::channel(cap);
@@ -665,7 +677,7 @@ impl Core {
             seqs: HashMap::new(),
             last_ts: HashMap::new(),
             gseq,
-            known_attn: HashSet::new(),
+            known_attn: std::collections::BTreeSet::new(),
             adapter_attn: HashMap::new(),
             rt: HashMap::new(),
             generation: 0,
@@ -677,6 +689,7 @@ impl Core {
             compact_rows: Default::default(),
             task_progress: coalesce::TaskProgress::default(),
             persist_retries: 0,
+            retry_reads: Default::default(),
             orch: orch::OrchState::default(),
             hub_questions: HashMap::new(),
             hub_cards: HashMap::new(),

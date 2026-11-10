@@ -16,6 +16,8 @@ export const MAX_RECORDING = 16000 * 2 * 120 + 4096;
  */
 const TRANSCRIBE_TIMEOUT = 630_000;
 const STOP_GRACE = 5_000;
+/** `twr voice setup` downloads 148 MB: generous for a slow connection. */
+const SETUP_TIMEOUT = 30 * 60_000;
 
 export const recordingSchema = z
   .instanceof(Uint8Array)
@@ -108,6 +110,8 @@ export interface SpeakerEvent {
 
 export class DesktopVoice {
   private speaker?: ChildProcessWithoutNullStreams;
+  /** The download under way: a second click waits for it rather than starting another. */
+  private setupRun?: Promise<unknown>;
   /** What it plays per workspace: the state shown is all of them together. */
   private workspaces = new Map<
     string,
@@ -143,7 +147,30 @@ export class DesktopVoice {
       local: Boolean(value.local),
       engine: typeof value.engine === "string" ? value.engine : undefined,
       problem: typeof value.problem === "string" ? value.problem : undefined,
+      setup: value.setup === true,
+      // `[voice]`'s listening settings; an older `twr` says none, and the defaults hold.
+      pauseMs: typeof value.pause_ms === "number" ? value.pause_ms : undefined,
+      listenWhileSpeaking: value.listen_while_speaking === true,
     };
+  }
+
+  /** Downloads the default model (`twr voice setup`), then says what is there now. */
+  async setup() {
+    this.setupRun ??= runWithInput(
+      this.twr(),
+      ["voice", "setup"],
+      undefined,
+      this.env(),
+      SETUP_TIMEOUT,
+    )
+      .then((run) => {
+        if (run.code !== 0) throw new Error(cliError(run));
+      })
+      .finally(() => {
+        this.setupRun = undefined;
+      });
+    await this.setupRun;
+    return this.status();
   }
 
   async transcribe(recording: unknown, hint: unknown) {

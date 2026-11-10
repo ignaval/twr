@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { coalesceInboxSources, localInboxSources } from "../desktop/inbox";
+import {
+  coalesceInboxSources,
+  localInboxSources,
+  WorkspaceListing,
+} from "../desktop/inbox";
 import type { InboxSource } from "../shared/types";
 afterEach(() => vi.useRealTimers());
 const summary = (workspace: string): InboxSource => ({
@@ -162,5 +166,29 @@ describe("inbox refresh coalescing", () => {
     await expect(first).rejects.toThrow("listing failed");
     await expect(refresh()).resolves.toEqual([]);
     expect(read).toHaveBeenCalledTimes(2);
+  });
+});
+describe("workspace listing", () => {
+  it("gives the listing one overall budget and falls back to the last good list", async () => {
+    const list = vi
+      .fn<(timeout: number) => Promise<unknown>>()
+      .mockResolvedValueOnce({ workspaces: [{ name: "default" }, "other"] })
+      .mockRejectedValueOnce(new Error("Command timed out after 5000 ms"))
+      .mockResolvedValueOnce("garbage")
+      .mockResolvedValueOnce(["default"]);
+    const listing = new WorkspaceListing(list, 5000);
+    expect(await listing.get()).toEqual([{ name: "default" }, "other"]);
+    expect(list).toHaveBeenLastCalledWith(5000);
+    // A slow hub or a bad answer keeps the previous list.
+    expect(await listing.get()).toEqual([{ name: "default" }, "other"]);
+    expect(await listing.get()).toEqual([{ name: "default" }, "other"]);
+    expect(await listing.get()).toEqual(["default"]);
+  });
+
+  it("reports a failure when no listing has worked yet", async () => {
+    const listing = new WorkspaceListing(async () => {
+      throw new Error("Command timed out");
+    });
+    await expect(listing.get()).rejects.toThrow("Command timed out");
   });
 });

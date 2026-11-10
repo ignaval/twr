@@ -195,6 +195,24 @@ export function foldRoutineBlocks(
     ];
   });
 }
+/** A message's time: the time alone today, with the day before that, and with the year
+ * for another year's messages. */
+export function messageTime(ts: string, now = new Date()): string {
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return "";
+  const time: Intl.DateTimeFormatOptions = {
+    hour: "2-digit",
+    minute: "2-digit",
+  };
+  if (date.toDateString() === now.toDateString())
+    return date.toLocaleTimeString([], time);
+  return date.toLocaleString([], {
+    ...time,
+    month: "short",
+    day: "numeric",
+    ...(date.getFullYear() === now.getFullYear() ? {} : { year: "numeric" }),
+  });
+}
 export function mergeEvents(
   current: HubEvent[],
   incoming: HubEvent[],

@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from "node:child_process";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { expect } from "@playwright/test";
@@ -170,18 +171,15 @@ export async function multiHubQA({
     });
     for (let i = 0; i < 100 && !existsSync(join(home, "ws", "work.sock")); i++)
       await new Promise((r) => setTimeout(r, 100));
-    await expect
-      .poll(
-        () => page.locator('#workspace-select option[value="work"]').count(),
-        { timeout: 15000 },
-      )
-      .toBe(1);
+    // The sidebar lists every workspace, re-read every 15 s while it shows.
     const showSidebar = page.getByRole("button", {
       name: "Show sidebar",
       exact: true,
     });
     if (await showSidebar.isVisible()) await showSidebar.click();
-    await page.locator("#workspace-select").selectOption("work");
+    const work = page.locator('.workspace-entry[data-workspace="work"]');
+    await expect(work).toHaveCount(1, { timeout: 40000 });
+    await work.locator(".workspace-orchestrator").click();
     await expect
       .poll(() =>
         page.evaluate(async () => {
@@ -287,5 +285,8 @@ export async function multiHubQA({
     gateway?.kill();
     hub?.kill();
     workHub?.kill();
+    stopFixture(join(bin, "twr"), remoteEnv, {
+      workspaces: ["default", "work"],
+    });
   }
 }

@@ -1,5 +1,6 @@
 // Real gateway lifecycle and read-only pairing against an isolated debug hub.
 import { spawn, execFile, execFileSync } from "node:child_process";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { promisify } from "node:util";
 import {
   mkdtempSync,
@@ -317,5 +318,6 @@ try {
   gateway?.kill();
   hub.kill();
   await delay();
+  stopFixture(join(bin, "twr"), env);
   rmSync(home, { recursive: true, force: true });
 }

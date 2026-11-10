@@ -149,8 +149,23 @@ jobs:
           [ -n "$channel" ] || { echo "::error::no channel in rust-toolchain.toml"; exit 1; }
           rustup toolchain install "$channel" --profile minimal --no-self-update
           rustc --version
-      - name: Install cargo-deny
-        run: cargo install --locked cargo-deny@0.20.2
+      - name: Install cargo-deny (release binary, checksum pinned)
+        run: |
+          # The sha256 is the one in the release's cargo-deny-<version>-<host>.tar.gz.sha256.
+          version=0.20.2
+          sha256=9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+          if [ "$(uname -m)" != x86_64 ]; then
+            echo "::error::the pinned cargo-deny is for x86_64 Linux, this runner is $(uname -m)"
+            exit 1
+          fi
+          name="cargo-deny-$version-x86_64-unknown-linux-musl"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$version/$name.tar.gz"
+          echo "$sha256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name/cargo-deny"
+          mkdir -p "$RUNNER_TEMP/tools"
+          mv "$RUNNER_TEMP/$name/cargo-deny" "$RUNNER_TEMP/tools/"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
       - run: cargo deny check
 
   actionlint:
@@ -181,6 +196,34 @@ jobs:
           # Ubuntu runners have it.
           command -v shellcheck > /dev/null || { echo "::error::no shellcheck on this runner"; exit 1; }
           "$RUNNER_TEMP/actionlint" -color
+
+  clients:
+    # The desktop and mobile apps' TypeScript (clients/), on every push and pull request:
+    # desktop.yml and mobile.yml build the apps only when their paths change, and are not
+    # required checks. `catalog:check` needs a built twr, so it stays in desktop.yml.
+    name: clients (typecheck, tests, format, audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: clients
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      - run: npm run format:check
+      # Known advisories of high or critical severity, in the whole tree: Electron and the
+      # Capacitor runtime ship in the apps but are devDependencies (electron-builder and
+      # Capacitor want them there), so `--omit=dev` would skip them.
+      - run: npm audit --audit-level=high
 
   real-systemd:
     # The rest of the suite replaces systemd-run and systemctl with stand-ins
@@ -363,8 +406,34 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: python3 -I .github/scripts/test-token-check.py --twr "target/$TARGET/release/twr" --expect refuse
 
-      - name: Install cargo-about
-        run: cargo install --locked --features cli cargo-about@0.9.2
+      - name: Install cargo-about (release binary, checksum pinned)
+        shell: bash
+        run: |
+          # The sha256s are those in the release's cargo-about-<version>-<host>.tar.gz.sha256.
+          version=0.9.2
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64)
+              host=x86_64-unknown-linux-musl
+              sha256=9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
+              ;;
+            Darwin-arm64)
+              host=aarch64-apple-darwin
+              sha256=ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e
+              ;;
+            *) echo "::error::no pinned cargo-about for $(uname -s) $(uname -m)"; exit 1 ;;
+          esac
+          name="cargo-about-$version-$host"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/$version/$name.tar.gz"
+          if command -v sha256sum > /dev/null; then
+            echo "$sha256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
+          else
+            echo "$sha256  $RUNNER_TEMP/$name.tar.gz" | shasum -a 256 -c -
+          fi
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name/cargo-about"
+          mkdir -p "$RUNNER_TEMP/tools"
+          mv "$RUNNER_TEMP/$name/cargo-about" "$RUNNER_TEMP/tools/"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
 
       - name: Write the third-party licences
         run: cargo about generate --locked --fail -o THIRD-PARTY-LICENSES.html about.hbs

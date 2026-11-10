@@ -361,6 +361,17 @@ impl Core {
         let mut answer = answer_of(response, &item, attn_id)?;
         if let (Some(card), false) = (&card, dismiss) {
             if self.confirms(&item, &answer.decision)? {
+                // A card that changes a mode or moves a thread is confirmed from a device only
+                // with `admin` (`hub::device_scope`): refused before anything is applied, so
+                // it stays open for the user at the hub or a device that has it.
+                if card.changes_settings() {
+                    hub.require_scope(
+                        caller,
+                        "confirm a card that changes a permission mode or moves a thread to \
+                         another runtime",
+                        "admin",
+                    )?;
+                }
                 return self
                     .confirm_card(hub, &item, card, caller)
                     .map(|ev| Relay::Applied(Box::new(ev)));

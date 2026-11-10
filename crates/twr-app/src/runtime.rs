@@ -73,6 +73,12 @@ async fn probe(socket: &Path, deadline: tokio::time::Instant) -> Result<Probe> {
     }
 }
 
+/// On macOS a process inherits its parent's exception ports, and the desktop app's are those of
+/// its crash reporter (Crashpad): the binaries the app runs call this first, so what they start
+/// uses the system's crash reporting (`twr_adapters::process::forget_inherited_crash_handler`,
+/// which every `twr` calls too). Elsewhere it does nothing.
+pub use twr_link::forget_inherited_crash_handler;
+
 fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     anyhow::ensure!(

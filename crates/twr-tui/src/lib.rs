@@ -31,6 +31,8 @@ pub mod md;
 pub mod notify;
 pub mod order;
 pub mod queue;
+#[cfg(test)]
+mod reconnect_tests;
 pub mod select;
 pub mod settings;
 pub mod shell;
@@ -438,7 +440,7 @@ pub fn transient_status(method: &str, result: &Value) -> bool {
 /// orchestrator that cannot run, which says what to do from the TUI.
 pub fn error_status(method: &str, error: &str) -> String {
     if method == "say" && error.contains("no orchestrator is available") {
-        return "no orchestrator can run: nothing was sent. Switch it with o or /orch".into();
+        return "no orchestrator can run: nothing was sent. Switch it with /orch".into();
     }
     format!("{method}: {error}")
 }
@@ -772,6 +774,21 @@ const ACTIVITY_EVERY: Duration = Duration::from_secs(2);
 /// [`speech`]): the status bar's note and the conversation's `▶` follow it.
 pub const SPEECH_EVERY: Duration = Duration::from_secs(2);
 
+/// How often [`ACTIVITY_EVERY`]'s and [`SPEECH_EVERY`]'s polls ask while the terminal has no
+/// focus (it said so: [`notify::Notifier::unfocused`]): what they show matters less, and an
+/// idle TUI in a background tab need not wake the hub every two seconds.
+const UNFOCUSED_EVERY: Duration = Duration::from_secs(10);
+
+/// When a poll that asks every `every` asks next: [`UNFOCUSED_EVERY`] from now at the soonest
+/// while the terminal has no focus.
+fn next_poll(every: Duration, unfocused: bool) -> tokio::time::Instant {
+    let every = match unfocused {
+        true => every.max(UNFOCUSED_EVERY),
+        false => every,
+    };
+    tokio::time::Instant::now() + every
+}
+
 /// How long quitting waits for the input history's last lines to be written.
 const HISTORY_FLUSH: Duration = Duration::from_secs(2);
 
@@ -898,17 +915,44 @@ fn on_path(program: &str) -> bool {
 /// needs `set -g set-clipboard on`), and, when the session has a local clipboard command
 /// ([`select::clipboard_command`]), pipes it there on a task of its own, killed after
 /// [`CLIPBOARD_TIMEOUT`]. A failing command is reported on `status`.
-fn copy_text(text: String, status: StatusOut) {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = out
-        .write_all(select::osc52(&text).as_bytes())
-        .and_then(|()| out.flush());
-    let Some((program, args)) = select::clipboard_command(
+///
+/// OSC 52 is written on a thread of its own, holding [`TERMINAL_OUT`]: the loop draws no frame
+/// meanwhile (a frame's bytes inside the sequence would spoil both) and is told on `written`
+/// when it may again. A text over [`select::OSC52_MAX`] is not sent that way at all: terminals
+/// and tmux drop such a sequence without a word, so the status bar says so instead.
+fn copy_text(text: String, status: StatusOut, written: mpsc::UnboundedSender<()>) {
+    let local = select::clipboard_command(
         |k| std::env::var(k).ok(),
         on_path,
         cfg!(target_os = "macos"),
-    ) else {
+    );
+    if text.len() > select::OSC52_MAX {
+        status.send((
+            select::too_large(&text, local.map(|(program, _)| program)),
+            false,
+        ));
+    } else {
+        let sequence = select::osc52(&text);
+        let spawned = std::thread::Builder::new()
+            .name("twr-clipboard".into())
+            .spawn(move || {
+                use std::io::Write;
+                let held = terminal_out();
+                let mut out = std::io::stdout();
+                let _ = out
+                    .write_all(sequence.as_bytes())
+                    .and_then(|()| out.flush());
+                drop(held);
+                let _ = written.send(());
+            });
+        if spawned.is_err() {
+            status.send((
+                "copying: could not start the clipboard writer".into(),
+                false,
+            ));
+        }
+    }
+    let Some((program, args)) = local else {
         return;
     };
     tokio::spawn(async move {
@@ -938,6 +982,26 @@ fn copy_text(text: String, status: StatusOut) {
         };
         status.send((format!("copying with {program}: {why}"), false));
     });
+}
+
+/// Held while something other than a frame writes to the terminal (an OSC 52 copy, a
+/// notification), and while a frame is drawn: neither lands inside the other's bytes.
+static TERMINAL_OUT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// [`TERMINAL_OUT`], waited for.
+fn terminal_out() -> std::sync::MutexGuard<'static, ()> {
+    TERMINAL_OUT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`TERMINAL_OUT`] if nothing holds it (`None`: a copy is being written: the frame waits).
+fn terminal_out_now() -> Option<std::sync::MutexGuard<'static, ()>> {
+    match TERMINAL_OUT.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 /// A status-bar line from a task off the input loop, and whether it is transient (what a
@@ -1313,7 +1377,8 @@ fn handle_terminal_event(
 
     // Discard input until the replayed state has actually been shown. Buffering a command
     // or its confirmation would let it run later without the user seeing what it answers.
-    // Only quitting works: Ctrl-C (a typed `q` is a letter).
+    // Only quitting works: Ctrl-C (a typed `q` is a letter); with a draft kept from an earlier
+    // view of the workspace, the first one clears it into the history, as it does once drawn.
     if !has_drawn || state.catch_up.is_some() {
         return match event {
             TermEvent::Key(k)
@@ -1321,7 +1386,10 @@ fn handle_terminal_event(
                     && k.code == KeyCode::Char('c')
                     && k.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                vec![Action::Quit]
+                match state.clear_draft() {
+                    true => Vec::new(),
+                    false => vec![Action::Quit],
+                }
             }
             _ => Vec::new(),
         };
@@ -1345,8 +1413,9 @@ fn handle_terminal_event(
 /// A terminal event and when the input thread read it.
 type Stamped = (std::time::Instant, std::io::Result<TermEvent>);
 
-/// How long the input thread waits for an event before it checks whether to stop.
-const INPUT_POLL: Duration = Duration::from_millis(50);
+/// How long the input thread waits for an event before it checks whether to stop. Only
+/// stopping waits on it: an event is read as soon as it comes, whatever this is.
+const INPUT_POLL: Duration = Duration::from_millis(250);
 
 /// The terminal's reader: a thread of its own, the only reader, handing each event over with
 /// the time it was read. Whether a key was typed ahead of the first frame goes by that time,
@@ -2325,6 +2394,91 @@ enum End {
         tabs: Vec<workspace::Tab>,
         mouse: bool,
     },
+    /// The hub's streams ended and a hub on the same socket is connected again (`next`: the
+    /// hub was stopped and started, or updated): shown as a switch back to the same workspace
+    /// is, from its replay, with the view kept.
+    Reconnect {
+        next: Box<Session>,
+        view: Box<workspace::SavedView>,
+        tabs: Vec<workspace::Tab>,
+        mouse: bool,
+    },
+}
+
+/// What the band says while the TUI connects to its hub again ([`spawn_reconnect`]).
+pub const HUB_LOST: &str = "hub connection lost — reconnecting";
+
+/// What the band says when the hub that answered refuses this TUI.
+pub const HUB_REFUSES: &str =
+    "the hub refuses this TUI (it is newer than this twr): quit and start twr again";
+
+/// The first wait before connecting again, doubled after each try up to [`RECONNECT_MAX`].
+const RECONNECT_FIRST: Duration = Duration::from_millis(250);
+/// The longest wait between two tries to connect again.
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
+
+/// How a try to connect to the hub again went ([`spawn_reconnect`]).
+enum Reconnected {
+    /// Connected and subscribed: the view starts again on it.
+    Connected(Box<Session>),
+    /// Not yet (the `tries`-th try failed, `why`): tried again later.
+    Trying { tries: u32, why: String },
+    /// The hub answered but refuses this TUI's version: no more tries.
+    Refused(String),
+}
+
+/// Whether `e`, connecting, is the hub refusing this TUI: its `hello` answered `unsupported`
+/// (a client older than the hub, [`twr_core::proto::codes::UNSUPPORTED`]).
+fn refuses_this_tui(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<twr_core::proto::RpcError>()
+        .is_some_and(|r| r.code == twr_core::proto::codes::UNSUPPORTED)
+}
+
+/// A task aborted when this is dropped: the tries to connect again end with the view.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Connects to the hub on `socket` again (serving workspace `expected`, when given), after
+/// [`RECONNECT_FIRST`], then less and less often, every [`RECONNECT_MAX`] at most, until a
+/// hub answers and its control stream is subscribed, saying on `tx` how each try went. It
+/// never starts a hub: one stopped with `twr hub stop` stays stopped until the user starts it.
+fn spawn_reconnect(
+    socket: PathBuf,
+    expected: Option<String>,
+    tx: mpsc::UnboundedSender<Reconnected>,
+) -> AbortOnDrop {
+    let task = tokio::spawn(async move {
+        let mut wait = RECONNECT_FIRST;
+        for tries in 1.. {
+            tokio::time::sleep(wait).await;
+            match Session::connect(&socket, expected.as_deref()).await {
+                Ok(next) => {
+                    let _ = tx.send(Reconnected::Connected(Box::new(next)));
+                    return;
+                }
+                Err(e) if refuses_this_tui(&e) => {
+                    let _ = tx.send(Reconnected::Refused(format!("{e:#}")));
+                    return;
+                }
+                Err(e) => {
+                    // What failed at the bottom ("No such file or directory", "Connection
+                    // refused"), not the contexts above it, which name the socket.
+                    let why = e.root_cause().to_string();
+                    let why = why.lines().next().unwrap_or_default().to_string();
+                    if tx.send(Reconnected::Trying { tries, why }).is_err() {
+                        return;
+                    }
+                }
+            }
+            wait = (wait * 2).min(RECONNECT_MAX);
+        }
+    });
+    AbortOnDrop(task.abort_handle())
 }
 
 /// What lasts across the workspaces a TUI shows: the `[tui]` settings, the clock of the
@@ -2377,6 +2531,39 @@ struct Shared {
     /// The TUI's own speaker, once per process whichever workspace shows
     /// ([`speaker::OwnSpeaker`]).
     speaker: speaker::OwnSpeaker,
+    /// SIGTERM, SIGHUP, SIGQUIT and SIGINT: each ends the TUI as quitting does ([`Signals`]).
+    signals: Signals,
+}
+
+/// The signals that would otherwise kill the TUI with the terminal still in its hands (raw
+/// mode, the alternate screen, mouse, focus and paste reporting, the keyboard protocol's
+/// flags): `kill`, `pkill twr`, `timeout`, a closing SSH session (SIGHUP). Each ends the loop
+/// as quitting does, so [`TerminalGuard`] gives the terminal back; after SIGHUP there may be no
+/// terminal left to give it back to, and writing to it fails quietly. (In raw mode Ctrl-C is a
+/// key, not SIGINT: SIGINT only comes from `kill -INT`.)
+struct Signals(Vec<tokio::signal::unix::Signal>);
+
+impl Signals {
+    /// Listens for them; one that can't be listened for keeps its default action.
+    fn listen() -> Signals {
+        use tokio::signal::unix::{signal, SignalKind};
+        let kinds = [
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+            SignalKind::quit(),
+            SignalKind::interrupt(),
+        ];
+        Signals(kinds.into_iter().filter_map(|k| signal(k).ok()).collect())
+    }
+
+    /// Waits for the next of them (forever, when none could be listened for).
+    async fn recv(&mut self) {
+        if self.0.is_empty() {
+            return std::future::pending().await;
+        }
+        let waits = self.0.iter_mut().map(|s| Box::pin(s.recv()));
+        let _ = futures::future::select_all(waits).await;
+    }
 }
 
 /// The suggestion asks on their way (`suggest.next`, each on a connection of its own), or the
@@ -2443,9 +2630,10 @@ pub async fn run_with(
     let tui = tui_config(tui);
     // Connect before touching the terminal so connection errors print normally.
     // A workspace's socket must be that workspace's hub (`switching`: the socket was not given).
-    let mut session =
-        Session::connect(&socket, switching.as_ref().map(|s| s.current.as_str())).await?;
+    let session = Session::connect(&socket, switching.as_ref().map(|s| s.current.as_str())).await?;
 
+    // Listened for before the terminal is taken: from then on a `kill` gives it back.
+    let signals = Signals::listen();
     let mut terminal = ratatui::try_init().context("initializing the terminal")?;
     twr_core::trace::mark("tui: terminal initialized");
     let guard = TerminalGuard;
@@ -2500,7 +2688,7 @@ pub async fn run_with(
     }
     // Terminal notifications go out only while the terminal is not focused, and the hub's
     // notification command keeps quiet only while it is: the terminal says when that changes.
-    let mut notifier = notify::Notifier::new(&tui.notify, notify::Multiplexer::from_env());
+    let notifier = notify::Notifier::new(&tui.notify, notify::Multiplexer::from_env());
     crossterm::execute!(std::io::stdout(), EnableFocusChange)
         .context("enabling focus reporting")?;
     let mut input = Input::terminal()?;
@@ -2539,11 +2727,9 @@ pub async fn run_with(
         asking: Asks::default(),
         summarizing: Asks::default(),
         speaker,
+        signals,
     };
-    let mut current = switching.map(|s| s.current);
-    // The views of the workspaces left, by name.
-    let mut saved: std::collections::HashMap<String, workspace::SavedView> =
-        std::collections::HashMap::new();
+    let current = switching.map(|s| s.current);
     // The tabs are known from the start (their hubs are asked at the first poll), so `/ws`
     // never takes an existing workspace for a new one.
     let tabs = ctx
@@ -2554,18 +2740,68 @@ pub async fn run_with(
         .into_iter()
         .map(workspace::Tab::new)
         .collect();
-    let mut carried = Carried {
+    let carried = Carried {
         mouse: ctx.tui.mouse,
         view: None,
         tabs,
     };
-    let (result, history_writer) = loop {
+    let (result, history_writer) = show(
+        &mut terminal,
+        &mut input,
+        notifier,
+        &mut ctx,
+        session,
+        current,
+        carried,
+    )
+    .await;
+    // Nothing is sent once the user quit, from any workspace: no suggestion asked either,
+    // and nothing more read aloud.
+    abort_all(&mut ctx.all_callers);
+    ctx.asking.settle(false);
+    ctx.summarizing.settle(false);
+    ctx.speaker.stop();
+
+    // Nothing reads the terminal once it is the user's again.
+    drop(input);
+    drop(terminal);
+    // The terminal is the user's again before anything else waits.
+    drop(guard);
+    // The lines sent last are written before the TUI exits, unless another TUI holds the
+    // file's lock past [`HISTORY_FLUSH`]; so are the settings changed last.
+    flush_history(history_writer);
+    drop(ctx.saves.take());
+    flush_history(settings_writer);
+    result
+}
+
+/// Shows the hub of `session` (the workspace `current`, `None`: a TUI opened on a socket) on
+/// `terminal`, then the next workspace's when the user switches, and the same hub's again
+/// after it restarted, until the user quits. Returns how it ended, with the input history's
+/// last writer.
+async fn show<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    input: &mut Input,
+    mut notifier: notify::Notifier,
+    ctx: &mut Shared,
+    mut session: Session,
+    mut current: Option<String>,
+    mut carried: Carried,
+) -> (anyhow::Result<()>, Option<std::thread::JoinHandle<()>>)
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
+    // The views of the workspaces left, by name.
+    let mut saved: std::collections::HashMap<String, workspace::SavedView> =
+        std::collections::HashMap::new();
+    loop {
         ctx.all_callers.retain(|h| !h.is_finished());
         let (end, writer) = drive(
-            &mut terminal,
-            &mut input,
+            terminal,
+            input,
             &mut notifier,
-            &mut ctx,
+            ctx,
             session,
             current.clone(),
             std::mem::take(&mut carried),
@@ -2593,28 +2829,26 @@ pub async fn run_with(
                 session = *next;
                 notifier = notifier.renewed();
             }
-            Ok(End::Quit) => break (Ok(()), writer),
-            Err(e) => break (Err(e), writer),
+            // The same workspace again, from its new hub's replay, the view as it was left.
+            Ok(End::Reconnect {
+                next,
+                view,
+                tabs,
+                mouse,
+            }) => {
+                flush_history(writer);
+                carried = Carried {
+                    mouse,
+                    view: Some(*view),
+                    tabs,
+                };
+                session = *next;
+                notifier = notifier.renewed();
+            }
+            Ok(End::Quit) => return (Ok(()), writer),
+            Err(e) => return (Err(e), writer),
         }
-    };
-    // Nothing is sent once the user quit, from any workspace: no suggestion asked either,
-    // and nothing more read aloud.
-    abort_all(&mut ctx.all_callers);
-    ctx.asking.settle(false);
-    ctx.summarizing.settle(false);
-    ctx.speaker.stop();
-
-    // Nothing reads the terminal once it is the user's again.
-    drop(input);
-    drop(terminal);
-    // The terminal is the user's again before anything else waits.
-    drop(guard);
-    // The lines sent last are written before the TUI exits, unless another TUI holds the
-    // file's lock past [`HISTORY_FLUSH`]; so are the settings changed last.
-    flush_history(history_writer);
-    drop(ctx.saves.take());
-    flush_history(settings_writer);
-    result
+    }
 }
 
 /// Whether this is a thread's agent's TUI: `agent` given, or the process carries `TWR_AGENT`
@@ -2646,15 +2880,19 @@ struct Carried {
 /// Shows `session`'s hub, the workspace `current` (`None`: a TUI opened on a socket), until
 /// the user quits or switches workspaces. Returns why, with the input history's writer
 /// (its sender is closed: it ends once it wrote what it has).
-async fn drive(
-    terminal: &mut ratatui::DefaultTerminal,
+async fn drive<B>(
+    terminal: &mut ratatui::Terminal<B>,
     input: &mut Input,
     notifier: &mut notify::Notifier,
     ctx: &mut Shared,
     session: Session,
     current: Option<String>,
     carried: Carried,
-) -> (anyhow::Result<End>, Option<std::thread::JoinHandle<()>>) {
+) -> (anyhow::Result<End>, Option<std::thread::JoinHandle<()>>)
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
     let Session {
         socket,
         calls,
@@ -2706,12 +2944,15 @@ async fn drive(
         late: current.clone().map(|w| (ctx.late_tx.clone(), w)),
         selection: selection.clone(),
     };
-    let previous = current.as_ref().and_then(|w| ctx.callers.remove(w));
+    // A TUI opened on a socket keeps its calls under no workspace's name ("": no workspace
+    // has it), for a view of the same hub after it restarted.
+    let calls_key = current.clone().unwrap_or_default();
+    let previous = ctx.callers.remove(&calls_key);
     // The workspace's followed results: what came for it while another one showed is
     // waiting there.
-    let (followed_tx, mut followed_rx) = current
-        .as_ref()
-        .and_then(|w| ctx.followed.remove(w))
+    let (followed_tx, mut followed_rx) = ctx
+        .followed
+        .remove(&calls_key)
         .unwrap_or_else(mpsc::unbounded_channel);
     let results = ResultsOut {
         view: result_tx,
@@ -2733,6 +2974,7 @@ async fn drive(
     state.attach_via = selection;
     state.view.orch_runtimes = orch_runtimes;
     state.view.orch_installed = orch_installed;
+    state.view.model_choices = show["models"].clone();
     state.view.orch_default = orch_default;
     state.view.orch_default_account = show["account"].as_str().map(str::to_string);
     state.view.default_runtime = crate::app::default_runtime(&show);
@@ -2793,11 +3035,11 @@ async fn drive(
         history_writer = writer;
         tx
     });
-    let mut activity_poll = tokio::time::interval(ACTIVITY_EVERY);
-    activity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // What this hub's speakers read: asked now, then every [`SPEECH_EVERY`].
-    let mut speech_poll = tokio::time::interval(SPEECH_EVERY);
-    speech_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // What the threads are doing, and what this hub's speakers read: asked now, then every
+    // [`ACTIVITY_EVERY`] and [`SPEECH_EVERY`], or [`UNFOCUSED_EVERY`] while the terminal has
+    // no focus ([`next_poll`]); at once when it gets it back.
+    let mut activity_at = tokio::time::Instant::now();
+    let mut speech_at = tokio::time::Instant::now();
     // The other workspaces' tabs: asked now, then every [`TABS_EVERY`].
     let mut tab_poll = tokio::time::interval(TABS_EVERY);
     tab_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2862,6 +3104,12 @@ async fn drive(
     // The decisions older than a snapshot's (`decisions.list`), read once on a connection of
     // its own.
     let (dec_tx, mut dec_rx) = mpsc::unbounded_channel::<Value>();
+    // The tries to connect to the hub again once its streams ended ([`spawn_reconnect`]),
+    // stopped with the view.
+    let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel::<Reconnected>();
+    let mut reconnecting: Option<AbortOnDrop> = None;
+    // An OSC 52 copy written to the terminal ([`copy_text`]): the frame it held up is due.
+    let (written_tx, mut written_rx) = mpsc::unbounded_channel::<()>();
 
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
@@ -2912,7 +3160,12 @@ async fn drive(
                 }
                 loading_drawn = Some(std::time::Instant::now());
             }
-            if !std::mem::take(&mut replaying) && !replaying_control {
+            // No frame while a copy is written to the terminal ([`copy_text`]): drawn once it
+            // is (`written_rx`).
+            let held = (!std::mem::take(&mut replaying) && !replaying_control)
+                .then(terminal_out_now)
+                .flatten();
+            if let Some(_held) = held {
                 // The grid's Shift-arrows need the column count the grid is drawn with, the
                 // input box the height it may grow in.
                 let size = terminal.size()?;
@@ -3060,7 +3313,12 @@ async fn drive(
                 key = input.rx.recv() => {
                     if let Some((at, Ok(event))) = &key {
                         match event {
-                            TermEvent::FocusGained => notifier.focus(true),
+                            TermEvent::FocusGained => {
+                                notifier.focus(true);
+                                // What the polls left alone meanwhile, at once.
+                                activity_at = activity_at.min(tokio::time::Instant::now());
+                                speech_at = speech_at.min(tokio::time::Instant::now());
+                            }
                             TermEvent::FocusLost => {
                                 notifier.focus(false);
                                 // The pointer may have left with the focus: it holds nothing.
@@ -3117,7 +3375,7 @@ async fn drive(
                                 continue;
                             }
                             Action::Copy { text } => {
-                                copy_text(text, status.clone());
+                                copy_text(text, status.clone(), written_tx.clone());
                                 continue;
                             }
                             Action::Mouse(on) => {
@@ -3246,6 +3504,35 @@ async fn drive(
                             next = control.as_mut().and_then(|c| c.next().now_or_never());
                         }
                     }
+                    // The hub stopped or restarted: connect again, saying so until done.
+                    if control.is_none() && reconnecting.is_none() {
+                        state.view.hub_lost = Some(app::HubLost { text: HUB_LOST.into(), refused: false });
+                        reconnecting = Some(spawn_reconnect(socket.clone(), current_name.clone(), reconnect_tx.clone()));
+                    }
+                },
+                Some(r) = reconnect_rx.recv() => match r {
+                    Reconnected::Connected(next) => {
+                        twr_core::trace::mark("tui: connected to the hub again");
+                        state.keep_live_glance();
+                        return Ok(End::Reconnect {
+                            next,
+                            view: Box::new(state.take_view()),
+                            tabs: state.tabs.clone(),
+                            mouse: state.view.mouse,
+                        });
+                    }
+                    Reconnected::Trying { tries, why } => {
+                        state.view.hub_lost = Some(app::HubLost {
+                            text: format!("{HUB_LOST} (try {tries}: {why})"),
+                            refused: false,
+                        });
+                    }
+                    Reconnected::Refused(why) => {
+                        state.view.hub_lost = Some(app::HubLost {
+                            text: format!("{HUB_REFUSES} ({why})"),
+                            refused: true,
+                        });
+                    }
                 },
                 item = next_opt(&mut thread_sub) => {
                     // Like the control stream's: what came already in the same pass.
@@ -3289,6 +3576,9 @@ async fn drive(
                     } else {state.apply_result(method,&result);}
                 },
                 Some((method, result)) = followed_rx.recv() => state.apply_result(method, &result),
+                // SIGTERM, SIGHUP, SIGQUIT, SIGINT: ended as quitting is, so the terminal is
+                // given back ([`Signals`]).
+                () = ctx.signals.recv() => return Ok(End::Quit),
                 // A transient status is due to clear.
                 _ = sleep_opt(state.status_deadline()) => {
                     state.expire_status(std::time::Instant::now());
@@ -3308,6 +3598,7 @@ async fn drive(
                 }
                 Some(r) = sug_rx.recv() => state.apply_result("suggest.next", &r),
                 Some(r) = dec_rx.recv() => state.older_decisions_came(&r),
+                Some(()) = written_rx.recv() => {}
                 Some((thread, ask, answer)) = sum_rx.recv() => {
                     state.summary_result(&thread, ask, answer, std::time::Instant::now());
                 }
@@ -3323,6 +3614,7 @@ async fn drive(
                     );
                     if let Some(bytes) = alert {
                         use std::io::Write;
+                        let _held = terminal_out();
                         let mut out = std::io::stdout();
                         // A failed write shows in the status bar; nothing else depends on it.
                         if let Err(e) = out.write_all(bytes.as_bytes()).and_then(|()| out.flush()) {
@@ -3341,7 +3633,8 @@ async fn drive(
                 }
                 // The working icon's next frame: loop to draw it.
                 _ = sleep_opt(tick) => {}
-                _ = activity_poll.tick() => {
+                _ = tokio::time::sleep_until(activity_at) => {
+                    activity_at = next_poll(ACTIVITY_EVERY, notifier.unfocused());
                     if !state.activity_pending {
                         state.activity_pending = true;
                         let _ = call_tx.send(("thread.activity", Value::Null));
@@ -3349,7 +3642,8 @@ async fn drive(
                 }
                 // Not asked of a hub from before reading aloud, until a `/read` it answers;
                 // never by a thread's agent's TUI, which the hub refuses `speech.*`.
-                _ = speech_poll.tick(), if !state.speech.unsupported && state.agent.is_none() => {
+                _ = tokio::time::sleep_until(speech_at), if !state.speech.unsupported && state.agent.is_none() => {
+                    speech_at = next_poll(SPEECH_EVERY, notifier.unfocused());
                     if !state.speech.pending {
                         state.speech.pending = true;
                         let _ = call_tx.send(("speech.status", json!({})));
@@ -3423,6 +3717,7 @@ async fn drive(
                     );
                     for bytes in alerts {
                         use std::io::Write;
+                        let _held = terminal_out();
                         let mut out = std::io::stdout();
                         if let Err(e) = out.write_all(bytes.as_bytes()).and_then(|()| out.flush()) {
                             state.view.status = Some(format!("notification: {e}"));
@@ -3513,11 +3808,17 @@ async fn drive(
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
     drop(looking_tx);
     drop(call_tx);
-    let switching = matches!(end, Ok(End::Switch { .. }));
-    end_calls(switching, caller, current_name.as_deref(), &mut ctx.callers);
+    let switching = matches!(end, Ok(End::Switch { .. } | End::Reconnect { .. }));
+    // (A TUI opened on a socket has a next view only of the same hub.)
+    let next_view = current_name
+        .is_some()
+        .then_some(calls_key.as_str())
+        .or_else(|| matches!(end, Ok(End::Reconnect { .. })).then_some(""));
+    end_calls(switching, caller, next_view, &mut ctx.callers);
     // What still comes of this workspace's messages waits for its next view.
-    if let (true, Some(w)) = (switching, current_name.as_ref()) {
-        ctx.followed.insert(w.clone(), (followed_tx, followed_rx));
+    if let (true, Some(w)) = (switching, next_view) {
+        ctx.followed
+            .insert(w.to_string(), (followed_tx, followed_rx));
     }
     // What this view's status bar had not shown yet goes to the next one's.
     if switching {
@@ -3531,6 +3832,58 @@ async fn drive(
 #[cfg(test)]
 mod asks_tests {
     use super::*;
+
+    /// The activity and speech polls ask every two seconds while the terminal has focus (or
+    /// never said), and every ten once it said it lost it.
+    #[tokio::test(start_paused = true)]
+    async fn polls_back_off_while_the_terminal_is_unfocused() {
+        let mut n = notify::Notifier::new(
+            &twr_core::config::TuiNotifyConfig::default(),
+            notify::Multiplexer::None,
+        );
+        let now = tokio::time::Instant::now();
+        assert!(!n.unfocused());
+        assert_eq!(
+            next_poll(ACTIVITY_EVERY, n.unfocused()) - now,
+            ACTIVITY_EVERY
+        );
+        n.focus(false);
+        assert!(n.unfocused());
+        assert_eq!(
+            next_poll(SPEECH_EVERY, n.unfocused()) - now,
+            UNFOCUSED_EVERY
+        );
+        n.focus(true);
+        assert_eq!(next_poll(SPEECH_EVERY, n.unfocused()) - now, SPEECH_EVERY);
+    }
+
+    /// Only a hub refusing this TUI's version (`unsupported` to its `hello`) stops the tries
+    /// to connect again; a hub not there yet, or one that failed otherwise, is tried again.
+    #[test]
+    fn only_a_refused_version_stops_reconnecting() {
+        use twr_core::proto::{codes, RpcError};
+        let refused = anyhow::Error::new(RpcError::new(codes::UNSUPPORTED, "client too old"))
+            .context("greeting the hub");
+        assert!(refuses_this_tui(&refused));
+        let other = anyhow::Error::new(RpcError::new(codes::BAD_REQUEST, "x"));
+        assert!(!refuses_this_tui(&other));
+        assert!(!refuses_this_tui(&anyhow::anyhow!("connection refused")));
+    }
+
+    /// A SIGHUP (a closing SSH session) or SIGTERM (`kill`) ends the wait the loop selects on,
+    /// instead of killing the process with the terminal in raw mode.
+    #[tokio::test]
+    async fn a_signal_ends_the_tui_as_quitting_does() {
+        let mut signals = Signals::listen();
+        assert_eq!(signals.0.len(), 4);
+        for sig in [libc::SIGHUP, libc::SIGTERM] {
+            // SAFETY: signals this process now handles itself (tokio's handler).
+            assert_eq!(unsafe { libc::kill(libc::getpid(), sig) }, 0);
+            tokio::time::timeout(Duration::from_secs(5), signals.recv())
+                .await
+                .expect("the signal was not seen");
+        }
+    }
 
     /// Asks on their way stay while suggestions are on, and all go, of every workspace, once
     /// they are off.
@@ -4976,6 +5329,19 @@ mod tests {
                 assert!(state.view.input.is_empty());
             }
         }
+        // A draft kept from an earlier view of the workspace: the first Ctrl-C clears it into
+        // the history, the next quits.
+        let mut state = AppState::new();
+        state.begin_catch_up(1);
+        state.view.input.set("kept draft");
+        let c = TermEvent::Key(ctrl('c'));
+        assert!(handle_terminal_event(&mut state, c.clone(), &screen, false).is_empty());
+        assert!(state.view.input.is_empty());
+        assert_eq!(state.view.history, ["kept draft"]);
+        assert_eq!(
+            handle_terminal_event(&mut state, c, &screen, false),
+            [Action::Quit]
+        );
     }
 
     /// Feeds `events`, read at the given times, through `typed_ahead` and the state as the
@@ -5803,7 +6169,7 @@ mod tests {
                 "say",
                 "conflict: no orchestrator is available (runtime \"codex\" is not available)"
             ),
-            "no orchestrator can run: nothing was sent. Switch it with o or /orch"
+            "no orchestrator can run: nothing was sent. Switch it with /orch"
         );
         assert_eq!(
             error_status("thread.stop", "not_found: x"),

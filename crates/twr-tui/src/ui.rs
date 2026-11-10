@@ -49,16 +49,16 @@ pub const POPUP_ROWS: usize = 8;
 /// Shown when the hub has no worker threads.
 pub const EMPTY_STATE: &str = "no worker threads — /new <project>, or ask the orchestrator";
 
-/// Width of the sidebar's column of cards at terminal width `width`: three tenths of it, 34 to
-/// 48 columns, from [`SIDE_MIN_WIDTH`]; narrower, two fifths, 24 to 34, so the conversation
-/// keeps the rest.
+/// Width of the sidebar's column of cards at terminal width `width`: 28% of it, 32 to 44
+/// columns, from [`SIDE_MIN_WIDTH`]; narrower, 36%, 24 to 32, so the conversation keeps the
+/// rest.
 pub fn side_width(width: u16) -> u16 {
     let side = if width >= SIDE_MIN_WIDTH {
-        (u32::from(width) * 3 / 10).clamp(34, 48)
+        (u32::from(width) * 7 / 25).clamp(32, 44)
     } else {
-        (u32::from(width) * 2 / 5).clamp(24, 34)
+        (u32::from(width) * 9 / 25).clamp(24, 32)
     };
-    u16::try_from(side).unwrap_or(48)
+    u16::try_from(side).unwrap_or(44)
 }
 
 /// Draws the current view (stack, grid or decisions), the orchestrator picker, the help or
@@ -172,6 +172,9 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());
     }
+    if let Some(lost) = &state.view.hub_lost {
+        render_hub_lost(frame, area, lost, &mut panes);
+    }
     // Drawn in full color, then brought down to the colors the terminal has (`[tui] colors`).
     crate::color::degrade(frame.buffer_mut(), state.view.colors);
     // The clock ticks only for a moving cell still on screen once the overlays are drawn
@@ -180,6 +183,39 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     panes.moving.retain(|c| on(screen, *c));
     panes.animated = !panes.moving.is_empty();
     panes
+}
+
+/// The band across the top row while the hub's streams are gone ([`crate::app::HubLost`]):
+/// over whatever is there, so nothing hides it, and what it covers is not on screen (no key
+/// answers an item under it, no tap reaches a control there).
+fn render_hub_lost(frame: &mut Frame, area: Rect, lost: &crate::app::HubLost, panes: &mut Panes) {
+    let row = Rect::new(area.x, area.y, area.width, area.height.min(1));
+    if row.height == 0 || row.width == 0 {
+        return;
+    }
+    panes.cover(Some(row));
+    let style = if lost.refused {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    };
+    let width = usize::from(row.width);
+    let text = truncate_cells(&format!(" ⚠ {}", lost.text), width);
+    let fill = width.saturating_sub(crate::edit::width(&text));
+    frame.render_widget(Clear, row);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{text}{}", " ".repeat(fill)),
+            style,
+        ))),
+        row,
+    );
 }
 
 /// The tab strip's control of the sidebar.
@@ -458,7 +494,8 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     ),
     (
         "Ctrl-C",
-        "stop the ! command you started on this thread while it runs, else quit (/quit)",
+        "stop the ! command you started on this thread while it runs; else, with text in the \
+         box, clear it (Up brings it back; Ctrl-C again quits); else quit (/quit)",
     ),
 ];
 
@@ -875,6 +912,9 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     let Some(p) = &state.view.picker else {
         return Vec::new();
     };
+    if let Some(m) = &p.step {
+        return model_lines(state, m, !p.runtimes.is_empty());
+    }
     let dim = Style::default().fg(Color::DarkGray);
     let shown: Vec<String> = p
         .runtimes
@@ -952,6 +992,112 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     out
 }
 
+/// The lines of the picker's model step ([`crate::app::ModelStep`]): what it sets, one row
+/// per model (or effort) with a few words on it, the one in effect marked `(current)`, the
+/// keys. `back`: Esc goes back to the runtimes.
+fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<Line<'static>> {
+    use crate::app::ModelRow;
+    let dim = Style::default().fg(Color::DarkGray);
+    let runtime = crate::app::orch_label(&m.runtime, &state.accounts);
+    let effort = m.chosen.is_some();
+    let (title, note) = match (&m.thread, effort) {
+        (None, _) => (
+            format!("Model for the orchestrator on {runtime}"),
+            "(the default is the one the runtime picks; /orch switches it later)".to_string(),
+        ),
+        (Some((_, name)), false) => (
+            format!("Model for {name} ({runtime})"),
+            "(its reasoning effort next)".to_string(),
+        ),
+        (Some((_, name)), true) => (
+            format!("Reasoning effort for {name} ({runtime})"),
+            match m.chosen.as_ref().and_then(Option::as_deref) {
+                Some(model) => format!("(with model {model})"),
+                None => "(with the runtime's default model)".to_string(),
+            },
+        ),
+    };
+    let label = |r: &ModelRow| match r {
+        ModelRow::Default => "default".to_string(),
+        ModelRow::Known(id, _) => id.clone(),
+        ModelRow::Custom => "custom…".to_string(),
+    };
+    let name_width = m
+        .rows
+        .iter()
+        .map(|r| label(r).chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(note, dim)),
+        Line::from(""),
+    ];
+    let current = m.current_value();
+    for (i, row) in m.rows.iter().enumerate() {
+        let chosen = i == m.selected;
+        let mut spans = vec![
+            Span::raw(if chosen { "› " } else { "  " }),
+            Span::styled(
+                if i < 9 {
+                    format!("{} ", i + 1)
+                } else {
+                    "  ".to_string()
+                },
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        let style = if chosen {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        match (row, &m.typed) {
+            (ModelRow::Custom, Some(typed)) if chosen => {
+                spans.push(Span::styled(format!("{typed}▏"), style));
+            }
+            _ => spans.push(Span::styled(
+                format!("{:<name_width$}  ", label(row)),
+                style,
+            )),
+        }
+        let about = match row {
+            ModelRow::Default if effort => "the runtime's default".to_string(),
+            ModelRow::Default => "the runtime's default model".to_string(),
+            ModelRow::Known(_, about) => about.clone(),
+            ModelRow::Custom if m.typed.is_some() && chosen => String::new(),
+            ModelRow::Custom => "type an id".to_string(),
+        };
+        if !about.is_empty() {
+            spans.push(Span::styled(about, dim));
+        }
+        let is_current = match row {
+            ModelRow::Default => current.is_none(),
+            ModelRow::Known(id, _) => current == Some(id.as_str()),
+            ModelRow::Custom => false,
+        };
+        if is_current {
+            spans.push(Span::styled("  (current)", dim));
+        }
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(""));
+    let keys = if m.typed.is_some() {
+        "type the id · Enter choose · Esc back to the list"
+    } else if back || effort {
+        "↑↓ or 1-9 pick · Enter choose · Esc back"
+    } else {
+        "↑↓ or 1-9 pick · Enter choose · Esc cancel"
+    };
+    out.push(Line::from(Span::styled(keys, dim)));
+    out
+}
+
 /// The orchestrator picker, centered over the view.
 fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     let lines = picker_lines(state);
@@ -961,7 +1107,7 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     let inner_w = usize::from(width.min(area.width).saturating_sub(2)).max(1);
     // On a phone each runtime is a menu choice, a band two rows tall ([`TAP_ROWS`]).
     let phone = state.compact();
-    let runtimes = state.view.picker.as_ref().map_or(0, |p| p.runtimes.len());
+    let runtimes = state.view.picker.as_ref().map_or(0, |p| p.rows_len());
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut spans = Vec::new();
     for (k, line) in lines.into_iter().enumerate() {
@@ -979,7 +1125,11 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     // runtime the window cuts is left blank, never drawn without its tap.
     let room = usize::from(area.height.saturating_sub(2));
     if phone && rows.len() > room && room > 0 {
-        let sel = state.view.picker.as_ref().map_or(0, |p| p.selected);
+        let sel = state
+            .view
+            .picker
+            .as_ref()
+            .map_or(0, |p| p.step.as_ref().map_or(p.selected, |m| m.selected));
         let off = spans.get(3 + sel).map_or(0, |s: &std::ops::Range<usize>| {
             s.end.saturating_sub(room).min(s.start)
         });
@@ -1008,14 +1158,18 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
             .saturating_add(2),
     );
     let switch = state.view.picker.as_ref().is_some_and(|p| p.switch);
+    let step = state.view.picker.as_ref().and_then(|p| p.step.as_ref());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Magenta))
-        .title(if switch {
-            " switch the orchestrator "
-        } else {
-            " choose the orchestrator "
+        .title(match step {
+            Some(m) if m.chosen.is_some() => " reasoning effort ",
+            Some(m) if m.thread.is_some() => " model ",
+            Some(_) if switch => " switch the orchestrator: model ",
+            Some(_) => " choose the orchestrator: model ",
+            None if switch => " switch the orchestrator ",
+            None => " choose the orchestrator ",
         })
         .title(close_title());
     let inner = block.inner(rect);
@@ -7834,6 +7988,10 @@ fn render_popup(
     let sel = state.popup_selected(s.items.len());
     let first = table_first_row(sel, fit);
     let inner_w = usize::from(width.saturating_sub(2));
+    // On a phone, where a row is two tall anyway, what doesn't fit beside its label goes on
+    // the row's second line, cut with `…` (else the second line would be empty and the
+    // description dropped).
+    let stacked = phone && label_w + detail_w + 3 > inner_w;
     let lines: Vec<Line> = s
         .items
         .iter()
@@ -7841,23 +7999,32 @@ fn render_popup(
         .skip(first)
         .take(fit)
         .flat_map(|(i, item)| {
-            let label = format!(" {:<label_w$} ", truncate(&item.label, label_w));
-            let detail = truncate(&item.detail, inner_w.saturating_sub(label_w + 3));
             let mut label_style = Style::default().fg(Color::Cyan);
             let mut detail_style = Style::default().fg(Color::DarkGray);
             if i == sel {
                 label_style = label_style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 detail_style = Style::default().add_modifier(Modifier::REVERSED);
             }
-            let line = Line::from(vec![
-                Span::styled(label, label_style),
-                Span::styled(format!(" {detail}"), detail_style),
-            ]);
+            let lines = if stacked {
+                let label = truncate(&item.label, inner_w.saturating_sub(2));
+                let detail = truncate(&item.detail, inner_w.saturating_sub(3));
+                vec![
+                    Line::from(Span::styled(format!(" {label} "), label_style)),
+                    Line::from(Span::styled(format!("   {detail}"), detail_style)),
+                ]
+            } else {
+                let label = format!(" {:<label_w$} ", truncate(&item.label, label_w));
+                let detail = truncate(&item.detail, inner_w.saturating_sub(label_w + 3));
+                vec![Line::from(vec![
+                    Span::styled(label, label_style),
+                    Span::styled(format!(" {detail}"), detail_style),
+                ])]
+            };
             if phone {
                 let bg = if i.is_multiple_of(2) { BAND } else { BAND_ALT };
-                tap_band(vec![line], inner_w, bg)
+                tap_band(lines, inner_w, bg)
             } else {
-                vec![line]
+                lines
             }
         })
         .collect();
@@ -8644,15 +8811,19 @@ fn popup_item_rows(
 /// Key help for what is on screen, most important first (the status bar cuts it from the
 /// right). A line break is Shift-Enter where it is known to arrive apart from Enter
 /// ([`crate::app::ViewState::shift_enter`]), Ctrl-J elsewhere.
+/// With text in the input box, Ctrl-C clears it rather than quitting
+/// ([`AppState::clear_draft`]), and the hint says so.
 pub fn hints(state: &AppState) -> std::borrow::Cow<'static, str> {
-    let hints = screen_hints(state);
-    if state.view.shift_enter {
-        hints.into()
-    } else {
-        hints
+    let mut hints: std::borrow::Cow<'static, str> = screen_hints(state).into();
+    if !state.view.shift_enter {
+        hints = hints
             .replace("Shift-Enter new line", "Ctrl-J new line")
-            .into()
+            .into();
     }
+    if !state.view.input.trim().is_empty() && !state.ctrl_c_stops() {
+        hints = hints.replace("Ctrl-C quit", "Ctrl-C clear").into();
+    }
+    hints
 }
 
 /// [`hints`], with Shift-Enter for a line break: one line for each view and what is selected
@@ -10377,6 +10548,7 @@ mod tests {
             default: "claude-code".into(),
             model: None,
             switch: false,
+            step: None,
         });
         let lines = draw(&st, 80, 6);
         assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));
@@ -10561,7 +10733,7 @@ mod tests {
     fn three_threads_permission_is_first_with_card_text() {
         let mut st = three_threads();
         st.set_focus(Some("t-alpha".into()));
-        let lines = draw_panes(&mut st, 120, 40);
+        let lines = draw_panes(&mut st, 130, 40);
         let at = |id: &str| st.view.panes.get(&card(id)).unwrap().area;
         let (beta, alpha, gamma) = (at("t-beta"), at("t-alpha"), at("t-gamma"));
         assert!(beta.y < alpha.y && alpha.y < gamma.y, "{}", screen(&lines));
@@ -10578,7 +10750,7 @@ mod tests {
 
         let beta_card = pane_text(&st, &lines, &card("t-beta"));
         assert!(beta_card.contains("│waiting "), "{beta_card}");
-        // The title: the name, the model (the side column at 120 has no room for the project
+        // The title: the name, the model (the side column at 130 has no room for the project
         // and the runtime), the mode at the top right; none of it on a row of its own.
         assert!(
             beta_card.starts_with("┌ beta ──── default model ─ manual ┐"),
@@ -10613,7 +10785,7 @@ mod tests {
         assert!(alpha_card.starts_with('┏'), "{alpha_card}");
         let s = screen(&lines);
         assert!(
-            view_part(&st, 120, &lines[0])
+            view_part(&st, 130, &lines[0])
                 .starts_with(" ORCHESTRATOR  starts with your first message "),
             "{s}"
         );
@@ -11496,8 +11668,12 @@ mod tests {
         let lines = draw(&st, 60, 24);
         assert!(screen(&lines).contains(" gamma "), "{}", screen(&lines));
         assert_eq!(side_width(60), 24);
-        assert_eq!(side_width(99), 34);
-        assert_eq!(side_width(100), 34);
+        assert_eq!(side_width(80), 28);
+        assert_eq!(side_width(99), 32);
+        assert_eq!(side_width(100), 32);
+        assert_eq!(side_width(120), 33);
+        assert_eq!(side_width(160), 44);
+        assert_eq!(side_width(300), 44);
     }
 
     /// The side column shows the cards that fit, keeping the selected one in view, with
@@ -11518,7 +11694,7 @@ mod tests {
         assert!(!s.contains(" more┐") && !s.contains("↑ 3"), "{s}");
         st.set_focus(Some("t-eps".into()));
         let s = screen(&draw_panes(&mut st, 160, 12));
-        assert!(s.contains("┏ proj · eps "), "{s}");
+        assert!(s.contains("┏ eps "), "{s}");
         assert!(s.contains("↑ 3 more"), "{s}");
     }
 
@@ -12353,7 +12529,7 @@ mod tests {
     /// report, cut to the rows the card has. Never the activity next to a report of an
     /// earlier turn, never a report of an earlier turn while it works, never a `report:` label
     /// or a `›`. Who runs it is in the title. In the column
-    /// (34, 40 and 48 columns), the narrower one beside a narrow conversation (24 and 34), the
+    /// (32, 37 and 44 columns), the narrower one beside a narrow conversation (24 and 32), the
     /// grid, and the compact layout's Threads screen (40 columns).
     #[test]
     fn a_card_shows_one_section_for_each_state() {
@@ -12426,7 +12602,7 @@ mod tests {
             let lines = draw_panes(&mut st, w, 80);
             assert_eq!(
                 side_width(w) - 2,
-                [32, 38, 46][[100, 134, 160].iter().position(|x| *x == w).unwrap()]
+                [30, 35, 42][[100, 134, 160].iter().position(|x| *x == w).unwrap()]
             );
             for (name, ..) in &expect {
                 let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
@@ -12589,7 +12765,7 @@ mod tests {
             let lines = draw_panes(&mut st, w, 40);
             let text = pane_text(&st, &lines, &card("t-long"));
             assert!(text.contains("running the invoice"), "{w}:\n{text}");
-            let git: Vec<&str> = text.lines().filter(|l| l.contains("a-very-long")).collect();
+            let git: Vec<&str> = text.lines().filter(|l| l.contains("a-very-lon")).collect();
             assert_eq!(git.len(), 1, "{w}:\n{text}");
             // The branch is cut, not what it says after it; the card's last row.
             assert!(git[0].contains("… · changes made"), "{w}:\n{text}");
@@ -13656,7 +13832,7 @@ mod tests {
     /// · 2 behind`, the short form `+3/−2 vs dev` where that does not fit (then the branch cut
     /// or left out),
     /// nothing when it is even with its base or that is not known (a branch with no upstream
-    /// shows no `0`s either). In the column (34 and 48 columns), the narrower one beside a
+    /// shows no `0`s either). In the column (32 and 44 columns), the narrower one beside a
     /// narrow conversation (32 columns), the grid and the compact layout's Threads screen at
     /// 40x20.
     #[test]
@@ -13692,7 +13868,7 @@ mod tests {
                 false,
                 "twr/api · changes made · +3/−2 vs dev",
             ),
-            (80, 40, false, false, "changes made · +3/−2 vs dev"),
+            (89, 40, false, false, "changes made · +3/−2 vs dev"),
             (90, 40, true, false, "changes made · +3/−2 vs dev · 1 turn"),
             (40, 20, false, true, "twr/api · changes made · +3/−2 vs dev"),
         ];
@@ -14398,9 +14574,9 @@ mod tests {
         st.back();
         st.set_focus(Some("t-ops".into()));
 
-        // Narrow: a 30-column card (the sidebar beside a narrow conversation, 75 columns);
+        // Narrow: a 30-column card (the sidebar beside a narrow conversation, 84 columns);
         // its title drops the project and the runtime, keeps the model and the mode.
-        let lines = draw_panes(&mut st, 75, 24);
+        let lines = draw_panes(&mut st, 84, 24);
         let c = pane_text(&st, &lines, &card("t-ops"));
         let rows: Vec<&str> = c.lines().collect();
         assert_eq!(
@@ -14574,12 +14750,13 @@ mod tests {
         let mut heights = None;
         for (gpu, word) in box_cases() {
             let mut st = box_threads(gpu);
-            // Stack cards, wide: who runs it in the title.
+            // Stack cards, wide: who runs it in the title, the token first (on a 44-column
+            // card the model gives way to a long one).
             let title = |text: &str| text.lines().next().unwrap_or_default().to_string();
             let lines = draw_panes(&mut st, 160, 40);
             let c = pane_text(&st, &lines, &card("t-job"));
             assert!(has_token(&title(&c), "gpu", word), "{c}");
-            assert!(title(&c).contains("gpt"), "{c}");
+
             assert!(c.contains("idle · not started"), "{c}");
             let l = pane_text(&st, &lines, &card("t-loc"));
             assert!(title(&l).contains("claude-code · sonnet"), "{l}");
@@ -14791,7 +14968,8 @@ mod tests {
                 .to_string()
         };
         let c = title(&mut st);
-        assert!(c.contains("@gpu offline · gpt-5-codex"), "{c}");
+        // (The 44-column card cuts the model, never the token.)
+        assert!(c.contains("@gpu offline · gpt-5-cod…"), "{c}");
         let up = hub.event(EventBody::RunnerConnected(runner));
         control(&mut st, &[up]);
         let c = title(&mut st);
@@ -15027,17 +15205,18 @@ mod tests {
         use crate::accounts::tests::list;
         let mut st = account_threads(Some(list(true)));
         let lines = draw_panes(&mut st, 160, 40);
-        // (`ops`'s title has no room for its runtime beside its account and model.)
+        // (The claude-code titles have no room for the runtime beside the account and model
+        // on a 44-column card.)
         for (id, want) in [
             ("t-ops", "personal · opus-4-1"),
-            ("t-job", "claude-code:work · opus-4-1"),
+            ("t-job", "work · opus-4-1"),
             ("t-api", "codex · gpt-5-codex"),
-            ("t-web", "claude-code:personal · sonnet"),
+            ("t-web", "personal · sonnet"),
             ("t-sh", "pty · default model"),
         ] {
             let title = card_title(&st, &lines, id);
             assert!(title.contains(&format!(" {want} ")), "{title}");
-            if id == "t-ops" {
+            if ["t-ops", "t-job", "t-web"].contains(&id) {
                 assert!(!title.contains("claude-code"), "{title}");
             }
         }
@@ -15047,9 +15226,9 @@ mod tests {
             "{s}"
         );
         // Narrow cards: the account without the runtime, then without the model. (40
-        // columns in the sidebar at 134, 30 beside a narrow conversation at 75.)
+        // columns in the sidebar at 143, 30 beside a narrow conversation at 84.)
         st.set_focus(Some("t-job".into()));
-        let lines = draw_panes(&mut st, 134, 24);
+        let lines = draw_panes(&mut st, 143, 24);
         assert_eq!(
             card_title(&st, &lines, "t-job"),
             "┏ job ━━━━━━━ work · opus-4-1 ━ manual ┓",
@@ -15057,7 +15236,7 @@ mod tests {
             screen(&lines)
         );
         st.set_focus(Some("t-ops".into()));
-        let lines = draw_panes(&mut st, 75, 24);
+        let lines = draw_panes(&mut st, 84, 24);
         assert_eq!(
             card_title(&st, &lines, "t-ops"),
             "┏ ops ━━━━ personal ━ manual ┓",
@@ -15149,7 +15328,7 @@ mod tests {
         assert!(st.send_accounts(), "the event meanwhile asks again");
         st.apply_result("account.list", &list(true));
         assert!(!st.send_accounts());
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         assert!(title(&mut st, "t-ops").contains(" personal · opus-4-1 "));
         // An older hub's answer (null) keeps what was known; a failure keeps it too, and is
         // asked for again (`a_failed_account_list_is_asked_for_again_with_a_backoff`).
@@ -15157,7 +15336,7 @@ mod tests {
         crate::app::tests::control(&mut st, &[logout]);
         assert!(st.send_accounts());
         st.apply_result("account.list", &Value::Null);
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         st.accounts_due = true;
         assert!(st.send_accounts());
         st.apply_result("account.list", &list(false));
@@ -15217,14 +15396,14 @@ mod tests {
         assert_eq!(st.accounts_retry, None);
         // Answered: the labels are back, and nothing waits.
         st.accounts_answered(&list(true), secs(100));
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         assert_eq!((st.accounts_retry, st.accounts_failures), (None, 0));
         // A later failure keeps the labels and starts the backoff over (through
         // `apply_result`, as the calls' answers arrive).
         st.accounts_due = true;
         assert!(st.send_accounts());
         st.apply_result("account.list", &failed);
-        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
         assert_eq!(st.accounts_failures, 1);
         let at = st.accounts_retry.expect("a retry");
         assert!(at <= std::time::Instant::now() + std::time::Duration::from_secs(5));
@@ -15736,7 +15915,8 @@ mod tests {
         st.set_focus(Some("t-web".into()));
         let lines = draw_panes(&mut st, 160, 40);
         let c = pane_text(&st, &lines, &card("t-web"));
-        assert!(c.contains("claude-code · sonnet · high"), "{c}");
+        // (The 44-column card leaves out the runtime, never the effort.)
+        assert!(c.contains(" sonnet · high "), "{c}");
         st.view.screen = Screen::Grid;
         let g = screen(&draw(&st, 180, 30));
         assert!(g.contains(" sonnet · high "), "{g}");
@@ -16794,6 +16974,79 @@ mod tests {
             buf[(input.x + 1, input.y - 1)].bg,
             target_fill(st.dived()).bg.unwrap()
         );
+    }
+
+    /// On a phone, where a command's description doesn't fit beside it, the description is the
+    /// second row of its two-row choice (that row was left empty), cut with `…`; the counter
+    /// still counts every command.
+    #[test]
+    fn the_compact_slash_popup_puts_descriptions_under_their_commands() {
+        let mut st = three_threads();
+        st.view.compact_width = 60;
+        st.handle_key(key(KeyCode::Char('/')));
+        let total = st.popup().unwrap().items.len();
+        let lines = draw_panes(&mut st, 46, 30);
+        let s = screen(&lines);
+        assert!(st.compact(), "{s}");
+        let pop = st.view.panes.get(&PaneId::Popup).unwrap().area;
+        let items = st.popup().unwrap().items.clone();
+        let fit = usize::from(pop.height / TAP_ROWS);
+        assert!(fit >= 2, "{s}");
+        for (k, item) in items.iter().take(fit).enumerate() {
+            let label = &lines[usize::from(pop.y) + 2 * k];
+            let detail = &lines[usize::from(pop.y) + 2 * k + 1];
+            let name: String = item.label.chars().take(12).collect();
+            assert!(label.contains(&name), "{k}: {s}");
+            let start: String = item.detail.chars().take(10).collect();
+            assert!(
+                detail.contains(&start),
+                "{k}: {start:?} under {label:?}: {s}"
+            );
+        }
+        assert!(s.contains(&format!(" 1/{total} ")), "{s}");
+        // Wide, the description stays beside its command.
+        let lines = draw_panes(&mut st, 120, 30);
+        let pop = st.view.panes.get(&PaneId::Popup).unwrap().area;
+        let first = &lines[usize::from(pop.y)];
+        let start: String = items[0].detail.chars().take(10).collect();
+        assert!(first.contains(items[0].label.as_str()) && first.contains(&start));
+    }
+
+    /// While the hub's streams are gone, the band across the top row says so whatever the
+    /// status bar says, over every view and the compact layout; what it covers is no target.
+    #[test]
+    fn the_hub_lost_band_stays_on_the_top_row() {
+        let mut st = three_threads();
+        st.view.hub_lost = Some(crate::app::HubLost {
+            text: crate::HUB_LOST.into(),
+            refused: false,
+        });
+        st.view.status = Some("sent to the orchestrator".into());
+        for (w, compact) in [(120, false), (46, true)] {
+            st.view.compact = Some(compact);
+            let lines = draw_panes(&mut st, w, 30);
+            assert!(
+                lines[0].starts_with(" ⚠ hub connection lost"),
+                "{w}: {}",
+                screen(&lines)
+            );
+            assert!(st
+                .view
+                .panes
+                .targets
+                .iter()
+                .all(|(r, _)| r.y > 0 || r.height == 0));
+        }
+        st.view.compact = Some(false);
+        st.view.hub_lost = Some(crate::app::HubLost {
+            text: crate::HUB_REFUSES.into(),
+            refused: true,
+        });
+        let buf = crate::app::tests::draw(&mut st, 120, 30);
+        assert_eq!(buf[(1, 0)].bg, Color::Red);
+        st.view.hub_lost = None;
+        let lines = draw_panes(&mut st, 120, 30);
+        assert!(!screen(&lines).contains("hub connection lost"));
     }
 
     /// The popup lists the matching commands with their descriptions above the input line.
@@ -18841,7 +19094,7 @@ mod tests {
     }
 
     /// A finished thread's report takes the rows its title (who runs it is there now) and its
-    /// fixed height leave: 4 on a card in the column (32, 34 and 48 columns) and on the
+    /// fixed height leave: 4 on a card in the column (32 and 44 columns) and on the
     /// compact Threads screen at 40x20, 6 on a grid tile; its last row ends in `…`, the git
     /// line under it.
     #[test]
@@ -18875,7 +19128,7 @@ mod tests {
         for (w, h, grid, compact, rows) in [
             (100u16, 40u16, false, false, 4),
             (160, 40, false, false, 4),
-            (80, 40, false, false, 4),
+            (89, 40, false, false, 4),
             (40, 20, false, true, 4),
             (90, 40, true, false, 6),
         ] {

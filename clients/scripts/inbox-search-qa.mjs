@@ -1,5 +1,6 @@
 // Focused Electron + Rust QA. All hub processes and SQLite rows are disposable.
 import { clientProtocol } from "./client-protocol.mjs";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -307,10 +308,12 @@ archive.commit()
     childProcess.spawn = globalThis.__qaOriginalSpawn;
     return globalThis.__qaInboxReaders;
   });
+  // One read-only bridge, for the other running workspace: the open workspace is
+  // read over its own connection, and a stopped hub gets none.
   assert.equal(
     readers,
-    2,
-    "Concurrent refreshes must share one read scan and skip stopped hubs",
+    1,
+    "Concurrent refreshes must share one read scan, read the open workspace over its own connection and skip stopped hubs",
   );
   assert.deepEqual(concurrent[0], concurrent[1]);
   assert.deepEqual(concurrent[1], concurrent[2]);
@@ -474,6 +477,10 @@ archive.commit()
   const live = page
     .locator(".needs-inbox .attention-card")
     .filter({ hasText: "OTHER_WORKSPACE_QUESTION" });
+  // Answers count once the options have been on screen for 600 ms (shared/arming.ts),
+  // so bring them into view first: on a small screen the card is below the fold.
+  await live.locator(".attention-options").scrollIntoViewIfNeeded();
+  await live.locator('.attention-options[data-armed="true"]').waitFor();
   await live.getByRole("button", { name: /Later/ }).click();
   await expect
     .poll(
@@ -518,6 +525,7 @@ archive.commit()
   for (const process of processes)
     if (process.exitCode === null && process.signalCode === null)
       process.kill("SIGTERM");
+  stopFixture(join(bin, "twr"), env, { workspaces: [] });
   rmSync(home, {
     recursive: true,
     force: true,

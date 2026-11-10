@@ -7,6 +7,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import type { TerminalSession } from "./types";
 import { terminalReaderEvent, terminalScreenReader } from "./a11y";
+import { useOpenLink } from "./ui";
 export function Terminal({
   session,
   visible,
@@ -22,6 +23,9 @@ export function Terminal({
   const [controlPressed, setControlPressed] = useState(false);
   const search = useRef<SearchAddon>(null);
   const resize = useRef<() => void>(() => {});
+  const open = useOpenLink();
+  const openLink = useRef(open);
+  openLink.current = open;
   useEffect(() => {
     const term = new XTerm({
       fontFamily:
@@ -35,9 +39,23 @@ export function Terminal({
       // Renders output into an accessible buffer for VoiceOver, Orca and TalkBack.
       screenReaderMode: terminalScreenReader(),
       allowProposedApi: false,
+      // A program sets an OSC 8 hyperlink's text and its address separately: when they
+      // differ, the address is shown for confirmation before it opens.
       linkHandler: {
-        activate: (_event, uri) =>
-          void hostApi.openExternal(uri).catch(() => {}),
+        activate: (_event, uri, range) => {
+          const buffer = term.buffer.active;
+          let text = "";
+          for (let y = range.start.y; y <= range.end.y; y++)
+            text +=
+              buffer
+                .getLine(y - 1)
+                ?.translateToString(
+                  true,
+                  y === range.start.y ? range.start.x - 1 : 0,
+                  y === range.end.y ? range.end.x : undefined,
+                ) || "";
+          openLink.current(uri, text, true);
+        },
       },
       theme: {
         background: "#0b0d0f",
@@ -51,9 +69,7 @@ export function Terminal({
     term.loadAddon(addon);
     term.loadAddon(finder);
     term.loadAddon(
-      new WebLinksAddon(
-        (_event, url) => void hostApi.openExternal(url).catch(() => {}),
-      ),
+      new WebLinksAddon((_event, url) => openLink.current(url, url)),
     );
     term.open(node.current!);
     const colorContext = document.createElement("canvas").getContext("2d");

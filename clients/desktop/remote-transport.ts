@@ -37,6 +37,13 @@ export function gatewayUrl(input: unknown, development = false): string {
     );
   return url.origin;
 }
+export const AUTH_REVOKED_MESSAGE =
+  "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again.";
+/** The error for a refused socket upgrade: only 401 is a revocation. */
+export function refusal(status: number | undefined) {
+  if (status === 401) return AUTH_REVOKED_MESSAGE;
+  return `Gateway refused the connection (${status || "unknown"})`;
+}
 export class DesktopTransport {
   private socket?: WebSocket;
   private generation = 0;
@@ -204,17 +211,11 @@ export class DesktopTransport {
       socket.on("unexpected-response", (_request, response) => {
         clearTimeout(timer);
         response.resume();
-        const status = response.statusCode;
-        if (status === 401 || status === 403)
-          authenticationError =
-            "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again.";
-        reject(
-          new Error(
-            status === 401 || status === 403
-              ? "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again."
-              : `Gateway refused the connection (${status || "unknown"})`,
-          ),
-        );
+        // Only 401 means the gateway no longer knows this token. A 403 (an
+        // Origin the gateway refuses) and 5xx (the hub or its device file is
+        // briefly unavailable) are retried like any other failure.
+        authenticationError = refusal(response.statusCode);
+        reject(new Error(authenticationError));
         socket.terminate();
       });
       socket.on("error", () => {

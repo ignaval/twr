@@ -109,7 +109,7 @@ There are no modes: the input box always takes what you type, so you can write t
 | End on an empty line, Ctrl-End | back to the bottom of the main pane, following new text |
 | drag | select text in one pane and copy it (Shift-drag: the terminal's own selection) |
 | ? | help, typed on an empty line |
-| Ctrl-C | quit |
+| Ctrl-C | quit; with text in the input box, clear it first (Up brings it back) and quit on the second |
 
 | Command | Action |
 |---|---|

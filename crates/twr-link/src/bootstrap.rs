@@ -10,12 +10,24 @@ use std::{path::Path, time::Duration};
 use tokio::net::UnixStream;
 use twr_core::paths::{ensure_private_dir, Paths};
 
+/// Connects to the machine's runner service: at its socket, else at the `/tmp` socket of a
+/// service an earlier release started ([`Machine::legacy_socket`]), which serves until it is
+/// replaced (a new build stops it and starts the new one at the new socket).
+pub async fn connect(machine: &Machine) -> std::io::Result<UnixStream> {
+    match UnixStream::connect(&machine.socket).await {
+        Ok(stream) => Ok(stream),
+        Err(error) => match machine.legacy_socket() {
+            Some(legacy) => UnixStream::connect(legacy).await.map_err(|_| error),
+            None => Err(error),
+        },
+    }
+}
 pub async fn request(
     paths: &Paths,
     request: &crate::service::Request,
 ) -> Result<serde_json::Value> {
     let machine = Machine::of(paths);
-    let mut stream = UnixStream::connect(&machine.socket)
+    let mut stream = connect(&machine)
         .await
         .context("runner service is not running")?;
     wire::write(&mut stream, request).await?;
@@ -150,7 +162,7 @@ async fn replace_with_launcher(
 async fn stop_existing(paths: &Paths) -> Result<()> {
     request(paths, &crate::service::Request::Stop).await?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while UnixStream::connect(Machine::of(paths).socket).await.is_ok() {
+    while connect(&Machine::of(paths)).await.is_ok() {
         ensure!(
             tokio::time::Instant::now() < deadline,
             "old runner service did not stop for maintenance"
@@ -202,7 +214,13 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
                 forced.as_deref() == Some(std::ffi::OsStr::new("launchd")),
                 &launchd::Launchctl::system(),
                 std::env::vars_os().collect(),
-                &mut |line| tracing::info!("{line}"),
+                &mut |line| {
+                    if line.contains(": warning: ") {
+                        tracing::warn!("{line}")
+                    } else {
+                        tracing::info!("{line}")
+                    }
+                },
             )
             .await?
             {
@@ -227,7 +245,8 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
     cmd.args(["-c", "\"$@\" &", "twr-service-launch"])
         .arg(program)
         .args(args)
-        .env_remove("TWR_WORKSPACE")
+        .env_clear()
+        .envs(fallback_env(std::env::vars_os()))
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -245,6 +264,26 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
         let _ = child.wait();
     });
     Ok(())
+}
+/// The environment of a service started in a session of its own: what launchd and
+/// `systemd-run` give it ([`twr_runner::relay::launchd::service_env`]), plus two test knobs
+/// that hold no secret: how it starts its workers (`TWR_BOX_LAUNCHER`, which forces this
+/// start too) and whether they offer the fake adapter. A proxy's credentials are removed, with
+/// a warning, as for the others.
+fn fallback_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use twr_runner::relay::launchd;
+    let vars: Vec<_> = vars.into_iter().collect();
+    let service = launchd::service_env(vars.iter().cloned());
+    for name in &service.stripped {
+        tracing::warn!("{}", launchd::credentials_note(name));
+    }
+    let mut env = service.vars;
+    env.extend(vars.into_iter().filter(|(name, _)| {
+        name == twr_runner::relay::LAUNCHER_ENV || name == twr_adapters::ENABLE_FAKE_ENV
+    }));
+    env
 }
 fn install(machine: &Machine, binary: &Path) -> Result<std::path::PathBuf> {
     let program = copy_executable(&machine.dir.join("service"), binary)?;
@@ -358,7 +397,7 @@ pub async fn open(
     executable: &Path,
     replace: bool,
 ) -> Result<(UnixStream, std::path::PathBuf, String)> {
-    let mut stream = UnixStream::connect(Machine::of(paths).socket).await?;
+    let mut stream = connect(&Machine::of(paths)).await?;
     wire::write(
         &mut stream,
         &crate::service::Request::Open {
@@ -391,6 +430,44 @@ pub async fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_detached_service_gets_the_allowlist_and_test_knobs_only() {
+        let env = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("XDG_DATA_HOME", "/home/u/data"),
+            ("ANTHROPIC_API_KEY", "sk-secret"),
+            ("TWR_WORKSPACE", "work"),
+            ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
+            ("https_proxy", "socks5h://me:hunter2@proxy.corp:1080"),
+            ("NODE_EXTRA_CA_CERTS", "/etc/corp-ca.pem"),
+            ("CODEX_HOME", "/home/u/.config/codex"),
+            ("RUSTUP_HOME", "/opt/rustup"),
+            (twr_runner::relay::LAUNCHER_ENV, "setsid"),
+            (twr_adapters::ENABLE_FAKE_ENV, "1"),
+        ]
+        .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
+        let kept = fallback_env(env);
+        assert!(kept.contains(&("https_proxy".into(), "socks5h://proxy.corp:1080".into())));
+        let mut names: Vec<_> = kept
+            .into_iter()
+            .map(|(k, _)| k.into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut expected = vec![
+            "CODEX_HOME",
+            "HOME",
+            "NODE_EXTRA_CA_CERTS",
+            "PATH",
+            "RUSTUP_HOME",
+            "XDG_DATA_HOME",
+            "https_proxy",
+            twr_runner::relay::LAUNCHER_ENV,
+            twr_adapters::ENABLE_FAKE_ENV,
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
     struct MockLauncher {
         good: String,
         stopped_bad: std::sync::Arc<std::sync::atomic::AtomicUsize>,

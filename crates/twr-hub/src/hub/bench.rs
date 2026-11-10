@@ -282,3 +282,97 @@ fn thread_cpu() -> Duration {
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
+
+/// What 2,000 threads deleted and then purged from the trash take in a client's control
+/// snapshot and in a checkpoint: before their purges (what a hub kept of them for good before
+/// it kept only who a purged thread was) and after. Each thread has run a few turns, with a
+/// report, a git snapshot, a background task and usage, as a worker does.
+///
+/// ```sh
+/// cargo test --release -p twr-hub --lib -- --ignored --nocapture purged_threads_bench
+/// ```
+#[tokio::test]
+#[ignore = "a measurement: run with --ignored --nocapture"]
+async fn purged_threads_bench() {
+    use twr_core::config::{Config, NotifyConfig};
+
+    const THREADS: usize = 2000;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("twr.db");
+    let hub = super::Hub::open(super::HubOptions::new(&db, Config::default()))
+        .await
+        .unwrap();
+    let inner = &hub.inner;
+    let mut last = String::new();
+    for i in 0..THREADS {
+        let mut s = ThreadScript::new(format!("01JTHREAD{i:017}"));
+        let mut evs = vec![s.created(&format!("worker-{i}")), s.started("s1")];
+        for turn in 0..3 {
+            evs.push(s.turn_started(&format!("step {turn}: look at the failing tests")));
+            evs.push(s.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: format!("task-{turn}"),
+                running: true,
+                description: "cargo test --workspace".into(),
+                ..Default::default()
+            })));
+            evs.push(s.event(EventBody::ReportReady(ReportReady {
+                summary: format!("Step {turn} done: {}", "the fix is in place. ".repeat(6)),
+                ..Default::default()
+            })));
+            evs.push(s.turn_ended(TurnResult::Completed));
+        }
+        evs.push(s.event(EventBody::GitSnapshot(GitSnapshot {
+            branch: Some(format!("twr/worker-{i}")),
+            ahead: 3,
+            dirty_files: 2,
+            ..Default::default()
+        })));
+        evs.push(s.event(EventBody::ThreadDeleted(ThreadDeleted {
+            name: format!("worker-{i}"),
+            trash: Some(format!("item-{i}")),
+            ..Default::default()
+        })));
+        let mut core = inner.core();
+        for ev in evs {
+            let e = core
+                .append(inner, &ev.thread, ev.turn, ev.source, ev.body)
+                .unwrap();
+            if e.is_control() {
+                last = e.id.clone();
+            }
+        }
+    }
+    let measure = |last: &str| {
+        let snapshot = serde_json::to_vec(&inner.core().client).unwrap().len();
+        let checkpoint = checkpoint::write_upto(&db, &NotifyConfig::default(), 1, Some(last))
+            .unwrap()
+            .map_or(0, |w| w.bytes);
+        (snapshot, checkpoint)
+    };
+    let before = measure(&last);
+    for i in 0..THREADS {
+        let thread = format!("01JTHREAD{i:017}");
+        assert!(inner
+            .core()
+            .record_purged(inner, &format!("item-{i}"), &thread, false));
+    }
+    let last = store::read_control(&inner.reader(), 0, usize::MAX)
+        .unwrap()
+        .last()
+        .map(|(_, e)| e.id.clone())
+        .unwrap();
+    let after = measure(&last);
+    assert!(inner
+        .core()
+        .registry
+        .is_purged("01JTHREAD00000000000000000"));
+    let kib = |b: usize| format!("{:.1} KiB", b as f64 / 1024.0);
+    eprintln!(
+        "{THREADS} deleted threads: client snapshot {} before their purges, {} after; \
+         checkpoint {} before, {} after",
+        kib(before.0),
+        kib(after.0),
+        kib(before.1),
+        kib(after.1),
+    );
+}

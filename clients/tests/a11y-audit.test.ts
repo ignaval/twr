@@ -210,6 +210,7 @@ describe("theme contrast", () => {
             failures.push(`${fg} on ${bg}: ${ratio.toFixed(2)}:1`);
         }
       expect(contrast(theme["accent-fg"], theme.accent)).toBeGreaterThan(4.5);
+      expect(contrast(theme["danger-fg"], theme.danger)).toBeGreaterThan(4.5);
       expect(failures).toEqual([]);
     });
 });

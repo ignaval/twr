@@ -291,14 +291,16 @@ impl Core {
         }
     }
 
-    /// Live event `ev` of a thread a gated prompt concerns: [`after_task`] checks them again
-    /// (and ends what a deletion dropped).
+    /// Live event `ev` of a thread a gated prompt concerns: [`after_task`] checks them again;
+    /// and a deletion that dropped some: [`after_task`] ends them (only a deletion makes an
+    /// orphan, so no other event wakes it for them; one that failed is tried again after
+    /// [`RETRY`]).
     pub(super) fn feed_after(&self, ev: &Event) {
         if let Some(tx) = &self.after.tx {
             if self.after.concerns(&ev.thread) {
                 let _ = tx.send(ev.thread.clone());
             }
-            if !self.after.orphans.is_empty() {
+            if matches!(ev.body, EventBody::ThreadDeleted(_)) && !self.after.orphans.is_empty() {
                 let _ = tx.send(ORPHANS.to_string());
             }
         }
@@ -1015,9 +1017,7 @@ async fn after_task(
                 }
             }
             t = rx.recv() => match t {
-                Some(t) => {
-                    due.insert(t, Instant::now());
-                }
+                Some(t) => wake(&mut due, t, Instant::now()),
                 None => return,
             },
             _ = sleep_until_opt(next) => {
@@ -1059,9 +1059,86 @@ async fn after_task(
     }
 }
 
+/// A wake of [`after_task`] for `t` at `now`: a thread's prompts are checked at once; the
+/// orphans when they are not due already (a failure's retry, [`RETRY`], is never brought
+/// forward).
+fn wake(due: &mut HashMap<String, Instant>, t: String, now: Instant) {
+    if t == ORPHANS {
+        due.entry(t).or_insert(now);
+    } else {
+        due.insert(t, now);
+    }
+}
+
 async fn sleep_until_opt(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at.into()).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Hub, HubOptions};
+    use super::*;
+    use twr_core::config::Config;
+
+    /// Only a deletion wakes the task for the prompts deletions dropped: while one waits to be
+    /// recorded, the threads' other events do not; and a retry's due time is never brought
+    /// forward by a wake.
+    #[tokio::test]
+    async fn only_a_deletion_wakes_the_orphans() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(HubOptions::new(
+            dir.path().join("twr.db"),
+            Config::default(),
+        ))
+        .await
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut core = hub.inner.core();
+        core.after.tx = Some(tx);
+        let g = Gated {
+            id: "g1".into(),
+            prompt: "go".into(),
+            after: vec![Gate {
+                thread: "t2".into(),
+                turn: 0,
+            }],
+            source: Source::Hub,
+            from: TurnFrom::default(),
+            target: "t1".into(),
+            card: None,
+        };
+        core.after
+            .orphans
+            .insert("g1".into(), (g, "its thread was deleted".into()));
+        let ev = |thread: &str, body| Event::new(thread, 1, None, Source::Hub, body);
+        core.feed_after(&ev(
+            "t3",
+            EventBody::AgentText(AgentText {
+                text: "busy".into(),
+                ..Default::default()
+            }),
+        ));
+        assert!(rx.try_recv().is_err(), "an event of another thread woke it");
+        core.feed_after(&ev(
+            "t3",
+            EventBody::ThreadDeleted(ThreadDeleted {
+                name: "x".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(rx.try_recv().ok().as_deref(), Some(ORPHANS));
+        drop(core);
+
+        let mut due = HashMap::new();
+        let now = Instant::now();
+        due.insert(ORPHANS.to_string(), now + RETRY);
+        wake(&mut due, ORPHANS.to_string(), now);
+        assert_eq!(due[ORPHANS], now + RETRY, "the retry was brought forward");
+        due.insert("t1".to_string(), now + GRACE);
+        wake(&mut due, "t1".to_string(), now);
+        assert_eq!(due["t1"], now, "a thread's event checks at once");
     }
 }

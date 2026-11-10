@@ -27,6 +27,7 @@
   --warning-soft: rgb(224 180 92 / 13%);
   --danger: #f08a84;
   --danger-soft: rgb(240 138 132 / 12%);
+  --danger-fg: #1f0907;
   --success: #7cc79a;
   --focus: var(--accent);
   --scrim: rgb(0 0 0 / 60%);
@@ -309,6 +310,34 @@ kbd {
 .danger-quiet {
   color: var(--danger);
 }
+/* The confirming button of a confirmation that stops, removes or interrupts something. */
+.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  font-weight: 600;
+  color: var(--danger-fg);
+}
+.danger:hover {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 88%, var(--text));
+}
+.app-crash {
+  max-width: 640px;
+  margin: 12vh auto 0;
+  padding: 0 16px;
+  color: var(--text);
+}
+.app-crash pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--danger);
+}
 .error-text {
   color: var(--danger);
   font-size: 0.923077rem;
@@ -397,41 +426,11 @@ kbd {
   margin-left: auto;
   margin-right: 0;
 }
-.workspace-picker {
-  padding: 12px;
-}
-.workspace-picker > label {
-  font-size: 0.923077rem;
-  letter-spacing: 0;
-  color: var(--faint);
-  font-weight: 600;
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-  border: 0;
-}
-.workspace-picker > div {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 0;
-}
-.workspace-picker select {
-  padding: 6px 8px;
-  background: transparent;
-  font-weight: 500;
-  font-size: 1rem;
-}
 .primary-nav {
   display: flex;
   flex-direction: column;
   border-bottom: 1px solid var(--border);
-  padding: 0 8px 12px;
+  padding: 12px 8px;
   gap: 2px;
 }
 .primary-nav > button,
@@ -491,12 +490,132 @@ kbd {
   display: flex;
   gap: 2px;
 }
-.thread-list {
+/* Every workspace, its threads nested under it (as in the TUI's sidebar); the tree scrolls. */
+.workspace-tree {
   overflow: auto;
   flex: 1;
   scrollbar-width: thin;
-  padding: 0 8px 8px;
+  padding: 0 4px 8px 8px;
+  /* Its scrollbar stays clear of the resize edge. */
+  margin-right: 6px;
   min-height: 48px;
+}
+.workspace-entry {
+  margin-bottom: 6px;
+}
+.workspace-entry-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.workspace-toggle,
+.workspace-orchestrator,
+.workspace-thread,
+.workspace-add {
+  border: 0;
+  background: none;
+  justify-content: flex-start;
+  text-align: left;
+}
+.workspace-toggle {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.workspace-toggle:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.workspace-entry.current .workspace-toggle {
+  color: var(--text);
+}
+.workspace-entry.stopped .workspace-toggle {
+  color: var(--faint);
+}
+.workspace-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.workspace-badges {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 0.846154rem;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.workspace-waiting {
+  color: var(--warning);
+}
+.workspace-working {
+  color: var(--accent);
+}
+.workspace-orchestrator,
+.workspace-thread,
+.workspace-add {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  gap: 8px;
+  padding: 4px 8px 4px 26px;
+  min-height: 28px;
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.workspace-orchestrator:hover,
+.workspace-thread:hover,
+.workspace-add:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.workspace-orchestrator.active,
+.workspace-orchestrator.active:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.workspace-entry .thread-list {
+  padding-left: 18px;
+  border-left: 1px solid var(--border);
+  margin-left: 12px;
+}
+.workspace-entry.current .thread-list {
+  border-left-color: var(--accent-soft);
+}
+.workspace-peek {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.workspace-thread-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  color: var(--text);
+}
+.workspace-thread > .thread-status {
+  margin-left: auto;
+  font-size: 0.846154rem;
+}
+.workspace-more {
+  color: var(--faint);
+}
+.workspace-add {
+  padding-left: 8px;
+  color: var(--faint);
+}
+.thread-list {
+  min-height: 0;
 }
 .thread-card {
   display: flex;
@@ -949,6 +1068,44 @@ kbd {
   top: 4px;
   right: 4px;
   padding: 6px;
+}
+/* A link the app doesn't open (a path, another scheme): its text, and a copy button. */
+.link-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  max-width: 100%;
+}
+.link-text > code {
+  overflow-wrap: anywhere;
+}
+/* Small inside a line of text on the desktop; phones keep their 44 px targets. */
+:root:not([data-mobile="true"]) .link-text > .copy-link {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 3px;
+  align-self: center;
+}
+.link-confirm {
+  padding: 8px 24px 20px;
+  overflow: auto;
+}
+.link-confirm > p {
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.link-destination {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow: auto;
+  user-select: text;
 }
 .markdown table {
   border-collapse: collapse;
@@ -1816,6 +1973,24 @@ meter::-webkit-meter-optimum-value {
   color: var(--faint);
   font-size: 0.846154rem;
 }
+/* For 600 ms after the options come on screen they answer nothing (a click or key meant
+ * for what was there before): they show as not yet available. */
+.attention-options button[aria-disabled="true"] {
+  opacity: 0.55;
+  cursor: progress;
+}
+.attention-options button {
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    opacity 200ms ease;
+}
+.attention-sent {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--success);
+}
 .attention-options > form {
   display: flex;
   gap: 8px;
@@ -2145,6 +2320,7 @@ meter::-webkit-meter-optimum-value {
   --warning-soft: rgb(138 92 0 / 10%);
   --danger: #b83a34;
   --danger-soft: rgb(184 58 52 / 9%);
+  --danger-fg: #ffffff;
   --success: #2b7449;
   --scrim: rgb(20 22 25 / 35%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
@@ -2172,6 +2348,7 @@ meter::-webkit-meter-optimum-value {
     --warning-soft: rgb(138 92 0 / 10%);
     --danger: #b83a34;
     --danger-soft: rgb(184 58 52 / 9%);
+    --danger-fg: #ffffff;
     --success: #2b7449;
     --scrim: rgb(20 22 25 / 35%);
     --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
@@ -2203,6 +2380,7 @@ meter::-webkit-meter-optimum-value {
   --warning-soft: color-mix(in srgb, var(--bg) 90%, var(--warning));
   --danger: var(--omarchy-danger, color-mix(in srgb, var(--text) 70%, #db4b4b));
   --danger-soft: color-mix(in srgb, var(--bg) 90%, var(--danger));
+  --danger-fg: var(--bg);
   --success: color-mix(in srgb, var(--text) 70%, #3b9c6e);
   --scrim: color-mix(in srgb, var(--bg) 75%, transparent);
   --shadow-color: color-mix(in srgb, var(--bg) 25%, #000);
@@ -2434,10 +2612,6 @@ meter::-webkit-meter-optimum-value {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.suggested-message kbd {
-  flex-shrink: 0;
-  font-size: 0.923077rem;
 }
 .routine-updates {
   font-size: 0.923077rem;
@@ -2849,7 +3023,7 @@ meter::-webkit-meter-optimum-value {
   .sidebar {
     overflow-y: auto;
   }
-  .thread-list {
+  .workspace-tree {
     flex: none;
     overflow: visible;
   }
@@ -2896,9 +3070,21 @@ meter::-webkit-meter-optimum-value {
   cursor: col-resize;
   touch-action: none;
   z-index: 5;
+  /* Over the title bar's drag region, the handle must still take the pointer. */
+  -webkit-app-region: no-drag;
 }
+/* The sidebar's whole right edge resizes it. */
 .pane-resize-sidebar {
   right: 0;
+  bottom: 0;
+  height: auto;
+  width: 6px;
+}
+.pane-resize-sidebar:hover,
+.pane-resize-sidebar:focus-visible {
+  background: var(--accent);
+  outline: 0;
+  opacity: 0.6;
 }
 .pane-resize-inspector {
   left: 0;

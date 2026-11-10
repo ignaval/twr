@@ -1,5 +1,22 @@
-import { autoUpdater } from "electron-updater";
+import {
+  AppImageUpdater,
+  autoUpdater,
+  type AppUpdater,
+  type UpdateDownloadedEvent,
+} from "electron-updater";
+import type { InstallOptions } from "electron-updater/out/BaseUpdater";
+import { basename } from "node:path";
+import { unlinkSync } from "node:fs";
 import type { DiagnosticLog } from "./diagnostics";
+import {
+  checkSignedDownload,
+  MAX_SUMS_BYTES,
+  SIGNED_SUMS,
+  SIGNED_SUMS_SIGNATURE,
+  SignatureError,
+  verifySignedSums,
+  type SignedSums,
+} from "./release-signature";
 import {
   compareVersions,
   installerFor,
@@ -13,6 +30,84 @@ import {
 const RELEASES = "https://api.github.com/repos/ignaval/twr/releases/latest";
 
 /**
+ * Reads and verifies the release's signed desktop checksums (release-signature.ts).
+ * Undefined when the release has none: a release published before they existed, or one
+ * whose desktop assets are still being attached.
+ */
+export async function fetchSignedSums(
+  get: typeof fetch,
+  tag: string,
+  assets: ReleaseAsset[],
+): Promise<SignedSums | undefined> {
+  const list = assets.find((asset) => asset.name === SIGNED_SUMS);
+  const signature = assets.find(
+    (asset) => asset.name === SIGNED_SUMS_SIGNATURE,
+  );
+  if (!list || !signature) return undefined;
+  const read = async (asset: ReleaseAsset) => {
+    const response = await get(asset.url, {
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!response.ok)
+      throw new Error(
+        `GitHub answered ${response.status} for ${asset.name}. Try again later.`,
+      );
+    const body = Buffer.from(await response.arrayBuffer());
+    if (body.length > MAX_SUMS_BYTES)
+      throw new SignatureError(`${asset.name} is too large`);
+    return body;
+  };
+  const [text, sig] = await Promise.all([read(list), read(signature)]);
+  return verifySignedSums(text, sig.toString("utf8"), tag);
+}
+
+/**
+ * electron-updater's AppImage updater, which checks a download only against the SHA-512 in
+ * latest-linux.yml, a file of the same release as the image. This one also requires the
+ * image's SHA-256 in the release's signed checksums, when the download completes (before it
+ * is offered) and again just before it replaces the running image.
+ */
+class SignedAppImageUpdater extends AppImageUpdater {
+  /** The verified checksums of the release being updated to. */
+  signed?: SignedSums;
+  private verified?: { file: string; version: string };
+  private check(file: string, version: string) {
+    checkSignedDownload(this.signed, version, basename(file), file);
+  }
+  protected dispatchUpdateDownloaded(event: UpdateDownloadedEvent) {
+    try {
+      this.check(event.downloadedFile, event.version);
+    } catch (error) {
+      // Thrown here, before electron-updater arms its install-on-quit: nothing installs it.
+      this.verified = undefined;
+      try {
+        unlinkSync(event.downloadedFile);
+      } catch {}
+      throw new SignatureError(
+        `Update refused: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    this.verified = { file: event.downloadedFile, version: event.version };
+    super.dispatchUpdateDownloaded(event);
+  }
+  protected doInstall(options: InstallOptions): boolean {
+    const file = this.installerPath;
+    if (!file || !this.verified || this.verified.file !== file)
+      throw new SignatureError(
+        "Update refused: the downloaded AppImage was not verified against the release's signed checksums.",
+      );
+    try {
+      this.check(file, this.verified.version);
+    } catch (error) {
+      throw new SignatureError(
+        `Update refused: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return super.doInstall(options);
+  }
+}
+
+/**
  * One update flow for every install kind. The GitHub release is always read
  * first: electron-updater is only engaged for self-updating installs, and only
  * once the release actually carries their update metadata (desktop assets are
@@ -22,11 +117,17 @@ export class Updater {
   status: UpdateStatus;
   private checking?: Promise<UpdateStatus>;
   private wired = false;
+  private automatic = false;
+  private readonly ready: Promise<void>;
   constructor(
     private readonly options: {
       kind: InstallKind;
-      automatic: boolean;
-      manualReason?: string;
+      /**
+       * Whether this install replaces itself. On macOS that needs a code
+       * signature check, which runs after the window shows; checks and
+       * downloads wait for it.
+       */
+      mode: Promise<{ automatic: boolean; manualReason?: string }>;
       current: string;
       log: DiagnosticLog;
       onChange(status: UpdateStatus): void;
@@ -37,45 +138,60 @@ export class Updater {
   ) {
     this.status = {
       kind: options.kind,
-      automatic: options.automatic,
-      manualReason: options.manualReason,
+      automatic: false,
       state: "idle",
       current: options.current,
     };
+    this.ready = options.mode.then(
+      ({ automatic, manualReason }) => {
+        this.automatic = automatic;
+        this.set({ automatic, manualReason });
+      },
+      (error) => {
+        options.log.warn("updater", "Could not tell how to update", error);
+        this.set({ manualReason: "This build could not be checked." });
+      },
+    );
   }
   private set(update: Partial<UpdateStatus>) {
     this.status = { ...this.status, ...update };
     this.options.onChange(this.status);
   }
+  private appImage?: SignedAppImageUpdater;
+  /** electron-updater's updater for this platform; the signed one for an AppImage. */
+  private get engine(): AppUpdater {
+    if (this.options.kind !== "appimage") return autoUpdater;
+    return (this.appImage ??= new SignedAppImageUpdater());
+  }
   private wire() {
     if (this.wired) return;
     this.wired = true;
     const log = this.options.log;
-    autoUpdater.logger = {
+    this.engine.logger = {
       info: (message?: unknown) => log.info("updater", String(message)),
       warn: (message?: unknown) => log.warn("updater", String(message)),
       error: (message?: unknown) => log.error("updater", String(message)),
       debug: () => {},
     };
-    autoUpdater.allowPrerelease = false;
-    autoUpdater.allowDowngrade = false;
-    autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.on("download-progress", (progress) =>
+    this.engine.allowPrerelease = false;
+    this.engine.allowDowngrade = false;
+    this.engine.autoInstallOnAppQuit = true;
+    this.engine.on("download-progress", (progress) =>
       this.set({
         state: "downloading",
         progress: Math.round(progress.percent),
       }),
     );
-    autoUpdater.on("appimage-filename-updated", (path: string) =>
+    this.engine.on("appimage-filename-updated", (path: string) =>
       this.options.onAppImageRenamed?.(path),
     );
-    autoUpdater.on("update-not-available", () =>
+    this.engine.on("update-not-available", () =>
       this.set({ state: "up-to-date", instructions: undefined }),
     );
-    autoUpdater.on("update-downloaded", (info) =>
+    this.engine.on("update-downloaded", (info) =>
       this.set({ state: "downloaded", latest: info.version, progress: 100 }),
     );
-    autoUpdater.on("error", (error) => {
+    this.engine.on("error", (error) => {
       log.error("updater", "Automatic update failed", error);
       this.set({ state: "error", error: describe(error) });
     });
@@ -86,7 +202,9 @@ export class Updater {
       this.status.state === "downloaded"
     )
       return Promise.resolve(this.status);
-    this.checking ??= this.run().finally(() => (this.checking = undefined));
+    this.checking ??= this.ready
+      .then(() => this.run())
+      .finally(() => (this.checking = undefined));
     return this.checking;
   }
   private async run(): Promise<UpdateStatus> {
@@ -136,7 +254,7 @@ export class Updater {
       }
       const metadata = updateMetadataName(kind);
       const selfUpdating =
-        this.options.automatic &&
+        this.automatic &&
         !!metadata &&
         assets.some((asset) => asset.name === metadata);
       if (!selfUpdating) {
@@ -144,18 +262,41 @@ export class Updater {
           ...base,
           state: "available",
           instructions:
-            this.options.automatic && !download
+            this.automatic && !download
               ? "This release's desktop installers are still being published. Check again shortly."
               : manualInstructions(kind, download),
         });
         return this.status;
       }
+      if (kind === "appimage") {
+        // An AppImage installs only what the release's signed checksums name. A release
+        // without them (published before they existed, or still being attached) is offered
+        // as a manual download, never installed unsigned.
+        const signed = await fetchSignedSums(
+          this.options.fetch || fetch,
+          release.tag_name,
+          assets,
+        );
+        if (!signed) {
+          this.set({
+            ...base,
+            state: "available",
+            instructions: `This release has no signed checksums (${SIGNED_SUMS_SIGNATURE}), so twr will not replace itself with it. If it was published just now, check again shortly; otherwise download the AppImage from the release page.`,
+          });
+          return this.status;
+        }
+        if (!download || !signed.sums.has(download.name))
+          throw new SignatureError(
+            `Update refused: ${download?.name ?? "the AppImage"} is not in the release's signed checksums.`,
+          );
+        (this.engine as SignedAppImageUpdater).signed = signed;
+      }
       this.wire();
-      autoUpdater.autoDownload = this.options.autoDownload();
+      this.engine.autoDownload = this.options.autoDownload();
       // Stay "checking" until electron-updater has its own update info, so a
       // Download request cannot arrive before it can be served.
       this.set({ ...base, instructions: undefined });
-      const result = await autoUpdater.checkForUpdates();
+      const result = await this.engine.checkForUpdates();
       if (this.status.state === "checking")
         this.set({
           state:
@@ -169,11 +310,11 @@ export class Updater {
     }
   }
   async download() {
-    if (!this.options.automatic || this.status.state !== "available")
+    if (!this.automatic || this.status.state !== "available")
       throw new Error("No automatic update is waiting to download");
     this.wire();
     this.set({ state: "downloading", progress: 0 });
-    await autoUpdater.downloadUpdate();
+    await this.engine.downloadUpdate();
     return this.status;
   }
   install() {
@@ -181,7 +322,7 @@ export class Updater {
       throw new Error("No update has been downloaded yet");
     this.options.log.info("updater", `Restarting into ${this.status.latest}`);
     // isSilent=false, isForceRunAfter=true: reopen twr after installing.
-    autoUpdater.quitAndInstall(false, true);
+    this.engine.quitAndInstall(false, true);
   }
 }
 

@@ -375,7 +375,8 @@ final class RemoteHubTests: XCTestCase {
           [...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
            .find(e=>e.getClientRects().length&&e.textContent.includes('Needs you')).click();return true;
           """)
-        try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed'))")
+        // A request's options answer only once they have been on screen for 600 ms (armed).
+        try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')&&e.closest('.attention-options')?.getAttribute('data-armed')==='true')")
         _ = try await js("[...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')).click();return true")
         try await until("return window.__qaEvents.some(e=>e.type==='thread' && e.event?.kind==='agent.text' && e.event?.data?.text?.includes('IOS_ANSWERED'))")
         let commandIds = try await js("return (await window.twr.catalog()).map(command => command.id).sort()") as? [String]
@@ -385,7 +386,9 @@ final class RemoteHubTests: XCTestCase {
           catch(error) { return error.code==='REQUEST_TOO_LARGE' }
           """) as? Bool
         XCTAssertEqual(sizeGuard, true, "Native requests must be bounded by UTF-8 bytes without closing the socket")
-        _ = try await js("[...document.querySelectorAll('.mobile-tabs button,.primary-nav button')].find(e=>e.getClientRects().length&&(e.textContent==='Chat'||e.textContent.includes('Orchestrator')))?.click();return true")
+        // Back to the conversation: the Chat tab on a phone, the open workspace's Orchestrator
+        // entry in the sidebar's workspace list on a wide layout.
+        _ = try await js("[...document.querySelectorAll('.mobile-tabs button,.workspace-entry.current .workspace-orchestrator,.primary-nav button')].find(e=>e.getClientRects().length&&(e.textContent==='Chat'||e.textContent.includes('Orchestrator'))).click();return true")
         try await until("return !!document.querySelector('.composer textarea')")
         _ = try await js("const shell=[...document.querySelectorAll('button[aria-label=\"Open shell\"]')].find(e=>e.getClientRects().length);if(shell)shell.click();else{document.querySelector('.conversation-menu summary').click();[...document.querySelectorAll('.conversation-menu button')].find(e=>e.textContent.includes('Open shell')).click();}return true")
         try await until("return !!document.querySelector('.terminal-session .xterm-helper-textarea') && !!document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]')")
@@ -407,7 +410,7 @@ final class RemoteHubTests: XCTestCase {
         // Calling the host API alone intentionally leaves the terminal's UI history open.
         _ = try await js("document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]').click();return true")
         try await until("return !!document.querySelector('[role=dialog]')")
-        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(e=>e.textContent==='Continue').click();return true")
+        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(e=>['Close terminal','Remove tab'].includes(e.textContent.trim())).click();return true")
         try await until("return !document.querySelector('.terminal-dock')")
         _ = try await js("await window.Capacitor.Plugins.Keyboard.hide();return true")
         // Keep the socket active beyond the former 40 second resource timeout.

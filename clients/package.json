@@ -15,7 +15,7 @@
     "test": "vitest run",
     "test:integration": "node scripts/integration.mjs",
     "test:voice": "node scripts/voice-qa.mjs",
-    "package": "npm run build:rust && npm run build && electron-builder --publish never",
+    "package": "npm run build:rust && npm run build && node scripts/notices.mjs && electron-builder --publish never",
     "package:mac": "npm run package -- --mac --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false",
     "package:linux": "npm run package -- --linux --x64",
     "postinstall": "electron-builder install-app-deps",
@@ -87,7 +87,7 @@
   "build": {
     "appId": "tools.twr.desktop",
     "productName": "twr",
-    "afterPack": "./scripts/linux-abi.mjs",
+    "afterPack": "./scripts/after-pack.mjs",
     "directories": {
       "output": "release"
     },
@@ -107,6 +107,18 @@
       {
         "from": "packaging/tray",
         "to": "tray"
+      },
+      {
+        "from": "dist-notices/THIRD-PARTY-LICENSES.html",
+        "to": "THIRD-PARTY-LICENSES.html"
+      },
+      {
+        "from": "../LICENSE",
+        "to": "LICENSE"
+      },
+      {
+        "from": "../NOTICE",
+        "to": "NOTICE"
       }
     ],
     "mac": {

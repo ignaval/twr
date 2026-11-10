@@ -30,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 # `float_roundtrip`: a float reads back as the same float (the hub's checkpoints hold sums of
 # costs, `twr_hub` `hub::checkpoint`).
 serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 ulid = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 sha2 = "0.11"
@@ -43,19 +43,26 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+# `twr completions`: shell completion scripts from the clap definition.
+clap_complete = "4"
 ratatui = "0.30"
 crossterm = "0.29"
 # The TUI's markdown (replies drawn as Claude Code draws them): the parser only, no HTML.
 pulldown-cmark = { version = "0.13", default-features = false }
 tempfile = "3"
 portable-pty = "0.9"
-rmcp = { version = "3.5", default-features = false, features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io", "macros"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # The hub's runner listener over TLS (wss://): the same rustls with ring.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-# `twr update`'s HTTP client: rustls with ring (reqwest uses an installed default provider, else ring), no OpenSSL.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `twr update`'s HTTP client and the mobile gateway's APNs/FCM client: rustls, no OpenSSL, the
+# same reqwest as iroh's. `rustls-no-provider` because each client is handed its own rustls
+# configuration (ring, the Mozilla roots of `webpki-roots`: `https_client` in twr-cli,
+# `push_tls` in twr-app) in place of 0.13's platform verifier and aws-lc-rs default.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+# The roots those HTTP clients trust (reqwest 0.12's `rustls-tls` used the same crate).
+webpki-roots = "1"
 # macOS's mount list (`getfsstat`) for twr-runner's trims and deletions.
 libc = "0.2"
 # twr-runner's shutdown latch (`client::Shutdown`): an action in the SIGTERM / SIGINT handler

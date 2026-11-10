@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde_json::{Map, Value};
-use twr_core::blob::{cap_body, has_capped, hydrate_with, BlobStore, CapError};
+use twr_core::blob::{cap_for_log, has_capped, hydrate_with, BlobStore, CapError};
 use twr_core::event::*;
 
 use super::{
@@ -82,9 +82,9 @@ fn display_safe(body: &mut EventBody) {
     }
 }
 
-/// Checks the size of every top-level identifier (`id`, `*_id`) of `body`'s payload.
-fn check_identifiers(body: &EventBody) -> anyhow::Result<()> {
-    let data = body.data()?;
+/// Checks the size of every top-level identifier (`id`, `*_id`) of `data`, the payload of an
+/// event of kind `kind`.
+fn check_identifiers(kind: &str, data: &Value) -> anyhow::Result<()> {
     if let Some(map) = data.as_object() {
         for (k, v) in map {
             if k != "id" && !k.ends_with("_id") {
@@ -92,8 +92,7 @@ fn check_identifiers(body: &EventBody) -> anyhow::Result<()> {
             }
             if let Some(s) = v.as_str().filter(|s| s.len() > MAX_ID_BYTES) {
                 return Err(InvalidEvent(format!(
-                    "{} {k} is {} bytes (max {MAX_ID_BYTES})",
-                    body.kind(),
+                    "{kind} {k} is {} bytes (max {MAX_ID_BYTES})",
                     s.len()
                 ))
                 .into());
@@ -101,6 +100,18 @@ fn check_identifiers(body: &EventBody) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// What [`Core::append_batch`] made of an event before the commit.
+struct Prepared {
+    /// The event as stored (its payload capped).
+    ev: Event,
+    /// The body before capping, when capping changed it: what the reducers fold.
+    full_body: Option<EventBody>,
+    /// The whole text of a final `agent.text`.
+    final_text: Option<String>,
+    /// The stored payload as JSON text (written once, for the log and every subscriber).
+    data: String,
 }
 
 /// The event with its payload hydrated from `conn`'s blobs, when it has capped fields (`None`
@@ -344,14 +355,25 @@ impl Core {
                 {
                     self.trash.remove(&p.item);
                 }
-                if self.registry.is_deleted(&p.thread) {
-                    if let Some(d) = self
-                        .deleted_rt
-                        .get_mut(&p.thread)
-                        .filter(|d| d.item.as_deref() == Some(p.item.as_str()))
-                    {
-                        d.purged = true;
-                        self.activity.remove(&p.thread);
+                // The item of its last delete: the thread can never come back
+                // (`Registry::is_purged`), so nothing set aside for a restore is kept.
+                if self
+                    .deleted_rt
+                    .get(&p.thread)
+                    .is_some_and(|d| d.item.as_deref() == Some(p.item.as_str()))
+                {
+                    self.deleted_rt.remove(&p.thread);
+                    self.activity.remove(&p.thread);
+                    // Its requests (`<thread>:<id>`) are answered by no one again.
+                    let prefix = format!("{}:", p.thread);
+                    let gone: Vec<String> = self
+                        .known_attn
+                        .range(prefix.clone()..)
+                        .take_while(|a| a.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    for a in gone {
+                        self.known_attn.remove(&a);
                     }
                 }
             }
@@ -534,8 +556,7 @@ impl Core {
         // are in.
         let mut seqs: HashMap<String, u64> = HashMap::new();
         let mut times: HashMap<String, DateTime<Utc>> = HashMap::new();
-        let mut prepared: Vec<(Event, EventBody, Option<String>)> =
-            Vec::with_capacity(events.len());
+        let mut prepared: Vec<Prepared> = Vec::with_capacity(events.len());
         for mut e in events {
             // The orchestrator's memory calls are recorded without their text (`hub::memory`).
             self.redact_memory_call(&e.thread, &mut e.body, &mut e.raw, &e.source);
@@ -575,17 +596,27 @@ impl Core {
                 return Err(InvalidEvent(format!("thread {} was deleted", e.thread)).into());
             }
             display_safe(&mut e.body);
-            check_identifiers(&e.body)?;
             let full_final_text = match &e.body {
                 EventBody::AgentText(t) if t.is_final => Some(t.text.clone()),
                 _ => None,
             };
-            let capped = cap_body(&e.body, &staged)?;
+            // The payload is built once: checked, capped and written as the JSON the log
+            // stores and every subscriber's line carries.
+            let kind = e.body.kind();
+            let capped = cap_for_log(&e.body, &staged, |data| check_identifiers(kind, data))
+                .map_err(|err| match err {
+                    // As the check said it (a refusal `rejection` tells).
+                    CapError::Other(err) => err,
+                    err => err.into(),
+                })?;
             // The reducers always fold the original body: it is what hydrating the stored
             // event gives back. (Whether a field was capped cannot be told from the staged
             // blob count: staging deduplicates, so a second event of the batch sharing a large
             // field adds no blob.)
-            let full_body = e.body;
+            let (stored_body, full_body) = match capped.body {
+                Some(c) => (c, Some(e.body)),
+                None => (e.body, None),
+            };
             let raw_ref = e.raw.map(|r| staged.put(r.as_bytes())).transpose()?;
             let last = seqs
                 .get(&e.thread)
@@ -593,7 +624,7 @@ impl Core {
                 .copied()
                 .unwrap_or(0);
             seqs.insert(e.thread.clone(), last + 1);
-            let mut ev = Event::new(e.thread, last + 1, e.turn, e.source, capped);
+            let mut ev = Event::new(e.thread, last + 1, e.turn, e.source, stored_body);
             if let Some(at) = at {
                 let floor = times
                     .get(&ev.thread)
@@ -602,21 +633,25 @@ impl Core {
             }
             times.insert(ev.thread.clone(), ev.ts);
             ev.raw = raw_ref;
-            prepared.push((ev, full_body, full_final_text));
+            prepared.push(Prepared {
+                ev,
+                full_body,
+                final_text: full_final_text,
+                data: capped.json,
+            });
         }
         let enqueue = prompts
             .into_iter()
             .map(|p| {
-                let routed_by =
-                    match p.routed_by {
-                        None => None,
-                        Some(RoutedBy::Id(id)) => Some(id),
-                        Some(RoutedBy::Event(i)) => {
-                            Some(prepared.get(i).map(|(ev, _, _)| ev.id.clone()).ok_or_else(
-                                || anyhow::anyhow!("routed_by names no event of the batch"),
-                            )?)
-                        }
-                    };
+                let routed_by = match p.routed_by {
+                    None => None,
+                    Some(RoutedBy::Id(id)) => Some(id),
+                    Some(RoutedBy::Event(i)) => {
+                        Some(prepared.get(i).map(|p| p.ev.id.clone()).ok_or_else(|| {
+                            anyhow::anyhow!("routed_by names no event of the batch")
+                        })?)
+                    }
+                };
                 Ok(store::NewPrompt {
                     thread: p.thread,
                     prompt: p.prompt,
@@ -629,11 +664,16 @@ impl Core {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let blobs = staged.take();
+        let data: Vec<String> = prepared
+            .iter_mut()
+            .map(|p| std::mem::take(&mut p.data))
+            .collect();
         let commit = self.store.append_batch(store::AppendBatch {
             events: prepared
                 .iter()
-                .map(|(ev, _, _)| (ev, ev.is_control()))
+                .map(|p| (&p.ev, p.ev.is_control()))
                 .collect(),
+            data: &data,
             blobs: &blobs,
             dequeue,
             enqueue,
@@ -651,28 +691,35 @@ impl Core {
             }
         }
         let mut out = Vec::with_capacity(prepared.len());
-        for ((ev, full_body, final_text), gseq) in prepared.into_iter().zip(commit.gseqs) {
+        for ((p, data), gseq) in prepared.into_iter().zip(data).zip(commit.gseqs) {
+            let Prepared {
+                ev,
+                full_body,
+                final_text,
+                ..
+            } = p;
             // Reducers see the event's own gseq as the head (the relay guard orders by it).
             if let Some(g) = gseq {
                 self.gseq = g;
             }
-            let full = Event {
-                body: full_body,
-                ..ev.clone()
-            };
-            self.apply(&full);
+            // The event as the reducers fold it: the stored one, but for a capped payload.
+            let uncapped = full_body.map(|body| Event { body, ..ev.clone() });
+            let full = uncapped.as_ref().unwrap_or(&ev);
+            self.apply(full);
             if let Some(g) = gseq {
-                self.feed_hook(&full, g);
+                self.feed_hook(full, g);
             }
-            self.feed_after(&full);
-            self.task_progress_after(&full);
+            self.feed_after(full);
+            self.task_progress_after(full);
             if let Some(text) = final_text {
                 self.rt(&ev.thread).final_text = Some(text);
             }
-            let shared = Arc::new(ev.clone());
             if let Some(g) = gseq {
                 // Folded for the snapshots (`hub::subscribe`) before any subscriber has it.
-                self.client.apply(&full, Some(g));
+                self.client.apply(full, Some(g));
+            }
+            let shared = Arc::new(super::Recorded::new(ev.clone(), data));
+            if let Some(g) = gseq {
                 let _ = hub.control_tx.send((g, Arc::clone(&shared)));
             }
             let _ = hub.events_tx.send(shared);

@@ -25,6 +25,10 @@ import {
   referencedEngines,
   linuxEngineProcesses,
   ENGINE_BINARIES,
+  SHIPPED_DIGESTS,
+  readShippedDigests,
+  stageEngines,
+  streamDigest,
 } from "../desktop/engines";
 it("preserves the engine identity across chunk boundaries and detects cache tampering", () => {
   const dir = mkdtempSync(join(tmpdir(), "twr-engine-hash-"));
@@ -48,24 +52,117 @@ it("preserves the engine identity across chunk boundaries and detects cache tamp
   }
 });
 
-it("cached engine digests detect changed content even when mtime is restored", () => {
+it("cached engine digests detect changed content even when mtime is restored", async () => {
   const dir = mkdtempSync(join(tmpdir(), "twr-digest-cache-"));
   try {
     const path = join(dir, "engine"),
       index = join(dir, "digests.json");
     writeFileSync(path, "original");
     const first = new EngineDigests(index);
-    const digest = first.digest(path);
+    const digest = await first.digest(path);
     first.save();
     const old = statSync(path);
-    expect(new EngineDigests(index).digest(path)).toBe(digest);
+    expect(await new EngineDigests(index).digest(path)).toBe(digest);
     writeFileSync(path, "modified");
     utimesSync(path, old.atime, old.mtime);
-    expect(new EngineDigests(index).digest(path)).not.toBe(digest);
+    expect(await new EngineDigests(index).digest(path)).not.toBe(digest);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+function engineSource(root: string, name: string) {
+  const source = join(root, name);
+  mkdirSync(source);
+  for (const engine of ENGINE_BINARIES)
+    writeFileSync(join(source, engine), `${engine} build`);
+  return source;
+}
+const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+
+it("streams the same digest as the synchronous reader", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "twr-engine-stream-"));
+  try {
+    writeFileSync(join(dir, "engine"), Buffer.alloc(3 * 1024 * 1024 + 5, 7));
+    expect(await streamDigest(join(dir, "engine"))).toBe(
+      fileDigest(join(dir, "engine")),
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+it("stages engines into a directory named by their contents, from any mount path", async () => {
+  const root = mkdtempSync(join(tmpdir(), "twr-engine-stage-"));
+  try {
+    const first = engineSource(root, "mount-a");
+    const engines = join(root, "engines");
+    const stable = await stageEngines(first, engines);
+    const expected = createHash("sha256")
+      .update(
+        JSON.stringify(
+          ENGINE_BINARIES.map((name) => [name, sha(`${name} build`)]),
+        ),
+      )
+      .digest("hex");
+    expect(stable).toBe(join(engines, expected));
+    for (const name of ENGINE_BINARIES)
+      expect(await streamDigest(join(stable, name))).toBe(sha(`${name} build`));
+    // An AppImage mounts the same build at a new path: the shipped digests name
+    // the same directory without hashing the mounted engines.
+    const second = engineSource(root, "mount-b");
+    writeFileSync(
+      join(second, SHIPPED_DIGESTS),
+      JSON.stringify(
+        Object.fromEntries(
+          ENGINE_BINARIES.map((name) => [name, sha(`${name} build`)]),
+        ),
+      ),
+    );
+    expect(readShippedDigests(second)?.get("twr")).toBe(sha("twr build"));
+    expect(await stageEngines(second, engines, true)).toBe(stable);
+    // A damaged staged copy is replaced.
+    writeFileSync(join(stable, "twr"), "tampered");
+    expect(await stageEngines(second, engines, true)).toBe(stable);
+    expect(await streamDigest(join(stable, "twr"))).toBe(sha("twr build"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it("ignores shipped digests that do not match the engines beside them", async () => {
+  const root = mkdtempSync(join(tmpdir(), "twr-engine-manifest-"));
+  try {
+    const source = engineSource(root, "mount");
+    const engines = join(root, "engines");
+    writeFileSync(
+      join(source, SHIPPED_DIGESTS),
+      JSON.stringify(
+        Object.fromEntries(ENGINE_BINARIES.map((name) => [name, sha(name)])),
+      ),
+    );
+    const stable = await stageEngines(source, engines, true);
+    const honest = await stageEngines(source, join(root, "honest"));
+    expect(stable.slice(engines.length)).toBe(
+      honest.slice(join(root, "honest").length),
+    );
+    expect(await streamDigest(join(stable, "twr"))).toBe(sha("twr build"));
+    // No half-copied scratch files remain in the rejected directory.
+    const rejected = createHash("sha256")
+      .update(JSON.stringify(ENGINE_BINARIES.map((name) => [name, sha(name)])))
+      .digest("hex");
+    expect(
+      (await fs.readdir(join(engines, rejected))).filter((name) =>
+        name.startsWith("."),
+      ),
+    ).toEqual([]);
+    // Malformed manifests are not trusted at all.
+    writeFileSync(join(source, SHIPPED_DIGESTS), '{"twr":"nope"}');
+    expect(readShippedDigests(source)).toBeUndefined();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("engine cleanup retains running hubs and two recent versions", () => {
   const root = mkdtempSync(join(tmpdir(), "twr-engine-retain-"));
   try {
@@ -100,7 +197,11 @@ it("retains an engine used by a live OS process and prunes it after exit", async
       mkdirSync(dir);
       utimesSync(dir, new Date(i * 1000), new Date(i * 1000));
     });
-    const executable = join(dirs[0], "twr");
+    // The copy keeps the name sleep: on some Linux systems /bin/sleep is a
+    // multi-call binary that picks its program by the name of its own file,
+    // and under any other name it exits at once. Only the engine's directory
+    // matters to the cleanup.
+    const executable = join(dirs[0], "sleep");
     copyFileSync("/bin/sleep", executable);
     chmodSync(executable, 0o755);
     // Current macOS can kill a copied platform binary after spawn. Give the

@@ -51,6 +51,10 @@ chown twr-runtime:twr-runtime "$fixture/config.toml"
 chmod 600 "$fixture/config.toml"
 stat -c 'Sandbox helper: %U:%G %a %n' /opt/twr/chrome-sandbox
 test "$(stat -c %u /opt/twr/chrome-sandbox)" = 0
+# The release package must not carry the QA marker (desktop/automation.ts); this test
+# install gets it, as root, so the packaged app honours TWR_DESKTOP_TEST_AUTOMATION.
+test ! -e /opt/twr/resources/twr-qa-automation
+echo 'QA install: honours TWR_DESKTOP_TEST_AUTOMATION.' > /opt/twr/resources/twr-qa-automation
 
 launcher=
 cleanup() {
@@ -58,6 +62,13 @@ cleanup() {
     kill -- -"$launcher" 2>/dev/null || true
     wait "$launcher" 2>/dev/null || true
   fi
+  # The hub the app started outlives it, and so does the runner service that hub started
+  # for this TWR_HOME (docs/runner-links.md): stop both, the hub first.
+  for command in "hub stop" "runner stop"; do
+    # shellcheck disable=SC2086 # two words on purpose
+    runuser -u twr-runtime -- env HOME=/home/twr-runtime TWR_HOME="$fixture" \
+      timeout 20 /opt/twr/resources/bin/twr $command > /dev/null 2>&1 || true
+  done
   cat /tmp/twr-runtime-application.log 2>/dev/null || true
 }
 trap cleanup EXIT

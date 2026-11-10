@@ -1015,7 +1015,7 @@ async fn connection(
             loop {
                 tokio::select! {
                     _ = device_tick.tick() => {
-                        if conn.device.as_ref().is_some_and(|d| !hub.device_auth().is_ok_and(|a|a.current(d))) {break None;}
+                        if conn.device.as_ref().is_some_and(|d| twr_core::devices::Standing::of(hub.device_auth(), d).revoked()) {break None;}
                     }
                     f = &mut read => break Some(f),
                     _ = wait_state(&mut state, |s| *s == HubState::Stopped) => {
@@ -1052,8 +1052,22 @@ async fn connection(
         };
         let id = req.id;
         if let Some(device) = &conn.device {
-            if !hub.device_auth().is_ok_and(|a| a.current(device)) {
-                break;
+            // Judged by the records as they are now: a device revoked since is disconnected,
+            // and while they can't be read nothing is known (it may have been revoked or
+            // narrowed), so the request is refused, to be tried again, never granted by the
+            // scopes the device had at `hello`.
+            match twr_core::devices::Standing::of(hub.device_auth(), device) {
+                twr_core::devices::Standing::Current => {}
+                twr_core::devices::Standing::Revoked => break,
+                twr_core::devices::Standing::Unknown => {
+                    tracing::warn!(device = %device.id, method = %req.method, "cannot read the paired devices; refusing the device's request");
+                    let _ = send(
+                        &writer,
+                        &Response::err(id, crate::hub::devices_unreadable()),
+                    )
+                    .await;
+                    continue;
+                }
             }
             if !device.allows_params(&req.method, &req.params)
                 || matches!(
@@ -1598,45 +1612,38 @@ const WRITE_BATCH: usize = 64 * 1024;
 
 /// A subscription [`pump`] serves.
 trait Feed: Send {
-    type Item: Send;
-    /// The next item; `Ok(None)` once the hub has shut down.
-    fn next(
+    /// Appends the line of the next item to `buf`, waiting for it when it is still to come;
+    /// `Ok(false)` once the hub has shut down.
+    fn next_line(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send;
+        buf: &mut Vec<u8>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
     /// Appends the line of the next item already in the store to `buf`; `Ok(false)` when none
     /// is, without waiting.
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool>;
-    /// Appends `item` to `buf` as its line.
-    fn line(item: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()>;
 }
 
 impl Feed for crate::hub::ControlSubscription {
-    type Item = crate::hub::ControlItem;
-    fn next(
+    fn next_line(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
-        crate::hub::ControlSubscription::next(self)
+        buf: &mut Vec<u8>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        crate::hub::ControlSubscription::next_line(self, buf)
     }
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
         crate::hub::ControlSubscription::write_stored(self, buf)
     }
-    fn line((gseq, ev): &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
-        crate::hub::stream_line(buf, Some(*gseq), ev)
-    }
 }
 
 impl Feed for crate::hub::ThreadSubscription {
-    type Item = Arc<Event>;
-    fn next(
+    fn next_line(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
-        crate::hub::ThreadSubscription::next(self)
+        buf: &mut Vec<u8>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        crate::hub::ThreadSubscription::next_line(self, buf)
     }
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
         crate::hub::ThreadSubscription::write_stored(self, buf)
-    }
-    fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
-        crate::hub::stream_line(buf, None, ev)
     }
 }
 
@@ -1664,13 +1671,9 @@ async fn pump<F: Feed>(w: Writer, id: u64, ack: Value, mut sub: F) {
         }
         // Nothing stored left: the next item comes live.
         if buf.is_empty() && failed.is_none() {
-            match sub.next().await {
-                Ok(Some(item)) => {
-                    if F::line(&item, &mut buf).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => break,
+            match sub.next_line(&mut buf).await {
+                Ok(true) => {}
+                Ok(false) => break,
                 Err(e) => failed = Some(e),
             }
         }
@@ -2560,8 +2563,10 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             codes::UNSUPPORTED,
             format!(
                 "this twr is older than the hub (protocol {}, the hub's is {PROTOCOL_VERSION}): \
-                 update it with `twr update` and start it again",
-                p.protocol.unwrap_or(0)
+                 update it to the hub's twr {} ({}) and start it again",
+                p.protocol.unwrap_or(0),
+                twr_core::version(),
+                crate::hub::to_hub_version()
             ),
         ));
     }
@@ -2587,7 +2592,8 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
         let device = hub
             .device_auth()
             .and_then(|a| a.authenticate(&token))
-            .map_err(|_| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
+            .map_err(|_| crate::hub::devices_unreadable())?
+            .ok_or_else(|| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
         conn.client = format!("device:{}", device.id);
         conn.device = Some(device);
         return Ok(
@@ -3385,15 +3391,16 @@ mod tests {
     }
 
     impl Feed for FakeFeed {
-        type Item = Arc<Event>;
-        async fn next(&mut self) -> anyhow::Result<Option<Self::Item>> {
+        async fn next_line(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
             if self.next >= self.stored + self.live {
-                return Ok(None);
+                return Ok(false);
             }
             if self.next >= self.stored {
                 tokio::task::yield_now().await;
             }
-            self.take()
+            let ev = self.take()?.unwrap();
+            crate::hub::stream_line(buf, None, &ev)?;
+            Ok(true)
         }
         fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
             if self.next >= self.stored {
@@ -3402,9 +3409,6 @@ mod tests {
             let ev = self.take()?.unwrap();
             crate::hub::stream_line(buf, None, &ev)?;
             Ok(true)
-        }
-        fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
-            crate::hub::stream_line(buf, None, ev)
         }
     }
 
@@ -3456,6 +3460,113 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("the store failed"));
+    }
+
+    /// How long recording events takes with clients streaming them: [`APPENDS`] appends (half
+    /// `agent.text`, half `task.updated`, which is also a control item) through the single
+    /// writer, with [`SUBSCRIBERS`] control and as many thread subscriptions pumped to sockets
+    /// whose other ends read every line. Reports the time spent appending (all of it under the
+    /// core lock) and until every subscriber had every line. Run in release mode:
+    ///
+    /// ```sh
+    /// cargo test --release -p twr-hub --lib -- --ignored --nocapture fan_out_bench
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn fan_out_bench() {
+        use tokio::io::AsyncBufReadExt;
+        const APPENDS: u64 = 5000;
+        const SUBSCRIBERS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = HubOptions::new(dir.path().join("twr.db"), Config::default());
+        // Room for the whole run: this measures the work, not catching up after a lag.
+        opts.broadcast_capacity = 2 * APPENDS as usize;
+        let hub = Hub::open(opts).await.unwrap();
+        let created = hub
+            .append(
+                "t1",
+                None,
+                twr_core::event::Source::Hub,
+                twr_core::event::EventBody::ThreadCreated(twr_core::event::ThreadCreated {
+                    name: "bench".into(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        let mut readers = Vec::new();
+        for i in 0..2 * SUBSCRIBERS {
+            let (a, b) = UnixStream::pair().unwrap();
+            let (_r, w) = a.into_split();
+            let w = Arc::new(Mutex::new(w));
+            // Thread subscriptions see every event; control ones, the `task.updated` half.
+            let want = if i < SUBSCRIBERS {
+                let sub = hub.subscribe_control(hub.control_read(0, 0).unwrap().1);
+                tokio::spawn(pump(w, 1, json!({}), sub));
+                APPENDS / 2
+            } else {
+                let sub = hub.subscribe_thread("t1", created.seq).unwrap();
+                tokio::spawn(pump(w, 1, json!({}), sub));
+                APPENDS
+            };
+            readers.push(tokio::spawn(async move {
+                let mut lines = BufReader::new(b).lines();
+                // The ack, then the items.
+                lines.next_line().await.unwrap();
+                for _ in 0..want {
+                    lines.next_line().await.unwrap().unwrap();
+                }
+                drop(_r);
+            }));
+        }
+        /// The CPU time this process used so far (user and system, every thread).
+        fn cpu() -> std::time::Duration {
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            let t = |tv: libc::timeval| {
+                std::time::Duration::from_micros(tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64)
+            };
+            t(u.ru_utime) + t(u.ru_stime)
+        }
+        let started = std::time::Instant::now();
+        let cpu_started = cpu();
+        let mut appending = std::time::Duration::ZERO;
+        for i in 0..APPENDS {
+            let body = if i % 2 == 0 {
+                twr_core::event::EventBody::AgentText(twr_core::event::AgentText {
+                    text: format!("Looking at step {i}: {}", "x".repeat(300)),
+                    ..Default::default()
+                })
+            } else {
+                twr_core::event::EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                    task_id: format!("task-{}", i / 20),
+                    running: true,
+                    description: "cargo test --workspace".into(),
+                    ..Default::default()
+                })
+            };
+            let t = std::time::Instant::now();
+            hub.append("t1", Some(1), twr_core::event::Source::Hub, body, None)
+                .unwrap();
+            appending += t.elapsed();
+            if i % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for r in readers {
+            r.await.unwrap();
+        }
+        let total = started.elapsed();
+        let cpu_used = cpu() - cpu_started;
+        eprintln!(
+            "{APPENDS} appends, {SUBSCRIBERS}+{SUBSCRIBERS} subscribers: appending {:.1} ms \
+             ({:.1} us each, under the core lock), every line delivered after {:.1} ms, \
+             {:.1} ms of CPU in all",
+            appending.as_secs_f64() * 1e3,
+            appending.as_secs_f64() * 1e6 / APPENDS as f64,
+            total.as_secs_f64() * 1e3,
+            cpu_used.as_secs_f64() * 1e3,
+        );
     }
 
     /// A connection from this test process that presented `token`, opened by this process
@@ -3536,8 +3647,67 @@ mod tests {
         .await
         .is_err());
         auth.revoke(&device.id).unwrap();
-        assert!(!auth.current(local.device.as_ref().unwrap()));
-        assert!(auth.authenticate(&token).is_err());
+        assert!(auth.current(local.device.as_ref().unwrap()).revoked());
+        assert!(auth.authenticate(&token).unwrap().is_none());
+    }
+
+    /// A device's request is judged by its records as they are when it comes: while they
+    /// can't be read it is refused with an error to try again (never served on the scopes the
+    /// device had at `hello`), the connection stays, and once they read again the device's
+    /// requests are served; a device revoked since is disconnected.
+    #[tokio::test]
+    async fn a_device_s_request_is_refused_while_its_records_cannot_be_read() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = HubOptions::new(dir.path().join("twr.db"), Config::default());
+        options.config_file = Some(dir.path().join("config.toml"));
+        let hub = Hub::open(options).await.unwrap();
+        let auth = hub.device_auth().unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let (device, token) = auth.pair(&code, "Test phone").unwrap();
+        let records = dir.path().join("mobile").join("devices.json");
+        let good = std::fs::read(&records).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let served = tokio::spawn(connection(
+            hub.clone(),
+            a,
+            "cli".into(),
+            Arc::new(SubCount::default()),
+        ));
+        let (r, mut w) = b.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut call = async |id: u64, method: &str, params: Value| -> Option<Value> {
+            let req = json!({"id": id, "method": method, "params": params});
+            w.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+            let line = lines.next_line().await.unwrap()?;
+            Some(serde_json::from_str(&line).unwrap())
+        };
+        let hi =
+            json!({"client": "mobile-test", "protocol": PROTOCOL_VERSION, "device_token": token});
+        let r = call(1, "hello", hi).await.unwrap();
+        assert_eq!(
+            r["result"]["client"],
+            format!("device:{}", device.id),
+            "{r}"
+        );
+        let r = call(2, "hub.info", Value::Null).await.unwrap();
+        assert!(r["result"].is_object(), "{r}");
+        std::fs::write(&records, b"{\"devices\": [").unwrap();
+        let r = call(3, "hub.info", Value::Null).await.unwrap();
+        assert_eq!(r["error"]["code"], codes::INTERNAL, "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Try again"),
+            "{r}"
+        );
+        std::fs::write(&records, &good).unwrap();
+        let r = call(4, "hub.info", Value::Null).await.unwrap();
+        assert!(r["result"].is_object(), "{r}");
+        auth.revoke(&device.id).unwrap();
+        assert_eq!(call(5, "hub.info", Value::Null).await, None);
+        served.await.unwrap();
     }
 
     /// A peer whose credentials cannot be read, or name no pid the hub can see, is no user: it

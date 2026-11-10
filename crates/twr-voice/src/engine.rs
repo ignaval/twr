@@ -62,7 +62,32 @@ pub struct Status {
     /// Why there is none, and how to set one up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    /// Whether `twr voice setup` sets it up: whisper.cpp is there and only the default model
+    /// is missing (the desktop app offers to download it).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub setup: bool,
+    /// `[voice] pause_ms`: what the app listening hands-free takes for the end of an utterance.
+    pub pause_ms: u64,
+    /// `[voice] listen_while_speaking`: whether hands-free listens while replies are read.
+    pub listen_while_speaking: bool,
 }
+
+/// The default model is not there yet: `twr voice setup` downloads it ([`MODEL_URL`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingModel(pub PathBuf);
+
+impl std::fmt::Display for MissingModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no speech model yet: `twr voice setup` downloads whisper's base.en ({MODEL_SIZE}) to \
+             {}, or name yours with [voice] model (docs/voice.md)",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for MissingModel {}
 
 /// The recognizer `cfg` names, with `data_dir` (twr's data directory: the default model) and
 /// `path` (`$PATH`). Fails, saying how to set one up, when there is none.
@@ -78,15 +103,19 @@ pub fn resolve(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> anyh
                 .ok_or_else(|| anyhow!("voice.whisper: {} not found", cfg.whisper))?
         };
         let model = if cfg.model.trim().is_empty() {
-            data_dir.join(DEFAULT_MODEL)
+            let model = data_dir.join(DEFAULT_MODEL);
+            if !model.is_file() {
+                return Err(MissingModel(model).into());
+            }
+            model
         } else {
             expand_home(cfg.model.trim())
         };
         if !model.is_file() {
             bail!(
-                "no whisper model at {}: {}",
-                model.display(),
-                model_hint(&model)
+                "no whisper model at {} ([voice] model): download one, or leave [voice] model \
+                 empty and run `twr voice setup` (docs/voice.md)",
+                model.display()
             );
         }
         Ok(Kind::Whisper {
@@ -121,12 +150,18 @@ pub fn status(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> Statu
             engine: Some(k.name().to_string()),
             local: k.local(),
             problem: None,
+            setup: false,
+            pause_ms: cfg.pause_ms,
+            listen_while_speaking: cfg.listen_while_speaking,
         },
         Err(e) => Status {
             available: false,
             engine: None,
             local: false,
+            setup: e.downcast_ref::<MissingModel>().is_some(),
             problem: Some(format!("{e:#}")),
+            pause_ms: cfg.pause_ms,
+            listen_while_speaking: cfg.listen_while_speaking,
         },
     }
 }
@@ -136,15 +171,25 @@ const NO_WHISPER: &str = "no speech recognizer: install whisper.cpp (`brew insta
                           `whisper-cli` is on PATH, or set [voice] engine = \"command\" \
                           (docs/voice.md)";
 
-/// How to get the model at `model`.
-fn model_hint(model: &Path) -> String {
-    format!(
-        "download one (`mkdir -p {dir} && curl -L -o {file} \
-         https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin`) or name \
-         yours with [voice] model (docs/voice.md)",
-        dir = model.parent().unwrap_or(Path::new(".")).display(),
-        file = model.display(),
-    )
+/// The commit of whisper.cpp's model repository on Hugging Face (`ggerganov/whisper.cpp`)
+/// that [`MODEL_URL`] is pinned to, so the file can't change under the same URL.
+pub const MODEL_COMMIT: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+/// Where `twr voice setup` downloads [`DEFAULT_MODEL`] from: whisper.cpp's own models, at
+/// [`MODEL_COMMIT`].
+pub const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/\
+                             5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin";
+/// The SHA-256 of `ggml-base.en.bin` at [`MODEL_COMMIT`] (its Git LFS `oid`, checked against
+/// a download): `twr voice setup` keeps no file with another.
+pub const MODEL_SHA256: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002";
+/// Its size in bytes.
+pub const MODEL_BYTES: u64 = 147_964_211;
+/// Its size, as said to the user.
+pub const MODEL_SIZE: &str = "148 MB";
+
+/// Whether `head`, a downloaded file's first bytes, starts a whisper.cpp model: ggml's magic,
+/// `0x67676d6c` little-endian.
+pub fn is_model(head: &[u8]) -> bool {
+    head.starts_with(&0x6767_6d6c_u32.to_le_bytes())
 }
 
 /// `~/x` as the home directory's `x`.
@@ -354,6 +399,24 @@ mod tests {
     use crate::wav::{encode, RATE};
     use std::os::unix::fs::PermissionsExt;
 
+    /// The model is downloaded from one commit of its repository, never a branch, and is
+    /// checked against a whole SHA-256.
+    #[test]
+    fn the_model_url_is_pinned_to_a_commit() {
+        assert_eq!(MODEL_COMMIT.len(), 40);
+        assert!(MODEL_COMMIT.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(
+            MODEL_URL,
+            format!(
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/{MODEL_COMMIT}/ggml-base.en.bin"
+            )
+        );
+        assert_eq!(MODEL_SHA256.len(), 64);
+        assert!(MODEL_SHA256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -386,7 +449,9 @@ mod tests {
         let e = resolve(&cfg(), d.path(), Some(&path))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("no whisper model") && e.contains("curl"), "{e}");
+        assert!(e.contains("twr voice setup"), "{e}");
+        let s = status(&cfg(), d.path(), Some(&path));
+        assert!(!s.available && s.setup, "{s:?}");
         std::fs::create_dir_all(d.path().join("voice")).unwrap();
         std::fs::write(d.path().join(DEFAULT_MODEL), b"model").unwrap();
         let k = resolve(&cfg(), d.path(), Some(&path)).unwrap();
@@ -400,7 +465,48 @@ mod tests {
         );
         assert!(k.local());
         let s = status(&cfg(), d.path(), Some(&path));
-        assert!(s.available && s.local, "{s:?}");
+        assert!(s.available && s.local && !s.setup, "{s:?}");
+    }
+
+    #[test]
+    fn setup_is_offered_only_for_the_default_model() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = bin.as_os_str().to_owned();
+        // No whisper.cpp: a download would not help.
+        assert!(!status(&cfg(), d.path(), Some(&path)).setup);
+        script(&bin, "whisper-cli", "exit 0");
+        // A model of the user's that isn't there: theirs to fix.
+        let mut c = cfg();
+        c.model = d.path().join("mine.bin").to_string_lossy().into_owned();
+        let s = status(&c, d.path(), Some(&path));
+        assert!(!s.available && !s.setup, "{s:?}");
+        assert!(s.problem.unwrap().contains("mine.bin"));
+        let json = serde_json::to_value(status(&cfg(), d.path(), Some(&path))).unwrap();
+        assert_eq!(json["setup"], true, "{json}");
+    }
+
+    #[test]
+    fn status_tells_the_app_how_to_listen_hands_free() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().as_os_str().to_owned();
+        let json = serde_json::to_value(status(&cfg(), d.path(), Some(&path))).unwrap();
+        assert_eq!(json["pause_ms"], 2000, "{json}");
+        assert_eq!(json["listen_while_speaking"], false, "{json}");
+        let mut c = cfg();
+        c.pause_ms = 3500;
+        c.listen_while_speaking = true;
+        let json = serde_json::to_value(status(&c, d.path(), Some(&path))).unwrap();
+        assert_eq!(json["pause_ms"], 3500, "{json}");
+        assert_eq!(json["listen_while_speaking"], true, "{json}");
+    }
+
+    #[test]
+    fn a_model_starts_with_ggml_magic() {
+        assert!(is_model(b"lmgg\x00\x00"));
+        assert!(!is_model(b"<!DOCTYPE html>"));
+        assert!(!is_model(b"lm"));
     }
 
     #[test]

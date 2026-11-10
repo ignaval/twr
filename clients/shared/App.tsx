@@ -11,6 +11,8 @@ import { AttachmentManager } from "./AttachmentManager";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
+import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
+import { attentionSummary } from "./attentionSummary";
 import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
@@ -20,6 +22,7 @@ import {
   useId,
   useLayoutEffect,
   useMemo,
+  memo,
   useRef,
   useState,
   lazy,
@@ -27,6 +30,7 @@ import {
   type CSSProperties,
   type FormEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -62,9 +66,9 @@ import {
   Trash2,
   Volume2,
   Command as CommandIcon,
+  Check,
   CheckCircle2,
   Circle,
-  Copy,
   ExternalLink,
   Download,
   Paperclip,
@@ -72,6 +76,7 @@ import {
   EyeOff,
   Filter,
   AlertCircle,
+  FolderPlus,
 } from "lucide-react";
 import {
   commands as applicationCommands,
@@ -89,15 +94,36 @@ import type {
   Thread,
   ViewState,
 } from "./types";
-import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
-import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
+import {
+  CopyButton,
+  DataView,
+  Dialog,
+  Empty,
+  FieldInput,
+  LinkConfirm,
+  Markdown,
+  Spinner,
+} from "./ui";
+import { effortChoices, formRuntime, modelChoices } from "./models";
+import {
+  AssistanceNotice,
+  takesSuggestion,
+  useAssistance,
+  type Summary,
+} from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { announcements, voiceHint } from "./voice";
-import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
+import {
+  blocksOf,
+  mergeEvents,
+  foldRoutineBlocks,
+  messageTime,
+} from "./transcript";
 import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
+import { armed, armsIn, hidden, mayAnswer, shown, type Arming } from "./arming";
 import {
   announce,
   attentionAnnouncement,
@@ -112,6 +138,7 @@ const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
 
+const noAttention: Attention[] = [];
 const initial: ViewState = {
   threads: [],
   attention: [],
@@ -155,6 +182,17 @@ function operationAction(command: Command, again: boolean) {
   };
   const label = labels[command.id] || command.title.replace(/…$/, "");
   return again ? `${label} again` : label;
+}
+/** A list of strings saved in local storage; anything else there reads as empty. */
+function storedList(key: string): string[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "[]");
+    return Array.isArray(saved)
+      ? saved.filter((v): v is string => typeof v === "string").slice(0, 256)
+      : [];
+  } catch {
+    return [];
+  }
 }
 function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
   const root = document.documentElement;
@@ -269,9 +307,20 @@ export default function App({
   const [hovering, setHovering] = useState(false);
   const [focus, setFocus] = useState(false);
   const [parked, setParked] = useState(false);
-  const [pins, setPins] = useState<string[]>(() =>
-    JSON.parse(localStorage.getItem("twr.pins") || "[]"),
+  const [collapsed, setCollapsed] = useState<string[]>(() =>
+    storedList("twr.sidebar.collapsed"),
   );
+  const pendingOpen = useRef<{
+    workspace: string;
+    thread?: string;
+    talk: boolean;
+    then?: () => void;
+  }>(undefined);
+  /** Opens Needs you at a thread's request, in its workspace (the tray, notifications). */
+  const openAttention = useRef<(workspace?: string, thread?: string) => void>(
+    () => {},
+  );
+  const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
   const observedDestination = useRef<string | undefined>(undefined);
@@ -401,6 +450,10 @@ export default function App({
   const [confirmation, setConfirmation] = useState<{
     title: string;
     detail: string;
+    /** The confirming button's label: the action it takes. */
+    action: string;
+    /** Something stops, goes or is interrupted: the button says so in danger style. */
+    destructive?: boolean;
     run: () => void;
   }>();
   const [workspaceModal, setWorkspaceModal] = useState(false);
@@ -415,6 +468,8 @@ export default function App({
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
+  /** The conversation whose transcript on screen was loaded live from the hub. */
+  const liveTranscript = useRef<string | undefined>(undefined);
   const activeSubscription = useRef("");
   const pendingEvents = useRef<HubEvent[]>([]);
   const eventTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -438,19 +493,42 @@ export default function App({
   const draftKey = workspace + ":" + (destination || "orchestrator");
   const draft = drafts[draftKey] || "";
   const selectedThread = view.threads.find((t) => t.id === selected);
-  // The desktop tray/menu bar and Dock badge mirror what needs the user.
+  // The desktop tray/menu bar, Dock badge and notifications mirror what needs the user in
+  // every workspace: this one's live view and the others' latest reads. The live view's
+  // stream starts over on each (re)connection and resync, so what it lists first is not
+  // taken for news (desktop/notify-state.ts).
+  const [resyncs, setResyncs] = useState(0);
+  const liveStream = useRef({ epoch: 0, connected: false, resyncs: 0 });
   useEffect(() => {
-    window.twrApp?.setAttention({
-      count: view.attention.length,
-      items: view.attention.slice(0, 5).map((item) => ({
-        thread: item.thread,
-        title: (
-          view.threads.find((t) => t.id === item.thread)?.name || item.thread
-        ).slice(0, 200),
-        summary: (item.summary || item.reason || "").slice(0, 300),
-      })),
-    });
-  }, [view.attention, view.threads]);
+    if (!window.twrApp) return;
+    const stream = liveStream.current;
+    if ((connected && !stream.connected) || resyncs !== stream.resyncs)
+      stream.epoch++;
+    stream.connected = connected;
+    stream.resyncs = resyncs;
+    window.twrApp.setAttention(
+      attentionSummary({
+        current: workspace,
+        hubId: hostId,
+        live: connecting
+          ? undefined
+          : { threads: view.threads, attention: view.attention },
+        liveStream: connected
+          ? `live:${hostId}:${workspace}:${stream.epoch}`
+          : undefined,
+        sources: inboxSources,
+      }),
+    );
+  }, [
+    view.threads,
+    view.attention,
+    inboxSources,
+    workspace,
+    hostId,
+    connected,
+    connecting,
+    resyncs,
+  ]);
   const [visibleRoutines, setVisibleRoutines] = useState<string[]>([]);
   const presentedEvents = useMemo(() => {
     const resolved = new Set(view.went_on || []);
@@ -516,9 +594,18 @@ export default function App({
     },
     [target?.worktree, target?.repo, target?.box_name, homePath],
   );
+  const infoRef = useRef(info);
+  infoRef.current = info;
   const action = useCallback(
     (id: string, initialValues: Json = {}) => {
       const command = commands.find((c) => c.id === id);
+      // Choosing the first orchestrator starts from the one the hub would start: its
+      // runtime, and the runtime's default model unless one is picked.
+      const o = infoRef.current?.orchestrator;
+      if (id === "orch" && !initialValues.runtime && o && !o.thread) {
+        const runtime = o.configured?.runtime || o.runtime;
+        if (runtime) initialValues = { ...initialValues, runtime };
+      }
       if (command) openOperation(command, initialValues);
     },
     [openOperation, commands],
@@ -546,6 +633,22 @@ export default function App({
     const value = await rpc("hub.info");
     setInfo(value);
   }, [rpc]);
+  // What the model pickers offer (`orchestrator.show` `models`), once per hub: a list that
+  // changes only with twr. An older hub has none, and its model fields stay free text.
+  const [modelCatalog, setModelCatalog] = useState<Json>();
+  useEffect(() => {
+    setModelCatalog(undefined);
+    if (!connected) return;
+    let live = true;
+    void rpc("orchestrator.show")
+      .then((show) => {
+        if (live) setModelCatalog(show?.models);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [connected, workspace, rpc]);
   const refreshWorkspaces = useCallback(async () => {
     const value = await hostApi.cli(["ws", "list", "--json"]);
     if (value.code !== 0) throw new Error(value.stderr || value.stdout);
@@ -553,37 +656,66 @@ export default function App({
     setWorkspaces(Array.isArray(parsed) ? parsed : parsed.workspaces || []);
   }, []);
   const inboxGeneration = useRef(0);
-  const refreshInboxSources = useCallback(async () => {
-    if (!hostApi.inboxSources) return;
-    const generation = ++inboxGeneration.current;
-    setInboxRefreshing(true);
-    try {
-      const sources = await hostApi.inboxSources();
-      if (generation === inboxGeneration.current)
-        setInboxSources(
-          sources.map((source) => ({
-            ...source,
-            updatedAt:
-              source.updatedAt ||
-              (!source.cached && !source.error && source.running !== false
-                ? Date.now()
-                : undefined),
-          })),
-        );
-    } catch (error) {
-      if (generation === inboxGeneration.current) {
-        setInboxSources((old) =>
-          old.map((source) => ({ ...source, cached: true })),
-        );
-        fail(error);
+  // `quiet`: the sidebar's background reads, which neither show progress nor report errors.
+  const refreshInboxSources = useCallback(
+    async (quiet = false) => {
+      if (!hostApi.inboxSources) return;
+      const generation = ++inboxGeneration.current;
+      if (!quiet) setInboxRefreshing(true);
+      try {
+        const sources = await hostApi.inboxSources();
+        if (generation === inboxGeneration.current)
+          setInboxSources(
+            sources.map((source) => ({
+              ...source,
+              updatedAt:
+                source.updatedAt ||
+                (!source.cached && !source.error && source.running !== false
+                  ? Date.now()
+                  : undefined),
+            })),
+          );
+      } catch (error) {
+        if (generation === inboxGeneration.current) {
+          setInboxSources((old) =>
+            old.map((source) => ({ ...source, cached: true })),
+          );
+          if (!quiet) fail(error);
+        }
+      } finally {
+        if (generation === inboxGeneration.current) setInboxRefreshing(false);
       }
-    } finally {
-      if (generation === inboxGeneration.current) setInboxRefreshing(false);
-    }
-  }, [hostApi, fail]);
+    },
+    [hostApi, fail],
+  );
   useEffect(() => {
     if (section === "attention" && connected) void refreshInboxSources();
   }, [section, connected, workspace, refreshInboxSources]);
+  // The sidebar lists every workspace's threads, as the TUI's does: while it shows, the other
+  // workspaces are re-read now and then over short-lived read-only connections.
+  const sidebarReads = sidebar && connected && workspaces.length > 1;
+  useEffect(() => {
+    if (!sidebarReads) return;
+    const read = () => {
+      if (document.visibilityState !== "hidden") void refreshInboxSources(true);
+    };
+    read();
+    const timer = setInterval(read, WORKSPACE_REFRESH_MS);
+    document.addEventListener("visibilitychange", read);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", read);
+    };
+  }, [sidebarReads, workspace, refreshInboxSources]);
+  // The desktop also reads them on its main process's beat (`inbox-poll`), whatever the
+  // sidebar shows and while the window is hidden, so that its tray, badge and
+  // notifications cover every workspace. A shown sidebar reads on its own timer.
+  const inboxPoll = useRef(() => {});
+  inboxPoll.current = () => {
+    if (!connected || workspaces.length < 2) return;
+    if (sidebarReads && document.visibilityState !== "hidden") return;
+    void refreshInboxSources(true);
+  };
   const openTerminal = useCallback(
     async (
       request: Parameters<typeof hostApi.terminalOpen>[0],
@@ -707,8 +839,11 @@ export default function App({
     const unsubscribe = hostApi.onEvent((event) => {
       if (event.type === "resync" && event.scope !== "control")
         refreshTerminals();
-      if (event.type === "resync" && event.scope !== "terminal")
+      if (event.type === "resync" && event.scope !== "terminal") {
         setTranscriptRefresh((n) => n + 1);
+        setResyncs((n) => n + 1);
+      }
+      if (event.type === "inbox-poll") inboxPoll.current();
       if (event.type === "state" && event.state) {
         liveView.current = true;
         hasLiveSnapshot.current = true;
@@ -778,11 +913,8 @@ export default function App({
         setSection("settings");
         setSidebar(false);
       }
-      if (event.type === "menu-attention") {
-        setSection("attention");
-        setSidebar(false);
-        if (event.thread) setSelected(event.thread);
-      }
+      if (event.type === "menu-attention")
+        openAttention.current(event.workspace, event.thread);
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");
@@ -928,15 +1060,30 @@ export default function App({
     activeThread.current = id;
     const generation = ++transcriptGeneration.current;
     const buffered = pendingEvents.current.splice(0);
+    const shownEvents = latestCache.current.events;
+    // Only a change of conversation clears the transcript.
+    const kept =
+      connected &&
+      id &&
+      previousThread === id &&
+      liveTranscript.current === id &&
+      shownEvents.length
+        ? mergeEvents(shownEvents, buffered)
+        : undefined;
+    // A disconnect keeps the live transcript on screen; its reconnect catches up.
+    if (previousThread !== id || !hasLiveSnapshot.current)
+      liveTranscript.current = undefined;
     setEvents((previous) =>
-      !connected && hasLiveSnapshot.current && previousThread === id
+      kept
         ? mergeEvents(previous, buffered)
-        : !connected && journal && id
-          ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
-          : [],
+        : !connected && hasLiveSnapshot.current && previousThread === id
+          ? mergeEvents(previous, buffered)
+          : !connected && journal && id
+            ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
+            : [],
     );
     setTranscriptError("");
-    setEarliestTurn(undefined);
+    if (!kept) setEarliestTurn(undefined);
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -947,6 +1094,41 @@ export default function App({
     }
     setTranscriptLoading(true);
     void (async () => {
+      // The same conversation again (a reconnect, a resync, a retry after a transcript
+      // error): keep what is on screen and catch up from its last event, so the view,
+      // its older turns and its scroll position stay. Far behind, reload it instead.
+      if (kept?.length) {
+        const last = kept[kept.length - 1].seq;
+        let page = await rpc("thread.transcript", {
+          thread: id,
+          since_seq: last,
+          limit: 500,
+        });
+        const fresh: HubEvent[] = [...page.events];
+        for (let pages = 1; page.more && pages < 8; pages++) {
+          page = await rpc("thread.transcript", {
+            thread: id,
+            since_seq: page.next,
+            limit: 500,
+          });
+          if (generation !== transcriptGeneration.current) return;
+          fresh.push(...page.events);
+        }
+        if (generation !== transcriptGeneration.current) return;
+        if (!page.more) {
+          setEvents((old) => mergeEvents(old, fresh));
+          liveTranscript.current = id;
+          const subscription = String(generation);
+          activeSubscription.current = subscription;
+          await rpc("desktop.subscribe", {
+            thread: id,
+            since: page.next || last,
+            subscription,
+          });
+          return;
+        }
+        setEarliestTurn(undefined);
+      }
       let page: Json;
       try {
         page = await rpc("thread.transcript", { thread: id, limit: 500 });
@@ -1005,6 +1187,7 @@ export default function App({
       if (generation !== transcriptGeneration.current) return;
       setEarliestTurn(firstTurn);
       setEvents(all);
+      liveTranscript.current = id;
       const subscription = String(generation);
       activeSubscription.current = subscription;
       await rpc("desktop.subscribe", {
@@ -1015,7 +1198,7 @@ export default function App({
     })()
       .catch((e) => {
         if (generation === transcriptGeneration.current)
-          setTranscriptError(String(e));
+          setTranscriptError(errorMessage(e));
       })
       .finally(() => {
         if (generation === transcriptGeneration.current)
@@ -1275,6 +1458,8 @@ export default function App({
       setConfirmation({
         title: operation.title,
         detail: operation.confirm,
+        action: operationAction(operation, false),
+        destructive: true,
         run: () => void run(),
       });
     else await run();
@@ -1440,16 +1625,14 @@ export default function App({
   // What this device may have read aloud lately, for voice mode's echo check: the
   // orchestrator's last messages (kept while a worker's conversation is on screen) and the
   // sentences a speaker announces.
-  const orchestratorSaid = useRef<string[]>([]);
-  useEffect(() => {
-    if (destination || !orchestrator) return;
-    orchestratorSaid.current = blocksOf(events)
+  // Read only when voice checks an utterance: not folded again on every event batch.
+  const orchestratorEvents = useRef<HubEvent[]>([]);
+  if (!destination && orchestrator) orchestratorEvents.current = events;
+  const spokenLately = () => [
+    ...blocksOf(orchestratorEvents.current)
       .filter((b) => b.kind === "assistant")
       .slice(-3)
-      .map((b) => b.text);
-  }, [events, destination, orchestrator?.id]);
-  const spokenLately = () => [
-    ...orchestratorSaid.current,
+      .map((b) => b.text),
     ...announcements(view.threads),
   ];
   async function submitSlash(text: string) {
@@ -1784,7 +1967,27 @@ export default function App({
       fail(error);
     }
   }
-  async function takeBack(message: Json) {
+  // A queued message's Take back / Send now run once at a time: its buttons are disabled
+  // while its request is in flight.
+  const [queueBusy, setQueueBusy] = useState<unknown[]>([]);
+  const queueInFlight = useRef(new Set<unknown>());
+  async function queueAction(message: Json, run: () => Promise<void>) {
+    const ref = message.ref;
+    if (queueInFlight.current.has(ref)) return;
+    queueInFlight.current.add(ref);
+    setQueueBusy([...queueInFlight.current]);
+    try {
+      await run();
+    } finally {
+      queueInFlight.current.delete(ref);
+      setQueueBusy([...queueInFlight.current]);
+    }
+  }
+  const takeBack = (message: Json) =>
+    queueAction(message, () => withdrawMessage(message));
+  const sendNow = (message: Json) =>
+    queueAction(message, () => sendMessageNow(message));
+  async function withdrawMessage(message: Json) {
     try {
       const response = await rpc("message.withdraw", {
         thread: target?.id,
@@ -1805,7 +2008,7 @@ export default function App({
       fail(error);
     }
   }
-  async function sendNow(message: Json) {
+  async function sendMessageNow(message: Json) {
     try {
       const response = await rpc("message.send_now", {
         thread: target?.id,
@@ -1828,7 +2031,9 @@ export default function App({
       const next = old.includes(id)
         ? old.filter((p) => p !== id)
         : [...old, id];
-      localStorage.setItem("twr.pins", JSON.stringify(next));
+      try {
+        localStorage.setItem("twr.pins", JSON.stringify(next));
+      } catch {}
       return next;
     });
   const workers = view.threads.filter((t) => !t.is_orchestrator);
@@ -1839,35 +2044,151 @@ export default function App({
         ["running", "background", "waiting", "error"].includes(t.status) ||
         view.attention.some((a) => a.thread === t.id)),
   );
-  const attentionFor = (id: string) =>
-    view.attention.filter((a) => a.thread === id);
-  const respond = async (item: Attention, answer: string, message?: string) => {
-    if (!connected || !liveView.current || !permitted("operate")) return;
-    try {
+  const attentionByThread = useMemo(() => {
+    const byThread = new Map<string, Attention[]>();
+    for (const item of view.attention)
+      byThread.set(item.thread, [...(byThread.get(item.thread) || []), item]);
+    return byThread;
+  }, [view.attention]);
+  const attentionFor = (id: string) => attentionByThread.get(id) || noAttention;
+  const selectThread = useCallback((id: string) => setSelected(id), []);
+  const openThread = useCallback((id: string) => {
+    setDestination(id);
+    setSection("chat");
+    setSelected(undefined);
+  }, []);
+  // While a workspace connects, its entry keeps the rows it had (a double-click's second
+  // click lands on the row the first one chose).
+  const entries = workspaceEntries(
+    workspaces,
+    workspace,
+    hostId,
+    inboxSources,
+    connecting
+      ? undefined
+      : { threads: view.threads, attention: view.attention },
+  );
+  const toggleCollapsed = (name: string) =>
+    setCollapsed((old) => {
+      const next = old.includes(name)
+        ? old.filter((n) => n !== name)
+        : [...old, name];
+      try {
+        localStorage.setItem("twr.sidebar.collapsed", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  /**
+   * Opens a workspace's orchestrator (no `thread`) or one of its threads from the sidebar,
+   * switching to the workspace first when it is another one. `talk` makes the thread the
+   * message destination (a double-click); otherwise it is selected, opening its inspector.
+   * Clicks while the switch connects update the pending request instead of switching again.
+   * `then` runs once it is open (a new thread's form, the grid).
+   */
+  const openIn = (
+    name: string,
+    thread?: string,
+    talk = false,
+    then?: () => void,
+  ) => {
+    const show = (
+      id: string | undefined,
+      toThread: boolean,
+      after?: () => void,
+    ) => {
+      setSection("chat");
+      if (!id) {
+        setDestination(undefined);
+        setSelected(undefined);
+      } else if (toThread) {
+        setDestination(id);
+        setSelected(undefined);
+      } else setSelected(id);
+      after?.();
+    };
+    // `connect` names the new workspace at once: until it finishes, clicks there update
+    // what opens once it has.
+    const pending = pendingOpen.current;
+    if (pending?.workspace === name) {
+      pendingOpen.current = {
+        workspace: name,
+        thread,
+        talk: pending.thread === thread ? pending.talk || talk : talk,
+        then,
+      };
+      return;
+    }
+    if (name === workspace) return show(thread, talk, then);
+    pendingOpen.current = { workspace: name, thread, talk, then };
+    const switched = connect(name);
+    // A later switch (here, the workspaces dialog, `/ws`) supersedes this one.
+    const generation = connectGeneration.current;
+    void switched.then(() => {
+      const wanted = pendingOpen.current;
+      if (wanted?.workspace !== name) return;
+      pendingOpen.current = undefined;
+      if (generation === connectGeneration.current)
+        show(wanted.thread, wanted.talk, wanted.then);
+    });
+  };
+  // Another workspace's request switches to it first, as the sidebar does.
+  openAttention.current = (name, thread) => {
+    const show = () => {
+      setSection("attention");
+      setSidebar(false);
+      if (thread) setSelected(thread);
+    };
+    if (name && name !== workspace) openIn(name, thread, false, show);
+    else show();
+  };
+  // Every attention answer (conversation cards, Needs you, the inspector, mobile) goes
+  // through here: only a live hub view, never a cached one, can authorize it.
+  const liveAnswerCheck = useCallback(() => {
+    if (!connectionRef.current || !liveView.current)
+      throw new Error(
+        "Not connected to the live hub. Reconnect and review the current request.",
+      );
+    if (deviceScopes && !deviceScopes.includes("operate"))
+      throw new Error("This device has read-only access.");
+  }, [deviceScopes]);
+  const respond = useCallback(
+    async (item: Attention, answer: string, message?: string) => {
+      liveAnswerCheck();
       await rpc("attention.respond", {
         attn_id: item.attn_id,
         revision: item.revision,
         answer,
         ...(message ? { message } : {}),
       });
-    } catch (e) {
-      fail(e);
-    }
-  };
-  const earlier = async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !target || earlierBusy) return;
+    },
+    [liveAnswerCheck, rpc],
+  );
+  const dismissAttention = useCallback(
+    async (item: Attention) => {
+      liveAnswerCheck();
+      await rpc("attention.dismiss", {
+        attn_id: item.attn_id,
+        revision: item.revision,
+      });
+    },
+    [liveAnswerCheck, rpc],
+  );
+  const earlierTarget = target?.id;
+  const earlier = useCallback(async () => {
+    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+      return;
     const generation = transcriptGeneration.current;
     setEarlierBusy(true);
     try {
       let page = await rpc("thread.transcript", {
-        thread: target.id,
+        thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
-          thread: target.id,
+          thread: earlierTarget,
           turn: earliestTurn - 1,
           since_seq: page.next,
           limit: 500,
@@ -1882,7 +2203,8 @@ export default function App({
     } finally {
       setEarlierBusy(false);
     }
-  };
+  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   function chooseMention(thread: Thread) {
     setDrafts((old) => ({
       ...old,
@@ -1956,7 +2278,7 @@ export default function App({
           if (
             window.innerWidth <= 800 &&
             (event.target as HTMLElement).closest(
-              ".primary-nav button,.thread-card,.sidebar-secondary button,.sidebar-footer button",
+              ".primary-nav button,.thread-card,.workspace-orchestrator,.workspace-thread,.sidebar-secondary button,.sidebar-footer button",
             )
           )
             setSidebar(false);
@@ -1979,55 +2301,7 @@ export default function App({
             <PanelLeftClose size={16} />
           </button>
         </div>
-        <div className="workspace-picker">
-          <label htmlFor="workspace-select">Workspace</label>
-          <div>
-            <select
-              id="workspace-select"
-              value={workspace}
-              disabled={connecting}
-              onChange={(e) => void connect(e.target.value)}
-            >
-              {[
-                ...new Set([
-                  workspace,
-                  ...workspaces.map((w) =>
-                    typeof w === "string" ? w : w.name,
-                  ),
-                ]),
-              ]
-                .filter(Boolean)
-                .map((w) => (
-                  <option key={w} value={w}>
-                    {w}
-                  </option>
-                ))}
-            </select>
-            <button
-              className="icon-button"
-              aria-label="Manage workspaces"
-              title="Manage workspaces"
-              aria-haspopup="dialog"
-              onClick={() => setWorkspaceModal(true)}
-            >
-              <Plus size={16} />
-            </button>
-          </div>
-        </div>
         <nav className="primary-nav" aria-label="Primary">
-          <button
-            className={section === "chat" && !destination ? "active" : ""}
-            aria-current={
-              section === "chat" && !destination ? "page" : undefined
-            }
-            onClick={() => {
-              setSection("chat");
-              setDestination(undefined);
-            }}
-          >
-            <MessageSquare size={17} />
-            Orchestrator
-          </button>
           <button
             className={section === "attention" ? "active" : ""}
             aria-current={section === "attention" ? "page" : undefined}
@@ -2054,8 +2328,8 @@ export default function App({
           </button>
         </nav>
         <div className="threads-heading">
-          <span role="heading" aria-level={2} id="twr-threads-heading">
-            Threads
+          <span role="heading" aria-level={2} id="twr-workspaces-heading">
+            Workspaces
           </span>
           <div>
             <button
@@ -2069,58 +2343,215 @@ export default function App({
             </button>
             <button
               className="icon-button"
-              aria-label="New thread"
-              title="New thread"
-              disabled={!permitted("operate")}
-              onClick={() => action("new")}
+              aria-label="Manage workspaces"
+              title="New or remove workspaces"
+              aria-haspopup="dialog"
+              onClick={() => setWorkspaceModal(true)}
             >
-              <Plus size={16} />
+              <FolderPlus size={15} />
             </button>
           </div>
         </div>
         <div
-          className="thread-list"
-          role="list"
-          aria-labelledby="twr-threads-heading"
-          onMouseEnter={() => setHovering(true)}
-          onMouseLeave={() => setHovering(false)}
+          className="workspace-tree"
+          aria-labelledby="twr-workspaces-heading"
+          role="group"
         >
-          {visible.map((thread) => (
-            <ThreadCard
-              listItem
-              key={thread.id}
-              thread={thread}
-              items={attentionFor(thread.id)}
-              dived={destination === thread.id}
-              selected={selected === thread.id}
-              pinned={pins.includes(thread.id)}
-              onSelect={() => setSelected(thread.id)}
-              onOpen={() => {
-                setDestination(thread.id);
-                setSection("chat");
-                setSelected(undefined);
-              }}
-            />
-          ))}
-          {!visible.length && (
-            <p className="sidebar-empty" role="listitem">
-              {workers.length
-                ? "No threads match your filters."
-                : "Threads appear here as your agents start working."}
-            </p>
-          )}
-        </div>
-        {workers.some((t) => t.status === "parked") && (
+          {entries.map((entry) => {
+            const shut = collapsed.includes(entry.name);
+            const headingId = `twr-ws-${entry.name}`;
+            const status =
+              entry.running === false
+                ? "hub not running"
+                : [
+                    entry.waiting ? `${entry.waiting} waiting on you` : "",
+                    entry.working ? `${entry.working} working` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(", ") || (entry.stale ? "not refreshed" : "idle");
+            const talkingToOrchestrator =
+              entry.current && section === "chat" && !destination;
+            return (
+              <section
+                key={entry.name}
+                className={`workspace-entry ${entry.current ? "current" : ""} ${entry.running === false ? "stopped" : ""}`}
+                data-workspace={entry.name}
+                aria-labelledby={headingId}
+              >
+                <div className="workspace-entry-head">
+                  <button
+                    className="workspace-toggle"
+                    id={headingId}
+                    aria-expanded={!shut}
+                    aria-current={entry.current ? "true" : undefined}
+                    title={`${entry.name}: ${status}`}
+                    onClick={() => toggleCollapsed(entry.name)}
+                  >
+                    {shut ? (
+                      <ChevronRight size={14} aria-hidden="true" />
+                    ) : (
+                      <ChevronDown size={14} aria-hidden="true" />
+                    )}
+                    <span className="workspace-name">{entry.name}</span>
+                    <span className="visually-hidden">, {status}</span>
+                    <span className="workspace-badges" aria-hidden="true">
+                      {entry.running === false ? (
+                        <span className="workspace-stopped">○</span>
+                      ) : (
+                        <>
+                          {entry.waiting > 0 && (
+                            <span className="workspace-waiting">
+                              ⚠{entry.waiting}
+                            </span>
+                          )}
+                          {entry.working > 0 && (
+                            <span className="workspace-working">
+                              ●{entry.working}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </span>
+                  </button>
+                  <button
+                    className="icon-button"
+                    aria-label={
+                      entry.current
+                        ? "New thread"
+                        : `New thread in ${entry.name}`
+                    }
+                    title={`New thread in ${entry.name}`}
+                    disabled={!permitted("operate")}
+                    onClick={() =>
+                      openIn(entry.name, undefined, false, () =>
+                        actionRef.current("new"),
+                      )
+                    }
+                  >
+                    <Plus size={15} />
+                  </button>
+                </div>
+                {!shut && (
+                  <>
+                    <button
+                      className={`workspace-orchestrator ${talkingToOrchestrator ? "active" : ""}`}
+                      aria-current={talkingToOrchestrator ? "page" : undefined}
+                      onClick={() => openIn(entry.name)}
+                    >
+                      <MessageSquare size={15} />
+                      Orchestrator
+                    </button>
+                    {entry.current && !connecting ? (
+                      <>
+                        <div
+                          className="thread-list"
+                          role="list"
+                          aria-label={`Threads in ${entry.name}`}
+                          onMouseEnter={() => setHovering(true)}
+                          onMouseLeave={() => setHovering(false)}
+                        >
+                          {visible.map((thread) => (
+                            <ThreadCard
+                              listItem
+                              key={thread.id}
+                              thread={thread}
+                              items={attentionFor(thread.id)}
+                              dived={destination === thread.id}
+                              selected={selected === thread.id}
+                              pinned={pins.includes(thread.id)}
+                              onSelect={selectThread}
+                              onOpen={openThread}
+                            />
+                          ))}
+                          {!visible.length && (
+                            <p className="sidebar-empty" role="listitem">
+                              {connecting
+                                ? "Connecting…"
+                                : workers.length
+                                  ? "No threads match your filters."
+                                  : "Threads appear here as your agents start working."}
+                            </p>
+                          )}
+                        </div>
+                        {workers.some((t) => t.status === "parked") && (
+                          <button
+                            className="parked-toggle"
+                            aria-pressed={parked}
+                            onClick={() => setParked((v) => !v)}
+                          >
+                            {parked
+                              ? "Hide parked"
+                              : `${workers.filter((t) => t.status === "parked").length} parked threads hidden`}
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <ul
+                        className="workspace-peek"
+                        aria-label={`Threads in ${entry.name}`}
+                      >
+                        {entry.threads.map((thread) => (
+                          <li key={thread.id}>
+                            <button
+                              className="workspace-thread"
+                              style={
+                                {
+                                  "--thread-color": thread.accent,
+                                } as CSSProperties
+                              }
+                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
+                              onClick={(event) =>
+                                openIn(entry.name, thread.id, event.detail > 1)
+                              }
+                            >
+                              {thread.accent && (
+                                <span
+                                  className="thread-color-dot"
+                                  aria-hidden="true"
+                                />
+                              )}
+                              <span className="workspace-thread-name">
+                                {thread.name}
+                              </span>
+                              <span className="visually-hidden">, </span>
+                              <span
+                                className={`thread-status status-${thread.status}`}
+                              >
+                                {thread.status_label || thread.status}
+                              </span>
+                            </button>
+                          </li>
+                        ))}
+                        {entry.more > 0 && (
+                          <li>
+                            <button
+                              className="workspace-thread workspace-more"
+                              onClick={() =>
+                                openIn(entry.name, undefined, false, () =>
+                                  setSection("grid"),
+                                )
+                              }
+                            >
+                              +{entry.more} more
+                            </button>
+                          </li>
+                        )}
+                      </ul>
+                    )}
+                  </>
+                )}
+              </section>
+            );
+          })}
           <button
-            className="parked-toggle"
-            aria-pressed={parked}
-            onClick={() => setParked((v) => !v)}
+            className="workspace-add"
+            aria-haspopup="dialog"
+            onClick={() => setWorkspaceModal(true)}
           >
-            {parked
-              ? "Hide parked"
-              : `${workers.filter((t) => t.status === "parked").length} parked threads hidden`}
+            <Plus size={14} />
+            New workspace
           </button>
-        )}
+        </div>
         <details className="sidebar-secondary manage-nav">
           <summary>Manage</summary>
           <nav aria-label="Manage">
@@ -2563,6 +2994,7 @@ export default function App({
                         thread={view.threads.find((t) => t.id === item.thread)}
                         readOnly={!connected || !permitted("operate")}
                         onRespond={respond}
+                        onDismiss={dismissAttention}
                         rpc={rpc}
                         fail={fail}
                       />
@@ -2573,14 +3005,14 @@ export default function App({
                   events={presentedEvents}
                   showTools={showTools}
                   showThinking={showThinking}
-                  loading={transcriptLoading}
+                  loading={transcriptLoading && !presentedEvents.length}
                   error={transcriptError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
                   }
                   earlierBusy={earlierBusy}
                   target={target}
-                  onSetup={() => action("orch")}
+                  onSetup={setupOrchestrator}
                   connected={connected}
                   summaries={assistance.summaries}
                   onError={fail}
@@ -2612,6 +3044,7 @@ export default function App({
                   journal={journal}
                   workspace={workspace}
                   connected={connected}
+                  threads={view.threads}
                   onSent={(result) => {
                     setQueueRefresh((n) => n + 1);
                     for (const restored of [
@@ -2664,18 +3097,22 @@ export default function App({
                             JSON.stringify(message)}
                         </span>
                         <button
-                          disabled={!message.mine}
+                          disabled={
+                            !message.mine || queueBusy.includes(message.ref)
+                          }
                           onClick={() => void takeBack(message)}
                         >
                           Take back
                         </button>
                         <button
-                          disabled={i !== 0}
+                          disabled={i !== 0 || queueBusy.includes(message.ref)}
                           onClick={() => {
                             setConfirmation({
                               title: "Send this message now?",
                               detail:
                                 "The running turn will be interrupted so this message can start.",
+                              action: "Send now",
+                              destructive: true,
                               run: () => void sendNow(message),
                             });
                           }}
@@ -2742,16 +3179,18 @@ export default function App({
                     </button>
                   </div>
                 )}
-                {!draft && assistance.suggestion && (
-                  <button
-                    className="suggested-message"
-                    onClick={acceptSuggestion}
-                  >
-                    <span className="visually-hidden">Suggested reply: </span>
-                    <span>{assistance.suggestion}</span>
-                    <kbd>Tab to use</kbd>
-                  </button>
-                )}
+                {!draft &&
+                  assistance.suggestion &&
+                  document.documentElement.dataset.mobile === "true" && (
+                    <button
+                      className="suggested-message"
+                      onClick={acceptSuggestion}
+                    >
+                      <span className="visually-hidden">Suggested reply: </span>
+                      <span>{assistance.suggestion}</span>
+                      <span className="visually-hidden">, tap to use</span>
+                    </button>
+                  )}
                 <form
                   className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
                   aria-label="Message composer"
@@ -2842,11 +3281,15 @@ export default function App({
                       setMentionIndex(0);
                     }}
                     placeholder={
-                      document.documentElement.dataset.mobile === "true"
-                        ? "Message…"
-                        : destination
-                          ? `Message ${target?.name} directly…`
-                          : "Ask your orchestrator to build something…"
+                      // A suggestion shows as the empty box's placeholder, as the TUI's
+                      // ghost text: Tab or → takes it, typing types over it.
+                      !draft && assistance.suggestion
+                        ? assistance.suggestion
+                        : document.documentElement.dataset.mobile === "true"
+                          ? "Message…"
+                          : destination
+                            ? `Message ${target?.name} directly…`
+                            : "Ask your orchestrator to build something…"
                     }
                     rows={Math.min(
                       6,
@@ -2861,7 +3304,14 @@ export default function App({
                     onKeyDown={(e) => {
                       if (e.nativeEvent.isComposing || e.keyCode === 229)
                         return;
-                      if (e.key === "Tab" && !draft && assistance.suggestion) {
+                      if (
+                        takesSuggestion(
+                          e,
+                          draft,
+                          assistance.suggestion,
+                          assistance.suggestionShownFor(),
+                        )
+                      ) {
                         e.preventDefault();
                         acceptSuggestion();
                         return;
@@ -2982,6 +3432,12 @@ export default function App({
                       <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd>{" "}
                       reference a thread <span>·</span> Shift Enter for a new
                       line
+                      {!draft && assistance.suggestion && (
+                        <span>
+                          {" "}
+                          · <kbd>Tab</kbd> or <kbd>→</kbd> takes the suggestion
+                        </span>
+                      )}
                       {assistance.stats && (
                         <small
                           title={`${assistance.stats.calls} calls · ${assistance.stats.failures} failed`}
@@ -3158,12 +3614,8 @@ export default function App({
                       dived={destination === t.id}
                       selected={selected === t.id}
                       pinned={pins.includes(t.id)}
-                      onSelect={() => setSelected(t.id)}
-                      onOpen={() => {
-                        setDestination(t.id);
-                        setSection("chat");
-                        setSelected(undefined);
-                      }}
+                      onSelect={selectThread}
+                      onOpen={openThread}
                       large
                     />
                   ))}
@@ -3237,6 +3689,7 @@ export default function App({
                     )}
                     readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
@@ -3363,6 +3816,7 @@ export default function App({
                     thread={selectedThread}
                     readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
@@ -3504,6 +3958,8 @@ export default function App({
                         detail: t.exited
                           ? "Remove this terminal tab?"
                           : "Its interactive program will exit. The hub and other agents keep running.",
+                        action: t.exited ? "Remove tab" : "Close terminal",
+                        destructive: !t.exited,
                         run: () => {
                           terminalSnapshots.current.changed();
                           void hostApi
@@ -3708,12 +4164,35 @@ export default function App({
                             ]),
                           ],
                         }
-                      : field.key === "mode" && !permitted("admin")
+                      : field.type === "model" || field.type === "effort"
                         ? {
                             ...field,
-                            options: ["manual", "plan", "read-only", "dontAsk"],
+                            choices: (field.type === "model"
+                              ? modelChoices
+                              : effortChoices)(
+                              modelCatalog,
+                              formRuntime(
+                                operation,
+                                values,
+                                view.threads,
+                                info?.orchestrator?.configured?.explicit ===
+                                  false
+                                  ? info.orchestrator.configured.runtime
+                                  : undefined,
+                              ),
+                            ),
                           }
-                        : field
+                        : field.key === "mode" && !permitted("admin")
+                          ? {
+                              ...field,
+                              options: [
+                                "manual",
+                                "plan",
+                                "read-only",
+                                "dontAsk",
+                              ],
+                            }
+                          : field
                   }
                   value={values[field.key]}
                   onChange={(value) =>
@@ -3829,14 +4308,14 @@ export default function App({
             <div>
               <button onClick={() => setConfirmation(undefined)}>Cancel</button>
               <button
-                className="primary"
+                className={confirmation.destructive ? "danger" : "primary"}
                 onClick={() => {
                   const run = confirmation.run;
                   setConfirmation(undefined);
                   run();
                 }}
               >
-                Continue
+                {confirmation.action}
               </button>
             </div>
           </footer>
@@ -3976,6 +4455,7 @@ export default function App({
           </button>
         </nav>
       )}
+      <LinkConfirm onError={fail} />
       <span id="twr-thread-open-hint" hidden>
         Details shown. Press Enter to open this conversation.
       </span>
@@ -3983,7 +4463,9 @@ export default function App({
   );
 }
 
-function ThreadCard({
+/** Memoized, with stable `onSelect`/`onOpen` taking the thread's id and `items` shared
+ * per thread: typing and streaming don't redraw every card. */
+const ThreadCard = memo(function ThreadCard({
   thread,
   items,
   selected,
@@ -3999,8 +4481,8 @@ function ThreadCard({
   selected: boolean;
   dived?: boolean;
   pinned: boolean;
-  onSelect: () => void;
-  onOpen: () => void;
+  onSelect: (id: string) => void;
+  onOpen: (id: string) => void;
   large?: boolean;
   listItem?: boolean;
 }) {
@@ -4011,8 +4493,8 @@ function ThreadCard({
       selected={selected}
       dived={dived}
       pinned={pinned}
-      onSelect={onSelect}
-      onOpen={onOpen}
+      onSelect={() => onSelect(thread.id)}
+      onOpen={() => onOpen(thread.id)}
       large={large}
     />
   );
@@ -4023,7 +4505,7 @@ function ThreadCard({
   ) : (
     card
   );
-}
+});
 function ThreadCardButton({
   thread,
   items,
@@ -4118,48 +4600,117 @@ function ThreadCardButton({
     </button>
   );
 }
+/** Tracks how long an attention card's options have been on screen: from mount, or from
+ * when they scroll into view, and again from zero after they leave it or the window is
+ * hidden. `identity` restarts it for a new item or revision. */
+function useArming(target: RefObject<HTMLElement | null>, identity: string) {
+  const state = useRef<Arming>({});
+  const [isArmed, setArmed] = useState(false);
+  useEffect(() => {
+    state.current = hidden();
+    setArmed(false);
+    const node = target.current;
+    const observable = !!node && typeof IntersectionObserver !== "undefined";
+    let onScreen = !observable;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const update = () => {
+      clearTimeout(timer);
+      const now = performance.now();
+      state.current =
+        onScreen && document.visibilityState !== "hidden"
+          ? shown(state.current, now)
+          : hidden();
+      setArmed(armed(state.current, now));
+      const wait = armsIn(state.current, now);
+      if (wait) timer = setTimeout(update, wait);
+    };
+    let observer: IntersectionObserver | undefined;
+    if (observable) {
+      observer = new IntersectionObserver((entries) => {
+        onScreen = entries[entries.length - 1].isIntersecting;
+        update();
+      });
+      observer.observe(node);
+    } else update();
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      clearTimeout(timer);
+      observer?.disconnect();
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [identity]);
+  return { armed: isArmed, state: () => state.current };
+}
 function AttentionCard({
   item,
   readOnly = false,
   thread,
   onRespond,
+  onDismiss,
   rpc,
   fail,
 }: {
   item: Attention;
   readOnly?: boolean;
   thread?: Thread;
+  /** Answers through App's live-view guard; rejects when it can't be answered now. */
   onRespond: (
     item: Attention,
     answer: string,
     message?: string,
   ) => Promise<void>;
+  onDismiss: (item: Attention) => Promise<void>;
   rpc: (method: string, params?: Json) => Promise<Json>;
   fail: (e: unknown) => void;
 }) {
   const [answer, setAnswer] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  // Once an answer is accepted the card stays answered until the next state removes it:
+  // a second click would only meet the stale revision.
+  const [sent, setSent] = useState(false);
   const [requestError, setRequestError] = useState("");
   const options = item.options || [];
   const ids = useId();
-  const respond = async (value: string) => {
-    if (readOnly || !canRespond(item, busy)) return;
+  const response = useRef<HTMLDivElement>(null);
+  const arming = useArming(response, item.attn_id + ":" + item.revision);
+  const pending = useRef(false);
+  const answered = useRef(false);
+  const settle = async (run: () => Promise<void>) => {
+    // Clicks and keys that land before the options have been on screen for 600 ms were
+    // meant for whatever was there before (a card that just slid away, the previous
+    // revision): they answer nothing.
+    if (
+      pending.current ||
+      answered.current ||
+      !canRespond(item, busy) ||
+      !mayAnswer({
+        arming: arming.state(),
+        now: performance.now(),
+        busy,
+        sent,
+        readOnly,
+      })
+    )
+      return;
+    pending.current = true;
     setBusy(true);
     setRequestError("");
     try {
-      await rpc("attention.respond", {
-        attn_id: item.attn_id,
-        revision: item.revision,
-        answer: value,
-        ...(message ? { message } : {}),
-      });
+      await run();
+      answered.current = true;
+      setSent(true);
     } catch (e) {
       setRequestError(errorMessage(e));
     } finally {
+      pending.current = false;
       setBusy(false);
     }
   };
+  const respond = (value: string) =>
+    settle(() => onRespond(item, value, message || undefined));
+  const locked = readOnly || busy || sent || !item.revision || item.incomplete;
+  const waiting = !locked && !arming.armed;
   return (
     <article
       className={`attention-card attention-${item.reason}`}
@@ -4174,10 +4725,7 @@ function AttentionCard({
       onKeyDown={(event) => {
         if (
           event.target !== event.currentTarget ||
-          readOnly ||
-          busy ||
-          item.incomplete ||
-          !item.revision ||
+          locked ||
           event.ctrlKey ||
           event.metaKey ||
           event.altKey
@@ -4243,19 +4791,23 @@ function AttentionCard({
         {item.note && <p className="attention-note">{item.note}</p>}
       </div>
       {readOnly && <p className="muted">This device has read-only access.</p>}
-      <div className="attention-response">
+      <div className="attention-response" ref={response}>
         <input
           aria-label="Optional message with your decision"
           aria-describedby={requestError ? `${ids}-error` : undefined}
           placeholder="Add a note (optional)…"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          disabled={readOnly || busy}
+          disabled={readOnly || busy || sent}
         />
-        <div className="attention-options">
+        <div
+          className={`attention-options ${waiting ? "arming" : ""}`}
+          data-armed={arming.armed && !locked ? "true" : "false"}
+        >
           {options.map((option, i) => (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
               key={option + ":" + i}
               aria-keyshortcuts={String(i + 1)}
               onClick={() => void respond(option)}
@@ -4284,16 +4836,11 @@ function AttentionCard({
                   value={answer}
                   onChange={(e) => setAnswer(e.target.value)}
                   placeholder="Your answer…"
-                  disabled={readOnly || busy}
+                  disabled={readOnly || busy || sent}
                 />
                 <button
-                  disabled={
-                    readOnly ||
-                    busy ||
-                    !answer.trim() ||
-                    !item.revision ||
-                    item.incomplete
-                  }
+                  disabled={locked || !answer.trim()}
+                  aria-disabled={waiting || undefined}
                 >
                   Answer
                 </button>
@@ -4301,21 +4848,20 @@ function AttentionCard({
             )}
           {!["permission", "question"].includes(item.reason) && (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
-              onClick={() => {
-                setBusy(true);
-                void rpc("attention.dismiss", {
-                  attn_id: item.attn_id,
-                  revision: item.revision,
-                })
-                  .catch(fail)
-                  .finally(() => setBusy(false));
-              }}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
+              onClick={() => void settle(() => onDismiss(item))}
             >
               Dismiss
             </button>
           )}
           {busy && <Spinner />}
+          {sent && (
+            <span className="attention-sent" role="status">
+              <Check size={14} aria-hidden="true" />
+              Sent
+            </span>
+          )}
         </div>
         {requestError && (
           <p role="alert" className="error-text" id={`${ids}-error`}>
@@ -4326,7 +4872,8 @@ function AttentionCard({
     </article>
   );
 }
-function Conversation({
+/** Memoized: typing in the composer doesn't redraw the transcript. */
+const Conversation = memo(function Conversation({
   events,
   showTools,
   showThinking,
@@ -4360,6 +4907,20 @@ function Conversation({
   const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
+  // Expanded messages and open tool details, by block: rows scrolled out of the virtual
+  // list unmount, and come back as they were left.
+  const [opened, setOpened] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
+  const setOpen = useCallback((key: string, open: boolean) => {
+    setOpened((old) => {
+      if ((old.get(key) ?? false) === open) return old;
+      const next = new Map(old);
+      if (open) next.set(key, true);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
   const blocks = useMemo(
     () =>
       foldRoutineBlocks(blocksOf(events), events, summaries).filter(
@@ -4545,11 +5106,11 @@ function Conversation({
                           ? "twr"
                           : target?.name || "Agent"}
                 </b>
-                <time>
-                  {new Date(block.ts).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
+                <time
+                  dateTime={block.ts}
+                  title={new Date(block.ts).toLocaleString()}
+                >
+                  {messageTime(block.ts)}
                 </time>
                 {block.pending && <Spinner />}
                 {block.kind === "assistant" && !block.pending && target && (
@@ -4569,19 +5130,22 @@ function Conversation({
                     <Volume2 size={13} />
                   </button>
                 )}
-                <button
+                <CopyButton
                   className="icon-button copy-message"
-                  aria-label="Copy message"
-                  title="Copy message"
-                  onClick={() =>
-                    void hostApi.copyText(block.detail || block.text)
-                  }
-                >
-                  <Copy size={13} />
-                </button>
+                  label="Copy message"
+                  size={13}
+                  text={() => block.detail || block.text}
+                  onError={onError}
+                />
               </div>
               {block.children ? (
-                <details className="routine-updates">
+                <details
+                  className="routine-updates"
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.text}
                     <span>
@@ -4592,22 +5156,35 @@ function Conversation({
                   </summary>
                   {block.children.map((entry) => (
                     <div key={entry.id}>
-                      <time>{new Date(entry.ts).toLocaleTimeString()}</time>
+                      <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
                       <Markdown text={entry.text} />
                     </div>
                   ))}
                 </details>
               ) : block.kind === "tool" ? (
-                <details>
+                <details
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.detail?.split("\n")[0] || "Tool call"}
                   </summary>
-                  <MessageBody text={block.detail || ""} mono />
+                  <MessageBody
+                    text={block.detail || ""}
+                    mono
+                    expanded={opened.get(block.id) ?? false}
+                    onExpandedChange={(open) => setOpen(block.id, open)}
+                  />
                 </details>
               ) : (
                 <MessageBody
                   text={block.text}
                   clamp={block.kind === "user" || block.kind === "notice"}
+                  streaming={block.kind === "assistant" && !!block.pending}
+                  expanded={opened.get(block.id) ?? false}
+                  onExpandedChange={(open) => setOpen(block.id, open)}
                 />
               )}
             </article>
@@ -4632,7 +5209,7 @@ function Conversation({
       )}
     </div>
   );
-}
+});
 function ContextEditor({
   value,
   project,

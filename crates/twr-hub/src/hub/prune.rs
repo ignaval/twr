@@ -2112,8 +2112,8 @@ mod tests {
         let (core, _) = Core::replay_full(&db, None).unwrap();
         assert!(!core.trash.contains_key("01ITEMPURGED"));
         assert!(core.trash.contains_key("01ITEMKEPT"));
-        assert!(core.deleted_rt["t-p"].purged);
-        assert!(!core.deleted_rt["t-d"].purged);
+        assert!(core.registry.is_purged("t-p") && !core.deleted_rt.contains_key("t-p"));
+        assert!(!core.registry.is_purged("t-d") && core.deleted_rt.contains_key("t-d"));
         assert!(!core.activity.contains_key("t-p"));
         assert!(core.activity.contains_key("t-d"));
         // A purge naming the item of another thread, or from someone else, is not folded.
@@ -2133,7 +2133,7 @@ mod tests {
         }
         drop(store);
         let (core, _) = Core::replay_full(&db, None).unwrap();
-        assert!(!core.deleted_rt["t-d"].purged);
+        assert!(!core.registry.is_purged("t-d") && core.deleted_rt.contains_key("t-d"));
         assert!(core.trash.contains_key("01ITEMKEPT"));
         // The plan matches a purge by its item and thread, as the fold does.
         let conn = store::connect(&db).unwrap();

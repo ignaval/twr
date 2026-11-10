@@ -18,7 +18,10 @@ import {
   countCrashReports,
   diagnosticsReport,
 } from "./diagnostics";
+import { Notifier, type Post } from "./notifier";
 import { AppTray, statusNotifierAvailable } from "./tray";
+import { attentionSummarySchema } from "./validation";
+import { WORKSPACE_REFRESH_MS } from "../shared/workspaceTree";
 import {
   FIRST_UPDATE_CHECK_DELAY,
   UPDATE_CHECK_INTERVAL,
@@ -32,23 +35,6 @@ import type {
   DesktopEvent,
 } from "../shared/types";
 
-const attentionSchema = z
-  .object({
-    count: z.number().int().min(0).max(100000),
-    items: z
-      .array(
-        z
-          .object({
-            // Menu labels are short; never reject a summary for its length.
-            thread: z.string().max(200),
-            title: z.string().transform((value) => value.slice(0, 200)),
-            summary: z.string().transform((value) => value.slice(0, 300)),
-          })
-          .strict(),
-      )
-      .max(5),
-  })
-  .strict();
 const errorSchema = z
   .object({
     message: z.string().max(4000),
@@ -82,10 +68,12 @@ export class AppServices {
   });
   updater!: Updater;
   private tray: AppTray;
+  private notifier: Notifier;
   private trayAvailable = process.platform !== "linux";
   private errors = new RateLimiter(30, 60_000);
   private rejected = new RateLimiter(10, 60_000);
   private timer?: ReturnType<typeof setInterval>;
+  private poll?: ReturnType<typeof setInterval>;
   private autostartFile = autostartPath(process.env, homedir());
   constructor(
     private readonly host: AppServiceHost,
@@ -102,9 +90,9 @@ export class AppServices {
           host.showWindow();
           host.emit({ type: "menu-new" });
         },
-        openAttention: (thread) => {
+        openAttention: (thread, workspace) => {
           host.showWindow();
-          host.emit({ type: "menu-attention", thread });
+          host.emit({ type: "menu-attention", thread, workspace });
         },
         checkUpdates: () => {
           host.showWindow();
@@ -137,15 +125,44 @@ export class AppServices {
             : undefined,
       }),
     );
+    const automation = process.env.TWR_DESKTOP_TEST_AUTOMATION === "1";
+    this.notifier = new Notifier(
+      {
+        enabled: () => this.notificationsEnabled,
+        attended: () => {
+          const window = host.window();
+          return !!window && window.isVisible() && window.isFocused();
+        },
+        open: (target) => {
+          host.showWindow();
+          host.emit({ type: "menu-attention", ...target });
+        },
+        log: this.log,
+      },
+      // Automated QA records what would be posted instead of posting it.
+      automation ? { post: testPost(), supported: true } : {},
+    );
   }
 
-  /** Before any window exists: decide whether this launch starts hidden. */
+  private startedHidden = false;
+
+  /**
+   * Before any window exists: decide whether this launch starts hidden. On
+   * Linux the tray host is checked only after the window exists, so a login
+   * launch that would hide starts hidden and `probe` shows the window when
+   * there turns out to be no tray to bring it back from.
+   */
   get startHidden() {
     const atLogin =
       process.argv.includes(AUTOSTART_ARG) ||
       (process.platform === "darwin" &&
         app.getLoginItemSettings().wasOpenedAtLogin === true);
-    return atLogin && this.background;
+    this.startedHidden =
+      atLogin &&
+      (process.platform === "linux"
+        ? this.host.settings().background === true && this.trayEnabled
+        : this.background);
+    return this.startedHidden;
   }
 
   get trayEnabled() {
@@ -161,31 +178,22 @@ export class AppServices {
     );
   }
 
-  async start() {
+  private settleUpdateMode!: (
+    mode: Promise<{ automatic: boolean; manualReason?: string }>,
+  ) => void;
+
+  /** Everything that needs no subprocess; runs before the window is created. */
+  start() {
     this.log.info(
       "app",
       `twr ${app.getVersion()} starting (${this.kind}, Electron ${process.versions.electron}, ${process.platform} ${release()})`,
     );
-    let automatic = this.kind === "appimage";
-    let manualReason: string | undefined;
-    if (this.kind === "mac") {
-      automatic = await macDeveloperIdSigned();
-      if (!automatic)
-        manualReason =
-          "This build is not signed with a Developer ID, which macOS requires to replace the app automatically.";
-    } else if (this.kind === "deb")
-      manualReason = "Debian packages are updated through apt.";
-    else if (this.kind === "pacman")
-      manualReason =
-        "Arch packages are updated through pacman or your AUR helper.";
-    else if (this.kind === "portable")
-      manualReason = "This portable copy is replaced by hand.";
-    else if (this.kind === "development")
-      manualReason = "Development builds are not updated.";
+    const mode = new Promise<{ automatic: boolean; manualReason?: string }>(
+      (resolve) => (this.settleUpdateMode = resolve),
+    );
     this.updater = new Updater({
       kind: this.kind,
-      automatic,
-      manualReason,
+      mode,
       current: app.getVersion(),
       log: this.log,
       autoDownload: () => this.autoUpdate,
@@ -199,16 +207,6 @@ export class AppServices {
       },
     });
     this.refreshAutostart(linuxLaunchCommand(process.env, process.execPath));
-    this.trayAvailable = await statusNotifierAvailable();
-    if (!this.trayAvailable) {
-      this.log.info(
-        "tray",
-        "No StatusNotifier host yet; checking again while the session starts.",
-      );
-      // At login, uwsm can start twr before Waybar registers its tray.
-      void this.waitForTray();
-    }
-    this.applyTray();
     // Automated QA never reaches the network on its own schedule.
     const scheduled =
       this.kind !== "development" &&
@@ -222,7 +220,17 @@ export class AppServices {
       if (scheduled && this.autoUpdate) void this.updater.check();
     }, UPDATE_CHECK_INTERVAL);
     this.timer.unref();
-    app.on("will-quit", () => this.timer && clearInterval(this.timer));
+    // Other workspaces are read on this beat (shared/App.tsx), also while the window is
+    // hidden, when the page's own timers are throttled.
+    this.poll = setInterval(
+      () => this.host.emit({ type: "inbox-poll" }),
+      WORKSPACE_REFRESH_MS,
+    );
+    this.poll.unref();
+    app.on("will-quit", () => {
+      if (this.timer) clearInterval(this.timer);
+      if (this.poll) clearInterval(this.poll);
+    });
     app.on("render-process-gone", (_event, _contents, details) =>
       this.log.error(
         "renderer",
@@ -236,6 +244,29 @@ export class AppServices {
           `${details.type} exited: ${details.reason} (code ${details.exitCode})`,
         );
     });
+  }
+
+  /**
+   * The subprocess checks (the macOS code signature, the Linux tray host), run
+   * once the window exists so they never delay it.
+   */
+  async probe() {
+    this.settleUpdateMode(updateMode(this.kind));
+    this.trayAvailable = await statusNotifierAvailable();
+    if (!this.trayAvailable) {
+      this.log.info(
+        "tray",
+        "No StatusNotifier host yet; checking again while the session starts.",
+      );
+      // At login, uwsm can start twr before Waybar registers its tray.
+      void this.waitForTray();
+    }
+    this.applyTray();
+    // Hidden at login with no tray to come back from: show the window.
+    if (this.startedHidden && !this.background) {
+      this.log.info("window", "No tray host; showing the window");
+      this.host.showWindow();
+    }
   }
 
   get autoUpdate() {
@@ -282,6 +313,37 @@ export class AppServices {
 
   setAttention(summary: AttentionSummary) {
     this.tray.setAttention(summary);
+    this.notifier.update(summary);
+    if (testState) {
+      testState.attention = summary;
+      // Each summary's sources and requests, for a failing test to show what it saw.
+      const entry = {
+        workspaces: summary.workspaces,
+        items: summary.items.map((i) => `${i.workspace}:${i.id}@${i.revision}`),
+        attended:
+          !!this.host.window()?.isVisible() &&
+          !!this.host.window()?.isFocused(),
+      };
+      if (JSON.stringify(entry) !== JSON.stringify(testState.history.at(-1))) {
+        testState.history.push(entry);
+        testState.history.splice(0, testState.history.length - 100);
+      }
+    }
+  }
+
+  /** The window came to the front. */
+  focused() {
+    this.notifier.attend();
+  }
+
+  /** The window is gone (not hidden): nothing it could open is left to notify about. */
+  closed() {
+    this.notifier.clear();
+    this.setAttention({ count: 0, items: [], workspaces: [] });
+  }
+
+  get notificationsEnabled() {
+    return this.host.settings().notifications !== false;
   }
 
   login(): DesktopAppSettings["login"] {
@@ -330,6 +392,10 @@ export class AppServices {
     return {
       login: this.login(),
       tray: { enabled: this.trayEnabled, available: this.trayAvailable },
+      notifications: {
+        enabled: this.notificationsEnabled,
+        supported: this.notifier.supported,
+      },
       background: this.background,
       autoUpdate: this.autoUpdate,
       update: this.updater.status,
@@ -400,6 +466,10 @@ export class AppServices {
             }
           : undefined,
       tray: { enabled: this.trayEnabled, available: this.trayAvailable },
+      notifications: {
+        enabled: this.notificationsEnabled,
+        supported: this.notifier.supported,
+      },
       background: this.background,
       launchAtLogin: this.login().enabled,
       memoryMB: Math.round(
@@ -430,6 +500,13 @@ export class AppServices {
       this.applyTray();
       return this.snapshot();
     });
+    handle("app-notifications", (enabled) => {
+      const value = z.boolean().parse(enabled);
+      this.host.save({ notifications: value });
+      if (!value) this.notifier.clear();
+      this.log.info("notify", `Notifications ${value ? "on" : "off"}`);
+      return this.snapshot();
+    });
     handle("app-background", (enabled) => {
       this.host.save({ background: z.boolean().parse(enabled) });
       this.tray.render();
@@ -448,7 +525,7 @@ export class AppServices {
       if (error) throw new Error(error);
     });
     listen("app-attention", (summary) =>
-      this.setAttention(attentionSchema.parse(summary)),
+      this.setAttention(attentionSummarySchema.parse(summary)),
     );
     listen("app-error", (report) => {
       if (!this.errors.allow()) return;
@@ -462,6 +539,44 @@ export class AppServices {
   }
 }
 
+/**
+ * What automated QA reads of the notifications and the tray (scripts/integration.mjs, in
+ * the main process): what was posted, closed and clicked, and the latest summary.
+ */
+interface TestState {
+  attention?: AttentionSummary;
+  notifications: {
+    title: string;
+    body: string;
+    target: object;
+    closed: boolean;
+    click(): void;
+  }[];
+  /** The latest summaries' sources and requests, oldest first. */
+  history: {
+    workspaces: AttentionSummary["workspaces"];
+    items: string[];
+    attended: boolean;
+  }[];
+}
+let testState: TestState | undefined;
+function testPost(): Post {
+  const state: TestState = { notifications: [], history: [] };
+  testState = state;
+  (globalThis as { __twrTest?: TestState }).__twrTest = state;
+  return (notice, handlers) => {
+    const record = {
+      title: notice.title,
+      body: notice.body,
+      target: notice.target,
+      closed: false,
+      click: () => handlers.click(),
+    };
+    state.notifications.push(record);
+    return { close: () => (record.closed = true) };
+  };
+}
+
 function readPackageType() {
   try {
     return readFileSync(
@@ -471,6 +586,31 @@ function readPackageType() {
   } catch {
     return undefined;
   }
+}
+
+async function updateMode(
+  kind: AppServices["kind"],
+): Promise<{ automatic: boolean; manualReason?: string }> {
+  if (kind === "appimage") return { automatic: true };
+  if (kind === "mac")
+    return (await macDeveloperIdSigned())
+      ? { automatic: true }
+      : {
+          automatic: false,
+          manualReason:
+            "This build is not signed with a Developer ID, which macOS requires to replace the app automatically.",
+        };
+  const manualReason =
+    kind === "deb"
+      ? "Debian packages are updated through apt."
+      : kind === "pacman"
+        ? "Arch packages are updated through pacman or your AUR helper."
+        : kind === "portable"
+          ? "This portable copy is replaced by hand."
+          : kind === "development"
+            ? "Development builds are not updated."
+            : undefined;
+  return { automatic: false, manualReason };
 }
 
 function macDeveloperIdSigned(): Promise<boolean> {

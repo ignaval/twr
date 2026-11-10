@@ -178,6 +178,37 @@ pub fn efforts(runtime: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// A model a runtime's picker offers ([`models`]): the id passed as the thread's model, and a
+/// few words on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownModel {
+    /// What `--model` (or the runtime's own setting) gets: an alias or a full id.
+    pub id: &'static str,
+    /// A few words on it, for the picker.
+    pub description: &'static str,
+}
+
+impl KnownModel {
+    const fn new(id: &'static str, description: &'static str) -> Self {
+        KnownModel { id, description }
+    }
+}
+
+/// The models twr's pickers (the TUI's, the desktop app's) offer for `runtime`: Claude Code's
+/// (`claude_code::MODELS`), Codex's (`codex::MODELS`) and Grok Build's (`grok_build::MODELS`),
+/// each list as that runtime reported it when checked. Empty for any other runtime (a generic
+/// ACP agent's are its own; `pty` runs a command line). Not a check: a runtime takes ids the
+/// list doesn't have, and a picker keeps a custom id for them; leaving the model unset runs
+/// the runtime's own default.
+pub fn models(runtime: &str) -> &'static [KnownModel] {
+    match runtime {
+        claude_code::NAME => claude_code::MODELS,
+        codex::NAME => codex::MODELS,
+        grok_build::NAME => grok_build::MODELS,
+        _ => &[],
+    }
+}
+
 /// Which settings a runtime keeps from a session it resumes without them ([`resume_keeps`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResumeKeeps {
@@ -244,6 +275,36 @@ pub fn find(name: &str) -> Option<Arc<dyn Adapter>> {
 
 #[cfg(test)]
 mod tests {
+    /// Every built-in agent runtime's picker has models, each a model the hub takes (no
+    /// whitespace or control characters, at most 128 bytes) and listed once; the others
+    /// have none. A display name such as `opus-5.5`, which Claude Code refuses, is not one.
+    #[test]
+    fn pickers_list_usable_models() {
+        for rt in [
+            super::claude_code::NAME,
+            super::codex::NAME,
+            super::grok_build::NAME,
+        ] {
+            let ms = super::models(rt);
+            assert!(!ms.is_empty(), "{rt}");
+            let mut ids: Vec<&str> = ms.iter().map(|m| m.id).collect();
+            for m in ms {
+                assert!(!m.id.is_empty() && m.id.len() <= 128, "{rt} {m:?}");
+                assert!(!m.id.chars().any(|c| c.is_whitespace() || c.is_control()));
+                assert!(!m.description.is_empty(), "{rt} {m:?}");
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), ms.len(), "{rt}: an id listed twice");
+        }
+        assert!(super::models("claude-code")
+            .iter()
+            .all(|m| m.id != "opus-5.5"));
+        for rt in ["acp", "pty", "fake", "nonsense"] {
+            assert!(super::models(rt).is_empty(), "{rt}");
+        }
+    }
+
     /// A narrowing is any capability lost, not only a lower level: Codex's same-level modes
     /// with another approval policy, network or roots; another mode or runtime at one level;
     /// anything unknown. Equal effective policies and wider ones do not narrow.

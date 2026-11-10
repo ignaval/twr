@@ -41,6 +41,8 @@ import java.util.Locale;
 public class TwrVoicePlugin extends Plugin {
     private static final long RESTART_AFTER_RESULT = 250, RESTART_AFTER_SILENCE = 500, RESTART_WHEN_BUSY = 1000;
     private static final long FINAL_WAIT = 3000;
+    /** Silence that ends a hands-free utterance (shared/voice.ts {@code PAUSE_MS}). */
+    private static final long END_SILENCE = 2000;
     private final Handler main = new Handler(Looper.getMainLooper());
     private SpeechRecognizer recognizer;
     private boolean onDevice;
@@ -169,9 +171,9 @@ public class TwrVoicePlugin extends Plugin {
         intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getContext().getPackageName());
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
         if ("hands-free".equals(mode)) {
-            // Hints: recognizers may keep their own endpointing.
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
-            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L);
+            // Hints (shared/voice.ts `PAUSE_MS`): recognizers may keep their own endpointing.
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, END_SILENCE);
+            intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, END_SILENCE);
         } else {
             intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 10000L);
             intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 10000L);

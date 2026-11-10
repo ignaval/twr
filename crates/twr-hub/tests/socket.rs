@@ -1339,7 +1339,8 @@ async fn an_attach_end_that_fails_leaves_the_lease_with_its_connection() {
 }
 
 /// A twr client older than the hub (its own client names without `protocol`, or an older
-/// `protocol`) is told to update at `hello`, before any event it cannot decode reaches it.
+/// `protocol`) is told to update to the hub's version at `hello`, before any event it cannot
+/// decode reaches it.
 /// Other clients may leave `protocol` out.
 #[tokio::test]
 async fn a_twr_older_than_the_hub_is_told_to_update() {
@@ -1352,7 +1353,14 @@ async fn a_twr_older_than_the_hub_is_told_to_update() {
         let mut c = Client::connect(&th.socket).await.unwrap();
         let e = c.call("hello", params.clone()).await.unwrap_err();
         assert_eq!(code(&e), codes::UNSUPPORTED, "{params}");
-        assert!(e.to_string().contains("twr update"), "{e}");
+        // To the hub's version, not whatever release is the latest.
+        let e = e.to_string();
+        assert!(e.contains(&format!("twr {}", twr_core::version())), "{e}");
+        assert!(
+            e.contains(&format!("`twr update --version v{}`", twr_core::version()))
+                || e.contains("development build"),
+            "{e}"
+        );
     }
     let mut c = Client::connect(&th.socket).await.unwrap();
     let hello = c.call("hello", json!({"client": "script"})).await.unwrap();

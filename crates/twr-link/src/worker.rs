@@ -18,7 +18,33 @@ pub struct Build {
     pub arch: String,
     pub protocol: u32,
 }
+/// What identifies a file's content as unchanged since it was hashed: its device, inode, size,
+/// and modification and change times. Worker and service slots are written once and renamed
+/// into place, and no process can set a change time, so a write in place always misses.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FileKey([i64; 7]);
+impl FileKey {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self([
+            metadata.dev() as i64,
+            metadata.ino() as i64,
+            metadata.size() as i64,
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        ])
+    }
+}
+/// SHA-256 digests of executables already hashed ([`FileKey`]): opening a box on every hub
+/// reconnect checks its worker of up to 1 GiB without reading it again.
+static DIGESTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<FileKey, String>>> =
+    std::sync::LazyLock::new(Default::default);
+const MAX_DIGESTS: usize = 256;
 impl Build {
+    /// The build at `path` (hashed, or its digest remembered: [`DIGESTS`]). Blocks: call
+    /// [`Build::of_async`] on the async runtime.
     pub fn of(path: &Path) -> Result<Self> {
         use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
@@ -26,15 +52,28 @@ impl Build {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
+        let metadata = file.metadata()?;
         ensure!(
-            file.metadata()?.is_file(),
+            metadata.is_file(),
             "worker executable must be a regular file"
         );
-        let size = file.metadata()?.len();
+        let size = metadata.len();
         ensure!(size <= MAX_EXECUTABLE, "worker executable exceeds limit");
+        let build = |sha256| Self {
+            sha256,
+            size,
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            protocol: twr_core::runner::PROTOCOL_VERSION,
+        };
+        let key = FileKey::of(&metadata);
+        let digests = || DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sha256) = digests().get(&key) {
+            return Ok(build(sha256.clone()));
+        }
         let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
         let mut received = 0u64;
-        let mut buf = [0; 65536];
+        let mut buf = vec![0; 65536];
         loop {
             let n = file.read(&mut buf)?;
             if n == 0 {
@@ -45,16 +84,24 @@ impl Build {
             digest.update(&buf[..n]);
         }
         ensure!(received == size, "worker file changed while hashing");
-        Ok(Self {
-            sha256: hex::encode(digest.finish()),
-            size,
-            os: std::env::consts::OS.into(),
-            arch: std::env::consts::ARCH.into(),
-            protocol: twr_core::runner::PROTOCOL_VERSION,
-        })
+        let sha256 = hex::encode(digest.finish());
+        // Remembered only when nothing changed the file while it was read.
+        if FileKey::of(&file.metadata()?) == key {
+            let mut digests = digests();
+            if digests.len() >= MAX_DIGESTS {
+                digests.clear();
+            }
+            digests.insert(key, sha256.clone());
+        }
+        Ok(build(sha256))
+    }
+    /// [`Build::of`] on a blocking thread.
+    pub async fn of_async(path: &Path) -> Result<Self> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::of(&path)).await?
     }
     pub async fn executable(path: &Path) -> Result<Self> {
-        let mut build = Self::of(path)?;
+        let mut build = Self::of_async(path).await?;
         let mut cmd = tokio::process::Command::new(path);
         cmd.arg("--link-service-version")
             .env(twr_runner::reap::AGENT_ENV, "linked-worker-probe");
@@ -83,8 +130,16 @@ impl Build {
         }
         Ok(build)
     }
+    /// Whether the file at `path` is this build. Blocks: [`Build::matches_async`] on the
+    /// async runtime.
     pub fn matches(&self, path: &Path) -> bool {
         Self::of(path).is_ok_and(|actual| actual.sha256 == self.sha256 && actual.size == self.size)
+    }
+    /// [`Build::matches`] on a blocking thread.
+    pub async fn matches_async(&self, path: &Path) -> bool {
+        Self::of_async(path)
+            .await
+            .is_ok_and(|actual| actual.sha256 == self.sha256 && actual.size == self.size)
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -132,11 +187,7 @@ pub fn options(machine: &Machine, worker: &Worker) -> Result<twr_runner::relay::
         &ring::digest::SHA256,
         format!("{}\0{}\0{}", worker.scope, worker.box_name, worker.epoch).as_bytes(),
     ));
-    let sockets = machine
-        .socket
-        .parent()
-        .context("socket parent missing")?
-        .join("lr");
+    let sockets = machine.worker_sockets(&format!("{}.sock", &digest[..20]))?;
     twr_core::paths::ensure_private_dir(&sockets)?;
     let mut opts = twr_runner::relay::RelayOptions::new(&worker.box_name, key, false)?;
     opts.paths = twr_runner::relay::DaemonPaths {
@@ -298,6 +349,30 @@ mod tests {
             old.managed.unwrap().revocation,
             new.managed.unwrap().revocation
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn remembered_digests_never_survive_a_change_in_place() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("twr");
+        std::fs::write(&path, b"first build")?;
+        let modified = std::fs::metadata(&path)?.modified()?;
+        let first = Build::of_async(&path).await?;
+        assert_eq!(Build::of(&path)?, first);
+        // Same size and modification time, other bytes: the change time still differs.
+        std::fs::write(&path, b"other build")?;
+        std::fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_modified(modified)?;
+        let second = Build::of(&path)?;
+        assert_ne!(second.sha256, first.sha256);
+        assert_eq!(
+            second.sha256,
+            hex::encode(ring::digest::digest(&ring::digest::SHA256, b"other build"))
+        );
+        assert!(second.matches_async(&path).await);
+        assert!(!first.matches_async(&path).await);
         Ok(())
     }
     #[tokio::test]

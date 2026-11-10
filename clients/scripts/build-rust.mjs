@@ -1,6 +1,7 @@
 import { generatedCatalog } from "./catalog.mjs";
 import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   mkdirSync,
   copyFileSync,
@@ -66,7 +67,14 @@ if (readFileSync("mobile/catalog.json", "utf8") !== generated) {
   if (rebuilt.status !== 0) process.exit(rebuilt.status || 1);
 }
 mkdirSync("bin", { recursive: true });
+// The packaged app names its engine directory from these digests instead of
+// hashing ~70 MB on every launch, and verifies each copy against them.
+const digests = {};
 for (const name of ["twr", "twr-desktop-bridge", "twr-mobile-gateway"]) {
   copyFileSync(`../target/${target}/release/${name}`, `bin/${name}`);
   chmodSync(`bin/${name}`, 0o755);
+  digests[name] = createHash("sha256")
+    .update(readFileSync(`bin/${name}`))
+    .digest("hex");
 }
+writeFileSync("bin/digests.json", JSON.stringify(digests, null, 2) + "\n");

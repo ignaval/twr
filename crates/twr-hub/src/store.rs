@@ -311,6 +311,9 @@ pub fn connect(path: &Path) -> anyhow::Result<Connection> {
     let conn =
         Connection::open(path).with_context(|| format!("opening database {}", path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    // Room for every statement the writer prepares cached (its commits' and its lookups'):
+    // the default of 16 would evict the ones each commit runs.
+    conn.set_prepared_statement_cache_capacity(64);
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(conn)
@@ -442,8 +445,61 @@ pub struct QueuedPrompt {
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
-    /// Successful [`Store::sync`] calls (for tests: what was made durable when).
-    syncs: std::sync::atomic::AtomicU64,
+    /// Syncs the write-ahead log ([`Store::sync`]), also from outside the hub's lock.
+    wal: WalSync,
+}
+
+/// What [`Store::sync`] does, apart from the [`Store`]: syncing the write-ahead log needs no
+/// connection, so a runner connection syncs the frames it committed without holding the
+/// hub's lock (`hub::runners`). Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct WalSync {
+    /// The database's write-ahead log (`None`: an in-memory database, nothing to sync).
+    wal: Option<String>,
+    /// Successful syncs (for tests: what was made durable when).
+    syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WalSync {
+    fn of(conn: &Connection) -> WalSync {
+        WalSync {
+            wal: conn
+                .path()
+                .filter(|p| !p.is_empty())
+                .map(|db| format!("{db}-wal")),
+            syncs: Default::default(),
+        }
+    }
+
+    /// One that syncs nothing (for tests without a database).
+    #[cfg(test)]
+    pub fn none() -> WalSync {
+        WalSync {
+            wal: None,
+            syncs: Default::default(),
+        }
+    }
+
+    /// [`Store::sync`]. Every commit made before the call is durable once it returns: SQLite
+    /// writes a commit to the log file before the commit returns, a checkpoint syncs the log
+    /// before it copies it into the database and the database after, and syncing the file
+    /// through any descriptor makes its writes durable. Needs no lock: commits made meanwhile
+    /// are synced too, or not, and were not asked about.
+    pub fn sync(&self) -> anyhow::Result<()> {
+        let Some(wal) = &self.wal else {
+            return Ok(());
+        };
+        match std::fs::File::open(wal) {
+            Ok(f) => f.sync_all().with_context(|| format!("syncing {wal}"))?,
+            // No log: everything is in the database file, synced by the checkpoint that
+            // emptied it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {wal}"))),
+        }
+        self.syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 /// Extra writes committed together with an appended event.
@@ -483,6 +539,9 @@ pub struct NewPrompt {
 pub struct AppendBatch<'a> {
     /// Events in append order, each with whether it gets a control row.
     pub events: Vec<(&'a Event, bool)>,
+    /// Each event's `data` as the JSON text to store, in the same order, when the caller made
+    /// it already (the hub's writer, `blob::cap_for_log`); empty: written here from the events.
+    pub data: &'a [String],
     /// Blobs to store (`(ref, bytes)`), idempotent.
     pub blobs: &'a [(String, Vec<u8>)],
     /// Pending prompt row to remove (dispatch).
@@ -563,8 +622,8 @@ impl Store {
         migrate(&mut conn)?;
         restrict_db_files(path)?;
         Ok(Store {
+            wal: WalSync::of(&conn),
             conn,
-            syncs: Default::default(),
         })
     }
 
@@ -572,9 +631,10 @@ impl Store {
     /// migrated already: for a replay in the background that writes nothing but a checkpoint
     /// (`hub::checkpoint`).
     pub fn open_existing(path: &Path) -> anyhow::Result<Store> {
+        let conn = connect(path)?;
         Ok(Store {
-            conn: connect(path)?,
-            syncs: Default::default(),
+            wal: WalSync::of(&conn),
+            conn,
         })
     }
 
@@ -610,6 +670,7 @@ impl Store {
     ) -> anyhow::Result<Option<u64>> {
         let commit = self.append_batch(AppendBatch {
             events: vec![(ev, control)],
+            data: &[],
             blobs: extras.blobs,
             dequeue: extras.dequeue,
             enqueue: Vec::new(),
@@ -627,11 +688,23 @@ impl Store {
     /// its control row) in order, then the queued prompts. Either all of it is recorded or
     /// none of it.
     pub fn append_batch(&mut self, batch: AppendBatch<'_>) -> anyhow::Result<BatchCommit> {
-        let data = batch
-            .events
-            .iter()
-            .map(|(ev, _)| Ok(serde_json::to_string(&ev.body.data()?)?))
-            .collect::<anyhow::Result<Vec<String>>>()?;
+        let written;
+        let data: &[String] = if batch.data.is_empty() {
+            written = batch
+                .events
+                .iter()
+                .map(|(ev, _)| Ok(serde_json::to_string(&ev.body.data()?)?))
+                .collect::<anyhow::Result<Vec<String>>>()?;
+            &written
+        } else if batch.data.len() == batch.events.len() {
+            batch.data
+        } else {
+            bail!(
+                "{} events with {} data texts",
+                batch.events.len(),
+                batch.data.len()
+            );
+        };
         // A runner frame is acked once this commits, and the runner then deletes it: that
         // commit must survive a power loss too, not only a crash of the hub (unless the caller
         // syncs a batch of frames before acking them, `defer_sync`).
@@ -651,17 +724,19 @@ impl Store {
     fn commit_batch(
         conn: &mut Connection,
         batch: AppendBatch<'_>,
-        data: Vec<String>,
+        data: &[String],
     ) -> anyhow::Result<BatchCommit> {
         let tx = conn.transaction()?;
+        // Every statement here runs on most commits: prepared once per connection.
+        let exec = |sql: &str, p: &[&dyn rusqlite::ToSql]| tx.prepare_cached(sql)?.execute(p);
         for (r, bytes) in batch.blobs {
-            tx.execute(
+            exec(
                 "INSERT OR IGNORE INTO blobs (hash, bytes) VALUES (?1, ?2)",
                 params![r, bytes],
             )?;
         }
         if let Some(id) = batch.dequeue {
-            let n = tx.execute("DELETE FROM pending_prompts WHERE id = ?1", params![id])?;
+            let n = exec("DELETE FROM pending_prompts WHERE id = ?1", params![id])?;
             if n != 1 {
                 bail!("pending prompt {id} is gone");
             }
@@ -673,13 +748,13 @@ impl Store {
         }
         let mut out = BatchCommit::default();
         for thread in batch.drop_queues {
-            out.dropped += tx.execute(
+            out.dropped += exec(
                 "DELETE FROM pending_prompts WHERE thread = ?1",
                 params![thread],
             )?;
         }
         for ((ev, control), data) in batch.events.iter().zip(data) {
-            tx.execute(
+            exec(
                 "INSERT INTO events (thread, seq, id, v, ts, turn, source, kind, data, raw)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
@@ -696,7 +771,7 @@ impl Store {
                 ],
             )?;
             let gseq = if *control {
-                tx.execute(
+                exec(
                     "INSERT INTO control (thread, seq) VALUES (?1, ?2)",
                     params![ev.thread, to_i64(ev.seq)?],
                 )?;
@@ -706,17 +781,17 @@ impl Store {
             };
             out.gseqs.push(gseq);
             if CLOSING_KINDS.contains(&ev.kind()) {
-                tx.execute(
+                exec(
                     "DELETE FROM stop_requests WHERE thread = ?1",
                     params![ev.thread],
                 )?;
-                tx.execute(
+                exec(
                     "DELETE FROM spawn_intents WHERE thread = ?1",
                     params![ev.thread],
                 )?;
             }
             if ATTACH_KINDS.contains(&ev.kind()) {
-                tx.execute(
+                exec(
                     "DELETE FROM attach_processes WHERE thread = ?1",
                     params![ev.thread],
                 )?;
@@ -728,7 +803,7 @@ impl Store {
                 .push(insert_prompt(&tx, p, p.said_after.unwrap_or(head), head)?);
         }
         if let Some(a) = batch.runner_ack {
-            tx.execute(
+            exec(
                 "INSERT INTO runner_acks (box, thread, rseq) VALUES (?1, ?2, ?3)
                  ON CONFLICT(box, thread) DO UPDATE SET rseq = MAX(rseq, excluded.rseq)",
                 params![a.box_name, a.thread, to_i64(a.rseq)?],
@@ -737,7 +812,7 @@ impl Store {
         if !batch.remote_cmds.is_empty() {
             let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
             for c in batch.remote_cmds {
-                tx.execute(
+                exec(
                     "INSERT OR IGNORE INTO remote_outbox (box, cmd_id, thread, turn, op, created)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
@@ -752,13 +827,13 @@ impl Store {
             }
         }
         for (box_name, cmd_id) in batch.remote_done {
-            tx.execute(
+            exec(
                 "DELETE FROM remote_outbox WHERE box = ?1 AND cmd_id = ?2",
                 params![box_name, cmd_id],
             )?;
         }
         for thread in batch.stop_requests {
-            tx.execute(
+            exec(
                 "INSERT OR REPLACE INTO stop_requests (thread, ts) VALUES (?1, ?2)",
                 params![
                     thread,
@@ -777,25 +852,17 @@ impl Store {
     /// and only then are they acknowledged. SQLite writes a commit to the log file before the
     /// commit returns; syncing the file through any descriptor makes those writes durable.
     pub fn sync(&self) -> anyhow::Result<()> {
-        let Some(db) = self.conn.path().filter(|p| !p.is_empty()) else {
-            return Ok(());
-        };
-        let wal = format!("{db}-wal");
-        match std::fs::File::open(&wal) {
-            Ok(f) => f.sync_all().with_context(|| format!("syncing {wal}"))?,
-            // No log: everything is in the database file, synced by the checkpoint that
-            // emptied it.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(anyhow::Error::new(e).context(format!("opening {wal}"))),
-        }
-        self.syncs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        self.wal.sync()
     }
 
-    /// How many [`Store::sync`] calls succeeded so far.
+    /// [`Store::sync`] for use without the store, or the lock that guards it.
+    pub fn wal_sync(&self) -> WalSync {
+        self.wal.clone()
+    }
+
+    /// How many [`Store::sync`] (and [`WalSync::sync`]) calls succeeded so far.
     pub fn sync_count(&self) -> u64 {
-        self.syncs.load(std::sync::atomic::Ordering::Relaxed)
+        self.wal.syncs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The committed watermark of `thread` from box `box_name` (0: nothing yet).
@@ -996,6 +1063,36 @@ impl Store {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forgets every box's watermark of `thread` (it can never run again: its trash item is
+    /// purged). Returns how many there were.
+    pub fn forget_runner_acks(&self, thread: &str) -> anyhow::Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM runner_acks WHERE thread = ?1", [thread])?)
+    }
+
+    /// Every committed watermark's `(box, thread)`.
+    pub fn runner_ack_keys(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare("SELECT box, thread FROM runner_acks")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forgets the watermarks of `keys` (`(box, thread)`), in one transaction. Returns how
+    /// many there were.
+    pub fn forget_runner_acks_of(&mut self, keys: &[(String, String)]) -> anyhow::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut st = tx.prepare("DELETE FROM runner_acks WHERE box = ?1 AND thread = ?2")?;
+            for (b, t) in keys {
+                n += st.execute(params![b, t])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Every event in append order.
@@ -1381,25 +1478,58 @@ pub fn search_candidates(
     before: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<Event>> {
-    let mut st = conn.prepare_cached(&format!(
-        "SELECT {EVENT_COLS} FROM events WHERE id < ?1 {}
-         AND kind IN ('turn.started','agent.text','agent.tool_call','agent.tool_result',
-                      'decision.made','conversation.update','report.ready')
-         AND (kind != 'agent.text' OR coalesce(json_extract(data,'$.delta'),0) != 1 OR json_extract(data,'$.final') = 1)
-         ORDER BY id DESC LIMIT ?3",
-        if thread.is_some() {
-            "AND thread = ?2"
-        } else {
-            "AND ?2 IS NULL"
-        }
-    ))?;
+    let sql = if thread.is_some() {
+        SEARCH_THREAD
+    } else {
+        SEARCH_ALL
+    };
+    let mut st = conn.prepare_cached(sql)?;
     let rows = st.query_map(params![before, thread, limit as i64], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
 }
 
+/// The searchable kinds and the filter that drops streamed text deltas. The `+` keeps the
+/// planner off `events_kind_turn` for the kinds: walking that index reads every matching
+/// row of the log (with its data) and sorts them all by id for a `LIMIT` of a few hundred,
+/// where walking the id index backwards stops after the limit.
+macro_rules! search_filter {
+    () => {
+        " AND +kind IN ('turn.started','agent.text','agent.tool_call','agent.tool_result',
+                        'decision.made','conversation.update','report.ready')
+         AND (kind != 'agent.text' OR coalesce(json_extract(data,'$.delta'),0) != 1
+              OR json_extract(data,'$.final') = 1)
+         ORDER BY id DESC LIMIT ?3"
+    };
+}
+
+/// Search across every thread: walks the id index backwards from the cursor.
+const SEARCH_ALL: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE id < ?1 AND ?2 IS NULL",
+    search_filter!()
+);
+
+/// Search in one thread: walks `events_thread_id` backwards from the cursor.
+const SEARCH_THREAD: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE id < ?1 AND thread = ?2",
+    search_filter!()
+);
+
+/// The name a thread was created with or last renamed to, read off `events_kind_turn`
+/// (`+seq` keeps the planner from walking the thread's whole primary key backwards).
+const LATEST_THREAD_NAME: &str = "SELECT json_extract(data, '$.name') FROM events
+     WHERE thread = ?1 AND kind IN ('thread.created','thread.renamed')
+     ORDER BY +seq DESC LIMIT 1";
+
 /// A deleted thread still has its creation/rename event even after its live view is gone.
 pub fn latest_thread_name(conn: &Connection, thread: &str) -> anyhow::Result<Option<String>> {
-    Ok(conn.query_row("SELECT json_extract(data, '$.name') FROM events WHERE thread=?1 AND kind IN ('thread.created','thread.renamed') ORDER BY seq DESC LIMIT 1",[thread],|row|row.get(0)).optional()?)
+    Ok(conn
+        .prepare_cached(LATEST_THREAD_NAME)?
+        .query_row([thread], |row| row.get(0))
+        .optional()?)
 }
 
 /// One exact event, scoped to its recorded thread (also in an archive).
@@ -1489,37 +1619,81 @@ fn stream_line(row: RawRow, gseq: Option<u64>, out: &mut Vec<u8>) -> anyhow::Res
         out.push(b'\n');
         return Ok(());
     };
+    // (Neither is negative: `readable`.)
+    write_line(
+        out,
+        gseq,
+        &Envelope {
+            v: row.v,
+            id: &row.id,
+            seq: row.seq as u64,
+            ts: &ts,
+            thread: &row.thread,
+            turn: row.turn.map(|t| t as u64),
+            source: &source,
+            kind: &row.kind,
+            data: data.get(),
+            raw: row.raw.as_deref(),
+        },
+    )?;
+    Ok(())
+}
+
+/// An event's envelope as text, for [`write_line`]: `ts` as `Event` writes it (to the
+/// millisecond, in UTC), `source` spelled its way, `data` one JSON value on one line.
+pub(crate) struct Envelope<'a> {
+    pub v: u32,
+    pub id: &'a str,
+    pub seq: u64,
+    pub ts: &'a str,
+    pub thread: &'a str,
+    pub turn: Option<u64>,
+    pub source: &'a str,
+    pub kind: &'a str,
+    pub data: &'a str,
+    pub raw: Option<&'a str>,
+}
+
+/// Appends the line a subscription writes for event `e` (a control item when it has a
+/// `gseq`), with its newline: what serializing its [`twr_core::proto::StreamItem`] writes,
+/// `data` going in as it is (its keys in the order it has them).
+pub(crate) fn write_line(
+    out: &mut Vec<u8>,
+    gseq: Option<u64>,
+    e: &Envelope<'_>,
+) -> serde_json::Result<()> {
     let text = |out: &mut Vec<u8>, s: &str| serde_json::to_writer(&mut *out, s);
+    let number = |out: &mut Vec<u8>, n: u64| out.extend_from_slice(n.to_string().as_bytes());
     match gseq {
         Some(g) => {
             out.extend_from_slice(br#"{"stream":"control","gseq":"#);
-            out.extend_from_slice(g.to_string().as_bytes());
+            number(out, g);
         }
         None => out.extend_from_slice(br#"{"stream":"thread""#),
     }
     out.extend_from_slice(br#","event":{"v":"#);
-    out.extend_from_slice(row.v.to_string().as_bytes());
+    number(out, u64::from(e.v));
     out.extend_from_slice(br#","id":"#);
-    text(out, &row.id)?;
+    text(out, e.id)?;
     out.extend_from_slice(br#","seq":"#);
-    out.extend_from_slice(row.seq.to_string().as_bytes());
+    number(out, e.seq);
     out.extend_from_slice(br#","ts":"#);
-    text(out, &ts)?;
+    text(out, e.ts)?;
     out.extend_from_slice(br#","thread":"#);
-    text(out, &row.thread)?;
+    text(out, e.thread)?;
     out.extend_from_slice(br#","turn":"#);
-    match row.turn {
-        Some(t) => out.extend_from_slice(t.to_string().as_bytes()),
+    match e.turn {
+        Some(t) => number(out, t),
         None => out.extend_from_slice(b"null"),
     }
     out.extend_from_slice(br#","source":"#);
-    text(out, &source)?;
+    text(out, e.source)?;
     out.extend_from_slice(br#","kind":"#);
-    text(out, &row.kind)?;
+    text(out, e.kind)?;
     out.extend_from_slice(br#","data":"#);
-    out.extend_from_slice(data.get().as_bytes());
+    out.extend_from_slice(e.data.as_bytes());
     out.extend_from_slice(br#","raw":"#);
-    match &row.raw {
+    match e.raw {
         Some(r) => text(out, r)?,
         None => out.extend_from_slice(b"null"),
     }
@@ -2414,6 +2588,11 @@ pub fn next_final_text(
     row.map(|r| r.into_event()).transpose()
 }
 
+/// Read off `events_kind_turn`: `+seq` keeps the planner from walking the thread's whole
+/// primary key backwards (with every event's data) to find the newest `turn.started`.
+const TURN_OF_MESSAGE: &str = "SELECT turn FROM events WHERE kind = 'turn.started' AND thread = ?1
+     AND json_extract(data, '$.ext.twr.ref') = ?2 ORDER BY +seq DESC LIMIT 1";
+
 /// The turn of `thread` that message `msg_ref` started (its `turn.started` `ext.twr.ref`),
 /// if one did.
 pub fn turn_of_message(
@@ -2422,10 +2601,7 @@ pub fn turn_of_message(
     msg_ref: i64,
 ) -> anyhow::Result<Option<u64>> {
     let turn: Option<i64> = conn
-        .prepare_cached(
-            "SELECT turn FROM events WHERE kind = 'turn.started' AND thread = ?1
-             AND json_extract(data, '$.ext.twr.ref') = ?2 ORDER BY seq DESC LIMIT 1",
-        )?
+        .prepare_cached(TURN_OF_MESSAGE)?
         .query_row(params![thread, msg_ref], |r| r.get(0))
         .optional()?
         .flatten();
@@ -3065,6 +3241,59 @@ mod tests {
         }
     }
 
+    fn query_plan(conn: &Connection, sql: &str, args: &[&dyn rusqlite::ToSql]) -> String {
+        let mut st = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan: Vec<String> = st
+            .query_map(args, |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        plan.join("\n")
+    }
+
+    /// A search across threads walks the id index backwards from its cursor and stops at its
+    /// limit; one in a thread walks `events_thread_id`. Neither reads every event of the
+    /// searched kinds and sorts them, as a plan through `events_kind_turn` would.
+    #[test]
+    fn search_walks_the_id_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let none: Option<&str> = None;
+        let all = query_plan(s.conn(), SEARCH_ALL, &[&"z", &none, &513]);
+        assert!(
+            all.contains("USING INDEX sqlite_autoindex_events_1 (id<?)"),
+            "{all}"
+        );
+        assert!(!all.contains("TEMP B-TREE"), "{all}");
+        assert!(!all.contains("events_kind_turn"), "{all}");
+        let one = query_plan(s.conn(), SEARCH_THREAD, &[&"z", &"t", &513]);
+        assert!(
+            one.contains("USING INDEX events_thread_id (thread=? AND id<?)"),
+            "{one}"
+        );
+        assert!(!one.contains("TEMP B-TREE"), "{one}");
+    }
+
+    /// A thread's latest name and the turn a message started are read off
+    /// `events_kind_turn`, never by walking the thread's whole primary key backwards.
+    #[test]
+    fn name_and_message_turn_use_the_kind_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("twr.db")).unwrap();
+        for (sql, args) in [
+            (LATEST_THREAD_NAME, &[&"t" as &dyn rusqlite::ToSql][..]),
+            (TURN_OF_MESSAGE, &[&"t" as &dyn rusqlite::ToSql, &1][..]),
+        ] {
+            let plan = query_plan(s.conn(), sql, args);
+            assert!(
+                plan.contains("USING INDEX events_kind_turn (kind=? AND thread=?)"),
+                "{sql}:\n{plan}"
+            );
+            assert!(!plan.contains("PRIMARY KEY"), "{sql}:\n{plan}");
+            assert!(!plan.contains("SCAN "), "{sql}:\n{plan}");
+        }
+    }
+
     /// [`latest_final_text`] reads the texts of the newest turns only: on a thread of 5000
     /// replies whose last turn has a partial text alone, it takes about as many steps as on
     /// a thread of one.
@@ -3289,6 +3518,7 @@ mod tests {
         let committed = s
             .append_batch(AppendBatch {
                 events: vec![(&a, true), (&b, false)],
+                data: &[],
                 blobs: &[],
                 dequeue: None,
                 enqueue: vec![prompt(None), prompt(Some(1))],
@@ -3315,6 +3545,7 @@ mod tests {
         assert!(s
             .append_batch(AppendBatch {
                 events: vec![(&c, true), (&dup, true)],
+                data: &[],
                 blobs: &[],
                 dequeue: Some(p.id),
                 enqueue: vec![prompt(None)],
@@ -3413,6 +3644,7 @@ mod tests {
         };
         let batch = |enqueue| AppendBatch {
             events: vec![],
+            data: &[],
             blobs: &[],
             dequeue: None,
             enqueue,
@@ -3792,6 +4024,7 @@ mod tests {
         };
         let batch = AppendBatch {
             events: vec![],
+            data: &[],
             blobs: &[],
             dequeue: None,
             enqueue: vec![],

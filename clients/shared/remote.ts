@@ -21,7 +21,8 @@ export interface PairRequest {
 }
 /** Native code owns credentials, TLS and exactly one active socket. */
 export interface NativeTransport {
-  listHubs(): Promise<{ hubs: Hub[] }>;
+  /** `notice`: saved hubs were dropped (Android: undecryptable after a device transfer). */
+  listHubs(): Promise<{ hubs: Hub[]; notice?: string }>;
   pair(request: PairRequest): Promise<Hub>;
   connect(request: { id: string }): Promise<void>;
   send(request: { message: string }): Promise<void>;
@@ -43,6 +44,12 @@ export interface RemoteServices {
   secureWrite?: DesktopAPI["secureWrite"];
   secureDelete?: DesktopAPI["secureDelete"];
   includeLocalInboxCache?: boolean;
+}
+/** How long the socket stays open after the app leaves the foreground. */
+export const BACKGROUND_GRACE = 30_000;
+/** Native transports report a revoked or unknown token (HTTP 401) this way; nothing else is a revocation. */
+export function isRevocationError(error: unknown) {
+  return /AUTH_REVOKED|credential.*revok|re-pair/i.test(String(error));
 }
 export class RemoteHost {
   private inboxRefresh?: Promise<import("./types").InboxSource[]>;
@@ -138,13 +145,38 @@ export class RemoteHost {
       }
     }, 15000);
   }
+  private backgroundTimer?: ReturnType<typeof setTimeout>;
+  /** The socket was closed for the background; nothing answers the gateway's heartbeats. */
+  private parked = false;
   setForeground(value: boolean) {
     this.foreground = value;
     this.looking = value;
     if (!value) {
       clearTimeout(this.retryTimer);
       this.retryTimer = undefined;
-    } else if (!this.nativeConnected) this.scheduleReconnect();
+      this.armBackgroundTimer();
+    } else {
+      clearTimeout(this.backgroundTimer);
+      this.backgroundTimer = undefined;
+      this.parked = false;
+      if (!this.nativeConnected) this.scheduleReconnect();
+    }
+  }
+  /**
+   * After BACKGROUND_GRACE in the background the socket closes, so answering the
+   * gateway's heartbeats doesn't wake the radio every 15 s (Android keeps the app
+   * running until Doze). Durable requests stay pending with their original IDs and
+   * are sent again by the reconnect on resume; remote terminals survive it.
+   */
+  private armBackgroundTimer() {
+    if (this.stopped || this.foreground || this.backgroundTimer) return;
+    this.backgroundTimer = setTimeout(() => {
+      this.backgroundTimer = undefined;
+      if (this.stopped || this.foreground) return;
+      this.parked = true;
+      if (this.nativeConnected)
+        this.transportFailed("Disconnected while twr is in the background");
+    }, BACKGROUND_GRACE);
   }
   private scheduleReconnect() {
     if (
@@ -204,7 +236,7 @@ export class RemoteHost {
         }),
       ]);
     } catch (error) {
-      if (/AUTH_REVOKED|credential.*revok|re-pair/i.test(String(error))) {
+      if (isRevocationError(error)) {
         this.authenticationRevoked = true;
         clearTimeout(this.retryTimer);
         this.listeners.forEach((listener) =>
@@ -244,6 +276,7 @@ export class RemoteHost {
         }
         if (!message) return;
         if (message.type === "heartbeat") {
+          if (this.parked) return;
           void this.send(
             JSON.stringify({ id: requestId(), method: "heartbeat" }),
           ).catch(() => {});
@@ -309,11 +342,7 @@ export class RemoteHost {
       this.readMethods = new Set(capabilities.read_methods || []);
       this.workspace = capabilities.workspace || "default";
     } catch (e) {
-      if (
-        this.stopped ||
-        /AUTH_REVOKED|credential.*revok|re-pair/i.test(String(e))
-      )
-        throw e;
+      if (this.stopped || isRevocationError(e)) throw e;
       const cached = await this.cachedBootstrap();
       if (!cached) {
         await this.listener.remove();
@@ -343,6 +372,8 @@ export class RemoteHost {
   }
   async stop() {
     this.stopped = true;
+    this.workspaceListeners.clear();
+    clearTimeout(this.backgroundTimer);
     clearInterval(this.heartbeatTimer);
     this.assembler.clear();
     clearTimeout(this.retryTimer);
@@ -380,7 +411,37 @@ export class RemoteHost {
     this.listeners.forEach((listener) =>
       listener({ type: "resync", scope: "terminal" }),
     );
+    this.workspaceListeners.forEach((listener) => {
+      try {
+        listener(workspace);
+      } catch {
+        /* A listener's failure must not fail the connection. */
+      }
+    });
+    // A connection that finished after the app left the foreground closes again later.
+    this.parked = false;
+    this.armBackgroundTimer();
     return result;
+  }
+  private workspaceListeners = new Set<(workspace: string) => void>();
+  /** The native socket is authenticated (false while offline history is shown). */
+  get socketConnected() {
+    return this.nativeConnected && !this.stopped;
+  }
+  /** The gateway refused this device's token: it no longer reconnects. */
+  get revoked() {
+    return this.authenticationRevoked;
+  }
+  /**
+   * Called after every successful workspace connection: the first one, a switch
+   * to another workspace and each reconnect. Mobile refreshes its push
+   * registration here, which the gateway keeps per device and workspace.
+   */
+  onWorkspaceConnected(listener: (workspace: string) => void) {
+    this.workspaceListeners.add(listener);
+    return () => {
+      this.workspaceListeners.delete(listener);
+    };
   }
   async resume() {
     if (this.stopped) return;

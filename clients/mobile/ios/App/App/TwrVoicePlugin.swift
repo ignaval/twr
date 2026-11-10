@@ -10,13 +10,18 @@ import UIKit
 ///   (`requiresOnDeviceRecognition`); otherwise the audio goes to Apple's servers, and
 ///   `status` says so (`local: false`).
 /// - Push mode records until `stop`; hands-free keeps listening, ends an utterance after
-///   about 0.9 s of silence, and starts a new recognition task for the next (a task lasts
+///   2 s of silence (shared/voice.ts `PAUSE_MS`), and starts a new recognition task for the next (a task lasts
 ///   about a minute at most, so a long silence restarts it too).
 /// - The audio session is `.playAndRecord` in `.voiceChat` mode with voice processing on
 ///   the input: the system's echo cancellation keeps the phone's own voice out of what is
 ///   heard.
 /// - Foreground only: leaving the app ends recognition and the voice (an `error` event with
 ///   `background: true`).
+/// - The session is given back (`.notifyOthersOnDeactivation`) once nothing listens or speaks,
+///   so other apps' audio resumes. A call or Siri ends listening and the voice (an `error`
+///   event with `interrupted: true`); hands-free listens again when the interruption ends with
+///   `.shouldResume`. An audio route change restarts the engine in hands-free and ends a push
+///   recording with what it heard.
 /// Every event is one `voice` listener call with a `type`; all state lives on the main queue.
 @objc(TwrVoicePlugin)
 final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDelegate {
@@ -26,8 +31,9 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
         CAPPluginMethod(name: $0, returnType: CAPPluginReturnPromise)
     }
 
-    /// Silence that ends a hands-free utterance.
-    private static let endSilence: TimeInterval = 0.9
+    /// Silence that ends a hands-free utterance (shared/voice.ts `PAUSE_MS`): long enough for a
+    /// pause to think mid-sentence.
+    private static let endSilence: TimeInterval = 2.0
     /// A sound loud enough to count as speech that brings no words this soon (a cough, a door)
     /// ends its utterance empty: the phone's own voice, paused for it, goes on.
     private static let noWords: TimeInterval = 2.5
@@ -63,18 +69,34 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
 
     private let synthesizer = AVSpeechSynthesizer()
     private var utterances: [ObjectIdentifier: Int] = [:]
-    private var backgroundObserver: NSObjectProtocol?
+    private var observers: [NSObjectProtocol] = []
+    /// This plugin activated the shared audio session and has not given it back yet.
+    private var sessionActive = false
+    /// A hands-free session a call, Siri or another app interrupted: its hints, to listen
+    /// again when the interruption ends with `.shouldResume`.
+    private var resumeHints: [String]?
+    /// Recent engine restarts after configuration changes, to stop a restart loop.
+    private var engineRestarts: [Date] = []
 
     override func load() {
         synthesizer.delegate = self
         recognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
-        backgroundObserver = NotificationCenter.default.addObserver(
-            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.enteredBackground() }
+        let center = NotificationCenter.default
+        observers = [
+            center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.enteredBackground()
+            },
+            center.addObserver(forName: AVAudioSession.interruptionNotification, object: AVAudioSession.sharedInstance(), queue: .main) { [weak self] note in
+                self?.interrupted(note)
+            },
+            center.addObserver(forName: .AVAudioEngineConfigurationChange, object: audio, queue: .main) { [weak self] _ in
+                self?.engineConfigurationChanged()
+            },
+        ]
     }
 
     deinit {
-        if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
     private func emit(_ data: [String: Any]) {
@@ -136,6 +158,96 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: options)
         }
         try session.setActive(true)
+        sessionActive = true
+    }
+
+    /// Gives the audio session back once nothing listens or speaks, so the music or podcast
+    /// voice mode interrupted resumes (`.notifyOthersOnDeactivation`).
+    private func releaseSessionIfIdle() {
+        guard sessionActive, !listening, pass == nil, !audio.isRunning,
+              !synthesizer.isSpeaking, utterances.isEmpty else { return }
+        sessionActive = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    /// The synthesizer reports `isSpeaking` a moment after it was stopped, and a reply's next
+    /// sentence arrives over the network: check again after `delay`.
+    private func scheduleRelease(after delay: TimeInterval = 0.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.releaseSessionIfIdle() }
+    }
+
+    // MARK: Interruptions and route changes
+
+    /// A call, Siri or another app's audio took the session: the engine has stopped, so the
+    /// recognition and the voice end, and the UI hears it as an `error` (`interrupted: true`).
+    /// A hands-free session listens again when the interruption ends with `.shouldResume`.
+    private func interrupted(_ note: Notification) {
+        guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+        switch type {
+        case .began:
+            // The system deactivated the session.
+            sessionActive = false
+            let wasListening = listening || pass != nil
+            guard wasListening || synthesizer.isSpeaking || !utterances.isEmpty else { return }
+            resumeHints = listening && mode == "hands-free" ? hints : nil
+            teardown(release: false)
+            utterances.removeAll()
+            synthesizer.stopSpeaking(at: .immediate)
+            emit(["type": "error", "message": "Voice mode stopped for a call or another app's audio", "interrupted": true])
+        case .ended:
+            guard let hints = resumeHints else { return }
+            resumeHints = nil
+            let options = AVAudioSession.InterruptionOptions(rawValue: note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0)
+            guard options.contains(.shouldResume), UIApplication.shared.applicationState == .active else { return }
+            do {
+                teardown(release: false)
+                mode = "hands-free"
+                self.hints = hints
+                quickFailures = 0
+                try configureSession()
+                try startAudio()
+                listening = true
+                beginPass()
+            } catch {
+                teardown()
+                emit(["type": "error", "message": "The microphone could not start again: \(error.localizedDescription)"])
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    /// The input or output route changed (headphones, Bluetooth, a dock) and the engine stopped
+    /// itself. What the current pass heard is delivered; hands-free starts the engine again with
+    /// the new input format, push mode ends its recording there.
+    private func engineConfigurationChanged() {
+        guard listening, !audio.isRunning else { return }
+        let now = Date()
+        engineRestarts = engineRestarts.filter { now.timeIntervalSince($0) < 10 } + [now]
+        guard mode == "hands-free", engineRestarts.count <= 3 else {
+            let handsFree = mode == "hands-free"
+            listening = false
+            if let pass { endPass(pass) } else { teardown() }
+            stopAudio()
+            if handsFree {
+                emit(["type": "error", "message": "The microphone stopped after the audio route changed"])
+            }
+            scheduleRelease()
+            return
+        }
+        bufferLock.lock()
+        bufferTarget = nil
+        bufferLock.unlock()
+        audio.inputNode.removeTap(onBus: 0)
+        if let pass { endPass(pass) } else { beginPass() }
+        do {
+            try configureSession()
+            try startAudio()
+        } catch {
+            teardown()
+            emit(["type": "error", "message": "The microphone could not start again: \(error.localizedDescription)"])
+        }
     }
 
     // MARK: Recognition
@@ -152,7 +264,8 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
                 if let problem { call.reject(problem); return }
                 if let problem = self.problem() { call.reject(problem); return }
                 do {
-                    self.teardown()
+                    self.teardown(release: false)
+                    self.engineRestarts = []
                     self.mode = mode
                     self.hints = Array(hints)
                     self.quickFailures = 0
@@ -326,7 +439,10 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
                 beginPass()
             } else {
                 self.pass = nil
-                if !listening || mode == "push" { stopAudio() }
+                if !listening || mode == "push" {
+                    stopAudio()
+                    releaseSessionIfIdle()
+                }
             }
         }
     }
@@ -362,8 +478,10 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
         audio.inputNode.removeTap(onBus: 0)
     }
 
-    /// Stops listening and drops what was not recognized yet.
-    private func teardown() {
+    /// Stops listening and drops what was not recognized yet; with `release`, gives the audio
+    /// session back unless the phone's voice is still speaking.
+    private func teardown(release: Bool = true) {
+        resumeHints = nil
         listening = false
         silenceTimer?.invalidate()
         limitTimer?.invalidate()
@@ -374,13 +492,19 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
         pass = nil
         heardSpeech = false
         stopAudio()
+        if release { releaseSessionIfIdle() }
     }
 
     private func enteredBackground() {
         let wasActive = listening || pass != nil || synthesizer.isSpeaking
-        teardown()
+        teardown(release: false)
         utterances.removeAll()
         synthesizer.stopSpeaking(at: .immediate)
+        // Nothing listens or speaks any more: give the session back now, while the app still runs.
+        if sessionActive {
+            sessionActive = false
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        }
         if wasActive {
             emit(["type": "error", "message": "Voice mode stops while twr is in the background", "background": true])
         }
@@ -433,6 +557,7 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
             if id == nil || self.utterances.values.contains(id!) {
                 self.utterances.removeAll()
                 self.synthesizer.stopSpeaking(at: .immediate)
+                self.scheduleRelease()
             }
             call.resolve()
         }
@@ -443,6 +568,8 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
             if let id = self.utterances.removeValue(forKey: ObjectIdentifier(utterance)) {
                 self.emit(["type": "spoken", "id": id])
             }
+            // The next sentence usually follows at once; the session goes back if none does.
+            if self.utterances.isEmpty { self.scheduleRelease(after: 2) }
         }
     }
 

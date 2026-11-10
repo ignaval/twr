@@ -674,7 +674,17 @@ pub struct VoiceConfig {
     pub command: Vec<String>,
     /// How long recognizing one recording may take, in seconds.
     pub timeout_secs: u64,
+    /// Hands-free: the silence that ends an utterance (and sends it), in milliseconds.
+    pub pause_ms: u64,
+    /// Hands-free keeps listening while replies are read aloud, so talking interrupts them.
+    /// Off (the default), it stops listening until they end: their echo is never sent.
+    pub listen_while_speaking: bool,
 }
+
+/// `[voice] pause_ms`'s default: a pause to think mid-sentence doesn't end the message.
+pub const VOICE_PAUSE_MS: u64 = 2000;
+/// `[voice] pause_ms`'s bounds.
+pub const VOICE_PAUSE_MS_RANGE: std::ops::RangeInclusive<u64> = 500..=10_000;
 
 impl Default for VoiceConfig {
     fn default() -> Self {
@@ -685,6 +695,8 @@ impl Default for VoiceConfig {
             language: "en".into(),
             command: Vec::new(),
             timeout_secs: 60,
+            pause_ms: VOICE_PAUSE_MS,
+            listen_while_speaking: false,
         }
     }
 }
@@ -709,6 +721,14 @@ impl VoiceConfig {
             anyhow::bail!(
                 "voice.timeout_secs: {} is not 1 to 600 seconds",
                 self.timeout_secs
+            );
+        }
+        if !VOICE_PAUSE_MS_RANGE.contains(&self.pause_ms) {
+            anyhow::bail!(
+                "voice.pause_ms: {} is not {} to {} milliseconds",
+                self.pause_ms,
+                VOICE_PAUSE_MS_RANGE.start(),
+                VOICE_PAUSE_MS_RANGE.end()
             );
         }
         Ok(())
@@ -4212,6 +4232,20 @@ account = "gpu-work"
             "[notify]\nevents = [\"everything\"]\n",
             "[notify]\nurl = \"https://ntfy.sh/x\"\n",
         ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn voice_listening_settings_default_and_are_checked() {
+        let c = Config::default();
+        assert_eq!(c.voice.pause_ms, 2000);
+        assert!(!c.voice.listen_while_speaking);
+        let c = Config::from_toml_str("[voice]\npause_ms = 3500\nlisten_while_speaking = true\n")
+            .unwrap();
+        assert_eq!(c.voice.pause_ms, 3500);
+        assert!(c.voice.listen_while_speaking);
+        for bad in ["[voice]\npause_ms = 100\n", "[voice]\npause_ms = 60000\n"] {
             assert!(Config::from_toml_str(bad).is_err(), "{bad}");
         }
     }
