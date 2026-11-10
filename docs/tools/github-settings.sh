@@ -63,7 +63,7 @@ for branch in main dev; do
   "allow_deletions": false
 }
 EOF
-    echo "$branch: pull requests with CI passed, no force pushes or deletion (admins exempt)"
+    echo "$branch: pull requests with CI passed, no force pushes or deletion (admins included)"
 done
 
 # Publishing a release waits for the owner's approval; it still deploys only from v* tags
