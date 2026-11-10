@@ -710,7 +710,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release upload "$TAG" desktop/* --clobber
+        # The update metadata goes last: a self-updating app engages only once latest-*.yml is
+        # there, and the AppImage updater then needs the signed checksums beside it.
+        run: |
+          shopt -s extglob
+          gh release upload "$TAG" desktop/!(latest-*.yml) --clobber
+          gh release upload "$TAG" desktop/latest-*.yml --clobber
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-aur

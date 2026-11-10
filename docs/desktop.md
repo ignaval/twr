@@ -196,7 +196,13 @@ The app checks the latest GitHub release 45 seconds after launch and then every 
 hours. Turn this off, or check by hand, in Settings › Updates or Help › Check for Updates.
 It only reacts to a release once that release has the installers and update metadata for
 this platform. Self-updating builds verify the download against the SHA-512 in the
-release's `latest-*.yml`, and on macOS against the app's code signature. The hub and its
+release's `latest-*.yml`, and on macOS against the app's code signature. An AppImage also
+needs the image's SHA-256 in `desktop-sha256sums.txt`, checked with its signature
+(`desktop-sha256sums.txt.sig`, the release key `twr update` uses) when the download
+completes and again before the image is replaced: someone who can change the release's
+files but does not hold the release key cannot get an AppImage installed. A release without
+that signature (one published before signing existed, or one still being attached) is never
+installed automatically: the AppImage offers it as a manual download instead. The hub and its
 agents keep running through an app update. Each app build keeps its engine in its own
 content-addressed directory, so a running hub's executable is never replaced.
 
