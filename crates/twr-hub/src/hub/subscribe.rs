@@ -212,7 +212,7 @@ impl Hub {
     /// after `since`.
     fn control_subscription(
         &self,
-        rx: broadcast::Receiver<ControlItem>,
+        rx: broadcast::Receiver<(u64, Arc<Recorded>)>,
         since: u64,
         head: u64,
         compact: Option<Compact>,
@@ -229,6 +229,7 @@ impl Hub {
             lines: VecDeque::new(),
             compact,
             snapshot,
+            ended: false,
         }
     }
 
@@ -260,6 +261,7 @@ impl Hub {
             head,
             backlog: VecDeque::new(),
             lines: VecDeque::new(),
+            ended: false,
         })
     }
 }
@@ -293,6 +295,49 @@ pub(crate) fn stream_line(
     )?;
     buf.push(b'\n');
     Ok(())
+}
+
+/// A committed event as the hub broadcasts it (`Core::append_batch`): the event as stored
+/// (its payload capped) and that payload's JSON text as the log has it, written once for the
+/// log and every subscriber's line ([`Recorded::line`]), none of which serializes the event
+/// again.
+pub(crate) struct Recorded {
+    event: Arc<Event>,
+    data: String,
+}
+
+impl Recorded {
+    /// `event` as stored, with `data`, its payload as the log stores it.
+    pub(super) fn new(event: Event, data: String) -> Recorded {
+        Recorded {
+            event: Arc::new(event),
+            data,
+        }
+    }
+
+    /// Appends the line a subscription writes for it (a control item with its `gseq`), with
+    /// its newline: what [`stream_line`] writes, `data`'s keys in the order the log has them.
+    fn line(&self, gseq: Option<u64>, out: &mut Vec<u8>) -> serde_json::Result<()> {
+        let ev = &self.event;
+        let ts = ev.ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let source = ev.source.to_string();
+        store::write_line(
+            out,
+            gseq,
+            &store::Envelope {
+                v: ev.v,
+                id: &ev.id,
+                seq: ev.seq,
+                ts: &ts,
+                thread: &ev.thread,
+                turn: ev.turn,
+                source: &source,
+                kind: ev.kind(),
+                data: &self.data,
+                raw: ev.raw.as_deref(),
+            },
+        )
+    }
 }
 
 /// How many bytes `v` takes serialized (without writing them anywhere).
@@ -356,7 +401,7 @@ async fn wake<T: Clone>(
 /// A control stream subscription (see [`Hub::subscribe_control`]).
 pub struct ControlSubscription {
     hub: Arc<Inner>,
-    rx: broadcast::Receiver<ControlItem>,
+    rx: broadcast::Receiver<(u64, Arc<Recorded>)>,
     state: watch::Receiver<HubState>,
     since: u64,
     last: u64,
@@ -369,6 +414,8 @@ pub struct ControlSubscription {
     compact: Option<Compact>,
     /// The state at the head, until [`ControlSubscription::snapshot`] took it.
     snapshot: Option<Snapshot>,
+    /// The hub shut down and nothing live is left.
+    ended: bool,
 }
 
 /// What a subscription with `snapshot` took under the core lock
@@ -637,21 +684,52 @@ impl ControlSubscription {
             if let Some(item) = self.next_stored()? {
                 return Ok(Some(item));
             }
-            match wake(&mut self.rx, &mut self.state).await {
-                Wake::Item((g, ev)) => {
-                    if g == self.last + 1 {
-                        self.last = g;
-                        return Ok(Some((g, ev)));
-                    }
-                    if g > self.last {
-                        // A gap: everything up to g is committed, read it from the store.
-                        self.head = g;
-                    }
-                }
-                Wake::Lagged => self.head = store::control_head(&self.hub.reader())?,
-                Wake::Closed | Wake::Drained => return Ok(None),
+            if let Some((g, rec)) = self.next_live().await? {
+                return Ok(Some((g, Arc::clone(&rec.event))));
+            }
+            if self.ended {
+                return Ok(None);
             }
         }
+    }
+
+    /// Appends the line of the next item to `buf` (as [`ControlSubscription::next`] would
+    /// give it, a live one from the line's payload it was committed with, [`Recorded`]);
+    /// `Ok(false)` once the hub has shut down.
+    pub(crate) async fn next_line(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        loop {
+            if self.write_stored(buf)? {
+                return Ok(true);
+            }
+            if let Some((g, rec)) = self.next_live().await? {
+                rec.line(Some(g), buf)?;
+                return Ok(true);
+            }
+            if self.ended {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Waits for the next live item: `Some` when it is the next one; `None` when it is not
+    /// (what comes before it is then read from the store), or the hub has shut down
+    /// (`ended`).
+    async fn next_live(&mut self) -> anyhow::Result<Option<(u64, Arc<Recorded>)>> {
+        match wake(&mut self.rx, &mut self.state).await {
+            Wake::Item((g, rec)) => {
+                if g == self.last + 1 {
+                    self.last = g;
+                    return Ok(Some((g, rec)));
+                }
+                if g > self.last {
+                    // A gap: everything up to g is committed, read it from the store.
+                    self.head = g;
+                }
+            }
+            Wake::Lagged => self.head = store::control_head(&self.hub.reader())?,
+            Wake::Closed | Wake::Drained => self.ended = true,
+        }
+        Ok(None)
     }
 }
 
@@ -659,13 +737,15 @@ impl ControlSubscription {
 pub struct ThreadSubscription {
     hub: Arc<Inner>,
     thread: String,
-    rx: broadcast::Receiver<Arc<Event>>,
+    rx: broadcast::Receiver<Arc<Recorded>>,
     state: watch::Receiver<HubState>,
     last: u64,
     head: u64,
     backlog: VecDeque<Event>,
     /// Stored events read as their lines ([`ThreadSubscription::write_stored`]).
     lines: VecDeque<(u64, Vec<u8>)>,
+    /// The hub shut down and nothing live is left.
+    ended: bool,
 }
 
 impl ThreadSubscription {
@@ -759,21 +839,232 @@ impl ThreadSubscription {
             if let Some(ev) = self.next_stored()? {
                 return Ok(Some(ev));
             }
-            match wake(&mut self.rx, &mut self.state).await {
-                Wake::Item(ev) => {
-                    if ev.thread != self.thread || ev.seq <= self.last {
-                        continue;
-                    }
-                    if ev.seq == self.last + 1 {
-                        self.last = ev.seq;
-                        return Ok(Some(ev));
-                    }
-                    self.head = ev.seq;
+            if let Some(rec) = self.next_live().await? {
+                return Ok(Some(Arc::clone(&rec.event)));
+            }
+            if self.ended {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Appends the line of the next event to `buf` (as [`ThreadSubscription::next`] would
+    /// give it, a live one from the line's payload it was committed with, [`Recorded`]);
+    /// `Ok(false)` once the hub has shut down.
+    pub(crate) async fn next_line(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        loop {
+            if self.write_stored(buf)? {
+                return Ok(true);
+            }
+            if let Some(rec) = self.next_live().await? {
+                rec.line(None, buf)?;
+                return Ok(true);
+            }
+            if self.ended {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Waits for the next live event: `Some` when it is the thread's next one; `None` when it
+    /// is not (another thread's, one delivered, or one after a gap, which is then read from
+    /// the store), or the hub has shut down (`ended`).
+    async fn next_live(&mut self) -> anyhow::Result<Option<Arc<Recorded>>> {
+        match wake(&mut self.rx, &mut self.state).await {
+            Wake::Item(rec) => {
+                let ev = &rec.event;
+                if ev.thread != self.thread || ev.seq <= self.last {
+                    return Ok(None);
                 }
-                Wake::Lagged => {
-                    self.head = store::thread_head(&self.hub.reader(), &self.thread)?;
+                if ev.seq == self.last + 1 {
+                    self.last = ev.seq;
+                    return Ok(Some(rec));
                 }
-                Wake::Closed | Wake::Drained => return Ok(None),
+                self.head = ev.seq;
+            }
+            Wake::Lagged => {
+                self.head = store::thread_head(&self.hub.reader(), &self.thread)?;
+            }
+            Wake::Closed | Wake::Drained => self.ended = true,
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HubOptions;
+    use twr_core::config::Config;
+
+    /// The JSON work of recording an event and streaming it, alone: what the append did before
+    /// (the payload built to check its identifiers, again to cap it and measure it, again to
+    /// write it for the log; then the whole event serialized for each subscriber's line), and
+    /// what it does now ([`twr_core::blob::cap_for_log`] once, each line from that text). Run in
+    /// release mode:
+    ///
+    /// ```sh
+    /// cargo test --release -p twr-hub --lib -- --ignored --nocapture json_work_bench
+    /// ```
+    #[test]
+    #[ignore]
+    fn json_work_bench() {
+        use std::time::{Duration, Instant};
+        const EVENTS: usize = 5000;
+        const SUBSCRIBERS: usize = 16;
+        let store = twr_core::blob::MemoryBlobStore::new();
+        let bodies: Vec<EventBody> = (0..EVENTS)
+            .map(|i| match i % 3 {
+                0 => EventBody::AgentText(AgentText {
+                    text: format!("Looking at step {i}: {}", "x".repeat(300)),
+                    ..Default::default()
+                }),
+                1 => EventBody::AgentToolCall(AgentToolCall {
+                    call_id: format!("c-{i}"),
+                    tool: "Bash".into(),
+                    input_summary: "cargo test --workspace --locked".into(),
+                    ..Default::default()
+                }),
+                _ => EventBody::TaskUpdated(TaskUpdated {
+                    task_id: format!("task-{}", i / 20),
+                    running: true,
+                    description: "cargo test --workspace".into(),
+                    ..Default::default()
+                }),
+            })
+            .collect();
+        let check = |data: &serde_json::Value| {
+            std::hint::black_box(data.as_object().map(|m| m.len()));
+            Ok(())
+        };
+        let mut lines = 0usize;
+        let mut buf = Vec::new();
+        let (mut old_append, mut old_lines) = (Duration::ZERO, Duration::ZERO);
+        for (i, body) in bodies.iter().enumerate() {
+            let t = Instant::now();
+            check(&body.data().unwrap()).unwrap();
+            let capped = twr_core::blob::cap_body(body, &store).unwrap();
+            let data = serde_json::to_string(&capped.data().unwrap()).unwrap();
+            old_append += t.elapsed();
+            std::hint::black_box(data);
+            let ev = Event::new("t1", i as u64 + 1, Some(1), Source::Hub, capped);
+            let t = Instant::now();
+            for _ in 0..SUBSCRIBERS {
+                buf.clear();
+                stream_line(&mut buf, Some(i as u64), &ev).unwrap();
+                lines += buf.len();
+            }
+            old_lines += t.elapsed();
+        }
+        let (mut new_append, mut new_lines) = (Duration::ZERO, Duration::ZERO);
+        for (i, body) in bodies.iter().enumerate() {
+            let t = Instant::now();
+            let capped = twr_core::blob::cap_for_log(body, &store, check).unwrap();
+            new_append += t.elapsed();
+            let stored = capped.body.unwrap_or_else(|| body.clone());
+            let rec = Recorded::new(
+                Event::new("t1", i as u64 + 1, Some(1), Source::Hub, stored),
+                capped.json,
+            );
+            let t = Instant::now();
+            for _ in 0..SUBSCRIBERS {
+                buf.clear();
+                rec.line(Some(i as u64), &mut buf).unwrap();
+                lines -= buf.len().min(lines);
+            }
+            new_lines += t.elapsed();
+        }
+        let us = |d: Duration| d.as_secs_f64() * 1e6 / EVENTS as f64;
+        eprintln!(
+            "per event: payload work under the core lock {:.2} us before, {:.2} us now; \
+             {SUBSCRIBERS} subscribers' lines {:.2} us before, {:.2} us now",
+            us(old_append),
+            us(new_append),
+            us(old_lines),
+            us(new_lines),
+        );
+    }
+
+    /// A live item's line, written from the payload text the append made for the log, is the
+    /// line a replay reads back from the log, byte for byte, on both streams, for a payload
+    /// that was capped too; and it reads as the event the append returned.
+    #[tokio::test]
+    async fn live_lines_are_the_lines_a_replay_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(HubOptions::new(
+            dir.path().join("twr.db"),
+            Config::default(),
+        ))
+        .await
+        .unwrap();
+        let created = hub
+            .append(
+                "t1",
+                None,
+                Source::Hub,
+                EventBody::ThreadCreated(ThreadCreated {
+                    name: "lines".into(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        let head = hub.control_read(0, 0).unwrap().1;
+        let mut control = hub.subscribe_control(head);
+        let mut thread = hub.subscribe_thread("t1", created.seq).unwrap();
+        let bodies = [
+            EventBody::AgentText(AgentText {
+                text: "hello\nthere \u{1b}[31m".into(),
+                ..Default::default()
+            }),
+            EventBody::AttentionRaised(AttentionRaised {
+                attn_id: "a1".into(),
+                reason: AttentionReason::Error,
+                summary: "s".repeat(10_000),
+                options: vec!["dismiss".into()],
+                ..Default::default()
+            }),
+        ];
+        let mut live = Vec::new();
+        for body in bodies {
+            let ev = hub
+                .append("t1", Some(1), Source::User("cli".into()), body, None)
+                .unwrap();
+            let mut line = Vec::new();
+            assert!(thread.next_line(&mut line).await.unwrap());
+            let control_line = if ev.is_control() {
+                let mut l = Vec::new();
+                assert!(control.next_line(&mut l).await.unwrap());
+                Some(l)
+            } else {
+                None
+            };
+            live.push((ev, line, control_line));
+        }
+        // The large one was stored capped, and its line says so.
+        assert!(twr_core::blob::has_capped(&live[1].0.body.data().unwrap()));
+        let mut replay = hub.subscribe_thread("t1", created.seq).unwrap();
+        let mut replay_control = hub.subscribe_control(head);
+        for (ev, line, control_line) in &live {
+            let mut stored = Vec::new();
+            assert!(replay.write_stored(&mut stored).unwrap());
+            assert_eq!(
+                String::from_utf8_lossy(line),
+                String::from_utf8_lossy(&stored)
+            );
+            let item: twr_core::proto::StreamItem = serde_json::from_slice(line).unwrap();
+            assert_eq!(&item.event, ev);
+            if let Some(control_line) = control_line {
+                let mut stored = Vec::new();
+                assert!(replay_control.write_stored(&mut stored).unwrap());
+                assert_eq!(
+                    String::from_utf8_lossy(control_line),
+                    String::from_utf8_lossy(&stored)
+                );
+                let item: twr_core::proto::StreamItem =
+                    serde_json::from_slice(control_line).unwrap();
+                assert_eq!(&item.event, ev);
+                assert!(item.gseq.is_some());
             }
         }
     }

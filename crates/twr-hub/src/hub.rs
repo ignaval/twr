@@ -219,8 +219,10 @@ pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
 pub use shell::ShellRun;
+#[cfg(test)]
 pub(crate) use subscribe::stream_line;
 pub(crate) use subscribe::wait_state;
+use subscribe::Recorded;
 pub use subscribe::{ControlSubscription, ThreadSubscription, DECISIONS_MAX, SNAPSHOT_MAX};
 pub use supervisor::{adapter_may_emit, runtime_attn_id};
 pub use usage::SpentBy;
@@ -774,8 +776,10 @@ struct Inner {
     /// ([`subscribe::CompactRows`]). Taken by a compacted subscription's selection only,
     /// never with the core lock held.
     compact_rows: Arc<Mutex<subscribe::CompactRows>>,
-    control_tx: broadcast::Sender<ControlItem>,
-    events_tx: broadcast::Sender<Arc<Event>>,
+    /// Every control item as it is committed, with its line's payload ([`Recorded`]).
+    control_tx: broadcast::Sender<(u64, Arc<Recorded>)>,
+    /// Every event as it is committed.
+    events_tx: broadcast::Sender<Arc<Recorded>>,
     /// [`HubOptions::snapshot_max`].
     snapshot_max: usize,
     live_count: watch::Sender<usize>,
