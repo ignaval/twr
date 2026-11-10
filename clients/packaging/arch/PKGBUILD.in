@@ -25,4 +25,5 @@ package() {
   install -Dm644 "$srcdir/twr-desktop/packaging/icon.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/tools.twr.desktop.svg"
   install -Dm644 "$srcdir/twr-desktop/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 "$srcdir/twr-desktop/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 "$srcdir/twr-desktop/resources/THIRD-PARTY-LICENSES.html" "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES.html"
 }

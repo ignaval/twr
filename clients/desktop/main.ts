@@ -52,6 +52,7 @@ import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
 import { RendererRecovery } from "./crash-recovery";
+import { testAutomation } from "./automation";
 import { contextMenuTemplate } from "./context-menu";
 import {
   MIN_WINDOW,
@@ -72,6 +73,17 @@ if (
   )
 )
   app.commandLine.appendSwitch("password-store", "gnome-libsecret");
+// TWR_DESKTOP_TEST_AUTOMATION is honoured by development runs, and by a packaged build only
+// when its own bundle carries the QA marker (desktop/automation.ts). Otherwise it is removed
+// here, so nothing below, nor the hub or a terminal, sees it.
+const automationIgnored =
+  process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" &&
+  !testAutomation({
+    packaged: app.isPackaged,
+    env: process.env,
+    resourcesPath: process.resourcesPath,
+  });
+if (automationIgnored) delete process.env.TWR_DESKTOP_TEST_AUTOMATION;
 if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
   app.commandLine.removeSwitch("remote-debugging-port");
   app.commandLine.removeSwitch("remote-debugging-pipe");
@@ -399,6 +411,32 @@ async function connectWorkspace(next: string, generation: number) {
     throw error;
   }
 }
+/** The third-party notices every package carries (scripts/notices.mjs), in the browser. */
+function openNotices() {
+  const path = app.isPackaged
+    ? join(process.resourcesPath, "THIRD-PARTY-LICENSES.html")
+    : resolve(__dirname, "../dist-notices/THIRD-PARTY-LICENSES.html");
+  // Automated QA (scripts/integration.mjs) reads what would have opened.
+  if (process.env.TWR_DESKTOP_TEST_AUTOMATION === "1") {
+    (globalThis as { __twrOpenedNotices?: object }).__twrOpenedNotices = {
+      path,
+      exists: existsSync(path),
+    };
+    return;
+  }
+  if (!existsSync(path)) {
+    dialog.showErrorBox(
+      "Third-party licences not found",
+      app.isPackaged
+        ? `This copy of twr has no ${path}. Reinstall it from the release page.`
+        : "Write them with node scripts/notices.mjs in clients/.",
+    );
+    return;
+  }
+  void shell.openPath(path).then((error) => {
+    if (error) dialog.showErrorBox("Could not open the licences", error);
+  });
+}
 function omarchyTheme(): Record<string, string> | null {
   if (process.platform !== "linux") return null;
   try {
@@ -515,13 +553,23 @@ function register() {
     coalesceInboxSources(async () =>
       localInboxSources(
         await workspaceListing.get(),
-        (name) =>
-          new Bridge(
+        (name) => {
+          // The open workspace is read over its own connection: a second bridge process
+          // and hub connection for it cost ~300 ms and a peer check on every refresh.
+          const live = bridge;
+          if (live && workspaceReady && name === workspace)
+            return {
+              call: (method: string, params?: any) =>
+                live.call(method, params, 5000),
+              close: () => {},
+            };
+          return new Bridge(
             binaries.bridge,
             name,
             { ...env(), TWR_BRIDGE_READ_ONLY: "1" },
             () => {},
-          ),
+          );
+        },
         4000,
       ),
     ),
@@ -1269,13 +1317,20 @@ else {
             terminals: [...terminals.values()].filter((t) => !t.exited).length,
           }),
         },
-        // Automated runs keep their log with their isolated user data.
+        // Automated runs, and any run given its own --user-data-dir, keep their log with
+        // that isolated user data instead of the installed app's.
         process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" ||
+          app.commandLine.hasSwitch("user-data-dir") ||
           (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
           ? join(app.getPath("userData"), "logs")
           : app.getPath("logs"),
       );
       services.start();
+      if (automationIgnored)
+        services.log.warn(
+          "app",
+          "Ignored TWR_DESKTOP_TEST_AUTOMATION: this build has no QA marker",
+        );
       // The login shell and the engine copy run while the window opens.
       void (async () => {
         await loadLoginEnvironment();
@@ -1379,6 +1434,10 @@ else {
                     "https://github.com/ignaval/twr#readme",
                   );
                 },
+              },
+              {
+                label: "Third-Party Licences",
+                click: () => openNotices(),
               },
             ],
           },

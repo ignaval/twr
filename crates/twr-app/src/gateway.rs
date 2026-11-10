@@ -2055,6 +2055,9 @@ async fn serve_socket(
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The app starts the gateway, which outlives it and may start a hub: neither may keep
+    // the app's crash handler.
+    twr_app::runtime::forget_inherited_crash_handler();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
     if let Some(path) = args.log_file.clone() {

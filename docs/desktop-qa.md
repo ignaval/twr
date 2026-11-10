@@ -8,9 +8,11 @@ The tests do not use real provider accounts or the user's existing workspaces.
 
 ## Coverage and intentional differences
 
-All 74 runnable entries in the current CLI help tree have their arguments/options checked
-against the generated form catalog. The desktop exposes 71 of those entries plus native
-application actions. Counting entries alone is not proof of behavioral parity: regression
+Every runnable entry in the current CLI help tree has its arguments/options checked
+against the generated form catalog (`npm run catalog:check`). The desktop exposes all of
+them except the intentional exclusions below, plus native application actions; the
+integration suite reports how many CLI workflows it ran in its final `PASS:` line.
+Counting entries alone is not proof of behavioral parity: regression
 tests also exercise argument preservation, target selection and actual hub operations.
 
 The catalog exclusions are intentional: agent-only `mcp`, the foreground `hub`
@@ -40,6 +42,16 @@ npm run package:mac
 npm run test:qa:mac
 ```
 
+Packaged builds ignore `TWR_DESKTOP_TEST_AUTOMATION`, which the suites need for remote
+debugging, unless their resources folder holds the QA marker `twr-qa-automation`
+([desktop.md](desktop.md#architecture-and-extension-points)). `npm run test:qa:mac` first
+checks that the release app ignores the variable and keeps its debugging port shut, then runs
+a copy of the app with the marker added; the release app is never changed. To run
+`npm run test:integration` against an installed Linux package (`TWR_DESKTOP_EXECUTABLE`), add
+the marker as root, as CI does: `sudo touch /opt/twr/resources/twr-qa-automation`. Remove it
+afterwards. `npm run package` needs cargo-about for the third-party notices; a local review
+build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](desktop.md#packages)).
+
 | Area | Automated check |
 | --- | --- |
 | Packaged startup | Production user authentication, bundled engine startup, native PTY, hub survives app quit |
@@ -61,15 +73,15 @@ npm run test:qa:mac
 Real Anthropic/OpenAI/Grok authentication and paid turns, live SSH/container/dial-in hosts,
 and audible platform speech have not been tested end to end in this pass. Their existing
 CLI implementations are bundled and reachable; the above fixtures validate the desktop
-bridge and UI rather than those external services. An installed Ubuntu 22.04 Debian package passed all 71 CLI form workflows with the
-default Chromium sandbox enabled. Its native terminal module was built against
+bridge and UI rather than those external services. An installed Ubuntu 22.04 Debian package passed every CLI form workflow of the integration
+suite with the default Chromium sandbox enabled. Its native terminal module was built against
 Ubuntu 22.04 headers and verified with baud-rate changes, input, resize and exit.
 The portable bundle passes an ELF symbol-version gate; a clean Ubuntu base with
 only declared runtime dependencies has no unresolved libraries. This Ubuntu
 userspace runs on the Arch VM kernel, so it does not certify an Ubuntu kernel.
 An installed x86_64 Arch package also passed the integration suite under Cage/Wayland in that VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers use ad hoc signatures for testing. Developer ID signing and notarization remain release steps that require the owner’s Apple credentials.
 
-The frontend suite has 70 checks, including engine cleanup with real live processes,
+The frontend suite (`npm test`) includes engine cleanup with real live processes,
 conservative handling of inaccessible engine identities, normal Linux session processes
 and the portable ELF ABI gate.
 

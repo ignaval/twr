@@ -176,7 +176,8 @@ try {
     }
     assert(
       browser,
-      "Packaged app must expose its test Chromium port: " + packagedLog,
+      "Packaged app must expose its test Chromium port (a packaged build honours TWR_DESKTOP_TEST_AUTOMATION only with resources/twr-qa-automation in its install; docs/desktop-qa.md): " +
+        packagedLog,
     );
     const context = browser.contexts()[0];
     assert(context, "Packaged application must expose its browser context");
@@ -883,18 +884,10 @@ try {
       });
     execFileSync(twr, ["ws", "new", "side"], { env, stdio: "pipe" });
     sideWorkspace = true;
-    // Started here, as the default hub is: a hub the app started would keep this
-    // runner's pipes to Electron open past its exit.
-    spawn(twr, ["-w", "side", "hub"], { env, stdio: "ignore" });
-    for (let i = 0; ; i++) {
-      try {
-        side("info", "--json");
-        break;
-      } catch (error) {
-        if (i === 99) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }
+    // The app starts this workspace's hub itself. That hub must keep nothing of the app's:
+    // on macOS it once inherited the crash reporter's exception ports, which kept
+    // Electron's crash handler, and with it this runner's pipes, open past the app's exit,
+    // so that closing the app below never finished.
     const send = (event) =>
       application.evaluate(
         ({ BrowserWindow }, event) =>
@@ -1017,6 +1010,25 @@ try {
     await showing("default");
     console.log(
       "PASS: tray and badge count every workspace; a hidden window notifies of another workspace's permission without its text, removes it once answered, and a click opens it there",
+    );
+  }
+  if (!packagedProcess) {
+    // Help › Third-Party Licences; automation records the file instead of opening it.
+    const opened = await application.evaluate(({ Menu }) => {
+      const help = Menu.getApplicationMenu().items.find(
+        (item) => item.label === "Help",
+      );
+      help.submenu.items
+        .find((item) => item.label === "Third-Party Licences")
+        .click();
+      return globalThis.__twrOpenedNotices;
+    });
+    assert.equal(
+      opened?.path,
+      resolve("dist-notices/THIRD-PARTY-LICENSES.html"),
+    );
+    console.log(
+      `PASS: Help › Third-Party Licences opens the generated notices${opened.exists ? "" : " (not generated in this checkout: node scripts/notices.mjs)"}`,
     );
   }
   if (errors.length) throw new Error(errors.join("\n"));
