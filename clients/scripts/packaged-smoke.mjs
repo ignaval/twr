@@ -22,23 +22,134 @@ if (process.platform !== "darwin" || process.arch !== "arm64")
   throw new Error(
     "This packaged launcher smoke test runs on Apple Silicon macOS.",
   );
-const application = resolve("release/mac-arm64/twr.app");
-assert(existsSync(application), "Build the Mac application first");
+const release = resolve("release/mac-arm64/twr.app");
+assert(existsSync(release), "Build the Mac application first");
+const resources = join(release, "Contents/Resources");
+// A packaged build honours TWR_DESKTOP_TEST_AUTOMATION only when its bundle carries this
+// marker (desktop/automation.ts). Release packaging never writes it: this test checks that
+// the release app ignores the variable, then drives a copy of it that has the marker.
+const QA_MARKER = "twr-qa-automation";
+assert(
+  !existsSync(join(resources, QA_MARKER)),
+  `The release app must not carry the QA marker ${QA_MARKER}`,
+);
 // The menu bar icon and electron-updater's feed configuration ship in the bundle.
 for (const name of ["trayTemplate.png", "trayTemplate@2x.png"])
   assert(
-    existsSync(join(application, "Contents/Resources/tray", name)),
+    existsSync(join(resources, "tray", name)),
     `Missing menu bar icon ${name}`,
   );
 {
-  const feed = readFileSync(
-    join(application, "Contents/Resources/app-update.yml"),
-    "utf8",
-  );
+  const feed = readFileSync(join(resources, "app-update.yml"), "utf8");
   for (const line of ["provider: github", "owner: ignaval", "repo: twr"])
     assert(feed.split("\n").includes(line), `app-update.yml lacks ${line}`);
 }
 const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-package-")));
+function launcherPID(app, userData, port) {
+  for (const line of execFileSync("/bin/ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+  }).split("\n")) {
+    const match = line.trim().match(/^(\d+) (.+)$/);
+    if (
+      match &&
+      match[2].startsWith(app + "/Contents/MacOS/twr ") &&
+      match[2].includes(`--user-data-dir=${userData}`) &&
+      match[2].includes(`--remote-debugging-port=${port}`)
+    )
+      return Number(match[1]);
+  }
+  return undefined;
+}
+async function freePort() {
+  return await new Promise((resolvePort, reject) => {
+    const socket = createServer();
+    socket.on("error", reject);
+    socket.listen(0, "127.0.0.1", () => {
+      const port = socket.address().port;
+      socket.close(() => resolvePort(port));
+    });
+  });
+}
+// Without the marker, the release app must start normally and keep its debugging port shut.
+{
+  const home = join(fixture, "unmarked");
+  mkdirSync(home);
+  writeFileSync(
+    join(home, "config.toml"),
+    `[orchestrator]\nautostart = false\n[tui]\nsuggest = false\nsummaries = false\n`,
+    { mode: 0o600 },
+  );
+  const userData = join(home, "user-data");
+  const port = await freePort();
+  const twr = join(resources, "bin/twr");
+  const hubEnv = { ...process.env, HOME: home, TWR_HOME: home };
+  delete hubEnv.TWR_DESKTOP_TEST_AUTOMATION;
+  execFileSync("/usr/bin/open", [
+    "-n",
+    "-a",
+    release,
+    "--env",
+    `TWR_HOME=${home}`,
+    "--env",
+    `HOME=${home}`,
+    "--env",
+    "TWR_DESKTOP_TEST_AUTOMATION=1",
+    "--env",
+    "SHELL=/bin/sh",
+    "--env",
+    "PATH=/usr/bin:/bin",
+    "--args",
+    `--user-data-dir=${userData}`,
+    `--remote-debugging-port=${port}`,
+  ]);
+  try {
+    // The app is up once it has started this fixture's hub.
+    let started = false;
+    for (let attempt = 0; attempt < 300 && !started; attempt++) {
+      try {
+        execFileSync(twr, ["info", "--json"], { env: hubEnv, stdio: "pipe" });
+        started = true;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+    assert(started, "The release app did not start its hub");
+    assert(
+      launcherPID(release, userData, port),
+      "The release app exited instead of ignoring the automation variable",
+    );
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+      signal: AbortSignal.timeout(2000),
+    }).catch((error) => error);
+    assert(
+      response instanceof Error,
+      "The release app opened remote debugging without the QA marker",
+    );
+    const log = readFileSync(join(userData, "logs/twr-desktop.log"), "utf8");
+    assert.match(log, /Ignored TWR_DESKTOP_TEST_AUTOMATION/);
+    console.log(
+      "PASS: without the QA marker the release app ignores TWR_DESKTOP_TEST_AUTOMATION and keeps remote debugging shut",
+    );
+  } finally {
+    const pid = launcherPID(release, userData, port);
+    if (pid) process.kill(pid, "SIGKILL");
+    try {
+      execFileSync(twr, ["hub", "stop"], {
+        env: hubEnv,
+        stdio: "ignore",
+        timeout: 15000,
+      });
+    } catch {}
+  }
+}
+// The copy under test, with the marker. It is not re-signed: the added file breaks the
+// bundle's seal, which macOS checks only for a quarantined (downloaded) app.
+const application = join(fixture, "twr.app");
+execFileSync("/usr/bin/ditto", [release, application]);
+writeFileSync(
+  join(application, "Contents/Resources", QA_MARKER),
+  "This copy of twr is a QA build: it honours TWR_DESKTOP_TEST_AUTOMATION. Never ship it.\n",
+);
 const repository = join(fixture, "repo");
 const speechScript = join(fixture, "speech-sink.sh");
 const spoken = join(fixture, "spoken.txt");

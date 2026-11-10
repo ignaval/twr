@@ -40,6 +40,15 @@ npm run package:mac
 npm run test:qa:mac
 ```
 
+Packaged builds ignore `TWR_DESKTOP_TEST_AUTOMATION`, which the suites need for remote
+debugging, unless their resources folder holds the QA marker `twr-qa-automation`
+([desktop.md](desktop.md#architecture-and-extension-points)). `npm run test:qa:mac` first
+checks that the release app ignores the variable and keeps its debugging port shut, then runs
+a copy of the app with the marker added; the release app is never changed. To run
+`npm run test:integration` against an installed Linux package (`TWR_DESKTOP_EXECUTABLE`), add
+the marker as root, as CI does: `sudo touch /opt/twr/resources/twr-qa-automation`. Remove it
+afterwards.
+
 | Area | Automated check |
 | --- | --- |
 | Packaged startup | Production user authentication, bundled engine startup, native PTY, hub survives app quit |

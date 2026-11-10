@@ -128,6 +128,33 @@ jobs:
         env:
           TWR_PERF: "1"
         run: npm run test:qa:mac
+      # A packaged build honours TWR_DESKTOP_TEST_AUTOMATION (remote debugging) only when it
+      # carries this marker (clients/desktop/automation.ts). The QA above drives a marked
+      # copy of the app; no installer may carry it.
+      - name: Check that no installer carries the QA marker
+        working-directory: clients/release
+        run: |
+          shopt -s nullglob
+          marker=twr-qa-automation
+          test ! -e "mac-arm64/twr.app/Contents/Resources/$marker"
+          for zip in ./*-mac.zip; do
+            if unzip -l "$zip" | grep -q "$marker"; then
+              echo "::error::$zip carries the QA marker $marker"
+              exit 1
+            fi
+          done
+          dmgs=(./*.dmg)
+          test "${#dmgs[@]}" -ge 1
+          for dmg in "${dmgs[@]}"; do
+            mount=$(mktemp -d "$RUNNER_TEMP/dmg.XXXXXXXX")
+            hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg" > /dev/null
+            found=$(find "$mount" -name "$marker" -print -quit)
+            hdiutil detach "$mount" > /dev/null
+            if [ -n "$found" ]; then
+              echo "::error::$dmg carries the QA marker $marker"
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-macos-arm64
@@ -236,7 +263,29 @@ jobs:
           dpkg-query -W twr-desktop
           test "$(stat -c %u /opt/twr/chrome-sandbox)" = 0
           node scripts/linux-abi.mjs /opt/twr
+          # The QA marker (clients/desktop/automation.ts), added as root to this test install
+          # only, lets the packaged app honour TWR_DESKTOP_TEST_AUTOMATION.
+          test ! -e /opt/twr/resources/twr-qa-automation
+          echo 'QA install: honours TWR_DESKTOP_TEST_AUTOMATION.' | sudo tee /opt/twr/resources/twr-qa-automation > /dev/null
           TWR_DESKTOP_EXECUTABLE=/usr/bin/twr-desktop xvfb-run -a dbus-run-session -- npm run test:integration
+      - name: Check that no package carries the QA marker
+        working-directory: clients/release
+        run: |
+          marker=twr-qa-automation
+          test ! -e "linux-unpacked/resources/$marker"
+          if dpkg-deb -c ./*.deb | grep -q "$marker" ||
+            tar -tzf arch/*-linux-x64.tar.gz | grep -q "$marker"; then
+            echo "::error::a Linux package carries the QA marker $marker"
+            exit 1
+          fi
+          appimage=$(realpath ./*.AppImage)
+          extract=$(mktemp -d "$RUNNER_TEMP/appimage.XXXXXXXX")
+          (cd "$extract" && "$appimage" --appimage-extract > /dev/null)
+          if [ -n "$(find "$extract/squashfs-root" -name "$marker" -print -quit)" ]; then
+            echo "::error::$appimage carries the QA marker $marker"
+            exit 1
+          fi
+          rm -rf "$extract"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-linux-portable-x86_64
@@ -310,6 +359,9 @@ jobs:
         working-directory: clients
         run: |
           install -dm700 -o builder -g builder /tmp/twr-wayland
+          # The QA marker (clients/desktop/automation.ts), on this test install only.
+          test ! -e /opt/twr-desktop/resources/twr-qa-automation
+          echo 'QA install: honours TWR_DESKTOP_TEST_AUTOMATION.' > /opt/twr-desktop/resources/twr-qa-automation
           runuser -u builder -- env XDG_RUNTIME_DIR=/tmp/twr-wayland WLR_BACKENDS=headless WLR_RENDERER=pixman TWR_DESKTOP_WAYLAND_TEST=1 TWR_DESKTOP_EXECUTABLE=/usr/bin/twr-desktop dbus-run-session -- cage -- npm run test:integration
       - name: Validate the AUR package against the same archive
         working-directory: clients

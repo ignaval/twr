@@ -237,6 +237,29 @@ the engines again, even from an AppImage's new mount path; each copy is verified
 those digests, and a manifest that does not match its engines is ignored. Existing engine versions are retained while hubs may
 still use them. Restarting or updating the desktop never silently stops an existing hub.
 
+Packaged builds strip `--remote-debugging-port`, `--remote-debugging-pipe` and Chromium's
+fake-media switches, and their Electron fuses refuse `--inspect`, `NODE_OPTIONS` and
+`ELECTRON_RUN_AS_NODE`, so another process running as you cannot drive the window, which can
+answer requests and open terminals. The test suites need those switches:
+`TWR_DESKTOP_TEST_AUTOMATION=1` keeps them, but a packaged build honours it only when its own
+resources folder holds the QA marker `twr-qa-automation` (`desktop/automation.ts`); otherwise
+it logs that it ignored the variable and removes it. Release packaging never writes the marker
+and the release jobs fail if an installer carries it. `npm run test:qa:mac` adds it to a copy
+of the app; Linux CI adds it, as root, to its test installs. The marker is only as protected
+as the app's files:
+
+- Debian and Arch packages install root-owned files: only root can add it there.
+- On macOS, the marker inside the bundle is covered by its code signature. An app in
+  `/Applications` is also protected by macOS's App Management privacy setting (macOS 13 and
+  later), which stops a process without that permission (or Full Disk Access) from changing it,
+  even when the user owns the files. A copy elsewhere with the marker added has a broken
+  signature, which should make macOS ask before it reads the app's keychain items (saved remote
+  hubs and offline history); this was not tested.
+- An AppImage, or a portable archive in your home folder, is yours to rewrite, and on Linux any
+  process running as you can already read the secret service and the hub socket: there the
+  marker keeps a stray environment variable from opening remote debugging, not a determined
+  process running as you.
+
 The iOS and Android clients share this React UI and Rust projection through an
 authenticated gateway. Native vaults keep device credentials out of the web renderer.
 See [mobile development, trust model and verification limits](mobile.md).

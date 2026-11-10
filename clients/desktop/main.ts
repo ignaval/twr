@@ -52,6 +52,7 @@ import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
 import { RendererRecovery } from "./crash-recovery";
+import { testAutomation } from "./automation";
 import { contextMenuTemplate } from "./context-menu";
 import {
   MIN_WINDOW,
@@ -72,6 +73,17 @@ if (
   )
 )
   app.commandLine.appendSwitch("password-store", "gnome-libsecret");
+// TWR_DESKTOP_TEST_AUTOMATION is honoured by development runs, and by a packaged build only
+// when its own bundle carries the QA marker (desktop/automation.ts). Otherwise it is removed
+// here, so nothing below, nor the hub or a terminal, sees it.
+const automationIgnored =
+  process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" &&
+  !testAutomation({
+    packaged: app.isPackaged,
+    env: process.env,
+    resourcesPath: process.resourcesPath,
+  });
+if (automationIgnored) delete process.env.TWR_DESKTOP_TEST_AUTOMATION;
 if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
   app.commandLine.removeSwitch("remote-debugging-port");
   app.commandLine.removeSwitch("remote-debugging-pipe");
@@ -1269,13 +1281,20 @@ else {
             terminals: [...terminals.values()].filter((t) => !t.exited).length,
           }),
         },
-        // Automated runs keep their log with their isolated user data.
+        // Automated runs, and any run given its own --user-data-dir, keep their log with
+        // that isolated user data instead of the installed app's.
         process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" ||
+          app.commandLine.hasSwitch("user-data-dir") ||
           (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
           ? join(app.getPath("userData"), "logs")
           : app.getPath("logs"),
       );
       services.start();
+      if (automationIgnored)
+        services.log.warn(
+          "app",
+          "Ignored TWR_DESKTOP_TEST_AUTOMATION: this build has no QA marker",
+        );
       // The login shell and the engine copy run while the window opens.
       void (async () => {
         await loadLoginEnvironment();

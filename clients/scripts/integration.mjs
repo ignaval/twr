@@ -176,7 +176,8 @@ try {
     }
     assert(
       browser,
-      "Packaged app must expose its test Chromium port: " + packagedLog,
+      "Packaged app must expose its test Chromium port (a packaged build honours TWR_DESKTOP_TEST_AUTOMATION only with resources/twr-qa-automation in its install; docs/desktop-qa.md): " +
+        packagedLog,
     );
     const context = browser.contexts()[0];
     assert(context, "Packaged application must expose its browser context");
