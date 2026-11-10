@@ -2563,6 +2563,12 @@ mod tests {
             .with_ansi(false)
             .finish();
         let _logs = tracing::subscriber::set_default(subscriber);
+        // tracing decides once per log line whether it is wanted, where the line is first
+        // reached. While a single dispatcher is registered, a line another test's thread
+        // reaches first is decided by that thread's (none): never wanted, here too, and this
+        // test saw no log at all. With a second one registered, the decision is that of all
+        // registered dispatchers, this one's included.
+        let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let d = tempfile::tempdir().unwrap();
         let home = d.path().canonicalize().unwrap();
         let wanted = "https://github.com/o/api";
