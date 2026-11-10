@@ -89,6 +89,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - The desktop installers' checksums are signed (`desktop-sha256sums.txt.sig`), each installer has a build provenance attestation, and desktop release builds use no CI caches.
 - twr.tools sends a Content-Security-Policy, `X-Frame-Options`, `X-Content-Type-Options` and `Referrer-Policy`.
 - The mobile apps delete transcript exports after sharing them.
+- twr's built-in SQLite is 3.54.1 (rusqlite 0.41), which no longer returns uninitialized memory for a database opened with a `-wal` file of another page size (RUSTSEC-2026-0459, CVE-2026-119375).
 
 ## [0.3.0] - 2026-10-30
 
