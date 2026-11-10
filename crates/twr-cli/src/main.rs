@@ -1351,6 +1351,10 @@ enum ThreadCmd {
 }
 
 fn main() -> ExitCode {
+    // Before anything starts: a twr run from the desktop app's terminal (Electron starts its
+    // shells itself) would keep the app's crash handler, and pass it to the hub, runner
+    // service or box daemon it starts (macOS; nothing elsewhere).
+    twr_adapters::process::forget_inherited_crash_handler();
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--link-service-version"))
     {
         println!(

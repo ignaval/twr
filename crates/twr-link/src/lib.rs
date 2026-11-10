@@ -14,6 +14,10 @@ pub mod state;
 pub mod wire;
 pub mod worker;
 
+/// For the desktop's binaries, which start hubs and runner services but use twr-adapters
+/// only through this crate.
+pub use twr_adapters::process::forget_inherited_crash_handler;
+
 pub const ALPN: &[u8] = b"twr/link/1";
 pub const PKARR_RELAY: &str = "https://dns.iroh.link/pkarr";
 
