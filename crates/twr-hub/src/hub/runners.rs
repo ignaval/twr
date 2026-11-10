@@ -40,8 +40,14 @@
 //! and the numbering it has from another generation (or from none, while the box is
 //! forgotten) before it applies the watermarks, so a removed box added again never replays
 //! old frames against watermarks that are gone (a gap on every connection) or into its
-//! threads. The mark is cleared once a runner has taken the generation: at its `synced`, or
-//! an inventory stamped with it. A runner without a stamp (an older twr) gets no generation
+//! threads. Such a forgetting welcome ends the box's sessions as far as the hub is
+//! concerned (`Conn::forgets`): what they did since the removal is gone, so the hub takes
+//! over none of them, and the reconciliation stops every run the runner still has (as strays:
+//! their later frames, those spooled after the inventory included, are never recorded) and
+//! closes every session of the box the hub holds, its open turn ended, as a crash saying the
+//! box was removed, without the crash's hold on the queue: the next prompt starts the runtime
+//! again on its session. The mark is cleared once a runner has taken the generation: at its
+//! `synced`, or an inventory stamped with it. A runner without a stamp (an older twr) gets no generation
 //! and is served as before, except while its box is forgotten: it is refused
 //! `error{protocol}` before it is connected (nothing changes), noted on the box, and a sealed
 //! one's end says so ([`SealedEnd::spool_refused`]), so its daemon or worker is replaced as
@@ -353,6 +359,10 @@ struct Conn {
     /// took it once it says `synced` (it does so after the welcome), and the box is no longer
     /// forgotten then ([`store::Store::confirm_runner_box`]).
     confirm: Option<String>,
+    /// The welcome had the runner forget its spool (the box was removed, and what its runner
+    /// had not delivered is gone): the hub adopted none of its sessions, and the
+    /// reconciliation ends every one of them ([`reconcile`]).
+    forgets: bool,
 }
 
 impl Conn {
@@ -1069,12 +1079,22 @@ where
                         }
                     }
                 }
+                // This welcome has the runner forget what it spooled (the box was removed):
+                // none of its sessions is the hub's any more (`reconcile`).
+                let forgets = takes_generation
+                    && twr_core::runner::welcome_forgets(
+                        stamp.as_deref(),
+                        &g.generation,
+                        g.forgotten,
+                    );
                 let c = rbox.connect(&inv, tx.clone(), token_gen, legacy);
                 c.epoch()
                     .map(|epoch| {
                         // Not ready until synced and reconciled.
                         core.online_boxes.remove(&box_name);
-                        core.adopt_remote_sessions(&hub, &rbox, &inv);
+                        if !forgets {
+                            core.adopt_remote_sessions(&hub, &rbox, &inv);
+                        }
                         // The runner deletes every frame at or below a watermark it is told
                         // about, so only durable commits may be: the fenced previous
                         // connection's open ack batch (frames committed without a sync, see
@@ -1093,13 +1113,13 @@ where
                             // Gated from now on, before anything is dispatched to it.
                             drain_note = core.enter_drain(&hub, &rbox, p, &inv.version);
                         }
-                        (epoch, watermarks, g)
+                        (epoch, watermarks, g, forgets)
                     })
                     .ok_or(Unwelcome::Connect(c))
             }
         }
     };
-    let (epoch, watermarks, generation) = match connected {
+    let (epoch, watermarks, generation, forgets) = match connected {
         Ok(c) => c,
         Err(why) => {
             // Nothing changed: the current connection (if any) stays.
@@ -1252,6 +1272,7 @@ where
         batch_delay: hub.ack_batch_delay,
         wal: hub.core().store.wal_sync(),
         confirm: (takes_generation && generation.forgotten).then_some(generation.generation),
+        forgets,
     };
     let mut state = hub.state.subscribe();
     // Only protocol messages keep the connection open: WebSocket pings (answered by the
@@ -1734,6 +1755,14 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     // Threads whose runtime the runner lost and that crashed: they get their crash reactions
     // (and the automatic retry when it is due) but nothing from the queue.
     let mut crashed: HashSet<String> = HashSet::new();
+    // Threads closed because the welcome had the runner forget its spool (`Conn::forgets`):
+    // closed for the box's removal, not for anything they did, so their queue is not held.
+    let mut forgotten: HashSet<String> = HashSet::new();
+    let removed = format!(
+        "twr: box {box_name} was removed from the hub, and its runner forgot what this \
+         thread's runtime had done there that had not reached the hub: the session is closed \
+         (the next message resumes it)"
+    );
     let (exits, strays, threads) = {
         let mut core = hub.core();
         if !fence.holds() {
@@ -1760,6 +1789,61 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
                 .filter(|l| l.run_confirmed)
                 .and_then(|l| l.run.clone());
             let named_run = rt.and_then(|r| r.live.as_ref()).and_then(|l| l.run.clone());
+            // The runner forgot what it had not delivered (the box was removed): no session
+            // of the box is the hub's any more. Whatever the runner still runs is stopped (as
+            // a stray: its frames, including those it spooled after its inventory, are never
+            // recorded), and the hub's side of each session is closed, its open turn ended, so
+            // nothing waits for an end the runner forgot. The box was offline from the removal
+            // to this connection, so every session the hub holds is from before it.
+            if conn.forgets {
+                if let Some(run) = running {
+                    strays.push((v.id.clone(), run.clone()));
+                }
+                match generation {
+                    Some(g) => {
+                        tracing::warn!(thread = %v.id, box_name = %box_name, "closing a session of a removed box whose runner forgot its spool");
+                        if let Some(exit) =
+                            core.begin_exit_on(&v.id, g, None, removed.clone(), &fence)
+                        {
+                            forgotten.insert(v.id.clone());
+                            exits.push((v.id.clone(), exit));
+                        }
+                    }
+                    None if (process_live || v.has_work() || stop_requested)
+                        && !v.parked
+                        && v.attached.is_none() =>
+                    {
+                        tracing::warn!(thread = %v.id, box_name = %box_name, "closing a session of a removed box whose runner forgot its spool");
+                        let exit = if stop_requested {
+                            Exit::Stopped
+                        } else {
+                            Exit::Crashed {
+                                exit_code: None,
+                                stderr_tail: removed.clone(),
+                            }
+                        };
+                        let crash = matches!(exit, Exit::Crashed { .. });
+                        match core.close_process(hub, &v.id, exit) {
+                            Ok(()) => {
+                                forgotten.insert(v.id.clone());
+                                if let Some(rt) = core.rt.get_mut(&v.id) {
+                                    rt.restart_reason = None;
+                                }
+                                if crash {
+                                    if let Err(e) = core.react_to_failure(hub, &v.id) {
+                                        tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot react to a removed box's closed session");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot close a removed box's session")
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
             match (running, generation) {
                 (None, Some(g)) if process_live => {
                     tracing::warn!(thread = %v.id, box_name = %box_name, "the runner lost a live runtime");
@@ -1855,6 +1939,15 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     }
     conn.synced = true;
     let mut core = hub.core();
+    // Closed for the box's removal, not by a crash of their own: their queues go on (no crash
+    // hold, `ThreadRt::queue_held`, as for a runtime that died with the previous hub; a due
+    // retry still comes first), so the next prompt starts the runtime again on its session.
+    for thread in &forgotten {
+        if let Some(rt) = core.rt.get_mut(thread) {
+            rt.queue_held = false;
+            rt.crash_hold = None;
+        }
+    }
     // Fenced meanwhile (a token change included): the recorded commands are the newer
     // connection's to retire or send.
     if !fence.holds() {
@@ -2987,6 +3080,7 @@ mod tests {
             batch_delay: ACK_BATCH_DELAY,
             wal: store::WalSync::none(),
             confirm: None,
+            forgets: false,
         }
     }
 

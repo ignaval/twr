@@ -6948,9 +6948,11 @@ async fn a_box_removed_while_its_runner_is_offline_is_clean_once_added_again() {
 /// `twr box remove` of a token box (`box.token` finds it gone from the files) forgets its
 /// watermarks at once, with a new generation. Added again while the hub runs, with the same
 /// token, its runner, which went on running the thread's session and spooled a turn the hub
-/// never asked for meanwhile, forgets that turn's frames and numbers from 1: the hub's session
-/// goes on, the turn it was not asked for is never recorded, and the next turn is recorded
-/// once.
+/// never asked for meanwhile, forgets that turn's frames and numbers from 1. The removal
+/// ends the session as far as the hub is concerned: the hub closes it (a `thread.crashed`
+/// saying the box was removed and its runner forgot what it had not delivered) and the runner
+/// stops it, the turn the hub was not asked for is never recorded, and the next prompt starts
+/// the runtime again on its session, a turn recorded once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_box_removed_and_added_again_while_the_hub_runs_numbers_from_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -7012,8 +7014,18 @@ async fn a_box_removed_and_added_again_while_the_hub_runs_numbers_from_one() {
     let all = log(h.hub(), &t);
     assert!(all.iter().all(|e| e.turn != Some(99)), "{:?}", kinds(&all));
     assert_eq!(deltas(&all), ["one", "two", "three", "four"]);
-    assert_eq!(count(&all, "thread.started"), 1, "{:?}", kinds(&all));
-    assert_eq!(count(&all, "thread.crashed"), 0, "{:?}", kinds(&all));
+    // Closed once, for the removal; a new runtime (the session resumed) took turn 2.
+    let closed: Vec<&str> = all
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::ThreadCrashed(c) => Some(c.stderr_tail.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 1, "{:?}", kinds(&all));
+    assert!(closed[0].contains("was removed from the hub"), "{closed:?}");
+    assert_eq!(count(&all, "thread.started"), 2, "{:?}", kinds(&all));
+    assert!(h.hub().get_thread(&t).unwrap()["current_turn"].is_null());
     let now = *h.hub().runner_watermarks(BOX).unwrap().get(&t).unwrap();
     assert_eq!(now + 1, lbox.spool().next_rseq(&t).unwrap());
     r.shutdown().await;
@@ -7101,4 +7113,122 @@ async fn an_older_runner_is_refused_only_while_its_box_is_forgotten() {
     assert_eq!(welcome(raw_expect(&mut ws).await), (None, false));
     drop(ws);
     h.shutdown().await;
+}
+
+/// A turn in flight when its token box is removed, whose end the runner then forgets: the
+/// removal ends the session as far as the hub is concerned. Once the box is added again, the
+/// first connection (whose welcome has the runner forget its spool) gets no session of the
+/// hub's adopted: the run the runner still runs is stopped on the box as a stray, the thread
+/// is closed (its turn ended, a `thread.crashed` saying why) instead of `running` with a turn
+/// that can never end, and the next prompt resumes the session and completes.
+///
+/// Twice: with the turn's end spooled before the inventory (`acks_needed`), and appended
+/// after it, between the inventory and the runner's forget, so the inventory names no frame
+/// of it (the race): the outcome is the same, as the run is stopped either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_whose_end_the_runner_forgot_is_closed_and_the_next_prompt_resumes() {
+    for spooled_before_inventory in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+        let stamped = |generation: Option<String>| Hello {
+            spool: Some(twr_core::runner::SpoolStamp { generation }),
+            ..hello(TOKEN)
+        };
+        let mut ws = raw(&h.url).await;
+        raw_hello(&mut ws, stamped(None)).await;
+        let Some(HubMsg::Welcome {
+            generation: Some(g1),
+            ..
+        }) = raw_expect(&mut ws).await
+        else {
+            panic!("no welcome")
+        };
+        raw_send(&mut ws, &RunnerMsg::Synced).await;
+        h.online().await;
+        // Turn 1 runs on the box (spawned, `started` at rseq 1).
+        let t = h.raw_session(&mut ws, dir.path(), "forgot").await;
+        assert_eq!(h.hub().get_thread(&t).unwrap()["current_turn"], 1);
+        // Removed, then added again (`box.token` both times): forgotten.
+        std::fs::write(&boxes_file, "").unwrap();
+        box_token(&h, Caller::user("test")).await.unwrap();
+        while raw_next(&mut ws).await.is_some() {}
+        std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{TOKEN}\"\n")).unwrap();
+        box_token(&h, Caller::user("test")).await.unwrap();
+        // The runner comes back: the session still runs (idle), turn 1's end was spooled
+        // meanwhile, and it forgets that at this welcome, as a real runner does.
+        let mut ws = raw(&h.url).await;
+        let mut hi = stamped(Some(g1));
+        hi.running = vec![running(&t, "r1")];
+        if spooled_before_inventory {
+            hi.acks_needed = [(t.clone(), 3)].into();
+        }
+        raw_hello(&mut ws, hi).await;
+        let Some(HubMsg::Welcome { forgotten, .. }) = raw_expect(&mut ws).await else {
+            panic!("no welcome")
+        };
+        assert!(forgotten);
+        raw_send(&mut ws, &RunnerMsg::Synced).await;
+        // The run is stopped on the box, by its run id.
+        let (cmd_id, op) = raw_cmd(&mut ws).await;
+        assert!(
+            matches!(&op, Op::Stop { thread, run: Some(r) } if thread == &t && *r == run_id(&t, "r1")),
+            "{op:?}"
+        );
+        raw_ok(&mut ws, cmd_id).await;
+        h.online().await;
+        let v = h.hub().get_thread(&t).unwrap();
+        assert!(v["current_turn"].is_null(), "{v}");
+        assert_ne!(v["status"], "running", "{v}");
+        let all = log(h.hub(), &t);
+        let closed: Vec<&str> = all
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ThreadCrashed(c) => Some(c.stderr_tail.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed.len(), 1, "{:?}", kinds(&all));
+        assert!(
+            closed[0].contains("was removed from the hub") && closed[0].contains("forgot"),
+            "{closed:?}"
+        );
+        // The stopped run's exit (numbered from 1 again) is no exit of the thread's.
+        raw_frame(&mut ws, exited(&t, 1, Some(0), Some("r1"))).await;
+        assert_eq!(count(&log(h.hub(), &t), "thread.crashed"), 1);
+        // The next prompt resumes the session and its turn completes.
+        h.send(&t, "next");
+        let (cmd_id, op) = raw_cmd(&mut ws).await;
+        assert!(
+            matches!(&op, Op::Resume { thread, .. } if thread == &t),
+            "{op:?}"
+        );
+        raw_ok(&mut ws, cmd_id).await;
+        let session = |rseq: u64, turn: Option<u64>, body: EventBody| RunnerMsg::Event {
+            thread: t.clone(),
+            rseq,
+            turn,
+            body,
+            raw: None,
+            run: Some(run_id(&t, "r2")),
+            at_ms: None,
+        };
+        let mut cmds = raw_frame(&mut ws, session(2, None, started("s-forgot"))).await;
+        let (cmd_id, op) = match cmds.pop() {
+            Some(c) => c,
+            None => raw_cmd(&mut ws).await,
+        };
+        let Op::Send { turn, .. } = op else {
+            panic!("{op:?}")
+        };
+        raw_ok(&mut ws, cmd_id).await;
+        raw_frame(&mut ws, session(3, Some(turn), turn_ended())).await;
+        let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+        until(&mut sub, |e| {
+            e.kind() == "turn.ended" && e.turn == Some(turn)
+        })
+        .await;
+        let v = h.hub().get_thread(&t).unwrap();
+        assert!(v["current_turn"].is_null(), "{v}");
+        h.shutdown().await;
+    }
 }
