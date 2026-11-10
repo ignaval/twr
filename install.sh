@@ -59,8 +59,11 @@ PROBE_SIGNATURE='fEAddJcpdHzHQJhiSd6QOtAlzR7Boxkn0wpZJBGVKdOUF06lnwox2LcTgjFSh9y
 # where openssl can't check Ed25519 (macOS's LibreSSL), and PROBE_MESSAGE signed with it (base64
 # of the DER signature). Empty: releases have no P-256 signature yet, and such an openssl checks
 # nothing. docs/tools/make-signing-key.sh --p256 writes this block.
-RELEASE_KEY_P256=''
-PROBE_SIGNATURE_P256=''
+RELEASE_KEY_P256='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEgs7mdVn04hFNq8NQp5E5e2kXhpU1
+F+IC21xcMhqpPrjk83HLK81KWyvkV5xyaMYgjYhB/yNASIBqLUHWnnxLlg==
+-----END PUBLIC KEY-----'
+PROBE_SIGNATURE_P256='MEYCIQDMpn6V4PfMq2wJa21noPZ+cKKbg5ahWlPoM+vBaJfcnwIhAIuei/hR5QJMMHRZp/o3kSKYk9JcTdkQPpyqwXWZ4T2d'
 # --- end release key p256 ---
 
 # The staged binary next to the target, removed on every way out until it is renamed into place.
