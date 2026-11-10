@@ -66,6 +66,8 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - `twr ws list` asks every workspace's hub at once instead of one after another, so listing several running workspaces takes about as long as the slowest hub.
 - Desktop: the tray, badge, notifications and sidebar read every workspace with one `twr ws list --json --detail` per refresh, instead of listing the workspaces and then opening a read-only connection to each one. A refresh with four running workspaces takes about a quarter of a second instead of about one second.
 - Typing in the message box no longer re-renders the whole desktop and mobile app on each key: the composer and its drafts moved into their own component, and the rest of the window renders again only when the box goes from empty to a draft or back.
+- Removing a box makes the hub forget what the box's runner sent it: at once for a dial-in box, and when the hub next starts without it for any other box (including boxes removed before this release). Added back under the same name, the box's runner forgets the frames it had not delivered and numbers its threads' frames from 1 again, instead of replaying old frames or failing on a gap at every connection ([runners.md](docs/runners.md)).
+- A runner from before this release is refused, with a message to update twr on the box, only while its box has been removed and added back and no updated runner has connected since. An SSH or container box's daemon, or a linked worker, is replaced with the hub's build then.
 
 ### Fixed
 
@@ -103,6 +105,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - A runner service or linked-runner worker whose twr home was deleted without `twr runner stop` now ends, once the directory has been gone (its filesystem still there) for five looks over five minutes. A home that is only briefly unavailable (permission or I/O errors, a hung network filesystem, an unmounted volume) never counts. The service no longer re-creates lease files in a home that is gone.
 - `twr runner stop`, and any other end of the runner service, take its launchd job away, so stopped services no longer pile up as `tools.twr.box.*` labels in `launchctl list`.
 - Every `twr` drops an inherited macOS crash handler, so a hub, runner service or box daemon started from the desktop app's terminal no longer keeps the app's crash reporter alive.
+- Linked runners come online: the hub refused every linked worker's connection as an unknown box.
 
 ### Security
 
