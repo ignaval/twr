@@ -267,17 +267,49 @@ impl Managed {
         Err(Capacity.into())
     }
 }
+/// Resolves when a managed worker must end: its hub's grant was revoked (the fence exists), or
+/// its managed root has been gone long enough ([`crate::gone`]: its twr home was deleted),
+/// which [`root_gone`] then says. Never for a worker that is not managed.
 pub async fn revoked(policy: Option<Managed>) {
     let Some(policy) = policy else {
         std::future::pending::<()>().await;
         return;
     };
-    loop {
-        if policy.active().is_err() {
-            return;
+    let fenced = async {
+        loop {
+            if policy.active().is_err() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    let gone = async {
+        match crate::gone::Anchor::of(&policy.root) {
+            Ok(anchor) => {
+                crate::gone::until_gone(anchor).await;
+                tracing::warn!(
+                    root = %policy.root.display(),
+                    "this worker's twr home is gone: shutting down"
+                );
+                ROOT_GONE.store(true, std::sync::atomic::Ordering::Release);
+            }
+            // Not there to begin with: nothing to watch (the fence still is).
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        () = fenced => {}
+        () = gone => {}
     }
+}
+
+/// Set once [`revoked`] found the managed root gone.
+static ROOT_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this worker is ending because its managed root is gone ([`revoked`]): its launchd
+/// job is then taken away as it exits ([`crate::gone::unregister_own_job`]).
+pub fn root_gone() -> bool {
+    ROOT_GONE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[derive(Debug)]
