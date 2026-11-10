@@ -553,13 +553,23 @@ function register() {
     coalesceInboxSources(async () =>
       localInboxSources(
         await workspaceListing.get(),
-        (name) =>
-          new Bridge(
+        (name) => {
+          // The open workspace is read over its own connection: a second bridge process
+          // and hub connection for it cost ~300 ms and a peer check on every refresh.
+          const live = bridge;
+          if (live && workspaceReady && name === workspace)
+            return {
+              call: (method: string, params?: any) =>
+                live.call(method, params, 5000),
+              close: () => {},
+            };
+          return new Bridge(
             binaries.bridge,
             name,
             { ...env(), TWR_BRIDGE_READ_ONLY: "1" },
             () => {},
-          ),
+          );
+        },
         4000,
       ),
     ),
