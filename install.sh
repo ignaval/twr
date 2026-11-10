@@ -480,9 +480,10 @@ main() {
     say "Installed $installed to $dir/twr"
     if [ "$pair_after_install" = 1 ]; then
         # This script comes from main, which can be ahead of the latest release: v0.3.0 and
-        # older have no `twr runner up`.
+        # older have no `twr runner up`. The message names no version, so it stays true once
+        # a release has it (then only an older TWR_VERSION gets here).
         if ! "$dir/twr" runner up --help > /dev/null 2>&1; then
-            err "$installed has no \`twr runner up\`: pairing needs a twr newer than 0.3.0. It is installed at $dir/twr; pair once a newer release is out (TWR_VERSION=<version> sh install.sh --pair)"
+            err "installed $installed at $dir/twr, but it is too old to pair: it has no \`twr runner up\`, which --pair runs (this script can be ahead of the release it installs). To pair this machine, install a twr that has it: run this script again with --pair once a newer release is out (without TWR_VERSION it takes the latest), or build twr from source (https://github.com/$REPO/blob/main/docs/install.md#from-source) and run \`twr runner up\`. The hub you pair with needs \`twr box pair\`, from a twr as new."
         fi
         "$dir/twr" runner up
         return

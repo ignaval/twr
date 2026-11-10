@@ -214,7 +214,13 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
                 forced.as_deref() == Some(std::ffi::OsStr::new("launchd")),
                 &launchd::Launchctl::system(),
                 std::env::vars_os().collect(),
-                &mut |line| tracing::info!("{line}"),
+                &mut |line| {
+                    if line.contains(": warning: ") {
+                        tracing::warn!("{line}")
+                    } else {
+                        tracing::info!("{line}")
+                    }
+                },
             )
             .await?
             {
@@ -262,12 +268,18 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
 /// The environment of a service started in a session of its own: what launchd and
 /// `systemd-run` give it ([`twr_runner::relay::launchd::service_env`]), plus two test knobs
 /// that hold no secret: how it starts its workers (`TWR_BOX_LAUNCHER`, which forces this
-/// start too) and whether they offer the fake adapter.
+/// start too) and whether they offer the fake adapter. A proxy's credentials are removed, with
+/// a warning, as for the others.
 fn fallback_env(
     vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use twr_runner::relay::launchd;
     let vars: Vec<_> = vars.into_iter().collect();
-    let mut env = twr_runner::relay::launchd::service_env(vars.iter().cloned());
+    let service = launchd::service_env(vars.iter().cloned());
+    for name in &service.stripped {
+        tracing::warn!("{}", launchd::credentials_note(name));
+    }
+    let mut env = service.vars;
     env.extend(vars.into_iter().filter(|(name, _)| {
         name == twr_runner::relay::LAUNCHER_ENV || name == twr_adapters::ENABLE_FAKE_ENV
     }));
@@ -426,19 +438,30 @@ mod tests {
             ("XDG_DATA_HOME", "/home/u/data"),
             ("ANTHROPIC_API_KEY", "sk-secret"),
             ("TWR_WORKSPACE", "work"),
+            ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
+            ("https_proxy", "socks5h://me:hunter2@proxy.corp:1080"),
+            ("NODE_EXTRA_CA_CERTS", "/etc/corp-ca.pem"),
+            ("CODEX_HOME", "/home/u/.config/codex"),
+            ("RUSTUP_HOME", "/opt/rustup"),
             (twr_runner::relay::LAUNCHER_ENV, "setsid"),
             (twr_adapters::ENABLE_FAKE_ENV, "1"),
         ]
         .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v)));
-        let mut names: Vec<_> = fallback_env(env)
+        let kept = fallback_env(env);
+        assert!(kept.contains(&("https_proxy".into(), "socks5h://proxy.corp:1080".into())));
+        let mut names: Vec<_> = kept
             .into_iter()
             .map(|(k, _)| k.into_string().unwrap())
             .collect();
         names.sort();
         let mut expected = vec![
+            "CODEX_HOME",
             "HOME",
+            "NODE_EXTRA_CA_CERTS",
             "PATH",
+            "RUSTUP_HOME",
             "XDG_DATA_HOME",
+            "https_proxy",
             twr_runner::relay::LAUNCHER_ENV,
             twr_adapters::ENABLE_FAKE_ENV,
         ];

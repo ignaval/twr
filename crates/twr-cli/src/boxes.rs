@@ -1646,7 +1646,7 @@ pub(super) fn drain_text(name: &str, b: &Value, hub: &Value) -> Option<(String, 
     let update = match hub["version"].as_str() {
         Some(v) => format!(
             "on the box: {}, then restart its runner ({})",
-            token::update_hint(v),
+            token::update_hint(v, b["version"].as_str()),
             token::restart_hint(name)
         ),
         None => format!(
@@ -1835,7 +1835,7 @@ async fn install(
         bail!(
             "box {name} is a token box: its runner connects to the hub, and twr can't reach it \
              to install twr. On the box: {}; then restart its runner ({})",
-            token::update_hint(&hub.version),
+            token::update_hint(&hub.version, None),
             token::restart_hint(name)
         );
     };

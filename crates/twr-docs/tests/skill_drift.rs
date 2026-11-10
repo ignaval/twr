@@ -17,24 +17,25 @@ const SKILL: &str = include_str!("../../../SKILL.md");
 /// Methods SKILL.md doesn't document yet: each needs more than a line, so it is listed here
 /// until it is written up. Remove a name when SKILL.md documents it (the test fails while a
 /// listed name is documented, or no longer a method).
-const UNDOCUMENTED_METHODS: &[&str] = &[
-    // `{thread, models?, every_secs, retry?}` (users only): the TUI's one-line summary of a
-    // worker thread, with its own reasons, caching and rate limits (`twr_hub::hub::summary`).
-    "summary.thread",
-];
+const UNDOCUMENTED_METHODS: &[&str] = &[];
 
 /// Tools SKILL.md doesn't document yet, as [`UNDOCUMENTED_METHODS`].
 const UNDOCUMENTED_TOOLS: &[&str] = &[];
 
 /// The string literals of `pub const METHODS: &[&str] = &[ ... ];` in server.rs.
 fn socket_methods() -> Vec<&'static str> {
+    const_list("METHODS")
+}
+
+/// The string literals of `pub const <name>: &[&str] = &[ ... ];` in server.rs.
+fn const_list(name: &str) -> Vec<&'static str> {
     let start = SERVER_RS
-        .find("pub const METHODS: &[&str] = &[")
-        .expect("twr-hub's server.rs defines METHODS");
+        .find(&format!("pub const {name}: &[&str] = &["))
+        .unwrap_or_else(|| panic!("twr-hub's server.rs defines {name}"));
     let body = &SERVER_RS[start..];
     let body = &body[body.find('[').unwrap() + 1..];
     let body = &body[body.find('[').unwrap() + 1..];
-    let body = &body[..body.find("];").expect("METHODS ends")];
+    let body = &body[..body.find("];").expect("the list ends")];
     body.lines()
         .map(|l| l.split("//").next().unwrap().trim())
         .filter(|l| !l.is_empty())
@@ -42,7 +43,7 @@ fn socket_methods() -> Vec<&'static str> {
             l.trim_end_matches(',')
                 .strip_prefix('"')
                 .and_then(|l| l.strip_suffix('"'))
-                .unwrap_or_else(|| panic!("an entry of METHODS this test can't read: {l}"))
+                .unwrap_or_else(|| panic!("an entry of {name} this test can't read: {l}"))
         })
         .collect()
 }
@@ -135,6 +136,68 @@ fn skill_md_names_every_socket_method() {
         assert!(methods.contains(&m), "{m} is not in {methods:?}");
     }
     check("socket method", &methods, SKILL, UNDOCUMENTED_METHODS);
+}
+
+/// The methods SKILL.md names in code between `from` and the first `to` after it: the
+/// backticked words that are socket methods (others, such as `refresh`, are left out).
+fn methods_between(from: &str, to: &str) -> Vec<&'static str> {
+    let start = SKILL
+        .find(from)
+        .unwrap_or_else(|| panic!("SKILL.md says {from:?}"))
+        + from.len();
+    let end = SKILL[start..]
+        .find(to)
+        .unwrap_or_else(|| panic!("SKILL.md says {to:?} after {from:?}"))
+        + start;
+    let methods = socket_methods();
+    let mut named: Vec<&str> = SKILL[start..end]
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|w| methods.contains(w))
+        .collect();
+    named.sort_unstable();
+    named.dedup();
+    named
+}
+
+/// `want` (a list in server.rs) and `named` (what SKILL.md says of it) hold the same methods.
+fn same_methods(what: &str, want: &[&str], named: &[&str]) {
+    let missing: Vec<&str> = want
+        .iter()
+        .copied()
+        .filter(|m| !named.contains(m))
+        .collect();
+    let extra: Vec<&str> = named
+        .iter()
+        .copied()
+        .filter(|m| !want.contains(m))
+        .collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "SKILL.md's list of the methods {what} may call is not the hub's: it leaves out \
+         {missing:?} and names {extra:?}, which the hub refuses"
+    );
+}
+
+/// SKILL.md's lists of what the orchestrator and an agent may call are the hub's
+/// (`ORCHESTRATOR_METHODS`, `AGENT_METHODS`).
+#[test]
+fn skill_md_lists_what_the_orchestrator_and_agents_may_call() {
+    let orchestrator = const_list("ORCHESTRATOR_METHODS");
+    assert!(orchestrator.len() > 30, "{orchestrator:?}");
+    same_methods(
+        "the orchestrator",
+        &orchestrator,
+        &methods_between("The orchestrator may call only:", "(not `say`"),
+    );
+    let agent = const_list("AGENT_METHODS");
+    assert!(agent.len() > 15, "{agent:?}");
+    same_methods(
+        "an agent",
+        &agent,
+        &methods_between("An agent may call\nonly", "Anything else is `unauthorized`"),
+    );
 }
 
 #[test]
