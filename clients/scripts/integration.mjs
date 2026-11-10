@@ -1012,6 +1012,25 @@ try {
       "PASS: tray and badge count every workspace; a hidden window notifies of another workspace's permission without its text, removes it once answered, and a click opens it there",
     );
   }
+  if (!packagedProcess) {
+    // Help › Third-Party Licences; automation records the file instead of opening it.
+    const opened = await application.evaluate(({ Menu }) => {
+      const help = Menu.getApplicationMenu().items.find(
+        (item) => item.label === "Help",
+      );
+      help.submenu.items
+        .find((item) => item.label === "Third-Party Licences")
+        .click();
+      return globalThis.__twrOpenedNotices;
+    });
+    assert.equal(
+      opened?.path,
+      resolve("dist-notices/THIRD-PARTY-LICENSES.html"),
+    );
+    console.log(
+      `PASS: Help › Third-Party Licences opens the generated notices${opened.exists ? "" : " (not generated in this checkout: node scripts/notices.mjs)"}`,
+    );
+  }
   if (errors.length) throw new Error(errors.join("\n"));
   if (process.env.TWR_PERF === "1")
     await performanceAudit(

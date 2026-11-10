@@ -44,6 +44,24 @@ for (const name of ["trayTemplate.png", "trayTemplate@2x.png"])
   for (const line of ["provider: github", "owner: ignaval", "repo: twr"])
     assert(feed.split("\n").includes(line), `app-update.yml lacks ${line}`);
 }
+// twr's licence and the third-party notices (scripts/notices.mjs) the Help menu opens.
+for (const name of ["LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.html"])
+  assert(existsSync(join(resources, name)), `The app bundle has no ${name}`);
+{
+  const notices = readFileSync(
+    join(resources, "THIRD-PARTY-LICENSES.html"),
+    "utf8",
+  );
+  for (const name of ["react", "@xterm/xterm", "electron-updater", "node-pty"])
+    assert(
+      notices.includes(`data-package="${name}"`),
+      `THIRD-PARTY-LICENSES.html does not list ${name}`,
+    );
+  if (!notices.includes('id="rust-crates"'))
+    console.log(
+      "WARNING: THIRD-PARTY-LICENSES.html lists no Rust crates: it was packaged without cargo-about",
+    );
+}
 const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-package-")));
 function launcherPID(app, userData, port) {
   for (const line of execFileSync("/bin/ps", ["-axo", "pid=,command="], {

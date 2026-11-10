@@ -47,7 +47,8 @@ checks that the release app ignores the variable and keeps its debugging port sh
 a copy of the app with the marker added; the release app is never changed. To run
 `npm run test:integration` against an installed Linux package (`TWR_DESKTOP_EXECUTABLE`), add
 the marker as root, as CI does: `sudo touch /opt/twr/resources/twr-qa-automation`. Remove it
-afterwards.
+afterwards. `npm run package` needs cargo-about for the third-party notices; a local review
+build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](desktop.md#packages)).
 
 | Area | Automated check |
 | --- | --- |

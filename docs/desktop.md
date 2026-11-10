@@ -323,6 +323,15 @@ cd release/arch
 makepkg                   # twr-desktop-*.pkg.tar.zst
 ```
 
+Every package carries twr's `LICENSE` and `NOTICE` and `THIRD-PARTY-LICENSES.html` in its
+resources folder (and, for Arch, in `/usr/share/licenses/`); **Help › Third-Party Licences**
+opens the last in your browser. `npm run package` writes it with `node scripts/notices.mjs`:
+the Rust crates in the bundled engines, from cargo-about with the CLI release's settings
+(`about.toml`, `about.hbs`), then every npm package bundled into the app or copied into it.
+Packaging fails without cargo-about (`cargo install --locked cargo-about --version 0.9.2`).
+For a local review build, `TWR_NOTICES_WITHOUT_RUST=1` packages notices without the Rust
+crates, marked incomplete at the top of the file; never distribute such a build.
+
 The Arch package includes its own matching Electron runtime and native terminal module,
 so a system Electron upgrade cannot change the app's ABI. The Arch package reuses
 the portable producer's native terminal module without recompiling it. Its launcher uses the stable
