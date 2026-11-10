@@ -191,12 +191,56 @@ const exactAssistantText = () =>
   [...document.querySelectorAll(".block-assistant .markdown")].some(
     (node) => node.textContent.trim() === marker,
   );
+// The stream's end. On a CI runner the debug hub, the gateway and the Simulator share a few
+// cores: the hub's own timestamps of the 2002 fixture events have spanned 1 s to 50 s there
+// (0.2 s on a laptop), and the app received them as they came. A fixed limit fails a run that
+// is only slow. So it waits as long as events keep arriving: it fails when none has come for
+// STREAM_STALL_MS while the final one is still missing (a stall), or after STREAM_LIMIT_MS in
+// all, saying how far the stream got.
+const STREAM_STALL_MS = 60000;
+const STREAM_LIMIT_MS = 300000;
+const streamEnd = async () => {
+  const started = performance.now();
+  let seen = -1,
+    progressAt = started;
+  for (;;) {
+    if (measurementErrors.length) throw new Error(measurementErrors.join("; "));
+    if (!!finalTextEvent() && exactAssistantText()) return;
+    const now = performance.now();
+    if (streamEvents.length !== seen) {
+      seen = streamEvents.length;
+      progressAt = now;
+    }
+    const stalled = !finalTextEvent() && now - progressAt > STREAM_STALL_MS;
+    if (stalled || now - started > STREAM_LIMIT_MS) {
+      const first = streamEvents[0],
+        last = streamEvents.at(-1);
+      throw new Error(
+        "iOS performance fixture timed out: " +
+          (stalled
+            ? `no fixture event for ${STREAM_STALL_MS / 1000} s`
+            : `the stream took over ${STREAM_LIMIT_MS / 1000} s`) +
+          " " +
+          JSON.stringify({
+            eventCounts,
+            uniqueEvents: streamEvents.length,
+            duplicateEvents,
+            serverSpanMs: last ? last.server - first.server : null,
+            firstReceivedMs: first ? Math.round(first.received) : null,
+            lastReceivedMs: last ? Math.round(last.received) : null,
+            finalEvent: !!finalTextEvent(),
+            transitions,
+          }) +
+          " | " +
+          document.body.innerText.slice(-2000),
+      );
+    }
+    await new Promise((r) => setTimeout(r, 30));
+  }
+};
 try {
   // Observe the DOM independently of the RPC reply, which may arrive later.
-  const observed = wait(() => {
-    if (measurementErrors.length) throw new Error(measurementErrors.join("; "));
-    return !!finalTextEvent() && exactAssistantText();
-  }).then(() => {
+  const observed = streamEnd().then(() => {
     streamToVisibleMs = Math.round(performance.now() - workloadStart);
   });
   const acknowledged = rpc("thread.send", {
