@@ -106,6 +106,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - `twr runner stop`, and any other end of the runner service, take its launchd job away, so stopped services no longer pile up as `tools.twr.box.*` labels in `launchctl list`.
 - Every `twr` drops an inherited macOS crash handler, so a hub, runner service or box daemon started from the desktop app's terminal no longer keeps the app's crash reporter alive.
 - Typing very fast in the desktop app's message box, or a tool that types for you, no longer drops characters.
+- `twr ws rm` and `twr hub stop` could take a workspace whose lock had just been let go for one with a running hub, and the mobile gateway's status could fail with "No such file or directory" right after it stopped: both locks are now released explicitly, not only by closing their file.
 
 ### Security
 
