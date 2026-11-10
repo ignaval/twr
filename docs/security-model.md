@@ -69,7 +69,7 @@ runtime or a configured preset). A mode change needs admin however it arrives: `
 a new thread's mode outside `manual`, `plan`, `read-only` and `dontAsk`, a short mode
 command in `say` (refused, nothing sent), the orchestrator relaying one from the device's
 message (`relay_forbidden`, directly or as a card), or Confirm on a card that holds one (the
-card stays open for you). A device without admin also starts threads only where the orchestrator may: a configured project, or a git repository that isn't, and doesn't hold, your home folder, and doesn't hold and isn't inside twr's data, `TWR_HOME` or a credentials folder such as `~/.ssh`; a folder outside git is refused too. A device's own move of a thread to another runtime, a move the
+card stays open for you). A device without admin also starts threads only in a configured project, or in a folder or git repository that isn't, and doesn't hold, your home folder, and doesn't hold and isn't inside twr's data, `TWR_HOME` or a credentials folder such as `~/.ssh`. Unlike the orchestrator it may start one in a folder outside git, such as `~/notes`; the rule then applies to the folder itself, and on another box, whose home folder twr doesn't know, to the shape of its path, which must not go through `..`. A device's own move of a thread to another runtime, a move the
 orchestrator would put on a card from its message, and `outside_pin` are held to admin the
 same way (the orchestrator's own move of a thread in a restricted mode, which needs no card,
 is not a device's). A device revoked since its message arrived counts as holding nothing.

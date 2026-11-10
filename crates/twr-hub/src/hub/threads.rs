@@ -485,14 +485,18 @@ impl Hub {
 
     /// Refuses the orchestrator (`bad_request`) or a paired device without `admin`
     /// (`unauthorized`), `who`, a thread in `dir` (on `host`; `remote`: another box) that is not
-    /// a configured project: `dir` must be inside a git repository, and that
-    /// repository must not be, or hold, the home folder, nor hold or be in twr's data directory,
-    /// `TWR_HOME` or a credentials folder of the home folder (the folders the orchestrator's
-    /// project reads refuse, [`project_read::protected_dirs`]). Otherwise it could start a
-    /// worker in `$HOME` or `/` (a folder outside git is the thread's worktree as it is). On
-    /// another box, whose home folder twr does not know, a repository at `/`, at a home folder
-    /// by its shape (`/root`, `/home/<user>`, `/Users/<user>`) or in a credentials folder by its
-    /// name is refused. The user starts such a thread themselves, or a device with `admin`.
+    /// a configured project, unless the repository `dir` is in is not, and does not hold, the
+    /// home folder, and neither holds nor is in twr's data directory, `TWR_HOME` or a
+    /// credentials folder of the home folder (the folders the orchestrator's project reads
+    /// refuse, [`project_read::protected_dirs`]). Otherwise it could start a worker in `$HOME`
+    /// or `/`. On another box, whose home folder twr does not know, a repository at `/`, at a
+    /// home folder by its shape (`/root`, `/home/<user>`, `/Users/<user>`) or in a credentials
+    /// folder by its name is refused.
+    ///
+    /// A folder outside git (the thread's worktree as it is) is refused the orchestrator
+    /// always. A device is held to the same rule for the folder itself: it must exist here, or
+    /// be named without `..` on another box, where its path's shape is all there is to judge.
+    /// The user starts any other thread themselves, or a device with `admin`.
     async fn refuse_barred_dir(
         &self,
         host: &Arc<dyn ThreadHost>,
@@ -514,9 +518,10 @@ impl Hub {
                     codes::UNAUTHORIZED,
                     format!(
                         "{why}: without the admin permission this device starts threads only in \
-                         a configured project or a git repository outside the home folder's \
-                         private folders. Pick such a project, start the thread on the computer \
-                         running the hub, or pair the device again with --allow-admin"
+                         a configured project, or in a folder or git repository that is not the \
+                         home folder and is outside its private folders and twr's data. Pick \
+                         such a folder, start the thread on the computer running the hub, or \
+                         pair the device again with --allow-admin"
                     ),
                 ),
             })
@@ -526,18 +531,35 @@ impl Hub {
             .repo_root(dir.to_path_buf())
             .await
             .map_err(|e| rpc(codes::BAD_REQUEST, format!("{e:#}")))?;
-        let Some(root) = root else {
-            return refuse(format!("{} is not in a git repository", dir.display()));
-        };
-        let why = if remote {
-            project_read::remote_repo_refusal(&root)
-        } else {
+        let local_dirs = || {
             let home = std::env::var_os("HOME")
                 .filter(|h| !h.is_empty())
                 .map(PathBuf::from);
             let protected =
                 project_read::protected_dirs(home.as_deref(), &data_dir_of(&self.inner.db_path));
-            project_read::repo_refusal(&root, home.as_deref(), &protected)
+            (home, protected)
+        };
+        let why = match (root, who) {
+            (Some(root), _) if remote => project_read::remote_repo_refusal(&root),
+            (Some(root), _) => {
+                let (home, protected) = local_dirs();
+                project_read::repo_refusal(&root, home.as_deref(), &protected)
+            }
+            (None, DirChooser::Orchestrator) => {
+                Some(format!("{} is not in a git repository", dir.display()))
+            }
+            (None, DirChooser::Device) if remote => project_read::remote_folder_refusal(dir),
+            // Resolved first: a path that names no folder yet says nothing of where it is.
+            (None, DirChooser::Device) => match std::fs::canonicalize(dir) {
+                Ok(dir) if dir.is_dir() => {
+                    let (home, protected) = local_dirs();
+                    project_read::folder_refusal(&dir, home.as_deref(), &protected)
+                }
+                _ => Some(format!(
+                    "{} is not a folder on this computer",
+                    dir.display()
+                )),
+            },
         };
         match why {
             Some(why) => refuse(why),
