@@ -25,10 +25,11 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - The desktop app's menu bar or tray icon and its Dock badge count and list what needs you in every workspace, grouped by workspace; choosing an item switches to it.
 - The desktop app posts a system notification for a new permission or question in any workspace while its window isn't in front. It names only the thread and the workspace, never the command or the question, and a click opens the request without answering it. Turn them off in Settings › Application. See [notifications.md](docs/notifications.md).
 - Right-click menus in the desktop app (Cut, Copy, Paste, Select All, Copy Link Address), and it remembers its window's size, position and maximized state.
-- `install.sh` and the release workflow can check a second, ECDSA P-256 signature of the checksums, for macOS's LibreSSL, which cannot verify Ed25519. It is off until a P-256 release key exists ([development.md](docs/development.md)).
+- `install.sh` and the release workflow can check a second, ECDSA P-256 signature of the checksums, for macOS's LibreSSL, which cannot verify Ed25519. Releases after v0.3.0 carry it (`sha256sums.txt.p256.sig`), and `install.sh` holds the key, so `curl … | sh` on a Mac checks the release's signature; on a Mac without OpenSSL 3 it refuses v0.3.0 and older, which have none ([install.md](docs/install.md#the-install-script)).
 - CI type-checks, tests, format-checks and audits the desktop and mobile TypeScript on every pull request and builds the Android app; Dependabot now covers the clients' npm tree and the Android Gradle build.
 - Desktop: every package carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.html` (Rust crates and npm packages), opened from Help › Third-Party Licences.
 - The linked-runner service, and a Mac box daemon's launchd job, pass on proxy and CA bundle variables (`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` and the like), `CARGO_HOME`, `RUSTUP_HOME` and the agents' config directories (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`). A proxy URL's user name and password are removed, with a warning; give an authenticated proxy to agents with a paired hub's `[threads] env`. A linked runner's native worker build gets the proxy and CA bundle variables too, so cargo can fetch crates behind a proxy.
+- `twr ws list --json --detail` also prints each running hub's threads and requests (`detail`, its `thread.list` and `attention.list`), when the hub takes the process for you, or why not (`detail_error`). It waits up to 3 s per hub. A paired device can't run it through the gateway.
 
 ### Changed
 
@@ -62,6 +63,9 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Desktop: notifications for the orchestrator's confirm cards and for delete cards say what they ask ("Asks you to confirm what the orchestrator proposed", "Asks you to confirm a deletion") instead of "Has a question for you", without naming the threads.
 - The hub's hints to update an older runner or client name the hub's version (`twr update --version v…`), or the commit for a development hub.
 - Development: QA scripts stop the linked-runner service their fixture's hub started and remove its launchd job, so test runs no longer leave `tools.twr.box.*` jobs behind.
+- `twr ws list` asks every workspace's hub at once instead of one after another, so listing several running workspaces takes about as long as the slowest hub.
+- Desktop: the tray, badge, notifications and sidebar read every workspace with one `twr ws list --json --detail` per refresh, instead of listing the workspaces and then opening a read-only connection to each one. A refresh with four running workspaces takes about a quarter of a second instead of about one second.
+- Typing in the message box no longer re-renders the whole desktop and mobile app on each key: the composer and its drafts moved into their own component, and the rest of the window renders again only when the box goes from empty to a draft or back.
 
 ### Fixed
 
