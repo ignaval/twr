@@ -610,6 +610,7 @@ impl CloneTarget {
         let mut c = tokio::process::Command::new("git");
         without_git_env(&mut c);
         let parent = self.parent.file().as_raw_fd();
+        twr_core::fork::prepare_fork();
         // SAFETY: fchdir(2) is async-signal-safe and the closure allocates nothing (an
         // `io::Error` of an OS error does not); the descriptor is this process's, open while
         // `self` is (closed in git as it execs: `O_CLOEXEC`).
@@ -982,6 +983,7 @@ async fn run_group_with(
 ) -> std::io::Result<ExitStatus> {
     // SAFETY: isatty, tcgetpgrp and getpgrp only read; no memory is passed.
     let hand_over = unsafe { libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp() };
+    twr_core::fork::prepare_fork();
     // SAFETY: setpgid, sigemptyset, sigaddset, sigprocmask, tcsetpgrp and getpid are
     // async-signal-safe; the closure allocates nothing (an `io::Error` of an OS error does not)
     // and nothing else runs between fork and exec.
@@ -1532,6 +1534,7 @@ mod tests {
         for (k, v) in env {
             c.env(k, v);
         }
+        twr_core::fork::prepare_fork();
         // SAFETY: umask(2) is async-signal-safe and cannot fail.
         unsafe {
             c.pre_exec(move || {
@@ -2177,6 +2180,7 @@ mod tests {
             .stdin(Stdio::piped())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
+        twr_core::fork::prepare_fork();
         // The terminal's session starts with Ctrl-C's SIGINT at its default action, as a
         // login's does. Ignored by whatever ran the tests (a background job of a shell without
         // job control ignores it), it would stay ignored through every exec: `script`, its

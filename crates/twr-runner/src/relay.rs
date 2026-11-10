@@ -1486,6 +1486,7 @@ fn spawn_setsid(program: &Path, args: &[OsString]) -> std::io::Result<std::proce
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    twr_core::fork::prepare_fork();
     // SAFETY: runs in the child between fork and exec, where only async-signal-safe calls
     // are allowed: setsid(2) is one, and the closure allocates nothing.
     unsafe {

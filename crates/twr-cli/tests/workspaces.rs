@@ -587,6 +587,7 @@ fn the_hub_twr_starts_has_no_controlling_terminal() {
             c.env_remove(k);
         }
     }
+    twr_core::fork::prepare_fork();
     // SAFETY: setsid(2) and ioctl(2) are async-signal-safe and nothing is allocated: a new
     // session whose controlling terminal is the pseudo-terminal on stdin (TIOCSCTTY).
     unsafe {

@@ -1636,6 +1636,7 @@ async fn a_job_that_reads_the_terminal_ends_with_an_error() {
         .stdin(slave)
         .stdout(out.try_clone().unwrap())
         .stderr(out);
+    twr_core::fork::prepare_fork();
     // SAFETY: setsid(2) and ioctl(2) are async-signal-safe; nothing is allocated. The new
     // session's controlling terminal becomes the pseudo-terminal on stdin.
     unsafe {

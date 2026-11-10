@@ -251,6 +251,7 @@ async fn launch(machine: &Machine, program: &Path, root: &Path) -> Result<()> {
         .stdout(log.try_clone()?)
         .stderr(log);
     use std::os::unix::process::CommandExt;
+    twr_core::fork::prepare_fork();
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
