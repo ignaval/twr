@@ -27,13 +27,17 @@
 //!    hub ignores the runner's proof (the hub's ssh dialed the box: there is nothing more to
 //!    check on its side).
 //! 3. The runner sends [`RunnerMsg::Inventory`] (version, running sessions, in-flight command
-//!    ids, highest spooled `rseq` per thread), which may be large: only an authenticated
-//!    connection may send large messages. The hub answers [`HubMsg::Welcome`] with a fresh
-//!    connection epoch and its ack watermark per thread of the box; it closes any older
-//!    connection of the same box (fencing). On failure, at any step, it sends
-//!    [`HubMsg::Error`] and closes.
-//! 4. The runner drops spooled frames at or below each watermark, replays the rest in spool
-//!    order (per thread: `rseq` order), sends [`RunnerMsg::Synced`], then streams live frames.
+//!    ids, highest spooled `rseq` per thread, and the box generation its spool was written
+//!    under), which may be large: only an authenticated connection may send large messages.
+//!    The hub answers [`HubMsg::Welcome`] with a fresh connection epoch, its ack watermark per
+//!    thread of the box and, to a runner that sent a generation stamp, the box's generation;
+//!    it closes any older connection of the same box (fencing). On failure, at any step, it
+//!    sends [`HubMsg::Error`] and closes.
+//! 4. A runner whose spool was written under another generation (the hub forgot the box's
+//!    watermarks since: it was removed, [`SpoolStamp`]) forgets its spool for that hub first:
+//!    its frames and every thread's numbering. Then it drops spooled frames at or below each
+//!    watermark, replays the rest in spool order (per thread: `rseq` order), sends
+//!    [`RunnerMsg::Synced`], then streams live frames.
 //! 5. The hub commits each [`RunnerMsg::Event`] / [`RunnerMsg::Exited`] and then sends
 //!    [`HubMsg::Ack`]. Acks are cumulative per thread: `ack{thread, rseq}` acknowledges every
 //!    frame of `thread` with `rseq` at or below it; the hub acks a batch of frames at once
@@ -110,6 +114,11 @@ pub fn valid_run_id(run: &str) -> bool {
 /// none). No spooled frame changed: a protocol 6 spool's frames decode as they are.
 ///
 /// 8: bounded resumable thread attachments ([`Op::Upload`]); session/spool frames are unchanged.
+/// Later within 8, additive: the box generation ([`Inventory::spool`], [`HubMsg::Welcome`]
+/// `generation` and `forgotten`). A runner without it sends no stamp and gets no generation;
+/// the hub serves it as before, unless it forgot the box's watermarks (the box was removed),
+/// where it refuses it (`error{protocol}`, saying to update it). A hub without it sends no
+/// generation, and a runner then keeps its spool as before.
 ///
 /// A runner's spool keeps its frames across a restart, and so across an upgrade (it records
 /// the protocol they were written under): a bump that changes how spooled frames encode must
@@ -504,6 +513,60 @@ pub struct Inventory {
     /// by an older hub.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch: Option<String>,
+    /// The box generation the runner's spool was written under ([`SpoolStamp`]). Present from
+    /// a runner that takes the welcome's [`HubMsg::Welcome`] `generation` (and forgets its spool
+    /// when that says to); absent from an older runner, and ignored by an older hub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool: Option<SpoolStamp>,
+}
+
+/// What a runner's spool was written under ([`Inventory::spool`]): the box generation of the
+/// last welcome it took ([`HubMsg::Welcome`] `generation`).
+///
+/// The hub numbers a box's generations: a new one each time it forgets the box's watermarks
+/// (the box was removed). Frame numbers (`rseq`) and watermarks mean something only within one
+/// generation, so a runner whose spool was written under another generation than the
+/// welcome's forgets it first: the frames it holds and the numbering of every thread, which
+/// starts at 1 again ([`welcome_forgets`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpoolStamp {
+    /// The generation; none when the spool took none yet (a new spool, or one an older runner
+    /// wrote).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+}
+
+/// Whether a runner whose spool took generation `stamp` ([`SpoolStamp::generation`]) forgets
+/// it on a welcome of `generation` (`forgotten`: the welcome's flag, see [`HubMsg::Welcome`]):
+/// a spool of another generation always, one of none only when the hub forgot the box since
+/// it last welcomed a runner that took a generation (that spool was written before).
+pub fn welcome_forgets(stamp: Option<&str>, generation: &str, forgotten: bool) -> bool {
+    match stamp {
+        Some(s) => s != generation,
+        None => forgotten,
+    }
+}
+
+/// Longest box generation ([`HubMsg::Welcome`] `generation`) a runner takes, in bytes. A
+/// hub's are 32 hex digits ([`new_generation`]).
+pub const GENERATION_MAX: usize = 64;
+
+/// A new box generation (see [`SpoolStamp`]): 16 random bytes from the OS, lowercase hex.
+pub fn new_generation() -> anyhow::Result<String> {
+    use ring::rand::SecureRandom;
+    let mut buf = [0u8; 16];
+    ring::rand::SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| anyhow::anyhow!("the OS gave no random bytes for a box generation"))?;
+    Ok(hex::encode(buf))
+}
+
+/// Whether `generation` is one a runner takes: 1 to [`GENERATION_MAX`] ASCII letters and
+/// digits.
+pub fn valid_generation(generation: &str) -> bool {
+    (1..=GENERATION_MAX).contains(&generation.len())
+        && generation.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Whether `launch` is what a box daemon reports of how it was started
@@ -690,6 +753,17 @@ pub enum HubMsg {
         /// Highest committed `rseq` per thread of this box. Threads not listed: 0.
         #[serde(default)]
         watermarks: BTreeMap<String, u64>,
+        /// The box's generation ([`SpoolStamp`]), sent only to a runner whose inventory has
+        /// [`Inventory::spool`] (an older runner gets none, and an older hub sends none). The
+        /// runner forgets its spool when [`welcome_forgets`] says so, before it applies the
+        /// watermarks, and records the generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<String>,
+        /// With `generation`: the hub forgot the box's watermarks (the box was removed) and no
+        /// runner has taken this generation since, so a spool that took no generation was
+        /// written before that and is forgotten too.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        forgotten: bool,
     },
     /// Every frame of `thread` with `rseq` at or below this one is committed.
     Ack {
@@ -724,7 +798,9 @@ pub mod hub_errors {
     /// A bad proof (wrong token), or an unknown box.
     pub const UNAUTHORIZED: &str = "unauthorized";
     /// [`super::Hello::protocol`] is neither the hub's version nor one it drains
-    /// ([`super::DRAINABLE_PROTOCOLS`]).
+    /// ([`super::DRAINABLE_PROTOCOLS`]); or, after the inventory, the hub forgot the box's
+    /// watermarks (it was removed) and the runner is too old to forget its spool
+    /// ([`super::Inventory::spool`] absent): it must be updated.
     pub const PROTOCOL: &str = "protocol";
     /// A newer connection of the same box replaced this one.
     pub const FENCED: &str = "fenced";
@@ -1469,6 +1545,64 @@ mod tests {
             assert!(!valid_launch(bad), "{bad:?}");
         }
     }
+
+    /// The box generation is additive within protocol 8: an inventory and a welcome without
+    /// it decode as before (no stamp, no generation) and encode back unchanged; with it they
+    /// round-trip. A spool of another generation is forgotten, one of none only when the
+    /// welcome says the hub forgot the box.
+    #[test]
+    fn the_box_generation_is_additive() {
+        let old_inventory = json!({
+            "type": "inventory", "version": "0.3.0", "running": [], "in_flight": [],
+            "acks_needed": {}, "runtimes": [], "worktrees": "/w",
+        });
+        let m: RunnerMsg = serde_json::from_value(old_inventory.clone()).unwrap();
+        let RunnerMsg::Inventory(inv) = &m else {
+            panic!("{m:?}")
+        };
+        assert_eq!(inv.spool, None);
+        assert_eq!(serde_json::to_value(&m).unwrap(), old_inventory);
+        let old_welcome = json!({"type": "welcome", "epoch": 2, "watermarks": {"t1": 4}});
+        let w: HubMsg = serde_json::from_value(old_welcome.clone()).unwrap();
+        assert!(matches!(
+            &w,
+            HubMsg::Welcome {
+                generation: None,
+                forgotten: false,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(&w).unwrap(), old_welcome);
+        // A runner that took none yet says so with an empty stamp.
+        let fresh = RunnerMsg::Inventory(Inventory {
+            spool: Some(SpoolStamp::default()),
+            ..Default::default()
+        });
+        assert_eq!(serde_json::to_value(&fresh).unwrap()["spool"], json!({}));
+        round_trip_runner(fresh);
+        round_trip_runner(RunnerMsg::Inventory(Inventory {
+            spool: Some(SpoolStamp {
+                generation: Some("0a1b".into()),
+            }),
+            ..Default::default()
+        }));
+        round_trip_hub(HubMsg::Welcome {
+            epoch: 1,
+            watermarks: BTreeMap::new(),
+            generation: Some(new_generation().unwrap()),
+            forgotten: true,
+        });
+
+        let g = new_generation().unwrap();
+        assert!(valid_generation(&g) && g.len() == 32 && g != new_generation().unwrap());
+        for bad in ["", "a b", "x\n", &"a".repeat(GENERATION_MAX + 1)] {
+            assert!(!valid_generation(bad), "{bad:?}");
+        }
+        assert!(!welcome_forgets(Some("g1"), "g1", true));
+        assert!(welcome_forgets(Some("g1"), "g2", false));
+        assert!(!welcome_forgets(None, "g1", false));
+        assert!(welcome_forgets(None, "g1", true));
+    }
     use crate::event::{AgentText, GitSnapshot, SessionPayload};
     use serde_json::json;
 
@@ -1539,6 +1673,9 @@ mod tests {
                 note: None,
             }],
             launch: Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d".into()),
+            spool: Some(SpoolStamp {
+                generation: Some("0123456789abcdef0123456789abcdef".into()),
+            }),
         }));
         round_trip_runner(RunnerMsg::Event {
             thread: "t1".into(),
@@ -1603,6 +1740,8 @@ mod tests {
         round_trip_hub(HubMsg::Welcome {
             epoch: 9,
             watermarks: wm,
+            generation: None,
+            forgotten: false,
         });
         round_trip_hub(HubMsg::Ack {
             thread: "t1".into(),

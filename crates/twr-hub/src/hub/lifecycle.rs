@@ -93,14 +93,26 @@ impl Hub {
         )
         .unwrap_or(chrono::Duration::MAX);
         twr_core::trace::mark("hub: log replayed");
-        // Before any runner connects: watermarks of threads the hub keeps none of go
-        // (`Core::sweep_runner_acks`). A failure leaves them, as they were.
-        match core.sweep_runner_acks() {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                watermarks = n,
-                "forgot runner watermarks of threads the log does not keep"
-            ),
+        // Before any runner connects: the watermarks of boxes the hub starts without (removed)
+        // and of threads it keeps none of go (`Core::sweep_runner_acks`). A failure leaves
+        // what it did not get to, as it was.
+        let boxes = opts.config.boxes.keys().cloned().collect();
+        match core.sweep_runner_acks(&boxes) {
+            Ok(s) => {
+                if s.boxes > 0 {
+                    tracing::info!(
+                        boxes = s.boxes,
+                        watermarks = s.box_watermarks,
+                        "forgot the runner watermarks of boxes the hub no longer has"
+                    );
+                }
+                if s.thread_watermarks > 0 {
+                    tracing::info!(
+                        watermarks = s.thread_watermarks,
+                        "forgot runner watermarks of threads the log does not keep"
+                    );
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "cannot forget stale runner watermarks")
             }

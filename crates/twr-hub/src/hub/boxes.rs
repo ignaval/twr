@@ -31,7 +31,10 @@
 //! `box.restart {box}` has such a box's supervisor restart its daemon ([`crate::ssh_box`],
 //! "Restarting the daemon"); `box.token {box}` has a token box take its token from them again,
 //! or none when they no longer give it one (`twr box token --rotate`, `twr box remove`), and
-//! drops its runner connection when that changed it: rotation and revocation are live. The
+//! drops its runner connection when that changed it: rotation and revocation are live. When
+//! the files no longer have the box at all, it also forgets the box's runner watermarks
+//! (`Core::forget_box`; a box the hub dials, or a linked one, is forgotten when the hub next
+//! starts without it, `Core::sweep_runner_acks`). The
 //! four that read the files (`box.add`, `box.install`, `box.projects`, `box.token`) run one
 //! at a time, each from its read to its change (`Inner::box_files_lock`): a removal's
 //! `box.token` never runs between a `box.add`'s read of the removed box and its registration.
@@ -610,7 +613,10 @@ impl Hub {
     /// [`twr_core::runner::TOKEN_MIN_LEN`] is not taken: the old one is revoked all the same,
     /// and the answer is `bad_request` with why; a short one is taken with a warning, as at
     /// startup. A change drops the box's runner connection at once (the box goes offline) and
-    /// refuses a handshake that proved the old token (`hub::runners`). Nothing else of the box
+    /// refuses a handshake that proved the old token (`hub::runners`). When the files no longer
+    /// have the box at all (`twr box remove`), the hub also forgets its runner watermarks and
+    /// gives it a new generation (`Core::forget_box`), so a runner of the box that comes back
+    /// once it is added again forgets what it spooled before. Nothing else of the box
     /// changes; the configuration the hub compares `box.add`, `box.install` and
     /// `box.projects` against takes the same token. Returns `{box, changed, accepting}`
     /// (`accepting`: the box has a token now), never the token. Serialized with `box.add`,
@@ -681,11 +687,21 @@ impl Hub {
             None => (None, None, None),
         };
         let accepting = token.is_some();
+        let removed = !config.boxes.contains_key(name);
         let changed = runners::set_box_token(
             &self.inner,
             &rbox,
             Secret::new(token.clone().unwrap_or_default()),
         );
+        // Gone from the files (`twr box remove`): its runner is refused from now on, so its
+        // watermarks go, with a new generation that has the runner forget its spool should the
+        // box be added again (`Core::forget_box`). A failure leaves them; the next hub start
+        // forgets them (`Core::sweep_runner_acks`).
+        if removed {
+            if let Err(e) = self.inner.core().forget_box(name) {
+                tracing::warn!(box_name = %name, error = %format!("{e:#}"), "cannot forget the removed box's runner watermarks");
+            }
+        }
         if let Some(c) = self.inner.boxes_mut().configs.get_mut(name) {
             c.token = token;
         }

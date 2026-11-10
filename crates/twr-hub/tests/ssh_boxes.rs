@@ -490,6 +490,7 @@ async fn a_sealed_handshake_is_bound_to_its_box() {
             protocol_refused: None,
             build: Some("0123456789abcdef".into()),
             legacy: None,
+            spool_refused: false,
         }
     );
     hub.shutdown().await;

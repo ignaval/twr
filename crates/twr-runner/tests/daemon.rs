@@ -132,6 +132,8 @@ impl Hub {
             HubMsg::Welcome {
                 epoch: s.epoch,
                 watermarks: s.watermarks.clone(),
+                generation: None,
+                forgotten: false,
             }
         };
         sink.send(text(&welcome)).await.unwrap();

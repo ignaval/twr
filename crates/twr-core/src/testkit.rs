@@ -865,6 +865,9 @@ pub fn outbound_samples() -> Vec<(&'static str, crate::runner::HubMsg)> {
             HubMsg::Welcome {
                 epoch: 3,
                 watermarks: [("t1".to_string(), 5), ("t2".to_string(), 1)].into(),
+                // (A drained runner is an older one: it sent no spool stamp, and gets none.)
+                generation: None,
+                forgotten: false,
             },
         ),
         (
@@ -872,6 +875,8 @@ pub fn outbound_samples() -> Vec<(&'static str, crate::runner::HubMsg)> {
             HubMsg::Welcome {
                 epoch: 1,
                 watermarks: Default::default(),
+                generation: None,
+                forgotten: false,
             },
         ),
         (

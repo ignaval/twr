@@ -2834,6 +2834,27 @@ impl Hub {
         self.inner.core().store.sync_count()
     }
 
+    /// Box `box_name`'s committed runner watermarks (`runner_acks`), by thread. For tests.
+    #[doc(hidden)]
+    pub fn runner_watermarks(
+        &self,
+        box_name: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, u64>> {
+        self.inner.core().store.runner_watermarks(box_name)
+    }
+
+    /// Box `box_name`'s generation and whether it is forgotten (`runner_boxes`), when it has
+    /// one. For tests.
+    #[doc(hidden)]
+    pub fn runner_generation(&self, box_name: &str) -> anyhow::Result<Option<(String, bool)>> {
+        Ok(self
+            .inner
+            .core()
+            .store
+            .runner_box_of(box_name)?
+            .map(|b| (b.generation, b.forgotten)))
+    }
+
     /// Appends an event through the single writer (no hub reactions). Returns the stored
     /// event (payload capped, `raw` replaced by its blob pointer).
     pub fn append(
