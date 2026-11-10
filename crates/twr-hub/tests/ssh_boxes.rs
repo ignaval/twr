@@ -490,6 +490,7 @@ async fn a_sealed_handshake_is_bound_to_its_box() {
             protocol_refused: None,
             build: Some("0123456789abcdef".into()),
             legacy: None,
+            spool_refused: false,
         }
     );
     hub.shutdown().await;
@@ -1689,5 +1690,121 @@ async fn a_command_box_is_added_dialed_and_restarted() {
     // The orchestrator may not.
     let e = hub.box_restart("sb", &Caller::Orchestrator).unwrap_err();
     assert_eq!(e.code, codes::UNAUTHORIZED);
+    hub.shutdown().await;
+}
+
+/// A sealed connection of box `name` through to its inventory (with `spool` as its stamp):
+/// the runner's end, and how the hub's session of it ends.
+async fn sealed_inventory(
+    hub: &Hub,
+    name: &str,
+    spool: Option<twr_core::runner::SpoolStamp>,
+) -> (
+    WebSocketStream<tokio::io::DuplexStream>,
+    impl std::future::Future<Output = SealedEnd>,
+) {
+    let (mut ws, served) = raw_sealed(hub, name).await;
+    send(&mut ws, &hello(name, PROTOCOL_VERSION)).await;
+    assert!(matches!(
+        next(&mut ws).await,
+        Some(HubMsg::Challenge { .. })
+    ));
+    let auth = RunnerMsg::Auth {
+        proof: SEALED_AUTH_PROOF.into(),
+    };
+    send(&mut ws, &auth).await;
+    assert!(matches!(next(&mut ws).await, Some(HubMsg::Authenticated)));
+    let inv = Inventory {
+        version: "9.9.9-raw".into(),
+        runtimes: vec!["fake".into()],
+        worktrees: "/nonexistent".into(),
+        build: Some("0123456789abcdef".into()),
+        spool,
+        ..Default::default()
+    };
+    send(&mut ws, &RunnerMsg::Inventory(inv)).await;
+    (ws, served)
+}
+
+/// A box daemon too old to forget its spool, of a box the hub forgot (it started without the
+/// box, then with it again), is refused `error{protocol}` and its session's end says so
+/// (`spool_refused`: the supervisor replaces it as one of another protocol); a daemon that
+/// takes generations is welcomed with the new one and told the box was forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_daemon_of_a_forgotten_box_is_refused_for_its_spool() {
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = |g: Option<String>| Some(twr_core::runner::SpoolStamp { generation: g });
+    let hub = Hub::open(hub_opts(dir.path(), config())).await.unwrap();
+    let (mut ws, served) = sealed_inventory(&hub, BOX, stamp(None)).await;
+    let Some(HubMsg::Welcome {
+        generation: Some(g1),
+        forgotten: false,
+        ..
+    }) = next(&mut ws).await
+    else {
+        panic!("no welcome with a generation")
+    };
+    drop(ws);
+    served.await;
+    hub.shutdown().await;
+    drop(hub);
+    // Removed: the hub starts without it.
+    let mut without = config();
+    without.boxes.clear();
+    let hub = Hub::open(hub_opts(dir.path(), without)).await.unwrap();
+    hub.shutdown().await;
+    drop(hub);
+    // Added again.
+    let hub = Hub::open(hub_opts(dir.path(), config())).await.unwrap();
+    let (g2, forgotten) = hub.runner_generation(BOX).unwrap().unwrap();
+    assert!(forgotten && g2 != g1);
+    let (mut ws, served) = sealed_inventory(&hub, BOX, None).await;
+    let m = assert_error(next(&mut ws).await, hub_errors::PROTOCOL);
+    assert!(m.contains("update twr on box `gpu`"), "{m}");
+    drop(ws);
+    assert_eq!(
+        served.await,
+        SealedEnd {
+            spool_refused: true,
+            ..Default::default()
+        }
+    );
+    let (mut ws, served) = sealed_inventory(&hub, BOX, stamp(Some(g1))).await;
+    let Some(HubMsg::Welcome {
+        generation,
+        forgotten,
+        ..
+    }) = next(&mut ws).await
+    else {
+        panic!("no welcome")
+    };
+    assert_eq!((generation, forgotten), (Some(g2), true));
+    drop(ws);
+    assert!(served.await.welcomed);
+    hub.shutdown().await;
+}
+
+/// A linked box's worker reaches the hub on a sealed connection too (`hub::linked`): it is
+/// welcomed as an SSH box's daemon is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_box_is_welcomed_on_a_sealed_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.boxes.clear();
+    cfg.boxes.insert(
+        "desk".into(),
+        BoxConfig {
+            transport: Some(BoxTransport::Link),
+            ..Default::default()
+        },
+    );
+    let hub = Hub::open(hub_opts(dir.path(), cfg)).await.unwrap();
+    let (mut ws, served) = sealed_inventory(&hub, "desk", None).await;
+    assert!(
+        matches!(next(&mut ws).await, Some(HubMsg::Welcome { .. })),
+        "a linked box's sealed connection is welcomed"
+    );
+    drop(ws);
+    assert!(served.await.welcomed);
     hub.shutdown().await;
 }

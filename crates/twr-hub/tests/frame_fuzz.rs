@@ -376,6 +376,9 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
                 note: opt(rng, string),
             }],
             launch: opt(rng, string),
+            spool: opt(rng, |r| twr_core::runner::SpoolStamp {
+                generation: opt(r, string),
+            }),
         }),
         3 | 4 => RunnerMsg::Event {
             thread: string(rng),
@@ -418,6 +421,8 @@ fn hub_msg(rng: &mut Rng) -> HubMsg {
         2 => HubMsg::Welcome {
             epoch: number(rng),
             watermarks: BTreeMap::from([(string(rng), number(rng))]),
+            generation: opt(rng, string),
+            forgotten: rng.chance(50),
         },
         3 => HubMsg::Ack {
             thread: string(rng),

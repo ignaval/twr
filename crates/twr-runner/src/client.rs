@@ -7,10 +7,12 @@
 //!
 //! Connection loop: connect; authenticate ([`twr_core::runner`]: `hello` with a fresh nonce,
 //! check the hub's proof in its `challenge` before sending anything else, send this runner's
-//! proof, wait for `authenticated`); send the `inventory`; wait for `welcome`; drop spooled
-//! frames at or below the hub's watermarks; replay the rest of the spool in order; send `synced`; then
-//! stream live frames as the box spools them, while a reader task applies acks, answers pings
-//! and runs commands. A lost connection is retried with exponential backoff (1 s doubling,
+//! proof, wait for `authenticated`); send the `inventory` (with the box generation the spool
+//! was written under); wait for `welcome`; forget the spool when the welcome's generation says
+//! the hub forgot the box ([`crate::spool::Spool::take_generation`]: it was removed); drop
+//! spooled frames at or below the hub's watermarks; replay the rest of the spool in order;
+//! send `synced`; then stream live frames as the box spools them, while a reader task applies
+//! acks, answers pings and runs commands. A lost connection is retried with exponential backoff (1 s doubling,
 //! ±20% jitter): at most 5 s apart during the first minute of an outage (a hub restart is back
 //! within seconds), then up to 30 s by default; a welcomed connection starts the schedule
 //! over. Runtimes keep running while disconnected; their events wait in the spool.
@@ -61,7 +63,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use twr_core::runner::{
     auth_proof, check_auth_proof, hub_errors, new_nonce, valid_nonce, Hello, HubMsg, Inventory,
-    Prover, RunnerMsg, Secret, MAX_FRAME_BYTES, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
+    Prover, RunnerMsg, Secret, SpoolStamp, MAX_FRAME_BYTES, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
 use crate::lbox::{LocalBox, LocalBoxOptions};
@@ -1295,12 +1297,21 @@ async fn serve_inner<S: HubStream>(
     let io_timeout = opts.idle_timeout;
 
     let hint = *epoch_hint.lock().unwrap_or_else(|e| e.into_inner());
-    let (epoch, watermarks) = tokio::time::timeout(
+    let Welcomed {
+        epoch,
+        watermarks,
+        generation,
+        forgotten,
+    } = tokio::time::timeout(
         opts.welcome_timeout,
         handshake(&mut sink, &mut stream, lbox, opts, hint),
     )
     .await
     .map_err(|_| anyhow!("no welcome from the hub within {:?}", opts.welcome_timeout))??;
+    // Before the watermarks: they are of the generation the hub welcomes the box with.
+    if let Some(generation) = generation {
+        take_generation(&spool, opts, &generation, forgotten)?;
+    }
     spool.apply_watermarks(&watermarks)?;
     *welcomed = true;
     *epoch_hint.lock().unwrap_or_else(|e| e.into_inner()) = Some(epoch);
@@ -1454,17 +1465,54 @@ fn refused(opts: &RunnerOptions, code: &str, message: &str) -> anyhow::Error {
     )))
 }
 
-/// The handshake (see the module docs) up to the welcome: `(epoch, watermarks)`. Nothing but
-/// the hello goes out before the hub has proved that it knows the box's token. On a daemon's
-/// sealed connection the channel already proved the hub: the challenge's proof is not
-/// checked, and the runner's is [`SEALED_AUTH_PROOF`].
+/// What the hub's welcome said ([`HubMsg::Welcome`]).
+struct Welcomed {
+    epoch: u64,
+    watermarks: std::collections::BTreeMap<String, u64>,
+    /// The box's generation (none from an older hub).
+    generation: Option<String>,
+    forgotten: bool,
+}
+
+/// Takes the welcome's box generation `generation` into `spool`
+/// ([`crate::spool::Spool::take_generation`]): a spool written under another one (the hub
+/// forgot the box: it was removed, and maybe added again) is forgotten first, which is
+/// logged. A generation twr does not take is an error (the connection ends).
+fn take_generation(
+    spool: &crate::spool::Spool,
+    opts: &RunnerOptions,
+    generation: &str,
+    forgotten: bool,
+) -> anyhow::Result<()> {
+    if !twr_core::runner::valid_generation(generation) {
+        bail!(
+            "the hub's welcome names a box generation twr does not take ({} bytes)",
+            generation.len()
+        );
+    }
+    if let Some(gone) = spool.take_generation(generation, forgotten)? {
+        tracing::warn!(
+            box_name = %opts.box_name,
+            frames = gone.frames,
+            threads = gone.threads,
+            "the hub forgot this box (it was removed from the hub): this runner forgot the \
+             frames it still had for the hub and numbers each thread's frames from 1 again"
+        );
+    }
+    Ok(())
+}
+
+/// The handshake (see the module docs) up to the welcome. Nothing but the hello goes out
+/// before the hub has proved that it knows the box's token. On a daemon's sealed connection
+/// the channel already proved the hub: the challenge's proof is not checked, and the runner's
+/// is [`SEALED_AUTH_PROOF`].
 async fn handshake<S: HubStream>(
     sink: &mut futures::stream::SplitSink<WebSocketStream<S>, Message>,
     stream: &mut futures::stream::SplitStream<WebSocketStream<S>>,
     lbox: &LocalBox,
     opts: &RunnerOptions,
     epoch_hint: Option<u64>,
-) -> anyhow::Result<(u64, std::collections::BTreeMap<String, u64>)> {
+) -> anyhow::Result<Welcomed> {
     let nonce = new_nonce()?;
     let hello = RunnerMsg::Hello(Hello {
         box_name: opts.box_name.clone(),
@@ -1543,13 +1591,28 @@ async fn handshake<S: HubStream>(
         // What is known: none before the first probe ended (`Op::Agents` asks later).
         agents: lbox.agents(),
         launch: opts.daemon.as_ref().and_then(|d| d.launch.clone()),
+        spool: Some(SpoolStamp {
+            generation: lbox.spool().generation()?,
+        }),
     });
     sink.send(text(&inventory)?)
         .await
         .context("sending the inventory")?;
     loop {
         match next_hub_msg(stream).await? {
-            HubMsg::Welcome { epoch, watermarks } => return Ok((epoch, watermarks)),
+            HubMsg::Welcome {
+                epoch,
+                watermarks,
+                generation,
+                forgotten,
+            } => {
+                return Ok(Welcomed {
+                    epoch,
+                    watermarks,
+                    generation,
+                    forgotten,
+                })
+            }
             HubMsg::Error { code, message } => return Err(refused(opts, &code, &message)),
             HubMsg::Ping => sink.send(text(&RunnerMsg::Pong)?).await?,
             other => tracing::debug!(?other, "ignoring a message before the welcome"),
