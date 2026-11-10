@@ -73,6 +73,53 @@ async fn probe(socket: &Path, deadline: tokio::time::Instant) -> Result<Probe> {
     }
 }
 
+/// On macOS a process inherits its parent's exception ports, and the desktop app's are those of
+/// its crash reporter (Crashpad). A hub started from here would hold them for as long as it
+/// runs: the app's crash handler, and the app's stdout and stderr it keeps, would outlive the
+/// app, and the hub's crashes would be filed as the app's. The binaries the app runs call this
+/// first, so what they start uses the system's crash reporting. Elsewhere it does nothing.
+pub fn forget_inherited_crash_handler() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            // This task's port: what <mach/mach_init.h>'s mach_task_self() reads.
+            static mach_task_self_: u32;
+            // <mach/task.h>; the types are those of <mach/exception_types.h>.
+            fn task_set_exception_ports(
+                task: u32,
+                exception_mask: u32,
+                new_port: u32,
+                behavior: i32,
+                new_flavor: i32,
+            ) -> i32;
+        }
+        // EXC_MASK_ALL | EXC_MASK_CRASH | EXC_MASK_CORPSE_NOTIFY, then without the last for a
+        // system that refuses it.
+        const MASKS: [u32; 2] = [0x3ffe, 0x1ffe];
+        const EXCEPTION_DEFAULT: i32 = 1;
+        #[cfg(target_arch = "aarch64")]
+        const THREAD_STATE_NONE: i32 = 5;
+        #[cfg(not(target_arch = "aarch64"))]
+        const THREAD_STATE_NONE: i32 = 13;
+        for mask in MASKS {
+            // SAFETY: a Mach call on this task's own exception ports; MACH_PORT_NULL (0) puts
+            // back the default handler. No memory is passed.
+            let result = unsafe {
+                task_set_exception_ports(
+                    mach_task_self_,
+                    mask,
+                    0,
+                    EXCEPTION_DEFAULT,
+                    THREAD_STATE_NONE,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+        }
+    }
+}
+
 fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     anyhow::ensure!(

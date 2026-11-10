@@ -373,6 +373,8 @@ async fn run_call(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything starts a hub: it must not inherit the app's crash handler.
+    twr_app::runtime::forget_inherited_crash_handler();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     if std::env::var_os("TWR_MOBILE_TRANSPORT").is_some() {
         let line = lines

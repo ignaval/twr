@@ -883,18 +883,10 @@ try {
       });
     execFileSync(twr, ["ws", "new", "side"], { env, stdio: "pipe" });
     sideWorkspace = true;
-    // Started here, as the default hub is: a hub the app started would keep this
-    // runner's pipes to Electron open past its exit.
-    spawn(twr, ["-w", "side", "hub"], { env, stdio: "ignore" });
-    for (let i = 0; ; i++) {
-      try {
-        side("info", "--json");
-        break;
-      } catch (error) {
-        if (i === 99) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-    }
+    // The app starts this workspace's hub itself. That hub must keep nothing of the app's:
+    // on macOS it once inherited the crash reporter's exception ports, which kept
+    // Electron's crash handler, and with it this runner's pipes, open past the app's exit,
+    // so that closing the app below never finished.
     const send = (event) =>
       application.evaluate(
         ({ BrowserWindow }, event) =>
