@@ -16,7 +16,9 @@
 //! `error{unauthorized}`. All of that within one deadline from the connection's accept
 //! ([`HELLO_TIMEOUT`], see [`crate::listener`]). Once it is good the connection gets the full
 //! message size, the hub says `authenticated` and waits (as long again) for the runner's
-//! `inventory`, which may be large. The token never crosses the connection and never appears
+//! `inventory`, which may be large; one naming a running session or spooled frames of
+//! something with no thread id's shape is refused `error{protocol}`, as such a frame closes
+//! the connection (below). The token never crosses the connection and never appears
 //! in logs or events. Both proofs are over one reading of the box's token
 //! ([`RemoteBox::token_snapshot`]), and the connection is accepted only while that is still
 //! the box's token: one whose handshake overlapped a change (`box.token`,
@@ -867,6 +869,16 @@ where
         return Err(Refused::Other);
     }
     let refused = match next_message(&mut ws, deadline).await {
+        // A session or a spool naming no thread id: refused, as a frame naming one closes its
+        // connection (nothing of it could be the hub's).
+        Next::Msg(RunnerMsg::Inventory(inv)) if unshaped_thread(&inv).is_some() => {
+            let len = unshaped_thread(&inv).map_or(0, str::len);
+            tracing::warn!(peer, box_name = %rbox.name(), len, "a runner inventory naming no thread id; refusing the connection");
+            Some(refuse(
+                hub_errors::PROTOCOL,
+                format!("the inventory names no thread id ({len} bytes)"),
+            ))
+        }
         Next::Msg(RunnerMsg::Inventory(inv)) => {
             let (inv, odd) = checked_inventory(inv);
             for why in odd {
@@ -900,6 +912,16 @@ where
     };
     refuse_unauthenticated(ws, None, refused).await;
     Err(Refused::Other)
+}
+
+/// The first thread `inv` names that has no thread id's shape ([`thread_id_shaped`]): of a
+/// session it runs, or of the frames it still has to replay.
+fn unshaped_thread(inv: &Inventory) -> Option<&str> {
+    inv.running
+        .iter()
+        .map(|r| r.thread.as_str())
+        .chain(inv.acks_needed.keys().map(String::as_str))
+        .find(|t| !thread_id_shaped(t))
 }
 
 /// Longest runner version an inventory may report ([`checked_inventory`]).

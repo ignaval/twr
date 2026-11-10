@@ -1272,6 +1272,67 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
     h.shutdown().await;
 }
 
+/// An inventory naming a session or spooled frames of something with no thread id's shape
+/// (too long, empty, or with characters a thread id never has) is refused before the welcome,
+/// as a frame naming one closes its connection; nothing of it is taken over or recorded, and
+/// a runner whose inventory names thread ids is welcomed afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inventory_naming_no_thread_id_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let long = "0".repeat(65);
+    for bad in [
+        "",
+        "01J TEST",
+        "01J\nforged log line",
+        "thréad",
+        long.as_str(),
+    ] {
+        for spooled in [false, true] {
+            let mut ws = raw(&h.url).await;
+            let mut hi = hello(TOKEN);
+            if spooled {
+                hi.acks_needed.insert(bad.to_string(), 3);
+            } else {
+                hi.running = vec![RunningSession {
+                    thread: bad.into(),
+                    runtime: "fake".into(),
+                    ..Default::default()
+                }];
+            }
+            raw_hello(&mut ws, hi).await;
+            match raw_expect(&mut ws).await {
+                Some(HubMsg::Error { code, message }) => {
+                    assert_eq!(code, hub_errors::PROTOCOL, "{bad:?}");
+                    assert!(message.contains("no thread id"), "{message}");
+                }
+                other => panic!("{bad:?} (spooled: {spooled}): {other:?}"),
+            }
+        }
+    }
+    assert_eq!(
+        log(h.hub(), HUB_THREAD)
+            .iter()
+            .filter(|e| e.kind() == "runner.connected")
+            .count(),
+        0
+    );
+    let mut ws = raw(&h.url).await;
+    let mut hi = hello(TOKEN);
+    hi.running = vec![RunningSession {
+        thread: "0".repeat(64),
+        runtime: "fake".into(),
+        ..Default::default()
+    }];
+    raw_hello(&mut ws, hi).await;
+    let welcome = raw_expect(&mut ws).await;
+    assert!(
+        matches!(welcome, Some(HubMsg::Welcome { .. })),
+        "{welcome:?}"
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicates_are_acked_gaps_close_and_strays_are_stopped() {
     let dir = tempfile::tempdir().unwrap();

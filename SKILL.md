@@ -1496,7 +1496,8 @@ can access it (`chmod 600`).
   dropped by watermark; a gap closes the connection. A frame of a thread the hub never had, or
   whose trash item is purged, is acked and not recorded, with no watermark kept (its session is
   told to stop); a frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
-  and `_`) closes the connection. Commands to the box carry an id that the
+  and `_`) closes the connection, and an inventory that names one (a running session's, or
+  spooled frames') is refused before the welcome (`error{protocol}`). Commands to the box carry an id that the
   runner deduplicates, so a command sent again after a lost connection runs once; a command
   cut short by a runner crash answers `interrupted` and is never retried (a spawn then fails
   the thread's turn).
