@@ -2730,10 +2730,18 @@ fn wait_after_a_start_failure_waits_for_a_held_prompt() {
     ok(home, &["send", "dep", "!sleep", "120000"]);
     // x runs a turn while two more prompts queue, and moves to a runtime that cannot start:
     // the next prompt fails to start it, and the last one stays queued behind the failure.
-    ok(home, &["send", "x", "!sleep", "2000"]);
+    // The turn waits for a permission, answered once all that is done: a turn of a fixed
+    // length could end before it, on a loaded machine.
+    ok(home, &["send", "x", "!perm Bash ls"]);
+    poll("x's permission", || {
+        ok(home, &["attention"])
+            .contains("permission")
+            .then_some(())
+    });
     ok(home, &["send", "x", "second"]);
     ok(home, &["send", "x", "third"]);
     ok(home, &["model", "x", "--runtime", "codex"]);
+    ok(home, &["respond", "x", "1", "--yes"]);
     poll("x's start failure", || {
         let t = thread_get(home, "x");
         (t["last_turn"]["result"] == "error" && t["pending"] == 1).then_some(())
