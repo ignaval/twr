@@ -96,6 +96,9 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - The hints that bring a box to the hub's twr add `--allow-downgrade` when the box runs a newer twr, use the installer over a development build of the hub's version, and name both cases when the box's version isn't known.
 - The hub forgets, as it starts, runner watermarks of threads it no longer keeps.
 - The mobile gateway works with a twr home whose path is too long for its administration socket, and prints a pairing code only once it is serving.
+- A runner service or linked-runner worker whose twr home was deleted without `twr runner stop` now ends, once the directory has been gone (its filesystem still there) for five looks over five minutes. A home that is only briefly unavailable (permission or I/O errors, a hung network filesystem, an unmounted volume) never counts. The service no longer re-creates lease files in a home that is gone.
+- `twr runner stop`, and any other end of the runner service, take its launchd job away, so stopped services no longer pile up as `tools.twr.box.*` labels in `launchctl list`.
+- Every `twr` drops an inherited macOS crash handler, so a hub, runner service or box daemon started from the desktop app's terminal no longer keeps the app's crash reporter alive.
 
 ### Security
 
