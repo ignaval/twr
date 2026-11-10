@@ -797,11 +797,12 @@ where
         refuse_unauthenticated(ws, permit, Some(m)).await;
         return Err(Refused::Other);
     }
-    // A listener's connection naming a box the hub dials (ssh or command) is one naming a box
-    // the hub does not know; a sealed one is its box's.
+    // A listener's connection naming a box the hub dials (ssh or command) or a linked one is
+    // one naming a box the hub does not know; a sealed one is its box's (a linked box's worker
+    // is reached through the runner service on a sealed connection too, `hub::linked`).
     let rbox = hub.remote(&hello.box_name).filter(|b| match &bound {
         None => b.transport() == BoxTransport::Token,
-        Some(_) => b.transport().dialed(),
+        Some(_) => b.transport().dialed() || b.transport() == BoxTransport::Link,
     });
     // A token box's token, once: both proofs are over it, and the connection is taken only
     // while it is still the box's (`RemoteBox::connect`).
