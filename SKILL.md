@@ -1503,8 +1503,15 @@ can access it (`chmod 600`).
   connection, a runner restart or a hub crash replays what was not acked; duplicates are
   dropped by watermark; a gap closes the connection. A frame of a thread the hub never had, or
   whose trash item is purged, is acked and not recorded, with no watermark kept (its session is
-  told to stop), and a hub forgets such watermarks an older hub kept as it starts; a removed
-  box's watermarks stay with its threads, should it be added again; a frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
+  told to stop), and a hub forgets such watermarks an older hub kept as it starts. A removed
+  box's watermarks are forgotten (a token box's when `twr box remove` drops its token, any
+  other box's when the hub starts without it), and the box gets a new generation: the
+  welcome names it to a runner whose inventory carries a spool stamp (`Inventory.spool`,
+  additive), and a runner whose spool was written under another one forgets its undelivered
+  frames and numbers each thread from 1 again, so a box added back under the same name never
+  replays old frames or hits a gap. A runner from before generations is refused
+  (`error{protocol}`, update it) while its box is forgotten, and served as before otherwise.
+  A frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
   and `_`) closes the connection, and an inventory that names one (a running session's, or
   spooled frames') is refused before the welcome (`error{protocol}`). Commands to the box carry an id that the
   runner deduplicates, so a command sent again after a lost connection runs once; a command
