@@ -203,6 +203,7 @@ pub use config_view::config_view;
 pub use context::{injection, CONTEXT_DIR, CONTEXT_FILE, INJECT_MAX, SET_MAX};
 pub(crate) use device_scope::devices_unreadable;
 pub use disk::{DISK_TICK, NOT_NOW as DISK_NOT_NOW, TRIM as DISK_TRIM};
+pub(crate) use drain::to_hub_version;
 pub use git::{ParkOutcome, ResumeOutcome, GIT_TICK};
 pub use handoff::{
     is_handoff, SwitchOptions, CONVERSATION_MAX, HANDOFF_REPLY_TIMEOUT, SUMMARY_WAIT,

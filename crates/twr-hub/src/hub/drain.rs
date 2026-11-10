@@ -143,14 +143,17 @@ impl Drain {
             (false, Stage::Drained) => format!(
                 "box {name:?} runs an older twr (runner protocol {p}; the hub speaks \
                  {PROTOCOL_VERSION}): its agents were stopped; update twr on the box and restart \
-                 its runner (`twr update`, then restart `twr runner`); new prompts wait until then"
+                 its runner (on the box, {}, then restart `twr runner`); new prompts wait until \
+                 then",
+                to_hub_version()
             ),
             // (A runner restarted before its agents are stopped reports their ends as crashes.)
             (false, _) => format!(
                 "box {name:?} runs an older twr (runner protocol {p}; the hub speaks \
                  {PROTOCOL_VERSION}): its running turns finish, then its agents stop; once `twr \
-                 box status {name}` says drained, update twr on the box and restart its runner; \
-                 new prompts wait until then"
+                 box status {name}` says drained, update twr on the box and restart its runner \
+                 (on the box, {}, then restart `twr runner`); new prompts wait until then",
+                to_hub_version()
             ),
         }
     }
@@ -583,6 +586,26 @@ async fn watch(
     }
 }
 
+/// How a twr older than this hub (a runner of an older protocol, a client) gets to the hub's
+/// version, for a message: `twr update --version v<the hub's version>` (a plain `twr update`
+/// installs the latest release, which need not be the hub's); for a hub of a development
+/// build, which has no release, a build of its commit. The twr to update is the older one, so
+/// no `--allow-downgrade`.
+pub(crate) fn to_hub_version() -> String {
+    to_version(twr_core::version())
+}
+
+/// [`to_hub_version`] for a hub of twr `version`.
+fn to_version(version: &str) -> String {
+    match version.split_once("+dev.") {
+        Some((_, commit)) => format!(
+            "install a build of commit {commit}, the development build the hub runs \
+             (docs/tools/dev-install.sh in a checkout of that commit)"
+        ),
+        None => format!("`twr update --version v{version}`"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
@@ -592,6 +615,19 @@ mod tests {
     use super::*;
     use crate::remote::ConnTx;
     use crate::HubOptions;
+
+    /// The way to the hub's version names that version (a plain `twr update` installs the
+    /// latest release, which need not be it), or for a development hub its commit.
+    #[test]
+    fn the_way_to_the_hub_s_version_names_it() {
+        assert_eq!(to_version("0.3.0"), "`twr update --version v0.3.0`");
+        let dev = to_version("0.3.0+dev.abc1234");
+        assert!(
+            dev.contains("commit abc1234") && dev.contains("dev-install.sh"),
+            "{dev}"
+        );
+        assert!(!dev.contains("twr update"), "{dev}");
+    }
 
     /// A connection of `rbox` (of an older protocol: `legacy`), ready and online, under the
     /// core lock as `hub::runners` makes one: its epoch, and its close switch.
