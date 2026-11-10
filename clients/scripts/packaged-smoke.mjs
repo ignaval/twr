@@ -1,8 +1,9 @@
 // Launch the actual release app through LaunchServices so macOS supplies a real user
 // process ancestry. This exercises production authentication, not the debug test token.
 import { performanceAudit } from "./performance.mjs";
-import { chromium } from "@playwright/test";
-import { execFileSync } from "node:child_process";
+import { stopFixture } from "./fixture-cleanup.mjs";
+import { chromium, _electron as electron } from "@playwright/test";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   realpathSync,
@@ -16,7 +17,7 @@ import { createServer } from "node:net";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
 
 if (process.platform !== "darwin" || process.arch !== "arm64")
@@ -26,6 +27,26 @@ if (process.platform !== "darwin" || process.arch !== "arm64")
 const release = resolve("release/mac-arm64/twr.app");
 assert(existsSync(release), "Build the Mac application first");
 const resources = join(release, "Contents/Resources");
+// How the app under test is signed decides its update policy: `package:mac` signs ad hoc,
+// a release with the Apple credentials with a Developer ID (desktop.yml).
+const signing = (() => {
+  const shown = spawnSync(
+    "/usr/bin/codesign",
+    ["--display", "--verbose=2", release],
+    { encoding: "utf8" },
+  );
+  const text = `${shown.stdout}${shown.stderr}`;
+  if (/^Signature=adhoc$/m.test(text)) return "adhoc";
+  if (
+    /^Authority=Developer ID Application: /m.test(text) &&
+    /^TeamIdentifier=[A-Z0-9]{10}$/m.test(text)
+  )
+    return "developer-id";
+  throw new Error(
+    `The app is neither ad hoc nor Developer ID signed:\n${text}`,
+  );
+})();
+console.log(`Testing a ${signing} signed app`);
 // A packaged build honours TWR_DESKTOP_TEST_AUTOMATION only when its bundle carries this
 // marker (desktop/automation.ts). Release packaging never writes it: this test checks that
 // the release app ignores the variable, then drives a copy of it that has the marker.
@@ -62,6 +83,57 @@ for (const name of ["LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.html"])
     console.log(
       "WARNING: THIRD-PARTY-LICENSES.html lists no Rust crates: it was packaged without cargo-about",
     );
+  // The page as a browser shows it: one document with both parts and every package. It is
+  // loaded in a window of the Electron the app is built with (the development copy).
+  const scratch = mkdtempSync(join(tmpdir(), "twr-notices-"));
+  const viewerMain = join(scratch, "main.cjs");
+  writeFileSync(
+    viewerMain,
+    `const { app, BrowserWindow } = require("electron");
+app.whenReady().then(() =>
+  new BrowserWindow({ show: false, webPreferences: { javascript: true } }).loadURL(
+    ${JSON.stringify(pathToFileURL(join(resources, "THIRD-PARTY-LICENSES.html")).href)},
+  ),
+);\n`,
+  );
+  const viewer = await electron.launch({
+    args: [viewerMain, `--user-data-dir=${join(scratch, "user-data")}`],
+  });
+  {
+    try {
+      const page = await viewer.firstWindow();
+      await page.waitForLoadState("load");
+      const shown = await page.evaluate(() => ({
+        title: document.title,
+        mains: document.querySelectorAll("main").length,
+        rust: !!document.getElementById("rust-crates"),
+        // The crates each Rust licence lists as using it (about.hbs), before the npm part.
+        crates: document.getElementById("rust-crates")
+          ? document
+              .querySelectorAll(".licenses-list")[0]
+              .querySelectorAll("ul li a").length
+          : 0,
+        npm: !!document.getElementById("npm-packages"),
+        packages: document.querySelectorAll("li[data-package]").length,
+        // Every npm entry inside the main column, after the npm heading.
+        outside: [...document.querySelectorAll("li[data-package]")].filter(
+          (li) => !li.closest("main"),
+        ).length,
+      }));
+      assert.equal(shown.mains, 1, "The notices page has one main column");
+      assert(
+        shown.npm &&
+          shown.packages > 50 &&
+          shown.outside === 0 &&
+          (!shown.rust || shown.crates > 50),
+        JSON.stringify(shown),
+      );
+      console.log(`Notices page: ${JSON.stringify(shown)}`);
+    } finally {
+      await viewer.close().catch(() => {});
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }
 }
 const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-package-")));
 function launcherPID(app, userData, port) {
@@ -152,13 +224,7 @@ async function freePort() {
   } finally {
     const pid = launcherPID(release, userData, port);
     if (pid) process.kill(pid, "SIGKILL");
-    try {
-      execFileSync(twr, ["hub", "stop"], {
-        env: hubEnv,
-        stdio: "ignore",
-        timeout: 15000,
-      });
-    } catch {}
+    stopFixture(twr, hubEnv);
   }
 }
 // The copy under test, with the marker. It is not re-signed: the added file breaks the
@@ -423,17 +489,39 @@ try {
     "PASS: packaged attachment preview is inert, progresses to ready, and waits for explicit send",
   );
   // Application services: settings, background mode, diagnostics and the
-  // update policy of an ad hoc signed build. Launch at login is not toggled
+  // update policy of the build's signature. Launch at login is not toggled
   // here because macOS login items belong to the real user session.
   {
-    const settings = await page.evaluate(() => window.twrApp.settings());
+    let settings = await page.evaluate(() => window.twrApp.settings());
     assert.equal(settings.update.kind, "mac");
-    assert.equal(
-      settings.update.automatic,
-      false,
-      "Ad hoc builds must not self-update",
-    );
-    assert.match(settings.update.manualReason, /Developer ID/);
+    if (signing === "adhoc") {
+      assert.equal(
+        settings.update.automatic,
+        false,
+        "Ad hoc builds must not self-update",
+      );
+      assert.match(settings.update.manualReason, /Developer ID/);
+    } else {
+      // The app finds its signature with codesign after the window shows.
+      for (
+        let i = 0;
+        i < 100 && !settings.update.automatic && !settings.update.manualReason;
+        i++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        settings = await page.evaluate(() => window.twrApp.settings());
+      }
+      assert.equal(
+        settings.update.automatic,
+        true,
+        "A Developer ID build updates itself",
+      );
+      assert.equal(
+        settings.update.manualReason,
+        undefined,
+        "A Developer ID build has no reason to update by hand",
+      );
+    }
     assert.equal(settings.login.supported, true);
     assert.equal(settings.tray.available, true);
     assert.equal(settings.tray.enabled, true);
@@ -511,6 +599,8 @@ try {
     );
     const diagnostics = await page.evaluate(() => window.twrApp.diagnostics());
     assert.match(diagnostics, /^install: mac$/m);
+    // The file Help › Third-Party Licences opens, as the packaged app resolves it.
+    assert.match(diagnostics, /^licences: present$/m);
     assert.match(diagnostics, /packaged QA probe token=\[redacted\]/);
     assert(!diagnostics.includes("SHOULD_NOT_APPEAR"));
     assert(
@@ -525,7 +615,7 @@ try {
     await page.getByRole("switch", { name: "Launch at login" }).waitFor();
     await page.getByRole("heading", { name: "Diagnostics" }).waitFor();
     console.log(
-      "PASS: packaged tray settings, background close/reopen, redacted diagnostics and ad hoc update policy",
+      `PASS: packaged tray settings, background close/reopen, redacted diagnostics and ${signing === "adhoc" ? "ad hoc" : "Developer ID"} update policy`,
     );
   }
   if (process.env.TWR_DESKTOP_EXTENDED_QA === "1") {
@@ -726,6 +816,12 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
+  // Then the runner service the app's release hub started for this home.
+  stopFixture(
+    join(resources, "bin/twr"),
+    { ...process.env, HOME: fixture, TWR_HOME: fixture },
+    { workspaces: [] },
+  );
   rmSync(fixture, {
     recursive: true,
     force: true,

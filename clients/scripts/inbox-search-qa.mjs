@@ -1,5 +1,6 @@
 // Focused Electron + Rust QA. All hub processes and SQLite rows are disposable.
 import { clientProtocol } from "./client-protocol.mjs";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, expect } from "@playwright/test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -520,6 +521,7 @@ archive.commit()
   for (const process of processes)
     if (process.exitCode === null && process.signalCode === null)
       process.kill("SIGTERM");
+  stopFixture(join(bin, "twr"), env, { workspaces: [] });
   rmSync(home, {
     recursive: true,
     force: true,

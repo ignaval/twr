@@ -30,13 +30,13 @@ While you use a TUI connected to the hub, it sends nothing: a TUI tells its hub 
 
 ## The desktop app
 
-The [desktop app](desktop.md#tray-login-and-background-mode) posts system notifications of its own, without any `[notify]` setting: a new permission or question, in any workspace of the hub it's connected to, while its window isn't in front. They stay on your computer and name only the thread, the workspace and the kind of request (`api · client-x`, *Asks for permission*), never what is asked, as the hub's notifications do without `detail` and as [mobile push](mobile.md#notifications) does. Settings › Application › **Notify me of new requests** turns them off.
+The [desktop app](desktop.md#tray-login-and-background-mode) posts system notifications of its own, without any `[notify]` setting: a new permission or question, or a confirm or delete card, in any workspace of the hub it's connected to, while its window isn't in front, once for each request. They stay on your computer and name only the thread, the workspace and the kind of request (`api · client-x`, *Asks for permission*; for the hub's cards `twr · client-x`, *Asks you to confirm what the orchestrator proposed* or *Asks you to confirm a deletion*), never what is asked or which threads a card would delete, as the hub's notifications do without `detail` and as [mobile push](mobile.md#notifications) does. Clicking one shows the window in that workspace at the request; it never answers it. Settings › Application › **Notify me of new requests** turns them off.
 
 They don't replace the hub's command, and the two don't know of each other:
 
 - While the window has focus, the app tells the hub of the workspace it shows that you're looking, as a TUI does, so that hub's command stays quiet, and the app posts nothing either. The other workspaces' hubs aren't told: their commands still run.
 - While the window isn't in front, both notify. If your `command` is itself a desktop notifier on the same computer (the `notify-send` and `osascript` recipes below), you see each request twice: keep the command for somewhere else, such as your phone or a chat, or turn the app's notifications off.
-- The hub's command also covers failures, reviews, finished turns and replies (`events`); the app notifies only permissions and questions, and shows the rest in Needs you, the tray menu and the Dock badge.
+- The hub's command also covers failures, reviews, finished turns and replies (`events`); the app notifies only permissions, questions and confirm and delete cards, and shows the rest in Needs you, the tray menu and the Dock badge.
 
 A TUI's `[tui.notify]` alerts go through its own terminal, whichever app is open: with a TUI and the desktop app both open, both can notify of the same request.
 

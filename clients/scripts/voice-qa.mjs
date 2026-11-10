@@ -9,6 +9,7 @@
 // read aloud by the app's own speaker (a command engine that logs what it is given); a
 // transcript that reads as a mode change is held for confirmation, nothing sent.
 import { _electron as electron } from "@playwright/test";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import {
   mkdtempSync,
@@ -351,6 +352,7 @@ try {
   await app?.close().catch(() => {});
   hub?.kill("SIGTERM");
   await wait(500);
+  stopFixture(join(bin, "twr"), env);
   if (!process.env.TWR_VOICE_QA_KEEP)
     rmSync(home, { recursive: true, force: true });
   else console.log("Kept", home);

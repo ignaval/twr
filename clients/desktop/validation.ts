@@ -133,6 +133,7 @@ export const attentionSummarySchema = z
             id: z.string().min(1).max(200),
             revision: z.number().int().min(0),
             reason: z.string().max(40),
+            card: z.enum(["confirm", "delete"]).optional(),
             incomplete: z.boolean().optional(),
           })
           .strict(),

@@ -1,6 +1,7 @@
 // Real Electron + real Rust hub + twr's deterministic test adapter. No provider account,
 // user's config, network agent, or existing workspace is touched.
 import { performanceAudit } from "./performance.mjs";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, chromium } from "@playwright/test";
 import { createServer } from "node:net";
 import { spawn, execFileSync } from "node:child_process";
@@ -1011,6 +1012,72 @@ try {
     console.log(
       "PASS: tray and badge count every workspace; a hidden window notifies of another workspace's permission without its text, removes it once answered, and a click opens it there",
     );
+    // The hub's delete card notifies too, saying it is a deletion, without the threads.
+    await application.evaluate(({ BrowserWindow }) =>
+      BrowserWindow.getAllWindows()[0].hide(),
+    );
+    // Back in default, the side workspace's first read again lists what it has as known:
+    // the card must come after it.
+    await until(
+      (state) =>
+        state.attention?.workspaces.some((w) => w.name === "side" && w.stream),
+      "The side workspace was never read again",
+    );
+    const posted = (await recorded()).notifications.length;
+    const deleting = spawn(twr, ["-w", "side", "delete", "side-api"], {
+      env,
+      stdio: "ignore",
+    });
+    try {
+      state = await until(
+        (state) =>
+          state.notifications.length > posted &&
+          state.notifications.at(-1).target.thread === "hub",
+        "No notification for the delete card",
+      ).catch(async (error) => {
+        const history = await application.evaluate(() =>
+          globalThis.__twrTest.history.slice(-30),
+        );
+        throw new Error(
+          `${error.message}\nSummaries: ${JSON.stringify(history)}`,
+        );
+      });
+      const card = state.notifications.at(-1);
+      assert.equal(card.title, "twr · side");
+      assert.equal(card.body, "Asks you to confirm a deletion");
+      assert.equal(card.target.workspace, "side");
+      assert.equal(state.notifications.length, posted + 1);
+      assert(
+        !JSON.stringify(card).includes("side-api"),
+        "A delete card's notification must not list the threads",
+      );
+      // Read again and again (the poll beat): still one notification.
+      await send({ type: "inbox-poll" });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      assert.equal((await recorded()).notifications.length, posted + 1);
+      await application.evaluate(() =>
+        globalThis.__twrTest.notifications.at(-1).click(),
+      );
+      await showing("side");
+      const open = JSON.parse(side("attention", "--json")).find(
+        (item) => item.thread === "hub",
+      );
+      assert(open, "Opening the notification must not answer the delete card");
+      side("respond", open.target, "Cancel");
+    } finally {
+      if (deleting.exitCode === null) deleting.kill("SIGTERM");
+    }
+    assert(
+      JSON.parse(side("thread", "list", "--json")).some(
+        (thread) => thread.name === "side-api",
+      ),
+      "Cancel keeps the thread",
+    );
+    await send({ type: "menu-attention", workspace: "default" });
+    await showing("default");
+    console.log(
+      "PASS: a delete card in another workspace notifies once as a deletion, without its threads, and a click opens it there without answering it",
+    );
   }
   if (!packagedProcess) {
     // Help › Third-Party Licences; automation records the file instead of opening it.
@@ -1129,6 +1196,8 @@ try {
       new Promise((resolve) => hub.once("exit", resolve)),
       new Promise((resolve) => setTimeout(resolve, 5000)),
     ]);
+  // The hubs are stopped; then the runner service of this home, if a hub started one.
+  stopFixture(join(bin, "twr"), env, { workspaces: [] });
   rmSync(home, {
     recursive: true,
     force: true,

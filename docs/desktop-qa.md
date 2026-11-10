@@ -49,7 +49,15 @@ checks that the release app ignores the variable and keeps its debugging port sh
 a copy of the app with the marker added; the release app is never changed. To run
 `npm run test:integration` against an installed Linux package (`TWR_DESKTOP_EXECUTABLE`), add
 the marker as root, as CI does: `sudo touch /opt/twr/resources/twr-qa-automation`. Remove it
-afterwards. `npm run package` needs cargo-about for the third-party notices; a local review
+afterwards.
+
+Every fixture works in a `TWR_HOME` of its own. A release hub starts a linked-runner
+service for its home ([runner-links.md](runner-links.md)) that outlives `twr hub stop`, so
+the QA scripts end with `scripts/fixture-cleanup.mjs`, on failure too: `twr hub stop`,
+then `twr runner stop` with the same `TWR_HOME`, then, on macOS, `launchctl bootout` of
+the `tools.twr.box.*` jobs whose files are inside that home (`twr runner stop` leaves its
+job loaded). Debug hubs start no runner service for a `TWR_HOME`; packaged runs do.
+`launchctl list | grep tools.twr.box` shows no new job after a run. `npm run package` needs cargo-about for the third-party notices; a local review
 build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](desktop.md#packages)).
 
 | Area | Automated check |

@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from "node:child_process";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import {
   mkdtempSync,
   writeFileSync,
@@ -156,6 +157,7 @@ try {
   gateway?.kill();
   hub?.kill();
   await new Promise((r) => setTimeout(r, 500));
+  stopFixture(join(bin, "twr"), env);
   rmSync(home, {
     recursive: true,
     force: true,
