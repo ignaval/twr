@@ -111,11 +111,11 @@ struct Devices {
 impl Env {
     fn new() -> Env {
         let (tx, spawns) = mpsc::unbounded_channel();
-        Env {
-            dir: tempfile::tempdir().unwrap(),
-            spawns,
-            tx,
-        }
+        let dir = tempfile::tempdir().unwrap();
+        // The test's project: a repository of its own, beside the hub's data (a device without
+        // admin starts threads only where the orchestrator may).
+        init_repo(&dir.path().join("repo"));
+        Env { dir, spawns, tx }
     }
 
     fn path(&self) -> &Path {
@@ -211,7 +211,7 @@ impl Env {
     }
 
     fn project(&self) -> String {
-        self.path().to_string_lossy().into_owned()
+        self.path().join("repo").to_string_lossy().into_owned()
     }
 
     async fn worker(&self, hub: &Hub, name: &str) -> String {
@@ -247,6 +247,32 @@ impl Env {
             caller,
         )
         .await
+    }
+}
+
+/// Makes `dir` a repository with one commit.
+fn init_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
     }
 }
 
@@ -660,5 +686,144 @@ async fn unreadable_device_records_refuse_a_device_and_never_grant() {
         env.new_on(&hub, Some("pty:/bin/echo hi"), &d.operate).await,
         "terminal",
     );
+    hub.shutdown().await;
+}
+
+/// A thread in `dir` with no worktree of its own.
+fn in_dir(dir: &Path) -> NewThread {
+    NewThread {
+        project: dir.to_string_lossy().into_owned(),
+        // The default runtime (`fake`): one a device may name.
+        no_worktree: true,
+        ..Default::default()
+    }
+}
+
+/// `thread.spawn` of `req` by `caller`, waited for: its result, or its error.
+async fn spawned(hub: &Hub, id: &str, req: NewThread, caller: &Caller) -> Result<Value, RpcError> {
+    let status = hub.begin_spawn(id, req, None, caller)?;
+    let status = if status["status"] == "pending" {
+        timeout(WAIT, async {
+            loop {
+                let s = hub.spawn_status(id, caller).unwrap();
+                if s["status"] != "pending" {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap()
+    } else {
+        status
+    };
+    if status["status"] == "error" {
+        let e = &status["error"];
+        return Err(RpcError::new(
+            e["code"].as_str().unwrap_or(""),
+            e["message"].as_str().unwrap_or(""),
+        ));
+    }
+    Ok(status)
+}
+
+/// A paired device without `admin` starts a thread only where the orchestrator may: a
+/// configured project, or a git repository outside the home folder's private folders and
+/// twr's own data. Directly (`thread.new`), in the background (`thread.spawn`) and through a
+/// typed `new <dir>: ...` in `say`, a folder outside git, the home folder and a repository in
+/// the hub's data are refused (`unauthorized`, saying what to do instead), operate's and
+/// terminal's alike; a device with `admin`, and the local user, start them. The orchestrator,
+/// acting on any message, is refused them as before.
+#[tokio::test]
+async fn a_device_without_admin_starts_threads_only_where_the_orchestrator_may() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let d = env.devices();
+    let plain = env.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let in_data = env.path().join("data").join("inner");
+    init_repo(&in_data);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut barred = vec![plain.clone(), in_data.clone()];
+    barred.extend(home.clone());
+    let refused = |r: Result<Value, RpcError>, dir: &Path| {
+        let e = r.unwrap_err();
+        assert_eq!(e.code, codes::UNAUTHORIZED, "{}: {e:?}", dir.display());
+        assert!(
+            e.message.contains("without the admin permission")
+                && e.message.contains("--allow-admin"),
+            "{e:?}"
+        );
+    };
+    let mut n = 0;
+    for device in [&d.operate, &d.terminal] {
+        for dir in &barred {
+            refused(hub.new_thread_by(in_dir(dir), device).await, dir);
+            n += 1;
+            refused(
+                spawned(&hub, &format!("op-{n}"), in_dir(dir), device).await,
+                dir,
+            );
+            let said = format!("new {}: hello", dir.display());
+            refused(hub.say(&said, None, device).await, dir);
+        }
+        // Where the orchestrator may: the test's repository.
+        hub.new_thread_by(in_dir(Path::new(&env.project())), device)
+            .await
+            .unwrap();
+    }
+    assert!(hub
+        .list_threads()
+        .iter()
+        .all(|t| t["worktree"].as_str() != Some(&*plain.to_string_lossy())));
+    // `admin`, and the local user, are not held to it (not in the home folder here: the
+    // thread would be real).
+    for caller in [&d.admin, &tui()] {
+        for dir in [&plain, &in_data] {
+            hub.new_thread_by(in_dir(dir), caller).await.unwrap();
+            n += 1;
+            spawned(&hub, &format!("op-{n}"), in_dir(dir), caller)
+                .await
+                .unwrap();
+        }
+        let said = format!("new {}: hello", plain.display());
+        let r = hub.say(&said, None, caller).await.unwrap();
+        assert_eq!(r["action"], "new_thread", "{r}");
+    }
+    // The orchestrator, acting on a device's message or the user's, as before.
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Watching.");
+    for who in [&d.operate, &d.admin] {
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let r = hub
+            .say_to_orchestrator(
+                &format!("start a thread in {}", plain.display()),
+                Some(seen),
+                who,
+            )
+            .unwrap();
+        assert_eq!(r["action"], "delegate", "{r}");
+        let (_, t) = rt.next_turn().await;
+        let e = hub
+            .new_thread_by(
+                NewThread {
+                    // (Not `fake`, which the orchestrator never starts.)
+                    runtime: Some("my-agent".into()),
+                    ..in_dir(&plain)
+                },
+                &Caller::Orchestrator,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+        assert!(
+            e.message.contains("the orchestrator starts threads only"),
+            "{e:?}"
+        );
+        rt.end_turn(t, "Done.");
+    }
+    drop(rt);
     hub.shutdown().await;
 }
