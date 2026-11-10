@@ -1075,9 +1075,11 @@ fn dir_refusal(
 ) -> Option<String> {
     let dir = real(dir);
     if let Some(home) = home {
-        if real(home).starts_with(&dir) {
+        let home = real(home);
+        if home.starts_with(&dir) {
+            let how = if home == dir { "is" } else { "holds" };
             return Some(format!(
-                "the {what} {} holds the home folder{tail}",
+                "the {what} {} {how} the home folder{tail}",
                 dir.display()
             ));
         }
@@ -1743,8 +1745,15 @@ mod tests {
         assert_eq!(
             repo_refusal(&home, Some(&home), &protected),
             Some(format!(
-                "the repository {} holds the home folder: twr does not read it",
+                "the repository {} is the home folder: twr does not read it",
                 home.display()
+            ))
+        );
+        assert_eq!(
+            refusal(&root),
+            Some(format!(
+                "the folder {} holds the home folder",
+                root.display()
             ))
         );
     }
