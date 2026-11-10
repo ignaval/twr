@@ -1558,7 +1558,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -1820,7 +1819,7 @@ dependencies = [
  "pin-project",
  "portable-atomic",
  "rand 0.10.3",
- "reqwest 0.13.5",
+ "reqwest",
  "rustc-hash",
  "rustls",
  "rustls-pki-types",
@@ -1952,7 +1951,7 @@ dependencies = [
  "pin-project",
  "postcard",
  "rand 0.10.3",
- "reqwest 0.13.5",
+ "reqwest",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -2139,9 +2138,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2330,7 +2329,7 @@ dependencies = [
  "n0-future",
  "ndk-context",
  "rand 0.10.3",
- "reqwest 0.13.5",
+ "reqwest",
  "rustc-hash",
  "rustls",
  "simple-dns",
@@ -3107,7 +3106,7 @@ dependencies = [
  "lru",
  "mainline",
  "ntimestamp",
- "reqwest 0.13.5",
+ "reqwest",
  "self_cell",
  "serde",
  "sha1_smol",
@@ -3587,13 +3586,14 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
@@ -3608,46 +3608,10 @@ dependencies = [
  "quinn",
  "rustls",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-rustls",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "webpki-roots 1.0.10",
-]
-
-[[package]]
-name = "reqwest"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "futures-core",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
- "rustls-platform-verifier",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -3678,19 +3642,21 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.5.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae7019994ae0fe4ada40b732f798f3ff26f0f04facb1477f1bf37eb4f18a2d3"
+checksum = "d24a7e92f4bcaa36b97fa93c4fa7ca8f3e669eced949345b3462dba333c7f909"
 dependencies = [
  "chrono",
  "futures",
  "indexmap",
+ "libc",
  "pastey",
  "pin-project-lite",
  "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -3701,9 +3667,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.5.0"
+version = "3.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e66877136e969d5a2d561ee5841b17717a0619aebd64abb47a2a2f46e34683"
+checksum = "b3140f24a766f80f9ec1607bde85680959a69b83d46fa9ce87dadab7e67ab029"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -3724,9 +3690,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.2",
  "fallible-iterator",
@@ -4997,7 +4963,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "portable-pty",
- "reqwest 0.12.28",
+ "reqwest",
  "ring",
  "rustls",
  "serde",
@@ -5012,6 +4978,7 @@ dependencies = [
  "twr-link",
  "twr-speech",
  "uuid",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -5035,8 +5002,9 @@ dependencies = [
  "hex",
  "libc",
  "portable-pty",
- "reqwest 0.12.28",
+ "reqwest",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
@@ -5055,6 +5023,7 @@ dependencies = [
  "twr-speech",
  "twr-tui",
  "twr-voice",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]

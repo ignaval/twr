@@ -45,6 +45,24 @@ pub struct Push {
     oauth: Mutex<Option<(u64, String)>>,
     apns_jwt: Mutex<Option<(u64, String)>>,
 }
+/// TLS for APNs and FCM: rustls with ring, trusting the Mozilla roots of `webpki-roots` and
+/// nothing from the system, offering HTTP/2 (APNs requires it) and HTTP/1.1. reqwest 0.13's
+/// own rustls setup verifies with the platform's verifier (and defaults to aws-lc-rs), so the
+/// configuration is built here.
+fn push_tls() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports TLS 1.2 and 1.3")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls
+}
 fn private_file(path: &Path) -> Result<Vec<u8>> {
     let meta = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(
@@ -98,6 +116,7 @@ impl Push {
             path,
             test_log,
             http: reqwest::Client::builder()
+                .tls_backend_preconfigured(push_tls())
                 .timeout(std::time::Duration::from_secs(20))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,

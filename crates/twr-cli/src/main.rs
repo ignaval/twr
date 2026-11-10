@@ -4138,11 +4138,30 @@ fn is_release_tag(tag: &str) -> bool {
         })
 }
 
+/// A builder for twr's own HTTPS clients (`twr update`, `twr voice` downloads): rustls with
+/// ring, trusting the Mozilla roots of `webpki-roots` and nothing from the system. reqwest
+/// 0.13's own rustls setup verifies with the platform's verifier (and defaults to aws-lc-rs),
+/// so the TLS configuration is built here. HTTP/1.1 only: twr-cli doesn't enable reqwest's `http2`.
+fn https_client() -> reqwest::ClientBuilder {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports TLS 1.2 and 1.3")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    reqwest::Client::builder().tls_backend_preconfigured(tls)
+}
+
 /// The latest release's tag: `<releases>/latest` redirects to `<releases>/tag/<tag>` (no API
 /// token needed). The redirect is read, not followed.
 async fn latest_tag() -> anyhow::Result<String> {
     let url = format!("{GITHUB}{RELEASES_PATH}/latest");
-    let client = reqwest::Client::builder()
+    let client = https_client()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(RELEASE_FILE_TIMEOUT)
@@ -4528,7 +4547,7 @@ async fn fetch_limited(url: &str, max: usize, timeout: Duration) -> anyhow::Resu
     if !url.starts_with("https://") {
         bail!("{url}: twr only downloads over https:// (or reads file:///)");
     }
-    let client = reqwest::Client::builder()
+    let client = https_client()
         .https_only(true)
         .timeout(timeout)
         .build()
@@ -8081,7 +8100,7 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
     }
     let dir = target.parent().context("the model's directory")?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let client = reqwest::Client::builder()
+    let client = https_client()
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()

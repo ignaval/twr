@@ -34,8 +34,9 @@ uuid = { workspace = true, features = ["v4"] }
 ring.workspace = true
 base64 = "0.23.1"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-reqwest = { workspace = true, features = ["http2"] }
+reqwest = { workspace = true, features = ["http2", "form"] }
 rustls.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
