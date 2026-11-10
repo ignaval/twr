@@ -90,6 +90,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - twr.tools sends a Content-Security-Policy, `X-Frame-Options`, `X-Content-Type-Options` and `Referrer-Policy`.
 - The mobile apps delete transcript exports after sharing them.
 - twr's built-in SQLite is 3.54.1 (rusqlite 0.41), which no longer returns uninitialized memory for a database opened with a `-wal` file of another page size (RUSTSEC-2026-0459, CVE-2026-119375).
+- `twr mcp` is built on rmcp 3.9, past RUSTSEC-2026-0457, RUSTSEC-2026-0461 and RUSTSEC-2026-0462. Those are in rmcp's Streamable HTTP and OAuth code, which twr doesn't use (`twr mcp` speaks MCP over stdio), so no released twr was exposed.
 
 ## [0.3.0] - 2026-10-30
 

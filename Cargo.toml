@@ -51,7 +51,7 @@ crossterm = "0.29"
 pulldown-cmark = { version = "0.13", default-features = false }
 tempfile = "3"
 portable-pty = "0.9"
-rmcp = { version = "3.5", default-features = false, features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io", "macros"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # The hub's runner listener over TLS (wss://): the same rustls with ring.
