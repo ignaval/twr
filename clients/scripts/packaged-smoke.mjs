@@ -3,7 +3,7 @@
 import { performanceAudit } from "./performance.mjs";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { chromium } from "@playwright/test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   realpathSync,
@@ -27,6 +27,26 @@ if (process.platform !== "darwin" || process.arch !== "arm64")
 const release = resolve("release/mac-arm64/twr.app");
 assert(existsSync(release), "Build the Mac application first");
 const resources = join(release, "Contents/Resources");
+// How the app under test is signed decides its update policy: `package:mac` signs ad hoc,
+// a release with the Apple credentials with a Developer ID (desktop.yml).
+const signing = (() => {
+  const shown = spawnSync(
+    "/usr/bin/codesign",
+    ["--display", "--verbose=2", release],
+    { encoding: "utf8" },
+  );
+  const text = `${shown.stdout}${shown.stderr}`;
+  if (/^Signature=adhoc$/m.test(text)) return "adhoc";
+  if (
+    /^Authority=Developer ID Application: /m.test(text) &&
+    /^TeamIdentifier=[A-Z0-9]{10}$/m.test(text)
+  )
+    return "developer-id";
+  throw new Error(
+    `The app is neither ad hoc nor Developer ID signed:\n${text}`,
+  );
+})();
+console.log(`Testing a ${signing} signed app`);
 // A packaged build honours TWR_DESKTOP_TEST_AUTOMATION only when its bundle carries this
 // marker (desktop/automation.ts). Release packaging never writes it: this test checks that
 // the release app ignores the variable, then drives a copy of it that has the marker.
@@ -418,17 +438,39 @@ try {
     "PASS: packaged attachment preview is inert, progresses to ready, and waits for explicit send",
   );
   // Application services: settings, background mode, diagnostics and the
-  // update policy of an ad hoc signed build. Launch at login is not toggled
+  // update policy of the build's signature. Launch at login is not toggled
   // here because macOS login items belong to the real user session.
   {
-    const settings = await page.evaluate(() => window.twrApp.settings());
+    let settings = await page.evaluate(() => window.twrApp.settings());
     assert.equal(settings.update.kind, "mac");
-    assert.equal(
-      settings.update.automatic,
-      false,
-      "Ad hoc builds must not self-update",
-    );
-    assert.match(settings.update.manualReason, /Developer ID/);
+    if (signing === "adhoc") {
+      assert.equal(
+        settings.update.automatic,
+        false,
+        "Ad hoc builds must not self-update",
+      );
+      assert.match(settings.update.manualReason, /Developer ID/);
+    } else {
+      // The app finds its signature with codesign after the window shows.
+      for (
+        let i = 0;
+        i < 100 && !settings.update.automatic && !settings.update.manualReason;
+        i++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        settings = await page.evaluate(() => window.twrApp.settings());
+      }
+      assert.equal(
+        settings.update.automatic,
+        true,
+        "A Developer ID build updates itself",
+      );
+      assert.equal(
+        settings.update.manualReason,
+        undefined,
+        "A Developer ID build has no reason to update by hand",
+      );
+    }
     assert.equal(settings.login.supported, true);
     assert.equal(settings.tray.available, true);
     assert.equal(settings.tray.enabled, true);
@@ -520,7 +562,7 @@ try {
     await page.getByRole("switch", { name: "Launch at login" }).waitFor();
     await page.getByRole("heading", { name: "Diagnostics" }).waitFor();
     console.log(
-      "PASS: packaged tray settings, background close/reopen, redacted diagnostics and ad hoc update policy",
+      `PASS: packaged tray settings, background close/reopen, redacted diagnostics and ${signing === "adhoc" ? "ad hoc" : "Developer ID"} update policy`,
     );
   }
   if (process.env.TWR_DESKTOP_EXTENDED_QA === "1") {
