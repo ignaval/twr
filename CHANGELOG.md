@@ -58,6 +58,10 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Desktop: the tray and badge summary reads the open workspace over its existing connection instead of starting another process every 15 seconds.
 - `install.sh --pair` says what to run when the release it installed has no `twr runner up`, instead of naming a version.
 - `SKILL.md` documents `summary.thread`, and its lists of the methods the orchestrator and agents may call match the hub's.
+- A thread purged from the trash is remembered only by who it was (name, former names, aliases, colour, box), so control snapshots and checkpoints no longer grow with every thread ever deleted. Checkpoint format 4: the hub folds the log once after the upgrade.
+- Desktop: notifications for the orchestrator's confirm cards and for delete cards say what they ask ("Asks you to confirm what the orchestrator proposed", "Asks you to confirm a deletion") instead of "Has a question for you", without naming the threads.
+- The hub's hints to update an older runner or client name the hub's version (`twr update --version v…`), or the commit for a development hub.
+- Development: QA scripts stop the linked-runner service their fixture's hub started and remove its launchd job, so test runs no longer leave `tools.twr.box.*` jobs behind.
 
 ### Fixed
 
@@ -91,6 +95,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Desktop (macOS): launches no longer copy and hash the bundled engines every time because of a manifest that signing made invalid.
 - The hints that bring a box to the hub's twr add `--allow-downgrade` when the box runs a newer twr, use the installer over a development build of the hub's version, and name both cases when the box's version isn't known.
 - The hub forgets, as it starts, runner watermarks of threads it no longer keeps.
+- The mobile gateway works with a twr home whose path is too long for its administration socket, and prints a pairing code only once it is serving.
 
 ### Security
 
@@ -107,6 +112,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Desktop: AppImage self-updates install only an image listed in the release's signed `desktop-sha256sums.txt`, checked with the twr release key; a release without that signature is offered as a manual download.
 - A paired device's requests are refused with an error to try again while the hub cannot read the device list, instead of being served on the access it had when it connected.
 - A runner whose inventory names something that is not a thread id is refused before the welcome.
+- A paired device without admin access starts threads only where the orchestrator may: a configured project, or a git repository clear of the home folder, twr's data and credentials folders.
 
 ## [0.3.0] - 2026-10-30
 
