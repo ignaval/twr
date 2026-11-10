@@ -4,6 +4,12 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-10
+
+Desktop apps for Apple Silicon macOS and Linux, and iOS and Android apps, on the same interface as the TUI; machines paired as runners with a short-lived code; voice mode; a grouped Needs you inbox with search; model pickers; the tray, badge and system notifications across every workspace; and an audit of the hub, gateway, runners and every client, with its security fixes.
+
+Upgrading: the runner protocol is now 8 and the client protocol 2, so update twr on a box or a client you set up yourself together with the hub; an SSH box of the hub's OS and CPU switches to the new build by itself, and a 0.3.0 runner is let finish its turns and then asked to update. The database stays at schema 9 (10 once it records an account), and the hub folds its log once on the first start (checkpoint format 4); copy the database first if you may go back to 0.3.0. `twr update` now installs only a newer release (`--version V --allow-downgrade` for an older one). On a Mac without OpenSSL 3, `install.sh` checks the release's new P-256 signature and so refuses 0.3.0 and older, which have none ([install.md](docs/install.md#the-install-script)). A paired device needs terminal access for a command-line runtime and admin access to change a thread's mode: pair it again with `--allow-terminal` or `--allow-admin` if it relied on either (Security, below).
+
 ### Added
 
 - Pair Linux and macOS machines as runners with a short-lived code from the CLI, TUI or desktop app. Local hubs start a private independent runner service; linked runners preserve workspace workers, synchronize exact Git commits and build the hub's recorded source when needed. Includes machine-wide runtime admission, idle-session retirement, durable revocation, offline forgetting and committed-result pulls. See [runner-links.md](docs/runner-links.md).
