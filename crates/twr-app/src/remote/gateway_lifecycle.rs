@@ -137,6 +137,88 @@ fn private_dir(dir: &Path) -> Result<()> {
     );
     Ok(())
 }
+/// The control socket's name.
+const CONTROL_SOCKET: &str = "gateway-control.sock";
+
+/// Where the control socket of gateway directory `dir` is: in `dir`, when that path fits a
+/// Unix socket ([`twr_core::paths::MAX_SOCKET_PATH`]); else, so that a deep twr home still
+/// works, in a directory of this user's alone named by a hash of `dir` (made private, 0700,
+/// when `create`): in the per-user runtime directory (`$XDG_RUNTIME_DIR`, else
+/// `/run/user/<uid>`, on Linux; the per-user temporary directory on macOS) when that is this
+/// user's and private, else `/tmp/twr-gateway-<uid>-<hash>`. Every reader finds the same one:
+/// the listener, `info`, `stop` and `cancel_invitation`. Whatever directory it is in, a
+/// connection is taken only from a peer of this user (and, by a reader, only from the pid
+/// the locked metadata names, [`verify_peer`]).
+fn control_socket(dir: &Path, create: bool) -> Result<PathBuf> {
+    let near = dir.join(CONTROL_SOCKET);
+    if near.as_os_str().len() <= twr_core::paths::MAX_SOCKET_PATH {
+        return Ok(near);
+    }
+    let real = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let hash = hex::encode(Sha256::digest(real.as_os_str().as_encoded_bytes()));
+    let uid = unsafe { libc::geteuid() };
+    let candidates = runtime_dir()
+        .map(|r| r.join(format!("twr-gw-{}", &hash[..16])))
+        .into_iter()
+        .chain([PathBuf::from(format!(
+            "/tmp/twr-gateway-{uid}-{}",
+            &hash[..24]
+        ))]);
+    for socket_dir in candidates {
+        let socket = socket_dir.join(CONTROL_SOCKET);
+        if socket.as_os_str().len() > twr_core::paths::MAX_SOCKET_PATH {
+            continue;
+        }
+        if create {
+            private_dir(&socket_dir)?;
+        }
+        return Ok(socket);
+    }
+    anyhow::bail!(
+        "the gateway's control socket {} is {} bytes, over the {} a Unix socket path can be, and \
+         no shorter private directory is available: set TWR_HOME to a shorter directory",
+        near.display(),
+        near.as_os_str().len(),
+        twr_core::paths::MAX_SOCKET_PATH
+    )
+}
+
+/// A directory only this user can write to, when the system has one: `$XDG_RUNTIME_DIR`
+/// (else `/run/user/<uid>`) on Linux, the per-user temporary directory on macOS.
+fn runtime_dir() -> Option<PathBuf> {
+    let private = |dir: &Path| {
+        std::fs::symlink_metadata(dir).is_ok_and(|m| {
+            m.is_dir()
+                && !m.file_type().is_symlink()
+                && m.uid() == unsafe { libc::geteuid() }
+                && m.permissions().mode() & 0o077 == 0
+        })
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0 as libc::c_char; 1024];
+        let len =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+        if len == 0 || len > buf.len() {
+            return None;
+        }
+        let dir = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        use std::os::unix::ffi::OsStrExt;
+        let dir = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+        (dir.is_absolute() && private(&dir)).then_some(dir)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .into_iter()
+            .chain([PathBuf::from(format!("/run/user/{}", unsafe {
+                libc::geteuid()
+            }))])
+            .find(|dir| dir.is_absolute() && private(dir))
+    }
+}
+
 fn lock_file(dir: &Path) -> Result<File> {
     private_dir(dir)?;
     let file = OpenOptions::new()
@@ -211,7 +293,7 @@ fn verify_peer(stream: &UnixStream, pid: Option<u32>) -> Result<()> {
 }
 async fn exchange(dir: &Path, info: &Info, operation: &str, code: Option<&str>) -> Result<Value> {
     tokio::time::timeout(Duration::from_secs(3), async {
-        let mut stream = UnixStream::connect(dir.join("gateway-control.sock")).await.context("Running gateway does not support verified local administration; restart it from the terminal that launched it")?;
+        let mut stream = UnixStream::connect(control_socket(dir, false)?).await.context("Running gateway does not support verified local administration; restart it from the terminal that launched it")?;
         verify_peer(&stream, Some(info.pid))?;
         stream.write_all(format!("{}\n", json!({"operation":operation,"instance":info.instance,"code":code})).as_bytes()).await?;
         let mut response = Vec::new(); let mut reader = BufReader::new(stream).take(32769);
@@ -273,6 +355,8 @@ pub async fn cancel_invitation(dir: &Path, code: &str) -> Result<bool> {
 #[derive(Clone)]
 pub struct Metadata {
     dir: PathBuf,
+    /// The control socket ([`control_socket`]).
+    socket: PathBuf,
     info: Arc<Mutex<Info>>,
     active: Arc<AtomicBool>,
 }
@@ -320,16 +404,19 @@ impl Lifecycle {
                 Err(error) => return Err(error).context("Another gateway is already running; check its configuration before restarting it"),
             }
         }
-        let socket = dir.join("gateway-control.sock");
+        let socket = control_socket(dir, true)?;
         let _ = std::fs::remove_file(&socket);
-        let listener = UnixListener::bind(socket)?;
-        std::fs::set_permissions(
-            dir.join("gateway-control.sock"),
-            std::fs::Permissions::from_mode(0o600),
-        )?;
+        let listener = UnixListener::bind(&socket).with_context(|| {
+            format!(
+                "Cannot listen for gateway administration at {}",
+                socket.display()
+            )
+        })?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         write_info(dir, &info)?;
         let metadata = Metadata {
             dir: dir.to_owned(),
+            socket,
             info: Arc::new(Mutex::new(info)),
             active: Arc::new(AtomicBool::new(true)),
         };
@@ -391,7 +478,16 @@ impl Drop for Lifecycle {
         self.metadata.active.store(false, Ordering::SeqCst);
         let expected = info.instance.clone();
         if read_info(&self.metadata.dir).is_ok_and(|info| info.instance == expected) {
-            let _ = std::fs::remove_file(self.metadata.dir.join("gateway-control.sock"));
+            let _ = std::fs::remove_file(&self.metadata.socket);
+            // Its own short directory, when it has one (and nothing else is in it).
+            if let Some(parent) = self
+                .metadata
+                .socket
+                .parent()
+                .filter(|p| *p != self.metadata.dir)
+            {
+                let _ = std::fs::remove_dir(parent);
+            }
             let _ = std::fs::remove_file(self.metadata.dir.join("gateway.json"));
         }
     }
@@ -466,6 +562,46 @@ mod tests {
         .unwrap();
         release.join().unwrap();
         drop(lifecycle);
+    }
+    /// A gateway directory so deep that its control socket would not fit a Unix socket path
+    /// still serves its administration: through a private directory named by a hash of it,
+    /// which every reader finds, and which the gateway's exit cleans up.
+    #[tokio::test]
+    async fn a_deep_gateway_directory_still_serves_its_administration() {
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = base.path().join("d".repeat(60)).join("mobile".repeat(4));
+        private_dir(&dir).unwrap();
+        assert!(dir.join(CONTROL_SOCKET).as_os_str().len() > twr_core::paths::MAX_SOCKET_PATH);
+        let record = Info::new("gateway-test".into(), "127.0.0.1:1234".into(), None, None).unwrap();
+        let instance = record.instance.clone();
+        let mut lifecycle = Lifecycle::acquire(&dir, record).unwrap();
+        let socket = control_socket(&dir, false).unwrap();
+        assert!(
+            !socket.starts_with(&dir) && socket.exists(),
+            "{}",
+            socket.display()
+        );
+        let parent = std::fs::symlink_metadata(socket.parent().unwrap()).unwrap();
+        assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+        let observed = info(&dir).await.unwrap();
+        assert_eq!(observed["instance"], instance);
+        assert_eq!(observed["running"], true);
+        let auth = super::super::auth::Auth::open(&dir).unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        assert!(cancel_invitation(&dir, &code).await.unwrap());
+        let stopped = stop(&dir, &instance);
+        let shutdown = async {
+            lifecycle.stopping().await;
+            drop(lifecycle);
+        };
+        let (result, ()) = tokio::join!(stopped, shutdown);
+        result.unwrap();
+        assert!(!socket.exists());
+        assert_eq!(info(&dir).await.unwrap()["running"], false);
+        assert!(
+            !socket.parent().unwrap().exists(),
+            "its short directory goes too"
+        );
     }
     #[test]
     fn diagnostics_rotate_with_a_bounded_backup() {

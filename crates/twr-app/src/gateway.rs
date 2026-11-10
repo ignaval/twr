@@ -2146,32 +2146,19 @@ async fn main() -> Result<()> {
         println!("{}", local.call("device.list", json!({})).await?);
         return Ok(());
     }
-    if args.pair {
-        let scopes = invitation_scopes;
-        let pairing_started = remote::auth::now();
-        let code = local
-            .call("device.pair_begin", json!({"scopes":scopes}))
-            .await?;
-        if args.pair_json {
-            println!(
-                "{}",
-                json!({
-                    "code": code["code"],
-                    "expires_at": pairing_started + code["expires_in"].as_u64().unwrap_or(300).min(300),
-                    "scopes": scopes,
-                    "gateway_id": std::fs::read_to_string(paths.config_file.with_file_name("mobile").join("gateway-id")).unwrap_or_default().trim(),
-                })
-            );
-        } else {
-            println!(
-                "Pairing code (one use, five minutes): {}",
-                code["code"].as_str().unwrap_or("")
-            );
-        }
-        if args.pair_only {
-            return Ok(());
-        }
+    // Only an invitation: now. A gateway that serves too begins one only once nothing of its
+    // start can fail any more (below), so one that is about to exit never shows a code.
+    if args.pair && args.pair_only {
+        announce_pairing(&mut local, &invitation_scopes, args.pair_json, &mobile_dir).await?;
+        return Ok(());
     }
+    let pairing = args.pair.then(|| {
+        (
+            invitation_scopes.clone(),
+            args.pair_json,
+            mobile_dir.clone(),
+        )
+    });
     let push = remote::push::Push::new(
         &paths.config_file.with_file_name("mobile"),
         args.push_config.as_deref(),
@@ -2234,6 +2221,9 @@ async fn main() -> Result<()> {
     crate::gateway_log!("twr mobile gateway listening on {}", args.listen);
     if args.development {
         let http = http_server(listener, axum_server::accept::DefaultAcceptor, connections)?;
+        if let Some((scopes, json, dir)) = &pairing {
+            announce_pairing(&mut owner_client().await?, scopes, *json, dir).await?;
+        }
         tokio::select! {
             result = http.serve(app) => { result?; },
             _ = lifecycle.stopping() => {},
@@ -2298,10 +2288,44 @@ async fn main() -> Result<()> {
         });
         let tls = axum_server::tls_rustls::RustlsAcceptor::new(config);
         let https = http_server(listener, tls, connections)?;
+        if let Some((scopes, json, dir)) = &pairing {
+            announce_pairing(&mut owner_client().await?, scopes, *json, dir).await?;
+        }
         tokio::select! {
             result = https.serve(app) => { result?; },
             _ = lifecycle.stopping() => {},
         }
+    }
+    Ok(())
+}
+/// Begins a device invitation with `scopes` on the hub (`device.pair_begin`, as the owner
+/// through `owner`) and prints its code: as JSON with `json` (with the gateway id from the
+/// gateway directory `dir`), else as a line.
+async fn announce_pairing(
+    owner: &mut twr_core::client::Client,
+    scopes: &[&str],
+    json: bool,
+    dir: &Path,
+) -> Result<()> {
+    let pairing_started = remote::auth::now();
+    let code = owner
+        .call("device.pair_begin", json!({"scopes":scopes}))
+        .await?;
+    if json {
+        println!(
+            "{}",
+            json!({
+                "code": code["code"],
+                "expires_at": pairing_started + code["expires_in"].as_u64().unwrap_or(300).min(300),
+                "scopes": scopes,
+                "gateway_id": std::fs::read_to_string(dir.join("gateway-id")).unwrap_or_default().trim(),
+            })
+        );
+    } else {
+        println!(
+            "Pairing code (one use, five minutes): {}",
+            code["code"].as_str().unwrap_or("")
+        );
     }
     Ok(())
 }
