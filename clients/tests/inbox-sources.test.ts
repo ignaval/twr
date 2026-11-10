@@ -130,6 +130,70 @@ describe("workspace inbox reads", () => {
     expect(closed).toHaveBeenCalledTimes(2);
   });
 });
+describe("workspaces the listing read", () => {
+  it("takes each running workspace from the listing, with no connection of its own", async () => {
+    const reader = vi.fn(() => {
+      throw new Error("unexpected reader");
+    });
+    const attention = [
+      { attn_id: "question", reason: "question", revision: 2 },
+    ];
+    const threads = [{ id: "worker", name: "api", status: "waiting" }];
+    const result = await localInboxSources(
+      [
+        { name: "default", hub: "running", detail: { attention, threads } },
+        {
+          name: "slow",
+          hub: "busy",
+          detail_error: "Workspace did not answer within 3 seconds",
+        },
+        { name: "odd", hub: "running", detail: { attention: {}, threads } },
+        { name: "off", hub: "stopped" },
+      ],
+      reader,
+    );
+    expect(reader).not.toHaveBeenCalled();
+    expect(result).toEqual([
+      { ...summary("default"), attention, threads },
+      {
+        ...summary("slow"),
+        error: "Workspace did not answer within 3 seconds",
+      },
+      { ...summary("odd"), error: "Invalid workspace summary" },
+      { ...summary("off"), running: false },
+    ]);
+  });
+  it("reads on its own only what the listing did not", async () => {
+    const closed = vi.fn();
+    const reader = vi.fn((workspace: string) => ({
+      call: async (method: string) =>
+        method === "hub.info"
+          ? { workspace }
+          : method === "attention.list"
+            ? [{ attn_id: "old-cli" }]
+            : [{ id: "worker" }],
+      close: closed,
+    }));
+    const result = await localInboxSources(
+      [
+        {
+          name: "default",
+          hub: "running",
+          detail: { attention: [], threads: [] },
+        },
+        { name: "older", hub: "running" },
+      ],
+      reader,
+    );
+    expect(reader.mock.calls).toEqual([["older"]]);
+    expect(closed).toHaveBeenCalledTimes(1);
+    expect(result[1]).toEqual({
+      ...summary("older"),
+      attention: [{ attn_id: "old-cli" }],
+      threads: [{ id: "worker" }],
+    });
+  });
+});
 describe("inbox refresh coalescing", () => {
   it("shares an in-flight scan, then allows a fresh scan after completion", async () => {
     let resolve!: (value: InboxSource[]) => void;
@@ -171,18 +235,59 @@ describe("inbox refresh coalescing", () => {
 describe("workspace listing", () => {
   it("gives the listing one overall budget and falls back to the last good list", async () => {
     const list = vi
-      .fn<(timeout: number) => Promise<unknown>>()
+      .fn<(timeout: number, detail: boolean) => Promise<unknown>>()
       .mockResolvedValueOnce({ workspaces: [{ name: "default" }, "other"] })
       .mockRejectedValueOnce(new Error("Command timed out after 5000 ms"))
       .mockResolvedValueOnce("garbage")
       .mockResolvedValueOnce(["default"]);
     const listing = new WorkspaceListing(list, 5000);
     expect(await listing.get()).toEqual([{ name: "default" }, "other"]);
-    expect(list).toHaveBeenLastCalledWith(5000);
+    expect(list).toHaveBeenLastCalledWith(5000, true);
     // A slow hub or a bad answer keeps the previous list.
     expect(await listing.get()).toEqual([{ name: "default" }, "other"]);
     expect(await listing.get()).toEqual([{ name: "default" }, "other"]);
     expect(await listing.get()).toEqual(["default"]);
+  });
+
+  it("asks for what each hub listed, and an older CLI for the list alone", async () => {
+    const refused = Object.assign(new Error("Command failed"), {
+      code: 2,
+      stderr:
+        "error: unexpected argument '--detail' found\n\nUsage: twr ws list --json\n",
+    });
+    const list = vi
+      .fn<(timeout: number, detail: boolean) => Promise<unknown>>()
+      .mockRejectedValueOnce(refused)
+      .mockResolvedValue([{ name: "default", hub: "running" }]);
+    const listing = new WorkspaceListing(list, 5000);
+    expect(await listing.get()).toEqual([{ name: "default", hub: "running" }]);
+    expect(await listing.get()).toEqual([{ name: "default", hub: "running" }]);
+    expect(list.mock.calls).toEqual([
+      [5000, true],
+      [5000, false],
+      [5000, false],
+    ]);
+  });
+
+  it("falls back to the last list without what its hubs listed then", async () => {
+    const detail = { threads: [{ id: "t" }], attention: [{ attn_id: "a" }] };
+    const list = vi
+      .fn<(timeout: number, detail: boolean) => Promise<unknown>>()
+      .mockResolvedValueOnce([
+        { name: "default", hub: "running", detail },
+        { name: "busy", hub: "busy", detail_error: "Workspace did not answer" },
+        { name: "off", hub: "stopped" },
+      ])
+      .mockRejectedValueOnce(new Error("Command timed out after 5000 ms"));
+    const listing = new WorkspaceListing(list, 5000);
+    expect((await listing.get())[0]).toMatchObject({ detail });
+    expect(await listing.get()).toEqual([
+      { name: "default", hub: "running" },
+      { name: "busy", hub: "busy" },
+      { name: "off", hub: "stopped" },
+    ]);
+    // Only a refusal of the flag itself turns it off.
+    expect(list.mock.calls.every(([, detail]) => detail)).toBe(true);
   });
 
   it("reports a failure when no listing has worked yet", async () => {
