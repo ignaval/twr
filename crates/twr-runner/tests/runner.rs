@@ -972,6 +972,47 @@ async fn a_new_box_generation_forgets_the_spool_and_numbers_from_one() {
     );
 }
 
+/// A welcome that has the runner forget its spool may still carry watermarks (of its new
+/// generation: a runner with another spool took it and delivered frames before it said
+/// `synced`, so the box is still marked forgotten). They apply after the forgetting: the
+/// thread's next frame is numbered above them, not from 1, so the hub takes it instead of
+/// dropping it as a duplicate.
+#[tokio::test]
+async fn a_forgetting_welcome_still_numbers_above_its_watermarks() {
+    let dir = tempfile::tempdir().unwrap();
+    let lbox = open_box(dir.path());
+    let r = lbox.handle_cmd("c1", spawn_op("t1", "one two")).await;
+    assert!(r.ok, "{r:?}");
+    wait_for("the turn spooled", || {
+        spooled(&lbox, "t1").iter().any(|f| f.1 == "turn.ended")
+    })
+    .await;
+    let hub = FakeHub::start().await;
+    {
+        let mut s = hub.state();
+        s.generation = Some("0123456789abcdef0123456789abcdef".into());
+        s.forgotten = true;
+        s.watermarks.insert("t1".into(), 50);
+    }
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("synced", |s| s.synced == 1).await;
+    let received = hub.state().received.clone();
+    assert!(received.is_empty(), "{received:?}");
+    assert!(lbox.spool().is_empty().unwrap());
+    assert_eq!(lbox.spool().next_rseq("t1").unwrap(), 51);
+    hub.cmd(
+        "c2",
+        Op::Stop {
+            thread: "t1".into(),
+            run: None,
+        },
+    );
+    hub.wait("the exit", |s| s.committed.iter().any(|c| c.2 == "exited"))
+        .await;
+    assert_eq!(hub.committed("t1"), [(51, "exited".to_string())]);
+    run.shutdown().await;
+}
+
 /// A test's box asks no login shell and probes no agent CLI, though a runner's own box
 /// options ask the user's.
 #[test]
