@@ -866,11 +866,8 @@ mod tests {
             Event::new("t1", 2, None, Source::Adapter("claude-code".into()), body)
         };
         let ext = serde_json::json!({"twr": {"pid": 1},
-            "claude": {"model": "claude-sonnet-4-5-20250929"}});
-        assert_eq!(
-            summary(&started(ext)),
-            "session=s1 model=claude-sonnet-4-5-20250929"
-        );
+            "claude": {"model": "claude-sonnet-5-5"}});
+        assert_eq!(summary(&started(ext)), "session=s1 model=claude-sonnet-5-5");
         assert_eq!(
             summary(&started(serde_json::json!({"twr": {"pid": 1}}))),
             "session=s1"

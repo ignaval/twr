@@ -1507,12 +1507,12 @@ mod tests {
         assert_eq!(parse("/model"), model(None, None, None));
         assert_eq!(parse("/model api"), model(Some("api"), None, None));
         assert_eq!(
-            parse("/model api claude-fable-5-1"),
-            model(Some("api"), Some("claude-fable-5-1"), None)
+            parse("/model api claude-fable-5-2"),
+            model(Some("api"), Some("claude-fable-5-2"), None)
         );
         assert_eq!(
-            parse("/model api claude-fable-5-1 --effort high"),
-            model(Some("api"), Some("claude-fable-5-1"), Some("high"))
+            parse("/model api claude-fable-5-2 --effort high"),
+            model(Some("api"), Some("claude-fable-5-2"), Some("high"))
         );
         assert_eq!(
             parse("/model api --effort high"),

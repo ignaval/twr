@@ -57,7 +57,7 @@ The mode goes into the log (`thread.mode_changed`). A thread that is idle restar
 
 ```sh
 twr model api                              # show api's model and reasoning effort
-twr model api claude-fable-5-1 --effort high
+twr model api claude-fable-5-2 --effort high
 twr model api --effort default             # back to the runtime's default effort
 twr model api gpt-6.1-sol --effort xhigh --runtime codex   # move api to Codex
 ```

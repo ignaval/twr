@@ -2460,7 +2460,7 @@ mod tests {
                 ..Default::default()
             }),
             EventBody::ThreadModelChanged(ThreadModelChanged {
-                model: Some("claude-fable-5-1".into()),
+                model: Some("claude-fable-5-2".into()),
                 effort: Some("high".into()),
                 previous_model: None,
                 previous_effort: Some("low".into()),
@@ -2930,7 +2930,7 @@ mod tests {
         assert!(body.is_control());
         // A cleared value is null; a log line without the effort fields reads them as `None`.
         let body = EventBody::ThreadModelChanged(ThreadModelChanged {
-            model: Some("claude-fable-5-1".into()),
+            model: Some("claude-fable-5-2".into()),
             effort: None,
             previous_model: None,
             previous_effort: Some("high".into()),
@@ -2941,7 +2941,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"kind":"thread.model_changed",
-                "data":{"model":"claude-fable-5-1","effort":null,"previous_model":null,
+                "data":{"model":"claude-fable-5-2","effort":null,"previous_model":null,
                     "previous_effort":"high","by":"orchestrator"}})
         );
         assert!(body.is_control());

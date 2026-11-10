@@ -87,7 +87,7 @@ impl OrchRt {
 }
 
 /// The model the test orchestrator runtime reports (`thread.started` `ext.claude.model`).
-const ORCH_MODEL: &str = "claude-haiku-4-5-20251001";
+const ORCH_MODEL: &str = "claude-haiku-5-5";
 
 /// `claude-code` for the tests: every session goes to the test through a channel.
 struct OrchAdapter(mpsc::UnboundedSender<OrchRt>);

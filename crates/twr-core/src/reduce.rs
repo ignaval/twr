@@ -3376,7 +3376,7 @@ mod tests {
         let evs = [
             created,
             s.started("sess-1"),
-            changed(&mut s, Some("claude-fable-5-1"), Some("high")),
+            changed(&mut s, Some("claude-fable-5-2"), Some("high")),
             s.event(EventBody::ThreadStopped(restart)),
             s.started("sess-1"),
             changed(&mut s, None, Some("low")),
@@ -3384,9 +3384,9 @@ mod tests {
         let want = [
             (Some("sonnet"), None),
             (Some("sonnet"), None),
-            (Some("claude-fable-5-1"), Some("high")),
-            (Some("claude-fable-5-1"), Some("high")),
-            (Some("claude-fable-5-1"), Some("high")),
+            (Some("claude-fable-5-2"), Some("high")),
+            (Some("claude-fable-5-2"), Some("high")),
+            (Some("claude-fable-5-2"), Some("high")),
             (None, Some("low")),
         ];
         for (n, (model, effort)) in want.iter().enumerate() {
@@ -4280,7 +4280,7 @@ mod tests {
                 &mut s,
                 "s1",
                 serde_json::json!({"twr": {"pid": 8},
-                    "claude": {"model": "claude-sonnet-4-5-20250929", "resumed": false}}),
+                    "claude": {"model": "claude-sonnet-5-5", "resumed": false}}),
             ),
             s.turn_started("go"),
             s.turn_ended(TurnResult::Completed),
@@ -4288,7 +4288,7 @@ mod tests {
             started(
                 &mut s,
                 "s1",
-                serde_json::json!({"claude": {"model": "claude-opus-4-1-20250805",
+                serde_json::json!({"claude": {"model": "claude-opus-5-5",
                     "resumed": true}}),
             ),
             // A hub-appended resume without a report keeps it.
@@ -4307,12 +4307,12 @@ mod tests {
         let want = [
             None,
             None,
-            Some("claude-sonnet-4-5-20250929"),
-            Some("claude-sonnet-4-5-20250929"),
-            Some("claude-sonnet-4-5-20250929"),
-            Some("claude-opus-4-1-20250805"),
-            Some("claude-opus-4-1-20250805"),
-            Some("claude-opus-4-1-20250805"),
+            Some("claude-sonnet-5-5"),
+            Some("claude-sonnet-5-5"),
+            Some("claude-sonnet-5-5"),
+            Some("claude-opus-5-5"),
+            Some("claude-opus-5-5"),
+            Some("claude-opus-5-5"),
             Some("gemini-2.5-pro"),
             None,
         ];
@@ -4324,12 +4324,12 @@ mod tests {
             assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         assert_eq!(live.shown_model(), Some("sonnet"));
-        live.actual_model = Some("claude-sonnet-4-5".into());
-        assert_eq!(live.shown_model(), Some("claude-sonnet-4-5"));
+        live.actual_model = Some("claude-sonnet-5-5".into());
+        assert_eq!(live.shown_model(), Some("claude-sonnet-5-5"));
         // Clients see both, under `model` and `model_actual`.
         let j = serde_json::to_value(&live).unwrap();
         assert_eq!(j["model"], "sonnet");
-        assert_eq!(j["model_actual"], "claude-sonnet-4-5");
+        assert_eq!(j["model_actual"], "claude-sonnet-5-5");
         let back: ThreadView = serde_json::from_value(j).unwrap();
         assert_eq!(back, live);
     }
@@ -4341,7 +4341,7 @@ mod tests {
     #[test]
     fn a_runtime_move_forgets_the_previous_runtimes_model() {
         let ext = |v: serde_json::Value| v.as_object().cloned();
-        let claude = || ext(serde_json::json!({"claude": {"model": "claude-opus-4-1"}}));
+        let claude = || ext(serde_json::json!({"claude": {"model": "claude-opus-5-5"}}));
         let mut s = ThreadScript::new("t1");
         let mut started = s.started("old");
         if let EventBody::ThreadStarted(p) = &mut started.body {
@@ -4377,8 +4377,8 @@ mod tests {
         ];
         let want = [
             None,
-            Some("claude-opus-4-1"),
-            Some("claude-opus-4-1"),
+            Some("claude-opus-5-5"),
+            Some("claude-opus-5-5"),
             None,
             None,
             None,
