@@ -1052,8 +1052,22 @@ async fn connection(
         };
         let id = req.id;
         if let Some(device) = &conn.device {
-            if twr_core::devices::Standing::of(hub.device_auth(), device).revoked() {
-                break;
+            // Judged by the records as they are now: a device revoked since is disconnected,
+            // and while they can't be read nothing is known (it may have been revoked or
+            // narrowed), so the request is refused, to be tried again, never granted by the
+            // scopes the device had at `hello`.
+            match twr_core::devices::Standing::of(hub.device_auth(), device) {
+                twr_core::devices::Standing::Current => {}
+                twr_core::devices::Standing::Revoked => break,
+                twr_core::devices::Standing::Unknown => {
+                    tracing::warn!(device = %device.id, method = %req.method, "cannot read the paired devices; refusing the device's request");
+                    let _ = send(
+                        &writer,
+                        &Response::err(id, crate::hub::devices_unreadable()),
+                    )
+                    .await;
+                    continue;
+                }
             }
             if !device.allows_params(&req.method, &req.params)
                 || matches!(
@@ -2576,7 +2590,7 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
         let device = hub
             .device_auth()
             .and_then(|a| a.authenticate(&token))
-            .map_err(|_| RpcError::new(codes::INTERNAL, "Paired devices could not be read"))?
+            .map_err(|_| crate::hub::devices_unreadable())?
             .ok_or_else(|| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
         conn.client = format!("device:{}", device.id);
         conn.device = Some(device);
@@ -3633,6 +3647,65 @@ mod tests {
         auth.revoke(&device.id).unwrap();
         assert!(auth.current(local.device.as_ref().unwrap()).revoked());
         assert!(auth.authenticate(&token).unwrap().is_none());
+    }
+
+    /// A device's request is judged by its records as they are when it comes: while they
+    /// can't be read it is refused with an error to try again (never served on the scopes the
+    /// device had at `hello`), the connection stays, and once they read again the device's
+    /// requests are served; a device revoked since is disconnected.
+    #[tokio::test]
+    async fn a_device_s_request_is_refused_while_its_records_cannot_be_read() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = HubOptions::new(dir.path().join("twr.db"), Config::default());
+        options.config_file = Some(dir.path().join("config.toml"));
+        let hub = Hub::open(options).await.unwrap();
+        let auth = hub.device_auth().unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let (device, token) = auth.pair(&code, "Test phone").unwrap();
+        let records = dir.path().join("mobile").join("devices.json");
+        let good = std::fs::read(&records).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let served = tokio::spawn(connection(
+            hub.clone(),
+            a,
+            "cli".into(),
+            Arc::new(SubCount::default()),
+        ));
+        let (r, mut w) = b.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut call = async |id: u64, method: &str, params: Value| -> Option<Value> {
+            let req = json!({"id": id, "method": method, "params": params});
+            w.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+            let line = lines.next_line().await.unwrap()?;
+            Some(serde_json::from_str(&line).unwrap())
+        };
+        let hi =
+            json!({"client": "mobile-test", "protocol": PROTOCOL_VERSION, "device_token": token});
+        let r = call(1, "hello", hi).await.unwrap();
+        assert_eq!(
+            r["result"]["client"],
+            format!("device:{}", device.id),
+            "{r}"
+        );
+        let r = call(2, "hub.info", Value::Null).await.unwrap();
+        assert!(r["result"].is_object(), "{r}");
+        std::fs::write(&records, b"{\"devices\": [").unwrap();
+        let r = call(3, "hub.info", Value::Null).await.unwrap();
+        assert_eq!(r["error"]["code"], codes::INTERNAL, "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Try again"),
+            "{r}"
+        );
+        std::fs::write(&records, &good).unwrap();
+        let r = call(4, "hub.info", Value::Null).await.unwrap();
+        assert!(r["result"].is_object(), "{r}");
+        auth.revoke(&device.id).unwrap();
+        assert_eq!(call(5, "hub.info", Value::Null).await, None);
+        served.await.unwrap();
     }
 
     /// A peer whose credentials cannot be read, or name no pid the hub can see, is no user: it

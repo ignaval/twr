@@ -597,3 +597,68 @@ async fn a_device_without_admin_cannot_confirm_a_mode_or_move_card() {
     drop(rt);
     hub.shutdown().await;
 }
+
+/// Device records the hub cannot read (damaged, or a file twr will not trust) grant a device
+/// nothing, its admin and terminal included, and say so as an error to try again, never as a
+/// scope it lacks; the local user is not affected, and once they read again the device's
+/// scopes hold as before. A hub with no device records at all serves the local user.
+#[tokio::test]
+async fn unreadable_device_records_refuse_a_device_and_never_grant() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    // No records yet: the local user names anything.
+    env.new_on(&hub, Some("pty:/bin/echo hi"), &tui())
+        .await
+        .unwrap();
+    let d = env.devices();
+    let api = env.worker(&hub, "api").await;
+    let records = env
+        .config_file()
+        .with_file_name("mobile")
+        .join("devices.json");
+    let good = std::fs::read(&records).unwrap();
+    let refused = |r: Result<_, RpcError>| {
+        let e: RpcError = r.map(|_: Value| ()).unwrap_err();
+        assert_eq!(e.code, codes::INTERNAL, "{e:?}");
+        assert!(e.message.contains("Try again"), "{e:?}");
+    };
+    let damaged = |path: &Path| std::fs::write(path, b"{\"devices\": [").unwrap();
+    let readable_by_others = |path: &Path| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    };
+    for spoil in [damaged, readable_by_others] {
+        std::fs::write(&records, &good).unwrap();
+        spoil(&records);
+        for device in [&d.terminal, &d.admin] {
+            refused(env.new_on(&hub, Some("pty:/bin/echo hi"), device).await);
+        }
+        let to = ModelRequest {
+            runtime: Some("claude-code"),
+            ..Default::default()
+        };
+        refused(
+            hub.set_thread_model(&api, to, &d.admin)
+                .await
+                .map(|_| Value::Null),
+        );
+        assert_eq!(hub.thread_view(&api).unwrap().runtime, "fake");
+        env.new_on(&hub, Some("pty:/bin/echo hi"), &tui())
+            .await
+            .unwrap();
+        std::fs::remove_file(&records).unwrap();
+    }
+    std::fs::write(&records, &good).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    env.new_on(&hub, Some("pty:/bin/echo hi"), &d.terminal)
+        .await
+        .unwrap();
+    unauthorized(
+        env.new_on(&hub, Some("pty:/bin/echo hi"), &d.operate).await,
+        "terminal",
+    );
+    hub.shutdown().await;
+}

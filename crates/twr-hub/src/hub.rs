@@ -201,6 +201,7 @@ pub(crate) use boxes::WeakHub;
 pub use checkpoint::{CHECKPOINT_EVERY, CHECKPOINT_TICK};
 pub use config_view::config_view;
 pub use context::{injection, CONTEXT_DIR, CONTEXT_FILE, INJECT_MAX, SET_MAX};
+pub(crate) use device_scope::devices_unreadable;
 pub use disk::{DISK_TICK, NOT_NOW as DISK_NOT_NOW, TRIM as DISK_TRIM};
 pub use git::{ParkOutcome, ResumeOutcome, GIT_TICK};
 pub use handoff::{
