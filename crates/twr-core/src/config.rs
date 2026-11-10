@@ -2938,7 +2938,7 @@ mod tests {
         for (rt, m) in [
             ("claude-code", "sonnet"),
             ("claude-code", "claude-opus-5-5"),
-            ("claude-code", "claude-fable-5-1"),
+            ("claude-code", "claude-fable-5-2"),
             ("claude-code", "default"),
             ("codex", "gpt-6.1-sol"),
             ("codex", "gpt-6-astra"),

@@ -304,7 +304,7 @@ pub struct SetModelParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     /// The model, as the thread's (new) runtime names it: an alias or a full id (Claude Code:
-    /// `fable`, `opus`, `sonnet` or e.g. `claude-fable-5-1`; Codex: OpenAI ids such as
+    /// `fable`, `opus`, `sonnet` or e.g. `claude-fable-5-2`; Codex: OpenAI ids such as
     /// `gpt-6.1-sol`). `default` returns to the runtime's default: with a new runtime always,
     /// otherwise only before the thread's first session (every runtime keeps a resumed
     /// session's model). Omit to keep the current one (with a new runtime: its default).
@@ -1251,11 +1251,11 @@ impl TwrMcp {
 
     #[tool(
         description = "Change a worker thread's model and/or reasoning effort, or move it to \
-                       another runtime, when the user asks (\"use Fable 5.1 on high for the \
+                       another runtime, when the user asks (\"use Fable 5.2 on high for the \
                        webapp thread\"): a model or effort change is applied directly, no \
                        confirm card; a move to another runtime asks the user first (below). \
                        `model` is the runtime's own model id or alias (Claude Code takes aliases \
-                       such as fable, opus or sonnet, or full ids such as claude-fable-5-1; \
+                       such as fable, opus or sonnet, or full ids such as claude-fable-5-2; \
                        Codex takes OpenAI ids such as gpt-6.1-sol); `effort` is one the runtime \
                        takes (Claude Code: low, medium, high, xhigh, max; Codex: minimal, low, \
                        medium, high, xhigh, max, ultra; Grok Build: low, medium, high, xhigh; \

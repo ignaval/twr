@@ -22,12 +22,12 @@ Threads, the sidebar on the left, lists every workspace, a card each, with its t
  THREADS                            ‹
 ▌_ default                      ⚠1 ●2
 ▌  working · waiting on you
-▌ ┌ beta ─────── sonnet-4-5 ─ manual ┐
+▌ ┌ beta ─────── sonnet-5-5 ─ manual ┐
 ▌ │waiting                           │
 ▌ │ PERMISSION  Bash: rm -rf target  │
 ▌ │1 allow  2 deny                   │
 ▌ └──────────────────────────────────┘
-▌ ┌ alpha ────── sonnet-4-5 ─ manual ┐
+▌ ┌ alpha ────── sonnet-5-5 ─ manual ┐
 ▌ │_ running                         │
 ▌ └──────────────────────────────────┘
 

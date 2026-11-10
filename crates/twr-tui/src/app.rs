@@ -2257,7 +2257,7 @@ fn setting(v: &Option<String>) -> &str {
 }
 
 /// The transcript notice for `thread.model_changed`: what changed, each from its value before,
-/// and who changed it: `model changed from sonnet to claude-fable-5-1, effort from default to
+/// and who changed it: `model changed from sonnet to claude-fable-5-2, effort from default to
 /// high (by the orchestrator)`, or `effort changed from default to high (by you)` when only
 /// the effort did. One that changes neither (the hub records none) reads `model kept at
 /// sonnet, effort at high`. A move to another runtime names the runtimes and the model and
@@ -2359,7 +2359,7 @@ fn moved_label(
 
 /// What `/model <thread>` says of a thread: its model and reasoning effort, and the model its
 /// runtime reports when that is another (an alias it resolved, or the one it still runs until
-/// it restarts): `api: model fable, effort high (runs claude-fable-5-1)`. A thread that moved
+/// it restarts): `api: model fable, effort high (runs claude-fable-5-2)`. A thread that moved
 /// to another runtime and has no session of it yet says so: `api: model default, effort
 /// default; its first codex session starts with its next turn` (or, moving back, that its
 /// earlier session resumes). With `account`, the account it runs on as the UI labels it
@@ -10420,7 +10420,7 @@ pub(crate) mod tests {
     }
 
     /// The `thread.created` (role orchestrator, runtime claude-code, model asked `opus`) and
-    /// `thread.started` (reporting `claude-opus-4-1-20250805`) of orchestrator `id`.
+    /// `thread.started` (reporting `claude-opus-5-5`) of orchestrator `id`.
     pub(crate) fn orch_events(o: &mut ThreadScript, id: &str) -> Vec<Event> {
         let mut created = o.created(id.trim_start_matches("t-"));
         if let EventBody::ThreadCreated(p) = &mut created.body {
@@ -10431,7 +10431,7 @@ pub(crate) mod tests {
         }
         let mut started = o.started("s-orch");
         if let EventBody::ThreadStarted(p) = &mut started.body {
-            p.ext = serde_json::json!({"claude": {"model": "claude-opus-4-1-20250805"}})
+            p.ext = serde_json::json!({"claude": {"model": "claude-opus-5-5"}})
                 .as_object()
                 .cloned();
         }
@@ -14221,13 +14221,13 @@ pub(crate) mod tests {
         for ((model, effort, previous_model, previous_effort, by), want) in [
             (
                 (
-                    Some("claude-fable-5-1"),
+                    Some("claude-fable-5-2"),
                     Some("high"),
                     Some("sonnet"),
                     None,
                     ChangedBy::Orchestrator,
                 ),
-                "model changed from sonnet to claude-fable-5-1, effort from default to high \
+                "model changed from sonnet to claude-fable-5-2, effort from default to high \
                  (by the orchestrator)",
             ),
             (
@@ -14479,22 +14479,22 @@ pub(crate) mod tests {
         assert!(st.picker_open());
         st.handle_key(key(KeyCode::Esc));
         assert!(!st.picker_open());
-        let actions = type_line(&mut st, "/model beta claude-fable-5-1 --effort high");
+        let actions = type_line(&mut st, "/model beta claude-fable-5-2 --effort high");
         assert_eq!(
             actions,
-            [set("t-beta", Some("claude-fable-5-1"), Some("high"))]
+            [set("t-beta", Some("claude-fable-5-2"), Some("high"))]
         );
         assert_eq!(
             crate::action_request(&actions[0]),
             Some((
                 "thread.set_model",
-                serde_json::json!({"thread": "t-beta", "model": "claude-fable-5-1",
+                serde_json::json!({"thread": "t-beta", "model": "claude-fable-5-2",
                                    "effort": "high"})
             ))
         );
         assert_eq!(
             st.view.status.as_deref(),
-            Some("beta → model claude-fable-5-1, effort high: waiting for the hub")
+            Some("beta → model claude-fable-5-2, effort high: waiting for the hub")
         );
         let actions = type_line(&mut st, "/model alpha opus");
         assert_eq!(actions, [set("t-alpha", Some("opus"), None)]);
@@ -14570,15 +14570,15 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_eq!(model_show(&t, None), "api: model fable, effort high");
-        t.actual_model = Some("claude-fable-5-1".into());
+        t.actual_model = Some("claude-fable-5-2".into());
         assert_eq!(
             model_show(&t, None),
-            "api: model fable, effort high (runs claude-fable-5-1)"
+            "api: model fable, effort high (runs claude-fable-5-2)"
         );
-        t.model = Some("claude-fable-5-1".into());
+        t.model = Some("claude-fable-5-2".into());
         assert_eq!(
             model_show(&t, None),
-            "api: model claude-fable-5-1, effort high"
+            "api: model claude-fable-5-2, effort high"
         );
         t.runtime = "codex".into();
         t.actual_model = None;
@@ -17904,7 +17904,7 @@ pub(crate) mod tests {
     /// the result with `thread_name`, then `thread`, so the cut result still names the thread.
     #[test]
     fn a_set_model_with_a_long_model_knows_its_thread_from_its_cut_result() {
-        let model = format!("claude-fable-5-1-{}", "x".repeat(150));
+        let model = format!("claude-fable-5-2-{}", "x".repeat(150));
         let cut = |s: &str, n: usize| format!("{}…", s.chars().take(n).collect::<String>());
         let input = cut(
             &format!(r#"{{"effort":"xhigh","model":"{model}","thread":"orbit-webapp-1"}}"#),

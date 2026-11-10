@@ -658,7 +658,7 @@ async fn hello_and_tool_list() {
     assert!(!set_model.contains("MODE RULE"), "{set_model}");
     for want in [
         "no confirm card",
-        "claude-fable-5-1",
+        "claude-fable-5-2",
         "alias",
         "xhigh",
         "ultra",
@@ -939,10 +939,10 @@ async fn each_tool_sends_the_expected_request() {
         ),
         (
             "set_model",
-            json!({ "thread": "orbit-webapp-1", "model": "claude-fable-5-1", "effort": "high" }),
+            json!({ "thread": "orbit-webapp-1", "model": "claude-fable-5-2", "effort": "high" }),
             vec![(
                 "thread.set_model",
-                json!({ "thread": "orbit-webapp-1", "model": "claude-fable-5-1",
+                json!({ "thread": "orbit-webapp-1", "model": "claude-fable-5-2",
                         "effort": "high" }),
             )],
         ),
@@ -1253,7 +1253,7 @@ async fn every_result_about_one_thread_leads_with_its_name() {
             "spawn_thread" => json!({ "project": "twr", "name": "w1", "prompt": "go" }),
             "send" => json!({ "thread": "w1", "prompt": "go on ".repeat(40) }),
             "set_mode" => json!({ "thread": "w1", "mode": "auto" }),
-            "set_model" => json!({ "thread": "w1", "model": "claude-fable-5-1", "effort": "high" }),
+            "set_model" => json!({ "thread": "w1", "model": "claude-fable-5-2", "effort": "high" }),
             "rename_thread" => json!({ "thread": "w1", "name": "notifications-design" }),
             "write_report" => json!({ "thread": "w1", "summary": "Done.", "grade": "success" }),
             "watch_thread" => json!({ "thread": "w1", "note": "send its branch on" }),

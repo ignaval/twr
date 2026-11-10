@@ -296,7 +296,7 @@ enum Cmd {
     },
     /// Show or set a thread's runtime, model and reasoning effort. With only the thread, shows
     /// them. The model is the runtime's own id or alias (Claude Code: `fable`, `opus`,
-    /// `sonnet`, or a full id such as `claude-fable-5-1`); `default` returns the model or the
+    /// `sonnet`, or a full id such as `claude-fable-5-2`); `default` returns the model or the
     /// effort to the runtime's default (once the thread has a session, only where a resumed
     /// session takes it: Claude Code's effort; the hub refuses the rest, except with
     /// `--runtime`). A running runtime finishes its turn first, then restarts on the same
@@ -10020,7 +10020,7 @@ mod tests {
             "twr",
             "model",
             "web",
-            "claude-fable-5-1",
+            "claude-fable-5-2",
             "--effort",
             "high",
         ])
@@ -10029,7 +10029,7 @@ mod tests {
             c.cmd,
             Some(Cmd::Model { ref thread, ref model, ref effort, runtime: None, account: None,
                 outside_pin: false })
-                if thread == "web" && model.as_deref() == Some("claude-fable-5-1")
+                if thread == "web" && model.as_deref() == Some("claude-fable-5-2")
                     && effort.as_deref() == Some("high")
         ));
         let c = Cli::try_parse_from(["twr", "model", "web"]).unwrap();
@@ -10436,8 +10436,8 @@ mod tests {
         );
         assert_eq!(m(json!("o5"), json!("o5")), " model o5");
         assert_eq!(
-            m(json!("haiku"), json!("claude-haiku-4-5-20251001")),
-            " model haiku (runs claude-haiku-4-5-20251001)"
+            m(json!("haiku"), json!("claude-haiku-5-5")),
+            " model haiku (runs claude-haiku-5-5)"
         );
         assert_eq!(
             m(Value::Null, json!("gpt-5-codex")),
@@ -10445,13 +10445,13 @@ mod tests {
         );
         let shown = orchestrator_text(&json!({
             "available": true, "runtime": "claude-code", "model": null,
-            "model_actual": "claude-sonnet-4-5-20250929", "thread": "01NEW",
+            "model_actual": "claude-sonnet-5-5", "thread": "01NEW",
             "name": "orchestrator", "status": "idle", "live": true,
             "configured": {"runtime": "claude-code", "model": null}, "runtimes": [],
         }));
         assert!(
             shown.starts_with(
-                "orchestrator: claude-code model claude-sonnet-4-5-20250929 (the runtime's \
+                "orchestrator: claude-code model claude-sonnet-5-5 (the runtime's \
                  default)\n"
             ),
             "{shown}"
@@ -10460,7 +10460,7 @@ mod tests {
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
             "started": false,
             "previous": {"thread": "01OLD", "runtime": "claude-code", "model": "haiku",
-                         "model_actual": "claude-haiku-4-5-20251001",
+                         "model_actual": "claude-haiku-5-5",
                          "stopping": false, "dropped_prompts": 0},
         }));
         assert!(
@@ -10470,15 +10470,15 @@ mod tests {
         assert!(
             switched.contains(
                 "The previous orchestrator (claude-code model haiku (runs \
-                 claude-haiku-4-5-20251001), 01OLD)"
+                 claude-haiku-5-5), 01OLD)"
             ),
             "{switched}"
         );
 
         let cell = |t: Value| model_cell(&t);
         assert_eq!(
-            cell(json!({"model": "opus", "model_actual": "claude-opus-4-1-20250805"})),
-            "claude-opus-4-1-20250805"
+            cell(json!({"model": "opus", "model_actual": "claude-opus-5-5"})),
+            "claude-opus-5-5"
         );
         assert_eq!(cell(json!({"model": "opus"})), "opus (requested)");
         assert_eq!(
@@ -10540,14 +10540,14 @@ mod tests {
     #[test]
     fn model_outcomes_and_show() {
         let r = |applies: &str| {
-            json!({"thread_name": "orbit-webapp-1", "model": "claude-fable-5-1",
+            json!({"thread_name": "orbit-webapp-1", "model": "claude-fable-5-2",
                    "effort": "high", "previous_model": null, "previous_effort": null,
                    "changed": true, "applies": applies})
         };
         assert_eq!(
             model_outcome("web", &r("after_turn")),
             "orbit-webapp-1: model (runtime default), effort (runtime default) -> model \
-             claude-fable-5-1, effort high (its runtime finishes the current turn, then \
+             claude-fable-5-2, effort high (its runtime finishes the current turn, then \
              restarts on the same session)"
         );
         assert!(model_outcome("web", &r("now")).ends_with("restarts on the same session now)"));
@@ -10562,10 +10562,10 @@ mod tests {
         assert_eq!(
             model_show(
                 &json!({"name": "api", "runtime": "claude-code", "model": null,
-                               "effort": "low", "model_actual": "claude-sonnet-5"})
+                               "effort": "low", "model_actual": "claude-sonnet-5-5"})
             ),
             "api: runtime claude-code, model (runtime default), effort low (runs \
-             claude-sonnet-5)"
+             claude-sonnet-5-5)"
         );
         assert_eq!(
             model_show(

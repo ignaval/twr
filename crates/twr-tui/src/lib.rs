@@ -6271,13 +6271,13 @@ mod tests {
         let set = |r: Value| result_status("thread.set_model", &r);
         assert_eq!(
             set(
-                json!({"thread": "t1", "thread_name": "web", "model": "claude-fable-5-1",
+                json!({"thread": "t1", "thread_name": "web", "model": "claude-fable-5-2",
                        "effort": "high", "previous_model": null, "previous_effort": null,
                        "changed": true, "applies": "after_turn"})
             )
             .as_deref(),
             Some(
-                "web now has model claude-fable-5-1, effort high; its runtime restarts with \
+                "web now has model claude-fable-5-2, effort high; its runtime restarts with \
                  them after the current turn"
             )
         );

@@ -217,10 +217,11 @@ pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 /// The models twr's pickers offer for Claude Code ([`crate::models`]): its aliases, each the
 /// latest model of its family, then the current models' full ids. Checked 2026-11-07 against
 /// Claude Code 2.1.318 (`--help`: "an alias for the latest model (e.g. 'fable', 'opus', or
-/// 'sonnet') or a model's full name"; each ran a turn). Claude Code takes other ids too (an
-/// older model's, a Bedrock or Vertex one), so the list is a choice, not a check; a name it
-/// doesn't know, such as `opus-5.5`, fails every turn ("There's an issue with the selected
-/// model").
+/// 'sonnet') or a model's full name"; each ran a turn; `claude-fable-5-2` replaced
+/// `claude-fable-5-1` on 2026-11-10, run on Claude Code 2.1.322). Claude Code takes other ids
+/// too (an older model's, a Bedrock or Vertex one), so the list is a choice, not a check; a
+/// name it doesn't know, such as `opus-5.5`, fails every turn ("There's an issue with the
+/// selected model").
 pub const MODELS: &[crate::KnownModel] = &[
     crate::KnownModel::new("opus", "the latest Opus"),
     crate::KnownModel::new("sonnet", "the latest Sonnet"),
@@ -230,7 +231,7 @@ pub const MODELS: &[crate::KnownModel] = &[
     crate::KnownModel::new("claude-opus-5-5", "Opus 5.5"),
     crate::KnownModel::new("claude-sonnet-5-5", "Sonnet 5.5"),
     crate::KnownModel::new("claude-haiku-5-5", "Haiku 5.5"),
-    crate::KnownModel::new("claude-fable-5-1", "Fable 5.1"),
+    crate::KnownModel::new("claude-fable-5-2", "Fable 5.2"),
 ];
 
 /// Why the `claude` a thread with environment `env` and working directory `cwd` would run (the

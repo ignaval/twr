@@ -2069,7 +2069,7 @@ fn card_border(block: Block<'static>, look: Look, color: Color) -> Block<'static
 
 /// The title of a card or tile `width` columns wide: at its left its project, dim, then its
 /// name in its color, bold (`twr · scroll-follow`, [`card_color`]) and `[pin]`; at its right who runs it ([`who_fit`]:
-/// `claude-code · sonnet-4-5`, with the box token of a remote box) and its permission mode,
+/// `claude-code · sonnet-5-5`, with the box token of a remote box) and its permission mode,
 /// apart (`─ auto`). Where they do not all fit, the project gives way first: cut with `…` to
 /// the room the rest leaves ([`title_project`]), then left out; then who runs it shortens
 /// (the runtime goes, the model is cut, then left out, then the account, then the box's name
@@ -3207,8 +3207,8 @@ fn box_word_style(word: BoxWord) -> Style {
 }
 
 /// A model id short enough for a card or tile: a trailing date (`-20250929`, `-2025-09-29`)
-/// and a leading `claude-` before the family name are dropped, so `claude-sonnet-4-5-20250929`
-/// reads `sonnet-4-5` (next to the `claude-code` runtime). The full id is in the transcript
+/// and a leading `claude-` before the family name are dropped, so `claude-haiku-4-5-20251001`
+/// reads `haiku-4-5` (next to the `claude-code` runtime). The full id is in the transcript
 /// header.
 pub fn short_model(id: &str) -> String {
     let id = id.trim();
@@ -3248,7 +3248,7 @@ fn effort_suffix(t: &ThreadView) -> String {
 
 /// The model a card or tile shows: the runtime's reported one, else the requested one
 /// (shortened, [`short_model`]), else `default model` (the runtime's own default, not reported
-/// yet or never); then the reasoning effort when the thread has one (`fable-5-1 · high`).
+/// yet or never); then the reasoning effort when the thread has one (`fable-5-2 · high`).
 pub fn model_label(t: &ThreadView) -> String {
     let model = t
         .shown_model()
@@ -14442,7 +14442,7 @@ mod tests {
     }
 
     /// `orch`: claude-code orchestrator, asked for `opus`, reports
-    /// `claude-opus-4-1-20250805`; `api`: codex, no model asked, reports `gpt-5-codex`; `web`:
+    /// `claude-opus-5-5`; `api`: codex, no model asked, reports `gpt-5-codex`; `web`:
     /// claude-code asked for `sonnet`, not started; `sh`: a pty thread, nothing asked or
     /// reported; `ops`: a claude-code worker like `orch`. `ops` is selected.
     fn model_threads() -> AppState {
@@ -14461,7 +14461,7 @@ mod tests {
                 "orch",
                 "claude-code",
                 Some("opus"),
-                Some(("claude", "claude-opus-4-1-20250805")),
+                Some(("claude", "claude-opus-5-5")),
             ),
             ("api", "codex", None, Some(("codex", "gpt-5-codex"))),
             ("web", "claude-code", Some("sonnet"), None),
@@ -14470,7 +14470,7 @@ mod tests {
                 "ops",
                 "claude-code",
                 Some("opus"),
-                Some(("claude", "claude-opus-4-1-20250805")),
+                Some(("claude", "claude-opus-5-5")),
             ),
         ];
         for (i, (name, runtime, model, reported)) in specs.into_iter().enumerate() {
@@ -14507,8 +14507,9 @@ mod tests {
     #[test]
     fn model_ids_are_shortened_but_recognizable() {
         for (id, short) in [
-            ("claude-sonnet-4-5-20250929", "sonnet-4-5"),
-            ("claude-opus-4-1-20250805", "opus-4-1"),
+            ("claude-haiku-4-5-20251001", "haiku-4-5"),
+            ("claude-opus-5-5", "opus-5-5"),
+            ("claude-fable-5-2", "fable-5-2"),
             ("claude-3-5-haiku-20241022", "claude-3-5-haiku"),
             ("gpt-5-codex", "gpt-5-codex"),
             ("gpt-4o-2024-08-06", "gpt-4o"),
@@ -14533,7 +14534,7 @@ mod tests {
         // orchestrator card.
         let lines = draw_panes(&mut st, 160, 40);
         for (id, want) in [
-            ("t-ops", "claude-code · opus-4-1"),
+            ("t-ops", "claude-code · opus-5-5"),
             ("t-api", "codex · gpt-5-codex"),
             ("t-web", "claude-code · sonnet"),
             ("t-sh", "pty · default model"),
@@ -14548,7 +14549,7 @@ mod tests {
         // The main pane is the orchestrator's: its full model id.
         let s = screen(&lines);
         assert!(
-            s.contains("ORCHESTRATOR  claude-code · claude-opus-4-1-20250805"),
+            s.contains("ORCHESTRATOR  claude-code · claude-opus-5-5"),
             "{s}"
         );
         // A dive names the thread, its runtime, model and mode, and how to get back.
@@ -14581,7 +14582,7 @@ mod tests {
         let rows: Vec<&str> = c.lines().collect();
         assert_eq!(
             rows[0],
-            "┏ ops ━━━━ opus-4-1 ━ manual ┓",
+            "┏ ops ━━━━ opus-5-5 ━ manual ┓",
             "{}",
             screen(&lines)
         );
@@ -14596,14 +14597,14 @@ mod tests {
         st.view.screen = Screen::Grid;
         let lines = draw(&st, 180, 30);
         let s = screen(&lines);
-        assert!(s.contains("claude-code · opus-4-1"), "{s}");
+        assert!(s.contains("claude-code · opus-5-5"), "{s}");
         assert!(s.contains("pty · default model"), "{s}");
         assert!(s.contains("grid · 4 threads"), "no orchestrator tile: {s}");
         let lines = draw(&st, 28, 30);
         let at = lines.iter().position(|l| l.starts_with("┏ ops ")).unwrap();
         assert_eq!(
             lines[at],
-            "┏ ops ━━ opus-4-1 ━ manual ┓",
+            "┏ ops ━━ opus-5-5 ━ manual ┓",
             "{}",
             screen(&lines)
         );
@@ -15139,7 +15140,7 @@ mod tests {
         }
         let mut started = j.started("s");
         if let EventBody::ThreadStarted(p) = &mut started.body {
-            p.ext = serde_json::json!({"claude": {"model": "claude-opus-4-1-20250805"}})
+            p.ext = serde_json::json!({"claude": {"model": "claude-opus-5-5"}})
                 .as_object()
                 .cloned();
         }
@@ -15190,7 +15191,7 @@ mod tests {
         }
         let lines = draw(&hidden, 160, 30);
         assert!(
-            screen(&lines).contains("talking to job  claude-code · opus-4-1 · mode manual"),
+            screen(&lines).contains("talking to job  claude-code · opus-5-5 · mode manual"),
             "{}",
             screen(&lines)
         );
@@ -15208,8 +15209,8 @@ mod tests {
         // (The claude-code titles have no room for the runtime beside the account and model
         // on a 44-column card.)
         for (id, want) in [
-            ("t-ops", "personal · opus-4-1"),
-            ("t-job", "work · opus-4-1"),
+            ("t-ops", "personal · opus-5-5"),
+            ("t-job", "work · opus-5-5"),
             ("t-api", "codex · gpt-5-codex"),
             ("t-web", "personal · sonnet"),
             ("t-sh", "pty · default model"),
@@ -15222,7 +15223,7 @@ mod tests {
         }
         let s = screen(&lines);
         assert!(
-            s.contains("ORCHESTRATOR  claude-code:personal · claude-opus-4-1-20250805"),
+            s.contains("ORCHESTRATOR  claude-code:personal · claude-opus-5-5"),
             "{s}"
         );
         // Narrow cards: the account without the runtime, then without the model. (40
@@ -15231,7 +15232,7 @@ mod tests {
         let lines = draw_panes(&mut st, 143, 24);
         assert_eq!(
             card_title(&st, &lines, "t-job"),
-            "┏ job ━━━━━━━ work · opus-4-1 ━ manual ┓",
+            "┏ job ━━━━━━━ work · opus-5-5 ━ manual ┓",
             "{}",
             screen(&lines)
         );
@@ -15246,8 +15247,8 @@ mod tests {
         // Tiles (too narrow for the runtime beside the account).
         st.view.screen = Screen::Grid;
         let s = screen(&draw(&st, 180, 30));
-        assert!(s.contains(" work · opus-4-1 "), "{s}");
-        assert!(s.contains(" personal · opus-4-1 "), "{s}");
+        assert!(s.contains(" work · opus-5-5 "), "{s}");
+        assert!(s.contains(" personal · opus-5-5 "), "{s}");
         assert!(s.contains(" personal · sonnet "), "{s}");
         assert!(s.contains(" codex · gpt-5-codex "), "{s}");
         // The dive header.
@@ -15257,7 +15258,7 @@ mod tests {
             main_title(&st, 160),
             (
                 "talking to job".into(),
-                "claude-code:work · opus-4-1 · mode manual · Esc returns to the orchestrator"
+                "claude-code:work · opus-5-5 · mode manual · Esc returns to the orchestrator"
                     .into()
             )
         );
@@ -15305,7 +15306,7 @@ mod tests {
             let lines = draw_panes(st, 160, 40);
             card_title(st, &lines, id)
         };
-        assert!(title(&mut st, "t-job").contains(" claude-code · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" claude-code · opus-5-5 "));
         let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
         let status = |hub: &mut ThreadScript, login| {
             hub.event(EventBody::AccountStatus(AccountStatus {
@@ -15328,26 +15329,26 @@ mod tests {
         assert!(st.send_accounts(), "the event meanwhile asks again");
         st.apply_result("account.list", &list(true));
         assert!(!st.send_accounts());
-        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
-        assert!(title(&mut st, "t-ops").contains(" personal · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-5-5 "));
+        assert!(title(&mut st, "t-ops").contains(" personal · opus-5-5 "));
         // An older hub's answer (null) keeps what was known; a failure keeps it too, and is
         // asked for again (`a_failed_account_list_is_asked_for_again_with_a_backoff`).
         let logout = status(&mut hub, twr_core::account::Login::LoggedOut);
         crate::app::tests::control(&mut st, &[logout]);
         assert!(st.send_accounts());
         st.apply_result("account.list", &Value::Null);
-        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-5-5 "));
         st.accounts_due = true;
         assert!(st.send_accounts());
         st.apply_result("account.list", &list(false));
-        assert!(title(&mut st, "t-job").contains(" claude-code · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" claude-code · opus-5-5 "));
         // Removed: `job` names its account, `ops` nothing.
         let mut removed = list(false);
         removed["runtimes"]["claude-code"]["accounts"][1]["removed"] = true.into();
         st.apply_result("account.list", &removed);
         let job = title(&mut st, "t-job");
-        assert!(job.contains(" work (removed) · opus-4-1 "), "{job}");
-        assert!(title(&mut st, "t-ops").contains(" claude-code · opus-4-1 "));
+        assert!(job.contains(" work (removed) · opus-5-5 "), "{job}");
+        assert!(title(&mut st, "t-ops").contains(" claude-code · opus-5-5 "));
         // The replay asks nothing.
         let mut st = account_threads(None);
         st.begin_catch_up(st.last_gseq + 5);
@@ -15396,14 +15397,14 @@ mod tests {
         assert_eq!(st.accounts_retry, None);
         // Answered: the labels are back, and nothing waits.
         st.accounts_answered(&list(true), secs(100));
-        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-5-5 "));
         assert_eq!((st.accounts_retry, st.accounts_failures), (None, 0));
         // A later failure keeps the labels and starts the backoff over (through
         // `apply_result`, as the calls' answers arrive).
         st.accounts_due = true;
         assert!(st.send_accounts());
         st.apply_result("account.list", &failed);
-        assert!(title(&mut st, "t-job").contains(" work · opus-4-1 "));
+        assert!(title(&mut st, "t-job").contains(" work · opus-5-5 "));
         assert_eq!(st.accounts_failures, 1);
         let at = st.accounts_retry.expect("a retry");
         assert!(at <= std::time::Instant::now() + std::time::Duration::from_secs(5));
@@ -15415,7 +15416,7 @@ mod tests {
         assert_eq!(old.accounts_retry, None);
         old.accounts_retry_due(secs(3600));
         assert!(!old.send_accounts());
-        assert!(title(&mut old, "t-job").contains(" claude-code · opus-4-1 "));
+        assert!(title(&mut old, "t-job").contains(" claude-code · opus-5-5 "));
     }
 
     /// Before an orchestrator exists, an `account.*` event asks for the orchestrator the hub
@@ -15928,7 +15929,7 @@ mod tests {
             "{d}"
         );
         let changed = s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
-            model: Some("claude-fable-5-1".into()),
+            model: Some("claude-fable-5-2".into()),
             effort: None,
             previous_model: Some("sonnet".into()),
             previous_effort: Some("high".into()),
@@ -15938,7 +15939,7 @@ mod tests {
         control(&mut st, &[changed]);
         let d = screen(&draw(&st, 160, 30));
         assert!(
-            d.contains("talking to web  claude-code · fable-5-1 · mode manual"),
+            d.contains("talking to web  claude-code · fable-5-2 · mode manual"),
             "{d}"
         );
     }
@@ -16308,7 +16309,7 @@ mod tests {
         let s = screen(&lines);
         assert!(
             view_part(&st, 160, &lines[0])
-                .starts_with(" ORCHESTRATOR  claude-code · claude-opus-4-1-20250805 "),
+                .starts_with(" ORCHESTRATOR  claude-code · claude-opus-5-5 "),
             "{s}"
         );
         for part in [
@@ -16335,7 +16336,7 @@ mod tests {
         let lines = draw_panes(&mut st, w, 30);
         let head = view_part(&st, w, &lines[0]);
         assert!(
-            head.contains(" ORCHESTRATOR  claude-code · claude-opus-4-1-20250805"),
+            head.contains(" ORCHESTRATOR  claude-code · claude-opus-5-5"),
             "{}",
             screen(&lines)
         );

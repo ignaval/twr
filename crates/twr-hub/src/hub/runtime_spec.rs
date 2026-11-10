@@ -691,7 +691,7 @@ mod tests {
             model_error("a\nb"),
             Some("model contains control characters")
         );
-        assert_eq!(model_error("claude-fable-5-1"), None);
+        assert_eq!(model_error("claude-fable-5-2"), None);
         // Only a local Claude Code thread is checked against its binary.
         let root = std::path::Path::new("/");
         assert_eq!(effort_refusal("codex", true, &[], root), None);

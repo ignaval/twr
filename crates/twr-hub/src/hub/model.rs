@@ -22,7 +22,7 @@
 //! in the error), and a local Claude Code whose `--help` does not list `--effort` refuses it
 //! up front ([`runtime_spec::effort_refusal`]). The model is the runtime's own id or alias,
 //! passed as given (Claude Code takes aliases such as `fable` or full ids such as
-//! `claude-fable-5-1`); the runtime says whether it knows it when it starts.
+//! `claude-fable-5-2`); the runtime says whether it knows it when it starts.
 //!
 //! With a `runtime` (`twr model --runtime`), the thread moves to that runtime too
 //! ([`super::switch`]): a new session of it starts with the thread's next turn, which carries a
