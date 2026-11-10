@@ -27,6 +27,8 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Right-click menus in the desktop app (Cut, Copy, Paste, Select All, Copy Link Address), and it remembers its window's size, position and maximized state.
 - `install.sh` and the release workflow can check a second, ECDSA P-256 signature of the checksums, for macOS's LibreSSL, which cannot verify Ed25519. It is off until a P-256 release key exists ([development.md](docs/development.md)).
 - CI type-checks, tests, format-checks and audits the desktop and mobile TypeScript on every pull request and builds the Android app; Dependabot now covers the clients' npm tree and the Android Gradle build.
+- Desktop: every package carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.html` (Rust crates and npm packages), opened from Help › Third-Party Licences.
+- The linked-runner service, and a Mac box daemon's launchd job, pass on proxy and CA bundle variables (`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` and the like), `CARGO_HOME`, `RUSTUP_HOME` and the agents' config directories (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`). A proxy URL's user name and password are removed, with a warning; give an authenticated proxy to agents with a paired hub's `[threads] env`. A linked runner's native worker build gets the proxy and CA bundle variables too, so cargo can fetch crates behind a proxy.
 
 ### Changed
 
@@ -50,6 +52,12 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Idle threads are git-snapshotted less often (30 s doubling to 5 minutes) until something happens on them: a hand edit in an idle thread's worktree can take up to 5 minutes to show on its card.
 - `twr voice setup` downloads the speech model from a pinned revision and checks its SHA-256 before using it.
 - The runner service's sockets live in a private per-user directory (`$XDG_RUNTIME_DIR`, macOS's per-user temporary directory) instead of a predictable `/tmp` path.
+- The hub writes each event's payload once, for the log and every subscriber; live stream lines are now the same bytes a replay reads (keys inside `data` sorted).
+- The gateway's `cli` call runs only `ws list [--json]` (read access) and `ws new <name>` (operate access) for a device, exactly so.
+- twr's HTTP clients use reqwest 0.13, the version its other dependencies already used, so the binary carries one HTTP stack. They keep rustls with ring and Mozilla's root certificates.
+- Desktop: the tray and badge summary reads the open workspace over its existing connection instead of starting another process every 15 seconds.
+- `install.sh --pair` says what to run when the release it installed has no `twr runner up`, instead of naming a version.
+- `SKILL.md` documents `summary.thread`, and its lists of the methods the orchestrator and agents may call match the hub's.
 
 ### Fixed
 
@@ -79,6 +87,10 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - The desktop's workspace list tolerates a slow hub and keeps the last good list, and its tray is rebuilt only when what it shows changes.
 - `install.sh --pair` says so when the installed release is too old to pair, instead of failing on an unknown command.
 - The committed mobile command catalog matches the CLI again (`twr voice setup` was missing).
+- Desktop (macOS): a hub the app starts no longer keeps the app's crash reporter running after the app quits.
+- Desktop (macOS): launches no longer copy and hash the bundled engines every time because of a manifest that signing made invalid.
+- The hints that bring a box to the hub's twr add `--allow-downgrade` when the box runs a newer twr, use the installer over a development build of the hub's version, and name both cases when the box's version isn't known.
+- The hub forgets, as it starts, runner watermarks of threads it no longer keeps.
 
 ### Security
 
@@ -91,6 +103,10 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - The mobile apps delete transcript exports after sharing them.
 - twr's built-in SQLite is 3.54.1 (rusqlite 0.41), which no longer returns uninitialized memory for a database opened with a `-wal` file of another page size (RUSTSEC-2026-0459, CVE-2026-119375).
 - `twr mcp` is built on rmcp 3.9, past RUSTSEC-2026-0457, RUSTSEC-2026-0461 and RUSTSEC-2026-0462. Those are in rmcp's Streamable HTTP and OAuth code, which twr doesn't use (`twr mcp` speaks MCP over stdio), so no released twr was exposed.
+- Desktop: a packaged app ignores `TWR_DESKTOP_TEST_AUTOMATION` unless it is a QA build, so no process can reopen remote debugging in an installed app by setting it.
+- Desktop: AppImage self-updates install only an image listed in the release's signed `desktop-sha256sums.txt`, checked with the twr release key; a release without that signature is offered as a manual download.
+- A paired device's requests are refused with an error to try again while the hub cannot read the device list, instead of being served on the access it had when it connected.
+- A runner whose inventory names something that is not a thread id is refused before the welcome.
 
 ## [0.3.0] - 2026-10-30
 
