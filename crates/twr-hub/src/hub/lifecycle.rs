@@ -1085,13 +1085,25 @@ impl Core {
     }
 
     /// Closes the `stale` threads (see [`stale_runtimes`]): as stopped when their stop was
-    /// asked for, else as crashed with the previous hub.
+    /// asked for, else as crashed with the previous hub, or with their box when the hub no
+    /// longer has it.
     fn close_stale_runtimes(&mut self, inner: &Inner, stale: Vec<Stale>) -> anyhow::Result<()> {
-        for (thread, _, _) in stale {
+        for (thread, _, box_name) in stale {
             // A runtime the user asked to stop closes as stopped (no error item, no retry).
             let exit = if self.rt.get(&thread).is_some_and(|r| r.stop_requested) {
                 tracing::info!(%thread, "closing a stopped thread whose runtime's exit the previous hub did not record");
                 Exit::Stopped
+            } else if box_name != LOCAL_BOX {
+                // A box the hub starts without (`twr box remove`): its runtime may well
+                // still run there, but nothing of it reaches this hub any more.
+                tracing::info!(%thread, box_name = %box_name, "closing a thread of a box the hub no longer has");
+                Exit::Crashed {
+                    exit_code: None,
+                    stderr_tail: format!(
+                        "box {box_name} is no longer one of this hub's boxes: what the thread's \
+                         runtime does there no longer reaches the hub"
+                    ),
+                }
             } else {
                 tracing::info!(%thread, "closing thread whose runtime died with the previous hub");
                 Exit::Crashed {
