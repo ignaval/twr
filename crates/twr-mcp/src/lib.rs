@@ -1143,7 +1143,8 @@ impl TwrMcp {
                           another: then pass `runtime` (claude-code, codex, grok-build or a \
                           [runtimes.<name>] preset the user configured; never a command line), \
                           with `model` and `effort` as that runtime names them. `project` is a \
-                          configured project name, an absolute path, or just the \
+                          configured project name, an absolute path (a git repository, or a \
+                          plain folder, where the thread works in the folder itself), or just the \
                           repository's folder name (`orbit-webapp`): the hub looks for a git \
                           repository of that name in the user's code folders (project_roots, \
                           one level deeper too) and, when exactly one matches, uses it and \

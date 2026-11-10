@@ -68,6 +68,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Typing in the message box no longer re-renders the whole desktop and mobile app on each key: the composer and its drafts moved into their own component, and the rest of the window renders again only when the box goes from empty to a draft or back.
 - Removing a box makes the hub forget what the box's runner sent it: at once for a dial-in box, and when the hub next starts without it for any other box (including boxes removed before this release). Added back under the same name, the box's runner forgets the frames it had not delivered and numbers its threads' frames from 1 again, instead of replaying old frames or failing on a gap at every connection ([runners.md](docs/runners.md)).
 - A runner from before this release is refused, with a message to update twr on the box, only while its box has been removed and added back and no updated runner has connected since. An SSH or container box's daemon, or a linked worker, is replaced with the hub's build then.
+- The orchestrator starts a thread in a folder outside git too, such as `~/notes`, where the thread works in the folder itself. It is still refused a folder or repository that is or holds the home folder, or holds or is inside twr's data, `TWR_HOME` or a credentials folder; add such a folder as a configured project to allow it.
 
 ### Fixed
 
@@ -122,7 +123,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Desktop: AppImage self-updates install only an image listed in the release's signed `desktop-sha256sums.txt`, checked with the twr release key; a release without that signature is offered as a manual download.
 - A paired device's requests are refused with an error to try again while the hub cannot read the device list, instead of being served on the access it had when it connected.
 - A runner whose inventory names something that is not a thread id is refused before the welcome.
-- A paired device without admin access starts threads only in a configured project, or in a folder or git repository that is not, and does not hold, the home folder and is clear of twr's data and credentials folders. A folder outside git is allowed, which the orchestrator is still refused.
+- A paired device without admin access starts threads only in a configured project, or in a folder or git repository that is not, and does not hold, the home folder and is clear of twr's data and credentials folders. A folder outside git is allowed.
 
 ## [0.3.0] - 2026-10-30
 

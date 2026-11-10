@@ -1058,8 +1058,8 @@ pub fn repo_refusal(repo: &Path, home: Option<&Path>, protected: &[PathBuf]) -> 
     )
 }
 
-/// Why a paired device without `admin` may not start a thread in `dir`, a folder outside git
-/// (resolved): by [`repo_refusal`]'s rule, for the folder itself.
+/// Why the orchestrator, or a paired device without `admin`, may not start a thread in `dir`,
+/// a folder outside git (resolved): by [`repo_refusal`]'s rule, for the folder itself.
 pub fn folder_refusal(dir: &Path, home: Option<&Path>, protected: &[PathBuf]) -> Option<String> {
     dir_refusal("folder", "", dir, home, protected)
 }
@@ -1111,10 +1111,10 @@ pub fn remote_repo_refusal(repo: &Path) -> Option<String> {
     remote_dir_refusal("repository", repo)
 }
 
-/// Why a paired device without `admin` may not start a thread in `dir`, a folder outside git
-/// on another box: by [`remote_repo_refusal`]'s rule, for the folder itself. A path with a
-/// `..` in it is refused too, since its shape then says nothing (a repository's path comes
-/// from git, resolved; this one is as the device gave it).
+/// Why the orchestrator, or a paired device without `admin`, may not start a thread in `dir`,
+/// a folder outside git on another box: by [`remote_repo_refusal`]'s rule, for the folder
+/// itself. A path with a `..` in it is refused too, since its shape then says nothing (a
+/// repository's path comes from git, resolved; this one is as it was given).
 pub fn remote_folder_refusal(dir: &Path) -> Option<String> {
     if dir
         .components()
