@@ -391,9 +391,26 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
     let mut power = crate::power::Power::default();
     let shutdown = twr_runner::client::shutdown_signal();
     tokio::pin!(shutdown);
+    // The twr home this service serves, and the machine state in it: when either has been
+    // gone long enough (deleted without `twr runner stop`), nothing can use this service
+    // again, and it ends (`twr_runner::gone`).
+    let anchors: Arc<Vec<twr_runner::gone::Anchor>> = Arc::new(
+        [service.paths.data_dir.as_path(), machine.dir.as_path()]
+            .iter()
+            .filter_map(|p| twr_runner::gone::Anchor::of(p).ok())
+            .collect(),
+    );
+    let home_gone = home_gone(anchors.clone());
+    tokio::pin!(home_gone);
+    let mut gone = false;
     loop {
         tokio::select! {
             _=service.stopping.notified()=>break,
+            ()=&mut home_gone=>{
+                tracing::warn!("the twr home this runner service serves is gone: stopping, and taking its launchd job away");
+                gone=true;
+                break;
+            },
             _=maintenance.tick()=>{
                 // A runtime directory removed at logout takes the socket with it: no client
                 // could reach this service, and its lifetime lock would keep a new one from
@@ -407,16 +424,20 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
                 }
                 service.expire_pairing().await;
                 service.retire_workspaces().await;
-                if std::time::Instant::now()>=next_prune {next_prune=std::time::Instant::now()+Duration::from_secs(6*60*60);let s=service.clone();service.spawn(async move {let _=s.control(Request::Prune{aggressive:false}).await;});}
+                if std::time::Instant::now()>=next_prune {next_prune=std::time::Instant::now()+Duration::from_secs(6*60*60);let s=service.clone();let a=anchors.clone();service.spawn(async move {if home_there(&a).await {let _=s.control(Request::Prune{aggressive:false}).await;}});}
                 if std::time::Instant::now()>=next_retirement {
                     next_retirement=std::time::Instant::now()+Duration::from_secs(60);
-                    let s=service.clone(); service.spawn(async move { s.retry_retirements().await; });
+                    let s=service.clone(); let a=anchors.clone(); service.spawn(async move { if home_there(&a).await { s.retry_retirements().await; } });
                 }
-                power.update(&machine.dir.join("runner/leases"),service.state.lock().await.allow_sleep);
+                // (Its lease files are made where they are missing: not in a home that is gone,
+                // nor on a volume's mount point while it is not mounted.)
+                if anchors.iter().all(|a| twr_runner::gone::look(a)==twr_runner::gone::Seen::There) {
+                    power.update(&machine.dir.join("runner/leases"),service.state.lock().await.allow_sleep);
+                }
                 let requested=service.update_requested.swap(false,std::sync::atomic::Ordering::AcqRel);
                 if requested || std::time::Instant::now()>=next_update {
                     next_update=std::time::Instant::now()+Duration::from_secs(6*60*60);
-                    if service.state.lock().await.owners.values().any(|o|o.committed&&!o.revoked){let s=service.clone();service.spawn(async move {let _=s.check_update().await;});}
+                    if service.state.lock().await.owners.values().any(|o|o.committed&&!o.revoked){let s=service.clone();let a=anchors.clone();service.spawn(async move {if home_there(&a).await {let _=s.check_update().await;}});}
                 }
             },
             _=&mut shutdown=>break,
@@ -446,6 +467,11 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
     }
     let _ = std::fs::remove_file(&machine.socket);
     drop(lock);
+    if gone {
+        // No update for a home that is gone; nothing restarts this service either.
+        twr_runner::gone::unregister_own_job();
+        return Ok(());
+    }
     if let Some(candidate) = service.upgrade.lock().await.take() {
         // Worker daemons are independent. Maintenance closes service streams, then the
         // bootstrapper performs readiness checks and rolls back to this executable on failure.
@@ -455,6 +481,30 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
         }
     }
     Ok(())
+}
+/// Resolves once one of `anchors` (the twr home a service serves, and its machine state) has
+/// been gone long enough ([`twr_runner::gone`]); never when they could not both be anchored at
+/// start.
+async fn home_gone(anchors: Arc<Vec<twr_runner::gone::Anchor>>) {
+    use twr_runner::gone::until_gone;
+    let [root, machine] = anchors.as_slice() else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        () = until_gone(root.clone()) => {}
+        () = until_gone(machine.clone()) => {}
+    }
+}
+/// Whether every one of `anchors` is there now: the periodic upkeep that writes in the home
+/// (prunes, retirements) runs only then, so a home that is gone is not made again, nor a
+/// volume's mount point written to while it is not mounted.
+async fn home_there(anchors: &[twr_runner::gone::Anchor]) -> bool {
+    for a in anchors {
+        if twr_runner::gone::look_bounded(a).await != twr_runner::gone::Seen::There {
+            return false;
+        }
+    }
+    true
 }
 impl Service {
     fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {

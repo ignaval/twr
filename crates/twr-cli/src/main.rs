@@ -4742,9 +4742,10 @@ async fn run_runner(
 /// `twr runner --daemon`: an SSH box's daemon ([`twr_runner::daemon`]), started by its relay
 /// with every path as an argument, its stdout and stderr `/dev/null`: it logs to `log`
 /// (appended, 0600, in its private data directory), its failure included, and runs until a
-/// `stop` request, SIGINT or SIGTERM. Those signals are listened for from the start: one that
-/// comes while it starts (its relay stopped meanwhile, say) stops it before it binds its socket
-/// ([`twr_runner::run`]).
+/// `stop` request, SIGINT or SIGTERM (a linked runner's worker also until its grant is revoked
+/// or its twr home is gone: [`twr_runner::managed::revoked`]). Those signals are listened for
+/// from the start: one that comes while it starts (its relay stopped meanwhile, say) stops it
+/// before it binds its socket ([`twr_runner::run`]).
 async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::Result<()> {
     let shutdown = twr_runner::Shutdown::install();
     if let Some(dir) = log.parent() {
@@ -4769,6 +4770,11 @@ async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::
     let r = twr_runner::run(opts, shutdown).await;
     if let Err(e) = &r {
         tracing::error!(error = %format!("{e:#}"), "the box daemon failed");
+    }
+    // A linked runner's worker whose twr home is gone: no relay will ever start or boot out
+    // its launchd job again, so it takes the job away itself.
+    if twr_runner::managed::root_gone() {
+        twr_runner::gone::unregister_own_job();
     }
     r
 }
