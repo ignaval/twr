@@ -197,7 +197,11 @@ it("retains an engine used by a live OS process and prunes it after exit", async
       mkdirSync(dir);
       utimesSync(dir, new Date(i * 1000), new Date(i * 1000));
     });
-    const executable = join(dirs[0], "twr");
+    // The copy keeps the name sleep: on some Linux systems /bin/sleep is a
+    // multi-call binary that picks its program by the name of its own file,
+    // and under any other name it exits at once. Only the engine's directory
+    // matters to the cleanup.
+    const executable = join(dirs[0], "sleep");
     copyFileSync("/bin/sleep", executable);
     chmodSync(executable, 0o755);
     // Current macOS can kill a copied platform binary after spawn. Give the
@@ -209,9 +213,7 @@ it("retains an engine used by a live OS process and prunes it after exit", async
         { stdio: "ignore" },
       );
     utimesSync(dirs[0], new Date(0), new Date(0));
-    // On some Linux systems /bin/sleep is a multi-call binary that picks its
-    // program by the name it is run as, so keep that name while the file is twr.
-    process = spawn(executable, ["60"], { stdio: "ignore", argv0: "sleep" });
+    process = spawn(executable, ["60"], { stdio: "ignore" });
     const exited = once(process, "exit");
     await once(process, "spawn");
     await new Promise((resolve) => setTimeout(resolve, 100));
