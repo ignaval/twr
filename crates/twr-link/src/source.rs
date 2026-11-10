@@ -406,10 +406,18 @@ mod tests {
         );
         child.kill().await?;
         child.wait().await?;
-        assert_eq!(
-            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        // Free once the child is gone. A process another test forked while the lease was open
+        // shares it until that process execs, which can take a moment: wait for that, for less
+        // than `unrelated` lives, which would hold it all along had it inherited the lease.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lease outlived the build child: {}",
+                std::io::Error::last_os_error()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(unrelated.try_wait()?.is_none());
         unrelated.kill().await?;
         unrelated.wait().await?;
