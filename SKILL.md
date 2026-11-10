@@ -1004,7 +1004,11 @@ Details:
   append) nothing is recorded, the item is still listed for the box while it is offline, and
   its thread's agent events are not archived as a purged thread's (a known limitation). A thread whose latest deletion's item is purged is not restorable, and one comes back
   only from the item of its latest deletion (`trash.restore` refuses another, `conflict`); its
-  agent events are archived (The log, below).
+  agent events are archived (The log, below). Of such a thread the fold keeps who it was alone
+  (id, name, former names, aliases, role, color, box, creation time), so older text that names
+  it still reads with its name and color; the rest of its view (turns, reports, tasks, usage,
+  git) goes, from a control snapshot and checkpoints too. A deleted thread that may still come
+  back keeps its whole view.
 - **The log** (`[log]`): agent events the hub no longer reads move from `twr.db` to
   `archive.db` beside it (0600; `archive = false`: deleted), with the blobs no row left in
   `twr.db` reaches: all of a purged deleted thread's, and of any other thread those of each

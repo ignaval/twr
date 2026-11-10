@@ -1622,8 +1622,10 @@ struct Core {
     /// before it, [`Core::event_time`]).
     last_ts: HashMap<String, DateTime<Utc>>,
     gseq: u64,
-    /// Every attn_id ever raised (to tell "already resolved" from "unknown").
-    known_attn: HashSet<String>,
+    /// Every attn_id ever raised (to tell "already resolved" from "unknown"), but those of a
+    /// thread purged from the trash, in its namespace (`<thread>:<id>`), which no one answers
+    /// again.
+    known_attn: std::collections::BTreeSet<String>,
     /// Open attention items raised by an adapter (answers are forwarded to it), with the
     /// turn of the event that raised it (last) ([`AdapterScope`]).
     adapter_attn: HashMap<String, Option<u64>>,

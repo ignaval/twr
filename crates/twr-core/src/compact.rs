@@ -54,9 +54,10 @@
 //! [`AttentionStack`], [`crate::usage::UsageView`] and [`crate::notify::Policy`] gives the
 //! state folding every item gives, except [`ThreadView::last_activity`],
 //! [`ThreadView::worked_at`] and [`ThreadView::last_seq`], which no client reads from the
-//! control stream, and, of a purged thread, its deleted view beyond who it was (id, name,
-//! aliases, former names, role, color, creation time) and the notifier's report and reply keys
-//! and reports known of it, which nothing reads again. (So past the notifier's bound on the
+//! control stream, and, of a purged thread, the notifier's report and reply keys and reports
+//! known of it, which nothing reads again. (A purged thread's deleted view is who it was alone
+//! in both, [`Registry`] keeping no more of it once its `trash.purged` is folded, which is
+//! kept.) (So past the notifier's bound on the
 //! keys it remembers, it may still remember older keys of other threads that a full fold let
 //! go: no key it gives can come again, so what it remembers of them changes nothing it gives.) A client that folded the items up to
 //! `since` this way gets the same after `(since, head]`. The tests check it on made-up logs
