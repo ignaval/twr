@@ -33,8 +33,10 @@
 //! or none when they no longer give it one (`twr box token --rotate`, `twr box remove`), and
 //! drops its runner connection when that changed it: rotation and revocation are live. When
 //! the files no longer have the box at all, it also forgets the box's runner watermarks
-//! (`Core::forget_box`; a box the hub dials, or a linked one, is forgotten when the hub next
-//! starts without it, `Core::sweep_runner_acks`). The
+//! (`Core::forget_box`), and takes it out of the removal record `twr box remove` named it in
+//! (`twr_core::config::BoxesFile::removed`); a box the hub dials, or a linked one, is
+//! forgotten when the hub next starts without it and finds it in that record
+//! (`Core::sweep_runner_acks`). The
 //! four that read the files (`box.add`, `box.install`, `box.projects`, `box.token`) run one
 //! at a time, each from its read to its change (`Inner::box_files_lock`): a removal's
 //! `box.token` never runs between a `box.add`'s read of the removed box and its registration.
@@ -665,8 +667,9 @@ impl Hub {
                 ),
             ));
         }
+        let read = file.clone();
         let config = tokio::task::spawn_blocking(move || {
-            Config::load_with_boxes(&file).map_err(|e| error_without_values(&e))
+            Config::load_with_boxes(&read).map_err(|e| error_without_values(&e))
         })
         .await
         .map_err(|e| rpc(codes::INTERNAL, format!("reading the config: {e}")))?
@@ -696,10 +699,22 @@ impl Hub {
         // Gone from the files (`twr box remove`): its runner is refused from now on, so its
         // watermarks go, with a new generation that has the runner forget its spool should the
         // box be added again (`Core::forget_box`). A failure leaves them; the next hub start
-        // forgets them (`Core::sweep_runner_acks`).
+        // forgets them, as the removal record names the box (`Core::sweep_runner_acks`). Once
+        // forgotten, durably, the record is done with it; a name left behind forgets nothing
+        // twice (the box is forgotten already).
         if removed {
-            if let Err(e) = self.inner.core().forget_box(name) {
-                tracing::warn!(box_name = %name, error = %format!("{e:#}"), "cannot forget the removed box's runner watermarks");
+            let forgotten = {
+                let mut core = self.inner.core();
+                core.forget_box(name).and_then(|_| core.store.sync())
+            };
+            match forgotten {
+                Ok(()) => {
+                    let names = std::iter::once(name.to_string()).collect();
+                    super::lifecycle::settle_removed(&file, &names).await;
+                }
+                Err(e) => {
+                    tracing::warn!(box_name = %name, error = %format!("{e:#}"), "cannot forget the removed box's runner watermarks");
+                }
             }
         }
         if let Some(c) = self.inner.boxes_mut().configs.get_mut(name) {

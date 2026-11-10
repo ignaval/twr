@@ -93,12 +93,24 @@ impl Hub {
         )
         .unwrap_or(chrono::Duration::MAX);
         twr_core::trace::mark("hub: log replayed");
-        // Before any runner connects: the watermarks of boxes the hub starts without (removed)
-        // and of threads it keeps none of go (`Core::sweep_runner_acks`). A failure leaves
-        // what it did not get to, as it was.
+        // Before any runner connects: the watermarks of boxes removed (`twr box remove`
+        // recorded it) that the hub starts without, and of threads it keeps none of, go
+        // (`Core::sweep_runner_acks`). A failure leaves what it did not get to, as it was.
         let boxes = opts.config.boxes.keys().cloned().collect();
-        match core.sweep_runner_acks(&boxes) {
+        match core.sweep_runner_acks(&boxes, &opts.removed_boxes) {
             Ok(s) => {
+                // Durable, then out of the removal record (the `default` workspace's hub,
+                // whose boxes they are): a crash in between forgets nothing twice, as a box
+                // forgotten already is left as it is.
+                if !s.settled.is_empty() && opts.workspace.is_none() {
+                    match (core.store.sync(), &opts.config_file) {
+                        (Ok(()), Some(file)) => settle_removed(file, &s.settled).await,
+                        (Err(e), _) => {
+                            tracing::warn!(error = %format!("{e:#}"), "cannot sync the forgotten boxes; their names stay in the removal record")
+                        }
+                        (Ok(()), None) => {}
+                    }
+                }
                 if s.boxes > 0 {
                     tracing::info!(
                         boxes = s.boxes,
@@ -875,6 +887,26 @@ fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
 /// A thread whose runtime may have outlived the previous hub: (thread, the recorded process,
 /// its box).
 type Stale = (String, Option<StaleProcess>, String);
+
+/// Takes `names` out of the removal record next to the `boxes.toml` of `config_file`
+/// ([`twr_core::config::BoxesFile::removed`]), under that file's lock: the hub forgot those
+/// boxes (durably), or has them configured again. A failure is a warning: a name left there
+/// forgets nothing twice (the box is forgotten already) and goes at a later start.
+pub(super) async fn settle_removed(config_file: &Path, names: &std::collections::BTreeSet<String>) {
+    use twr_core::config::BoxesFile;
+    let file = BoxesFile::path_for(config_file);
+    let names = names.clone();
+    let done = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _lock = BoxesFile::lock(&file)?;
+        BoxesFile::unmark_removed(&file, names.iter().map(String::as_str))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    if let Err(e) = done {
+        tracing::warn!(error = %format!("{e:#}"), "cannot take forgotten boxes out of the removal record");
+    }
+}
 
 /// Threads whose log shows a live runtime, or a stop request whose closing sequence is
 /// not recorded: (thread, the recorded process, its box).

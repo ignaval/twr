@@ -6463,16 +6463,24 @@ async fn a_remote_attach_refuses_a_session_id_that_reads_as_an_option() {
 /// next to a `config.toml` it reads boxes from (`box.add`, `box.token`): the hub, and the
 /// `boxes.toml`.
 async fn hub_with_boxes_file(dir: &Path, token: &str) -> (TestHub, PathBuf) {
+    hub_with_files(dir, &format!("[boxes.{BOX}]\ntoken = \"{token}\"\n"), &[]).await
+}
+
+/// A hub reading its config from files in `dir/cfg`: a `config.toml`, `boxes` as its
+/// `boxes.toml`, and `removed` as the removal record `twr hub` reads with them (and the boxes
+/// file's path).
+async fn hub_with_files(dir: &Path, boxes: &str, removed: &[&str]) -> (TestHub, PathBuf) {
     let cfg_dir = dir.join("cfg");
     std::fs::create_dir_all(&cfg_dir).unwrap();
     let config_file = cfg_dir.join("config.toml");
     let boxes_file = cfg_dir.join("boxes.toml");
     std::fs::write(&config_file, "default_runtime = \"fake\"\n").unwrap();
-    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{token}\"\n")).unwrap();
+    std::fs::write(&boxes_file, boxes).unwrap();
     let mut cfg = Config::load_with_boxes(&config_file).unwrap();
     cfg.hub.listen = Some("127.0.0.1:0".into());
     let mut opts = hub_opts(dir, cfg);
     opts.config_file = Some(config_file);
+    opts.removed_boxes = removed.iter().map(|b| b.to_string()).collect();
     (TestHub::start_opts(opts).await, boxes_file)
 }
 
@@ -6847,9 +6855,10 @@ async fn a_box_add_that_read_a_removed_box_does_not_bring_its_token_back() {
 // Removing a box: its watermarks go, with a new generation (`runner_boxes`)
 // ------------------------------------------------------------------------------------------
 
-/// A box the hub starts without (removed while its runner was offline, with a frame still
-/// spooled and the thread's numbering gone on past the hub's watermark) is forgotten as the
-/// hub opens: its watermarks go, and it gets a new generation, marked forgotten. Added again
+/// A box the hub starts without, which the removal record names (removed with `twr box
+/// remove` while its runner was offline, with a frame still spooled and the thread's
+/// numbering gone on past the hub's watermark), is forgotten as the hub opens: its watermarks
+/// go, and it gets a new generation, marked forgotten. Added again
 /// under the same name, its runner (the same data) forgets that frame at its welcome and
 /// numbers the thread's frames from 1: no gap, no loop, nothing old recorded, the box's
 /// generation no longer forgotten, and the thread takes a new turn.
@@ -6888,10 +6897,13 @@ async fn a_box_removed_while_its_runner_is_offline_is_clean_once_added_again() {
     wait_for("the exit spooled", || !lbox.spool().is_empty().unwrap()).await;
     assert!(lbox.spool().next_rseq(&t).unwrap() > w + 1);
 
-    // The hub starts without the box (`twr box remove`): forgotten.
+    // The hub starts without the box, which the removal record names (`twr box remove`):
+    // forgotten.
     let mut without = config(None);
     without.boxes.clear();
-    let h = TestHub::start(dir.path(), without).await;
+    let mut opts = hub_opts(dir.path(), without);
+    opts.removed_boxes = [BOX.to_string()].into();
+    let h = TestHub::start_opts(opts).await;
     proxy.st().upstream = h.url.clone();
     assert!(h.hub().runner_watermarks(BOX).unwrap().is_empty());
     let (g2, forgotten) = h.hub().runner_generation(BOX).unwrap().unwrap();
@@ -6945,12 +6957,85 @@ async fn a_box_removed_while_its_runner_is_offline_is_clean_once_added_again() {
     h.shutdown().await;
 }
 
+/// A box that merely is not in the config a hub starts with (an empty or missing config
+/// file, another `XDG_CONFIG_HOME`, a box commented out by hand), with no removal record
+/// naming it, is not forgotten: its watermarks and generation stay as they were. Once the
+/// hub has it again, its runner (offline meanwhile, with a frame spooled after the watermark)
+/// keeps its spool and delivers that frame: nothing is lost, and nothing is taken for a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_missing_from_the_config_without_a_removal_record_is_not_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let proxy = Proxy::start(&h.url).await;
+    let rdir = dir.path().join("r");
+    let lbox = open_box(&rdir);
+    let runner = Runner::start(runner_opts(&proxy.url, &rdir), lbox.clone());
+    h.online().await;
+    let t = h.new_thread(&project(dir.path()), "kept").await;
+    let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+    h.send(&t, "one two");
+    until(&mut sub, |e| e.kind() == "report.ready").await;
+    drop(sub);
+    let before = h.hub().runner_watermarks(BOX).unwrap();
+    let (g1, _) = h.hub().runner_generation(BOX).unwrap().unwrap();
+    wait_for("acks applied", || lbox.spool().is_empty().unwrap()).await;
+    h.shutdown().await;
+
+    // Offline: the session ends on the box, its exit spooled after the watermark.
+    let r = lbox
+        .handle_cmd(
+            "offline-stop",
+            Op::Stop {
+                thread: t.clone(),
+                run: None,
+            },
+        )
+        .await;
+    assert!(r.ok, "{r:?}");
+    wait_for("the exit spooled", || !lbox.spool().is_empty().unwrap()).await;
+    let exit_rseq = lbox.spool().next_rseq(&t).unwrap() - 1;
+
+    // A hub started with an empty config, and no removal record: nothing forgotten.
+    let mut empty = Config::default();
+    empty.hub.listen = Some("127.0.0.1:0".into());
+    let h = TestHub::start(dir.path(), empty).await;
+    proxy.st().upstream = h.url.clone();
+    assert_eq!(h.hub().runner_watermarks(BOX).unwrap(), before);
+    assert_eq!(
+        h.hub().runner_generation(BOX).unwrap(),
+        Some((g1.clone(), false))
+    );
+    h.shutdown().await;
+
+    // With the box again: the spooled exit is delivered, on the same generation.
+    let h = TestHub::start(dir.path(), config(None)).await;
+    proxy.st().upstream = h.url.clone();
+    h.online().await;
+    wait_for("the spooled exit delivered", || {
+        lbox.spool().is_empty().unwrap()
+            && h.hub().runner_watermarks(BOX).unwrap().get(&t) == Some(&exit_rseq)
+    })
+    .await;
+    assert_eq!(lbox.spool().generation().unwrap(), Some(g1.clone()));
+    assert_eq!(h.hub().runner_generation(BOX).unwrap(), Some((g1, false)));
+    let hub_log = log(h.hub(), HUB_THREAD);
+    assert_eq!(
+        count(&hub_log, "runner.connected"),
+        2,
+        "no connection closed on a gap"
+    );
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
 /// `twr box remove` of a token box (`box.token` finds it gone from the files) forgets its
 /// watermarks at once, with a new generation. Added again while the hub runs, with the same
 /// token, its runner, which went on running the thread's session and spooled a turn the hub
-/// never asked for meanwhile, forgets that turn's frames and numbers from 1: the hub's session
-/// goes on, the turn it was not asked for is never recorded, and the next turn is recorded
-/// once.
+/// never asked for meanwhile, forgets that turn's frames and numbers from 1. The removal
+/// ends the session as far as the hub is concerned: the hub closes it (a `thread.crashed`
+/// saying the box was removed and its runner forgot what it had not delivered) and the runner
+/// stops it, the turn the hub was not asked for is never recorded, and the next prompt starts
+/// the runtime again on its session, a turn recorded once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_box_removed_and_added_again_while_the_hub_runs_numbers_from_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -7012,8 +7097,18 @@ async fn a_box_removed_and_added_again_while_the_hub_runs_numbers_from_one() {
     let all = log(h.hub(), &t);
     assert!(all.iter().all(|e| e.turn != Some(99)), "{:?}", kinds(&all));
     assert_eq!(deltas(&all), ["one", "two", "three", "four"]);
-    assert_eq!(count(&all, "thread.started"), 1, "{:?}", kinds(&all));
-    assert_eq!(count(&all, "thread.crashed"), 0, "{:?}", kinds(&all));
+    // Closed once, for the removal; a new runtime (the session resumed) took turn 2.
+    let closed: Vec<&str> = all
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::ThreadCrashed(c) => Some(c.stderr_tail.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 1, "{:?}", kinds(&all));
+    assert!(closed[0].contains("was removed from the hub"), "{closed:?}");
+    assert_eq!(count(&all, "thread.started"), 2, "{:?}", kinds(&all));
+    assert!(h.hub().get_thread(&t).unwrap()["current_turn"].is_null());
     let now = *h.hub().runner_watermarks(BOX).unwrap().get(&t).unwrap();
     assert_eq!(now + 1, lbox.spool().next_rseq(&t).unwrap());
     r.shutdown().await;
@@ -7101,4 +7196,172 @@ async fn an_older_runner_is_refused_only_while_its_box_is_forgotten() {
     assert_eq!(welcome(raw_expect(&mut ws).await), (None, false));
     drop(ws);
     h.shutdown().await;
+}
+
+/// A turn in flight when its token box is removed, whose end the runner then forgets: the
+/// removal ends the session as far as the hub is concerned. Once the box is added again, the
+/// first connection (whose welcome has the runner forget its spool) gets no session of the
+/// hub's adopted: the run the runner still runs is stopped on the box as a stray, the thread
+/// is closed (its turn ended, a `thread.crashed` saying why) instead of `running` with a turn
+/// that can never end, and the next prompt resumes the session and completes.
+///
+/// Four ways: removed while the hub runs (`box.token`), with the turn's end spooled before
+/// the inventory (`acks_needed`), or appended after it, between the inventory and the
+/// runner's forget, so the inventory names no frame of it (the race); removed while the hub
+/// runs, then the hub restarted with the box before the runner came back (no session of the
+/// box held, the log still showing it running); and removed while the hub was stopped, which
+/// then starts without it (`boxes.removed` naming it: closed then, for a box the hub no longer
+/// has) and once more with it. The outcome is the same: the run is stopped either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_whose_end_the_runner_forgot_is_closed_and_the_next_prompt_resumes() {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Removal {
+        Live { spooled_before_inventory: bool },
+        LiveThenRestart,
+        AtStart,
+    }
+    for removal in [
+        Removal::Live {
+            spooled_before_inventory: true,
+        },
+        Removal::Live {
+            spooled_before_inventory: false,
+        },
+        Removal::LiveThenRestart,
+        Removal::AtStart,
+    ] {
+        let spooled_before_inventory = removal
+            != Removal::Live {
+                spooled_before_inventory: false,
+            };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+        let stamped = |generation: Option<String>| Hello {
+            spool: Some(twr_core::runner::SpoolStamp { generation }),
+            ..hello(TOKEN)
+        };
+        let mut ws = raw(&h.url).await;
+        raw_hello(&mut ws, stamped(None)).await;
+        let Some(HubMsg::Welcome {
+            generation: Some(g1),
+            ..
+        }) = raw_expect(&mut ws).await
+        else {
+            panic!("no welcome")
+        };
+        raw_send(&mut ws, &RunnerMsg::Synced).await;
+        h.online().await;
+        // Turn 1 runs on the box (spawned, `started` at rseq 1).
+        let t = h.raw_session(&mut ws, dir.path(), "forgot").await;
+        assert_eq!(h.hub().get_thread(&t).unwrap()["current_turn"], 1);
+        let with_box = format!("[boxes.{BOX}]\ntoken = \"{TOKEN}\"\n");
+        if removal == Removal::AtStart {
+            // Removed while the hub is stopped: it starts without the box, which the removal
+            // record names, and closes the thread then; then it starts with it again.
+            drop(ws);
+            h.shutdown().await;
+            let (without, _) = hub_with_files(dir.path(), "", &[BOX]).await;
+            assert_eq!(
+                without.hub().runner_generation(BOX).unwrap().map(|g| g.1),
+                Some(true)
+            );
+            assert!(without.hub().get_thread(&t).unwrap()["current_turn"].is_null());
+            without.shutdown().await;
+            h = hub_with_files(dir.path(), &with_box, &[]).await.0;
+        } else {
+            // Removed, then added again (`box.token` both times): forgotten.
+            std::fs::write(&boxes_file, "").unwrap();
+            box_token(&h, Caller::user("test")).await.unwrap();
+            while raw_next(&mut ws).await.is_some() {}
+            std::fs::write(&boxes_file, &with_box).unwrap();
+            box_token(&h, Caller::user("test")).await.unwrap();
+            if removal == Removal::LiveThenRestart {
+                h.shutdown().await;
+                h = hub_with_files(dir.path(), &with_box, &[]).await.0;
+            }
+        }
+        // The runner comes back: the session still runs (idle), turn 1's end was spooled
+        // meanwhile, and it forgets that at this welcome, as a real runner does.
+        let mut ws = raw(&h.url).await;
+        let mut hi = stamped(Some(g1));
+        hi.running = vec![running(&t, "r1")];
+        if spooled_before_inventory {
+            hi.acks_needed = [(t.clone(), 3)].into();
+        }
+        raw_hello(&mut ws, hi).await;
+        let Some(HubMsg::Welcome { forgotten, .. }) = raw_expect(&mut ws).await else {
+            panic!("no welcome")
+        };
+        assert!(forgotten);
+        raw_send(&mut ws, &RunnerMsg::Synced).await;
+        // The run is stopped on the box, by its run id.
+        let (cmd_id, op) = raw_cmd(&mut ws).await;
+        assert!(
+            matches!(&op, Op::Stop { thread, run: Some(r) } if thread == &t && *r == run_id(&t, "r1")),
+            "{op:?}"
+        );
+        raw_ok(&mut ws, cmd_id).await;
+        h.online().await;
+        let v = h.hub().get_thread(&t).unwrap();
+        assert!(v["current_turn"].is_null(), "{v}");
+        assert_ne!(v["status"], "running", "{v}");
+        let all = log(h.hub(), &t);
+        let closed: Vec<&str> = all
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ThreadCrashed(c) => Some(c.stderr_tail.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed.len(), 1, "{removal:?}: {:?}", kinds(&all));
+        if removal == Removal::AtStart {
+            assert!(
+                closed[0].contains("is no longer one of this hub's boxes"),
+                "{closed:?}"
+            );
+        } else {
+            assert!(
+                closed[0].contains("was removed from the hub") && closed[0].contains("forgot"),
+                "{closed:?}"
+            );
+        }
+        // The stopped run's exit (numbered from 1 again) is no exit of the thread's.
+        raw_frame(&mut ws, exited(&t, 1, Some(0), Some("r1"))).await;
+        assert_eq!(count(&log(h.hub(), &t), "thread.crashed"), 1);
+        // The next prompt resumes the session and its turn completes.
+        h.send(&t, "next");
+        let (cmd_id, op) = raw_cmd(&mut ws).await;
+        assert!(
+            matches!(&op, Op::Resume { thread, .. } if thread == &t),
+            "{op:?}"
+        );
+        raw_ok(&mut ws, cmd_id).await;
+        let session = |rseq: u64, turn: Option<u64>, body: EventBody| RunnerMsg::Event {
+            thread: t.clone(),
+            rseq,
+            turn,
+            body,
+            raw: None,
+            run: Some(run_id(&t, "r2")),
+            at_ms: None,
+        };
+        let mut cmds = raw_frame(&mut ws, session(2, None, started("s-forgot"))).await;
+        let (cmd_id, op) = match cmds.pop() {
+            Some(c) => c,
+            None => raw_cmd(&mut ws).await,
+        };
+        let Op::Send { turn, .. } = op else {
+            panic!("{op:?}")
+        };
+        raw_ok(&mut ws, cmd_id).await;
+        raw_frame(&mut ws, session(3, Some(turn), turn_ended())).await;
+        let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+        until(&mut sub, |e| {
+            e.kind() == "turn.ended" && e.turn == Some(turn)
+        })
+        .await;
+        let v = h.hub().get_thread(&t).unwrap();
+        assert!(v["current_turn"].is_null(), "{v}");
+        h.shutdown().await;
+    }
 }
