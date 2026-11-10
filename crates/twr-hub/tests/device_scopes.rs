@@ -734,7 +734,7 @@ async fn spawned(hub: &Hub, id: &str, req: NewThread, caller: &Caller) -> Result
 /// repository or a plain folder in the hub's data are refused (`unauthorized`, saying what to
 /// do instead), operate's and terminal's alike; a plain folder elsewhere is not. A device
 /// with `admin`, and the local user, start them all. The orchestrator, acting on any message,
-/// is refused a folder outside git as before.
+/// is held to the same rule as its own.
 #[tokio::test]
 async fn a_device_without_admin_starts_threads_only_outside_the_home_and_data_folders() {
     let mut env = Env::new();
@@ -817,7 +817,7 @@ async fn a_device_without_admin_starts_threads_only_outside_the_home_and_data_fo
         let r = hub.say(&said, None, caller).await.unwrap();
         assert_eq!(r["action"], "new_thread", "{r}");
     }
-    // The orchestrator, acting on a device's message or the user's, as before.
+    // The orchestrator, acting on a device's message or the user's, held to the same rule.
     hub.say_to_orchestrator("watch", None, &tui()).unwrap();
     let mut rt = env.orch().await;
     let (_, t1) = rt.next_turn().await;
@@ -826,7 +826,7 @@ async fn a_device_without_admin_starts_threads_only_outside_the_home_and_data_fo
         let seen = hub.control_read(0, 1000).unwrap().1;
         let r = hub
             .say_to_orchestrator(
-                &format!("start a thread in {}", plain.display()),
+                &format!("start a thread in {}", plain_in_data.display()),
                 Some(seen),
                 who,
             )
@@ -838,7 +838,7 @@ async fn a_device_without_admin_starts_threads_only_outside_the_home_and_data_fo
                 NewThread {
                     // (Not `fake`, which the orchestrator never starts.)
                     runtime: Some("my-agent".into()),
-                    ..in_dir(&plain)
+                    ..in_dir(&plain_in_data)
                 },
                 &Caller::Orchestrator,
             )
