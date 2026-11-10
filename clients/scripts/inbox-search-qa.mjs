@@ -319,8 +319,12 @@ archive.commit()
   assert.deepEqual(concurrent[1], concurrent[2]);
   const source = (workspace) =>
     concurrent[0].find((source) => source.workspace === workspace);
+  // This computer's workspaces, in the listing's order. Where encrypted storage is locked
+  // (a Linux session without a keyring) the result also carries the scan's own notice.
   assert.deepEqual(
-    concurrent[0].map((source) => source.workspace),
+    concurrent[0]
+      .filter((source) => source.hubId === "local")
+      .map((source) => source.workspace),
     ["default", "other", "sleeping"],
   );
   assert.equal(source("sleeping").running, false);
