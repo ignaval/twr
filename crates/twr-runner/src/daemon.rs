@@ -333,12 +333,30 @@ impl Drop for DaemonSocket {
 /// How this daemon was started (see the module docs): [`launch_of`] its own
 /// `XPC_SERVICE_NAME`, whether `INVOCATION_ID` is set, and on Linux `/proc/self/cgroup`.
 pub fn own_launch() -> String {
+    own_launch_with(BOX_UNIT_PREFIX)
+}
+
+/// How the linked runner's machine service was started, for `twr runner status`: as
+/// [`own_launch`], except that its systemd unit is the one `twr-link` starts it in
+/// (`twr-runner-<id>.service`). Its launchd label is the relay's, as a box daemon's.
+pub fn own_service_launch() -> String {
+    own_launch_with(SERVICE_UNIT_PREFIX)
+}
+
+/// The start of the name of a box daemon's systemd unit (the relay's, `twr-box-...service`).
+const BOX_UNIT_PREFIX: &str = "twr-box-";
+
+/// The start of the name of the linked runner service's systemd unit (`twr-runner-<id>`).
+const SERVICE_UNIT_PREFIX: &str = "twr-runner-";
+
+/// [`own_launch`], taking a systemd unit whose name starts with `unit_prefix`.
+fn own_launch_with(unit_prefix: &str) -> String {
     let xpc = std::env::var("XPC_SERVICE_NAME").ok();
     let invocation = std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty());
     let cgroup = (cfg!(target_os = "linux") && invocation)
         .then(|| std::fs::read_to_string("/proc/self/cgroup").ok())
         .flatten();
-    launch_of(xpc.as_deref(), invocation, cgroup.as_deref())
+    launch_with(xpc.as_deref(), invocation, cgroup.as_deref(), unit_prefix)
 }
 
 /// How a daemon was started, from its `XPC_SERVICE_NAME` (`xpc`), whether its
@@ -347,6 +365,16 @@ pub fn own_launch() -> String {
 /// relay's (`twr-box-...service`, the last component of a cgroup path that is one), else
 /// `detached`; always a [`twr_core::runner::valid_launch`].
 pub fn launch_of(xpc: Option<&str>, invocation: bool, cgroup: Option<&str>) -> String {
+    launch_with(xpc, invocation, cgroup, BOX_UNIT_PREFIX)
+}
+
+/// [`launch_of`], taking a systemd unit whose name starts with `unit_prefix`.
+fn launch_with(
+    xpc: Option<&str>,
+    invocation: bool,
+    cgroup: Option<&str>,
+    unit_prefix: &str,
+) -> String {
     let valid = |l: String| twr_core::runner::valid_launch(&l).then_some(l);
     let launchd = xpc
         .filter(|l| l.starts_with(crate::relay::launchd::LABEL_PREFIX))
@@ -356,7 +384,7 @@ pub fn launch_of(xpc: Option<&str>, invocation: bool, cgroup: Option<&str>) -> S
             .lines()
             .filter_map(|l| l.splitn(3, ':').nth(2))
             .filter_map(|path| path.rsplit('/').next())
-            .find(|unit| unit.starts_with("twr-box-") && unit.ends_with(".service"))
+            .find(|unit| unit.starts_with(unit_prefix) && unit.ends_with(".service"))
             .and_then(|unit| valid(format!("systemd {unit}")))
     };
     launchd
@@ -801,6 +829,30 @@ mod tests {
             );
         }
         assert!(twr_core::runner::valid_launch(&own_launch()));
+    }
+
+    /// The linked runner's machine service tells its own unit (`twr-runner-<id>.service`, as
+    /// `twr-link` starts it with systemd-run), not `detached`; a box daemon still takes only the
+    /// relay's units.
+    #[test]
+    fn the_runner_service_tells_its_systemd_unit() {
+        let unit = "twr-runner-60610e0c24bd1de1.service";
+        let cgroup = format!("0::/user.slice/user-501.slice/user@501.service/app.slice/{unit}\n");
+        assert_eq!(
+            launch_with(None, true, Some(&cgroup), SERVICE_UNIT_PREFIX),
+            format!("systemd {unit}")
+        );
+        assert_eq!(
+            launch_with(None, false, Some(&cgroup), SERVICE_UNIT_PREFIX),
+            "detached"
+        );
+        assert_eq!(launch_of(None, true, Some(&cgroup)), "detached");
+        let label = "tools.twr.box.0123456789abcdef.0a1b2c3d";
+        assert_eq!(
+            launch_with(Some(label), false, None, SERVICE_UNIT_PREFIX),
+            format!("launchd {label}")
+        );
+        assert!(twr_core::runner::valid_launch(&own_service_launch()));
     }
 
     /// A line is read up to its `\n` and no further; too long, cut short or not UTF-8 is an
