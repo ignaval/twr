@@ -249,7 +249,7 @@ ${npm}</main>
   console.error(`The desktop packages carry the licences of the Rust crates in their engines, which cargo-about writes.
 Install it (the release workflow uses ${CARGO_ABOUT_VERSION}):
 
-  cargo install --locked cargo-about --version ${CARGO_ABOUT_VERSION}
+  cargo install --locked cargo-about --version ${CARGO_ABOUT_VERSION} --features cli
 
 or, for a local review build that will not be distributed, package without them:
 

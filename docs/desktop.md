@@ -333,7 +333,7 @@ resources folder (and, for Arch, in `/usr/share/licenses/`); **Help › Third-Pa
 opens the last in your browser. `npm run package` writes it with `node scripts/notices.mjs`:
 the Rust crates in the bundled engines, from cargo-about with the CLI release's settings
 (`about.toml`, `about.hbs`), then every npm package bundled into the app or copied into it.
-Packaging fails without cargo-about (`cargo install --locked cargo-about --version 0.9.2`).
+Packaging fails without cargo-about (`cargo install --locked cargo-about --version 0.9.2 --features cli`; the binary needs the `cli` feature).
 For a local review build, `TWR_NOTICES_WITHOUT_RUST=1` packages notices without the Rust
 crates, marked incomplete at the top of the file; never distribute such a build.
 

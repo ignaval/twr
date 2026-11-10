@@ -412,10 +412,12 @@ async function connectWorkspace(next: string, generation: number) {
   }
 }
 /** The third-party notices every package carries (scripts/notices.mjs), in the browser. */
-function openNotices() {
-  const path = app.isPackaged
+const noticesPath = () =>
+  app.isPackaged
     ? join(process.resourcesPath, "THIRD-PARTY-LICENSES.html")
     : resolve(__dirname, "../dist-notices/THIRD-PARTY-LICENSES.html");
+function openNotices() {
+  const path = noticesPath();
   // Automated QA (scripts/integration.mjs) reads what would have opened.
   if (process.env.TWR_DESKTOP_TEST_AUTOMATION === "1") {
     (globalThis as { __twrOpenedNotices?: object }).__twrOpenedNotices = {
@@ -1315,6 +1317,8 @@ else {
             workspace: workspaceReady ? "connected" : "not connected",
             hubVersion,
             terminals: [...terminals.values()].filter((t) => !t.exited).length,
+            // What Help › Third-Party Licences opens.
+            licences: existsSync(noticesPath()) ? "present" : "missing",
           }),
         },
         // Automated runs, and any run given its own --user-data-dir, keep their log with
