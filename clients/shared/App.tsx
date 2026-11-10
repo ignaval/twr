@@ -694,7 +694,7 @@ export default function App({
     if (section === "attention" && connected) void refreshInboxSources();
   }, [section, connected, workspace, refreshInboxSources]);
   // The sidebar lists every workspace's threads, as the TUI's does: while it shows, the other
-  // workspaces are re-read now and then over short-lived read-only connections.
+  // workspaces are re-read now and then, all of them from one `twr ws list --json --detail`.
   const sidebarReads = sidebar && connected && workspaces.length > 1;
   useEffect(() => {
     if (!sidebarReads) return;
