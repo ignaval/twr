@@ -1495,7 +1495,8 @@ can access it (`chmod 600`).
   connection, a runner restart or a hub crash replays what was not acked; duplicates are
   dropped by watermark; a gap closes the connection. A frame of a thread the hub never had, or
   whose trash item is purged, is acked and not recorded, with no watermark kept (its session is
-  told to stop); a frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
+  told to stop), and a hub forgets such watermarks an older hub kept as it starts; a removed
+  box's watermarks stay with its threads, should it be added again; a frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
   and `_`) closes the connection, and an inventory that names one (a running session's, or
   spooled frames') is refused before the welcome (`error{protocol}`). Commands to the box carry an id that the
   runner deduplicates, so a command sent again after a lost connection runs once; a command

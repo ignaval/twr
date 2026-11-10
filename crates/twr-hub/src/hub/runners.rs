@@ -1956,13 +1956,43 @@ impl Core {
     /// one purged) is a stray acked without being recorded or classified: nothing of it is
     /// kept, so a runner cannot fill `runner_acks` with made-up threads.
     fn tracks(&self, ack: &RunnerAck) -> bool {
-        if self.registry.get(&ack.thread).is_some() {
+        self.tracks_thread(&ack.box_name, &ack.thread)
+    }
+
+    /// [`Core::tracks`] of `thread` from box `box_name`.
+    fn tracks_thread(&self, box_name: &str, thread: &str) -> bool {
+        if self.registry.get(thread).is_some() {
             return true;
         }
         self.registry
-            .deleted_view(&ack.thread)
-            .is_some_and(|v| v.box_name == ack.box_name)
-            && !self.deleted_rt.get(&ack.thread).is_some_and(|d| d.purged)
+            .deleted_view(thread)
+            .is_some_and(|v| v.box_name == box_name)
+            && !self.deleted_rt.get(thread).is_some_and(|d| d.purged)
+    }
+
+    /// Forgets, as the hub opens (the log folded), the watermarks it keeps no longer
+    /// ([`Core::tracks`]): of threads the log never had (a hub from before kept a watermark
+    /// for any frame's thread) or has purged, or deleted from another box. The next frame of
+    /// such a thread is a stray, acked without a watermark, so none of them can be taken for a
+    /// gap. Returns how many went.
+    ///
+    /// A box's watermarks are not forgotten when the box is removed: its runner may still
+    /// spool frames of its threads (and number them on from where they were), and the box may
+    /// be added again. Without its watermark, a thread's next frame would be a gap on every
+    /// connection (the runner replays it, the hub closes the connection, again); taking it
+    /// as the start instead could record twice what the hub committed but the runner never
+    /// heard was acked. So they stay as long as their threads do, as the log's rows of them do.
+    pub(super) fn sweep_runner_acks(&mut self) -> anyhow::Result<usize> {
+        let stale: Vec<(String, String)> = self
+            .store
+            .runner_ack_keys()?
+            .into_iter()
+            .filter(|(b, t)| !self.tracks_thread(b, t))
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        self.store.forget_runner_acks_of(&stale)
     }
 
     /// Whether `ack`'s thread is known and on another box than the frame's: then the frame is
@@ -2944,6 +2974,86 @@ mod tests {
         handle(&inner, &mut conn, frame_of(t, 9)).await.unwrap();
         assert_eq!(conn.unacked.get(t), Some(&9));
         assert!(rows().is_empty(), "{:?}", rows());
+    }
+
+    /// As the hub opens it forgets the watermarks of threads it keeps none of (one the log
+    /// never had, one purged, one deleted from another box), as a hub from before may have
+    /// kept; those of its threads and of a deleted thread still restorable from its box stay,
+    /// and so does a box's watermark of another box's thread (the box's strays of it drain).
+    #[tokio::test]
+    async fn stale_watermarks_are_forgotten_as_the_hub_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (deleted, purged, made_up) = (
+            "01JDELETED0000000000000001",
+            "01JPURGED00000000000000001",
+            "01JMADEUP00000000000000001",
+        );
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        {
+            let mut core = inner.core();
+            for (id, item) in [(deleted, "item-d"), (purged, "item-p")] {
+                let created = EventBody::ThreadCreated(ThreadCreated {
+                    name: id.to_lowercase(),
+                    box_name: "gpu".into(),
+                    runtime: "fake".into(),
+                    ..Default::default()
+                });
+                core.append(&inner, id, None, Source::Hub, created).unwrap();
+                let gone = EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                    name: id.to_lowercase(),
+                    trash: Some(item.into()),
+                    ..Default::default()
+                });
+                core.append(&inner, id, None, Source::Hub, gone).unwrap();
+            }
+        }
+        assert!(inner.core().record_purged(&inner, "item-p", purged, false));
+        let keep = [("gpu", t), ("gpu", deleted), ("cpu", t)];
+        let stale = [("gpu", purged), ("gpu", made_up), ("cpu", deleted)];
+        {
+            let mut core = inner.core();
+            for (b, thread) in keep.iter().chain(&stale) {
+                let ack = RunnerAck {
+                    box_name: b.to_string(),
+                    thread: thread.to_string(),
+                    rseq: 4,
+                };
+                core.commit_ack(&inner, Some(&ack)).unwrap();
+            }
+        }
+        let keys = |inner: &Inner| {
+            let mut k = inner.core().store.runner_ack_keys().unwrap();
+            k.sort();
+            k
+        };
+        let owned = |set: &[(&str, &str)]| {
+            let mut k: Vec<(String, String)> = set
+                .iter()
+                .map(|(b, t)| (b.to_string(), t.to_string()))
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&inner).len(), 6);
+        drop(inner);
+        hub.shutdown().await;
+        drop(hub);
+        let mut cfg = Config::default();
+        cfg.boxes.insert(
+            "gpu".into(),
+            BoxConfig {
+                token: Some("gpu-token-0123456789abcdef".into()),
+                ..Default::default()
+            },
+        );
+        let hub = crate::Hub::open(HubOptions::new(dir.path().join("twr.db"), cfg))
+            .await
+            .unwrap();
+        assert_eq!(keys(&hub.inner), owned(&keep));
+        assert_eq!(hub.inner.core().sweep_runner_acks().unwrap(), 0);
+        hub.shutdown().await;
     }
 
     /// A connection remembers at most [`MAX_STOPPED`] strays it stopped.

@@ -1073,6 +1073,28 @@ impl Store {
             .execute("DELETE FROM runner_acks WHERE thread = ?1", [thread])?)
     }
 
+    /// Every committed watermark's `(box, thread)`.
+    pub fn runner_ack_keys(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare("SELECT box, thread FROM runner_acks")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forgets the watermarks of `keys` (`(box, thread)`), in one transaction. Returns how
+    /// many there were.
+    pub fn forget_runner_acks_of(&mut self, keys: &[(String, String)]) -> anyhow::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut st = tx.prepare("DELETE FROM runner_acks WHERE box = ?1 AND thread = ?2")?;
+            for (b, t) in keys {
+                n += st.execute(params![b, t])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Every event in append order.
     pub fn load_all(&self) -> anyhow::Result<Vec<Event>> {
         let mut st = self
