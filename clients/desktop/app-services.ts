@@ -314,7 +314,21 @@ export class AppServices {
   setAttention(summary: AttentionSummary) {
     this.tray.setAttention(summary);
     this.notifier.update(summary);
-    if (testState) testState.attention = summary;
+    if (testState) {
+      testState.attention = summary;
+      // Each summary's sources and requests, for a failing test to show what it saw.
+      const entry = {
+        workspaces: summary.workspaces,
+        items: summary.items.map((i) => `${i.workspace}:${i.id}@${i.revision}`),
+        attended:
+          !!this.host.window()?.isVisible() &&
+          !!this.host.window()?.isFocused(),
+      };
+      if (JSON.stringify(entry) !== JSON.stringify(testState.history.at(-1))) {
+        testState.history.push(entry);
+        testState.history.splice(0, testState.history.length - 100);
+      }
+    }
   }
 
   /** The window came to the front. */
@@ -538,10 +552,16 @@ interface TestState {
     closed: boolean;
     click(): void;
   }[];
+  /** The latest summaries' sources and requests, oldest first. */
+  history: {
+    workspaces: AttentionSummary["workspaces"];
+    items: string[];
+    attended: boolean;
+  }[];
 }
 let testState: TestState | undefined;
 function testPost(): Post {
-  const state: TestState = { notifications: [] };
+  const state: TestState = { notifications: [], history: [] };
   testState = state;
   (globalThis as { __twrTest?: TestState }).__twrTest = state;
   return (notice, handlers) => {

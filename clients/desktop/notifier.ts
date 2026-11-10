@@ -43,9 +43,9 @@ export const systemPost: Post = (notice, handlers) => {
 };
 
 /**
- * OS notifications for new permissions and questions in any workspace while the window is
- * not in front (desktop/notify-state.ts decides which). A click shows the window at the
- * request; it never answers it.
+ * OS notifications for new permissions, questions and the hub's confirm and delete cards in
+ * any workspace while the window is not in front (desktop/notify-state.ts decides which). A
+ * click shows the window at the request; it never answers it.
  */
 export class Notifier {
   private watch = new AttentionWatch();

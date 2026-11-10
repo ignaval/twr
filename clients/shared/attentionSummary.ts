@@ -20,6 +20,23 @@ export function currentSource(source: InboxSource) {
   );
 }
 
+/** The thread of the hub's own questions (twr-core `HUB_THREAD`). */
+const HUB_THREAD = "hub";
+
+/**
+ * Which of the hub's cards an item is: a question on the hub's thread that the hub marks
+ * `proposal` (twr-core `is_confirm_card`), a delete card when it offers Delete (its options
+ * are `Delete`/`Cancel`; a confirm card's are `Confirm`/`Cancel`).
+ */
+export function cardOf(
+  item: Pick<Attention, "thread" | "proposal" | "options">,
+): AttentionSummaryItem["card"] {
+  if (item.thread !== HUB_THREAD || item.proposal !== true) return undefined;
+  return Array.isArray(item.options) && item.options.includes("Delete")
+    ? "delete"
+    : "confirm";
+}
+
 const order = (a: string, b: string) =>
   a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b);
 
@@ -81,14 +98,21 @@ export function attentionSummary({
       if (!item || typeof item.attn_id !== "string") continue;
       count++;
       if (items.length >= max) continue;
+      const card = cardOf(item);
       items.push({
         workspace: list.name,
         thread: item.thread,
-        title: (names.get(item.thread) || item.thread || "twr").slice(0, 200),
+        // The hub's own questions are on its thread `hub`; they are twr's, as in its [notify].
+        title: (
+          names.get(item.thread) ||
+          (item.thread === HUB_THREAD ? "twr" : item.thread) ||
+          "twr"
+        ).slice(0, 200),
         summary: (item.summary || item.reason || "").slice(0, 300),
         id: item.attn_id,
         revision: Number.isSafeInteger(item.revision) ? item.revision : 0,
         reason: String(item.reason || "").slice(0, 40),
+        ...(card ? { card } : {}),
         ...(item.incomplete ? { incomplete: true } : {}),
       });
     }

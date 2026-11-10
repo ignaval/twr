@@ -3,7 +3,10 @@ import type { AttentionSummary, AttentionSummaryItem } from "../shared/types";
 /* What the desktop notifies, decided without Electron so it is tested on its own
  * (desktop/notifier.ts posts what these return). docs/notifications.md › The desktop app. */
 
-/** The kinds of request that post an OS notification. */
+/**
+ * The kinds of request that post an OS notification. The hub's confirm and delete cards are
+ * questions too ({@link AttentionSummaryItem.card}), worded as what they are.
+ */
 export const NOTIFIED_REASONS: ReadonlySet<string> = new Set([
   "permission",
   "question",
@@ -110,12 +113,17 @@ const plain = (text: string, max = 120) => {
   return single.length > max ? single.slice(0, max - 1) + "…" : single;
 };
 
-const kind = (reason: string) =>
-  reason === "permission"
-    ? "Asks for permission"
-    : reason === "question"
-      ? "Has a question for you"
-      : "Needs you";
+/** What the request asks, in a few words that say nothing of its content. */
+export const kind = (item: Pick<AttentionSummaryItem, "reason" | "card">) =>
+  item.card === "delete"
+    ? "Asks you to confirm a deletion"
+    : item.card === "confirm"
+      ? "Asks you to confirm what the orchestrator proposed"
+      : item.reason === "permission"
+        ? "Asks for permission"
+        : item.reason === "question"
+          ? "Has a question for you"
+          : "Needs you";
 
 const list = (words: string[]) =>
   words.length <= 1
@@ -124,12 +132,15 @@ const list = (words: string[]) =>
 
 /**
  * The notifications for requests that came due together: one each, or one for all of them
- * when there are more than {@link BURST_MAX}. They name the thread, the workspace and the
- * kind of request, never what is asked (a command line, a question): that stays in the app,
+ * when there are more than {@link BURST_MAX}. They name the thread (`twr` for the hub's own
+ * cards), the workspace and the kind of request (a deletion says so), never what is asked
+ * (a command line, a question, the threads a card would delete): that stays in the app,
  * as in the hub's notifications without `detail` and in mobile push.
  */
 export function notices(items: AttentionSummaryItem[]): Notice[] {
-  const wanted = items.filter((item) => NOTIFIED_REASONS.has(item.reason));
+  const wanted = items.filter(
+    (item) => NOTIFIED_REASONS.has(item.reason) || item.card !== undefined,
+  );
   if (wanted.length > BURST_MAX) {
     const workspaces = [...new Set(wanted.map((item) => item.workspace))];
     const counts = workspaces.map(
@@ -150,7 +161,7 @@ export function notices(items: AttentionSummaryItem[]): Notice[] {
   }
   return wanted.map((item) => ({
     title: `${plain(item.title, 80)} · ${plain(item.workspace, 40)}`,
-    body: kind(item.reason),
+    body: kind(item),
     keys: [itemKey(item)],
     target: { workspace: item.workspace, thread: item.thread },
   }));

@@ -31,6 +31,8 @@ export interface Attention {
   note?: string;
   context?: Json;
   incomplete?: boolean;
+  /** A confirm or delete card: the hub's own question only the user answers. */
+  proposal?: boolean;
 }
 export interface ViewState {
   threads: Thread[];
@@ -195,8 +197,13 @@ export interface AttentionSummaryItem {
   /** The attention item (`attn_id`) and its revision: a new revision is a new request. */
   id: string;
   revision: number;
-  /** `permission`, `question`, `confirm`, `review`… */
+  /** `permission`, `question`, `review`… */
   reason: string;
+  /**
+   * The hub's own cards, which only the user answers: `confirm`, what the orchestrator
+   * proposed from your message; `delete`, a deletion of threads.
+   */
+  card?: "confirm" | "delete";
   /** Still being raised: not notified until it is complete. */
   incomplete?: boolean;
 }

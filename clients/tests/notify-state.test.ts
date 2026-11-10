@@ -144,8 +144,56 @@ describe("notices", () => {
       expect(notice.title + notice.body).not.toContain("rm -rf");
   });
 
-  it("only for permissions and questions", () => {
+  it("only for permissions, questions and the hub's cards", () => {
     expect(notices([item("a", "default", { reason: "review" })])).toEqual([]);
+    for (const reason of ["error", "stalled"])
+      expect(notices([item("a", "default", { reason })])).toEqual([]);
+  });
+
+  it("say what a confirm or delete card asks, never what it lists", () => {
+    const card = (id: string, card: "confirm" | "delete") =>
+      item(id, "side", {
+        thread: "hub",
+        title: "twr",
+        reason: "question",
+        card,
+        summary:
+          card === "delete"
+            ? "Delete api, web? api loses uncommitted changes"
+            : "From your message: allow api (Bash: git push --force)",
+      });
+    const [confirm, deletion] = notices([
+      card("c", "confirm"),
+      card("d", "delete"),
+    ]);
+    expect(confirm).toMatchObject({
+      title: "twr · side",
+      body: "Asks you to confirm what the orchestrator proposed",
+      target: { workspace: "side", thread: "hub" },
+    });
+    expect(deletion).toMatchObject({
+      title: "twr · side",
+      body: "Asks you to confirm a deletion",
+      target: { workspace: "side", thread: "hub" },
+    });
+    for (const notice of [confirm, deletion])
+      expect(notice.title + notice.body).not.toMatch(/api|git|uncommitted/);
+  });
+
+  it("notify a card once, and not again on a reconnect", () => {
+    const watch = new AttentionWatch();
+    const card = item("d", "default", {
+      thread: "hub",
+      reason: "question",
+      card: "delete",
+    });
+    expect(watch.observe(summary([]), false)).toEqual([]);
+    expect(watch.observe(summary([card]), false)).toEqual([card]);
+    expect(watch.observe(summary([card]), false)).toEqual([]);
+    // A new stream (a reconnect) lists it again: known, not news.
+    expect(
+      watch.observe(summary([card], { default: "live:2" }), false),
+    ).toEqual([]);
   });
 
   it("keep a thread name on one line", () => {

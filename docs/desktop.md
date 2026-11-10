@@ -160,10 +160,13 @@ Settings › Application has four switches:
   GNOME and KDE start at login. AppImages are started through the image itself. twr
   only removes an autostart entry that it created.
 - **Show in menu bar / Show tray icon.**
-- **Notify me of new requests** (on by default). A new permission or question in any
-  workspace posts a system notification while twr's window isn't in front: hidden in
-  background mode, minimized, or behind another app. It names the thread and the
-  workspace (`api · client-x`, *Asks for permission*), never what is asked. Clicking it
+- **Notify me of new requests** (on by default). A new permission or question, or a
+  confirm or delete card, in any workspace posts a system notification while twr's window
+  isn't in front: hidden in background mode, minimized, or behind another app. It names the
+  thread and the workspace (`api · client-x`, *Asks for permission*) and, for the hub's
+  cards, what kind of card it is (`twr · client-x`, *Asks you to confirm what the
+  orchestrator proposed*, or *Asks you to confirm a deletion*), never what is asked or which
+  threads a card would delete. Clicking it
   shows the window in that workspace at the request; it never answers it, and the
   request's buttons wait 600 ms after the window shows, as always. A notification goes
   away once its request is answered, anywhere, or when you bring the window to the front.

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { attentionSummary } from "../shared/attentionSummary";
+import { attentionSummarySchema } from "../desktop/validation";
 import type { Attention, InboxSource, Thread } from "../shared/types";
 
 const thread = (id: string, name = id) =>
@@ -120,5 +121,40 @@ describe("attention summary", () => {
       sources: [],
     });
     expect(summary.items[0].incomplete).toBe(true);
+  });
+
+  it("marks the hub's confirm and delete cards, as twr's", () => {
+    const hubAsk = (id: string, options: string[], proposal = true) =>
+      ({
+        ...ask(id, "hub", "question"),
+        options,
+        ...(proposal ? { proposal: true } : {}),
+      }) as Attention;
+    const summary = attentionSummary({
+      current: "default",
+      hubId: "local",
+      live: {
+        threads: [thread("t1", "api")],
+        attention: [
+          hubAsk("c", ["Confirm", "Cancel"]),
+          hubAsk("d", ["Delete", "Cancel"]),
+          // A hub question that is not a card, and a worker's question offering Delete.
+          hubAsk("q", ["yes", "no"], false),
+          { ...ask("w", "t1", "question"), options: ["Delete", "Keep"] },
+        ],
+      },
+      liveStream: "live:1",
+      sources: [],
+    });
+    expect(
+      summary.items.map(({ id, title, card }) => ({ id, title, card })),
+    ).toEqual([
+      { id: "c", title: "twr", card: "confirm" },
+      { id: "d", title: "twr", card: "delete" },
+      { id: "q", title: "twr", card: undefined },
+      { id: "w", title: "api", card: undefined },
+    ]);
+    // What the main process accepts from the renderer (`app-attention`).
+    expect(attentionSummarySchema.parse(summary)).toEqual(summary);
   });
 });
