@@ -1049,27 +1049,51 @@ pub fn protected_dirs(home: Option<&Path>, data_dir: &Path) -> Vec<PathBuf> {
 /// Why the orchestrator may not read repository `repo` (resolved): it is, or holds, the home
 /// folder `home`, or it holds or is in one of `protected`.
 pub fn repo_refusal(repo: &Path, home: Option<&Path>, protected: &[PathBuf]) -> Option<String> {
-    let repo = real(repo);
+    dir_refusal(
+        "repository",
+        ": twr does not read it",
+        repo,
+        home,
+        protected,
+    )
+}
+
+/// Why a paired device without `admin` may not start a thread in `dir`, a folder outside git
+/// (resolved): by [`repo_refusal`]'s rule, for the folder itself.
+pub fn folder_refusal(dir: &Path, home: Option<&Path>, protected: &[PathBuf]) -> Option<String> {
+    dir_refusal("folder", "", dir, home, protected)
+}
+
+/// [`repo_refusal`] and [`folder_refusal`]: `what` names `dir` in the refusal, which ends with
+/// `tail`.
+fn dir_refusal(
+    what: &str,
+    tail: &str,
+    dir: &Path,
+    home: Option<&Path>,
+    protected: &[PathBuf],
+) -> Option<String> {
+    let dir = real(dir);
     if let Some(home) = home {
-        if real(home).starts_with(&repo) {
+        if real(home).starts_with(&dir) {
             return Some(format!(
-                "the repository {} holds the home folder: twr does not read it",
-                repo.display()
+                "the {what} {} holds the home folder{tail}",
+                dir.display()
             ));
         }
     }
     protected.iter().find_map(|p| {
         let p_real = real(p);
-        if p_real.starts_with(&repo) {
+        if p_real.starts_with(&dir) {
             Some(format!(
-                "the repository {} holds {}: twr does not read it",
-                repo.display(),
+                "the {what} {} holds {}{tail}",
+                dir.display(),
                 p.display()
             ))
-        } else if repo.starts_with(&p_real) {
+        } else if dir.starts_with(&p_real) {
             Some(format!(
-                "the repository {} is in {}: twr does not read it",
-                repo.display(),
+                "the {what} {} is in {}{tail}",
+                dir.display(),
                 p.display()
             ))
         } else {
@@ -1084,8 +1108,30 @@ pub fn repo_refusal(repo: &Path, home: Option<&Path>, protected: &[PathBuf]) -> 
 /// agent folder (`.ssh`, `.config`, `.claude`, `.local/share/twr`, ...: the names
 /// [`protected_dirs`] lists under a home folder).
 pub fn remote_repo_refusal(repo: &Path) -> Option<String> {
+    remote_dir_refusal("repository", repo)
+}
+
+/// Why a paired device without `admin` may not start a thread in `dir`, a folder outside git
+/// on another box: by [`remote_repo_refusal`]'s rule, for the folder itself. A path with a
+/// `..` in it is refused too, since its shape then says nothing (a repository's path comes
+/// from git, resolved; this one is as the device gave it).
+pub fn remote_folder_refusal(dir: &Path) -> Option<String> {
+    if dir
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Some(format!(
+            "the folder {} is named through `..`: give its own path",
+            dir.display()
+        ));
+    }
+    remote_dir_refusal("folder", dir)
+}
+
+/// [`remote_repo_refusal`] and [`remote_folder_refusal`]: `what` names `dir` in the refusal.
+fn remote_dir_refusal(what: &str, dir: &Path) -> Option<String> {
     use std::path::Component;
-    let parts: Vec<String> = repo
+    let parts: Vec<String> = dir
         .components()
         .filter_map(|c| match c {
             Component::Normal(p) => Some(p.to_string_lossy().into_owned()),
@@ -1100,8 +1146,8 @@ pub fn remote_repo_refusal(repo: &Path) -> Option<String> {
     };
     if home_shaped {
         return Some(format!(
-            "the repository {} is the root or a home folder",
-            repo.display()
+            "the {what} {} is the root or a home folder",
+            dir.display()
         ));
     }
     let private = parts.iter().enumerate().any(|(i, p)| {
@@ -1112,8 +1158,8 @@ pub fn remote_repo_refusal(repo: &Path) -> Option<String> {
     });
     private.then(|| {
         format!(
-            "the repository {} is in a credentials or agent folder",
-            repo.display()
+            "the {what} {} is in a credentials or agent folder",
+            dir.display()
         )
     })
 }
@@ -1648,7 +1694,59 @@ mod tests {
             "/opt/configs",
         ] {
             assert_eq!(remote_repo_refusal(Path::new(fine)), None, "{fine}");
+            assert_eq!(remote_folder_refusal(Path::new(fine)), None, "{fine}");
         }
+        // A folder outside git, as a device named it: the same shapes, and no `..`.
+        for refused in [
+            "/",
+            "/home/me",
+            "/Users/me",
+            "/home/me/.ssh",
+            "/srv/x/../../home/me",
+            "/home/me/code/..",
+        ] {
+            let why = remote_folder_refusal(Path::new(refused));
+            assert!(
+                why.as_deref().is_some_and(|w| w.contains("the folder")),
+                "{refused}: {why:?}"
+            );
+        }
+    }
+
+    /// A folder outside git on this computer is held to a repository's rule: not the home
+    /// folder nor one that holds it, and neither holding nor in a protected folder.
+    #[test]
+    fn a_plain_folder_is_refused_as_a_repository_would_be() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let home = root.join("home");
+        let data = home.join("data");
+        let notes = home.join("notes");
+        let elsewhere = root.join("elsewhere");
+        for d in [&data, &notes, &elsewhere, &data.join("inner")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let protected = vec![data.clone()];
+        let refusal = |d: &Path| folder_refusal(d, Some(&home), &protected);
+        for refused in [&home, &root, &data, &data.join("inner")] {
+            let why = refusal(refused);
+            assert!(
+                why.as_deref().is_some_and(|w| w.starts_with("the folder")),
+                "{}: {why:?}",
+                refused.display()
+            );
+        }
+        for fine in [&notes, &elsewhere] {
+            assert_eq!(refusal(fine), None, "{}", fine.display());
+        }
+        // A repository's refusal reads as before.
+        assert_eq!(
+            repo_refusal(&home, Some(&home), &protected),
+            Some(format!(
+                "the repository {} holds the home folder: twr does not read it",
+                home.display()
+            ))
+        );
     }
 
     #[test]

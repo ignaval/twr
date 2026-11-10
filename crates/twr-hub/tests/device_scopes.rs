@@ -727,15 +727,16 @@ async fn spawned(hub: &Hub, id: &str, req: NewThread, caller: &Caller) -> Result
     Ok(status)
 }
 
-/// A paired device without `admin` starts a thread only where the orchestrator may: a
-/// configured project, or a git repository outside the home folder's private folders and
-/// twr's own data. Directly (`thread.new`), in the background (`thread.spawn`) and through a
-/// typed `new <dir>: ...` in `say`, a folder outside git, the home folder and a repository in
-/// the hub's data are refused (`unauthorized`, saying what to do instead), operate's and
-/// terminal's alike; a device with `admin`, and the local user, start them. The orchestrator,
-/// acting on any message, is refused them as before.
+/// A paired device without `admin` starts a thread in a configured project, or in a folder or
+/// git repository that is not, and does not hold, the home folder, and is outside its private
+/// folders and twr's own data. Directly (`thread.new`), in the background (`thread.spawn`) and
+/// through a typed `new <dir>: ...` in `say`, the home folder, a folder that holds it, a
+/// repository or a plain folder in the hub's data are refused (`unauthorized`, saying what to
+/// do instead), operate's and terminal's alike; a plain folder elsewhere is not. A device
+/// with `admin`, and the local user, start them all. The orchestrator, acting on any message,
+/// is refused a folder outside git as before.
 #[tokio::test]
-async fn a_device_without_admin_starts_threads_only_where_the_orchestrator_may() {
+async fn a_device_without_admin_starts_threads_only_outside_the_home_and_data_folders() {
     let mut env = Env::new();
     let hub = env.hub().await;
     let d = env.devices();
@@ -743,8 +744,15 @@ async fn a_device_without_admin_starts_threads_only_where_the_orchestrator_may()
     std::fs::create_dir_all(&plain).unwrap();
     let in_data = env.path().join("data").join("inner");
     init_repo(&in_data);
+    let plain_in_data = env.path().join("data").join("plain");
+    std::fs::create_dir_all(&plain_in_data).unwrap();
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut barred = vec![plain.clone(), in_data.clone()];
+    let mut barred = vec![in_data.clone(), plain_in_data.clone()];
+    barred.extend(
+        home.as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
+    );
     barred.extend(home.clone());
     let refused = |r: Result<Value, RpcError>, dir: &Path| {
         let e = r.unwrap_err();
@@ -767,15 +775,34 @@ async fn a_device_without_admin_starts_threads_only_where_the_orchestrator_may()
             let said = format!("new {}: hello", dir.display());
             refused(hub.say(&said, None, device).await, dir);
         }
-        // Where the orchestrator may: the test's repository.
+        // Where it may: the test's repository, and a plain folder clear of those.
         hub.new_thread_by(in_dir(Path::new(&env.project())), device)
             .await
             .unwrap();
+        hub.new_thread_by(in_dir(&plain), device).await.unwrap();
+        n += 1;
+        spawned(&hub, &format!("op-{n}"), in_dir(&plain), device)
+            .await
+            .unwrap();
+        let said = format!("new {}: hello", plain.display());
+        let r = hub.say(&said, None, device).await.unwrap();
+        assert_eq!(r["action"], "new_thread", "{r}");
     }
-    assert!(hub
-        .list_threads()
-        .iter()
-        .all(|t| t["worktree"].as_str() != Some(&*plain.to_string_lossy())));
+    // A path that names no folder is no thread's, whatever it would resolve to.
+    let missing = env.path().join("missing").join("..").join("plain");
+    hub.new_thread_by(in_dir(&missing), &d.operate)
+        .await
+        .unwrap_err();
+    // Nothing started in a barred folder.
+    for dir in &barred {
+        assert!(
+            hub.list_threads()
+                .iter()
+                .all(|t| t["worktree"].as_str() != Some(&*dir.to_string_lossy())),
+            "{}",
+            dir.display()
+        );
+    }
     // `admin`, and the local user, are not held to it (not in the home folder here: the
     // thread would be real).
     for caller in [&d.admin, &tui()] {

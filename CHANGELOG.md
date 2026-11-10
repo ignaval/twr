@@ -122,7 +122,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - Desktop: AppImage self-updates install only an image listed in the release's signed `desktop-sha256sums.txt`, checked with the twr release key; a release without that signature is offered as a manual download.
 - A paired device's requests are refused with an error to try again while the hub cannot read the device list, instead of being served on the access it had when it connected.
 - A runner whose inventory names something that is not a thread id is refused before the welcome.
-- A paired device without admin access starts threads only where the orchestrator may: a configured project, or a git repository clear of the home folder, twr's data and credentials folders.
+- A paired device without admin access starts threads only in a configured project, or in a folder or git repository that is not, and does not hold, the home folder and is clear of twr's data and credentials folders. A folder outside git is allowed, which the orchestrator is still refused.
 
 ## [0.3.0] - 2026-10-30
 
