@@ -1,4 +1,5 @@
 import { clientProtocol } from "../../scripts/client-protocol.mjs";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
@@ -707,6 +708,7 @@ for (const [
       stdio: "ignore",
     });
     await delay(250);
+    stopFixture(join(bin, "twr"), env);
     rmSync(fixture, { recursive: true, force: true });
   }
 }

@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from "node:child_process";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { expect } from "@playwright/test";
@@ -287,5 +288,8 @@ export async function multiHubQA({
     gateway?.kill();
     hub?.kill();
     workHub?.kill();
+    stopFixture(join(bin, "twr"), remoteEnv, {
+      workspaces: ["default", "work"],
+    });
   }
 }

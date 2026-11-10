@@ -1,6 +1,7 @@
 // Real Electron + real Rust hub + twr's deterministic test adapter. No provider account,
 // user's config, network agent, or existing workspace is touched.
 import { performanceAudit } from "./performance.mjs";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, chromium } from "@playwright/test";
 import { createServer } from "node:net";
 import { spawn, execFileSync } from "node:child_process";
@@ -1195,6 +1196,8 @@ try {
       new Promise((resolve) => hub.once("exit", resolve)),
       new Promise((resolve) => setTimeout(resolve, 5000)),
     ]);
+  // The hubs are stopped; then the runner service of this home, if a hub started one.
+  stopFixture(join(bin, "twr"), env, { workspaces: [] });
   rmSync(home, {
     recursive: true,
     force: true,

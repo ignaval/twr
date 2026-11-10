@@ -62,6 +62,13 @@ cleanup() {
     kill -- -"$launcher" 2>/dev/null || true
     wait "$launcher" 2>/dev/null || true
   fi
+  # The hub the app started outlives it, and so does the runner service that hub started
+  # for this TWR_HOME (docs/runner-links.md): stop both, the hub first.
+  for command in "hub stop" "runner stop"; do
+    # shellcheck disable=SC2086 # two words on purpose
+    runuser -u twr-runtime -- env HOME=/home/twr-runtime TWR_HOME="$fixture" \
+      timeout 20 /opt/twr/resources/bin/twr $command > /dev/null 2>&1 || true
+  done
   cat /tmp/twr-runtime-application.log 2>/dev/null || true
 }
 trap cleanup EXIT

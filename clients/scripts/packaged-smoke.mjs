@@ -1,6 +1,7 @@
 // Launch the actual release app through LaunchServices so macOS supplies a real user
 // process ancestry. This exercises production authentication, not the debug test token.
 import { performanceAudit } from "./performance.mjs";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { chromium } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import {
@@ -152,13 +153,7 @@ async function freePort() {
   } finally {
     const pid = launcherPID(release, userData, port);
     if (pid) process.kill(pid, "SIGKILL");
-    try {
-      execFileSync(twr, ["hub", "stop"], {
-        env: hubEnv,
-        stdio: "ignore",
-        timeout: 15000,
-      });
-    } catch {}
+    stopFixture(twr, hubEnv);
   }
 }
 // The copy under test, with the marker. It is not re-signed: the added file breaks the
@@ -726,6 +721,12 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
+  // Then the runner service the app's release hub started for this home.
+  stopFixture(
+    join(resources, "bin/twr"),
+    { ...process.env, HOME: fixture, TWR_HOME: fixture },
+    { workspaces: [] },
+  );
   rmSync(fixture, {
     recursive: true,
     force: true,

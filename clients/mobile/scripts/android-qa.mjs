@@ -1,4 +1,5 @@
 import { _android, expect } from "@playwright/test";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import { createServer, connect as connectTCP } from "node:net";
 import { Transform } from "node:stream";
@@ -1894,6 +1895,7 @@ try {
     } catch {}
   }
   await new Promise((r) => setTimeout(r, 1500));
+  stopFixture(join(bin, "twr"), env);
   rmSync(fixture, {
     recursive: true,
     force: true,
