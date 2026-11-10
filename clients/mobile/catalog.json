@@ -3705,6 +3705,13 @@
         "type": "boolean",
         "description": "Print JSON",
         "advanced": true
+      },
+      {
+        "key": "detail",
+        "label": "detail",
+        "type": "boolean",
+        "description": "With --json: also print what each running hub listed, its `thread.list` and `attention.list` (`detail`), when it recognizes this process as your user, or why not (`detail_error`). Waits up to 3 s per hub instead of 1 s",
+        "advanced": false
       }
     ],
     "cli": [
@@ -3715,6 +3722,12 @@
       {
         "key": "json",
         "flag": "--json",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "detail",
+        "flag": "--detail",
         "many": false,
         "separator": false
       }
