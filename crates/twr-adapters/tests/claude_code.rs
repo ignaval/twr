@@ -2895,14 +2895,29 @@ async fn driver_answers_unsupported_control_requests_with_an_error() {
 async fn stop_is_not_blocked_by_a_runtime_that_stops_reading_stdin() {
     let dir = tempfile::tempdir().unwrap();
     // Never reads stdin, ignores TERM: a 256 KiB prompt fills the pipe and the write blocks.
-    let bin = script(dir.path(), "trap '' TERM; while :; do sleep 1; done");
+    let ready = dir.path().join("ready");
+    let bin = script(
+        dir.path(),
+        &format!(
+            "trap '' TERM; : > '{}'; while :; do sleep 1; done",
+            ready.display()
+        ),
+    );
     let grace = Duration::from_millis(500);
     let mut h = ClaudeCodeAdapter::with_bin(&bin)
         .stop_grace(grace)
         .spawn(SpawnConfig::default(), Some("x".repeat(256 * 1024)))
         .unwrap();
     let mut rx = h.take_events().unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The process starts once the binary's `--help` is read: a stop before that cancels the
+    // start (a stop's exit, code 0) and tests nothing here. Wait until it runs, ignoring TERM.
+    timeout(WAIT, async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the runtime never started");
     // More queued input must not block the driver either.
     h.send("y".repeat(256 * 1024), 2).unwrap();
     let stopped = std::time::Instant::now();

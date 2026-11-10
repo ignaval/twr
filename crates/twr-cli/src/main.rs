@@ -8442,7 +8442,7 @@ async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Resul
 
 /// The exclusive lock on workspace `ws`'s data directory (`twr.lock`, which its hub holds
 /// while it runs); `None` when a hub holds it.
-fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<std::fs::File>> {
+fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<WorkspaceLock>> {
     let path = ws.data_dir.join(twr_hub::LOCK_FILE);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -8452,13 +8452,26 @@ fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<std::fs::File>> {
         .with_context(|| format!("opening {}", path.display()))?;
     // Also `None` when the file left its path before it was locked (another `ws rm`): a hub
     // may hold the new one's.
-    twr_hub::lock_opened(file, &path)
+    Ok(twr_hub::lock_opened(file, &path)?.map(WorkspaceLock))
+}
+
+/// A workspace's lock taken by [`lock_workspace`], let go when this is dropped: unlocked, not
+/// only closed. A process another thread starts meanwhile shares the open file until it execs
+/// (or for good, without exec), and the lock stays on the file while anyone has it open: a
+/// workspace merely looked at would then seem to have a running hub, to this process's next
+/// look and to a hub starting there.
+struct WorkspaceLock(std::fs::File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 enum StopWorkspaceLock {
     Missing,
     Held,
-    Free(std::fs::File),
+    Free(WorkspaceLock),
 }
 
 /// A workspace removed after discovery (or during this open) has no hub. Other filesystem

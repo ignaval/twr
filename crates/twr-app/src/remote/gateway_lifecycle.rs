@@ -219,7 +219,23 @@ fn runtime_dir() -> Option<PathBuf> {
     }
 }
 
-fn lock_file(dir: &Path) -> Result<File> {
+/// `gateway.lock`, opened by [`lock_file`]: unlocked when dropped, not only closed. A process
+/// another thread starts meanwhile shares the open file until it execs, and a lock stays on
+/// the file while anyone has it open: a gateway that stopped, or a lock merely tried, would
+/// still seem held, to `info` (which then reads metadata that is gone) and to the next gateway.
+struct LockFile(File);
+impl std::ops::Deref for LockFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+fn lock_file(dir: &Path) -> Result<LockFile> {
     private_dir(dir)?;
     let file = OpenOptions::new()
         .read(true)
@@ -236,7 +252,7 @@ fn lock_file(dir: &Path) -> Result<File> {
             && metadata.permissions().mode() & 0o077 == 0,
         "Unsafe gateway lock"
     );
-    Ok(file)
+    Ok(LockFile(file))
 }
 fn read_info(dir: &Path) -> Result<Info> {
     let file = OpenOptions::new()
@@ -388,7 +404,7 @@ impl Metadata {
     }
 }
 pub struct Lifecycle {
-    _lock: File,
+    _lock: LockFile,
     metadata: Metadata,
     administration: tokio::task::JoinHandle<()>,
     stopping: watch::Receiver<bool>,
