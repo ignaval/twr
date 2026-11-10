@@ -14,32 +14,67 @@ export function coalesceInboxSources(refresh: () => Promise<InboxSource[]>) {
         pending = undefined;
       }));
 }
+/** A CLI from before `twr ws list --detail` refuses the flag (clap's usage error). */
+function refusesDetail(error: unknown) {
+  const stderr = String((error as { stderr?: unknown })?.stderr ?? "");
+  return /unexpected argument '--detail'/.test(stderr);
+}
+/** A row of an earlier listing, without what its hub listed then: that is read again. */
+function withoutDetail(row: unknown) {
+  if (!row || typeof row !== "object") return row;
+  const rest: Record<string, unknown> = { ...row };
+  delete rest.detail;
+  delete rest.detail_error;
+  return rest;
+}
 /**
- * The workspace list for a refresh. `twr ws list` asks every hub in turn, so a
- * single busy hub can make it slow: it gets one overall budget, and a listing
- * that fails or runs out of time falls back to the last one that worked.
+ * The workspace list for a refresh, from `twr ws list --json --detail`: each running hub's
+ * threads and requests come with it, read once, so the refresh needs no connection of its
+ * own. A CLI without `--detail` is listed without it, and its workspaces are read one by one
+ * as before. The listing gets one overall budget (one busy hub can make it slow), and a
+ * listing that fails or runs out of time falls back to the last one that worked, without what
+ * the hubs listed then.
  */
 export class WorkspaceListing {
   private last?: unknown[];
+  private detail = true;
   constructor(
-    private readonly list: (timeoutMs: number) => Promise<unknown>,
+    private readonly list: (
+      timeoutMs: number,
+      detail: boolean,
+    ) => Promise<unknown>,
     private readonly budgetMs = 5000,
   ) {}
+  private async read(): Promise<unknown> {
+    if (!this.detail) return this.list(this.budgetMs, false);
+    try {
+      return await this.list(this.budgetMs, true);
+    } catch (error) {
+      if (!refusesDetail(error)) throw error;
+      this.detail = false;
+      return this.list(this.budgetMs, false);
+    }
+  }
   async get(): Promise<unknown[]> {
     try {
-      const value: any = await this.list(this.budgetMs);
+      const value: any = await this.read();
       const workspaces = Array.isArray(value) ? value : value?.workspaces;
       if (!Array.isArray(workspaces))
         throw new Error("Invalid workspace listing");
       this.last = workspaces;
       return workspaces;
     } catch (error) {
-      if (this.last) return this.last;
+      if (this.last) return this.last.map(withoutDetail);
       throw error;
     }
   }
 }
-/** Short-lived read connections leave the active workspace and its terminals alone. */
+/**
+ * One source per listed workspace. A row with `detail` (or `detail_error`) was read by the
+ * listing itself; any other running workspace (an older CLI's listing, or the last good one)
+ * is read over a short-lived read-only connection, which leaves the active workspace and its
+ * terminals alone.
+ */
 export async function localInboxSources(
   workspaces: unknown,
   reader: (workspace: string) => Reader,
@@ -55,26 +90,37 @@ export async function localInboxSources(
     );
   const names = [...listing.keys()];
   const sources: InboxSource[] = new Array(names.length);
+  const base = (workspace: string): InboxSource => ({
+    hubId: "local",
+    hubName: "This computer",
+    workspace,
+    attention: [],
+    threads: [],
+  });
+  const unread: number[] = [];
+  names.forEach((workspace, index) => {
+    const row = listing.get(workspace);
+    if (row?.hub === "stopped")
+      sources[index] = { ...base(workspace), running: false };
+    else if (row?.detail !== undefined) {
+      const { attention, threads } = row.detail ?? {};
+      sources[index] =
+        Array.isArray(attention) && Array.isArray(threads)
+          ? { ...base(workspace), attention, threads }
+          : { ...base(workspace), error: "Invalid workspace summary" };
+    } else if (typeof row?.detail_error === "string")
+      sources[index] = { ...base(workspace), error: row.detail_error };
+    else unread.push(index);
+  });
   let next = 0;
   const deadline = Date.now() + Math.max(0, budgetMs);
   async function worker() {
-    while (next < names.length) {
-      const index = next++;
+    while (next < unread.length) {
+      const index = unread[next++];
       const workspace = names[index];
-      const base: InboxSource = {
-        hubId: "local",
-        hubName: "This computer",
-        workspace,
-        attention: [],
-        threads: [],
-      };
-      if (listing.get(workspace)?.hub === "stopped") {
-        sources[index] = { ...base, running: false };
-        continue;
-      }
       if (Date.now() >= deadline) {
         sources[index] = {
-          ...base,
+          ...base(workspace),
           error: "Summary not checked before refresh deadline",
         };
         continue;
@@ -97,7 +143,7 @@ export async function localInboxSources(
             ]);
             if (!Array.isArray(attention) || !Array.isArray(threads))
               throw new Error("Invalid workspace summary");
-            return { ...base, attention, threads };
+            return { ...base(workspace), attention, threads };
           })(),
           new Promise<never>((_, reject) => {
             const remaining = Math.max(
@@ -126,7 +172,7 @@ export async function localInboxSources(
             message,
           );
         sources[index] = {
-          ...base,
+          ...base(workspace),
           ...(stopped ? { running: false } : { error: message }),
         };
       } finally {
@@ -135,6 +181,6 @@ export async function localInboxSources(
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(4, names.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(4, unread.length) }, worker));
   return sources;
 }

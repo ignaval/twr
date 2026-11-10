@@ -93,6 +93,10 @@ const RELEASE_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long one probe waits for `hub.info`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long `twr ws list --detail` waits for each hub: as long as the desktop app gave each
+/// workspace's own read-only connection before it read them all through this listing.
+const DETAIL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Page size for non-following `events` / `control`.
 const PAGE: u64 = 1000;
 
@@ -991,6 +995,11 @@ enum WsCmd {
         /// Print JSON.
         #[arg(long)]
         json: bool,
+        /// With --json: also print what each running hub listed, its `thread.list` and
+        /// `attention.list` (`detail`), when it recognizes this process as your user, or why
+        /// not (`detail_error`). Waits up to 3 s per hub instead of 1 s.
+        #[arg(long, requires = "json")]
+        detail: bool,
     },
     /// Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit).
     /// Its hub starts on first use: `twr -w <name>`.
@@ -7820,12 +7829,15 @@ async fn control(socket: &Path, follow: bool, since: u64, pretty: bool) -> anyho
 
 /// `twr ws`: lists, creates or removes the root's workspaces (whichever workspace `paths` is in).
 async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
-    let cmd = cmd.unwrap_or(WsCmd::List { json: false });
+    let cmd = cmd.unwrap_or(WsCmd::List {
+        json: false,
+        detail: false,
+    });
     if matches!(cmd, WsCmd::Rm { .. }) {
         refuse_agent()?;
     }
     match cmd {
-        WsCmd::List { json } => ws_list(paths, json).await,
+        WsCmd::List { json, detail } => ws_list(paths, json, detail).await,
         WsCmd::New { name } => ws_new(paths, &name),
         WsCmd::Rm { name, yes } => {
             // As for `twr trash empty`: only a terminal can confirm, else --yes.
@@ -7836,7 +7848,7 @@ async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
 }
 
 /// `twr ws list`: every workspace (`default` first), with what its hub reports when it runs.
-async fn ws_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
+async fn ws_list(paths: &Paths, json: bool, detail: bool) -> anyhow::Result<()> {
     let root = paths.root();
     // The root's config: its `hub.socket` is the `default` workspace's socket.
     let config = Config::load_from(&root)?;
@@ -7845,10 +7857,18 @@ async fn ws_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
         root.named_workspaces()
             .with_context(|| format!("listing {}", root.workspaces_dir().display()))?,
     );
+    // Every hub is asked at once: a slow one delays the listing by its own wait only.
+    let mut probes = Vec::new();
+    for name in &names {
+        let socket = config.socket_path(&root.workspace(name)?);
+        let name = name.clone();
+        probes.push(tokio::spawn(async move {
+            ws_status(&socket, &name, detail).await
+        }));
+    }
     let mut rows = Vec::new();
-    for name in names {
-        let ws = root.workspace(&name)?;
-        let mut row = ws_status(&config.socket_path(&ws), &name).await;
+    for (name, probe) in names.into_iter().zip(probes) {
+        let mut row = probe.await?;
         row["name"] = json!(name);
         row["current"] = json!(name == paths.workspace_name());
         rows.push(row);
@@ -7891,27 +7911,64 @@ async fn ws_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
 /// used (another user's, say), `"busy"` when it does not answer in time, `"other"` when it
 /// serves another workspace, else `"running"` with its worker threads, how many run, and how
 /// many items block on you.
-async fn ws_status(socket: &Path, name: &str) -> Value {
+///
+/// With `detail` (`twr ws list --json --detail`, the desktop app's one read of every workspace
+/// per refresh) it waits [`DETAIL_PROBE_TIMEOUT`], and a row whose hub isn't stopped also has
+/// `detail`, `{"threads": <thread.list>, "attention": <attention.list {all: true}>}` as the
+/// hub answered them, or `detail_error`, why not. `detail` needs the hub to have recognized
+/// this process as the user (`hello`'s `identity` is `user:...`), as the desktop's read-only
+/// companion does: what it lists never goes past what that companion could read.
+async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
+    let unread = |mut row: Value, why: &str| {
+        if detail {
+            row["detail_error"] = json!(why);
+        }
+        row
+    };
     let mut c = match Client::connect(socket).await {
         Ok(c) => c,
         Err(e) if nothing_listens(&e) => return json!({ "hub": "stopped" }),
-        Err(e) if backlog_full(&e) => return json!({ "hub": "busy" }),
-        Err(e) => return json!({ "hub": "error", "error": format!("{e:#}") }),
+        Err(e) if backlog_full(&e) => {
+            return unread(
+                json!({ "hub": "busy" }),
+                "Workspace is too busy to answer (its socket's backlog is full)",
+            )
+        }
+        Err(e) => {
+            let error = format!("{e:#}");
+            return unread(json!({ "hub": "error", "error": error }), &error);
+        }
     };
-    let answer = tokio::time::timeout(PROBE_TIMEOUT, async {
+    let wait = if detail {
+        DETAIL_PROBE_TIMEOUT
+    } else {
+        PROBE_TIMEOUT
+    };
+    let answer = tokio::time::timeout(wait, async {
         let hello = c.hello(json!({ "client": "cli" })).await?;
         if !hub_serves(&hello, name) {
             return Ok(None);
         }
+        let user = hello["identity"]
+            .as_str()
+            .is_some_and(|i| i.starts_with("user:"));
         let threads = c.call("thread.list", Value::Null).await?;
         let items = c.call("attention.list", json!({ "all": true })).await?;
-        anyhow::Ok(Some((threads, items)))
+        anyhow::Ok(Some((threads, items, user)))
     })
     .await;
-    let (threads, items) = match answer {
+    let (threads, items, user) = match answer {
         Ok(Ok(Some(answer))) => answer,
-        Ok(Ok(None)) => return json!({ "hub": "other" }),
-        _ => return json!({ "hub": "busy" }),
+        Ok(Ok(None)) => {
+            return unread(json!({ "hub": "other" }), "Socket serves another workspace")
+        }
+        Ok(Err(e)) => return unread(json!({ "hub": "busy" }), &format!("{e:#}")),
+        Err(_) => {
+            return unread(
+                json!({ "hub": "busy" }),
+                "Workspace did not answer within 3 seconds",
+            )
+        }
     };
     let workers: Vec<&Value> = threads
         .as_array()
@@ -7929,12 +7986,24 @@ async fn ws_status(socket: &Path, name: &str) -> Value {
         .flatten()
         .filter(|i| is_blocking(i))
         .count();
-    json!({
+    let row = json!({
         "hub": "running",
         "threads": workers.len(),
         "running": running,
         "waiting": waiting,
-    })
+    });
+    match (detail, user) {
+        (false, _) => row,
+        (true, true) => {
+            let mut row = row;
+            row["detail"] = json!({ "threads": threads, "attention": items });
+            row
+        }
+        (true, false) => unread(
+            row,
+            "The hub did not recognize this process as your user. Open twr from your desktop launcher or a terminal of your own.",
+        ),
+    }
 }
 
 /// `twr ws new`: makes the workspace's data directory (private, like every data directory).
@@ -8901,6 +8970,75 @@ mod tests {
         assert!(e.contains("sent more than"), "{e}");
         let e = run(&[b"<!doctype html>"], len).unwrap_err().to_string();
         assert!(e.contains("did not send a whisper model"), "{e}");
+    }
+
+    /// `twr ws list --detail` prints a hub's lists only to a process the hub took for the user,
+    /// as the desktop's read-only companion reads them: an agent's gets the counts it always
+    /// got and why there is no detail. It reads each hub once, and only the two lists.
+    #[tokio::test]
+    async fn ws_detail_needs_the_hub_to_take_this_process_for_the_user() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (identity, workspace, detail) in [
+            ("user:cli", "review", true),
+            ("thread:api", "review", false),
+            ("user:cli", "other", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hub.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let mut methods = Vec::new();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap().to_owned();
+                    let result = match method.as_str() {
+                        "hello" => json!({"identity": identity, "workspace": workspace}),
+                        "attention.list" => {
+                            assert_eq!(request["params"], json!({"all": true}));
+                            json!([{"attn_id": "a1", "reason": "question", "revision": 3}])
+                        }
+                        "thread.list" => json!([{"id": "t1", "name": "api", "status": "idle"}]),
+                        _ => panic!("ws list called {method}"),
+                    };
+                    methods.push(method);
+                    let line = json!({"id": request["id"], "result": result}).to_string() + "\n";
+                    writer.write_all(line.as_bytes()).await.unwrap();
+                }
+                methods
+            });
+            let row = ws_status(&path, "review", true).await;
+            let calls = server.await.unwrap();
+            if workspace == "other" {
+                assert_eq!(
+                    row,
+                    json!({"hub": "other", "detail_error": "Socket serves another workspace"})
+                );
+                assert_eq!(calls, ["hello"]);
+                continue;
+            }
+            assert_eq!(calls, ["hello", "thread.list", "attention.list"]);
+            assert_eq!(row["hub"], "running");
+            assert_eq!(row["threads"], 1);
+            assert_eq!(row["waiting"], 1);
+            if detail {
+                assert_eq!(row["detail"]["threads"][0]["name"], "api");
+                assert_eq!(row["detail"]["attention"][0]["attn_id"], "a1");
+                assert!(row.get("detail_error").is_none(), "{row}");
+            } else {
+                assert!(row.get("detail").is_none(), "{row}");
+                assert!(
+                    row["detail_error"].as_str().unwrap().contains("your user"),
+                    "{row}"
+                );
+            }
+        }
+        // A stopped hub is said by `hub` alone.
+        let dir = tempfile::tempdir().unwrap();
+        let row = ws_status(&dir.path().join("none.sock"), "review", true).await;
+        assert_eq!(row, json!({"hub": "stopped"}));
     }
 
     /// `twr ws rm` asks before it removes anything, naming what goes: anything but y/yes keeps
@@ -11536,7 +11674,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("hub.sock");
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Absent);
-        assert_eq!(ws_status(&sock, "default").await["hub"], "stopped");
+        assert_eq!(ws_status(&sock, "default", false).await["hub"], "stopped");
         // A socket file nobody listens on: connection refused (once the forks of this process
         // made meanwhile, which hold the listener too, have exec'd).
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
@@ -11549,7 +11687,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Absent);
-        assert_eq!(ws_status(&sock, "default").await["hub"], "stopped");
+        assert_eq!(ws_status(&sock, "default", false).await["hub"], "stopped");
         std::fs::remove_file(&sock).unwrap();
         slow_hub(&sock, Duration::from_secs(60));
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Busy);
@@ -11574,9 +11712,13 @@ mod tests {
         ] {
             let e = format!("{:#}", probe_hub(&sock).await.unwrap_err());
             assert!(e.contains(why), "{e}");
-            let status = ws_status(&sock, "default").await;
+            let status = ws_status(&sock, "default", false).await;
             assert_eq!(status["hub"], "error", "{status}");
             assert!(status["error"].as_str().unwrap().contains(why), "{status}");
+            assert!(status.get("detail_error").is_none(), "{status}");
+            // `--detail` says why there is no detail: the same reason.
+            let status = ws_status(&sock, "default", true).await;
+            assert_eq!(status["detail_error"], status["error"], "{status}");
         }
     }
 

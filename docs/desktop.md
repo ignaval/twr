@@ -40,8 +40,9 @@ running. Under each workspace are its **Orchestrator** and its threads. The curr
 workspace shows its full thread cards (with the focus filter and parked toggle). Other
 workspaces list up to six threads that aren't parked, as their hub last reported them:
 those waiting on you first, then failed, then working, the last row `+N more` when there
-are more. While the sidebar shows, the app re-reads the other workspaces every 15 seconds
-over short-lived read-only connections; it never starts a stopped hub to read it.
+are more. While the sidebar shows, the app re-reads the other workspaces every 15 seconds,
+all of them with one `twr ws list --json --detail`, which asks each running hub once; it
+never starts a stopped hub to read it.
 
 Choosing an orchestrator or a thread in another workspace switches to that workspace and
 opens it there, with no separate switch. A click selects a thread (its inspector), a
@@ -145,9 +146,8 @@ shown workspace's first, under their workspace's name when there are several) an
 quick actions for a new thread, Launch at Login, background mode, updates and Quit.
 Choosing an item shows the window, switches to its workspace and opens it in Needs you.
 The Dock icon (macOS) and Unity-style launchers (Linux) show the same count as a badge.
-The shown workspace's items are live; the others' are read every 15 seconds over
-short-lived read-only connections, as the sidebar reads them, also while the window is
-hidden. A stopped hub is not started to ask it.
+The shown workspace's items are live; the others' are read every 15 seconds, as the
+sidebar reads them, also while the window is hidden. A stopped hub is not started to ask it.
 On Linux the icon needs a StatusNotifierItem host: Waybar's `tray` module on Omarchy,
 KDE Plasma, or GNOME with the AppIndicator extension. Without one, Settings says so
 and background mode stays off, so the window can always be brought back.
@@ -391,8 +391,12 @@ Other workspaces show a summary with an Open action. Open the workspace before
 answering so the full live request and its current revision can be reviewed. Saved
 summaries for disconnected hubs are labeled; they cannot authorize a response.
 Refresh reads each running workspace without moving your active conversation.
-Only one refresh runs at a time. Listing the workspaces may take up to 5 seconds (it asks
-each hub in turn); if it takes longer or fails, the refresh uses the last list that worked.
+Only one refresh runs at a time. It lists the workspaces with `twr ws list --json --detail`,
+which asks every hub at once for its threads and requests and waits up to 3 seconds for
+each, so the refresh opens no connection of its own. If the listing takes longer than 5
+seconds or fails, the refresh uses the last list that worked and reads each running
+workspace over a short-lived read-only connection, as it does with a CLI too old for
+`--detail`.
 
 ### Search saved conversations
 

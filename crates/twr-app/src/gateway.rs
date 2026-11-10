@@ -667,6 +667,9 @@ mod socket_tests {
             &["ws"],
             &["ws", "ls"],
             &["ws", "list", "--json", "--json"],
+            // What each hub lists, read with the gateway's own user authority: never a device's.
+            &["ws", "list", "--json", "--detail"],
+            &["ws", "list", "--detail", "--json"],
             &["ws", "list", "extra"],
             &["ws", "rm", "work"],
             &["ws", "rm", "work", "--yes"],
@@ -1709,7 +1712,8 @@ impl Session {
 ///   (connecting to a workspace with operate starts its hub, creating it).
 ///
 /// Nothing else, whatever the scope: no other subcommand (a thread, a runtime, a mode, a box,
-/// configuration), no other flag (`--socket`, `-w`, `--`, `--help`), no other argument. What
+/// configuration), no other flag (`--socket`, `-w`, `--`, `--help`, `ws list --detail`, which
+/// would print every hub's threads and requests as the user reads them), no other argument. What
 /// else a device runs through the CLI it runs in an embedded terminal (`terminal-open`), which
 /// needs `terminal`.
 fn device_cli_args(device: &Device, args: &[String]) -> Result<()> {
