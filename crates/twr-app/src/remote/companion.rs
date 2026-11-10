@@ -153,6 +153,9 @@ impl Drop for Companion {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    /// How long a call waits for a reply the fixture gives: the fixture is a shell script,
+    /// which a loaded machine can take over a second to start. A reply ends the wait.
+    const REPLY_WAIT: Duration = Duration::from_secs(20);
     async fn fixture(reply: Option<Value>) -> (tempfile::TempDir, Companion) {
         let directory = tempfile::tempdir().unwrap();
         let binary = directory.path().join("companion");
@@ -177,10 +180,13 @@ mod tests {
     async fn typed_rpc_rejections_survive_the_stdio_boundary() {
         let(_directory,companion)=fixture(Some(json!({"id":1,"error":"Invalid filename","rpc_error":{"code":"upload_rejected","message":"Invalid filename"}}))).await;
         let error = companion
-            .call_with_timeout("thread.upload", json!({}), Duration::from_secs(1))
+            .call_with_timeout("thread.upload", json!({}), REPLY_WAIT)
             .await
             .unwrap_err();
-        assert!(super::super::upload::definite_rejection(&error));
+        assert!(
+            super::super::upload::definite_rejection(&error),
+            "{error:#}"
+        );
     }
     #[tokio::test]
     async fn plain_errors_and_timeouts_are_uncertain_and_pending_replies_are_released() {
@@ -189,9 +195,10 @@ mod tests {
         ))
         .await;
         let error = companion
-            .call_with_timeout("thread.upload", json!({}), Duration::from_secs(1))
+            .call_with_timeout("thread.upload", json!({}), REPLY_WAIT)
             .await
             .unwrap_err();
+        assert_eq!(error.to_string(), "upload_rejected text is not proof");
         assert!(!super::super::upload::definite_rejection(&error));
         let (_directory, companion) = fixture(None).await;
         let error = companion
