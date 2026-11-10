@@ -2479,6 +2479,198 @@ fn install_sh_checks_the_signature_of_the_checksums() {
     );
 }
 
+/// A throwaway ECDSA P-256 key, made by ring for one test: its pair, and its public key as the
+/// PEM install.sh holds (`SubjectPublicKeyInfo`: a fixed 26-byte header and the uncompressed
+/// point). Never written anywhere but the test's own temporary directory.
+fn p256_key() -> (ring::signature::EcdsaKeyPair, String) {
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let mut der = vec![
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    ];
+    der.extend_from_slice(pair.public_key().as_ref());
+    let body = twr_core::b64::encode(&der);
+    let lines: Vec<&str> = body
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    let pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+        lines.join("\n")
+    );
+    (pair, pem)
+}
+
+/// The base64 of `key`'s DER ECDSA signature of `data`, as the release workflow writes
+/// sha256sums.txt.p256.sig.
+fn p256_sign(key: &ring::signature::EcdsaKeyPair, data: &[u8]) -> String {
+    let rng = ring::rand::SystemRandom::new();
+    twr_core::b64::encode(key.sign(&rng, data).unwrap().as_ref())
+}
+
+/// `script` with the lines between `begin` and `end` (its key block) replaced by `with`.
+fn replace_block(script: &str, begin: &str, end: &str, with: &str) -> String {
+    let (head, rest) = script
+        .split_once(&format!("{begin}\n"))
+        .unwrap_or_else(|| panic!("install.sh has {begin}"));
+    let (_, tail) = rest
+        .split_once(&format!("{end}\n"))
+        .unwrap_or_else(|| panic!("install.sh has {end}"));
+    format!("{head}{begin}\n{with}{end}\n{tail}")
+}
+
+/// install.sh's P-256 path (what macOS's LibreSSL checks): run against a file:// release
+/// whose sha256sums.txt is signed with a throwaway P-256 key, by a copy of install.sh whose
+/// P-256 block holds that key and whose Ed25519 probe signature is left out, so that an
+/// OpenSSL that checks Ed25519 takes the P-256 path too. A good signature installs; a changed
+/// list, another key's signature, a missing one and one that is no signature are refused.
+/// Skipped where no openssl here checks ECDSA P-256 signatures.
+#[test]
+fn install_sh_checks_the_p256_signature_of_the_checksums() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key, pem) = p256_key();
+    let probe = p256_sign(&key, b"twr signature probe");
+    // Whether openssl here checks this key's signatures at all.
+    std::fs::write(tmp.path().join("pub.pem"), format!("{pem}\n")).unwrap();
+    std::fs::write(tmp.path().join("msg"), "twr signature probe").unwrap();
+    std::fs::write(
+        tmp.path().join("sig"),
+        twr_core::b64::decode(&probe).unwrap(),
+    )
+    .unwrap();
+    let usable = Command::new("openssl")
+        .args(["dgst", "-sha256", "-verify"])
+        .arg(tmp.path().join("pub.pem"))
+        .arg("-signature")
+        .arg(tmp.path().join("sig"))
+        .arg(tmp.path().join("msg"))
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !usable {
+        eprintln!("skipped: no openssl here checks ECDSA P-256 signatures");
+        return;
+    }
+
+    // install.sh with the test key in its P-256 block, and no Ed25519 probe signature, so
+    // that it finds no Ed25519 verifier (as with LibreSSL) whatever openssl this is.
+    let original = std::fs::read_to_string(install_sh()).unwrap();
+    let ed25519 = original
+        .split_once("# --- release key ---\n")
+        .and_then(|(_, rest)| rest.split_once("# --- end release key ---\n"))
+        .expect("install.sh has a release key block")
+        .0;
+    let ed25519: String = ed25519
+        .lines()
+        .filter(|l| !l.starts_with("PROBE_SIGNATURE="))
+        .map(|l| format!("{l}\n"))
+        .chain(["PROBE_SIGNATURE=''\n".to_string()])
+        .collect();
+    let text = replace_block(
+        &original,
+        "# --- release key ---",
+        "# --- end release key ---",
+        &ed25519,
+    );
+    let text = replace_block(
+        &text,
+        "# --- release key p256 ---",
+        "# --- end release key p256 ---",
+        &format!("RELEASE_KEY_P256='{pem}'\nPROBE_SIGNATURE_P256='{probe}'\n"),
+    );
+    let script = tmp.path().join("install.sh");
+    std::fs::write(&script, text).unwrap();
+
+    let release = tmp.path().join("release");
+    fake_release(&release, &tmp.path().join("stage"));
+    let sums = release.join("sha256sums.txt");
+    let sig = release.join("sha256sums.txt.p256.sig");
+    let good_sums = std::fs::read(&sums).unwrap();
+    let good_sig = p256_sign(&key, &good_sums);
+    let reset = || {
+        std::fs::write(&sums, &good_sums).unwrap();
+        std::fs::write(&sig, &good_sig).unwrap();
+    };
+    reset();
+
+    let mut n = 0;
+    let mut run = |env: &[(&str, &str)]| {
+        n += 1;
+        let dir = tmp.path().join(format!("bin{n}"));
+        let mut cmd = Command::new("sh");
+        cmd.arg(&script)
+            .env("HOME", tmp.path())
+            .env("TWR_INSTALL_DIR", &dir)
+            .env("TWR_VERSION", "v9.9.9")
+            .env("TWR_DOWNLOAD_URL", format!("file://{}", release.display()));
+        for k in ["TWR_SHA256SUMS_FILE", "TWR_REQUIRE_SIGNATURE", "TWR_UPDATE"] {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let installed = dir.join("twr").exists();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.success(), installed, "{env:?}: {out:?}");
+        (installed, stderr)
+    };
+
+    // A good signature installs, without a warning, also when a signature is required.
+    let (installed, stderr) = run(&[]);
+    assert!(installed, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let (installed, stderr) = run(&[("TWR_REQUIRE_SIGNATURE", "1")]);
+    assert!(installed, "{stderr}");
+
+    // A changed list is refused: a line added, or a character of a checksum changed.
+    let mut more = good_sums.clone();
+    more.extend_from_slice(format!("{}  other.tar.gz\n", "1".repeat(64)).as_bytes());
+    std::fs::write(&sums, &more).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("the P-256 signature of sha256sums.txt does not verify")
+            && stderr.contains("nothing was installed"),
+        "{stderr}"
+    );
+    let text = String::from_utf8(good_sums.clone()).unwrap();
+    let (first, rest) = text.split_once('\n').unwrap();
+    let flipped = if rest.starts_with('0') { "1" } else { "0" };
+    std::fs::write(&sums, format!("{first}\n{flipped}{}", &rest[1..])).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(stderr.contains("does not verify"), "{stderr}");
+    reset();
+
+    // Another key's signature is refused.
+    let (other, _) = p256_key();
+    std::fs::write(&sig, p256_sign(&other, &good_sums)).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(stderr.contains("does not verify"), "{stderr}");
+
+    // So is a missing signature, and one that is no signature.
+    std::fs::remove_file(&sig).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("could not download sha256sums.txt.p256.sig"),
+        "{stderr}"
+    );
+    std::fs::write(&sig, "c2lnbmVk\n").unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("is not an ECDSA P-256 signature"),
+        "{stderr}"
+    );
+}
+
 /// A thread whose runtime failed to start keeps the rest of its queue held, but a prompt held
 /// for it with `--after` still goes out by itself once the thread it waits for finishes, and
 /// its dispatch releases that queue: `twr wait` waits (here until its timeout) instead of
