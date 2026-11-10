@@ -2615,9 +2615,13 @@ fn install_sh_pair_needs_a_twr_with_runner_up() {
             assert!(stdout.contains("pairing..."), "{stdout}");
         } else {
             assert!(
-                stderr.contains(
-                    "twr 0.3.0 has no `twr runner up`: pairing needs a twr newer than 0.3.0"
-                ),
+                stderr.contains(&format!(
+                    "installed twr 0.3.0 at {}, but it is too old to pair: it has no `twr \
+                     runner up`",
+                    bin.join("twr").display()
+                )) && stderr.contains("run this script again with --pair")
+                    && stderr.contains("docs/install.md#from-source")
+                    && !stderr.contains("newer than 0.3.0"),
                 "{stderr}"
             );
             assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
