@@ -598,6 +598,8 @@ struct Hello {
     acks_needed: std::collections::BTreeMap<String, u64>,
     runtimes: Vec<String>,
     worktrees: std::path::PathBuf,
+    /// Its spool's generation stamp (`None`: a runner from before box generations).
+    spool: Option<twr_core::runner::SpoolStamp>,
 }
 
 fn hello(token: &str) -> Hello {
@@ -645,6 +647,7 @@ async fn raw_hello(ws: &mut RawWs, h: Hello) {
         build: None,
         agents: Vec::new(),
         launch: None,
+        spool: h.spool,
     };
     raw_send(ws, &RunnerMsg::Inventory(inv)).await;
 }
@@ -3603,6 +3606,7 @@ async fn runner_supplied_numbers_at_their_limits_break_nothing() {
     let Some(HubMsg::Welcome {
         epoch: e3,
         watermarks,
+        ..
     }) = raw_expect(&mut c).await
     else {
         panic!("no welcome after the gap")
@@ -6836,5 +6840,251 @@ async fn a_box_add_that_read_a_removed_box_does_not_bring_its_token_back() {
         .boxes()
         .iter()
         .any(|(n, online, _)| n == BOX && *online));
+    h.shutdown().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Removing a box: its watermarks go, with a new generation (`runner_boxes`)
+// ------------------------------------------------------------------------------------------
+
+/// A box the hub starts without (removed while its runner was offline, with a frame still
+/// spooled and the thread's numbering gone on past the hub's watermark) is forgotten as the
+/// hub opens: its watermarks go, and it gets a new generation, marked forgotten. Added again
+/// under the same name, its runner (the same data) forgets that frame at its welcome and
+/// numbers the thread's frames from 1: no gap, no loop, nothing old recorded, the box's
+/// generation no longer forgotten, and the thread takes a new turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_removed_while_its_runner_is_offline_is_clean_once_added_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let proxy = Proxy::start(&h.url).await;
+    let rdir = dir.path().join("r");
+    let lbox = open_box(&rdir);
+    let runner = Runner::start(runner_opts(&proxy.url, &rdir), lbox.clone());
+    h.online().await;
+    let t = h.new_thread(&project(dir.path()), "removed").await;
+    let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+    h.send(&t, "one two");
+    until(&mut sub, |e| e.kind() == "report.ready").await;
+    drop(sub);
+    let w = *h.hub().runner_watermarks(BOX).unwrap().get(&t).unwrap();
+    let (g1, forgotten) = h.hub().runner_generation(BOX).unwrap().unwrap();
+    assert!(!forgotten);
+    wait_for("acks applied", || lbox.spool().is_empty().unwrap()).await;
+    assert_eq!(lbox.spool().generation().unwrap(), Some(g1.clone()));
+    h.shutdown().await;
+
+    // Offline: the session ends on the box, its exit spooled after the watermark.
+    let r = lbox
+        .handle_cmd(
+            "offline-stop",
+            Op::Stop {
+                thread: t.clone(),
+                run: None,
+            },
+        )
+        .await;
+    assert!(r.ok, "{r:?}");
+    wait_for("the exit spooled", || !lbox.spool().is_empty().unwrap()).await;
+    assert!(lbox.spool().next_rseq(&t).unwrap() > w + 1);
+
+    // The hub starts without the box (`twr box remove`): forgotten.
+    let mut without = config(None);
+    without.boxes.clear();
+    let h = TestHub::start(dir.path(), without).await;
+    proxy.st().upstream = h.url.clone();
+    assert!(h.hub().runner_watermarks(BOX).unwrap().is_empty());
+    let (g2, forgotten) = h.hub().runner_generation(BOX).unwrap().unwrap();
+    assert!(forgotten && g2 != g1);
+    h.shutdown().await;
+
+    // Added again, the same name and the same runner.
+    let h = TestHub::start(dir.path(), config(None)).await;
+    proxy.st().upstream = h.url.clone();
+    h.online().await;
+    assert_eq!(lbox.spool().generation().unwrap(), Some(g2.clone()));
+    assert_eq!(
+        h.hub().runner_generation(BOX).unwrap(),
+        Some((g2, false)),
+        "the runner took it"
+    );
+    assert!(
+        lbox.spool().is_empty().unwrap(),
+        "the old exit was never sent"
+    );
+    assert_eq!(lbox.spool().next_rseq(&t).unwrap(), 1);
+    let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+    h.send(&t, "three four");
+    until(&mut sub, |e| {
+        e.kind() == "report.ready" && e.turn == Some(2)
+    })
+    .await;
+    let all = log(h.hub(), &t);
+    assert_eq!(deltas(&all), ["one", "two", "three", "four"]);
+    let now = *h.hub().runner_watermarks(BOX).unwrap().get(&t).unwrap();
+    assert_eq!(now + 1, lbox.spool().next_rseq(&t).unwrap());
+    assert!(now < w * 2, "numbered from 1 again: {now} (was {w})");
+    // Online once before the removal and once since: no connection closed on a gap.
+    let hub_log = log(h.hub(), HUB_THREAD);
+    assert_eq!(count(&hub_log, "runner.connected"), 2);
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// `twr box remove` of a token box (`box.token` finds it gone from the files) forgets its
+/// watermarks at once, with a new generation. Added again while the hub runs, with the same
+/// token, its runner, which went on running the thread's session and spooled a turn the hub
+/// never asked for meanwhile, forgets that turn's frames and numbers from 1: the hub's session
+/// goes on, the turn it was not asked for is never recorded, and the next turn is recorded
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_removed_and_added_again_while_the_hub_runs_numbers_from_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+    let rdir = dir.path().join("box");
+    let lbox = open_box(&rdir);
+    let r = Runner::start(runner_opts(&h.url, &rdir), lbox.clone());
+    h.online().await;
+    let t = h.new_thread(&project(dir.path()), "again").await;
+    let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+    h.send(&t, "one two");
+    until(&mut sub, |e| e.kind() == "report.ready").await;
+    assert!(h.hub().runner_watermarks(BOX).unwrap().contains_key(&t));
+    let (g1, _) = h.hub().runner_generation(BOX).unwrap().unwrap();
+
+    std::fs::write(&boxes_file, "").unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": true, "accepting": false}));
+    assert!(h.hub().runner_watermarks(BOX).unwrap().is_empty());
+    let (g2, forgotten) = h.hub().runner_generation(BOX).unwrap().unwrap();
+    assert!(forgotten && g2 != g1);
+
+    // Meanwhile the session takes a turn on the box itself: spooled, never sent.
+    let r99 = lbox
+        .handle_cmd(
+            "offline-send",
+            Op::Send {
+                thread: t.clone(),
+                turn: 99,
+                text: "never recorded".into(),
+                run: None,
+            },
+        )
+        .await;
+    assert!(r99.ok, "{r99:?}");
+    wait_for("the turn spooled", || {
+        lbox.spool()
+            .rows_after(0, 1000)
+            .unwrap()
+            .iter()
+            .any(|row| row.frame.contains("turn.ended"))
+    })
+    .await;
+
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{TOKEN}\"\n")).unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": true, "accepting": true}));
+    h.online().await;
+    assert_eq!(lbox.spool().generation().unwrap(), Some(g2.clone()));
+    wait_for("the generation taken", || {
+        h.hub().runner_generation(BOX).unwrap() == Some((g2.clone(), false))
+    })
+    .await;
+    h.send(&t, "three four");
+    until(&mut sub, |e| {
+        e.kind() == "report.ready" && e.turn == Some(2)
+    })
+    .await;
+    let all = log(h.hub(), &t);
+    assert!(all.iter().all(|e| e.turn != Some(99)), "{:?}", kinds(&all));
+    assert_eq!(deltas(&all), ["one", "two", "three", "four"]);
+    assert_eq!(count(&all, "thread.started"), 1, "{:?}", kinds(&all));
+    assert_eq!(count(&all, "thread.crashed"), 0, "{:?}", kinds(&all));
+    let now = *h.hub().runner_watermarks(BOX).unwrap().get(&t).unwrap();
+    assert_eq!(now + 1, lbox.spool().next_rseq(&t).unwrap());
+    r.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Mixed versions. A runner from before box generations (no spool stamp in its inventory)
+/// is welcomed as before, without a generation, and one that takes them gets the box's. Once
+/// the hub forgot the box (removed, then added again), the older runner is refused
+/// `error{protocol}` saying to update twr on the box (the box notes why), and the newer one is
+/// told to forget its spool (`forgotten`); once it took the generation (`synced`), the older
+/// runner is welcomed again: its numbering then is the one the hub knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_runner_is_refused_only_while_its_box_is_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+    let older = || hello(TOKEN);
+    let newer = |generation: Option<String>| Hello {
+        spool: Some(twr_core::runner::SpoolStamp { generation }),
+        ..hello(TOKEN)
+    };
+    let welcome = |m: Option<HubMsg>| match m {
+        Some(HubMsg::Welcome {
+            generation,
+            forgotten,
+            ..
+        }) => (generation, forgotten),
+        other => panic!("no welcome: {other:?}"),
+    };
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, older()).await;
+    assert_eq!(welcome(raw_expect(&mut ws).await), (None, false));
+    drop(ws);
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, newer(None)).await;
+    let (g1, forgotten) = welcome(raw_expect(&mut ws).await);
+    let g1 = g1.expect("a generation");
+    assert!(!forgotten);
+    drop(ws);
+
+    // Removed, then added again.
+    std::fs::write(&boxes_file, "").unwrap();
+    box_token(&h, Caller::user("test")).await.unwrap();
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{TOKEN}\"\n")).unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v["accepting"], true, "{v}");
+    let (g2, forgotten) = h.hub().runner_generation(BOX).unwrap().unwrap();
+    assert!(forgotten && g2 != g1);
+
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, older()).await;
+    match raw_expect(&mut ws).await {
+        Some(HubMsg::Error { code, message }) => {
+            assert_eq!(code, hub_errors::PROTOCOL);
+            assert!(message.contains("update twr on box `gpu`"), "{message}");
+        }
+        other => panic!("not refused: {other:?}"),
+    }
+    let why = h.hub().box_refusal(BOX).expect("a refusal noted").reason;
+    assert!(why.contains("update twr on the box"), "{why}");
+    assert_eq!(
+        h.hub().runner_generation(BOX).unwrap(),
+        Some((g2.clone(), true))
+    );
+
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, newer(Some(g1.clone()))).await;
+    assert_eq!(welcome(raw_expect(&mut ws).await), (Some(g2.clone()), true));
+    raw_send(&mut ws, &RunnerMsg::Synced).await;
+    wait_for("the generation taken", || {
+        h.hub().runner_generation(BOX).unwrap() == Some((g2.clone(), false))
+    })
+    .await;
+    drop(ws);
+    // A newer runner that took it already is not told to forget again.
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, newer(Some(g2.clone()))).await;
+    assert_eq!(
+        welcome(raw_expect(&mut ws).await),
+        (Some(g2.clone()), false)
+    );
+    drop(ws);
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, older()).await;
+    assert_eq!(welcome(raw_expect(&mut ws).await), (None, false));
+    drop(ws);
     h.shutdown().await;
 }

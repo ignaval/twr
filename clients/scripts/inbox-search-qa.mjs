@@ -308,18 +308,47 @@ archive.commit()
     childProcess.spawn = globalThis.__qaOriginalSpawn;
     return globalThis.__qaInboxReaders;
   });
-  // One read-only bridge, for the other running workspace: the open workspace is
-  // read over its own connection, and a stopped hub gets none.
+  // No read-only bridge at all: `twr ws list --json --detail` reads every running
+  // workspace once, the open one included, and a stopped hub not at all.
   assert.equal(
     readers,
-    1,
-    "Concurrent refreshes must share one read scan, read the open workspace over its own connection and skip stopped hubs",
+    0,
+    "Concurrent refreshes must share one scan and take every workspace from the listing, with no bridge of their own",
   );
   assert.deepEqual(concurrent[0], concurrent[1]);
   assert.deepEqual(concurrent[1], concurrent[2]);
-  assert.equal(
-    concurrent[0].find((source) => source.workspace === "sleeping").running,
-    false,
+  const source = (workspace) =>
+    concurrent[0].find((source) => source.workspace === workspace);
+  // This computer's workspaces, in the listing's order. Where encrypted storage is locked
+  // (a Linux session without a keyring) the result also carries the scan's own notice.
+  assert.deepEqual(
+    concurrent[0]
+      .filter((source) => source.hubId === "local")
+      .map((source) => source.workspace),
+    ["default", "other", "sleeping"],
+  );
+  assert.equal(source("sleeping").running, false);
+  // What the listing read is what the hubs list, item for item, as a bridge read it.
+  for (const workspace of ["default", "other"]) {
+    assert.equal(source(workspace).error, undefined, workspace);
+    assert.deepEqual(
+      source(workspace).attention,
+      await rpc(workspace, "attention.list", { all: true }),
+      workspace,
+    );
+    assert.deepEqual(
+      source(workspace)
+        .threads.map((thread) => thread.name)
+        .sort(),
+      (await rpc(workspace, "thread.list")).map((thread) => thread.name).sort(),
+      workspace,
+    );
+  }
+  assert.equal(source("default").attention.length, 3);
+  assert(
+    JSON.stringify(source("other").attention).includes(
+      "OTHER_WORKSPACE_QUESTION",
+    ),
   );
   await page
     .locator(".thread-list .thread-card")
@@ -491,7 +520,7 @@ archive.commit()
   await page.screenshot({ path: "test-results/inbox-search-qa.png" });
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: real Rust archived tool-result search, SQL delta exclusion, empty-page progress/cursor pagination, exact event context, preserved draft/destination, Cmd/Ctrl-F plus Linux Ctrl-Shift-F, coalesced bounded inbox reads, stopped-hub action, empty-filter arrows, permission/question filters, keyboard+touch navigation, workspace summaries require connection before responding",
+    "PASS: real Rust archived tool-result search, SQL delta exclusion, empty-page progress/cursor pagination, exact event context, preserved draft/destination, Cmd/Ctrl-F plus Linux Ctrl-Shift-F, coalesced inbox reads from one listing with no read-only bridge, stopped-hub action, empty-filter arrows, permission/question filters, keyboard+touch navigation, workspace summaries require connection before responding",
   );
 } catch (error) {
   if (app) {

@@ -29,6 +29,15 @@
 //!   frame (the runner deletes an acked frame for good): either as it commits (`synchronous =
 //!   FULL`), or, for a batch of frames of one connection, once for the whole batch
 //!   ([`Store::sync`]) before any of them is acked.
+//! - `runner_boxes(box, generation, forgotten)`: each box's generation
+//!   ([`twr_core::runner::SpoolStamp`]), made the first time the box is welcomed. Forgetting a
+//!   box (it was removed: [`Store::forget_runner_box`]) deletes its `runner_acks` and gives it
+//!   a new generation with `forgotten` set, in one transaction, so its runner forgets its
+//!   spool at its next welcome instead of replaying frames numbered against watermarks the hub
+//!   no longer has; `forgotten` is cleared once a runner has taken the new generation
+//!   ([`Store::confirm_runner_box`]). The row of a box removed for good stays, one per box
+//!   name, as what tells a runner that comes back later to forget. Created on every open
+//!   (no schema version: a twr before it ignores the table).
 //! - `remote_outbox(box, cmd_id, thread, turn, op, created)` (schema 3): the session commands
 //!   (`send`, `respond`) a remote box still has to get. Recorded in the same transaction as the
 //!   state change that implies them ([`AppendBatch::remote_cmds`]: `turn.started`,
@@ -240,6 +249,16 @@ CREATE TABLE IF NOT EXISTS attach_processes (
 );
 "#;
 
+/// The box generations (`runner_boxes`, see the module docs). No schema version of its own:
+/// created on every open when missing, as a twr before it ignores the table.
+const RUNNER_BOXES: &str = r#"
+CREATE TABLE IF NOT EXISTS runner_boxes (
+    box        TEXT PRIMARY KEY,
+    generation TEXT NOT NULL,
+    forgotten  INTEGER NOT NULL
+);
+"#;
+
 /// Schema 3: the outbox of commands for remote boxes.
 const REMOTE_OUTBOX: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_outbox (
@@ -344,6 +363,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         if old || !checkpoints {
             conn.execute_batch(&format!("BEGIN; {SCHEMA_9} {SCHEMA_9_PRUNE} COMMIT;"))?;
         }
+        conn.execute_batch(RUNNER_BOXES)?;
         return Ok(());
     }
     let tx = conn.transaction()?;
@@ -375,6 +395,7 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         tx.execute_batch(SCHEMA_9)?;
         tx.execute_batch(SCHEMA_9_PRUNE)?;
     }
+    tx.execute_batch(RUNNER_BOXES)?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -581,6 +602,15 @@ pub struct RemoteCmd {
     pub turn: Option<u64>,
     /// The operation (`twr_core::runner::Op` as JSON).
     pub op: String,
+}
+
+/// A box's generation (`runner_boxes`, see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerBox {
+    /// The generation ([`twr_core::runner::SpoolStamp`]).
+    pub generation: String,
+    /// The hub forgot the box's watermarks and no runner has taken this generation since.
+    pub forgotten: bool,
 }
 
 /// A committed runner frame: `rseq` of `thread` from box `box_name` (see `runner_acks`).
@@ -1093,6 +1123,86 @@ impl Store {
         }
         tx.commit()?;
         Ok(n)
+    }
+
+    /// Box `box_name`'s generation (`runner_boxes`), made now when it has none (`fresh`, a
+    /// new random one: [`twr_core::runner::new_generation`]), and whether it is `forgotten`.
+    pub fn runner_box(
+        &self,
+        box_name: &str,
+        fresh: impl FnOnce() -> anyhow::Result<String>,
+    ) -> anyhow::Result<RunnerBox> {
+        if let Some(b) = self.runner_box_of(box_name)? {
+            return Ok(b);
+        }
+        let generation = fresh()?;
+        self.conn.execute(
+            "INSERT INTO runner_boxes (box, generation, forgotten) VALUES (?1, ?2, 0)",
+            params![box_name, generation],
+        )?;
+        Ok(RunnerBox {
+            generation,
+            forgotten: false,
+        })
+    }
+
+    /// Box `box_name`'s generation, when it has one.
+    pub fn runner_box_of(&self, box_name: &str) -> anyhow::Result<Option<RunnerBox>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT generation, forgotten FROM runner_boxes WHERE box = ?1",
+                [box_name],
+                |r| {
+                    Ok(RunnerBox {
+                        generation: r.get(0)?,
+                        forgotten: r.get::<_, i64>(1)? != 0,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Every box the hub keeps a generation of, with it.
+    pub fn runner_boxes(&self) -> anyhow::Result<Vec<(String, RunnerBox)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT box, generation, forgotten FROM runner_boxes ORDER BY box")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                RunnerBox {
+                    generation: r.get(1)?,
+                    forgotten: r.get::<_, i64>(2)? != 0,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forgets box `box_name` (it was removed): every watermark of it goes and it gets
+    /// generation `generation` with `forgotten` set, in one transaction (see the module docs).
+    /// Returns how many watermarks there were.
+    pub fn forget_runner_box(&mut self, box_name: &str, generation: &str) -> anyhow::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let n = tx.execute("DELETE FROM runner_acks WHERE box = ?1", [box_name])?;
+        tx.execute(
+            "INSERT INTO runner_boxes (box, generation, forgotten) VALUES (?1, ?2, 1)
+             ON CONFLICT(box) DO UPDATE SET generation = excluded.generation, forgotten = 1",
+            params![box_name, generation],
+        )?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// A runner of box `box_name` took generation `generation`: when that is the box's, it is
+    /// no longer `forgotten`. Returns whether it was.
+    pub fn confirm_runner_box(&self, box_name: &str, generation: &str) -> anyhow::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE runner_boxes SET forgotten = 0
+             WHERE box = ?1 AND generation = ?2 AND forgotten != 0",
+            params![box_name, generation],
+        )? > 0)
     }
 
     /// Every event in append order.
@@ -3621,6 +3731,74 @@ mod tests {
             vec![("t1".to_string(), 2)]
         );
         assert!(s.runner_watermarks("other").unwrap().is_empty());
+    }
+
+    /// A box's generation is made once, on first use; forgetting the box deletes its
+    /// watermarks (only its own) and gives it a new generation, marked forgotten, in one
+    /// transaction; only a runner's taking that very generation clears the mark. A database
+    /// from before the table (schema 9 as an older twr leaves it) gets it when it opens.
+    #[test]
+    fn a_forgotten_box_loses_its_watermarks_with_a_new_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        let s = Store::open(&path).unwrap();
+        // As an older twr leaves it: no `runner_boxes`.
+        s.conn.execute_batch("DROP TABLE runner_boxes").unwrap();
+        drop(s);
+        let mut s = Store::open(&path).unwrap();
+        assert!(s.runner_boxes().unwrap().is_empty());
+        for (b, t) in [("gpu", "t1"), ("gpu", "t2"), ("cpu", "t1")] {
+            let a = RunnerAck {
+                box_name: b.into(),
+                thread: t.into(),
+                rseq: 3,
+            };
+            s.append_batch(AppendBatch {
+                runner_ack: Some(&a),
+                defer_sync: false,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        let fresh = |g: &'static str| move || Ok(g.to_string());
+        let g1 = s.runner_box("gpu", fresh("g1")).unwrap();
+        assert_eq!(
+            g1,
+            RunnerBox {
+                generation: "g1".into(),
+                forgotten: false
+            }
+        );
+        assert_eq!(s.runner_box("gpu", fresh("other")).unwrap(), g1);
+        assert_eq!(s.forget_runner_box("gpu", "g2").unwrap(), 2);
+        assert!(s.runner_watermarks("gpu").unwrap().is_empty());
+        assert_eq!(s.runner_watermarks("cpu").unwrap().len(), 1);
+        let g2 = RunnerBox {
+            generation: "g2".into(),
+            forgotten: true,
+        };
+        assert_eq!(s.runner_box_of("gpu").unwrap(), Some(g2.clone()));
+        assert!(!s.confirm_runner_box("gpu", "g1").unwrap());
+        assert_eq!(s.runner_box_of("gpu").unwrap(), Some(g2));
+        assert!(s.confirm_runner_box("gpu", "g2").unwrap());
+        assert!(!s.confirm_runner_box("gpu", "g2").unwrap());
+        assert_eq!(
+            s.runner_box("gpu", fresh("other")).unwrap(),
+            RunnerBox {
+                generation: "g2".into(),
+                forgotten: false
+            }
+        );
+        // A box never seen, forgotten (removed before it was ever welcomed): a row of its own.
+        assert_eq!(s.forget_runner_box("old", "g3").unwrap(), 0);
+        assert_eq!(
+            s.runner_boxes()
+                .unwrap()
+                .into_iter()
+                .map(|(b, g)| (b, g.forgotten))
+                .collect::<Vec<_>>(),
+            [("gpu".to_string(), false), ("old".to_string(), true)]
+        );
     }
 
     /// Only a row the user sent counts as a send after a crash, by the head it was queued

@@ -536,14 +536,19 @@ function register() {
     offlineVault.delete(z.string().max(512).parse(key)),
   );
   const workspaceListing = new WorkspaceListing(
-    async (timeout) =>
+    async (timeout, detail) =>
       JSON.parse(
         (
-          await exec(binaries.twr, ["ws", "list", "--json"], {
-            env: env(),
-            timeout,
-            maxBuffer: 1024 * 1024,
-          })
+          await exec(
+            binaries.twr,
+            ["ws", "list", "--json", ...(detail ? ["--detail"] : [])],
+            {
+              env: env(),
+              timeout,
+              // With --detail it carries every running workspace's threads and requests.
+              maxBuffer: (detail ? 64 : 1) * 1024 * 1024,
+            },
+          )
         ).stdout,
       ),
     5000,
@@ -551,7 +556,9 @@ function register() {
   handleWithEnvironment(
     "inbox-sources",
     // One refresh at a time: a request during a refresh shares its result.
-    // The listing has its own 5 s budget; the summaries then get 4 s.
+    // The listing has its own 5 s budget and reads every running workspace once; a
+    // workspace it could not read that way (an older CLI, a listing that failed) is read
+    // on its own, and those reads then get 4 s.
     coalesceInboxSources(async () =>
       localInboxSources(
         await workspaceListing.get(),

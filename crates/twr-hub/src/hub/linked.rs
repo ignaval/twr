@@ -101,7 +101,9 @@ async fn linked_session(
     loop {
         tokio::select! {
             end=&mut session=>{
-                if end.protocol_refused.is_some(){let _=hub.begin_blind_box_switch(&name);return Ok(true)}
+                // Another protocol, or a worker too old to forget what it spooled before the box
+                // was removed: replaced by the hub's exact worker.
+                if end.protocol_refused.is_some()||end.spool_refused{let _=hub.begin_blind_box_switch(&name);return Ok(true)}
                 return Ok(draining.is_some());
             },
             _=check.tick(),if needs_switch=>{

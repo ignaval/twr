@@ -29,6 +29,10 @@ type Committed = (String, u64, String);
 struct HubState {
     epoch: u64,
     watermarks: BTreeMap<String, u64>,
+    /// The box generation the welcome names (none: a hub from before generations), and its
+    /// `forgotten` flag.
+    generation: Option<String>,
+    forgotten: bool,
     hellos: Vec<Hello>,
     /// The inventories of the connections that authenticated.
     inventories: Vec<Inventory>,
@@ -155,6 +159,8 @@ impl FakeHub {
                 HubMsg::Welcome {
                     epoch: s.epoch,
                     watermarks: s.watermarks.clone(),
+                    generation: s.generation.clone(),
+                    forgotten: s.forgotten,
                 },
                 s.drop_after.take(),
             )
@@ -470,6 +476,8 @@ async fn a_peer_that_cannot_prove_the_token_gets_nothing_but_the_hello() {
                                 HubMsg::Welcome {
                                     epoch: 1,
                                     watermarks: BTreeMap::new(),
+                                    generation: None,
+                                    forgotten: false,
                                 },
                                 HubMsg::Cmd {
                                     cmd_id: "c-evil".into(),
@@ -823,6 +831,141 @@ async fn a_restarted_runner_replays_its_spool_and_continues_rseq() {
     // And again after a clean restart.
     drop(lbox);
     let lbox = open_box(dir.path());
+    assert_eq!(
+        lbox.spool().next_rseq("t1").unwrap(),
+        hub.committed("t1").len() as u64 + 1
+    );
+}
+
+/// The box generation of the welcome. A hub from before it sends none: the runner keeps its
+/// spool and takes nothing (its inventory says its spool took no generation). A hub's first
+/// generation is taken with the spool kept. A welcome of another generation (the hub forgot
+/// the box: it was removed, then added again) makes the runner forget the frames it still had
+/// and number the thread's frames from 1 again, so the hub, which has no watermark left, gets
+/// no gap and none of the old frames.
+#[tokio::test]
+async fn a_new_box_generation_forgets_the_spool_and_numbers_from_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let lbox = open_box(dir.path());
+    let r = lbox.handle_cmd("c1", spawn_op("t1", "one two three")).await;
+    assert!(r.ok, "{r:?}");
+    let ended = |lbox: &LocalBox, n: usize| {
+        spooled(lbox, "t1")
+            .iter()
+            .filter(|f| f.1 == "turn.ended")
+            .count()
+            == n
+    };
+    wait_for("the turn spooled", || ended(&lbox, 1)).await;
+    let t1 = spooled(&lbox, "t1");
+
+    // A hub of no generation: as before.
+    let hub = FakeHub::start().await;
+    {
+        let mut s = hub.state();
+        s.watermarks.insert("t1".into(), 2);
+        s.manual_acks = true;
+    }
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("replay", |s| s.synced == 1).await;
+    assert_eq!(
+        hub.state().inventories[0].spool,
+        Some(twr_core::runner::SpoolStamp { generation: None })
+    );
+    assert_eq!(hub.committed("t1"), t1[2..].to_vec());
+    assert_eq!(lbox.spool().generation().unwrap(), None);
+    run.crash().await;
+
+    // A second turn while disconnected, then a hub's first generation: taken, nothing
+    // forgotten (the new frames replay above the watermark).
+    let r = lbox
+        .handle_cmd(
+            "c2",
+            Op::Send {
+                thread: "t1".into(),
+                turn: 2,
+                text: "four five".into(),
+                run: None,
+            },
+        )
+        .await;
+    assert!(r.ok, "{r:?}");
+    wait_for("the second turn spooled", || ended(&lbox, 2)).await;
+    hub.state().generation = Some("0123456789abcdef0123456789abcdef".into());
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("replay", |s| s.synced == 2).await;
+    let before = hub.committed("t1");
+    assert_contiguous(&before, 3);
+    assert_eq!(
+        before.iter().filter(|f| f.1 == "turn.ended").count(),
+        2,
+        "{before:?}"
+    );
+    assert_eq!(
+        lbox.spool().generation().unwrap().as_deref(),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+    assert!(lbox.spool().len().unwrap() > 0, "nothing acked");
+    run.crash().await;
+
+    // The hub forgot the box: a new generation, no watermarks. The frames still spooled are
+    // never sent, and the thread's next frames start at 1.
+    {
+        let mut s = hub.state();
+        s.generation = Some("fedcba9876543210fedcba9876543210".into());
+        s.forgotten = true;
+        s.watermarks.clear();
+        s.committed.clear();
+        s.received.clear();
+        s.manual_acks = false;
+    }
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("synced", |s| s.synced == 3).await;
+    {
+        let s = hub.state();
+        assert_eq!(
+            s.inventories[2]
+                .spool
+                .as_ref()
+                .unwrap()
+                .generation
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            s.inventories[2].acks_needed.get("t1"),
+            Some(&(before.len() as u64 + 2))
+        );
+        assert!(s.received.is_empty(), "{:?}", s.received);
+    }
+    assert!(lbox.spool().is_empty().unwrap());
+    assert_eq!(lbox.spool().next_rseq("t1").unwrap(), 1);
+    // The session still runs: its next frames (a stop's exit, then a new session's) are
+    // numbered from 1, with no gap the hub would close the connection on.
+    hub.cmd(
+        "c3",
+        Op::Stop {
+            thread: "t1".into(),
+            run: None,
+        },
+    );
+    hub.wait("the exit", |s| s.committed.iter().any(|c| c.2 == "exited"))
+        .await;
+    hub.cmd("c4", spawn_op("t1", "six"));
+    hub.wait("the new turn", |s| {
+        s.committed.iter().any(|c| c.2 == "turn.ended")
+    })
+    .await;
+    let frames = hub.committed("t1");
+    assert_contiguous(&frames, 1);
+    assert_eq!(frames[0].1, "exited");
+    assert_eq!(hub.state().connections, 3, "no connection closed on a gap");
+    run.shutdown().await;
+    // Taken for good: numbering goes on, nothing more forgotten.
+    assert_eq!(
+        lbox.spool().generation().unwrap().as_deref(),
+        Some("fedcba9876543210fedcba9876543210")
+    );
     assert_eq!(
         lbox.spool().next_rseq("t1").unwrap(),
         hub.committed("t1").len() as u64 + 1

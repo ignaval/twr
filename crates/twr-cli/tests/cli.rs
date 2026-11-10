@@ -2263,7 +2263,8 @@ fn update_refuses_an_older_or_the_same_release() {
 
 /// install.sh checks sha256sums.txt against its signature when openssl here can: run against a
 /// file:// release signed with the test key, by a copy of install.sh whose release key block
-/// holds the test key. Skipped where openssl can't verify Ed25519.
+/// holds the test key and whose P-256 block holds none, so that the Ed25519 path is the one
+/// tested whatever key install.sh ships. Skipped where openssl can't verify Ed25519.
 #[test]
 fn install_sh_checks_the_signature_of_the_checksums() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2296,16 +2297,27 @@ fn install_sh_checks_the_signature_of_the_checksums() {
         .split_once("# --- end release key ---\n")
         .expect("install.sh's release key block ends");
     let script = tmp.path().join("install.sh");
-    std::fs::write(
-        &script,
-        format!(
-            "{head}# --- release key ---\nRELEASE_KEY='{}'\nPROBE_MESSAGE='twr signature probe'\n\
-             PROBE_SIGNATURE='{}'\n# --- end release key ---\n{tail}",
-            pub_pem.trim_end(),
-            probe.trim()
-        ),
-    )
-    .unwrap();
+    let text = format!(
+        "{head}# --- release key ---\nRELEASE_KEY='{}'\nPROBE_MESSAGE='twr signature probe'\n\
+         PROBE_SIGNATURE='{}'\n# --- end release key ---\n{tail}",
+        pub_pem.trim_end(),
+        probe.trim()
+    );
+    let p256_block = |with: &str| {
+        replace_block(
+            &text,
+            "# --- release key p256 ---",
+            "# --- end release key p256 ---",
+            with,
+        )
+    };
+    let without_p256 = p256_block("RELEASE_KEY_P256=''\nPROBE_SIGNATURE_P256=''\n");
+    let (p256, p256_pem) = p256_key();
+    let with_p256 = p256_block(&format!(
+        "RELEASE_KEY_P256='{p256_pem}'\nPROBE_SIGNATURE_P256='{}'\n",
+        p256_sign(&p256, b"twr signature probe")
+    ));
+    std::fs::write(&script, &without_p256).unwrap();
 
     let release = tmp.path().join("release");
     fake_release(&release, &tmp.path().join("stage"));
@@ -2440,6 +2452,20 @@ fn install_sh_checks_the_signature_of_the_checksums() {
     let (installed, stderr) = run(&[("TWR_REQUIRE_SIGNATURE", "1")], false);
     assert!(!installed);
     assert!(stderr.contains("TWR_REQUIRE_SIGNATURE=1"), "{stderr}");
+    // The same when the script holds a P-256 key too and no openssl checks either signature.
+    std::fs::write(&script, &with_p256).unwrap();
+    let (installed, stderr) = run(&[], false);
+    assert!(installed, "{stderr}");
+    assert!(
+        stderr.contains(
+            "twr install: the checksums were not signature-checked (no openssl that checks Ed25519 or P-256 signatures)"
+        ),
+        "{stderr}"
+    );
+    let (installed, stderr) = run(&[("TWR_REQUIRE_SIGNATURE", "1")], false);
+    assert!(!installed);
+    assert!(stderr.contains("TWR_REQUIRE_SIGNATURE=1"), "{stderr}");
+    std::fs::write(&script, &without_p256).unwrap();
     reset();
 
     // TWR_SHA256SUMS_FILE: that file, not a download, and no signature check here (the caller

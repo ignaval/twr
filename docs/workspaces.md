@@ -10,6 +10,8 @@ export TWR_WORKSPACE=client-x  # or select it for the whole shell
 twr ws                       # list them
 ```
 
+`twr ws` asks every running hub at once how many threads it has, how many run and how many requests wait on you; `twr ws list --json` prints the same as JSON, and `--json --detail` adds each hub's whole thread list and requests, which is how the desktop app reads every workspace in one go ([SKILL.md](../SKILL.md#cli-equivalents) has the fields).
+
 `-w` (`--workspace`) wins over `TWR_WORKSPACE`, which wins over `default`. `--socket` still picks the socket. A workspace that doesn't exist is an error that says how to create it, so a typo never makes a new one. Names are 1 to 32 lowercase letters, digits or `-`, starting and ending with a letter or digit.
 
 ## In the TUI
