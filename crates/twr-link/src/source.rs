@@ -272,8 +272,11 @@ pub async fn build(
         "TMPDIR",
         "LANG",
     ];
+    // And how to reach the network (a proxy, a CA bundle): cargo fetches the crates. The
+    // service's own environment, where these come from, holds no proxy credentials.
     let environment: Vec<_> = keep
         .iter()
+        .chain(twr_runner::relay::launchd::NETWORK_ENV)
         .filter_map(|key| std::env::var_os(key).map(|value| (*key, value)))
         .collect();
     cmd.env_clear()
