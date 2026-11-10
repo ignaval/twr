@@ -237,10 +237,12 @@ log. Tokens, keys, URL credentials and your home folder path are removed first.
 
 The bundled executables are copied to a content-addressed private engine directory before
 starting a hub. A hub therefore keeps a stable executable path after an AppImage mount or
-macOS translocated app disappears. Packaged builds ship the engines' SHA-256 digests in
+macOS translocated app disappears. Linux packages ship the engines' SHA-256 digests in
 `resources/bin/digests.json` (written by `npm run build:rust`), so a launch does not hash
 the engines again, even from an AppImage's new mount path; each copy is verified against
-those digests, and a manifest that does not match its engines is ignored. Existing engine versions are retained while hubs may
+those digests, and a manifest that does not match its engines is ignored. The Mac app
+leaves the manifest out, because signing the app changes its engines after the digests
+were taken: it hashes its engines once and keeps their digests, keyed by the bundle's paths. Existing engine versions are retained while hubs may
 still use them. Restarting or updating the desktop never silently stops an existing hub.
 
 Packaged builds strip `--remote-debugging-port`, `--remote-debugging-pipe` and Chromium's

@@ -13,6 +13,7 @@ import {
   readFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -305,6 +306,41 @@ try {
     existsSync(join(fixture, "user-data", "engines")),
     "Engine pair must be cached outside the app bundle",
   );
+  // The Mac app ships no bin/digests.json (scripts/after-pack.mjs: signing changes the
+  // engines). Its engines are staged in the directory named from their actual digests, and
+  // the app's digest cache keeps them, keyed by the bundle's stable paths.
+  {
+    assert(
+      !existsSync(join(application, "Contents/Resources/bin/digests.json")),
+      "The Mac app must not ship engine digests that its signature invalidates",
+    );
+    const names = ["twr", "twr-desktop-bridge", "twr-mobile-gateway"];
+    const actual = names.map((name) => [
+      name,
+      createHash("sha256")
+        .update(readFileSync(join(application, "Contents/Resources/bin", name)))
+        .digest("hex"),
+    ]);
+    const directory = createHash("sha256")
+      .update(JSON.stringify(actual))
+      .digest("hex");
+    assert(
+      existsSync(join(fixture, "user-data/engines", directory, "twr")),
+      "The engines must be staged under their digests",
+    );
+    const cached = JSON.parse(
+      readFileSync(join(fixture, "user-data/engines/digests.json"), "utf8"),
+    );
+    for (const [name, digest] of actual)
+      assert.equal(
+        cached[join(application, "Contents/Resources/bin", name)]?.hash,
+        digest,
+        `The digest cache must hold the bundle's ${name}`,
+      );
+    console.log(
+      "PASS: the packaged app stages its engines under their digests and caches the bundle's",
+    );
+  }
   await page.evaluate(() =>
     window.twr.rpc("thread.new", {
       project: "demo",
