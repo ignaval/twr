@@ -6847,9 +6847,10 @@ async fn a_box_add_that_read_a_removed_box_does_not_bring_its_token_back() {
 // Removing a box: its watermarks go, with a new generation (`runner_boxes`)
 // ------------------------------------------------------------------------------------------
 
-/// A box the hub starts without (removed while its runner was offline, with a frame still
-/// spooled and the thread's numbering gone on past the hub's watermark) is forgotten as the
-/// hub opens: its watermarks go, and it gets a new generation, marked forgotten. Added again
+/// A box the hub starts without, which the removal record names (removed with `twr box
+/// remove` while its runner was offline, with a frame still spooled and the thread's
+/// numbering gone on past the hub's watermark), is forgotten as the hub opens: its watermarks
+/// go, and it gets a new generation, marked forgotten. Added again
 /// under the same name, its runner (the same data) forgets that frame at its welcome and
 /// numbers the thread's frames from 1: no gap, no loop, nothing old recorded, the box's
 /// generation no longer forgotten, and the thread takes a new turn.
@@ -6888,10 +6889,13 @@ async fn a_box_removed_while_its_runner_is_offline_is_clean_once_added_again() {
     wait_for("the exit spooled", || !lbox.spool().is_empty().unwrap()).await;
     assert!(lbox.spool().next_rseq(&t).unwrap() > w + 1);
 
-    // The hub starts without the box (`twr box remove`): forgotten.
+    // The hub starts without the box, which the removal record names (`twr box remove`):
+    // forgotten.
     let mut without = config(None);
     without.boxes.clear();
-    let h = TestHub::start(dir.path(), without).await;
+    let mut opts = hub_opts(dir.path(), without);
+    opts.removed_boxes = [BOX.to_string()].into();
+    let h = TestHub::start_opts(opts).await;
     proxy.st().upstream = h.url.clone();
     assert!(h.hub().runner_watermarks(BOX).unwrap().is_empty());
     let (g2, forgotten) = h.hub().runner_generation(BOX).unwrap().unwrap();
@@ -6941,6 +6945,77 @@ async fn a_box_removed_while_its_runner_is_offline_is_clean_once_added_again() {
     // Online once before the removal and once since: no connection closed on a gap.
     let hub_log = log(h.hub(), HUB_THREAD);
     assert_eq!(count(&hub_log, "runner.connected"), 2);
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// A box that merely is not in the config a hub starts with (an empty or missing config
+/// file, another `XDG_CONFIG_HOME`, a box commented out by hand), with no removal record
+/// naming it, is not forgotten: its watermarks and generation stay as they were. Once the
+/// hub has it again, its runner (offline meanwhile, with a frame spooled after the watermark)
+/// keeps its spool and delivers that frame: nothing is lost, and nothing is taken for a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_missing_from_the_config_without_a_removal_record_is_not_forgotten() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let proxy = Proxy::start(&h.url).await;
+    let rdir = dir.path().join("r");
+    let lbox = open_box(&rdir);
+    let runner = Runner::start(runner_opts(&proxy.url, &rdir), lbox.clone());
+    h.online().await;
+    let t = h.new_thread(&project(dir.path()), "kept").await;
+    let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+    h.send(&t, "one two");
+    until(&mut sub, |e| e.kind() == "report.ready").await;
+    drop(sub);
+    let before = h.hub().runner_watermarks(BOX).unwrap();
+    let (g1, _) = h.hub().runner_generation(BOX).unwrap().unwrap();
+    wait_for("acks applied", || lbox.spool().is_empty().unwrap()).await;
+    h.shutdown().await;
+
+    // Offline: the session ends on the box, its exit spooled after the watermark.
+    let r = lbox
+        .handle_cmd(
+            "offline-stop",
+            Op::Stop {
+                thread: t.clone(),
+                run: None,
+            },
+        )
+        .await;
+    assert!(r.ok, "{r:?}");
+    wait_for("the exit spooled", || !lbox.spool().is_empty().unwrap()).await;
+    let exit_rseq = lbox.spool().next_rseq(&t).unwrap() - 1;
+
+    // A hub started with an empty config, and no removal record: nothing forgotten.
+    let mut empty = Config::default();
+    empty.hub.listen = Some("127.0.0.1:0".into());
+    let h = TestHub::start(dir.path(), empty).await;
+    proxy.st().upstream = h.url.clone();
+    assert_eq!(h.hub().runner_watermarks(BOX).unwrap(), before);
+    assert_eq!(
+        h.hub().runner_generation(BOX).unwrap(),
+        Some((g1.clone(), false))
+    );
+    h.shutdown().await;
+
+    // With the box again: the spooled exit is delivered, on the same generation.
+    let h = TestHub::start(dir.path(), config(None)).await;
+    proxy.st().upstream = h.url.clone();
+    h.online().await;
+    wait_for("the spooled exit delivered", || {
+        lbox.spool().is_empty().unwrap()
+            && h.hub().runner_watermarks(BOX).unwrap().get(&t) == Some(&exit_rseq)
+    })
+    .await;
+    assert_eq!(lbox.spool().generation().unwrap(), Some(g1.clone()));
+    assert_eq!(h.hub().runner_generation(BOX).unwrap(), Some((g1, false)));
+    let hub_log = log(h.hub(), HUB_THREAD);
+    assert_eq!(
+        count(&hub_log, "runner.connected"),
+        2,
+        "no connection closed on a gap"
+    );
     runner.shutdown().await;
     h.shutdown().await;
 }

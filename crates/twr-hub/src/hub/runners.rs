@@ -33,7 +33,8 @@
 //! **Box generations** ([`twr_core::runner::SpoolStamp`], `runner_boxes` in
 //! [`crate::store`]). Watermarks are kept per generation of a box: made the first time the box
 //! is welcomed, and replaced when the hub forgets the box (it was removed: a hub that starts
-//! without it, [`Core::sweep_runner_acks`], or `box.token` finding it gone from the files),
+//! without it while the removal record `twr box remove` writes names it,
+//! [`Core::sweep_runner_acks`], or `box.token` finding it gone from the files),
 //! which deletes its watermarks in the same transaction and marks the new generation
 //! forgotten. The welcome names the generation (read under the same lock, made durable by the
 //! same sync) to a runner whose inventory has a spool stamp; such a runner forgets the frames
@@ -623,14 +624,17 @@ pub(super) enum Admission {
 }
 
 /// What [`Core::sweep_runner_acks`] forgot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Swept {
-    /// Boxes forgotten (the hub started without them: removed).
+    /// Boxes forgotten (removed: recorded, and the hub started without them).
     pub boxes: usize,
     /// Their watermarks.
     pub box_watermarks: usize,
-    /// Watermarks of threads the hub does not track, of the boxes left.
+    /// Watermarks of threads the hub does not track.
     pub thread_watermarks: usize,
+    /// The names of the removal record the sweep is done with: forgotten (now or before), or
+    /// configured again. They can come out of the record once the forgets are durable.
+    pub settled: BTreeSet<String>,
 }
 
 /// Why an authenticated connection was not welcomed ([`serve`]).
@@ -2191,38 +2195,39 @@ impl Core {
     }
 
     /// Forgets, as the hub opens (the log folded), the watermarks it keeps no longer: first
-    /// those of every box the hub starts without (`boxes`: the boxes of its config; one it
-    /// keeps watermarks or a generation of that is not there was removed:
-    /// [`Core::forget_box`]), then, of the boxes left, those of threads it does not track
+    /// those of every box removed ([`Core::forget_box`]): named in the removal record
+    /// (`removed`, [`twr_core::config::BoxesFile::removed`]: `twr box remove` took it out of
+    /// `boxes.toml`) and not among the boxes the hub starts with (`boxes`, its config's), unless
+    /// it is forgotten already (`box.token` did it, or a start that ended before it took the
+    /// name out of the record). Then, of every box, those of threads it does not track
     /// ([`Core::tracks`]): ones the log never had (a hub from before kept a watermark for any
     /// frame's thread), purged, or deleted from another box. The next frame of such a thread
     /// is a stray, acked without a watermark, so none of them can be taken for a gap.
     ///
-    /// A removed box's watermarks can go only with its generation (in the same transaction):
-    /// its runner may still spool frames of its threads, numbered on from where they were, and
-    /// the box may be added again. Without its watermarks, a thread's next frame would be a
-    /// gap on every connection (the runner replays it, the hub closes the connection, again);
-    /// taking it as the start instead could record twice what the hub committed but the
-    /// runner never heard was acked. The new generation has the runner forget its spool and
-    /// number from 1 at its next welcome instead, or refuses a runner too old to.
-    pub(super) fn sweep_runner_acks(&mut self, boxes: &BTreeSet<String>) -> anyhow::Result<Swept> {
+    /// Only a recorded removal forgets a box: a box that is merely not in the config (a
+    /// config file missing or empty, another `XDG_CONFIG_HOME`, a box commented out by hand,
+    /// one removed before the record existed) keeps its watermarks, as its threads keep them,
+    /// should it come back. A removed box's watermarks can go only with its generation (in
+    /// the same transaction): its runner may still spool frames of its threads, numbered on
+    /// from where they were, and the box may be added again. Without its watermarks, a
+    /// thread's next frame would be a gap on every connection (the runner replays it, the hub
+    /// closes the connection, again); taking it as the start instead could record twice what
+    /// the hub committed but the runner never heard was acked. The new generation has the
+    /// runner forget its spool and number from 1 at its next welcome instead, or refuses a
+    /// runner too old to.
+    pub(super) fn sweep_runner_acks(
+        &mut self,
+        boxes: &BTreeSet<String>,
+        removed: &BTreeSet<String>,
+    ) -> anyhow::Result<Swept> {
         let mut swept = Swept::default();
-        let mut removed: BTreeSet<String> = self
-            .store
-            .runner_ack_keys()?
-            .into_iter()
-            .map(|(b, _)| b)
-            .collect();
-        removed.extend(
-            self.store
-                .runner_boxes()?
-                .into_iter()
-                .filter(|(_, g)| !g.forgotten)
-                .map(|(b, _)| b),
-        );
-        for b in removed.iter().filter(|b| !boxes.contains(*b)) {
-            swept.box_watermarks += self.forget_box(b)?;
-            swept.boxes += 1;
+        for b in removed {
+            // Configured again (by hand, in config.toml): no removal any more.
+            if !boxes.contains(b) && !self.store.runner_box_of(b)?.is_some_and(|g| g.forgotten) {
+                swept.box_watermarks += self.forget_box(b)?;
+                swept.boxes += 1;
+            }
+            swept.settled.insert(b.clone());
         }
         let stale: Vec<(String, String)> = self
             .store
@@ -3239,8 +3244,11 @@ mod tests {
     /// never had, one purged, one deleted from another box), as a hub from before may have
     /// kept; those of its threads and of a deleted thread still restorable from its box stay,
     /// and so does a box's watermark of another box's thread (the box's strays of it drain).
-    /// Every watermark of a box it starts without (`cpu`: removed before) goes too, and that
-    /// box gets a forgotten generation; the next start finds nothing more to forget.
+    /// Every watermark of a box it starts without that the removal record names (`old`:
+    /// `twr box remove` took it out) goes too, and that box gets a forgotten generation; one
+    /// the record names that is configured again (`cpu`) is only settled, and one that merely
+    /// is not in the config (`kept`) keeps its watermarks. The next start finds nothing more
+    /// to forget.
     #[tokio::test]
     async fn stale_watermarks_are_forgotten_as_the_hub_opens() {
         let dir = tempfile::tempdir().unwrap();
@@ -3271,7 +3279,7 @@ mod tests {
             }
         }
         assert!(inner.core().record_purged(&inner, "item-p", purged, false));
-        let keep = [("gpu", t), ("gpu", deleted), ("cpu", t)];
+        let keep = [("gpu", t), ("gpu", deleted), ("cpu", t), ("kept", t)];
         let stale = [
             ("gpu", purged),
             ("gpu", made_up),
@@ -3303,7 +3311,7 @@ mod tests {
             k.sort();
             k
         };
-        assert_eq!(keys(&inner).len(), 8);
+        assert_eq!(keys(&inner).len(), 9);
         drop(inner);
         hub.shutdown().await;
         drop(hub);
@@ -3318,9 +3326,10 @@ mod tests {
             );
         }
         let boxes: BTreeSet<String> = cfg.boxes.keys().cloned().collect();
-        let hub = crate::Hub::open(HubOptions::new(dir.path().join("twr.db"), cfg))
-            .await
-            .unwrap();
+        let removed: BTreeSet<String> = ["old", "cpu"].map(String::from).into();
+        let mut opts = HubOptions::new(dir.path().join("twr.db"), cfg);
+        opts.removed_boxes = removed.clone();
+        let hub = crate::Hub::open(opts).await.unwrap();
         assert_eq!(keys(&hub.inner), owned(&keep));
         let generations = || hub.inner.core().store.runner_boxes().unwrap();
         let old = generations();
@@ -3328,8 +3337,14 @@ mod tests {
         assert_eq!(old[0].0, "old");
         assert!(old[0].1.forgotten);
         assert_eq!(
-            hub.inner.core().sweep_runner_acks(&boxes).unwrap(),
-            Swept::default()
+            hub.inner
+                .core()
+                .sweep_runner_acks(&boxes, &removed)
+                .unwrap(),
+            Swept {
+                settled: removed.clone(),
+                ..Default::default()
+            }
         );
         // A box removed for good stays forgotten, under the same generation.
         assert_eq!(generations(), old);

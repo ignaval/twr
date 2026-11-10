@@ -397,6 +397,12 @@ pub struct HubOptions {
     /// no hub on the socket did so before this hub read the files, so the hub reads its edit.
     /// `None`: nothing is held (tests, or a lock file `twr hub` could not open).
     pub boxes_lock: Option<twr_core::config::BoxesLock>,
+    /// The boxes the removal record next to `boxes.toml` named when `config` was read
+    /// ([`twr_core::config::BoxesFile::removed`], `twr hub` reads both under the same lock):
+    /// the hub forgets those it starts without (`Core::sweep_runner_acks`), and, the
+    /// `default` workspace's hub with a `config_file`, takes them out of the record once that
+    /// is durable. Empty (tests, or a record that does not read): nothing is forgotten.
+    pub removed_boxes: std::collections::BTreeSet<String>,
     /// The file `config` was read from: the hub warns when it holds secrets (a box token, a
     /// `[notify]` command) and other users can access it ([`Config::warnings`]). `None` (tests):
     /// only the config itself is checked.
@@ -562,6 +568,7 @@ impl HubOptions {
             prune_tick: None,
             job_slots_dir: None,
             boxes_lock: None,
+            removed_boxes: Default::default(),
             config_file: None,
             test_user_token: None,
             hello_timeout: runners::HELLO_TIMEOUT,

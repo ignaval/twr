@@ -1727,7 +1727,7 @@ async fn sealed_inventory(
 }
 
 /// A box daemon too old to forget its spool, of a box the hub forgot (it started without the
-/// box, then with it again), is refused `error{protocol}` and its session's end says so
+/// box, which the removal record named, then with it again), is refused `error{protocol}` and its session's end says so
 /// (`spool_refused`: the supervisor replaces it as one of another protocol); a daemon that
 /// takes generations is welcomed with the new one and told the box was forgotten.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1748,10 +1748,12 @@ async fn an_older_daemon_of_a_forgotten_box_is_refused_for_its_spool() {
     served.await;
     hub.shutdown().await;
     drop(hub);
-    // Removed: the hub starts without it.
+    // Removed (`twr box remove` recorded it): the hub starts without it.
     let mut without = config();
     without.boxes.clear();
-    let hub = Hub::open(hub_opts(dir.path(), without)).await.unwrap();
+    let mut opts = hub_opts(dir.path(), without);
+    opts.removed_boxes = [BOX.to_string()].into();
+    let hub = Hub::open(opts).await.unwrap();
     hub.shutdown().await;
     drop(hub);
     // Added again.
