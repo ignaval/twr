@@ -6896,6 +6896,20 @@ async fn a_box_removed_while_its_runner_is_offline_is_clean_once_added_again() {
     assert!(h.hub().runner_watermarks(BOX).unwrap().is_empty());
     let (g2, forgotten) = h.hub().runner_generation(BOX).unwrap().unwrap();
     assert!(forgotten && g2 != g1);
+    // Its thread, whose session the hub last saw running, is closed for what it is: a
+    // thread of a box the hub no longer has, not a runtime that died with the hub.
+    let closed: Vec<String> = log(h.hub(), &t)
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::ThreadCrashed(c) => Some(c.stderr_tail.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert!(
+        closed[0].contains("is no longer one of this hub's boxes"),
+        "{closed:?}"
+    );
     h.shutdown().await;
 
     // Added again, the same name and the same runner.

@@ -482,7 +482,7 @@ When the hub forgets a box:
 - a token box at once, when `twr box remove` has the running hub drop its token (`box.token`);
 - every other box (SSH, container, linked) when the hub next starts without it. A hub also forgets this way the boxes removed before it had generations.
 
-A runner that is offline then learns of it whenever it next connects, however long after. The hub keeps one small row per removed box name, for that. A box's own threads stay as they were: the hub keeps them, and they are the box's again if it is added back.
+A runner that is offline then learns of it whenever it next connects, however long after. The hub keeps one small row per removed box name, for that. A box's own threads stay as they were: the hub keeps them, and they are the box's again if it is added back. A hub that starts without the box closes those of its threads that were running when it last saw them, with a note that the box is no longer one of the hub's (a `thread.crashed` in the log, though the runtime may still run on the box).
 
 A runner of a twr from before generations can't forget what it spooled. The hub serves it as before, except for a box it forgot whose runner has not connected since with a twr that has generations: it refuses that runner, saying to update twr on the box (`twr box status` shows the refusal). An SSH or container box's daemon, or a linked worker, is replaced with the hub's build then, as one of another protocol is ([A new twr build](#a-new-twr-build)); on a box of another OS or CPU whose configured build is that old, the box shows `needs_install`. A token box's runner must be updated by hand, as in [Versions and updates](#versions-and-updates). A twr with generations connected to a hub without them keeps its spool as before.
 
