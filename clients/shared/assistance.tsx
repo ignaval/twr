@@ -90,7 +90,7 @@ export function useAssistance({
   visible,
   target,
   events,
-  draft,
+  hasDraft,
   refresh,
   visibleRoutines,
   threads,
@@ -100,7 +100,8 @@ export function useAssistance({
   visible: boolean;
   target?: Thread;
   events: HubEvent[];
-  draft: string;
+  /** Whether the composer holds a draft: no suggestion is asked for, or kept, while it does. */
+  hasDraft: boolean;
   refresh: number;
   visibleRoutines: string[];
   threads: Thread[];
@@ -217,7 +218,7 @@ export function useAssistance({
       !disclosed ||
       !target ||
       !turn ||
-      draft ||
+      hasDraft ||
       ["running", "background"].includes(target.status)
     )
       return;
@@ -282,7 +283,7 @@ export function useAssistance({
     settingsReady,
     disclosed,
     turn,
-    draft,
+    hasDraft,
     retryVersion,
   ]);
   useEffect(() => {

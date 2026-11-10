@@ -8,6 +8,7 @@ import { TerminalSnapshots } from "./terminalSnapshots";
 import { Outbox } from "./Outbox";
 import { UploadController } from "./uploads";
 import { AttachmentManager } from "./AttachmentManager";
+import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
@@ -38,7 +39,6 @@ import {
   Wrench,
   Database,
   ListTodo,
-  ArrowUp,
   ArrowLeft,
   ArrowDown,
   ArrowUpRight,
@@ -71,7 +71,6 @@ import {
   Circle,
   ExternalLink,
   Download,
-  Paperclip,
   Eye,
   EyeOff,
   Filter,
@@ -105,13 +104,7 @@ import {
   Spinner,
 } from "./ui";
 import { effortChoices, formRuntime, modelChoices } from "./models";
-import {
-  AssistanceNotice,
-  takesSuggestion,
-  useAssistance,
-  type Summary,
-} from "./assistance";
-import { VoiceControl } from "./VoiceControl";
+import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
 import { announcements, voiceHint } from "./voice";
 import {
   blocksOf,
@@ -324,9 +317,10 @@ export default function App({
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
   const observedDestination = useRef<string | undefined>(undefined);
-  const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const currentDrafts = useRef(drafts);
-  currentDrafts.current = drafts;
+  // The message drafts, by destination: outside React state, so that typing re-renders
+  // the composer alone (Composer.tsx).
+  const [drafts] = useState(() => new Drafts());
+  const [composer] = useState(composerMemory);
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -338,7 +332,7 @@ export default function App({
   useEffect(() => {
     const reset = (event: Event) => {
       if ((event as CustomEvent).detail?.hostId === hostId) {
-        setDrafts({});
+        drafts.update(() => ({}));
         setJournal(offlineJournal(hostApi, hostId));
         setOfflineNotice("");
       }
@@ -349,7 +343,10 @@ export default function App({
       void saved
         .load()
         .then(() => {
-          setDrafts((current) => ({ ...saved.snapshot.drafts, ...current }));
+          drafts.update((current) => ({
+            ...saved.snapshot.drafts,
+            ...current,
+          }));
           setJournal(saved);
           setOfflineNotice("");
         })
@@ -369,44 +366,49 @@ export default function App({
       new UploadController(hostApi, (attachment) => {
         const key = attachment.workspace + ":" + attachment.thread;
         const orchKey = attachment.workspace + ":orchestrator";
-        setDrafts((old) => {
-          const targetKey =
-            attachment.thread ===
-            currentOrchestrator.current[attachment.workspace]
-              ? orchKey
-              : key;
-          return {
-            ...old,
-            [targetKey]:
-              `${old[targetKey] || ""}\nUploaded file: ${attachment.file.name}\n${attachment.path}\n`.trimStart(),
-          };
-        });
+        const targetKey =
+          attachment.thread ===
+          currentOrchestrator.current[attachment.workspace]
+            ? orchKey
+            : key;
+        drafts.set(targetKey, (old) =>
+          `${old || ""}\nUploaded file: ${attachment.file.name}\n${attachment.path}\n`.trimStart(),
+        );
       }),
   );
   const currentOrchestrator = useRef<Record<string, string | undefined>>({});
   useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
+  // Saves the drafts on this device 350 ms after the last change to any of them, into
+  // the storage epoch of that change.
   useEffect(() => {
     if (!journal) return;
-    const pending = pendingEnqueue.current;
-    if (pending?.saved && drafts[pending.key] !== pending.text)
-      pendingEnqueue.current = undefined;
-    const epoch = journal.epoch;
-    let timer: ReturnType<typeof setTimeout>;
-    const persist = () => {
-      if (pendingEnqueue.current) {
-        timer = setTimeout(persist, 100);
-        draftSaveTimer.current = timer;
-        return;
-      }
-      void journal
-        .drafts(currentDrafts.current, epoch)
-        .then(() => setOfflineNotice(""))
-        .catch((error) => setOfflineNotice(errorMessage(error)));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const changed = () => {
+      const pending = pendingEnqueue.current;
+      if (pending?.saved && drafts.get(pending.key) !== pending.text)
+        pendingEnqueue.current = undefined;
+      const epoch = journal.epoch;
+      const persist = () => {
+        if (pendingEnqueue.current) {
+          timer = setTimeout(persist, 100);
+          draftSaveTimer.current = timer;
+          return;
+        }
+        void journal
+          .drafts(drafts.all(), epoch)
+          .then(() => setOfflineNotice(""))
+          .catch((error) => setOfflineNotice(errorMessage(error)));
+      };
+      clearTimeout(timer);
+      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      timer = setTimeout(persist, 350);
+      draftSaveTimer.current = timer;
     };
-    timer = setTimeout(persist, 350);
-    draftSaveTimer.current = timer;
+    changed();
+    const unsubscribe = drafts.subscribe(changed);
     return () => {
+      unsubscribe();
       clearTimeout(timer);
       if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
     };
@@ -417,10 +419,6 @@ export default function App({
   const [queueInfo, setQueueInfo] = useState<Json>({});
   const [shellCwd, setShellCwd] = useState<string>();
   const [shellJobs, setShellJobs] = useState<Json[]>([]);
-  const [slashHidden, setSlashHidden] = useState(false);
-  const [mentionIndex, setMentionIndex] = useState(0);
-  const [mentionHidden, setMentionHidden] = useState(false);
-  const [slashIndex, setSlashIndex] = useState(-1);
   const [palette, setPalette] = useState(false);
   const [query, setQuery] = useState("");
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -491,7 +489,9 @@ export default function App({
     ? view.threads.find((t) => t.id === destination)
     : orchestrator;
   const draftKey = workspace + ":" + (destination || "orchestrator");
-  const draft = drafts[draftKey] || "";
+  // Whether the box is empty, not what it says: App renders again when typing starts or
+  // the box is cleared, never on each key.
+  const hasDraft = useHasDraft(drafts, draftKey);
   const selectedThread = view.threads.find((t) => t.id === selected);
   // The desktop tray/menu bar, Dock badge and notifications mirror what needs the user in
   // every workspace: this one's live view and the others' latest reads. The live view's
@@ -544,21 +544,23 @@ export default function App({
     visible: section === "chat",
     target,
     events: presentedEvents,
-    draft,
+    hasDraft,
     refresh,
     visibleRoutines,
     threads: view.threads,
   });
-  const [acceptedSuggestion, setAcceptedSuggestion] = useState<{
-    key: string;
-    text: string;
-  }>();
+  // The suggestion taken into the box, until it is edited: a message sent as it was
+  // suggested says so. Only `send` reads it, so it is not state.
+  const acceptedSuggestion = useRef<{ key: string; text: string }>(undefined);
   function acceptSuggestion() {
     if (!assistance.suggestion) return;
-    setDrafts((old) => ({ ...old, [draftKey]: assistance.suggestion }));
-    setAcceptedSuggestion({ key: draftKey, text: assistance.suggestion });
+    drafts.set(draftKey, assistance.suggestion);
+    acceptedSuggestion.current = { key: draftKey, text: assistance.suggestion };
     input.current?.focus();
   }
+  const forgetAcceptedSuggestion = useCallback(() => {
+    acceptedSuggestion.current = undefined;
+  }, []);
   async function setAssistance(key: "suggest" | "summaries", value: boolean) {
     try {
       await hostApi.configSet(["tui"], key, value);
@@ -948,7 +950,7 @@ export default function App({
               await saved.drafts(restored);
               localStorage.removeItem(oldKey);
             }
-            setDrafts((current) => ({ ...restored, ...current }));
+            drafts.update((current) => ({ ...restored, ...current }));
             setJournal(saved);
             setOfflineNotice(saved.historyError);
           })
@@ -1466,6 +1468,7 @@ export default function App({
   };
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
+    const draft = drafts.get(draftKey);
     if (!permitted("operate") || !draft.trim() || sending) return;
     if (
       !connected &&
@@ -1527,8 +1530,8 @@ export default function App({
               seen_gseq: view.head,
               to: "orchestrator",
               suggested:
-                acceptedSuggestion?.key === key &&
-                acceptedSuggestion.text === text,
+                acceptedSuggestion.current?.key === key &&
+                acceptedSuggestion.current.text === text,
             };
         // Live replies to a waiting request use only the current visible head.
         // They never enter the delayed message outbox or receive automatic retries.
@@ -1551,38 +1554,26 @@ export default function App({
             .catch((error) => {
               if (pendingEnqueue.current === pending)
                 pendingEnqueue.current = undefined;
-              void journal.drafts(currentDrafts.current, epoch).catch(() => {});
+              void journal.drafts(drafts.all(), epoch).catch(() => {});
               throw error;
             });
           pending.saved = true;
-          setDrafts((old) => ({
-            ...old,
-            [key]: old[key] === draft ? "" : old[key],
-          }));
+          drafts.set(key, (old) => (old === draft ? "" : old));
           if (connected) response = await journal.deliver(message);
           else response = { saved_offline: true };
         } else response = await rpc(method, params);
       }
 
       for (const restored of response.restored_drafts || [])
-        setDrafts((old) => ({
-          ...old,
-          [restored.key]: appendDraft(old[restored.key], restored.text),
-        }));
+        drafts.set(restored.key, (old) => appendDraft(old, restored.text));
       if (response.action === "pending") {
-        setDrafts((old) => ({
-          ...old,
-          [key]: appendDraft(old[key], draft),
-        }));
+        drafts.set(key, (old) => appendDraft(old, draft));
         setSection("attention");
         throw new Error(
           "Message not sent. Review the waiting requests and answer the exact item shown.",
         );
       }
-      setDrafts((old) => ({
-        ...old,
-        [key]: old[key] === draft ? "" : old[key],
-      }));
+      drafts.set(key, (old) => (old === draft ? "" : old));
       if (!response.saved_offline && target)
         uploads.dismissReady(target.id, workspace, draft);
       announce(
@@ -1650,7 +1641,7 @@ export default function App({
       };
       if (extraRoutes[rawName]) {
         setSection(extraRoutes[rawName]);
-        setDrafts((old) => ({ ...old, [draftKey]: "" }));
+        drafts.set(draftKey, "");
         return;
       }
       const parsed = await rpc("desktop.parse_slash", { line: text });
@@ -1683,7 +1674,7 @@ export default function App({
             throw new Error(
               "No message can be taken back in this conversation.",
             );
-          setDrafts((old) => ({ ...old, [draftKey]: "" }));
+          drafts.set(draftKey, "");
           await takeBack({ ref });
           return;
         }
@@ -1932,7 +1923,7 @@ export default function App({
         default:
           throw new Error("No desktop action for this command.");
       }
-      setDrafts((old) => ({ ...old, [draftKey]: "" }));
+      drafts.set(draftKey, "");
     } catch (error) {
       fail(error);
     } finally {
@@ -1997,11 +1988,10 @@ export default function App({
         throw new Error(
           response.message || "This message can no longer be taken back.",
         );
-      setDrafts((old) => ({
-        ...old,
-        [draftKey]:
-          (old[draftKey] ? old[draftKey] + "\n\n" : "") + response.prompt,
-      }));
+      drafts.set(
+        draftKey,
+        (old) => (old ? old + "\n\n" : "") + response.prompt,
+      );
       setQueueRefresh((n) => n + 1);
       input.current?.focus();
     } catch (error) {
@@ -2205,25 +2195,6 @@ export default function App({
     }
   }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
   const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
-  function chooseMention(thread: Thread) {
-    setDrafts((old) => ({
-      ...old,
-      [draftKey]: draft.replace(/@[\w-]*$/, "@" + thread.name + " "),
-    }));
-    setMentionHidden(true);
-    input.current?.focus();
-  }
-  const mentions = draft.match(/(?:^|\s)@([\w-]*)$/)
-    ? workers
-        .filter((t) => t.name.startsWith(draft.match(/@([\w-]*)$/)?.[1] || ""))
-        .slice(0, 6)
-    : [];
-  const slashMatches =
-    draft.startsWith("/") && !draft.startsWith("//")
-      ? (slashCommands.length ? slashCommands : commands)
-          .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
-          .slice(0, 6)
-      : [];
   useEffect(() => {
     setPaletteIndex(0);
   }, [query]);
@@ -3051,13 +3022,9 @@ export default function App({
                       ...(result.restored_drafts || []),
                       ...(result.restored_draft ? [result.restored_draft] : []),
                     ])
-                      setDrafts((old) => ({
-                        ...old,
-                        [restored.key]: appendDraft(
-                          old[restored.key],
-                          restored.text,
-                        ),
-                      }));
+                      drafts.set(restored.key, (old) =>
+                        appendDraft(old, restored.text),
+                      );
                   }}
                   onCopy={(message) => {
                     const key =
@@ -3067,10 +3034,7 @@ export default function App({
                         ? "orchestrator"
                         : message.params.thread);
                     const text = messageDraft(message);
-                    setDrafts((old) => ({
-                      ...old,
-                      [key]: appendDraft(old[key], text),
-                    }));
+                    drafts.set(key, (old) => appendDraft(old, text));
                   }}
                 />
                 {target && (
@@ -3179,390 +3143,39 @@ export default function App({
                     </button>
                   </div>
                 )}
-                {!draft &&
-                  assistance.suggestion &&
-                  document.documentElement.dataset.mobile === "true" && (
-                    <button
-                      className="suggested-message"
-                      onClick={acceptSuggestion}
-                    >
-                      <span className="visually-hidden">Suggested reply: </span>
-                      <span>{assistance.suggestion}</span>
-                      <span className="visually-hidden">, tap to use</span>
-                    </button>
-                  )}
-                <form
-                  className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
-                  aria-label="Message composer"
-                  onSubmit={(event) => void send(event)}
-                >
-                  <div className="composer-label">
-                    <span className="destination-chip">
-                      <span className="destination-dot" aria-hidden="true" />
-                      To:{" "}
-                      <b>
-                        {draft.startsWith("!") && !draft.startsWith("!!!")
-                          ? "Shell · " +
-                            (destination
-                              ? target?.name
-                              : shellCwd || "workspace folder") +
-                            (draft.startsWith("!!") ? " · share result" : "")
-                          : destination
-                            ? target?.name
-                            : "Orchestrator"}
-                      </b>
-                      {destination && (
-                        <button
-                          type="button"
-                          aria-label="Return to orchestrator"
-                          title="Return to orchestrator"
-                          onClick={() => setDestination(undefined)}
-                        >
-                          <X size={12} />
-                        </button>
-                      )}
-                    </span>
-
-                    <span>
-                      {!connected
-                        ? "Disconnected"
-                        : target
-                          ? target.status_label || target.status
-                          : "Choose an orchestrator"}
-                    </span>
-                    {onDismissKeyboard && (
-                      <button
-                        type="button"
-                        className="keyboard-dismiss"
-                        aria-label="Dismiss keyboard"
-                        onClick={onDismissKeyboard}
-                      >
-                        <ChevronDown size={18} />
-                      </button>
-                    )}
-                  </div>
-                  <textarea
-                    ref={input}
-                    aria-label={
-                      destination
-                        ? `Message ${target?.name} directly`
-                        : "Message orchestrator"
-                    }
-                    aria-describedby="twr-composer-hints"
-                    aria-autocomplete={
-                      mentions.length || slashMatches.length
-                        ? "list"
-                        : undefined
-                    }
-                    aria-controls={
-                      mentions.length && !mentionHidden
-                        ? "twr-mentions"
-                        : slashMatches.length && !slashHidden
-                          ? "twr-slash-suggestions"
-                          : undefined
-                    }
-                    aria-activedescendant={
-                      mentions.length && !mentionHidden
-                        ? `twr-mention-${mentionIndex % mentions.length}`
-                        : slashMatches.length && !slashHidden && slashIndex >= 0
-                          ? `twr-slash-${slashIndex % slashMatches.length}`
-                          : undefined
-                    }
-                    value={draft}
-                    onChange={(e) => {
-                      setAcceptedSuggestion(undefined);
-                      setDrafts((old) => ({
-                        ...old,
-                        [draftKey]: e.target.value,
-                      }));
-                      setSlashHidden(false);
-                      setSlashIndex(-1);
-                      setMentionHidden(false);
-                      setMentionIndex(0);
-                    }}
-                    placeholder={
-                      // A suggestion shows as the empty box's placeholder, as the TUI's
-                      // ghost text: Tab or → takes it, typing types over it.
-                      !draft && assistance.suggestion
-                        ? assistance.suggestion
-                        : document.documentElement.dataset.mobile === "true"
-                          ? "Message…"
-                          : destination
-                            ? `Message ${target?.name} directly…`
-                            : "Ask your orchestrator to build something…"
-                    }
-                    rows={Math.min(
-                      6,
-                      Math.max(
-                        document.documentElement.dataset.mobile === "true"
-                          ? 1
-                          : 2,
-                        draft.split("\n").length,
-                      ),
-                    )}
-                    disabled={(!connected && !journal) || !permitted("operate")}
-                    onKeyDown={(e) => {
-                      if (e.nativeEvent.isComposing || e.keyCode === 229)
-                        return;
-                      if (
-                        takesSuggestion(
-                          e,
-                          draft,
-                          assistance.suggestion,
-                          assistance.suggestionShownFor(),
-                        )
-                      ) {
-                        e.preventDefault();
-                        acceptSuggestion();
-                        return;
-                      }
-                      if (mentions.length && !mentionHidden) {
-                        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                          e.preventDefault();
-                          setMentionIndex(
-                            (i) =>
-                              (i +
-                                (e.key === "ArrowDown"
-                                  ? 1
-                                  : mentions.length - 1)) %
-                              mentions.length,
-                          );
-                          return;
-                        }
-                        if (
-                          (e.key === "Enter" && !e.shiftKey) ||
-                          e.key === "Tab"
-                        ) {
-                          e.preventDefault();
-                          chooseMention(
-                            mentions[mentionIndex % mentions.length],
-                          );
-                          return;
-                        }
-                        if (e.key === "Escape") {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setMentionHidden(true);
-                          return;
-                        }
-                      }
-                      if (
-                        e.key === "Escape" &&
-                        slashMatches.length &&
-                        !slashHidden
-                      ) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setSlashHidden(true);
-                        setSlashIndex(-1);
-                        return;
-                      }
-                      if (
-                        slashMatches.length &&
-                        !slashHidden &&
-                        !draft.includes("\n") &&
-                        (e.key === "ArrowDown" || e.key === "ArrowUp")
-                      ) {
-                        // Arrow keys pick a suggested command; Enter then runs it.
-                        e.preventDefault();
-                        setSlashIndex((i) =>
-                          e.key === "ArrowDown"
-                            ? (i + 1) % slashMatches.length
-                            : i <= 0
-                              ? slashMatches.length - 1
-                              : i - 1,
-                        );
-                        return;
-                      }
-                      if (
-                        e.key === "Enter" &&
-                        !e.shiftKey &&
-                        slashMatches.length &&
-                        !slashHidden &&
-                        slashIndex >= 0
-                      ) {
-                        e.preventDefault();
-                        const command =
-                          slashMatches[slashIndex % slashMatches.length];
-                        setSlashIndex(-1);
-                        void submitSlash(
-                          "/" + command.id + draft.slice(1).replace(/^\S+/, ""),
-                        );
-                        return;
-                      }
-                      if (
-                        e.key === "Enter" &&
-                        !e.shiftKey &&
-                        document.documentElement.dataset.mobile !== "true" &&
-                        !e.nativeEvent.isComposing
-                      ) {
-                        e.preventDefault();
-                        void send();
-                      }
-                    }}
-                  />
-                  <div className="composer-bottom">
-                    {hostApi.uploadFile && permitted("operate") && (
-                      <label
-                        className="attachment-button"
-                        title="Upload files to this thread"
-                      >
-                        <Paperclip size={18} />
-                        <span className="sr-only">Upload files</span>
-                        <input
-                          type="file"
-                          aria-label="Upload files"
-                          multiple
-                          disabled={!connected || !target || sending}
-                          onChange={(event) => {
-                            const files = Array.from(event.target.files || []);
-                            event.target.value = "";
-                            if (target) {
-                              try {
-                                uploads.add(files, target.id, workspace);
-                              } catch (error) {
-                                fail(error);
-                              }
-                            }
-                          }}
-                        />
-                      </label>
-                    )}
-                    <span id="twr-composer-hints">
-                      <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd>{" "}
-                      reference a thread <span>·</span> Shift Enter for a new
-                      line
-                      {!draft && assistance.suggestion && (
-                        <span>
-                          {" "}
-                          · <kbd>Tab</kbd> or <kbd>→</kbd> takes the suggestion
-                        </span>
-                      )}
-                      {assistance.stats && (
-                        <small
-                          title={`${assistance.stats.calls} calls · ${assistance.stats.failures} failed`}
-                        >
-                          {" "}
-                          · {assistance.stats.source} $
-                          {Number(assistance.stats.cost_usd || 0).toFixed(4)}{" "}
-                          USD
-                        </small>
-                      )}
-                    </span>
-                    <div className="composer-actions">
-                      <VoiceControl
-                        host={hostApi}
-                        rpc={rpc}
-                        connected={connected}
-                        allowed={permitted("operate") && Boolean(orchestrator)}
-                        submit={submitVoice}
-                        hint={voiceHintWords}
-                        spoken={spokenLately}
-                        edit={(text) => {
-                          setDestination(undefined);
-                          setDrafts((old) => ({
-                            ...old,
-                            [workspace + ":orchestrator"]: appendDraft(
-                              old[workspace + ":orchestrator"],
-                              text,
-                            ),
-                          }));
-                          input.current?.focus();
-                        }}
-                        onError={fail}
-                      />
-                      <button
-                        className="send-button"
-                        type="submit"
-                        disabled={
-                          !permitted("operate") ||
-                          !draft.trim() ||
-                          (!connected &&
-                            (!journal ||
-                              draft.startsWith("/") ||
-                              draft.startsWith("!"))) ||
-                          (!target && !draft.startsWith("/")) ||
-                          sending
-                        }
-                        aria-label={
-                          connected ? "Send message" : "Save message for later"
-                        }
-                        title={
-                          connected
-                            ? "Send message"
-                            : "Save on this device until the hub reconnects"
-                        }
-                      >
-                        {sending ? <Spinner /> : <ArrowUp size={18} />}
-                      </button>
-                    </div>
-                  </div>
-                  {mentions.length > 0 && !mentionHidden && (
-                    <div
-                      className="mentions"
-                      id="twr-mentions"
-                      role="listbox"
-                      aria-label="Threads to reference"
-                    >
-                      {mentions.map((t, i) => (
-                        <button
-                          className={
-                            i === mentionIndex % mentions.length ? "active" : ""
-                          }
-                          type="button"
-                          role="option"
-                          id={`twr-mention-${i}`}
-                          aria-selected={i === mentionIndex % mentions.length}
-                          tabIndex={-1}
-                          key={t.id}
-                          onClick={() => chooseMention(t)}
-                        >
-                          {" "}
-                          @{t.name}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  {slashMatches.length > 0 && !slashHidden && (
-                    <div
-                      className="mentions slash-suggestions"
-                      id="twr-slash-suggestions"
-                      role="listbox"
-                      aria-label="Commands"
-                    >
-                      {slashMatches.map((command, i) => (
-                        <button
-                          type="button"
-                          role="option"
-                          id={`twr-slash-${i}`}
-                          className={
-                            slashIndex >= 0 &&
-                            i === slashIndex % slashMatches.length
-                              ? "active"
-                              : ""
-                          }
-                          aria-selected={
-                            slashIndex >= 0 &&
-                            i === slashIndex % slashMatches.length
-                          }
-                          tabIndex={-1}
-                          key={command.id}
-                          onClick={() =>
-                            submitSlash(
-                              "/" +
-                                command.id +
-                                draft.slice(1).replace(/^\S+/, ""),
-                            )
-                          }
-                        >
-                          <b>/{command.id}</b>
-                          <span className="visually-hidden">, </span>
-                          <span>{command.title}</span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </form>
+                <Composer
+                  drafts={drafts}
+                  draftKey={draftKey}
+                  memory={composer}
+                  input={input}
+                  hostApi={hostApi}
+                  rpc={rpc}
+                  operate={permitted("operate")}
+                  connected={connected}
+                  journal={journal}
+                  sending={sending}
+                  workspace={workspace}
+                  target={target}
+                  destination={destination}
+                  setDestination={setDestination}
+                  orchestrator={orchestrator}
+                  workers={workers}
+                  slashCommands={
+                    slashCommands.length ? slashCommands : commands
+                  }
+                  shellCwd={shellCwd}
+                  assistance={assistance}
+                  acceptSuggestion={acceptSuggestion}
+                  onEdit={forgetAcceptedSuggestion}
+                  send={send}
+                  submitSlash={submitSlash}
+                  uploads={uploads}
+                  submitVoice={submitVoice}
+                  voiceHint={voiceHintWords}
+                  spokenLately={spokenLately}
+                  onDismissKeyboard={onDismissKeyboard}
+                  fail={fail}
+                />
               </>
             )}
             {section === "grid" && (
