@@ -539,6 +539,9 @@ pub struct NewPrompt {
 pub struct AppendBatch<'a> {
     /// Events in append order, each with whether it gets a control row.
     pub events: Vec<(&'a Event, bool)>,
+    /// Each event's `data` as the JSON text to store, in the same order, when the caller made
+    /// it already (the hub's writer, `blob::cap_for_log`); empty: written here from the events.
+    pub data: &'a [String],
     /// Blobs to store (`(ref, bytes)`), idempotent.
     pub blobs: &'a [(String, Vec<u8>)],
     /// Pending prompt row to remove (dispatch).
@@ -667,6 +670,7 @@ impl Store {
     ) -> anyhow::Result<Option<u64>> {
         let commit = self.append_batch(AppendBatch {
             events: vec![(ev, control)],
+            data: &[],
             blobs: extras.blobs,
             dequeue: extras.dequeue,
             enqueue: Vec::new(),
@@ -684,11 +688,23 @@ impl Store {
     /// its control row) in order, then the queued prompts. Either all of it is recorded or
     /// none of it.
     pub fn append_batch(&mut self, batch: AppendBatch<'_>) -> anyhow::Result<BatchCommit> {
-        let data = batch
-            .events
-            .iter()
-            .map(|(ev, _)| Ok(serde_json::to_string(&ev.body.data()?)?))
-            .collect::<anyhow::Result<Vec<String>>>()?;
+        let written;
+        let data: &[String] = if batch.data.is_empty() {
+            written = batch
+                .events
+                .iter()
+                .map(|(ev, _)| Ok(serde_json::to_string(&ev.body.data()?)?))
+                .collect::<anyhow::Result<Vec<String>>>()?;
+            &written
+        } else if batch.data.len() == batch.events.len() {
+            batch.data
+        } else {
+            bail!(
+                "{} events with {} data texts",
+                batch.events.len(),
+                batch.data.len()
+            );
+        };
         // A runner frame is acked once this commits, and the runner then deletes it: that
         // commit must survive a power loss too, not only a crash of the hub (unless the caller
         // syncs a batch of frames before acking them, `defer_sync`).
@@ -708,7 +724,7 @@ impl Store {
     fn commit_batch(
         conn: &mut Connection,
         batch: AppendBatch<'_>,
-        data: Vec<String>,
+        data: &[String],
     ) -> anyhow::Result<BatchCommit> {
         let tx = conn.transaction()?;
         // Every statement here runs on most commits: prepared once per connection.
@@ -1055,6 +1071,28 @@ impl Store {
         Ok(self
             .conn
             .execute("DELETE FROM runner_acks WHERE thread = ?1", [thread])?)
+    }
+
+    /// Every committed watermark's `(box, thread)`.
+    pub fn runner_ack_keys(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let mut st = self.conn.prepare("SELECT box, thread FROM runner_acks")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Forgets the watermarks of `keys` (`(box, thread)`), in one transaction. Returns how
+    /// many there were.
+    pub fn forget_runner_acks_of(&mut self, keys: &[(String, String)]) -> anyhow::Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        {
+            let mut st = tx.prepare("DELETE FROM runner_acks WHERE box = ?1 AND thread = ?2")?;
+            for (b, t) in keys {
+                n += st.execute(params![b, t])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Every event in append order.
@@ -1581,37 +1619,81 @@ fn stream_line(row: RawRow, gseq: Option<u64>, out: &mut Vec<u8>) -> anyhow::Res
         out.push(b'\n');
         return Ok(());
     };
+    // (Neither is negative: `readable`.)
+    write_line(
+        out,
+        gseq,
+        &Envelope {
+            v: row.v,
+            id: &row.id,
+            seq: row.seq as u64,
+            ts: &ts,
+            thread: &row.thread,
+            turn: row.turn.map(|t| t as u64),
+            source: &source,
+            kind: &row.kind,
+            data: data.get(),
+            raw: row.raw.as_deref(),
+        },
+    )?;
+    Ok(())
+}
+
+/// An event's envelope as text, for [`write_line`]: `ts` as `Event` writes it (to the
+/// millisecond, in UTC), `source` spelled its way, `data` one JSON value on one line.
+pub(crate) struct Envelope<'a> {
+    pub v: u32,
+    pub id: &'a str,
+    pub seq: u64,
+    pub ts: &'a str,
+    pub thread: &'a str,
+    pub turn: Option<u64>,
+    pub source: &'a str,
+    pub kind: &'a str,
+    pub data: &'a str,
+    pub raw: Option<&'a str>,
+}
+
+/// Appends the line a subscription writes for event `e` (a control item when it has a
+/// `gseq`), with its newline: what serializing its [`twr_core::proto::StreamItem`] writes,
+/// `data` going in as it is (its keys in the order it has them).
+pub(crate) fn write_line(
+    out: &mut Vec<u8>,
+    gseq: Option<u64>,
+    e: &Envelope<'_>,
+) -> serde_json::Result<()> {
     let text = |out: &mut Vec<u8>, s: &str| serde_json::to_writer(&mut *out, s);
+    let number = |out: &mut Vec<u8>, n: u64| out.extend_from_slice(n.to_string().as_bytes());
     match gseq {
         Some(g) => {
             out.extend_from_slice(br#"{"stream":"control","gseq":"#);
-            out.extend_from_slice(g.to_string().as_bytes());
+            number(out, g);
         }
         None => out.extend_from_slice(br#"{"stream":"thread""#),
     }
     out.extend_from_slice(br#","event":{"v":"#);
-    out.extend_from_slice(row.v.to_string().as_bytes());
+    number(out, u64::from(e.v));
     out.extend_from_slice(br#","id":"#);
-    text(out, &row.id)?;
+    text(out, e.id)?;
     out.extend_from_slice(br#","seq":"#);
-    out.extend_from_slice(row.seq.to_string().as_bytes());
+    number(out, e.seq);
     out.extend_from_slice(br#","ts":"#);
-    text(out, &ts)?;
+    text(out, e.ts)?;
     out.extend_from_slice(br#","thread":"#);
-    text(out, &row.thread)?;
+    text(out, e.thread)?;
     out.extend_from_slice(br#","turn":"#);
-    match row.turn {
-        Some(t) => out.extend_from_slice(t.to_string().as_bytes()),
+    match e.turn {
+        Some(t) => number(out, t),
         None => out.extend_from_slice(b"null"),
     }
     out.extend_from_slice(br#","source":"#);
-    text(out, &source)?;
+    text(out, e.source)?;
     out.extend_from_slice(br#","kind":"#);
-    text(out, &row.kind)?;
+    text(out, e.kind)?;
     out.extend_from_slice(br#","data":"#);
-    out.extend_from_slice(data.get().as_bytes());
+    out.extend_from_slice(e.data.as_bytes());
     out.extend_from_slice(br#","raw":"#);
-    match &row.raw {
+    match e.raw {
         Some(r) => text(out, r)?,
         None => out.extend_from_slice(b"null"),
     }
@@ -3436,6 +3518,7 @@ mod tests {
         let committed = s
             .append_batch(AppendBatch {
                 events: vec![(&a, true), (&b, false)],
+                data: &[],
                 blobs: &[],
                 dequeue: None,
                 enqueue: vec![prompt(None), prompt(Some(1))],
@@ -3462,6 +3545,7 @@ mod tests {
         assert!(s
             .append_batch(AppendBatch {
                 events: vec![(&c, true), (&dup, true)],
+                data: &[],
                 blobs: &[],
                 dequeue: Some(p.id),
                 enqueue: vec![prompt(None)],
@@ -3560,6 +3644,7 @@ mod tests {
         };
         let batch = |enqueue| AppendBatch {
             events: vec![],
+            data: &[],
             blobs: &[],
             dequeue: None,
             enqueue,
@@ -3939,6 +4024,7 @@ mod tests {
         };
         let batch = AppendBatch {
             events: vec![],
+            data: &[],
             blobs: &[],
             dequeue: None,
             enqueue: vec![],

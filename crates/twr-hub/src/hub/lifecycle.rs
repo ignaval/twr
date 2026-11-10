@@ -93,6 +93,18 @@ impl Hub {
         )
         .unwrap_or(chrono::Duration::MAX);
         twr_core::trace::mark("hub: log replayed");
+        // Before any runner connects: watermarks of threads the hub keeps none of go
+        // (`Core::sweep_runner_acks`). A failure leaves them, as they were.
+        match core.sweep_runner_acks() {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                watermarks = n,
+                "forgot runner watermarks of threads the log does not keep"
+            ),
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot forget stale runner watermarks")
+            }
+        }
         let intents = core.store.spawn_intents()?;
         let cap = opts.broadcast_capacity.max(1);
         let (control_tx, _) = broadcast::channel(cap);

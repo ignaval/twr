@@ -72,7 +72,10 @@ message (`relay_forbidden`, directly or as a card), or Confirm on a card that ho
 card stays open for you). A device's own move of a thread to another runtime, a move the
 orchestrator would put on a card from its message, and `outside_pin` are held to admin the
 same way (the orchestrator's own move of a thread in a restricted mode, which needs no card,
-is not a device's). A device revoked since its message arrived counts as holding nothing. Store credentials in the native
+is not a device's). A device revoked since its message arrived counts as holding nothing.
+While the device list can't be read, the hub serves none of a device's requests (each is
+refused with an error to try again; the connection stays) rather than going by what the
+device held when it connected. Store credentials in the native
 Keychain/Keystore, not the web renderer. The companion receives them over stdin. The host
 keeps token hashes in owner-private device state and checks revocation during connections.
 Same-user processes that can alter this state remain outside the boundary, like other

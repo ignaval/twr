@@ -34,7 +34,7 @@ pub(super) const DEVICE_PREFIX: &str = "device:";
 pub(super) struct DeviceGrant {
     /// The device's id.
     pub(super) id: String,
-    /// Its scopes; none when it is no longer paired or its records can't be read.
+    /// Its scopes; none when it is no longer paired.
     pub(super) scopes: Vec<String>,
 }
 
@@ -66,18 +66,36 @@ impl DeviceGrant {
     }
 }
 
+/// What a paired device's request gets while the hub cannot read the device records
+/// ([`devices_unreadable`]): the gateway's words for `twr_core::devices::Standing::Unknown`.
+/// Nothing was done; the same request may succeed once they read again.
+pub(crate) const DEVICES_UNREADABLE: &str =
+    "The hub could not read its paired devices. Try again in a moment.";
+
+/// The refusal of a paired device's request while the device records cannot be read: never a
+/// grant (the device may have been revoked or narrowed since), and not `unauthorized` either
+/// (nothing says it lost a scope): `internal`, saying to try again.
+pub(crate) fn devices_unreadable() -> RpcError {
+    rpc(codes::INTERNAL, DEVICES_UNREADABLE)
+}
+
 impl Inner {
     /// The grant of the paired device whose connection is named `client` (`device:<id>`);
-    /// `None` for every other client (the local user's). A device the records no longer list,
-    /// or records that can't be read, grant nothing.
-    pub(super) fn device_grant(&self, client: &str) -> Option<DeviceGrant> {
-        let id = client.strip_prefix(DEVICE_PREFIX)?;
-        let scopes = self
-            .device_records()
-            .map_err(|e| tracing::warn!(device = %id, error = %format!("{e:#}"), "cannot read the paired devices; the device gets no scope"))
-            .ok()
+    /// `Ok(None)` for every other client (the local user's), without reading anything. A
+    /// device the records no longer list grants nothing; records that can't be read refuse the
+    /// request ([`devices_unreadable`]): an error there is never taken for a grant.
+    pub(super) fn device_grant(&self, client: &str) -> Result<Option<DeviceGrant>, RpcError> {
+        let Some(id) = client.strip_prefix(DEVICE_PREFIX) else {
+            return Ok(None);
+        };
+        let devices = self.device_records().map_err(|e| {
+            tracing::warn!(device = %id, error = %format!("{e:#}"), "cannot read the paired devices; refusing the device's request");
+            devices_unreadable()
+        })?;
+        let scopes = devices
+            .as_array()
             .and_then(|devices| {
-                devices.as_array()?.iter().find_map(|d| {
+                devices.iter().find_map(|d| {
                     (d["id"].as_str() == Some(id)).then(|| {
                         d["scopes"]
                             .as_array()
@@ -91,17 +109,17 @@ impl Inner {
                 })
             })
             .unwrap_or_default();
-        Some(DeviceGrant {
+        Ok(Some(DeviceGrant {
             id: id.to_string(),
             scopes,
-        })
+        }))
     }
 
-    /// [`Inner::device_grant`] of `caller`; `None` for the orchestrator and the local user.
-    pub(super) fn caller_grant(&self, caller: &Caller) -> Option<DeviceGrant> {
+    /// [`Inner::device_grant`] of `caller`; `Ok(None)` for the orchestrator and the local user.
+    pub(super) fn caller_grant(&self, caller: &Caller) -> Result<Option<DeviceGrant>, RpcError> {
         match caller {
             Caller::User(client) => self.device_grant(client),
-            Caller::Orchestrator => None,
+            Caller::Orchestrator => Ok(None),
         }
     }
 
@@ -124,7 +142,7 @@ impl Inner {
     /// any; a device with `terminal` any; another device only what the orchestrator may
     /// ([`orch::check_chosen_runtime`]), never a command line.
     pub(super) fn check_caller_runtime(&self, caller: &Caller, spec: &str) -> Result<(), RpcError> {
-        match self.caller_grant(caller) {
+        match self.caller_grant(caller)? {
             Some(g) if !g.has("terminal") => {
                 orch::check_chosen_runtime(spec, &self.config, orch::Chooser::Device)
             }
@@ -139,7 +157,7 @@ impl Inner {
         what: &str,
         scope: &str,
     ) -> Result<(), RpcError> {
-        match self.caller_grant(caller) {
+        match self.caller_grant(caller)? {
             Some(g) => g.require(what, scope),
             None => Ok(()),
         }

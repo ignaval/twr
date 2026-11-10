@@ -115,8 +115,11 @@ whole, nothing sent), a `set_mode` the orchestrator relays from that device's me
 (`relay_forbidden`), and Confirm on a card that changes a mode or moves a thread (the card
 stays open). So do moving a thread to another runtime (directly, relayed or on a card) and
 `outside_pin`. Revocation closes
-existing connections too; a device list the hub cannot read revokes nothing (`hello` with a
-device token then fails with `internal`, not `unauthorized`). An agent or orchestrator cannot present a device token to widen
+existing connections too; a device list the hub cannot read revokes nothing and grants
+nothing: `hello` with a device token then fails with `internal`, not `unauthorized`, and so
+does every request of a device's open connection (nothing done, "Try again in a moment"),
+which stays open and is served again once the list reads; it is never served on the grants
+the device had at `hello`. An agent or orchestrator cannot present a device token to widen
 its authority, and a device connection cannot become an unrestricted local user.
 Pairing is local-owner-only; a device cannot create or complete another pairing even with
 `admin`. Treat the token as a secret: native clients keep it outside the renderer, and the
@@ -1493,8 +1496,10 @@ can access it (`chmod 600`).
   connection, a runner restart or a hub crash replays what was not acked; duplicates are
   dropped by watermark; a gap closes the connection. A frame of a thread the hub never had, or
   whose trash item is purged, is acked and not recorded, with no watermark kept (its session is
-  told to stop); a frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
-  and `_`) closes the connection. Commands to the box carry an id that the
+  told to stop), and a hub forgets such watermarks an older hub kept as it starts; a removed
+  box's watermarks stay with its threads, should it be added again; a frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
+  and `_`) closes the connection, and an inventory that names one (a running session's, or
+  spooled frames') is refused before the welcome (`error{protocol}`). Commands to the box carry an id that the
   runner deduplicates, so a command sent again after a lost connection runs once; a command
   cut short by a runner crash answers `interrupted` and is never retried (a spawn then fails
   the thread's turn).

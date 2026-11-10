@@ -3254,7 +3254,7 @@ impl Core {
         let Some(by) = self.orch.turn.as_ref().and_then(|t| t.by.as_deref()) else {
             return Ok(());
         };
-        match hub.device_grant(by) {
+        match hub.device_grant(by)? {
             Some(g) if !g.has("admin") => Err(rpc(
                 codes::RELAY_FORBIDDEN,
                 format!(

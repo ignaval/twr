@@ -371,19 +371,44 @@ pub enum CapError {
 /// cannot be brought under it is refused with [`CapError::TooLarge`] (nothing is stored for it
 /// beyond blobs `store` already received).
 pub fn cap_body(body: &EventBody, store: &dyn BlobStore) -> Result<EventBody, CapError> {
+    let capped = cap_for_log(body, store, |_| Ok(()))?;
+    Ok(capped.body.unwrap_or_else(|| body.clone()))
+}
+
+/// What [`cap_for_log`] made of a body.
+#[derive(Debug)]
+pub struct Capped {
+    /// The capped body, when [`cap_payload`] moved a field (`None`: the body as it was).
+    pub body: Option<EventBody>,
+    /// The capped payload's `data` as JSON text, at most [`PAYLOAD_CAP`] bytes: what the log
+    /// stores, and what a stream line of the event carries.
+    pub json: String,
+}
+
+/// [`cap_body`], building the payload's `data` once for all of it: `check` sees it before
+/// anything is moved (the identifiers an event may not have oversized), and the capped
+/// payload comes back as the JSON text the log stores along with the capped body.
+pub fn cap_for_log(
+    body: &EventBody,
+    store: &dyn BlobStore,
+    check: impl FnOnce(&Value) -> anyhow::Result<()>,
+) -> Result<Capped, CapError> {
     let mut data = body.data().map_err(anyhow::Error::from)?;
+    check(&data)?;
     let moved = cap_payload(&mut data, store)?;
-    let size = json_len(&data);
-    if size > PAYLOAD_CAP {
+    let json = serde_json::to_string(&data).map_err(anyhow::Error::from)?;
+    if json.len() > PAYLOAD_CAP {
         return Err(CapError::TooLarge {
             kind: body.kind().to_string(),
-            size,
+            size: json.len(),
         });
     }
-    if moved == 0 {
-        return Ok(body.clone());
-    }
-    EventBody::from_kind_data(body.kind(), data).map_err(|e| CapError::Other(e.into()))
+    let body = if moved == 0 {
+        None
+    } else {
+        Some(EventBody::from_kind_data(body.kind(), data).map_err(|e| CapError::Other(e.into()))?)
+    };
+    Ok(Capped { body, json })
 }
 
 /// Schema-owned blob pointers a producer may set itself (the full input / output of a tool
