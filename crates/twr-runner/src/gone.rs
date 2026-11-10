@@ -203,26 +203,43 @@ pub fn unregister_own_job() {
     let Some(label) = own_launchd_label() else {
         return;
     };
-    let target = format!("gui/{}/{label}", twr_core::paths::effective_uid());
+    bootout(
+        &["/bin/launchctl".into()],
+        &format!("gui/{}", twr_core::paths::effective_uid()),
+        &label,
+        Duration::from_secs(5),
+    );
+}
+
+/// Runs `launchctl bootout <domain>/<label>` with `launchctl` (`/bin/launchctl`, or a test's
+/// `sh <script>`) in a session of its own, waiting at most `wait` for it
+/// ([`unregister_own_job`]). Whether it could be run.
+fn bootout(launchctl: &[std::ffi::OsString], domain: &str, label: &str, wait: Duration) -> bool {
+    let Some((program, lead)) = launchctl.split_first() else {
+        return false;
+    };
+    let target = format!("{domain}/{label}");
     tracing::info!(job = %target, "taking this process's launchd job away");
-    let mut cmd = std::process::Command::new("/bin/launchctl");
-    cmd.args(["bootout", &target])
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(lead)
+        .args(["bootout", &target])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     twr_adapters::process::new_session_std(&mut cmd);
     let Ok(mut child) = cmd.spawn() else {
         tracing::warn!(job = %target, "could not run launchctl to take the job away");
-        return;
+        return false;
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if !matches!(child.try_wait(), Ok(None)) {
-            return;
+            return true;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
-    // Still waiting for this process to end: it goes on without being waited for.
+    // Still waiting for this process to end, as launchctl does: it goes on unwaited for.
+    true
 }
 
 #[cfg(test)]
@@ -309,6 +326,37 @@ mod tests {
         assert!(Anchor::of(&d.path().join("nothing")).is_err());
         std::fs::write(d.path().join("file"), "").unwrap();
         assert!(Anchor::of(&d.path().join("file")).is_err());
+    }
+
+    /// The job taken away is exactly the label given, in the domain given, by `launchctl
+    /// bootout` (a fake one here); one that waits for this process to end, as the real one
+    /// does, is not waited for long.
+    #[test]
+    fn bootout_takes_away_exactly_its_own_label() {
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("launchctl.sh");
+        std::fs::write(
+            &script,
+            "d=$(dirname \"$0\")\necho \"$*\" >> \"$d/calls\"\n[ -f \"$d/hang\" ] && sleep 30\nexit 0\n",
+        )
+        .unwrap();
+        let fake = ["/bin/sh".into(), script.clone().into_os_string()];
+        let label = "tools.twr.box.31c5e3e05b975a7f.27a95394";
+        assert!(bootout(&fake, "gui/501", label, Duration::from_secs(5)));
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("calls")).unwrap(),
+            format!("bootout gui/501/{label}\n")
+        );
+        std::fs::write(d.path().join("hang"), "").unwrap();
+        let t = Instant::now();
+        assert!(bootout(&fake, "gui/501", label, Duration::from_millis(300)));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(!bootout(
+            &[d.path().join("no-launchctl").into_os_string()],
+            "gui/501",
+            label,
+            Duration::from_secs(1)
+        ));
     }
 
     /// Only a label of twr's own jobs is taken for this process's.

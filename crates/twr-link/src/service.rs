@@ -467,19 +467,26 @@ pub async fn run(root: PathBuf, socket: PathBuf, peer_guard: PeerGuard) -> Resul
     }
     let _ = std::fs::remove_file(&machine.socket);
     drop(lock);
-    if gone {
-        // No update for a home that is gone; nothing restarts this service either.
-        twr_runner::gone::unregister_own_job();
-        return Ok(());
-    }
-    if let Some(candidate) = service.upgrade.lock().await.take() {
+    // (No update for a home that is gone.)
+    let upgrade = service.upgrade.lock().await.take().filter(|_| !gone);
+    if let Some(candidate) = upgrade {
         // Worker daemons are independent. Maintenance closes service streams, then the
         // bootstrapper performs readiness checks and rolls back to this executable on failure.
         if let Err(e) = crate::bootstrap::replace(&service.paths, &candidate).await {
             tracing::warn!("runner service update failed: {e:#}");
-            let _ = crate::bootstrap::replace(&service.paths, &std::env::current_exe()?).await;
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let _ = crate::bootstrap::replace(&service.paths, &exe).await;
+                }
+                Err(e) => tracing::warn!("cannot find this executable to roll back: {e}"),
+            }
         }
     }
+    // However it ends (`twr runner stop`, its home gone, an update, its socket gone), its
+    // launchd job goes with it: every start submits a job of a new label, so nothing would
+    // ever take this one away, and it would stay in `launchctl list`, not running. Only this
+    // process's own label (`XPC_SERVICE_NAME`); a `systemd-run` unit is collected on its own.
+    twr_runner::gone::unregister_own_job();
     Ok(())
 }
 /// Resolves once one of `anchors` (the twr home a service serves, and its machine state) has
