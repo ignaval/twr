@@ -386,7 +386,9 @@ final class RemoteHubTests: XCTestCase {
           catch(error) { return error.code==='REQUEST_TOO_LARGE' }
           """) as? Bool
         XCTAssertEqual(sizeGuard, true, "Native requests must be bounded by UTF-8 bytes without closing the socket")
-        _ = try await js("[...document.querySelectorAll('.mobile-tabs button,.primary-nav button')].find(e=>e.getClientRects().length&&(e.textContent==='Chat'||e.textContent.includes('Orchestrator')))?.click();return true")
+        // Back to the conversation: the Chat tab on a phone, the open workspace's Orchestrator
+        // entry in the sidebar's workspace list on a wide layout.
+        _ = try await js("[...document.querySelectorAll('.mobile-tabs button,.workspace-entry.current .workspace-orchestrator,.primary-nav button')].find(e=>e.getClientRects().length&&(e.textContent==='Chat'||e.textContent.includes('Orchestrator'))).click();return true")
         try await until("return !!document.querySelector('.composer textarea')")
         _ = try await js("const shell=[...document.querySelectorAll('button[aria-label=\"Open shell\"]')].find(e=>e.getClientRects().length);if(shell)shell.click();else{document.querySelector('.conversation-menu summary').click();[...document.querySelectorAll('.conversation-menu button')].find(e=>e.textContent.includes('Open shell')).click();}return true")
         try await until("return !!document.querySelector('.terminal-session .xterm-helper-textarea') && !!document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]')")

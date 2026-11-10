@@ -133,6 +133,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
     .locator(".manager .attention-card")
     .filter({ hasText: "Continue with the QA test?" });
   // Answers count once the options have been on screen for 600 ms (shared/arming.ts).
+  await question.locator(".attention-options").scrollIntoViewIfNeeded();
   await question.locator('.attention-options[data-armed="true"]').waitFor();
   await question.getByRole("button", { name: /Proceed/ }).click();
   await question.waitFor({ state: "hidden" });
@@ -382,6 +383,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   const deleteCard = page
     .locator(".manager .attention-card")
     .filter({ hasText: "qa-agent" });
+  await deleteCard.locator(".attention-options").scrollIntoViewIfNeeded();
   await deleteCard.locator('.attention-options[data-armed="true"]').waitFor();
   await deleteCard
     .locator(".attention-options button")
