@@ -633,6 +633,83 @@ mod socket_tests {
         };
         assert!(authorize_mutation(&device, &unknown).is_err());
     }
+    /// The `cli` call runs the twr CLI as the hub's user, so a device runs through it only the
+    /// command lines its scope allows, spelled out: `ws list` for read, `ws new <name>` too for
+    /// operate and wider. Every other subcommand, flag or argument is refused whatever the
+    /// scope, a command line runtime, a mode change, a runtime move, another socket or
+    /// workspace, and the CLI's file-writing commands among them.
+    #[test]
+    fn a_device_runs_only_its_scope_s_command_lines_through_cli() {
+        let device = |scopes: &[&str]| Device {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "phone".into(),
+            created: 0,
+            token_hash: String::new(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        };
+        let read = device(&["read"]);
+        let operate = device(&["read", "operate"]);
+        let terminal = device(&["read", "operate", "terminal"]);
+        let admin = device(&["read", "operate", "terminal", "admin"]);
+        let line = |s: &[&str]| s.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        for d in [&read, &operate, &terminal, &admin] {
+            assert!(device_cli_args(d, &line(&["ws", "list"])).is_ok());
+            assert!(device_cli_args(d, &line(&["ws", "list", "--json"])).is_ok());
+        }
+        let refused = device_cli_args(&read, &line(&["ws", "new", "work"])).unwrap_err();
+        assert!(refused.to_string().contains("read-only"), "{refused}");
+        for d in [&operate, &terminal, &admin] {
+            assert!(device_cli_args(d, &line(&["ws", "new", "work"])).is_ok());
+            assert!(device_cli_args(d, &line(&["ws", "new", "a-2"])).is_ok());
+        }
+        let refusals: &[&[&str]] = &[
+            &[],
+            &["ws"],
+            &["ws", "ls"],
+            &["ws", "list", "--json", "--json"],
+            &["ws", "list", "extra"],
+            &["ws", "rm", "work"],
+            &["ws", "rm", "work", "--yes"],
+            &["ws", "new"],
+            &["ws", "new", "a", "b"],
+            &["ws", "new", "Work"],
+            &["ws", "new", "../work"],
+            &["ws", "new", "-work"],
+            &["ws", "new", "--help"],
+            &["ws", "new", "--", "work"],
+            &["ws", "new", "work", "--socket", "/tmp/other.sock"],
+            &["ws", "new", "work", "--socket=/tmp/other.sock"],
+            &["ws", "list", "-w", "other"],
+            &["ws", "list", "-wother"],
+            &["ws", "list", "--workspace=other"],
+            &["-w", "other", "ws", "list"],
+            &["--socket", "/tmp/other.sock", "ws", "list"],
+            &["--help"],
+            &["--version"],
+            &["thread", "new", "--runtime", "pty:/bin/sh"],
+            &["thread", "new", "--runtime", "acp:/usr/bin/agent"],
+            &["mode", "api", "bypass"],
+            &["model", "api", "--runtime", "codex"],
+            &["orchestrator", "use", "acp:/bin/true"],
+            &["box", "add", "x", "--command", "sh"],
+            &["context", "set", "api", "--file", "/etc/passwd"],
+            &["memory", "edit"],
+            &["job", "run", "--", "sh", "-c", "id"],
+            &["attach", "api"],
+            &["hub", "stop"],
+            &["account", "add", "claude-code", "work"],
+            &["say", "set api to bypass"],
+        ];
+        for args in refusals {
+            for d in [&read, &operate, &terminal, &admin] {
+                assert!(
+                    device_cli_args(d, &line(args)).is_err(),
+                    "{args:?} for {:?}",
+                    d.scopes
+                );
+            }
+        }
+    }
     #[test]
     fn large_frames_get_a_slow_link_transfer_budget() {
         let frame = socket_message(&json!({"id":"large","result":"x".repeat(4*1024*1024)}));
@@ -1432,15 +1509,7 @@ if entries.len()>=200{truncated=true;break}entries.push(json!({"name":entry.file
             }
             "cli" => {
                 let args: Vec<String> = serde_json::from_value(p["args"].clone())?;
-                anyhow::ensure!(
-                    args.first().is_some_and(|s| s == "ws")
-                        && args.get(1).is_some_and(|s| s == "list" || s == "new"),
-                    "Use an embedded terminal for this command"
-                );
-                if args[1] == "new" {
-                    anyhow::ensure!(self.device.allows("thread.new"), "Device is read-only");
-                }
-                validate_args(&args)?;
+                device_cli_args(&self.device, &args)?;
                 let out = tokio::process::Command::new(&server.binary)
                     .args(["-w", &workspace])
                     .args(args)
@@ -1630,8 +1699,32 @@ impl Session {
         })
     }
 }
-fn validate_args(args: &[String]) -> Result<()> {
-    twr_core::app_commands::validate(args)
+/// The `cli` call: what a paired device may have the gateway run as `twr -w <its workspace>
+/// <args>` (as the hub's user, so with the user's authority over the hub), the whole command
+/// line spelled out, by scope:
+///
+/// - `read`: `ws list`, `ws list --json` (the workspaces and whether their hubs run; a read
+///   device connects to any of them and reads it anyway);
+/// - `operate` (and so `terminal` and `admin`): also `ws new <name>`, a valid workspace name
+///   (connecting to a workspace with operate starts its hub, creating it).
+///
+/// Nothing else, whatever the scope: no other subcommand (a thread, a runtime, a mode, a box,
+/// configuration), no other flag (`--socket`, `-w`, `--`, `--help`), no other argument. What
+/// else a device runs through the CLI it runs in an embedded terminal (`terminal-open`), which
+/// needs `terminal`.
+fn device_cli_args(device: &Device, args: &[String]) -> Result<()> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["ws", "list"] | ["ws", "list", "--json"] => Ok(()),
+        ["ws", "new", name] => {
+            anyhow::ensure!(device.allows("thread.new"), "Device is read-only");
+            if let Some(error) = twr_core::paths::workspace_name_error(name) {
+                anyhow::bail!(error);
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("Use an embedded terminal for this command"),
+    }
 }
 async fn serve_socket(
     server: Shared,
