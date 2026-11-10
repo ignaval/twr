@@ -1506,11 +1506,16 @@ can access it (`chmod 600`).
   whose trash item is purged, is acked and not recorded, with no watermark kept (its session is
   told to stop), and a hub forgets such watermarks an older hub kept as it starts. A removed
   box's watermarks are forgotten (a token box's when `twr box remove` drops its token, any
-  other box's when the hub starts without it), and the box gets a new generation: the
-  welcome names it to a runner whose inventory carries a spool stamp (`Inventory.spool`,
-  additive), and a runner whose spool was written under another one forgets its undelivered
-  frames and numbers each thread from 1 again, so a box added back under the same name never
-  replays old frames or hits a gap. A runner from before generations is refused
+  other box's when the hub starts without it and `boxes.removed`, which `twr box remove`
+  writes, names it; a box merely missing from the config keeps them), and the box gets a
+  new generation: the welcome names it to a runner whose inventory carries a spool stamp
+  (`Inventory.spool`, additive), and a runner whose spool was written under another one
+  forgets its undelivered frames and numbers each thread from 1 again, so a box added back
+  under the same name never replays old frames or hits a gap. That connection ends the box's
+  sessions: the hub takes none of them over, stops every run the runner still has, and
+  closes each of the box's threads it held running (its turn ended `interrupted`, then
+  `thread.crashed` saying the box was removed), without holding its queue: the next message
+  starts the runtime again on its session. A runner from before generations is refused
   (`error{protocol}`, update it) while its box is forgotten, and served as before otherwise.
   A frame whose thread is not a thread id (at most 64 ASCII letters, digits, `-`
   and `_`) closes the connection, and an inventory that names one (a running session's, or

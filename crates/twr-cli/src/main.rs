@@ -3306,8 +3306,9 @@ fn resume_outcome(thread: &str, r: &Value) -> String {
     out
 }
 
-/// `twr hub`: the hub of `paths` on `socket`, in the foreground. Its config is read again
-/// under boxes.toml's lock ([`read_config_locked`]), held until the socket is bound.
+/// `twr hub`: the hub of `paths` on `socket`, in the foreground. Its config, and the removal
+/// record next to boxes.toml, are read again under boxes.toml's lock ([`read_config_locked`]),
+/// held until the socket is bound.
 async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -3343,7 +3344,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     if let Some(dir) = paths.orchestrator_dir() {
         twr_core::paths::ensure_private_dir(&dir)?;
     }
-    let (config, boxes_lock) = {
+    let (config, boxes_lock, removed_boxes) = {
         let paths = paths.clone();
         tokio::task::spawn_blocking(move || read_config_locked(&paths)).await??
     };
@@ -3351,6 +3352,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     let mut opts = HubOptions::new(paths.db_file(), config);
     opts.link_program = link_program;
     opts.boxes_lock = boxes_lock;
+    opts.removed_boxes = removed_boxes;
     opts.config_file = Some(paths.config_file.clone());
     opts.instance_name = paths.instance_name();
     opts.workspace = paths.workspace.clone();
@@ -3395,9 +3397,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
 /// they wait for a hub or for the user. A lock file that can't be opened (a read-only config
 /// directory) is logged and the hub starts without it: no twr command can edit boxes.toml
 /// there either, since each takes the lock first.
-fn read_config_locked(
-    paths: &Paths,
-) -> anyhow::Result<(Config, Option<twr_core::config::BoxesLock>)> {
+fn read_config_locked(paths: &Paths) -> anyhow::Result<LockedConfig> {
     let file = paths.boxes_file();
     let lock = BoxesFile::lock(&file)
         .inspect_err(|e| {
@@ -3406,9 +3406,23 @@ fn read_config_locked(
         })
         .ok();
     let config = Config::load_from(paths)?;
+    // A record that does not read names no removal: the hub forgets nothing, as for a box
+    // that merely is not in the config.
+    let removed = BoxesFile::removed(&file).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "ignoring the removal record: no removed box is forgotten");
+        Default::default()
+    });
     hub_test_gate(HUB_START_GATE_ENV);
-    Ok((config, lock))
+    Ok((config, lock, removed))
 }
+
+/// What [`read_config_locked`] read: the config, the lock of `boxes.toml` (when it could be
+/// taken) and the boxes the removal record names ([`BoxesFile::removed`]).
+type LockedConfig = (
+    Config,
+    Option<twr_core::config::BoxesLock>,
+    std::collections::BTreeSet<String>,
+);
 
 /// `TWR_TEST_HUB_START_GATE=<file>`, for tests of a starting hub: right after it read its
 /// config ([`read_config_locked`]), the hub waits at the gate ([`hub_test_gate`]).
@@ -8428,7 +8442,7 @@ async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Resul
 
 /// The exclusive lock on workspace `ws`'s data directory (`twr.lock`, which its hub holds
 /// while it runs); `None` when a hub holds it.
-fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<std::fs::File>> {
+fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<WorkspaceLock>> {
     let path = ws.data_dir.join(twr_hub::LOCK_FILE);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -8438,13 +8452,26 @@ fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<std::fs::File>> {
         .with_context(|| format!("opening {}", path.display()))?;
     // Also `None` when the file left its path before it was locked (another `ws rm`): a hub
     // may hold the new one's.
-    twr_hub::lock_opened(file, &path)
+    Ok(twr_hub::lock_opened(file, &path)?.map(WorkspaceLock))
+}
+
+/// A workspace's lock taken by [`lock_workspace`], let go when this is dropped: unlocked, not
+/// only closed. A process another thread starts meanwhile shares the open file until it execs
+/// (or for good, without exec), and the lock stays on the file while anyone has it open: a
+/// workspace merely looked at would then seem to have a running hub, to this process's next
+/// look and to a hub starting there.
+struct WorkspaceLock(std::fs::File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 enum StopWorkspaceLock {
     Missing,
     Held,
-    Free(std::fs::File),
+    Free(WorkspaceLock),
 }
 
 /// A workspace removed after discovery (or during this open) has no hub. Other filesystem

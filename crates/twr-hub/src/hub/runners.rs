@@ -33,15 +33,22 @@
 //! **Box generations** ([`twr_core::runner::SpoolStamp`], `runner_boxes` in
 //! [`crate::store`]). Watermarks are kept per generation of a box: made the first time the box
 //! is welcomed, and replaced when the hub forgets the box (it was removed: a hub that starts
-//! without it, [`Core::sweep_runner_acks`], or `box.token` finding it gone from the files),
+//! without it while the removal record `twr box remove` writes names it,
+//! [`Core::sweep_runner_acks`], or `box.token` finding it gone from the files),
 //! which deletes its watermarks in the same transaction and marks the new generation
 //! forgotten. The welcome names the generation (read under the same lock, made durable by the
 //! same sync) to a runner whose inventory has a spool stamp; such a runner forgets the frames
 //! and the numbering it has from another generation (or from none, while the box is
 //! forgotten) before it applies the watermarks, so a removed box added again never replays
 //! old frames against watermarks that are gone (a gap on every connection) or into its
-//! threads. The mark is cleared once a runner has taken the generation: at its `synced`, or
-//! an inventory stamped with it. A runner without a stamp (an older twr) gets no generation
+//! threads. Such a forgetting welcome ends the box's sessions as far as the hub is
+//! concerned (`Conn::forgets`): what they did since the removal is gone, so the hub takes
+//! over none of them, and the reconciliation stops every run the runner still has (as strays:
+//! their later frames, those spooled after the inventory included, are never recorded) and
+//! closes every session of the box the hub holds, its open turn ended, as a crash saying the
+//! box was removed, without the crash's hold on the queue: the next prompt starts the runtime
+//! again on its session. The mark is cleared once a runner has taken the generation: at its
+//! `synced`, or an inventory stamped with it. A runner without a stamp (an older twr) gets no generation
 //! and is served as before, except while its box is forgotten: it is refused
 //! `error{protocol}` before it is connected (nothing changes), noted on the box, and a sealed
 //! one's end says so ([`SealedEnd::spool_refused`]), so its daemon or worker is replaced as
@@ -353,6 +360,10 @@ struct Conn {
     /// took it once it says `synced` (it does so after the welcome), and the box is no longer
     /// forgotten then ([`store::Store::confirm_runner_box`]).
     confirm: Option<String>,
+    /// The welcome had the runner forget its spool (the box was removed, and what its runner
+    /// had not delivered is gone): the hub adopted none of its sessions, and the
+    /// reconciliation ends every one of them ([`reconcile`]).
+    forgets: bool,
 }
 
 impl Conn {
@@ -613,14 +624,17 @@ pub(super) enum Admission {
 }
 
 /// What [`Core::sweep_runner_acks`] forgot.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Swept {
-    /// Boxes forgotten (the hub started without them: removed).
+    /// Boxes forgotten (removed: recorded, and the hub started without them).
     pub boxes: usize,
     /// Their watermarks.
     pub box_watermarks: usize,
-    /// Watermarks of threads the hub does not track, of the boxes left.
+    /// Watermarks of threads the hub does not track.
     pub thread_watermarks: usize,
+    /// The names of the removal record the sweep is done with: forgotten (now or before), or
+    /// configured again. They can come out of the record once the forgets are durable.
+    pub settled: BTreeSet<String>,
 }
 
 /// Why an authenticated connection was not welcomed ([`serve`]).
@@ -1069,12 +1083,22 @@ where
                         }
                     }
                 }
+                // This welcome has the runner forget what it spooled (the box was removed):
+                // none of its sessions is the hub's any more (`reconcile`).
+                let forgets = takes_generation
+                    && twr_core::runner::welcome_forgets(
+                        stamp.as_deref(),
+                        &g.generation,
+                        g.forgotten,
+                    );
                 let c = rbox.connect(&inv, tx.clone(), token_gen, legacy);
                 c.epoch()
                     .map(|epoch| {
                         // Not ready until synced and reconciled.
                         core.online_boxes.remove(&box_name);
-                        core.adopt_remote_sessions(&hub, &rbox, &inv);
+                        if !forgets {
+                            core.adopt_remote_sessions(&hub, &rbox, &inv);
+                        }
                         // The runner deletes every frame at or below a watermark it is told
                         // about, so only durable commits may be: the fenced previous
                         // connection's open ack batch (frames committed without a sync, see
@@ -1093,13 +1117,13 @@ where
                             // Gated from now on, before anything is dispatched to it.
                             drain_note = core.enter_drain(&hub, &rbox, p, &inv.version);
                         }
-                        (epoch, watermarks, g)
+                        (epoch, watermarks, g, forgets)
                     })
                     .ok_or(Unwelcome::Connect(c))
             }
         }
     };
-    let (epoch, watermarks, generation) = match connected {
+    let (epoch, watermarks, generation, forgets) = match connected {
         Ok(c) => c,
         Err(why) => {
             // Nothing changed: the current connection (if any) stays.
@@ -1252,6 +1276,7 @@ where
         batch_delay: hub.ack_batch_delay,
         wal: hub.core().store.wal_sync(),
         confirm: (takes_generation && generation.forgotten).then_some(generation.generation),
+        forgets,
     };
     let mut state = hub.state.subscribe();
     // Only protocol messages keep the connection open: WebSocket pings (answered by the
@@ -1734,6 +1759,14 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     // Threads whose runtime the runner lost and that crashed: they get their crash reactions
     // (and the automatic retry when it is due) but nothing from the queue.
     let mut crashed: HashSet<String> = HashSet::new();
+    // Threads closed because the welcome had the runner forget its spool (`Conn::forgets`):
+    // closed for the box's removal, not for anything they did, so their queue is not held.
+    let mut forgotten: HashSet<String> = HashSet::new();
+    let removed = format!(
+        "twr: box {box_name} was removed from the hub, and its runner forgot what this \
+         thread's runtime had done there that had not reached the hub: the session is closed \
+         (the next message resumes it)"
+    );
     let (exits, strays, threads) = {
         let mut core = hub.core();
         if !fence.holds() {
@@ -1760,6 +1793,61 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
                 .filter(|l| l.run_confirmed)
                 .and_then(|l| l.run.clone());
             let named_run = rt.and_then(|r| r.live.as_ref()).and_then(|l| l.run.clone());
+            // The runner forgot what it had not delivered (the box was removed): no session
+            // of the box is the hub's any more. Whatever the runner still runs is stopped (as
+            // a stray: its frames, including those it spooled after its inventory, are never
+            // recorded), and the hub's side of each session is closed, its open turn ended, so
+            // nothing waits for an end the runner forgot. The box was offline from the removal
+            // to this connection, so every session the hub holds is from before it.
+            if conn.forgets {
+                if let Some(run) = running {
+                    strays.push((v.id.clone(), run.clone()));
+                }
+                match generation {
+                    Some(g) => {
+                        tracing::warn!(thread = %v.id, box_name = %box_name, "closing a session of a removed box whose runner forgot its spool");
+                        if let Some(exit) =
+                            core.begin_exit_on(&v.id, g, None, removed.clone(), &fence)
+                        {
+                            forgotten.insert(v.id.clone());
+                            exits.push((v.id.clone(), exit));
+                        }
+                    }
+                    None if (process_live || v.has_work() || stop_requested)
+                        && !v.parked
+                        && v.attached.is_none() =>
+                    {
+                        tracing::warn!(thread = %v.id, box_name = %box_name, "closing a session of a removed box whose runner forgot its spool");
+                        let exit = if stop_requested {
+                            Exit::Stopped
+                        } else {
+                            Exit::Crashed {
+                                exit_code: None,
+                                stderr_tail: removed.clone(),
+                            }
+                        };
+                        let crash = matches!(exit, Exit::Crashed { .. });
+                        match core.close_process(hub, &v.id, exit) {
+                            Ok(()) => {
+                                forgotten.insert(v.id.clone());
+                                if let Some(rt) = core.rt.get_mut(&v.id) {
+                                    rt.restart_reason = None;
+                                }
+                                if crash {
+                                    if let Err(e) = core.react_to_failure(hub, &v.id) {
+                                        tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot react to a removed box's closed session");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot close a removed box's session")
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
             match (running, generation) {
                 (None, Some(g)) if process_live => {
                     tracing::warn!(thread = %v.id, box_name = %box_name, "the runner lost a live runtime");
@@ -1855,6 +1943,15 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     }
     conn.synced = true;
     let mut core = hub.core();
+    // Closed for the box's removal, not by a crash of their own: their queues go on (no crash
+    // hold, `ThreadRt::queue_held`, as for a runtime that died with the previous hub; a due
+    // retry still comes first), so the next prompt starts the runtime again on its session.
+    for thread in &forgotten {
+        if let Some(rt) = core.rt.get_mut(thread) {
+            rt.queue_held = false;
+            rt.crash_hold = None;
+        }
+    }
     // Fenced meanwhile (a token change included): the recorded commands are the newer
     // connection's to retire or send.
     if !fence.holds() {
@@ -2098,38 +2195,39 @@ impl Core {
     }
 
     /// Forgets, as the hub opens (the log folded), the watermarks it keeps no longer: first
-    /// those of every box the hub starts without (`boxes`: the boxes of its config; one it
-    /// keeps watermarks or a generation of that is not there was removed:
-    /// [`Core::forget_box`]), then, of the boxes left, those of threads it does not track
+    /// those of every box removed ([`Core::forget_box`]): named in the removal record
+    /// (`removed`, [`twr_core::config::BoxesFile::removed`]: `twr box remove` took it out of
+    /// `boxes.toml`) and not among the boxes the hub starts with (`boxes`, its config's), unless
+    /// it is forgotten already (`box.token` did it, or a start that ended before it took the
+    /// name out of the record). Then, of every box, those of threads it does not track
     /// ([`Core::tracks`]): ones the log never had (a hub from before kept a watermark for any
     /// frame's thread), purged, or deleted from another box. The next frame of such a thread
     /// is a stray, acked without a watermark, so none of them can be taken for a gap.
     ///
-    /// A removed box's watermarks can go only with its generation (in the same transaction):
-    /// its runner may still spool frames of its threads, numbered on from where they were, and
-    /// the box may be added again. Without its watermarks, a thread's next frame would be a
-    /// gap on every connection (the runner replays it, the hub closes the connection, again);
-    /// taking it as the start instead could record twice what the hub committed but the
-    /// runner never heard was acked. The new generation has the runner forget its spool and
-    /// number from 1 at its next welcome instead, or refuses a runner too old to.
-    pub(super) fn sweep_runner_acks(&mut self, boxes: &BTreeSet<String>) -> anyhow::Result<Swept> {
+    /// Only a recorded removal forgets a box: a box that is merely not in the config (a
+    /// config file missing or empty, another `XDG_CONFIG_HOME`, a box commented out by hand,
+    /// one removed before the record existed) keeps its watermarks, as its threads keep them,
+    /// should it come back. A removed box's watermarks can go only with its generation (in
+    /// the same transaction): its runner may still spool frames of its threads, numbered on
+    /// from where they were, and the box may be added again. Without its watermarks, a
+    /// thread's next frame would be a gap on every connection (the runner replays it, the hub
+    /// closes the connection, again); taking it as the start instead could record twice what
+    /// the hub committed but the runner never heard was acked. The new generation has the
+    /// runner forget its spool and number from 1 at its next welcome instead, or refuses a
+    /// runner too old to.
+    pub(super) fn sweep_runner_acks(
+        &mut self,
+        boxes: &BTreeSet<String>,
+        removed: &BTreeSet<String>,
+    ) -> anyhow::Result<Swept> {
         let mut swept = Swept::default();
-        let mut removed: BTreeSet<String> = self
-            .store
-            .runner_ack_keys()?
-            .into_iter()
-            .map(|(b, _)| b)
-            .collect();
-        removed.extend(
-            self.store
-                .runner_boxes()?
-                .into_iter()
-                .filter(|(_, g)| !g.forgotten)
-                .map(|(b, _)| b),
-        );
-        for b in removed.iter().filter(|b| !boxes.contains(*b)) {
-            swept.box_watermarks += self.forget_box(b)?;
-            swept.boxes += 1;
+        for b in removed {
+            // Configured again (by hand, in config.toml): no removal any more.
+            if !boxes.contains(b) && !self.store.runner_box_of(b)?.is_some_and(|g| g.forgotten) {
+                swept.box_watermarks += self.forget_box(b)?;
+                swept.boxes += 1;
+            }
+            swept.settled.insert(b.clone());
         }
         let stale: Vec<(String, String)> = self
             .store
@@ -2987,6 +3085,7 @@ mod tests {
             batch_delay: ACK_BATCH_DELAY,
             wal: store::WalSync::none(),
             confirm: None,
+            forgets: false,
         }
     }
 
@@ -3145,8 +3244,11 @@ mod tests {
     /// never had, one purged, one deleted from another box), as a hub from before may have
     /// kept; those of its threads and of a deleted thread still restorable from its box stay,
     /// and so does a box's watermark of another box's thread (the box's strays of it drain).
-    /// Every watermark of a box it starts without (`cpu`: removed before) goes too, and that
-    /// box gets a forgotten generation; the next start finds nothing more to forget.
+    /// Every watermark of a box it starts without that the removal record names (`old`:
+    /// `twr box remove` took it out) goes too, and that box gets a forgotten generation; one
+    /// the record names that is configured again (`cpu`) is only settled, and one that merely
+    /// is not in the config (`kept`) keeps its watermarks. The next start finds nothing more
+    /// to forget.
     #[tokio::test]
     async fn stale_watermarks_are_forgotten_as_the_hub_opens() {
         let dir = tempfile::tempdir().unwrap();
@@ -3177,7 +3279,7 @@ mod tests {
             }
         }
         assert!(inner.core().record_purged(&inner, "item-p", purged, false));
-        let keep = [("gpu", t), ("gpu", deleted), ("cpu", t)];
+        let keep = [("gpu", t), ("gpu", deleted), ("cpu", t), ("kept", t)];
         let stale = [
             ("gpu", purged),
             ("gpu", made_up),
@@ -3209,7 +3311,7 @@ mod tests {
             k.sort();
             k
         };
-        assert_eq!(keys(&inner).len(), 8);
+        assert_eq!(keys(&inner).len(), 9);
         drop(inner);
         hub.shutdown().await;
         drop(hub);
@@ -3224,9 +3326,10 @@ mod tests {
             );
         }
         let boxes: BTreeSet<String> = cfg.boxes.keys().cloned().collect();
-        let hub = crate::Hub::open(HubOptions::new(dir.path().join("twr.db"), cfg))
-            .await
-            .unwrap();
+        let removed: BTreeSet<String> = ["old", "cpu"].map(String::from).into();
+        let mut opts = HubOptions::new(dir.path().join("twr.db"), cfg);
+        opts.removed_boxes = removed.clone();
+        let hub = crate::Hub::open(opts).await.unwrap();
         assert_eq!(keys(&hub.inner), owned(&keep));
         let generations = || hub.inner.core().store.runner_boxes().unwrap();
         let old = generations();
@@ -3234,8 +3337,14 @@ mod tests {
         assert_eq!(old[0].0, "old");
         assert!(old[0].1.forgotten);
         assert_eq!(
-            hub.inner.core().sweep_runner_acks(&boxes).unwrap(),
-            Swept::default()
+            hub.inner
+                .core()
+                .sweep_runner_acks(&boxes, &removed)
+                .unwrap(),
+            Swept {
+                settled: removed.clone(),
+                ..Default::default()
+            }
         );
         // A box removed for good stays forgotten, under the same generation.
         assert_eq!(generations(), old);
