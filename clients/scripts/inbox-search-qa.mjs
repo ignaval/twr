@@ -308,10 +308,12 @@ archive.commit()
     childProcess.spawn = globalThis.__qaOriginalSpawn;
     return globalThis.__qaInboxReaders;
   });
+  // One read-only bridge, for the other running workspace: the open workspace is
+  // read over its own connection, and a stopped hub gets none.
   assert.equal(
     readers,
-    2,
-    "Concurrent refreshes must share one read scan and skip stopped hubs",
+    1,
+    "Concurrent refreshes must share one read scan, read the open workspace over its own connection and skip stopped hubs",
   );
   assert.deepEqual(concurrent[0], concurrent[1]);
   assert.deepEqual(concurrent[1], concurrent[2]);

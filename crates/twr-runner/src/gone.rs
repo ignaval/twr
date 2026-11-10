@@ -42,12 +42,16 @@ pub const LOOK_EVERY: Duration = Duration::from_secs(30);
 /// How long one look may take (a hung network filesystem): longer is [`Seen::Unknown`].
 pub const LOOK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A directory as it was when the process started: its path, device and inode.
+/// A directory as it was when the process started: its path, device and inode, and when it
+/// was made where the filesystem says. A filesystem can give a new directory the inode of one
+/// just deleted (ext4 does), so the inode alone can't tell a directory made again from the
+/// one that was there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub path: PathBuf,
     pub dev: u64,
     pub ino: u64,
+    pub born: Option<std::time::SystemTime>,
 }
 
 impl Anchor {
@@ -65,7 +69,21 @@ impl Anchor {
             path: path.to_path_buf(),
             dev: m.dev(),
             ino: m.ino(),
+            born: m.created().ok(),
         })
+    }
+
+    /// Whether `m` is this very directory: the same device and inode, and made at the same
+    /// time where both times are known.
+    fn is(&self, m: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        m.is_dir()
+            && m.dev() == self.dev
+            && m.ino() == self.ino
+            && match (self.born, m.created().ok()) {
+                (Some(then), Some(now)) => then == now,
+                _ => true,
+            }
     }
 }
 
@@ -81,7 +99,7 @@ pub enum Seen {
 pub fn look(anchor: &Anchor) -> Seen {
     use std::os::unix::fs::MetadataExt;
     match std::fs::metadata(&anchor.path) {
-        Ok(m) if m.is_dir() && m.dev() == anchor.dev && m.ino() == anchor.ino => Seen::There,
+        Ok(m) if anchor.is(&m) => Seen::There,
         // Another directory (or file) of the same filesystem where it was: it was deleted or
         // moved away, and something else made there.
         Ok(m) if m.dev() == anchor.dev => Seen::Gone,
@@ -295,6 +313,13 @@ mod tests {
         assert_eq!(look(&anchor), Seen::Gone);
         std::fs::remove_dir(d.path().join("home")).unwrap();
         assert_eq!(look(&anchor), Seen::Gone);
+        // Made again, possibly with the inode it had: told apart by when it was made. Where
+        // the filesystem keeps no such time, two directories made first take the freed inodes.
+        if anchor.born.is_none() {
+            std::fs::create_dir(d.path().join("taken-1")).unwrap();
+            std::fs::create_dir(d.path().join("taken-2")).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(20));
         std::fs::create_dir_all(&home).unwrap();
         assert_eq!(look(&anchor), Seen::Gone, "made again: another directory");
         std::fs::remove_dir(&home).unwrap();

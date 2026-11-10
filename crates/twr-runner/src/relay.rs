@@ -2765,7 +2765,6 @@ mod tests {
     /// The real `systemd-run --user` with [`systemd_run_args`] hands the service its
     /// arguments as they are: `$`, `${...}`, `$$` and `%` unexpanded. Skipped where no user
     /// manager answers.
-
     #[cfg(target_os = "linux")]
     #[test]
     fn systemd_runs_the_daemon_with_its_arguments_unexpanded() {

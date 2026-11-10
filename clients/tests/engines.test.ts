@@ -209,7 +209,9 @@ it("retains an engine used by a live OS process and prunes it after exit", async
         { stdio: "ignore" },
       );
     utimesSync(dirs[0], new Date(0), new Date(0));
-    process = spawn(executable, ["60"], { stdio: "ignore" });
+    // On some Linux systems /bin/sleep is a multi-call binary that picks its
+    // program by the name it is run as, so keep that name while the file is twr.
+    process = spawn(executable, ["60"], { stdio: "ignore", argv0: "sleep" });
     const exited = once(process, "exit");
     await once(process, "spawn");
     await new Promise((resolve) => setTimeout(resolve, 100));
