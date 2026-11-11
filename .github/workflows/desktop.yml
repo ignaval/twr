@@ -20,6 +20,18 @@ on:
         ".github/workflows/desktop.yml",
       ]
   workflow_dispatch:
+  # release.yml builds the tagged commit's installers here, with the same QA,
+  # and attaches them to the GitHub release.
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build
+        type: string
+        required: true
+      release:
+        description: Produce release assets and update metadata
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,22 +44,33 @@ jobs:
   mac:
     name: Apple Silicon application
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    # Apple credentials live in the protected `release` environment (tags and
+    # main only), so pull requests and branch pushes can never read them.
+    environment: ${{ inputs.release && 'release' || '' }}
+    env:
+      # Developer ID signing and notarization run only for releases, and only
+      # when the release environment has the Apple credentials (docs/desktop.md).
+      MAC_SIGNED_RELEASE: ${{ inputs.release && secrets.CSC_LINK != '' && secrets.APPLE_TEAM_ID != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Check host and install toolchain
         run: |
           test "$(uname -m)" = arm64
           channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
+      # A release restores no cache: nothing a branch or pull request run saved goes into the
+      # installers, as the CLI's release builds use no cache either.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "26.13.0"
-          cache: npm
+          cache: ${{ !inputs.release && 'npm' || '' }}
           cache-dependency-path: clients/package-lock.json
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: ${{ !inputs.release }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install desktop dependencies
         working-directory: clients
         run: npm ci
@@ -62,18 +85,126 @@ jobs:
       - name: Real application integration
         working-directory: clients
         run: npm run test:integration
-      - name: Build unsigned review installer
+      - name: Remote setup, inbox, search, and encrypted recovery QA
+        working-directory: clients
+        run: |
+          node scripts/gateway-lifecycle-qa.mjs
+          node scripts/inbox-search-qa.mjs
+          node scripts/preferences-offline-qa.mjs
+      # Packaging writes THIRD-PARTY-LICENSES.html (clients/scripts/notices.mjs) with the CLI
+      # release's cargo-about; the same pinned binary as release.yml.
+      - name: Install cargo-about (release binary, checksum pinned)
+        run: |
+          version=0.9.2
+          host=aarch64-apple-darwin
+          sha256=ae72f0df0c399a1e96336f696fa55b1b28679fd725632eba8cf8e4568467cc3e
+          name="cargo-about-$version-$host"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/$version/$name.tar.gz"
+          echo "$sha256  $RUNNER_TEMP/$name.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name/cargo-about"
+          mkdir -p "$RUNNER_TEMP/tools"
+          mv "$RUNNER_TEMP/$name/cargo-about" "$RUNNER_TEMP/tools/"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+      - name: Build ad hoc signed review installer
+        if: env.MAC_SIGNED_RELEASE != 'true'
         working-directory: clients
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm run package:mac
+          # package:mac selects identity '-'; this job provides no private
+          # signing credentials. Verify the resulting ad hoc identity below.
+          CSC_FOR_PULL_REQUEST: "true"
+        run: |
+          npm run package:mac
+          codesign --verify --deep --strict release/mac-arm64/twr.app
+          codesign --display --verbose=2 release/mac-arm64/twr.app 2> release/mac-signature.txt
+          grep -qx 'Signature=adhoc' release/mac-signature.txt
+          grep -qx 'TeamIdentifier=not set' release/mac-signature.txt
+      - name: Build Developer ID signed and notarized installer
+        if: env.MAC_SIGNED_RELEASE == 'true'
+        working-directory: clients
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          npm run package -- --mac --arm64 --config.mac.notarize=true
+          codesign --verify --deep --strict release/mac-arm64/twr.app
+          codesign --display --verbose=2 release/mac-arm64/twr.app 2> release/mac-signature.txt
+          grep -q '^Authority=Developer ID Application: ' release/mac-signature.txt
+          grep -qx "TeamIdentifier=$APPLE_TEAM_ID" release/mac-signature.txt
+          spctl --assess --type execute --verbose release/mac-arm64/twr.app
+          xcrun stapler validate release/mac-arm64/twr.app
+          test -f release/latest-mac.yml
       - name: Packaged Mac workflow QA
         working-directory: clients
+        env:
+          TWR_PERF: "1"
         run: npm run test:qa:mac
+      # A packaged build honours TWR_DESKTOP_TEST_AUTOMATION (remote debugging) only when it
+      # carries this marker (clients/desktop/automation.ts). The QA above drives a marked
+      # copy of the app; no installer may carry it.
+      - name: Check that no installer carries the QA marker
+        working-directory: clients/release
+        run: |
+          shopt -s nullglob
+          marker=twr-qa-automation
+          test ! -e "mac-arm64/twr.app/Contents/Resources/$marker"
+          for zip in ./*-mac.zip; do
+            if unzip -l "$zip" | grep -q "$marker"; then
+              echo "::error::$zip carries the QA marker $marker"
+              exit 1
+            fi
+          done
+          dmgs=(./*.dmg)
+          test "${#dmgs[@]}" -ge 1
+          for dmg in "${dmgs[@]}"; do
+            mount=$(mktemp -d "$RUNNER_TEMP/dmg.XXXXXXXX")
+            hdiutil attach -readonly -nobrowse -mountpoint "$mount" "$dmg" > /dev/null
+            found=$(find "$mount" -name "$marker" -print -quit)
+            hdiutil detach "$mount" > /dev/null
+            if [ -n "$found" ]; then
+              echo "::error::$dmg carries the QA marker $marker"
+              exit 1
+            fi
+          done
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-macos-arm64
           path: clients/release/*.dmg
+      # Self-update metadata is published only for Developer ID builds: macOS
+      # refuses to swap in an update whose signature differs from the app's.
+      - name: Note an unsigned release
+        if: inputs.release && env.MAC_SIGNED_RELEASE != 'true'
+        run: echo "::warning::the release environment has no Developer ID credentials; this release ships the ad hoc Mac disk image without self-update metadata"
+      - name: Stage macOS release assets
+        if: inputs.release
+        working-directory: clients/release
+        run: |
+          mkdir upload
+          cp ./*.dmg upload/
+          if [ "$MAC_SIGNED_RELEASE" = true ]; then
+            cp ./*-mac.zip ./*.blockmap latest-mac.yml upload/
+          fi
+          ls -l upload
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.release
+        with:
+          name: twr-desktop-release-macos
+          if-no-files-found: error
+          path: clients/release/upload/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: twr-desktop-client-workflow-qa
+          path: |
+            clients/test-results/*qa.json
+            clients/test-results/*qa.png
+            clients/test-results/preferences-*.png
+            clients/test-results/offline-*.png
+            clients/test-results/performance-*.json
 
   linux:
     # Build the *same* native-addon/Rust bundle used by AppImage and Arch on
@@ -85,6 +216,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Install build, sandbox, and X11 runtime dependencies
         run: |
@@ -92,22 +224,49 @@ jobs:
           sudo apt-get install -y build-essential python3 pkg-config libssl-dev libgtk-3-0 libnss3 libasound2 libgbm1 libxss1 libx11-xcb1 libfuse2 xvfb
           channel=$(sed -n 's/^channel *= *"\(.*\)"$/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy --no-self-update
+      # A release restores no cache: nothing a branch or pull request run saved goes into the
+      # installers, as the CLI's release builds use no cache either.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "26.13.0"
-          cache: npm
+          cache: ${{ !inputs.release && 'npm' || '' }}
           cache-dependency-path: clients/package-lock.json
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: ${{ !inputs.release }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # For THIRD-PARTY-LICENSES.html (clients/scripts/notices.mjs), as in the Mac job.
+      - name: Install cargo-about (release binary, checksum pinned)
+        run: |
+          version=0.9.2
+          host=x86_64-unknown-linux-musl
+          sha256=9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
+          name="cargo-about-$version-$host"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-about/releases/download/$version/$name.tar.gz"
+          echo "$sha256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP" "$name/cargo-about"
+          mkdir -p "$RUNNER_TEMP/tools"
+          mv "$RUNNER_TEMP/$name/cargo-about" "$RUNNER_TEMP/tools/"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
       - name: Build and check the portable distribution
         working-directory: clients
         run: |
           npm ci
           npm test
           npm run package:linux
+          test -f release/latest-linux.yml
           node scripts/arch.mjs
+          if tar -tzf release/arch/*-linux-x64.tar.gz | grep -qx 'twr-desktop/resources/package-type'; then
+            echo "::error::the portable archive must not carry the Debian package-type marker"
+            exit 1
+          fi
           node scripts/linux-abi.mjs release/linux-unpacked release/linux-abi.json
           # Integration fixtures use debug engines; the app contains release engines.
           cargo build --manifest-path ../Cargo.toml --locked -p twr-cli -p twr-app
+      - name: Remote setup, inbox, and archive search QA on Linux
+        working-directory: clients
+        run: |
+          node scripts/gateway-lifecycle-qa.mjs
+          xvfb-run -a dbus-run-session -- node scripts/inbox-search-qa.mjs
       - name: Clean Debian dependency closure and sandboxed launch
         working-directory: clients
         run: |
@@ -133,7 +292,29 @@ jobs:
           dpkg-query -W twr-desktop
           test "$(stat -c %u /opt/twr/chrome-sandbox)" = 0
           node scripts/linux-abi.mjs /opt/twr
+          # The QA marker (clients/desktop/automation.ts), added as root to this test install
+          # only, lets the packaged app honour TWR_DESKTOP_TEST_AUTOMATION.
+          test ! -e /opt/twr/resources/twr-qa-automation
+          echo 'QA install: honours TWR_DESKTOP_TEST_AUTOMATION.' | sudo tee /opt/twr/resources/twr-qa-automation > /dev/null
           TWR_DESKTOP_EXECUTABLE=/usr/bin/twr-desktop xvfb-run -a dbus-run-session -- npm run test:integration
+      - name: Check that no package carries the QA marker
+        working-directory: clients/release
+        run: |
+          marker=twr-qa-automation
+          test ! -e "linux-unpacked/resources/$marker"
+          if dpkg-deb -c ./*.deb | grep -q "$marker" ||
+            tar -tzf arch/*-linux-x64.tar.gz | grep -q "$marker"; then
+            echo "::error::a Linux package carries the QA marker $marker"
+            exit 1
+          fi
+          appimage=$(realpath ./*.AppImage)
+          extract=$(mktemp -d "$RUNNER_TEMP/appimage.XXXXXXXX")
+          (cd "$extract" && "$appimage" --appimage-extract > /dev/null)
+          if [ -n "$(find "$extract/squashfs-root" -name "$marker" -print -quit)" ]; then
+            echo "::error::$appimage carries the QA marker $marker"
+            exit 1
+          fi
+          rm -rf "$extract"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-linux-portable-x86_64
@@ -142,6 +323,16 @@ jobs:
             clients/release/*.deb
             clients/release/linux-abi.json
             clients/release/arch/PKGBUILD
+            clients/release/arch/*-linux-x64.tar.gz
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.release
+        with:
+          name: twr-desktop-release-linux
+          if-no-files-found: error
+          path: |
+            clients/release/*.AppImage
+            clients/release/*.deb
+            clients/release/latest-linux.yml
             clients/release/arch/*-linux-x64.tar.gz
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -167,6 +358,7 @@ jobs:
           useradd -m -s /bin/bash builder
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -196,8 +388,39 @@ jobs:
         working-directory: clients
         run: |
           install -dm700 -o builder -g builder /tmp/twr-wayland
+          # The QA marker (clients/desktop/automation.ts), on this test install only.
+          test ! -e /opt/twr-desktop/resources/twr-qa-automation
+          echo 'QA install: honours TWR_DESKTOP_TEST_AUTOMATION.' > /opt/twr-desktop/resources/twr-qa-automation
           runuser -u builder -- env XDG_RUNTIME_DIR=/tmp/twr-wayland WLR_BACKENDS=headless WLR_RENDERER=pixman TWR_DESKTOP_WAYLAND_TEST=1 TWR_DESKTOP_EXECUTABLE=/usr/bin/twr-desktop dbus-run-session -- cage -- npm run test:integration
+      - name: Validate the AUR package against the same archive
+        working-directory: clients
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          archive="release/arch/twr-desktop-$version-linux-x64.tar.gz"
+          runuser -u builder -- node scripts/aur.mjs "$archive" release/aur
+          # makepkg uses a source file that is already present instead of
+          # downloading it, so this builds exactly what AUR users will get.
+          cp "$archive" "release/aur/twr-desktop-bin-$version.tar.gz"
+          chown -R builder:builder release/aur
+          cd release/aur
+          runuser -u builder -- makepkg --printsrcinfo | diff -u - .SRCINFO
+          runuser -u builder -- makepkg --noconfirm --nodeps
+          pacman -Qip ./twr-desktop-bin-*.pkg.tar.zst | grep -qx 'Provides *: twr-desktop'
+          # The AUR package replaces the release package; both own /opt/twr-desktop.
+          pacman -U --noconfirm --ask=4 ./twr-desktop-bin-*.pkg.tar.zst
+          pacman -Qkk twr-desktop-bin
+          test "$(stat -c %a /opt/twr-desktop/chrome-sandbox)" = 4755
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: twr-desktop-arch-x86_64
           path: clients/release/arch/*.pkg.tar.zst
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.release
+        with:
+          name: twr-desktop-release-arch
+          if-no-files-found: error
+          path: |
+            clients/release/arch/twr-desktop-*-x86_64.pkg.tar.zst
+            clients/release/aur/PKGBUILD
+            clients/release/aur/.SRCINFO
+          include-hidden-files: true

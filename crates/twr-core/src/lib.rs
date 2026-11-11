@@ -37,6 +37,7 @@ pub mod compact;
 pub mod config;
 pub mod config_edit;
 pub mod event;
+pub mod fork;
 pub mod fsread;
 pub mod git;
 pub mod gitremote;
@@ -56,6 +57,7 @@ pub mod sorted;
 pub mod speech;
 pub mod testkit;
 pub mod trace;
+pub mod upload;
 pub mod usage;
 pub mod work;
 
@@ -384,3 +386,8 @@ mod tests {
 
 pub mod app_commands;
 pub mod devices;
+
+/// Target triple of this executable, used for native worker builds.
+pub fn build_target() -> &'static str {
+    env!("TWR_BUILD_TARGET")
+}

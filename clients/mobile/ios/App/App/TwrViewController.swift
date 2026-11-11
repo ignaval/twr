@@ -5,6 +5,8 @@ final class TwrViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(TwrTransportPlugin())
         bridge?.registerPluginInstance(TwrLayoutPlugin())
+        bridge?.registerPluginInstance(TwrOfflinePlugin())
+        bridge?.registerPluginInstance(TwrVoicePlugin())
     }
 }
 

@@ -24,6 +24,8 @@ pub enum CompactPane {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", content = "args")]
 pub enum Slash {
+    /// Show a private one-time code to use this terminal host as a runner.
+    Runner,
     /// `/clear`: reset the orchestrator without carrying the conversation over.
     Clear,
     /// `/open [thread]`: talk to a worker thread directly (dive in); default: the selected card.
@@ -394,6 +396,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "show the account a thread runs on, or move it to another (a new session with a \
          handoff; in a dive: /account [name]); add: the command that adds one",
         &[ArgKind::AccountOrThread, ArgKind::Account],
+    ),
+    (
+        "/runner",
+        "/runner",
+        "use this machine as a runner; shows a private pairing code",
+        &[],
     ),
     (
         "/accounts",
@@ -787,6 +795,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                 outside_pin,
             })
         }
+        "/runner" if args.is_empty() => Ok(Slash::Runner),
         "/accounts" if args.is_empty() => Ok(Slash::Accounts),
         "/new" => {
             let mut project = None;
@@ -1498,12 +1507,12 @@ mod tests {
         assert_eq!(parse("/model"), model(None, None, None));
         assert_eq!(parse("/model api"), model(Some("api"), None, None));
         assert_eq!(
-            parse("/model api claude-fable-5-1"),
-            model(Some("api"), Some("claude-fable-5-1"), None)
+            parse("/model api claude-fable-5-2"),
+            model(Some("api"), Some("claude-fable-5-2"), None)
         );
         assert_eq!(
-            parse("/model api claude-fable-5-1 --effort high"),
-            model(Some("api"), Some("claude-fable-5-1"), Some("high"))
+            parse("/model api claude-fable-5-2 --effort high"),
+            model(Some("api"), Some("claude-fable-5-2"), Some("high"))
         );
         assert_eq!(
             parse("/model api --effort high"),

@@ -295,6 +295,11 @@ impl Notifier {
         };
     }
 
+    /// Whether the terminal said it lost focus (and has not said it got it back).
+    pub fn unfocused(&self) -> bool {
+        self.focus == Focus::Unfocused
+    }
+
     /// The user pressed a key, clicked or pasted at `now`.
     pub fn input(&mut self, now: Instant) {
         self.last_input = Some(now);

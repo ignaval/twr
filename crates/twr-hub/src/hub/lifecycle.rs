@@ -93,6 +93,42 @@ impl Hub {
         )
         .unwrap_or(chrono::Duration::MAX);
         twr_core::trace::mark("hub: log replayed");
+        // Before any runner connects: the watermarks of boxes removed (`twr box remove`
+        // recorded it) that the hub starts without, and of threads it keeps none of, go
+        // (`Core::sweep_runner_acks`). A failure leaves what it did not get to, as it was.
+        let boxes = opts.config.boxes.keys().cloned().collect();
+        match core.sweep_runner_acks(&boxes, &opts.removed_boxes) {
+            Ok(s) => {
+                // Durable, then out of the removal record (the `default` workspace's hub,
+                // whose boxes they are): a crash in between forgets nothing twice, as a box
+                // forgotten already is left as it is.
+                if !s.settled.is_empty() && opts.workspace.is_none() {
+                    match (core.store.sync(), &opts.config_file) {
+                        (Ok(()), Some(file)) => settle_removed(file, &s.settled).await,
+                        (Err(e), _) => {
+                            tracing::warn!(error = %format!("{e:#}"), "cannot sync the forgotten boxes; their names stay in the removal record")
+                        }
+                        (Ok(()), None) => {}
+                    }
+                }
+                if s.boxes > 0 {
+                    tracing::info!(
+                        boxes = s.boxes,
+                        watermarks = s.box_watermarks,
+                        "forgot the runner watermarks of boxes the hub no longer has"
+                    );
+                }
+                if s.thread_watermarks > 0 {
+                    tracing::info!(
+                        watermarks = s.thread_watermarks,
+                        "forgot runner watermarks of threads the log does not keep"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot forget stale runner watermarks")
+            }
+        }
         let intents = core.store.spawn_intents()?;
         let cap = opts.broadcast_capacity.max(1);
         let (control_tx, _) = broadcast::channel(cap);
@@ -131,6 +167,7 @@ impl Hub {
             pins_lookup_hook: opts.pins_lookup_hook,
             socket_removed_hook: opts.socket_removed_hook,
             box_dialer: opts.box_dialer,
+            link_program: opts.link_program,
             local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
             agents_poll: opts.agents_poll,
             accounts: super::accounts::AccountsRt::new(
@@ -664,7 +701,7 @@ impl Core {
             seqs: HashMap::new(),
             last_ts: HashMap::new(),
             gseq,
-            known_attn: HashSet::new(),
+            known_attn: std::collections::BTreeSet::new(),
             adapter_attn: HashMap::new(),
             rt: HashMap::new(),
             generation: 0,
@@ -676,6 +713,7 @@ impl Core {
             compact_rows: Default::default(),
             task_progress: coalesce::TaskProgress::default(),
             persist_retries: 0,
+            retry_reads: Default::default(),
             orch: orch::OrchState::default(),
             hub_questions: HashMap::new(),
             hub_cards: HashMap::new(),
@@ -849,6 +887,26 @@ fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
 /// A thread whose runtime may have outlived the previous hub: (thread, the recorded process,
 /// its box).
 type Stale = (String, Option<StaleProcess>, String);
+
+/// Takes `names` out of the removal record next to the `boxes.toml` of `config_file`
+/// ([`twr_core::config::BoxesFile::removed`]), under that file's lock: the hub forgot those
+/// boxes (durably), or has them configured again. A failure is a warning: a name left there
+/// forgets nothing twice (the box is forgotten already) and goes at a later start.
+pub(super) async fn settle_removed(config_file: &Path, names: &std::collections::BTreeSet<String>) {
+    use twr_core::config::BoxesFile;
+    let file = BoxesFile::path_for(config_file);
+    let names = names.clone();
+    let done = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _lock = BoxesFile::lock(&file)?;
+        BoxesFile::unmark_removed(&file, names.iter().map(String::as_str))
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    if let Err(e) = done {
+        tracing::warn!(error = %format!("{e:#}"), "cannot take forgotten boxes out of the removal record");
+    }
+}
 
 /// Threads whose log shows a live runtime, or a stop request whose closing sequence is
 /// not recorded: (thread, the recorded process, its box).
@@ -1059,13 +1117,25 @@ impl Core {
     }
 
     /// Closes the `stale` threads (see [`stale_runtimes`]): as stopped when their stop was
-    /// asked for, else as crashed with the previous hub.
+    /// asked for, else as crashed with the previous hub, or with their box when the hub no
+    /// longer has it.
     fn close_stale_runtimes(&mut self, inner: &Inner, stale: Vec<Stale>) -> anyhow::Result<()> {
-        for (thread, _, _) in stale {
+        for (thread, _, box_name) in stale {
             // A runtime the user asked to stop closes as stopped (no error item, no retry).
             let exit = if self.rt.get(&thread).is_some_and(|r| r.stop_requested) {
                 tracing::info!(%thread, "closing a stopped thread whose runtime's exit the previous hub did not record");
                 Exit::Stopped
+            } else if box_name != LOCAL_BOX {
+                // A box the hub starts without (`twr box remove`): its runtime may well
+                // still run there, but nothing of it reaches this hub any more.
+                tracing::info!(%thread, box_name = %box_name, "closing a thread of a box the hub no longer has");
+                Exit::Crashed {
+                    exit_code: None,
+                    stderr_tail: format!(
+                        "box {box_name} is no longer one of this hub's boxes: what the thread's \
+                         runtime does there no longer reaches the hub"
+                    ),
+                }
             } else {
                 tracing::info!(%thread, "closing thread whose runtime died with the previous hub");
                 Exit::Crashed {

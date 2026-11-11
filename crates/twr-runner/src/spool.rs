@@ -38,7 +38,12 @@
 //!   frame it still holds decodes as this build's [`RunnerMsg`] (then it is stamped anew);
 //!   otherwise [`Spool::open`] refuses it, naming how many frames and which protocol, so the
 //!   runner fails where the user sees it instead of replaying frames the hub cannot read on
-//!   every connection.
+//!   every connection. And `generation`, the box generation of the hub's last welcome that
+//!   carried one ([`twr_core::runner::SpoolStamp`]): none until then (a new spool, or one an
+//!   older runner wrote). A welcome of another generation (the hub forgot the box: it was
+//!   removed) makes [`Spool::take_generation`] forget the outbox and `rseq_alloc` first, in
+//!   the transaction that records the new one; command results, runtimes and intents stay
+//!   (they are about this box's processes, not the hub's numbering).
 //!
 //! Size bound: the frames in the outbox may take at most `max_bytes` (default
 //! [`DEFAULT_MAX_BYTES`]). An append that would exceed it is refused ([`Appended::Full`])
@@ -220,6 +225,20 @@ fn lock_spool(path: &Path) -> anyhow::Result<std::fs::File> {
 
 /// The `meta` key of the spool's protocol stamp.
 const PROTOCOL_KEY: &str = "protocol";
+
+/// The `meta` key of the box generation the spool took last ([`Spool::take_generation`]).
+const GENERATION_KEY: &str = "generation";
+
+/// What [`Spool::take_generation`] forgot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Forgotten {
+    /// Spooled frames dropped unsent.
+    pub frames: u64,
+    /// Threads whose numbering started over.
+    pub threads: u64,
+    /// The generation they were written under (none: before spools took one).
+    pub from: Option<String>,
+}
 
 /// Checks the protocol stamp of the spool `conn` (at `path`, for errors) against this build's
 /// [`PROTOCOL_VERSION`]: the same, nothing to do; another one (or none: a spool from before
@@ -650,6 +669,68 @@ impl Spool {
         Ok(())
     }
 
+    /// The box generation the spool took last ([`Spool::take_generation`]); none yet: a new
+    /// spool, or one an older runner wrote.
+    pub fn generation(&self) -> anyhow::Result<Option<String>> {
+        let g = self.lock();
+        Ok(g.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [GENERATION_KEY],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Takes box generation `generation` from the hub's welcome (`forgotten`: its flag, see
+    /// [`twr_core::runner::HubMsg::Welcome`]), in one transaction: when
+    /// [`twr_core::runner::welcome_forgets`] says the spool was written under another one, the
+    /// outbox and every thread's numbering go first (the hub forgot the box's watermarks: it
+    /// was removed, so those frames and numbers mean nothing to it any more), and the next
+    /// frame of each thread is `rseq` 1. Returns what was forgotten then, `None` when nothing
+    /// was. Command results, runtimes and start intents stay.
+    pub fn take_generation(
+        &self,
+        generation: &str,
+        forgotten: bool,
+    ) -> anyhow::Result<Option<Forgotten>> {
+        let mut g = self.lock();
+        let tx = g
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stamp: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [GENERATION_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let forgets = twr_core::runner::welcome_forgets(stamp.as_deref(), generation, forgotten);
+        let mut out = None;
+        if forgets {
+            let frames: i64 = tx.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?;
+            let threads: i64 = tx.query_row("SELECT COUNT(*) FROM rseq_alloc", [], |r| r.get(0))?;
+            tx.execute("DELETE FROM outbox", [])?;
+            tx.execute("DELETE FROM rseq_alloc", [])?;
+            out = Some(Forgotten {
+                frames: frames as u64,
+                threads: threads as u64,
+                from: stamp.clone(),
+            });
+        }
+        if stamp.as_deref() != Some(generation) {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![GENERATION_KEY, generation],
+            )?;
+        }
+        let bytes = tx_bytes(&tx)?;
+        tx.commit()?;
+        g.bytes = bytes;
+        Ok(out)
+    }
+
     /// Highest spooled `rseq` per thread.
     pub fn pending(&self) -> anyhow::Result<BTreeMap<String, u64>> {
         let g = self.lock();
@@ -922,6 +1003,63 @@ mod tests {
             assert_eq!(s.rows_after(0, 100).unwrap().len(), 1);
             assert_eq!(s.next_rseq("a").unwrap(), 4);
         }
+    }
+
+    /// A spool that took no generation adopts the first one, frames and numbering kept,
+    /// unless the hub says it forgot the box; one of another generation forgets its frames
+    /// and every thread's numbering (rseq 1 again), across a reopen too; the same generation
+    /// again changes nothing. Command results stay.
+    #[test]
+    fn a_new_box_generation_forgets_the_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open(dir.path(), DEFAULT_MAX_BYTES);
+        for _ in 0..3 {
+            s.append("a", false, frame("a")).unwrap();
+        }
+        s.append("b", false, frame("b")).unwrap();
+        s.ack("a", 1).unwrap();
+        assert_eq!(s.cmd_begin("send:a:1").unwrap(), CmdState::New);
+        s.cmd_finish(&CmdResult::new("send:a:1", Ok(serde_json::Value::Null)))
+            .unwrap();
+        assert_eq!(s.generation().unwrap(), None);
+        // Adopted: nothing goes.
+        assert_eq!(s.take_generation("g1", false).unwrap(), None);
+        assert_eq!(s.generation().unwrap().as_deref(), Some("g1"));
+        assert_eq!(s.len().unwrap(), 3);
+        assert_eq!(s.next_rseq("a").unwrap(), 4);
+        assert_eq!(s.take_generation("g1", true).unwrap(), None);
+        assert_eq!(s.len().unwrap(), 3);
+        drop(s);
+        let s = open(dir.path(), DEFAULT_MAX_BYTES);
+        assert_eq!(s.generation().unwrap().as_deref(), Some("g1"));
+        let gone = s.take_generation("g2", false).unwrap().unwrap();
+        assert_eq!(
+            gone,
+            Forgotten {
+                frames: 3,
+                threads: 2,
+                from: Some("g1".into())
+            }
+        );
+        assert!(s.is_empty().unwrap());
+        assert_eq!(s.bytes(), 0);
+        assert_eq!(s.next_rseq("a").unwrap(), 1);
+        assert_eq!(
+            s.append("a", false, frame("a")).unwrap(),
+            Appended::Stored { rseq: 1 }
+        );
+        assert!(matches!(
+            s.cmd_begin("send:a:1").unwrap(),
+            CmdState::Done(r) if r.ok
+        ));
+        // A spool that took none, after the hub forgot the box: forgotten too.
+        let other = tempfile::tempdir().unwrap();
+        let s = open(other.path(), DEFAULT_MAX_BYTES);
+        s.append("a", false, frame("a")).unwrap();
+        let gone = s.take_generation("g3", true).unwrap().unwrap();
+        assert_eq!((gone.frames, gone.threads, gone.from), (1, 1, None));
+        assert_eq!(s.generation().unwrap().as_deref(), Some("g3"));
+        assert_eq!(s.next_rseq("a").unwrap(), 1);
     }
 
     #[test]

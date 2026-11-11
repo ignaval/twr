@@ -234,6 +234,12 @@ fn hub_thread_send_events() {
     );
     let activity = row.rsplit("  ").next().unwrap();
     assert!(activity.starts_with("done"), "{list}");
+    // --json: the same threads, as thread.list returns them.
+    let listed: Vec<Value> =
+        serde_json::from_str(&ok(home, &["thread", "list", "--json"])).unwrap();
+    let t1 = listed.iter().find(|t| t["name"] == "t1").unwrap();
+    assert_eq!(t1["status"], "done", "{t1}");
+    assert!(row.contains(t1["id"].as_str().unwrap()), "{list}");
     // Threads run in twr's default mode, `auto`, until `twr mode` changes it.
     assert!(list.lines().next().unwrap().contains(" MODE "), "{list}");
     assert!(row.contains(" auto "), "{list}");
@@ -498,6 +504,7 @@ fn respond_and_attention_work_without_a_screen() {
     );
     assert!(created.contains("model=opus-x"), "{created}");
     assert_eq!(ok(home, &["attention"]).trim(), "nothing needs you");
+    assert_eq!(ok(home, &["attention", "--json"]).trim(), "[]");
 
     // A permission, answered by number on the thread.
     ok(home, &["send", "t1", "!perm Bash ls"]);
@@ -523,6 +530,16 @@ fn respond_and_attention_work_without_a_screen() {
         "{err}"
     );
     assert!(ok(home, &["attention"]).contains(listed_id));
+    // --json: the items listed, each with the target `twr respond` takes.
+    let items: Vec<Value> = serde_json::from_str(&ok(home, &["attention", "--json"])).unwrap();
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["target"], listed_id);
+    assert_eq!(items[0]["thread_name"], "t1");
+    assert_eq!(items[0]["reason"], "permission");
+    assert!(
+        listed_id.starts_with(items[0]["attn_id"].as_str().unwrap()),
+        "{items:?}"
+    );
     // --yes: the question it answers is shown first (with its revision), then answered.
     let answered = ok(home, &["respond", "t1", "1", "--yes"]);
     let shown = answered.lines().next().unwrap();
@@ -756,6 +773,11 @@ fn a_workers_shell_cannot_answer_for_the_user() {
 
 #[test]
 fn attach_hands_the_thread_to_the_runtime_cli_and_back() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "attach_hands_the_thread_to_the_runtime_cli_and_back",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
     let project = home.join("proj");
@@ -962,6 +984,11 @@ fn since_attached(home: &Path) -> Vec<Value> {
 /// restart, until that CLI exits; then the hub detaches and dispatches.
 #[test]
 fn a_killed_attach_client_leaves_the_thread_attached_while_its_cli_runs() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_killed_attach_client_leaves_the_thread_attached_while_its_cli_runs",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
     let hub = start_hub(home);
@@ -1042,6 +1069,11 @@ fn a_killed_attach_client_leaves_the_thread_attached_while_its_cli_runs() {
 /// CLI alone.
 #[test]
 fn sigterm_to_attach_reaches_its_cli_before_the_attach_ends() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "sigterm_to_attach_reaches_its_cli_before_the_attach_ends",
+    ) {
+        return;
+    }
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
     let _hub = start_hub(home);
@@ -1323,6 +1355,14 @@ fn park_and_resume_free_and_recreate_the_worktree() {
     );
     let all = ok(home, &["thread", "list", "--all"]);
     assert!(all.contains("parked") && !all.contains("hidden"), "{all}");
+    // So does --json.
+    assert_eq!(ok(home, &["thread", "list", "--json"]).trim(), "[]");
+    let all: Vec<Value> =
+        serde_json::from_str(&ok(home, &["thread", "list", "--all", "--json"])).unwrap();
+    assert!(
+        all.iter().any(|t| t["name"] == "wt" && t["parked"] == true),
+        "{all:?}"
+    );
     // Parking twice is a conflict.
     let again = twr(home, &["park", "wt"]);
     assert!(!again.status.success());
@@ -2085,9 +2125,146 @@ fn update_reinstalls_the_running_executable() {
     assert!(left.is_empty(), "{left:?}");
 }
 
+/// `twr completions <shell>` prints the shell's completion script for twr's commands, from
+/// the command definition alone: no hub starts, nothing is written under `TWR_HOME`, and a
+/// workspace that doesn't exist or a config twr can't read doesn't stop it.
+#[test]
+fn completions_print_a_script_for_each_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("config.toml"), "this is = not [toml\n").unwrap();
+    for (shell, marker) in [
+        ("bash", "_twr()"),
+        ("zsh", "#compdef twr"),
+        ("fish", "complete -c twr"),
+        ("elvish", "edit:completion:arg-completer[twr]"),
+        ("powershell", "Register-ArgumentCompleter"),
+    ] {
+        let out = twr_cmd()
+            .args(["-w", "no-such-workspace", "completions", shell])
+            .env("TWR_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{shell}: {out:?}");
+        let script = String::from_utf8(out.stdout).unwrap();
+        assert!(script.contains(marker), "{shell}: no {marker:?}");
+        for word in [
+            "thread",
+            "attention",
+            "respond",
+            "completions",
+            "allow-downgrade",
+        ] {
+            assert!(script.contains(word), "{shell}: no {word}");
+        }
+    }
+    let left: Vec<_> = std::fs::read_dir(&home)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["config.toml"], "{left:?}");
+    let bad = twr_cmd()
+        .args(["completions", "tcsh"])
+        .env("TWR_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("possible values: bash"));
+}
+
+/// `twr update` never runs the installer of a release that is not newer than itself, even
+/// properly signed (a mirror's old release): the same release is up to date (exit 0), an older
+/// one is refused unless `--version` and `--allow-downgrade` name it.
+#[test]
+fn update_refuses_an_older_or_the_same_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    if std::fs::hard_link(TWR, bin.join("twr")).is_err() {
+        cp(Path::new(TWR), &bin.join("twr"));
+    }
+    let marker = tmp.path().join("ran");
+    let script = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+    let signer = test_signer();
+    // A signed mirror release `tag` whose installer leaves `marker`.
+    let release = |tag: &str| {
+        let d = tmp.path().join(tag);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("install.sh"), &script).unwrap();
+        std::fs::write(
+            d.join("sha256sums.txt"),
+            format!(
+                "# twr release {tag}\n{}  install.sh\n",
+                sha256_hex(script.as_bytes())
+            ),
+        )
+        .unwrap();
+        sign_file(&signer, &d.join("install.sh"));
+        sign_file(&signer, &d.join("sha256sums.txt"));
+        d.join("install.sh")
+    };
+    let update = |installer: &Path, args: &[&str]| {
+        Command::new(bin.join("twr"))
+            .arg("update")
+            .args(args)
+            .env("TWR_HOME", &home)
+            .env("TMPDIR", tmp.path())
+            .env(
+                "TWR_INSTALL_SCRIPT_URL",
+                format!("file://{}", installer.display()),
+            )
+            .env("TWR_TEST_RELEASE_KEY_FILE", signing_fixture("test-key.pub"))
+            .env("https_proxy", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env_remove("TWR_VERSION")
+            .env_remove("RUST_LOG")
+            .output()
+            .unwrap()
+    };
+    let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let current = env!("CARGO_PKG_VERSION");
+
+    // The same release: up to date, nothing run.
+    let same = release(&format!("v{current}"));
+    let out = update(&same, &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text(&out.stdout).contains("is up to date"), "{out:?}");
+    assert!(!marker.exists());
+
+    // An older one: refused, with or without --version, and with --allow-downgrade only
+    // together with the --version it names.
+    let old = release("v0.0.1");
+    for args in [&[][..], &["--version", "v0.0.1"]] {
+        let out = update(&old, args);
+        assert!(!out.status.success(), "{args:?}: {out:?}");
+        let e = text(&out.stderr);
+        assert!(
+            e.contains(&format!("is older than this twr ({current})")),
+            "{e}"
+        );
+        assert!(e.contains("may refuse the database"), "{e}");
+        assert!(
+            e.contains("twr update --version v0.0.1 --allow-downgrade"),
+            "{e}"
+        );
+        assert!(!marker.exists(), "{args:?}: the installer ran");
+    }
+    let out = update(&old, &["--allow-downgrade"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!marker.exists());
+    let out = update(&old, &["--version", "v0.0.1", "--allow-downgrade"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text(&out.stderr).contains("older than this twr"), "{out:?}");
+    assert!(marker.exists(), "the installer did not run");
+}
+
 /// install.sh checks sha256sums.txt against its signature when openssl here can: run against a
 /// file:// release signed with the test key, by a copy of install.sh whose release key block
-/// holds the test key. Skipped where openssl can't verify Ed25519.
+/// holds the test key and whose P-256 block holds none, so that the Ed25519 path is the one
+/// tested whatever key install.sh ships. Skipped where openssl can't verify Ed25519.
 #[test]
 fn install_sh_checks_the_signature_of_the_checksums() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2120,16 +2297,27 @@ fn install_sh_checks_the_signature_of_the_checksums() {
         .split_once("# --- end release key ---\n")
         .expect("install.sh's release key block ends");
     let script = tmp.path().join("install.sh");
-    std::fs::write(
-        &script,
-        format!(
-            "{head}# --- release key ---\nRELEASE_KEY='{}'\nPROBE_MESSAGE='twr signature probe'\n\
-             PROBE_SIGNATURE='{}'\n# --- end release key ---\n{tail}",
-            pub_pem.trim_end(),
-            probe.trim()
-        ),
-    )
-    .unwrap();
+    let text = format!(
+        "{head}# --- release key ---\nRELEASE_KEY='{}'\nPROBE_MESSAGE='twr signature probe'\n\
+         PROBE_SIGNATURE='{}'\n# --- end release key ---\n{tail}",
+        pub_pem.trim_end(),
+        probe.trim()
+    );
+    let p256_block = |with: &str| {
+        replace_block(
+            &text,
+            "# --- release key p256 ---",
+            "# --- end release key p256 ---",
+            with,
+        )
+    };
+    let without_p256 = p256_block("RELEASE_KEY_P256=''\nPROBE_SIGNATURE_P256=''\n");
+    let (p256, p256_pem) = p256_key();
+    let with_p256 = p256_block(&format!(
+        "RELEASE_KEY_P256='{p256_pem}'\nPROBE_SIGNATURE_P256='{}'\n",
+        p256_sign(&p256, b"twr signature probe")
+    ));
+    std::fs::write(&script, &without_p256).unwrap();
 
     let release = tmp.path().join("release");
     fake_release(&release, &tmp.path().join("stage"));
@@ -2264,6 +2452,20 @@ fn install_sh_checks_the_signature_of_the_checksums() {
     let (installed, stderr) = run(&[("TWR_REQUIRE_SIGNATURE", "1")], false);
     assert!(!installed);
     assert!(stderr.contains("TWR_REQUIRE_SIGNATURE=1"), "{stderr}");
+    // The same when the script holds a P-256 key too and no openssl checks either signature.
+    std::fs::write(&script, &with_p256).unwrap();
+    let (installed, stderr) = run(&[], false);
+    assert!(installed, "{stderr}");
+    assert!(
+        stderr.contains(
+            "twr install: the checksums were not signature-checked (no openssl that checks Ed25519 or P-256 signatures)"
+        ),
+        "{stderr}"
+    );
+    let (installed, stderr) = run(&[("TWR_REQUIRE_SIGNATURE", "1")], false);
+    assert!(!installed);
+    assert!(stderr.contains("TWR_REQUIRE_SIGNATURE=1"), "{stderr}");
+    std::fs::write(&script, &without_p256).unwrap();
     reset();
 
     // TWR_SHA256SUMS_FILE: that file, not a download, and no signature check here (the caller
@@ -2303,6 +2505,198 @@ fn install_sh_checks_the_signature_of_the_checksums() {
     );
 }
 
+/// A throwaway ECDSA P-256 key, made by ring for one test: its pair, and its public key as the
+/// PEM install.sh holds (`SubjectPublicKeyInfo`: a fixed 26-byte header and the uncompressed
+/// point). Never written anywhere but the test's own temporary directory.
+fn p256_key() -> (ring::signature::EcdsaKeyPair, String) {
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let pair =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let mut der = vec![
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    ];
+    der.extend_from_slice(pair.public_key().as_ref());
+    let body = twr_core::b64::encode(&der);
+    let lines: Vec<&str> = body
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    let pem = format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
+        lines.join("\n")
+    );
+    (pair, pem)
+}
+
+/// The base64 of `key`'s DER ECDSA signature of `data`, as the release workflow writes
+/// sha256sums.txt.p256.sig.
+fn p256_sign(key: &ring::signature::EcdsaKeyPair, data: &[u8]) -> String {
+    let rng = ring::rand::SystemRandom::new();
+    twr_core::b64::encode(key.sign(&rng, data).unwrap().as_ref())
+}
+
+/// `script` with the lines between `begin` and `end` (its key block) replaced by `with`.
+fn replace_block(script: &str, begin: &str, end: &str, with: &str) -> String {
+    let (head, rest) = script
+        .split_once(&format!("{begin}\n"))
+        .unwrap_or_else(|| panic!("install.sh has {begin}"));
+    let (_, tail) = rest
+        .split_once(&format!("{end}\n"))
+        .unwrap_or_else(|| panic!("install.sh has {end}"));
+    format!("{head}{begin}\n{with}{end}\n{tail}")
+}
+
+/// install.sh's P-256 path (what macOS's LibreSSL checks): run against a file:// release
+/// whose sha256sums.txt is signed with a throwaway P-256 key, by a copy of install.sh whose
+/// P-256 block holds that key and whose Ed25519 probe signature is left out, so that an
+/// OpenSSL that checks Ed25519 takes the P-256 path too. A good signature installs; a changed
+/// list, another key's signature, a missing one and one that is no signature are refused.
+/// Skipped where no openssl here checks ECDSA P-256 signatures.
+#[test]
+fn install_sh_checks_the_p256_signature_of_the_checksums() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key, pem) = p256_key();
+    let probe = p256_sign(&key, b"twr signature probe");
+    // Whether openssl here checks this key's signatures at all.
+    std::fs::write(tmp.path().join("pub.pem"), format!("{pem}\n")).unwrap();
+    std::fs::write(tmp.path().join("msg"), "twr signature probe").unwrap();
+    std::fs::write(
+        tmp.path().join("sig"),
+        twr_core::b64::decode(&probe).unwrap(),
+    )
+    .unwrap();
+    let usable = Command::new("openssl")
+        .args(["dgst", "-sha256", "-verify"])
+        .arg(tmp.path().join("pub.pem"))
+        .arg("-signature")
+        .arg(tmp.path().join("sig"))
+        .arg(tmp.path().join("msg"))
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !usable {
+        eprintln!("skipped: no openssl here checks ECDSA P-256 signatures");
+        return;
+    }
+
+    // install.sh with the test key in its P-256 block, and no Ed25519 probe signature, so
+    // that it finds no Ed25519 verifier (as with LibreSSL) whatever openssl this is.
+    let original = std::fs::read_to_string(install_sh()).unwrap();
+    let ed25519 = original
+        .split_once("# --- release key ---\n")
+        .and_then(|(_, rest)| rest.split_once("# --- end release key ---\n"))
+        .expect("install.sh has a release key block")
+        .0;
+    let ed25519: String = ed25519
+        .lines()
+        .filter(|l| !l.starts_with("PROBE_SIGNATURE="))
+        .map(|l| format!("{l}\n"))
+        .chain(["PROBE_SIGNATURE=''\n".to_string()])
+        .collect();
+    let text = replace_block(
+        &original,
+        "# --- release key ---",
+        "# --- end release key ---",
+        &ed25519,
+    );
+    let text = replace_block(
+        &text,
+        "# --- release key p256 ---",
+        "# --- end release key p256 ---",
+        &format!("RELEASE_KEY_P256='{pem}'\nPROBE_SIGNATURE_P256='{probe}'\n"),
+    );
+    let script = tmp.path().join("install.sh");
+    std::fs::write(&script, text).unwrap();
+
+    let release = tmp.path().join("release");
+    fake_release(&release, &tmp.path().join("stage"));
+    let sums = release.join("sha256sums.txt");
+    let sig = release.join("sha256sums.txt.p256.sig");
+    let good_sums = std::fs::read(&sums).unwrap();
+    let good_sig = p256_sign(&key, &good_sums);
+    let reset = || {
+        std::fs::write(&sums, &good_sums).unwrap();
+        std::fs::write(&sig, &good_sig).unwrap();
+    };
+    reset();
+
+    let mut n = 0;
+    let mut run = |env: &[(&str, &str)]| {
+        n += 1;
+        let dir = tmp.path().join(format!("bin{n}"));
+        let mut cmd = Command::new("sh");
+        cmd.arg(&script)
+            .env("HOME", tmp.path())
+            .env("TWR_INSTALL_DIR", &dir)
+            .env("TWR_VERSION", "v9.9.9")
+            .env("TWR_DOWNLOAD_URL", format!("file://{}", release.display()));
+        for k in ["TWR_SHA256SUMS_FILE", "TWR_REQUIRE_SIGNATURE", "TWR_UPDATE"] {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let installed = dir.join("twr").exists();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.success(), installed, "{env:?}: {out:?}");
+        (installed, stderr)
+    };
+
+    // A good signature installs, without a warning, also when a signature is required.
+    let (installed, stderr) = run(&[]);
+    assert!(installed, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let (installed, stderr) = run(&[("TWR_REQUIRE_SIGNATURE", "1")]);
+    assert!(installed, "{stderr}");
+
+    // A changed list is refused: a line added, or a character of a checksum changed.
+    let mut more = good_sums.clone();
+    more.extend_from_slice(format!("{}  other.tar.gz\n", "1".repeat(64)).as_bytes());
+    std::fs::write(&sums, &more).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("the P-256 signature of sha256sums.txt does not verify")
+            && stderr.contains("nothing was installed"),
+        "{stderr}"
+    );
+    let text = String::from_utf8(good_sums.clone()).unwrap();
+    let (first, rest) = text.split_once('\n').unwrap();
+    let flipped = if rest.starts_with('0') { "1" } else { "0" };
+    std::fs::write(&sums, format!("{first}\n{flipped}{}", &rest[1..])).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(stderr.contains("does not verify"), "{stderr}");
+    reset();
+
+    // Another key's signature is refused.
+    let (other, _) = p256_key();
+    std::fs::write(&sig, p256_sign(&other, &good_sums)).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(stderr.contains("does not verify"), "{stderr}");
+
+    // So is a missing signature, and one that is no signature.
+    std::fs::remove_file(&sig).unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("could not download sha256sums.txt.p256.sig"),
+        "{stderr}"
+    );
+    std::fs::write(&sig, "c2lnbmVk\n").unwrap();
+    let (installed, stderr) = run(&[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("is not an ECDSA P-256 signature"),
+        "{stderr}"
+    );
+}
+
 /// A thread whose runtime failed to start keeps the rest of its queue held, but a prompt held
 /// for it with `--after` still goes out by itself once the thread it waits for finishes, and
 /// its dispatch releases that queue: `twr wait` waits (here until its timeout) instead of
@@ -2336,10 +2730,18 @@ fn wait_after_a_start_failure_waits_for_a_held_prompt() {
     ok(home, &["send", "dep", "!sleep", "120000"]);
     // x runs a turn while two more prompts queue, and moves to a runtime that cannot start:
     // the next prompt fails to start it, and the last one stays queued behind the failure.
-    ok(home, &["send", "x", "!sleep", "2000"]);
+    // The turn waits for a permission, answered once all that is done: a turn of a fixed
+    // length could end before it, on a loaded machine.
+    ok(home, &["send", "x", "!perm Bash ls"]);
+    poll("x's permission", || {
+        ok(home, &["attention"])
+            .contains("permission")
+            .then_some(())
+    });
     ok(home, &["send", "x", "second"]);
     ok(home, &["send", "x", "third"]);
     ok(home, &["model", "x", "--runtime", "codex"]);
+    ok(home, &["respond", "x", "1", "--yes"]);
     poll("x's start failure", || {
         let t = thread_get(home, "x");
         (t["last_turn"]["result"] == "error" && t["pending"] == 1).then_some(())
@@ -2390,6 +2792,67 @@ fn install_sh_keeps_the_old_twr_when_the_new_one_fails_to_run() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(left, ["twr"], "{left:?}");
+}
+
+/// `install.sh --pair` runs `twr runner up` from the twr it installed, and says clearly when
+/// that release has none (the script comes from main, which can be ahead of the latest
+/// release) instead of failing on a usage error.
+#[test]
+fn install_sh_pair_needs_a_twr_with_runner_up() {
+    for (twr, ok) in [
+        // A release without `runner up`: clap refuses the subcommand (exit 2).
+        (
+            "#!/bin/sh\ncase \"$*\" in --version) echo 'twr 0.3.0';; \
+             *) echo \"error: unrecognized subcommand 'up'\" >&2; exit 2;; esac\n",
+            false,
+        ),
+        // One with it: `--help` succeeds, then `runner up` runs.
+        (
+            "#!/bin/sh\ncase \"$*\" in --version) echo 'twr 9.9.9';; \
+             'runner up --help') echo help;; 'runner up') echo 'pairing...';; \
+             *) exit 2;; esac\n",
+            true,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let release = tmp.path().join("release");
+        fake_release_of(&release, &tmp.path().join("stage"), twr);
+        let bin = tmp.path().join("bin");
+        let out = Command::new("sh")
+            .arg(install_sh())
+            .arg("--pair")
+            .env("HOME", tmp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("TWR_INSTALL_DIR", &bin)
+            .env("TWR_VERSION", "v9.9.9")
+            .env("TWR_DOWNLOAD_URL", format!("file://{}", release.display()))
+            .env("TWR_SHA256SUMS_FILE", release.join("sha256sums.txt"))
+            .env_remove("TWR_UPDATE")
+            .env_remove("TWR_REQUIRE_SIGNATURE")
+            .output()
+            .unwrap();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(out.status.success(), ok, "{stdout}\n{stderr}");
+        assert!(bin.join("twr").exists(), "{stderr}");
+        if ok {
+            assert!(stdout.contains("pairing..."), "{stdout}");
+        } else {
+            assert!(
+                stderr.contains(&format!(
+                    "installed twr 0.3.0 at {}, but it is too old to pair: it has no `twr \
+                     runner up`",
+                    bin.join("twr").display()
+                )) && stderr.contains("run this script again with --pair")
+                    && stderr.contains("docs/install.md#from-source")
+                    && !stderr.contains("newer than 0.3.0"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("unrecognized subcommand"), "{stderr}");
+        }
+    }
 }
 
 /// install.sh's advice for an install directory that is not on PATH works pasted as shown,

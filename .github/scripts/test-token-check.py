@@ -29,6 +29,7 @@ Standard library only.
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -39,11 +40,25 @@ import time
 
 TOKEN = "release-token-check-0123456789abcdef"
 WAIT = 30.0
+PROTO_RS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "..", "crates", "twr-core", "src", "proto.rs")
 
 
 def fail(msg):
     print(f"test-token-check: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def client_protocol():
+    """The client protocol of this checkout's twr (`PROTOCOL_VERSION` in twr-core's proto.rs).
+
+    A hub refuses a `hello` whose protocol is older than its own, so a number written here
+    would fail the check at the next protocol change, with nothing wrong in the build."""
+    with open(PROTO_RS, encoding="utf-8") as f:
+        found = re.search(r"^pub const PROTOCOL_VERSION: u32 = (\d+);", f.read(), re.M)
+    if not found:
+        fail(f"no PROTOCOL_VERSION in {PROTO_RS}")
+    return int(found.group(1))
 
 
 def call(conn, reader, rid, method, params):
@@ -67,7 +82,8 @@ def client(sock_path, token, expect):
     conn.connect(sock_path)
     reader = conn.makefile("r", encoding="utf-8")
     hello = call(conn, reader, 1, "hello",
-                 {"client": "token-check", "protocol": 1, "user_token": token})
+                 {"client": "token-check", "protocol": client_protocol(),
+                  "user_token": token})
     print(f"hello: {json.dumps(hello)}")
     if "result" not in hello:
         fail(f"hello failed: {hello}")

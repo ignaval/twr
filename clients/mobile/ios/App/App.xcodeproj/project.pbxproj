@@ -21,6 +21,8 @@
 		A00000000000000000000002 /* TwrTransportPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000001 /* TwrTransportPlugin.swift */; };
 		A00000000000000000000004 /* TwrViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000003 /* TwrViewController.swift */; };
 		A00000000000000000000006 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A00000000000000000000005 /* PrivacyInfo.xcprivacy */; };
+		B00000000000000000000002 /* TwrOfflinePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000001 /* TwrOfflinePlugin.swift */; };
+		B00000000000000000000004 /* TwrVoicePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000003 /* TwrVoicePlugin.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -52,6 +54,8 @@
 		A00000000000000000000005 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		C5EBBAA87D679AA598C77C2E /* RemoteHubTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = RemoteHubTests.swift; sourceTree = "<group>"; };
 		F4820369321EAA82AE6FB0F8 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
+		B00000000000000000000001 /* TwrOfflinePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwrOfflinePlugin.swift; sourceTree = "<group>"; };
+		B00000000000000000000003 /* TwrVoicePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TwrVoicePlugin.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -111,6 +115,8 @@
 				504EC3071FED79650016851F /* AppDelegate.swift */,
 				A00000000000000000000003 /* TwrViewController.swift */,
 				A00000000000000000000001 /* TwrTransportPlugin.swift */,
+				B00000000000000000000001 /* TwrOfflinePlugin.swift */,
+				B00000000000000000000003 /* TwrVoicePlugin.swift */,
 				504EC30B1FED79650016851F /* Main.storyboard */,
 				504EC30E1FED79650016851F /* Assets.xcassets */,
 				504EC3101FED79650016851F /* LaunchScreen.storyboard */,
@@ -258,6 +264,8 @@
 				504EC3081FED79650016851F /* AppDelegate.swift in Sources */,
 				A00000000000000000000004 /* TwrViewController.swift in Sources */,
 				A00000000000000000000002 /* TwrTransportPlugin.swift in Sources */,
+				B00000000000000000000002 /* TwrOfflinePlugin.swift in Sources */,
+				B00000000000000000000004 /* TwrVoicePlugin.swift in Sources */,
 				9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -416,7 +424,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.0;
 				OTHER_SWIFT_FLAGS = "$(inherited) \"-D\" \"COCOAPODS\" \"-DDEBUG\"";
 				PRODUCT_BUNDLE_IDENTIFIER = tools.twr.mobile.dev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -439,7 +447,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.3.0;
+				MARKETING_VERSION = 0.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = tools.twr.mobile.dev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";

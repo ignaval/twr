@@ -1,6 +1,12 @@
 package tools.twr.mobile.dev;
 
 import android.content.Context;
+import androidx.activity.result.ActivityResult;
+import com.getcapacitor.annotation.ActivityCallback;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
+import com.google.zxing.integration.android.IntentIntegrator;
+import com.google.zxing.integration.android.IntentResult;
 import android.content.SharedPreferences;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
@@ -18,7 +24,7 @@ import okhttp3.*;
 import org.json.*;
 
 /** Tokens stay in Android Keystore protected storage and never cross the JS bridge. */
-@CapacitorPlugin(name="TwrTransport")
+@CapacitorPlugin(name="TwrTransport", permissions={@Permission(alias="camera",strings={android.Manifest.permission.CAMERA})})
 public class TwrTransportPlugin extends Plugin {
     private static final String KEY="tools.twr.mobile.credentials";
     // Application heartbeats/watchdog observe frame progress; OkHttp's fixed
@@ -28,9 +34,26 @@ public class TwrTransportPlugin extends Plugin {
     private final java.util.concurrent.atomic.AtomicLong connectionGeneration=new java.util.concurrent.atomic.AtomicLong();
     private String activeHub;
     private final java.util.concurrent.ExecutorService worker=java.util.concurrent.Executors.newSingleThreadExecutor();
+    private static final String VAULT_RESET="Saved hubs couldn't be restored on this device; pair again.";
+    /** The saved hubs could not be decrypted and were dropped: listHubs says so once. */
+    private boolean vaultReset=false;
+    /** A Keystore key that is gone or unusable, or data a different key encrypted. */
+    private static boolean unrecoverable(Throwable error) {
+        for(Throwable cause=error;cause!=null;cause=cause.getCause()) {
+            if(cause instanceof javax.crypto.AEADBadTagException||cause instanceof java.security.UnrecoverableKeyException||cause instanceof android.security.keystore.KeyPermanentlyInvalidatedException)return true;
+        }
+        return false;
+    }
     private SecretKey key() throws Exception {
         KeyStore store=KeyStore.getInstance("AndroidKeyStore");store.load(null);
-        if(store.containsAlias(KEY)) return (SecretKey)store.getKey(KEY,null);
+        if(store.containsAlias(KEY)) {
+            try {
+                return (SecretKey)store.getKey(KEY,null);
+            } catch(java.security.UnrecoverableKeyException unusable) {
+                // What it encrypted can't be read any more: start again with a new key.
+                store.deleteEntry(KEY);
+            }
+        }
         KeyGenerator generator=KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES,"AndroidKeyStore");
         generator.init(new KeyGenParameterSpec.Builder(KEY,KeyProperties.PURPOSE_ENCRYPT|KeyProperties.PURPOSE_DECRYPT).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build());
         return generator.generateKey();
@@ -39,8 +62,17 @@ public class TwrTransportPlugin extends Plugin {
     private synchronized JSONObject vault() throws Exception {
         String encoded=prefs().getString("hubs",null);if(encoded==null)return new JSONObject();
         byte[] bytes=Base64.decode(encoded,Base64.NO_WRAP);
-        Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,bytes,0,12));
-        return new JSONObject(new String(cipher.doFinal(bytes,12,bytes.length-12),java.nio.charset.StandardCharsets.UTF_8));
+        try {
+            Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,bytes,0,12));
+            return new JSONObject(new String(cipher.doFinal(bytes,12,bytes.length-12),java.nio.charset.StandardCharsets.UTF_8));
+        } catch(Exception error) {
+            // Restored from another phone, or its Keystore key was lost: the tokens can never
+            // be decrypted here. Drop them so pairing works again instead of failing forever.
+            if(!unrecoverable(error))throw error;
+            if(!prefs().edit().remove("hubs").commit())throw new Exception(VAULT_RESET,error);
+            vaultReset=true;
+            return new JSONObject();
+        }
     }
     private synchronized void save(JSONObject data) throws Exception {
         Cipher cipher=Cipher.getInstance("AES/GCM/NoPadding");cipher.init(Cipher.ENCRYPT_MODE,key());
@@ -57,7 +89,34 @@ public class TwrTransportPlugin extends Plugin {
     private JSObject metadata(String id,JSONObject hub) throws JSONException {
         JSObject data=new JSObject();data.put("id",id);data.put("name",hub.optString("name"));data.put("url",hub.optString("url"));data.put("scopes",hub.optJSONArray("scopes"));data.put("gateway_id",hub.optString("gateway_id"));return data;
     }
-    @PluginMethod public void listHubs(PluginCall call){try{JSONObject data=vault();JSArray hubs=new JSArray();java.util.Iterator<String> keys=data.keys();while(keys.hasNext()){String id=keys.next();hubs.put(metadata(id,data.getJSONObject(id)));}JSObject value=new JSObject();value.put("hubs",hubs);call.resolve(value);}catch(Exception e){call.reject("Could not read paired hubs",e);}}
+    private final java.util.concurrent.atomic.AtomicBoolean scanning=new java.util.concurrent.atomic.AtomicBoolean();
+    @PluginMethod public void scanInvitation(PluginCall call) {
+        if(!scanning.compareAndSet(false,true)){call.reject("The QR scanner is already open","SCAN_BUSY");return;}
+        if(!getContext().getPackageManager().hasSystemFeature(android.content.pm.PackageManager.FEATURE_CAMERA_ANY)){scanning.set(false);call.reject("This device has no available camera. Enter the address and code manually.","CAMERA_UNAVAILABLE");return;}
+        if(getPermissionState("camera")!=PermissionState.GRANTED){requestPermissionForAlias("camera",call,"cameraPermission");return;}
+        launchScanner(call);
+    }
+    @PermissionCallback private void cameraPermission(PluginCall call) {
+        if(getPermissionState("camera")!=PermissionState.GRANTED){scanning.set(false);call.reject("Camera permission was denied. Allow it in Settings or enter the address and code manually.","CAMERA_PERMISSION_DENIED");return;}
+        launchScanner(call);
+    }
+    private void launchScanner(PluginCall call) {
+        getActivity().runOnUiThread(()->{
+            try {
+                android.content.Intent intent=new IntentIntegrator(getActivity()).setDesiredBarcodeFormats(IntentIntegrator.QR_CODE).setPrompt("Scan the one-use invitation from twr on your computer").setBeepEnabled(false).setOrientationLocked(false).createScanIntent();
+                startActivityForResult(call,intent,"invitationScanned");
+            } catch(Exception error) { scanning.set(false);call.reject("Could not open the camera. Enter the address and code manually.","CAMERA_UNAVAILABLE",error); }
+        });
+    }
+    @ActivityCallback private void invitationScanned(PluginCall call, ActivityResult result) {
+        scanning.set(false);if(call==null)return;
+        IntentResult scanned=IntentIntegrator.parseActivityResult(IntentIntegrator.REQUEST_CODE,result.getResultCode(),result.getData());
+        if(scanned==null||scanned.getContents()==null){call.reject("QR scan cancelled","SCAN_CANCELLED");return;}
+        String text=scanned.getContents();
+        if(text.length()>2048){call.reject("Scan a twr pairing invitation");return;}
+        call.resolve(new JSObject().put("invitation",text));
+    }
+    @PluginMethod public void listHubs(PluginCall call){try{JSONObject data=vault();JSArray hubs=new JSArray();java.util.Iterator<String> keys=data.keys();while(keys.hasNext()){String id=keys.next();hubs.put(metadata(id,data.getJSONObject(id)));}JSObject value=new JSObject();value.put("hubs",hubs);synchronized(this){if(vaultReset){vaultReset=false;value.put("notice",VAULT_RESET);}}call.resolve(value);}catch(Exception e){call.reject("Could not read paired hubs",e);}}
     @PluginMethod public void pair(PluginCall call){worker.execute(()->{try{
         String url=endpoint(call.getString("url",""));JSONObject body=new JSONObject();body.put("code",call.getString("code",""));body.put("name",call.getString("name",""));
         try(Response health=http.newCall(new Request.Builder().url(url+"/health").build()).execute()) {
@@ -80,7 +139,7 @@ public class TwrTransportPlugin extends Plugin {
             }
             JSONObject record=new JSONObject(responseText);String id=java.util.UUID.randomUUID().toString();record.put("url",url);record.put("name",call.getString("hubName","My hub"));
             if(record.getString("token").length()!=64)throw new Exception("Invalid hub credentials");
-            JSONObject all=vault();all.put(id,record);save(all);call.resolve(metadata(id,record));
+            JSONObject all=vault();all.put(id,record);save(all);synchronized(this){vaultReset=false;}call.resolve(metadata(id,record));
         }
     }catch(Exception e){call.reject(e.getMessage(),e);}});}
     @PluginMethod public void connect(PluginCall call){try{
@@ -93,8 +152,11 @@ public class TwrTransportPlugin extends Plugin {
             @Override public void onOpen(WebSocket ws,Response response){}
             @Override public void onMessage(WebSocket ws,String text){if(generation!=connectionGeneration.get())return;try{if(text.length()>16*1024*1024)throw new Exception("Hub response too large");JSObject message=new JSObject(text);if("authenticated".equals(message.optString("type"))){authenticated=true;call.resolve();}JSObject value=new JSObject();value.put("message",message);notifyListeners("message",value);}catch(Exception e){ws.cancel();}}
             @Override public void onClosed(WebSocket ws,int code,String reason){if(!authenticated)call.reject("Hub authentication failed");closed(ws);}
-            @Override public void onFailure(WebSocket ws,Throwable error,Response response){if(!authenticated)call.reject("Could not connect to the hub");closed(ws);}
-            private void closed(WebSocket ws){if(generation!=connectionGeneration.get())return;JSObject value=new JSObject();value.put("message",new JSObject().put("type","transport-closed").put("connected",false).put("error","Remote hub connection closed"));notifyListeners("message",value);}
+            // Only 401 means the gateway no longer knows this token. A 403 and 5xx are
+            // refusals the app retries like any other lost connection.
+            @Override public void onFailure(WebSocket ws,Throwable error,Response response){boolean revoked=response!=null&&response.code()==401;boolean refused=!authenticated&&response!=null&&response.code()!=101;String message=revoked?"AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again.":refused?"Gateway refused the connection ("+response.code()+")":"Remote hub connection closed";if(!authenticated)call.reject(message,revoked?"AUTH_REVOKED":null);closed(ws,message);}
+            private void closed(WebSocket ws){closed(ws,"Remote hub connection closed");}
+            private void closed(WebSocket ws,String error){if(generation!=connectionGeneration.get())return;JSObject value=new JSObject();value.put("message",new JSObject().put("type","transport-closed").put("connected",false).put("error",error));notifyListeners("message",value);}
         });
         if(generation==connectionGeneration.get())socket=opened;else opened.cancel();
     }catch(Exception e){call.reject("Could not connect to the paired hub",e);}}

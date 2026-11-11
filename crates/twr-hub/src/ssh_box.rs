@@ -524,6 +524,7 @@ impl BoxLink {
     /// some (an SSH box; a token box's are for attach). `None` without either.
     pub fn of(cfg: &BoxConfig) -> Option<BoxLink> {
         match cfg.transport() {
+            BoxTransport::Link => None,
             BoxTransport::Command => cfg
                 .command
                 .clone()
@@ -2711,7 +2712,19 @@ fn after_session(
     switched: bool,
 ) -> Attempt {
     let name = sbox.name();
-    let refused = end.protocol_refused;
+    let refused = match (end.protocol_refused, end.spool_refused) {
+        (Some(p), _) => Some(format!(
+            "the box's daemon speaks runner protocol {p}, which this hub (protocol {}) cannot \
+             serve: replacing it",
+            twr_core::runner::PROTOCOL_VERSION
+        )),
+        (None, true) => Some(
+            "the box's daemon is too old to forget what it spooled for this hub before the box \
+             was removed: replacing it"
+                .to_string(),
+        ),
+        (None, false) => None,
+    };
     // A drain stopped the runtimes of this older daemon: it is replaced, unless it is the
     // build launched (nothing newer to start: the box needs an install, and that build is not
     // launched again meanwhile). (Only a legacy session's end: the drain asked it of that
@@ -2736,12 +2749,7 @@ fn after_session(
         sbox.remark(format!("switching to build {id}"));
     }
     let attempt = session_ended(name, id, end, hello, switched || drained.is_some());
-    if let (Some(p), Attempt::Session { replace: true, .. }) = (refused, &attempt) {
-        let mut note = format!(
-            "the box's daemon speaks runner protocol {p}, which this hub (protocol {}) cannot \
-             serve: replacing it",
-            twr_core::runner::PROTOCOL_VERSION
-        );
+    if let (Some(mut note), Attempt::Session { replace: true, .. }) = (refused, &attempt) {
         match hub.begin_blind_box_switch(name) {
             Some((0, _)) => {}
             Some((k, running)) => {
@@ -2778,6 +2786,7 @@ fn session_ended(
     let SealedEnd {
         welcomed,
         protocol_refused,
+        spool_refused,
         ..
     } = end;
     if let Some(p) = protocol_refused {
@@ -2786,8 +2795,27 @@ fn session_ended(
         }
         tracing::warn!(box_name = %name, protocol = p, daemon = ?hello.build, launched = id, "the box's daemon speaks another runner protocol: replacing it");
     }
-    let replace = switched || (protocol_refused.is_some() && hello.build.as_deref() != Some(id));
+    // A daemon too old to forget what it spooled for a box the hub forgot (it was removed,
+    // then added again): as one of another protocol.
+    if spool_refused {
+        if hello.build.as_deref() == Some(id) {
+            return Attempt::Failed(State::NeedsInstall, stale_spool_why(name));
+        }
+        tracing::warn!(box_name = %name, daemon = ?hello.build, launched = id, "the box's daemon is too old to forget what it spooled for this hub before the box was removed: replacing it");
+    }
+    let refused = protocol_refused.is_some() || spool_refused;
+    let replace = switched || (refused && hello.build.as_deref() != Some(id));
     Attempt::Session { welcomed, replace }
+}
+
+/// Why box `name` needs this hub's build installed: the build launched there is too old to
+/// forget what it spooled for the hub before the box was removed (`hub::runners`).
+fn stale_spool_why(name: &str) -> String {
+    format!(
+        "box {name} was removed from the hub and added again, and the twr build that runs there \
+         is too old to forget what it spooled for the hub before: install this hub's build \
+         there: `twr box install {name}`"
+    )
 }
 
 /// Why box `name` needs this hub's build installed: the build launched there speaks runner
@@ -3029,6 +3057,14 @@ async fn prune(sbox: &SshBox, data: &str, reference: &str, id: &str, running: Op
 mod tests {
     use super::*;
     use crate::test_support::install;
+
+    /// A temporary directory whose path has no links (macOS's temporary directory is under
+    /// `/var`, a link to `/private/var`): the box scripts report the paths they check
+    /// resolved, and refuse a link in the tree that they cannot resolve with the tools a case
+    /// leaves on `PATH`.
+    fn resolved_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
 
     /// Takes group and other write off `root` and everything under it (not following links):
     /// what a test made under a umask that leaves group write on, made as twr makes it.
@@ -3421,7 +3457,7 @@ mod tests {
         let mode = |p: &std::path::Path, m: u32| {
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = resolved_tempdir();
         let home = dir.path().join("home");
         let data = home.join(".local/share");
         let data_s = data.to_str().unwrap();
@@ -3701,7 +3737,7 @@ mod tests {
     /// `shasum` falls back to size and version (the hub's upload) or refuses (a release).
     #[test]
     fn a_failing_sha256_tool_refuses_the_upload() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = resolved_tempdir();
         let data = dir.path().join("data");
         let data_s = data.to_str().unwrap();
         let builds = data.join("twr/runner/builds");
@@ -4773,6 +4809,28 @@ mod tests {
             Attempt::Session {
                 welcomed: false,
                 replace: false
+            }
+        ));
+        // A daemon too old to forget what it spooled for a box the hub forgot (removed, then
+        // added again) goes the same way.
+        let stale = || SealedEnd {
+            spool_refused: true,
+            ..Default::default()
+        };
+        match session_ended("gpu", launched, stale(), &hello(launched), false) {
+            Attempt::Failed(State::NeedsInstall, why) => assert_eq!(
+                why,
+                "box gpu was removed from the hub and added again, and the twr build that runs \
+                 there is too old to forget what it spooled for the hub before: install this \
+                 hub's build there: `twr box install gpu`"
+            ),
+            _ => panic!("not needs_install"),
+        }
+        assert!(matches!(
+            session_ended("gpu", launched, stale(), &hello("00000000000000b5"), false),
+            Attempt::Session {
+                welcomed: false,
+                replace: true
             }
         ));
     }

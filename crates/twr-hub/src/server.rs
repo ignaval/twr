@@ -16,6 +16,8 @@
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
 //! | `thread.spawn_status` | `{operation_id}` | durable operation |
+//! | `conversation.search` | `{query, thread?, before?:event_id, limit?}` | literal case-insensitive search across messages, tool output and decisions, including archive; `{items, next, more, workspace}` |
+//! | `thread.event_context` | `{thread, event_id, before?, after?, query?}` | exact event plus nearby events in its recorded workspace/thread, including archive |
 //! | `thread.transcript` | `{thread, turn?, since_seq?, limit?}` | filtered semantic events, default latest turn |
 //! | `thread.new`        | `{project, runtime?, name?, mode?, model?, effort?, aliases?, box?, worktree?, no_worktree?, base?}` | thread object |
 //! | `thread.list`       | -                                                   | `[thread object]` |
@@ -68,7 +70,7 @@
 //! | `memory.read`       | `{name}`                                            | a note of `memory.list` with its `body` |
 //! | `memory.save`       | `{name, type, description, body, rev?}`             | `{name, rev, op: saved \| updated, count, bytes}` (`conflict` when `rev` is stale, or missing for a note that exists) |
 //! | `memory.forget`     | `{name, rev?}`                                      | `{name, op: forgotten, count}` |
-//! | `speech.attach`     | `{device, name, engine, voice?, live?, read?, turn_from?, watermarks?, catchup_secs?}` (users only) | ack `{orchestrator, head}`, then `{"stream":"speech","item":{...}}` items (`msg`, `ctl`, `missed`, `orchestrator`): a speaker reads the orchestrator's messages aloud (`hub::speech`, `twr_core::speech`); `conflict` while a speaker of the device is attached |
+//! | `speech.attach`     | `{device, name, engine, voice?, live?, read?, turn_from?, watermarks?, catchup_secs?}` (users only) | ack `{orchestrator, head}`, then `{"stream":"speech","item":{...}}` items (`msg`, `ctl`, `missed`, `orchestrator`; `announce` and `retract` with `read` naming `attention`): a speaker reads the orchestrator's messages aloud (`hub::speech`, `twr_core::speech`); `conflict` while a speaker of the device is attached |
 //! | `speech.state`      | `{playing?, queued, batch?, paused, live, voice?, rate, error?}` (on the connection that attached a speaker) | `{ok: true}`: what that speaker plays, for `speech.status` |
 //! | `speech.request`    | `{thread?, last? \| seq?, speaker?}` (users only)   | `{count, speakers, thread}`: reads the last `last` messages, or the one at `seq`, on the speakers now, as one batch (`hub::speech`) |
 //! | `speech.control`    | `{op, value?, speaker?}` (users only)               | `{speakers}`: stop, pause, resume, skip, live, voice or rate, sent to the speakers |
@@ -269,7 +271,7 @@ use twr_runner::reap::{self, AncestryEnd, ProcessId};
 
 use crate::hub::{
     wait_state, AgentPeer, AgentWhy, BoxView, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
-    StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
+    SayOrigin, StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
 };
 
 /// Attach leases held by one connection: `(thread id, lease id)`.
@@ -604,6 +606,7 @@ async fn send<T: Serialize>(w: &Writer, msg: &T) -> std::io::Result<()> {
 /// orchestrator token, or its peer is a thread's agent.
 struct Conn {
     client: String,
+    upload_uid: Option<u32>,
     device: Option<twr_core::devices::Device>,
     /// The orchestrator token this connection presented; checked again on every request, with
     /// the peer's ancestry walked again ([`still_orchestrator`]), so a connection from an
@@ -632,6 +635,20 @@ static NEXT_CONN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 impl Conn {
     /// The agent this connection is restricted as: its peer is a thread's agent and it did not
     /// present the orchestrator token (only the orchestrator's own agent may, [`hello`]).
+    fn upload_scope(&self) -> Result<String, RpcError> {
+        if let Some(device) = &self.device {
+            return Ok(format!("device:{}", device.id));
+        }
+        self.upload_uid
+            .map(|uid| format!("uid:{uid}"))
+            .ok_or_else(|| {
+                RpcError::new(
+                    codes::UNAUTHORIZED,
+                    "Cannot authenticate the upload owner from socket credentials",
+                )
+            })
+    }
+
     fn restricted(&self) -> Option<&AgentPeer> {
         self.agent.as_ref().filter(|_| self.token.is_none())
     }
@@ -665,6 +682,7 @@ pub const METHODS: &[&str] = &[
     "hello",
     "device.pair_begin",
     "device.pair_complete",
+    "device.pair_cancel",
     "device.list",
     "device.revoke",
     "say",
@@ -672,6 +690,12 @@ pub const METHODS: &[&str] = &[
     "hub.glance",
     "hub.shutdown",
     "config.show",
+    "runner.manage",
+    "runner.status",
+    "runner.connect",
+    "runner.recover",
+    "runner.revoke",
+    "runner.forget",
     "box.add",
     "box.install",
     "box.restart",
@@ -685,6 +709,7 @@ pub const METHODS: &[&str] = &[
     "account.add",
     "account.remove",
     "account.status",
+    "thread.pull",
     "thread.new",
     "thread.spawn",
     "thread.spawn_status",
@@ -692,6 +717,7 @@ pub const METHODS: &[&str] = &[
     "thread.activity",
     "thread.get",
     "thread.send",
+    "thread.upload",
     "thread.send_cancel",
     "thread.stop",
     "thread.set_mode",
@@ -703,6 +729,8 @@ pub const METHODS: &[&str] = &[
     "thread.trim",
     "thread.events",
     "thread.transcript",
+    "conversation.search",
+    "thread.event_context",
     "thread.subscribe",
     "message.withdraw",
     "message.send_now",
@@ -785,6 +813,8 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "thread.resume",
     "thread.events",
     "thread.transcript",
+    "conversation.search",
+    "thread.event_context",
     "thread.subscribe",
     "attention.list",
     "attention.respond",
@@ -860,6 +890,8 @@ pub const AGENT_METHODS: &[&str] = &[
     "thread.get",
     "thread.events",
     "thread.transcript",
+    "conversation.search",
+    "thread.event_context",
     "thread.subscribe",
     "attention.list",
     "control.read",
@@ -956,11 +988,13 @@ async fn connection(
     if let Some(a) = &agent {
         tracing::info!(thread = ?a.thread, peer = a.peer, why = ?a.why, "a connection from a thread's agent: it reads, and starts and cancels its own thread's jobs only");
     }
+    let upload_uid = stream.peer_cred().ok().map(|credential| credential.uid());
     let (r, w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let writer: Writer = Arc::new(Mutex::new(w));
     let mut conn = Conn {
         client: default_client,
+        upload_uid,
         device: None,
         token: None,
         agent,
@@ -981,7 +1015,7 @@ async fn connection(
             loop {
                 tokio::select! {
                     _ = device_tick.tick() => {
-                        if conn.device.as_ref().is_some_and(|d| !hub.device_auth().is_ok_and(|a|a.current(d))) {break None;}
+                        if conn.device.as_ref().is_some_and(|d| twr_core::devices::Standing::of(hub.device_auth(), d).revoked()) {break None;}
                     }
                     f = &mut read => break Some(f),
                     _ = wait_state(&mut state, |s| *s == HubState::Stopped) => {
@@ -1018,13 +1052,27 @@ async fn connection(
         };
         let id = req.id;
         if let Some(device) = &conn.device {
-            if !hub.device_auth().is_ok_and(|a| a.current(device)) {
-                break;
+            // Judged by the records as they are now: a device revoked since is disconnected,
+            // and while they can't be read nothing is known (it may have been revoked or
+            // narrowed), so the request is refused, to be tried again, never granted by the
+            // scopes the device had at `hello`.
+            match twr_core::devices::Standing::of(hub.device_auth(), device) {
+                twr_core::devices::Standing::Current => {}
+                twr_core::devices::Standing::Revoked => break,
+                twr_core::devices::Standing::Unknown => {
+                    tracing::warn!(device = %device.id, method = %req.method, "cannot read the paired devices; refusing the device's request");
+                    let _ = send(
+                        &writer,
+                        &Response::err(id, crate::hub::devices_unreadable()),
+                    )
+                    .await;
+                    continue;
+                }
             }
             if !device.allows_params(&req.method, &req.params)
                 || matches!(
                     req.method.as_str(),
-                    "device.pair_begin" | "device.pair_complete"
+                    "device.pair_begin" | "device.pair_complete" | "device.pair_cancel"
                 )
             {
                 let _ = send(
@@ -1225,13 +1273,15 @@ async fn connection(
                     break;
                 }
             }
-            "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
-            | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
-            | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
-            | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
-            | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
-            | "box.projects" | "box.token" | "account.status" | "account.remove"
-            | "thread.set_model" | "speech.request" | "speech.control" => {
+            "thread.pull" | "thread.new" | "thread.park" | "thread.resume" | "thread.delete"
+            | "thread.trim" | "usage.threads" | "context.read" | "context.set"
+            | "orchestrator.use" | "orchestrator.reset" | "trash.list" | "trash.empty"
+            | "trash.restore" | "log.compact" | "log.stats" | "project.files" | "project.read"
+            | "project.search" | "memory.list" | "memory.read" | "box.add" | "box.install"
+            | "box.restart" | "runner.manage" | "runner.status" | "runner.connect"
+            | "runner.recover" | "runner.revoke" | "runner.forget" | "box.projects"
+            | "box.token" | "account.status" | "account.remove" | "thread.set_model"
+            | "speech.request" | "speech.control" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -1248,6 +1298,46 @@ async fn connection(
             "memory.save" | "memory.forget" => {
                 let result =
                     memory_change(&hub, &caller, &req.method, req.params, received.as_ref()).await;
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
+            "conversation.search" | "thread.event_context" => {
+                let search_hub = hub.clone();
+                let method = req.method.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    search_call(&search_hub, &method, req.params)
+                })
+                .await
+                .unwrap_or_else(|error| Err(internal(error)));
+                let response = match result {
+                    Ok(value) => Response::ok(id, value),
+                    Err(error) => Response::err(id, error),
+                };
+                if send(&writer, &response).await.is_err() {
+                    break;
+                }
+            }
+            "thread.upload" => {
+                #[derive(Deserialize)]
+                struct UploadParams {
+                    thread: String,
+                    #[serde(flatten)]
+                    request: twr_core::upload::Request,
+                }
+                let result = match serde_json::from_value::<UploadParams>(req.params)
+                    .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
+                {
+                    Ok(p) => match conn.upload_scope() {
+                        Ok(scope) => hub.upload(scope, &p.thread, p.request).await,
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                };
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -1522,45 +1612,38 @@ const WRITE_BATCH: usize = 64 * 1024;
 
 /// A subscription [`pump`] serves.
 trait Feed: Send {
-    type Item: Send;
-    /// The next item; `Ok(None)` once the hub has shut down.
-    fn next(
+    /// Appends the line of the next item to `buf`, waiting for it when it is still to come;
+    /// `Ok(false)` once the hub has shut down.
+    fn next_line(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send;
+        buf: &mut Vec<u8>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send;
     /// Appends the line of the next item already in the store to `buf`; `Ok(false)` when none
     /// is, without waiting.
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool>;
-    /// Appends `item` to `buf` as its line.
-    fn line(item: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()>;
 }
 
 impl Feed for crate::hub::ControlSubscription {
-    type Item = crate::hub::ControlItem;
-    fn next(
+    fn next_line(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
-        crate::hub::ControlSubscription::next(self)
+        buf: &mut Vec<u8>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        crate::hub::ControlSubscription::next_line(self, buf)
     }
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
         crate::hub::ControlSubscription::write_stored(self, buf)
     }
-    fn line((gseq, ev): &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
-        crate::hub::stream_line(buf, Some(*gseq), ev)
-    }
 }
 
 impl Feed for crate::hub::ThreadSubscription {
-    type Item = Arc<Event>;
-    fn next(
+    fn next_line(
         &mut self,
-    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
-        crate::hub::ThreadSubscription::next(self)
+        buf: &mut Vec<u8>,
+    ) -> impl std::future::Future<Output = anyhow::Result<bool>> + Send {
+        crate::hub::ThreadSubscription::next_line(self, buf)
     }
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
         crate::hub::ThreadSubscription::write_stored(self, buf)
-    }
-    fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
-        crate::hub::stream_line(buf, None, ev)
     }
 }
 
@@ -1588,13 +1671,9 @@ async fn pump<F: Feed>(w: Writer, id: u64, ack: Value, mut sub: F) {
         }
         // Nothing stored left: the next item comes live.
         if buf.is_empty() && failed.is_none() {
-            match sub.next().await {
-                Ok(Some(item)) => {
-                    if F::line(&item, &mut buf).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => break,
+            match sub.next_line(&mut buf).await {
+                Ok(true) => {}
+                Ok(false) => break,
                 Err(e) => failed = Some(e),
             }
         }
@@ -1985,6 +2064,10 @@ struct SayParams {
     /// as a short command at once.
     #[serde(default)]
     suggested: bool,
+    /// The message is a transcript of the user's speech (`docs/voice.md`): never applied as a
+    /// short command, and one that reads as one is handed back for the user to confirm.
+    #[serde(default)]
+    voice: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -2184,10 +2267,20 @@ async fn call_async(
     received: Option<&crate::hub::OrchCall>,
 ) -> Result<Value, RpcError> {
     match method {
+        "runner.manage" => hub.runner_control(method, p, caller).await,
+        "runner.status" => hub.runner_control(method, p, caller).await,
+        "runner.connect" => hub.runner_control(method, p, caller).await,
+        "runner.recover" => hub.runner_control(method, p, caller).await,
+        "runner.revoke" => hub.runner_control(method, p, caller).await,
+        "runner.forget" => hub.runner_control(method, p, caller).await,
         // Committed files of a project on the hub's box (`hub::project_read`).
         "project.files" => hub.project_read(ReadTool::Files, params(p)?, caller).await,
         "project.read" => hub.project_read(ReadTool::Read, params(p)?, caller).await,
         "project.search" => hub.project_read(ReadTool::Search, params(p)?, caller).await,
+        "thread.pull" => {
+            let p: ThreadRef = params(p)?;
+            hub.thread_pull(&p.thread, caller).await
+        }
         "thread.new" => {
             let p: NewThread = params(p)?;
             hub.new_thread_bound(p, caller, received).await
@@ -2402,14 +2495,32 @@ async fn say(hub: &Hub, caller: &Caller, p: Value) -> Result<Value, RpcError> {
             "a suggested message goes to the orchestrator only (`to: \"orchestrator\"`)",
         ));
     }
+    // A transcript, routed, could answer a request (`@api yes`) on a misheard word.
+    if p.voice && p.to.as_deref() != Some("orchestrator") {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a spoken message goes to the orchestrator only (`to: \"orchestrator\"`)",
+        ));
+    }
+    if p.voice && p.suggested {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a message is either suggested or spoken, not both",
+        ));
+    }
+    let origin = if p.voice {
+        SayOrigin::Voice
+    } else if p.suggested {
+        SayOrigin::Suggested
+    } else {
+        SayOrigin::Typed
+    };
     match p.to.as_deref() {
         None => {
             hub.say_seen(&p.message, p.focused.as_deref(), p.seen_gseq, caller)
                 .await
         }
-        Some("orchestrator") => {
-            hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, p.suggested)
-        }
+        Some("orchestrator") => hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, origin),
         Some(other) => Err(RpcError::new(
             codes::BAD_REQUEST,
             format!("say `to` can only be \"orchestrator\" (not {other:?}); omit it to route"),
@@ -2452,8 +2563,10 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             codes::UNSUPPORTED,
             format!(
                 "this twr is older than the hub (protocol {}, the hub's is {PROTOCOL_VERSION}): \
-                 update it with `twr update` and start it again",
-                p.protocol.unwrap_or(0)
+                 update it to the hub's twr {} ({}) and start it again",
+                p.protocol.unwrap_or(0),
+                twr_core::version(),
+                crate::hub::to_hub_version()
             ),
         ));
     }
@@ -2479,7 +2592,8 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
         let device = hub
             .device_auth()
             .and_then(|a| a.authenticate(&token))
-            .map_err(|_| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
+            .map_err(|_| crate::hub::devices_unreadable())?
+            .ok_or_else(|| RpcError::new(codes::UNAUTHORIZED, "Unauthorized device"))?;
         conn.client = format!("device:{}", device.id);
         conn.device = Some(device);
         return Ok(
@@ -2760,6 +2874,48 @@ async fn box_agents(hub: &Hub, conn: &Conn, caller: &Caller, p: Value) -> Result
         .await
 }
 
+fn search_call(hub: &Hub, method: &str, p: Value) -> Result<Value, RpcError> {
+    match method {
+        "conversation.search" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct SearchParams {
+                query: String,
+                thread: Option<String>,
+                before: Option<String>,
+                limit: Option<usize>,
+            }
+            let p: SearchParams = params(p)?;
+            hub.conversation_search(
+                &p.query,
+                p.thread.as_deref(),
+                p.before.as_deref(),
+                p.limit.unwrap_or(30),
+            )
+        }
+        "thread.event_context" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ContextParams {
+                thread: String,
+                event_id: String,
+                before: Option<usize>,
+                after: Option<usize>,
+                query: Option<String>,
+            }
+            let p: ContextParams = params(p)?;
+            hub.thread_event_context_matching(
+                &p.thread,
+                &p.event_id,
+                p.before.unwrap_or(12),
+                p.after.unwrap_or(12),
+                p.query.as_deref(),
+            )
+        }
+        _ => unreachable!("search method dispatch"),
+    }
+}
+
 fn call(
     hub: &Hub,
     conn: &mut Conn,
@@ -2784,6 +2940,13 @@ fn call(
                 .begin(scopes)
                 .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
             Ok(json!({"code":code,"expires_in":300}))
+        }
+        "device.pair_cancel" => {
+            let cancelled = hub
+                .device_auth()
+                .and_then(|auth| auth.cancel_pairing(p["code"].as_str().unwrap_or("")))
+                .map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))?;
+            Ok(json!({"cancelled":cancelled}))
         }
         "device.pair_complete" => {
             let auth = hub
@@ -3054,6 +3217,7 @@ fn call(
                 "more": more,
             }))
         }
+        "conversation.search" | "thread.event_context" => search_call(hub, method, p),
         "thread.transcript" => {
             #[derive(Default, Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -3227,15 +3391,16 @@ mod tests {
     }
 
     impl Feed for FakeFeed {
-        type Item = Arc<Event>;
-        async fn next(&mut self) -> anyhow::Result<Option<Self::Item>> {
+        async fn next_line(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
             if self.next >= self.stored + self.live {
-                return Ok(None);
+                return Ok(false);
             }
             if self.next >= self.stored {
                 tokio::task::yield_now().await;
             }
-            self.take()
+            let ev = self.take()?.unwrap();
+            crate::hub::stream_line(buf, None, &ev)?;
+            Ok(true)
         }
         fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
             if self.next >= self.stored {
@@ -3244,9 +3409,6 @@ mod tests {
             let ev = self.take()?.unwrap();
             crate::hub::stream_line(buf, None, &ev)?;
             Ok(true)
-        }
-        fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
-            crate::hub::stream_line(buf, None, ev)
         }
     }
 
@@ -3300,12 +3462,120 @@ mod tests {
             .contains("the store failed"));
     }
 
+    /// How long recording events takes with clients streaming them: [`APPENDS`] appends (half
+    /// `agent.text`, half `task.updated`, which is also a control item) through the single
+    /// writer, with [`SUBSCRIBERS`] control and as many thread subscriptions pumped to sockets
+    /// whose other ends read every line. Reports the time spent appending (all of it under the
+    /// core lock) and until every subscriber had every line. Run in release mode:
+    ///
+    /// ```sh
+    /// cargo test --release -p twr-hub --lib -- --ignored --nocapture fan_out_bench
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn fan_out_bench() {
+        use tokio::io::AsyncBufReadExt;
+        const APPENDS: u64 = 5000;
+        const SUBSCRIBERS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = HubOptions::new(dir.path().join("twr.db"), Config::default());
+        // Room for the whole run: this measures the work, not catching up after a lag.
+        opts.broadcast_capacity = 2 * APPENDS as usize;
+        let hub = Hub::open(opts).await.unwrap();
+        let created = hub
+            .append(
+                "t1",
+                None,
+                twr_core::event::Source::Hub,
+                twr_core::event::EventBody::ThreadCreated(twr_core::event::ThreadCreated {
+                    name: "bench".into(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        let mut readers = Vec::new();
+        for i in 0..2 * SUBSCRIBERS {
+            let (a, b) = UnixStream::pair().unwrap();
+            let (_r, w) = a.into_split();
+            let w = Arc::new(Mutex::new(w));
+            // Thread subscriptions see every event; control ones, the `task.updated` half.
+            let want = if i < SUBSCRIBERS {
+                let sub = hub.subscribe_control(hub.control_read(0, 0).unwrap().1);
+                tokio::spawn(pump(w, 1, json!({}), sub));
+                APPENDS / 2
+            } else {
+                let sub = hub.subscribe_thread("t1", created.seq).unwrap();
+                tokio::spawn(pump(w, 1, json!({}), sub));
+                APPENDS
+            };
+            readers.push(tokio::spawn(async move {
+                let mut lines = BufReader::new(b).lines();
+                // The ack, then the items.
+                lines.next_line().await.unwrap();
+                for _ in 0..want {
+                    lines.next_line().await.unwrap().unwrap();
+                }
+                drop(_r);
+            }));
+        }
+        /// The CPU time this process used so far (user and system, every thread).
+        fn cpu() -> std::time::Duration {
+            let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+            let t = |tv: libc::timeval| {
+                std::time::Duration::from_micros(tv.tv_sec as u64 * 1_000_000 + tv.tv_usec as u64)
+            };
+            t(u.ru_utime) + t(u.ru_stime)
+        }
+        let started = std::time::Instant::now();
+        let cpu_started = cpu();
+        let mut appending = std::time::Duration::ZERO;
+        for i in 0..APPENDS {
+            let body = if i % 2 == 0 {
+                twr_core::event::EventBody::AgentText(twr_core::event::AgentText {
+                    text: format!("Looking at step {i}: {}", "x".repeat(300)),
+                    ..Default::default()
+                })
+            } else {
+                twr_core::event::EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                    task_id: format!("task-{}", i / 20),
+                    running: true,
+                    description: "cargo test --workspace".into(),
+                    ..Default::default()
+                })
+            };
+            let t = std::time::Instant::now();
+            hub.append("t1", Some(1), twr_core::event::Source::Hub, body, None)
+                .unwrap();
+            appending += t.elapsed();
+            if i % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        for r in readers {
+            r.await.unwrap();
+        }
+        let total = started.elapsed();
+        let cpu_used = cpu() - cpu_started;
+        eprintln!(
+            "{APPENDS} appends, {SUBSCRIBERS}+{SUBSCRIBERS} subscribers: appending {:.1} ms \
+             ({:.1} us each, under the core lock), every line delivered after {:.1} ms, \
+             {:.1} ms of CPU in all",
+            appending.as_secs_f64() * 1e3,
+            appending.as_secs_f64() * 1e6 / APPENDS as f64,
+            total.as_secs_f64() * 1e3,
+            cpu_used.as_secs_f64() * 1e3,
+        );
+    }
+
     /// A connection from this test process that presented `token`, opened by this process
     /// started at `start_time` as the hub read it (`None`: it could not be read).
     fn conn(start_time: Option<u64>) -> Conn {
         let me = std::process::id();
         Conn {
             client: "c".into(),
+            upload_uid: Some(unsafe { libc::geteuid() }),
             device: None,
             token: Some("t".into()),
             agent: None,
@@ -3316,6 +3586,25 @@ mod tests {
             }),
             id: 0,
         }
+    }
+
+    #[test]
+    fn upload_identity_uses_peer_credentials_instead_of_client_hello_names() {
+        let mut first = conn(None);
+        first.client = "desktop".into();
+        let mut second = conn(None);
+        second.client = "different-client".into();
+        assert_eq!(
+            first.upload_scope().unwrap(),
+            second.upload_scope().unwrap()
+        );
+        second.upload_uid = first.upload_uid.map(|id| id + 1);
+        assert_ne!(
+            first.upload_scope().unwrap(),
+            second.upload_scope().unwrap()
+        );
+        second.upload_uid = None;
+        assert!(second.upload_scope().is_err());
     }
 
     #[tokio::test]
@@ -3358,8 +3647,67 @@ mod tests {
         .await
         .is_err());
         auth.revoke(&device.id).unwrap();
-        assert!(!auth.current(local.device.as_ref().unwrap()));
-        assert!(auth.authenticate(&token).is_err());
+        assert!(auth.current(local.device.as_ref().unwrap()).revoked());
+        assert!(auth.authenticate(&token).unwrap().is_none());
+    }
+
+    /// A device's request is judged by its records as they are when it comes: while they
+    /// can't be read it is refused with an error to try again (never served on the scopes the
+    /// device had at `hello`), the connection stays, and once they read again the device's
+    /// requests are served; a device revoked since is disconnected.
+    #[tokio::test]
+    async fn a_device_s_request_is_refused_while_its_records_cannot_be_read() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = HubOptions::new(dir.path().join("twr.db"), Config::default());
+        options.config_file = Some(dir.path().join("config.toml"));
+        let hub = Hub::open(options).await.unwrap();
+        let auth = hub.device_auth().unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let (device, token) = auth.pair(&code, "Test phone").unwrap();
+        let records = dir.path().join("mobile").join("devices.json");
+        let good = std::fs::read(&records).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        let served = tokio::spawn(connection(
+            hub.clone(),
+            a,
+            "cli".into(),
+            Arc::new(SubCount::default()),
+        ));
+        let (r, mut w) = b.into_split();
+        let mut lines = BufReader::new(r).lines();
+        let mut call = async |id: u64, method: &str, params: Value| -> Option<Value> {
+            let req = json!({"id": id, "method": method, "params": params});
+            w.write_all(format!("{req}\n").as_bytes()).await.unwrap();
+            let line = lines.next_line().await.unwrap()?;
+            Some(serde_json::from_str(&line).unwrap())
+        };
+        let hi =
+            json!({"client": "mobile-test", "protocol": PROTOCOL_VERSION, "device_token": token});
+        let r = call(1, "hello", hi).await.unwrap();
+        assert_eq!(
+            r["result"]["client"],
+            format!("device:{}", device.id),
+            "{r}"
+        );
+        let r = call(2, "hub.info", Value::Null).await.unwrap();
+        assert!(r["result"].is_object(), "{r}");
+        std::fs::write(&records, b"{\"devices\": [").unwrap();
+        let r = call(3, "hub.info", Value::Null).await.unwrap();
+        assert_eq!(r["error"]["code"], codes::INTERNAL, "{r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Try again"),
+            "{r}"
+        );
+        std::fs::write(&records, &good).unwrap();
+        let r = call(4, "hub.info", Value::Null).await.unwrap();
+        assert!(r["result"].is_object(), "{r}");
+        auth.revoke(&device.id).unwrap();
+        assert_eq!(call(5, "hub.info", Value::Null).await, None);
+        served.await.unwrap();
     }
 
     /// A peer whose credentials cannot be read, or name no pid the hub can see, is no user: it
@@ -3387,6 +3735,7 @@ mod tests {
         .unwrap();
         let c = Conn {
             client: "c".into(),
+            upload_uid: Some(unsafe { libc::geteuid() }),
             device: None,
             token: None,
             agent: Some(AgentPeer::unidentified()),

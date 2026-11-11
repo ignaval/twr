@@ -73,6 +73,12 @@ async fn probe(socket: &Path, deadline: tokio::time::Instant) -> Result<Probe> {
     }
 }
 
+/// On macOS a process inherits its parent's exception ports, and the desktop app's are those of
+/// its crash reporter (Crashpad): the binaries the app runs call this first, so what they start
+/// uses the system's crash reporting (`twr_adapters::process::forget_inherited_crash_handler`,
+/// which every `twr` calls too). Elsewhere it does nothing.
+pub use twr_link::forget_inherited_crash_handler;
+
 fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt;
     anyhow::ensure!(
@@ -99,6 +105,7 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
         .env_remove("TWR_DEVICE_TOKEN")
         .env_remove("TWR_MOBILE_TRANSPORT")
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
+    twr_core::fork::prepare_fork();
     // SAFETY: setsid is async-signal-safe and touches no Rust allocation or locks.
     unsafe {
         command.pre_exec(|| {

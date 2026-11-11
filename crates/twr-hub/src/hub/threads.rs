@@ -202,6 +202,15 @@ impl Core {
     }
 }
 
+/// Who [`Hub::refuse_barred_dir`] holds to the orchestrator's directories.
+#[derive(Debug, Clone, Copy)]
+enum DirChooser {
+    /// The orchestrator.
+    Orchestrator,
+    /// A paired device without `admin` (`hub::device_scope`).
+    Device,
+}
+
 impl Hub {
     /// `thread.new` by user client `client`.
     pub async fn new_thread(&self, req: NewThread, client: &str) -> Result<Value, RpcError> {
@@ -243,7 +252,7 @@ impl Hub {
     /// removed again.
     pub async fn new_thread_bound(
         &self,
-        req: NewThread,
+        mut req: NewThread,
         caller: &Caller,
         bound: Option<&OrchCall>,
     ) -> Result<Value, RpcError> {
@@ -265,6 +274,7 @@ impl Hub {
         )?;
         // Held until the thread is recorded (or refused): its box is not switched meanwhile.
         let (box_name, host, remote, mut op) = self.thread_box(&req)?;
+        self.linked_prepare_project(&mut req).await?;
         let found = self.find_project(&req, remote).await?;
         let target = self.thread_project(&req, &box_name, remote, found.as_deref())?;
         // A twr-managed worktree unless asked otherwise: `no_worktree`, or the project's
@@ -297,8 +307,18 @@ impl Hub {
         let model = thread_model(&req, cfg)?;
         let local = !host.is_remote();
         let effort = thread_effort(&req, &runtime)?;
-        if caller.is_orchestrator() && !target.configured {
-            self.refuse_orchestrator_dir(&host, &target.repo, remote)
+        // The orchestrator, and a paired device without `admin` (`hub::device_scope`), start
+        // threads only where the orchestrator may.
+        let barred = if caller.is_orchestrator() {
+            Some(DirChooser::Orchestrator)
+        } else {
+            match self.inner.caller_grant(caller)? {
+                Some(g) if !g.has("admin") => Some(DirChooser::Device),
+                _ => None,
+            }
+        };
+        if let Some(who) = barred.filter(|_| !target.configured) {
+            self.refuse_barred_dir(&host, &target.repo, remote, who)
                 .await?;
         }
 
@@ -463,48 +483,81 @@ impl Hub {
         Ok(out)
     }
 
-    /// Refuses (`bad_request`) the orchestrator a thread in `dir` (on `host`; `remote`: another
-    /// box) that is not a configured project: `dir` must be inside a git repository, and that
-    /// repository must not be, or hold, the home folder, nor hold or be in twr's data directory,
-    /// `TWR_HOME` or a credentials folder of the home folder (the folders the orchestrator's
-    /// project reads refuse, [`project_read::protected_dirs`]). Otherwise it could start a
-    /// worker in `$HOME` or `/` (a folder outside git is the thread's worktree as it is). On
-    /// another box, whose home folder twr does not know, a repository at `/`, at a home folder
-    /// by its shape (`/root`, `/home/<user>`, `/Users/<user>`) or in a credentials folder by its
-    /// name is refused. The user starts such a thread themselves.
-    async fn refuse_orchestrator_dir(
+    /// Refuses the orchestrator (`bad_request`) or a paired device without `admin`
+    /// (`unauthorized`), `who`, a thread in `dir` (on `host`; `remote`: another box) that is not
+    /// a configured project, unless the repository `dir` is in is not, and does not hold, the
+    /// home folder, and neither holds nor is in twr's data directory, `TWR_HOME` or a
+    /// credentials folder of the home folder (the folders the orchestrator's project reads
+    /// refuse, [`project_read::protected_dirs`]). Otherwise it could start a worker in `$HOME`
+    /// or `/`. On another box, whose home folder twr does not know, a repository at `/`, at a
+    /// home folder by its shape (`/root`, `/home/<user>`, `/Users/<user>`) or in a credentials
+    /// folder by its name is refused.
+    ///
+    /// A folder outside git (the thread's worktree as it is) is held to the same rule, for the
+    /// folder itself: it must exist here, or be named without `..` on another box, where its
+    /// path's shape is all there is to judge. The user starts any other thread themselves, or
+    /// a device with `admin`.
+    async fn refuse_barred_dir(
         &self,
         host: &Arc<dyn ThreadHost>,
         dir: &Path,
         remote: bool,
+        who: DirChooser,
     ) -> Result<(), RpcError> {
         let refuse = |why: String| {
-            Err(rpc(
-                codes::BAD_REQUEST,
-                format!(
-                    "{why}: the orchestrator starts threads only in a configured project or a \
-                     git repository outside the home folder's private folders; ask the user to \
-                     start this thread"
+            Err(match who {
+                DirChooser::Orchestrator => rpc(
+                    codes::BAD_REQUEST,
+                    format!(
+                        "{why}: the orchestrator starts threads only in a configured project, \
+                         or in a folder or git repository that is not the home folder and is \
+                         outside its private folders and twr's data; ask the user to start this \
+                         thread"
+                    ),
                 ),
-            ))
+                DirChooser::Device => rpc(
+                    codes::UNAUTHORIZED,
+                    format!(
+                        "{why}: without the admin permission this device starts threads only in \
+                         a configured project, or in a folder or git repository that is not the \
+                         home folder and is outside its private folders and twr's data. Pick \
+                         such a folder, start the thread on the computer running the hub, or \
+                         pair the device again with --allow-admin"
+                    ),
+                ),
+            })
         };
         let root = host
             .git()
             .repo_root(dir.to_path_buf())
             .await
             .map_err(|e| rpc(codes::BAD_REQUEST, format!("{e:#}")))?;
-        let Some(root) = root else {
-            return refuse(format!("{} is not in a git repository", dir.display()));
-        };
-        let why = if remote {
-            project_read::remote_repo_refusal(&root)
-        } else {
+        let local_dirs = || {
             let home = std::env::var_os("HOME")
                 .filter(|h| !h.is_empty())
                 .map(PathBuf::from);
             let protected =
                 project_read::protected_dirs(home.as_deref(), &data_dir_of(&self.inner.db_path));
-            project_read::repo_refusal(&root, home.as_deref(), &protected)
+            (home, protected)
+        };
+        let why = match root {
+            Some(root) if remote => project_read::remote_repo_refusal(&root),
+            Some(root) => {
+                let (home, protected) = local_dirs();
+                project_read::repo_refusal(&root, home.as_deref(), &protected)
+            }
+            None if remote => project_read::remote_folder_refusal(dir),
+            // Resolved first: a path that names no folder yet says nothing of where it is.
+            None => match std::fs::canonicalize(dir) {
+                Ok(dir) if dir.is_dir() => {
+                    let (home, protected) = local_dirs();
+                    project_read::folder_refusal(&dir, home.as_deref(), &protected)
+                }
+                _ => Some(format!(
+                    "{} is not a folder on this computer",
+                    dir.display()
+                )),
+            },
         };
         match why {
             Some(why) => refuse(why),
@@ -883,6 +936,10 @@ impl Hub {
             let configured = project_runtime.unwrap_or(&cfg.default_runtime);
             orch::check_spawn_runtime(req.runtime.as_deref(), configured, cfg)?;
         }
+        // A device names a command line only with `terminal` (`hub::device_scope`).
+        if let Some(r) = &req.runtime {
+            self.inner.check_caller_runtime(caller, r)?;
+        }
         let spec = runtime_spec::resolve(&runtime, cfg)?;
         let runtime = spec.runtime.clone();
         if !host.has_runtime(&runtime) {
@@ -909,6 +966,13 @@ impl Hub {
     ) -> Result<thread_account::AccountChoice, RpcError> {
         let explicit =
             thread_account::explicit_pin(req.account.as_deref(), spec.account.as_deref())?;
+        if req.outside_pin {
+            self.inner.require_scope(
+                caller,
+                "open a thread on an account outside its project's pin",
+                "admin",
+            )?;
+        }
         // The box's configuration is read before the core is locked.
         let pins = thread_account::project_pins(&self.inner, project, box_name, &spec.runtime);
         let core = self.inner.core();
@@ -955,6 +1019,14 @@ impl Hub {
                      threads use threads.default_mode ({default_mode:?}); omit mode"
                 ),
             ));
+        }
+        // A device without `admin` chooses only a mode that asks (`hub::device_scope`).
+        if let Some(m) = req_mode
+            .as_deref()
+            .filter(|m| !twr_core::devices::OPERATE_MODES.contains(m))
+        {
+            self.inner
+                .require_scope(caller, &format!("start a thread in {m} mode"), "admin")?;
         }
         Ok(match req_mode {
             Some(m) => m,
@@ -1161,7 +1233,7 @@ struct ThreadProject {
 }
 
 /// The box of a new thread: `box`, else the project's `box`, else `local`.
-fn thread_box_name(req: &NewThread, cfg: &Config) -> String {
+pub(super) fn thread_box_name(req: &NewThread, cfg: &Config) -> String {
     req.box_name
         .clone()
         .or_else(|| {

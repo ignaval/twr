@@ -471,6 +471,20 @@ pub struct ThreadView {
 }
 
 impl ThreadView {
+    /// Who it was, alone: its id, name, former names, aliases, role, color, box and creation
+    /// time (what [`Registry`] keeps of a thread purged from the trash).
+    pub fn identity(&self) -> ThreadView {
+        let mut t = ThreadView::new(self.id.clone());
+        t.name.clone_from(&self.name);
+        t.former_names.clone_from(&self.former_names);
+        t.aliases.clone_from(&self.aliases);
+        t.role.clone_from(&self.role);
+        t.color = self.color;
+        t.box_name.clone_from(&self.box_name);
+        t.created_at = self.created_at;
+        t
+    }
+
     /// Whether its runtime has background work of its own running (jobs aside, which the hub
     /// runs whatever the runtime does).
     pub fn runtime_tasks(&self) -> bool {
@@ -1281,12 +1295,101 @@ pub enum ResolveError {
 /// a deleted thread (`thread.deleted`): its view is set aside, and every later event of it is
 /// dropped until a `thread.restored` brings it back as it was.
 ///
-/// Serialized whole in the hub's checkpoints of its folded state.
+/// A deleted thread whose trash item (that of its last delete) the hub purges (`trash.purged`
+/// on the `hub` thread, from the hub) can never come back: of its view only who it was is kept
+/// from then on ([`ThreadView::identity`]: its id, name, former names, aliases, role, color,
+/// box and creation time), what a client needs to name an older transcript's thread. Derived
+/// from the log, so a replay, a checkpoint and a live hub keep the same.
+///
+/// Serialized whole in the hub's checkpoints of its folded state, and in a control snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Registry {
     threads: BTreeMap<String, ThreadView>,
-    /// Deleted threads, by id, with their views as they were when deleted.
+    /// Deleted threads that may come back, by id, with their views as they were when deleted.
     deleted: HashMap<String, ThreadView>,
+    /// The trash item of each deleted thread's last delete, when it has one.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    deleted_items: HashMap<String, String>,
+    /// Deleted threads purged from the trash, by id: who they were
+    /// ([`ThreadView::identity`]), written as that alone.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        with = "purged_views"
+    )]
+    purged: BTreeMap<String, ThreadView>,
+}
+
+/// [`Registry`]'s purged threads, written as who they were ([`Gone`]) and read back as views
+/// of that alone ([`ThreadView::identity`]).
+mod purged_views {
+    use std::collections::BTreeMap;
+
+    use chrono::{DateTime, Utc};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::ThreadView;
+
+    /// Who a purged thread was.
+    #[derive(Serialize, Deserialize)]
+    struct Gone {
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        former_names: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        aliases: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<u8>,
+        box_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created_at: Option<DateTime<Utc>>,
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        views: &BTreeMap<String, ThreadView>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let gone: BTreeMap<&str, Gone> = views
+            .iter()
+            .map(|(id, v)| {
+                (
+                    id.as_str(),
+                    Gone {
+                        name: v.name.clone(),
+                        former_names: v.former_names.clone(),
+                        aliases: v.aliases.clone(),
+                        role: v.role.clone(),
+                        color: v.color,
+                        box_name: v.box_name.clone(),
+                        created_at: v.created_at,
+                    },
+                )
+            })
+            .collect();
+        gone.serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<String, ThreadView>, D::Error> {
+        let gone = BTreeMap::<String, Gone>::deserialize(d)?;
+        Ok(gone
+            .into_iter()
+            .map(|(id, g)| {
+                let mut v = ThreadView::new(id.clone());
+                v.name = g.name;
+                v.former_names = g.former_names;
+                v.aliases = g.aliases;
+                v.role = g.role;
+                v.color = g.color;
+                v.box_name = g.box_name;
+                v.created_at = g.created_at;
+                (id, v)
+            })
+            .collect())
+    }
 }
 
 impl Registry {
@@ -1320,12 +1423,22 @@ impl Registry {
     /// own unless a thread alive took it meanwhile ([`crate::palette::keeps`]).
     pub fn apply(&mut self, ev: &Event) {
         if ev.thread == HUB_THREAD {
+            if let EventBody::TrashPurged(p) = &ev.body {
+                if ev.source == Source::Hub {
+                    self.purge(&p.thread, &p.item);
+                }
+            }
             return;
         }
-        if let Some(view) = self.deleted.get(&ev.thread) {
+        if self.is_deleted(&ev.thread) {
             if matches!(ev.body, EventBody::ThreadRestored(_)) {
-                let mut view = view.clone();
-                self.deleted.remove(&ev.thread);
+                // (A purged thread never comes back: the hub restores nothing of it. One the
+                // log says came back anyway comes back as who it was.)
+                let mut view = match self.deleted.remove(&ev.thread) {
+                    Some(v) => v,
+                    None => self.purged.remove(&ev.thread).unwrap_or_default(),
+                };
+                self.deleted_items.remove(&ev.thread);
                 view.apply(ev);
                 if !view.is_orchestrator() {
                     let held = self.held_colors(&ev.thread);
@@ -1340,12 +1453,16 @@ impl Registry {
             }
             return;
         }
-        if matches!(ev.body, EventBody::ThreadDeleted(_)) {
+        if let EventBody::ThreadDeleted(d) = &ev.body {
             let view = self
                 .threads
                 .remove(&ev.thread)
                 .unwrap_or_else(|| ThreadView::new(ev.thread.clone()));
             self.deleted.insert(ev.thread.clone(), view);
+            match &d.trash {
+                Some(item) => self.deleted_items.insert(ev.thread.clone(), item.clone()),
+                None => self.deleted_items.remove(&ev.thread),
+            };
             return;
         }
         let created = matches!(ev.body, EventBody::ThreadCreated(_));
@@ -1393,19 +1510,39 @@ impl Registry {
         self.threads.get(id)
     }
 
-    /// Whether thread `id` was deleted (`thread.deleted`) and not restored since.
+    /// Whether thread `id` was deleted (`thread.deleted`) and not restored since (purged
+    /// from the trash too).
     pub fn is_deleted(&self, id: &str) -> bool {
-        self.deleted.contains_key(id)
+        self.deleted.contains_key(id) || self.purged.contains_key(id)
     }
 
-    /// The view of deleted thread `id` as it was when it was deleted.
+    /// Whether deleted thread `id`'s trash item was purged: it can never come back, and its
+    /// view holds who it was alone ([`ThreadView::identity`]).
+    pub fn is_purged(&self, id: &str) -> bool {
+        self.purged.contains_key(id)
+    }
+
+    /// The view of deleted thread `id` as it was when it was deleted; of one purged from the
+    /// trash, who it was alone ([`Registry::is_purged`]).
     pub fn deleted_view(&self, id: &str) -> Option<&ThreadView> {
-        self.deleted.get(id)
+        self.deleted.get(id).or_else(|| self.purged.get(id))
     }
 
     /// The views of the deleted threads ([`Registry::deleted_view`]), in no order.
     pub fn deleted_views(&self) -> impl Iterator<Item = &ThreadView> {
-        self.deleted.values()
+        self.deleted.values().chain(self.purged.values())
+    }
+
+    /// `trash.purged` of trash `item`, which kept `thread`: when it is the item of the
+    /// thread's last delete, the thread can never come back, and only who it was is kept.
+    fn purge(&mut self, thread: &str, item: &str) {
+        if self.deleted_items.get(thread).map(String::as_str) != Some(item) {
+            return;
+        }
+        self.deleted_items.remove(thread);
+        if let Some(view) = self.deleted.remove(thread) {
+            self.purged.insert(thread.to_string(), view.identity());
+        }
     }
 
     /// Number of threads.
@@ -3239,7 +3376,7 @@ mod tests {
         let evs = [
             created,
             s.started("sess-1"),
-            changed(&mut s, Some("claude-fable-5-1"), Some("high")),
+            changed(&mut s, Some("claude-fable-5-2"), Some("high")),
             s.event(EventBody::ThreadStopped(restart)),
             s.started("sess-1"),
             changed(&mut s, None, Some("low")),
@@ -3247,9 +3384,9 @@ mod tests {
         let want = [
             (Some("sonnet"), None),
             (Some("sonnet"), None),
-            (Some("claude-fable-5-1"), Some("high")),
-            (Some("claude-fable-5-1"), Some("high")),
-            (Some("claude-fable-5-1"), Some("high")),
+            (Some("claude-fable-5-2"), Some("high")),
+            (Some("claude-fable-5-2"), Some("high")),
+            (Some("claude-fable-5-2"), Some("high")),
             (None, Some("low")),
         ];
         for (n, (model, effort)) in want.iter().enumerate() {
@@ -3606,6 +3743,123 @@ mod tests {
         let v = view(&[created, moved]);
         assert_eq!(v.acp_command, Some(serde_json::json!(["agent-a", "acp"])));
         assert_eq!(v.account.as_deref(), Some("team"));
+    }
+
+    /// A deleted thread whose last delete's trash item the hub purges keeps who it was alone
+    /// (name, former names, aliases, role, color, box, creation time), still deleted; a purge
+    /// of an older item (from a delete it was restored from), or one not from the hub, keeps
+    /// its whole view. Written and read back as who it was, the registry is the same.
+    #[test]
+    fn a_purged_thread_keeps_who_it_was_alone() {
+        let mut a = ThreadScript::new("t1");
+        let mut b = ThreadScript::new("t2");
+        let delete = |item: &str| {
+            EventBody::ThreadDeleted(ThreadDeleted {
+                name: "api".into(),
+                trash: Some(item.into()),
+                ..Default::default()
+            })
+        };
+        let mut hub_seq = 0;
+        let mut purge = |item: &str, thread: &str, source: Source| {
+            hub_seq += 1;
+            Event::new(
+                HUB_THREAD,
+                hub_seq,
+                None,
+                source,
+                EventBody::TrashPurged(TrashPurged {
+                    item: item.into(),
+                    thread: thread.into(),
+                    ..Default::default()
+                }),
+            )
+        };
+        let mut created = a.created("api");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.box_name = "gpu".into();
+        }
+        let mut web = b.created("web");
+        if let EventBody::ThreadCreated(p) = &mut web.body {
+            p.aliases = vec!["backend".into()];
+        }
+        let mut r = Registry::new();
+        for ev in [
+            created,
+            a.event(delete("item-1")),
+            a.event(EventBody::ThreadRestored(ThreadRestored {
+                item: "item-1".into(),
+                name: "api".into(),
+                former_names: vec!["api0".into()],
+                ..Default::default()
+            })),
+            a.event(EventBody::ThreadRenamed(ThreadRenamed {
+                name: "api2".into(),
+                previous: "api".into(),
+                ..Default::default()
+            })),
+            a.turn_started("go"),
+            a.turn_ended(TurnResult::Completed),
+            a.event(delete("item-2")),
+            web,
+            b.event(delete("item-b")),
+        ] {
+            r.apply(&ev);
+        }
+        let full = r.deleted_view("t1").unwrap().clone();
+        assert!(full.turns > 0 && full.last_turn.is_some());
+        // An older item, another thread's item, and a purge not from the hub: nothing changes.
+        for ev in [
+            purge("item-1", "t1", Source::Hub),
+            purge("item-b", "t1", Source::Hub),
+            purge("item-2", "t1", Source::User("cli".into())),
+        ] {
+            r.apply(&ev);
+            assert_eq!(r.deleted_view("t1"), Some(&full));
+            assert!(!r.is_purged("t1"));
+        }
+        r.apply(&purge("item-2", "t1", Source::Hub));
+        assert!(r.is_deleted("t1") && r.is_purged("t1") && !r.is_purged("t2"));
+        let gone = r.deleted_view("t1").unwrap();
+        assert_eq!(gone, &full.identity());
+        assert_eq!(
+            (
+                gone.name.as_str(),
+                gone.former_names.clone(),
+                gone.aliases.clone(),
+                gone.color,
+                gone.box_name.as_str(),
+                gone.created_at
+            ),
+            (
+                "api2",
+                vec!["api0".to_string(), "api".to_string()],
+                vec![],
+                full.color,
+                "gpu",
+                full.created_at
+            )
+        );
+        assert!(gone.color.is_some() && gone.turns == 0 && gone.last_turn.is_none());
+        assert_eq!(r.deleted_views().count(), 2);
+        r.apply(&purge("item-b", "t2", Source::Hub));
+        assert_eq!(r.deleted_view("t2").unwrap().aliases, ["backend"]);
+        // Later events of it change nothing; a second purge neither.
+        r.apply(&a.turn_started("again"));
+        r.apply(&purge("item-2", "t1", Source::Hub));
+        assert_eq!(r.deleted_view("t1"), Some(&full.identity()));
+        let json = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            json["purged"]["t1"],
+            serde_json::json!({
+                "name": "api2",
+                "former_names": ["api0", "api"],
+                "color": full.color,
+                "box_name": "gpu",
+                "created_at": full.created_at,
+            })
+        );
+        assert_eq!(serde_json::from_value::<Registry>(json).unwrap(), r);
     }
 
     /// A deleted thread leaves the registry and the attention stack, and nothing of it comes
@@ -4026,7 +4280,7 @@ mod tests {
                 &mut s,
                 "s1",
                 serde_json::json!({"twr": {"pid": 8},
-                    "claude": {"model": "claude-sonnet-4-5-20250929", "resumed": false}}),
+                    "claude": {"model": "claude-sonnet-5-5", "resumed": false}}),
             ),
             s.turn_started("go"),
             s.turn_ended(TurnResult::Completed),
@@ -4034,7 +4288,7 @@ mod tests {
             started(
                 &mut s,
                 "s1",
-                serde_json::json!({"claude": {"model": "claude-opus-4-1-20250805",
+                serde_json::json!({"claude": {"model": "claude-opus-5-5",
                     "resumed": true}}),
             ),
             // A hub-appended resume without a report keeps it.
@@ -4053,12 +4307,12 @@ mod tests {
         let want = [
             None,
             None,
-            Some("claude-sonnet-4-5-20250929"),
-            Some("claude-sonnet-4-5-20250929"),
-            Some("claude-sonnet-4-5-20250929"),
-            Some("claude-opus-4-1-20250805"),
-            Some("claude-opus-4-1-20250805"),
-            Some("claude-opus-4-1-20250805"),
+            Some("claude-sonnet-5-5"),
+            Some("claude-sonnet-5-5"),
+            Some("claude-sonnet-5-5"),
+            Some("claude-opus-5-5"),
+            Some("claude-opus-5-5"),
+            Some("claude-opus-5-5"),
             Some("gemini-2.5-pro"),
             None,
         ];
@@ -4070,12 +4324,12 @@ mod tests {
             assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         assert_eq!(live.shown_model(), Some("sonnet"));
-        live.actual_model = Some("claude-sonnet-4-5".into());
-        assert_eq!(live.shown_model(), Some("claude-sonnet-4-5"));
+        live.actual_model = Some("claude-sonnet-5-5".into());
+        assert_eq!(live.shown_model(), Some("claude-sonnet-5-5"));
         // Clients see both, under `model` and `model_actual`.
         let j = serde_json::to_value(&live).unwrap();
         assert_eq!(j["model"], "sonnet");
-        assert_eq!(j["model_actual"], "claude-sonnet-4-5");
+        assert_eq!(j["model_actual"], "claude-sonnet-5-5");
         let back: ThreadView = serde_json::from_value(j).unwrap();
         assert_eq!(back, live);
     }
@@ -4087,7 +4341,7 @@ mod tests {
     #[test]
     fn a_runtime_move_forgets_the_previous_runtimes_model() {
         let ext = |v: serde_json::Value| v.as_object().cloned();
-        let claude = || ext(serde_json::json!({"claude": {"model": "claude-opus-4-1"}}));
+        let claude = || ext(serde_json::json!({"claude": {"model": "claude-opus-5-5"}}));
         let mut s = ThreadScript::new("t1");
         let mut started = s.started("old");
         if let EventBody::ThreadStarted(p) = &mut started.body {
@@ -4123,8 +4377,8 @@ mod tests {
         ];
         let want = [
             None,
-            Some("claude-opus-4-1"),
-            Some("claude-opus-4-1"),
+            Some("claude-opus-5-5"),
+            Some("claude-opus-5-5"),
             None,
             None,
             None,

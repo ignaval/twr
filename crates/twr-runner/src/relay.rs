@@ -334,6 +334,7 @@ impl Launcher {
 /// Everything the relay needs.
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
+    pub managed: Option<crate::managed::Managed>,
     /// The box.
     pub box_name: String,
     /// The hub's public key (`--hub-key`).
@@ -369,6 +370,7 @@ impl RelayOptions {
     /// restart.
     pub fn new(box_name: &str, hub_key: [u8; 32], replace: bool) -> anyhow::Result<RelayOptions> {
         Ok(RelayOptions {
+            managed: None,
             box_name: box_name.to_string(),
             hub_key,
             replace,
@@ -424,6 +426,16 @@ impl RelayOptions {
         ] {
             args.push(flag.into());
             args.push(path.clone().into_os_string());
+        }
+        if let Some(managed) = &self.managed {
+            args.extend([
+                "--managed-root".into(),
+                managed.root.clone().into_os_string(),
+                "--resource-root".into(),
+                managed.resources.clone().into_os_string(),
+                "--revocation-file".into(),
+                managed.revocation.clone().into_os_string(),
+            ]);
         }
         args
     }
@@ -1474,6 +1486,7 @@ fn spawn_setsid(program: &Path, args: &[OsString]) -> std::io::Result<std::proce
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    twr_core::fork::prepare_fork();
     // SAFETY: runs in the child between fork and exec, where only async-signal-safe calls
     // are allowed: setsid(2) is one, and the closure allocates nothing.
     unsafe {
@@ -1512,7 +1525,7 @@ const NOT_PASSED_ON: &[&str] = &[
 /// looks). `%` needs nothing: a transient unit's command line is not subject to specifier
 /// expansion. A `systemd-run` older than 254 refuses the option, and the relay falls back to
 /// `setsid`.
-fn systemd_run_args(
+pub fn systemd_run_args(
     unit: &str,
     program: &Path,
     args: &[OsString],
@@ -1547,10 +1560,44 @@ fn systemd_run_args(
     out
 }
 
-/// Starts `program args` as the transient user service `unit` (`systemd-run --user`) with the
-/// relay's environment ([`systemd_run_args`]): an error with what `systemd-run` said when it
-/// fails or does not finish within [`PROBE_TIMEOUT`].
-async fn systemd_run(unit: &str, program: &Path, args: &[OsString]) -> anyhow::Result<()> {
+/// The arguments of `systemd-run` for [`systemd_service_run`]: [`systemd_run_args`] with only
+/// the variables `env` names (what [`launchd::service_env`] kept).
+pub fn systemd_service_args(
+    unit: &str,
+    program: &Path,
+    args: &[OsString],
+    env: &launchd::ServiceEnv,
+) -> Vec<OsString> {
+    let mut flags = systemd_run_args(unit, program, args, env.vars.iter().cloned());
+    flags.insert(0, "--property=KillMode=process".into());
+    flags
+}
+
+/// Starts the long-lived service `program args` as the transient user service `unit`
+/// (`systemd-run --user`) with the allowlisted part of this process's environment
+/// ([`launchd::service_env`], [`systemd_service_args`]): `systemd-run` gets those values (a
+/// proxy's without its credentials, with a warning) in its own environment, where
+/// `--setenv=NAME` takes them from. An error when `systemd-run` fails or does not finish
+/// within [`PROBE_TIMEOUT`].
+pub async fn systemd_service_run(
+    unit: &str,
+    program: &Path,
+    args: &[OsString],
+) -> anyhow::Result<()> {
+    let env = launchd::service_env(std::env::vars_os());
+    for name in &env.stripped {
+        tracing::warn!("{}", launchd::credentials_note(name));
+    }
+    let flags = systemd_service_args(unit, program, args, &env);
+    let mut cmd = tokio::process::Command::new("systemd-run");
+    cmd.args(flags).envs(env.vars);
+    match twr_adapters::process::run_bounded(cmd, PROBE_TIMEOUT, 16 * 1024, |_| false).await {
+        twr_adapters::process::Bounded::Exited(Some(0), _) => Ok(()),
+        _ => bail!("systemd user service is unavailable"),
+    }
+}
+
+pub async fn systemd_run(unit: &str, program: &Path, args: &[OsString]) -> anyhow::Result<()> {
     let mut cmd = tokio::process::Command::new("systemd-run");
     cmd.args(systemd_run_args(unit, program, args, std::env::vars_os()))
         .stdin(std::process::Stdio::null())
@@ -1708,6 +1755,7 @@ mod tests {
                 .unwrap();
         }
         RelayOptions {
+            managed: None,
             box_name: "gpu".into(),
             hub_key: KEY,
             replace: false,
@@ -2329,6 +2377,7 @@ mod tests {
             log: dir.path().join("data/daemon.log"),
         };
         let opts = |stop_timeout: Duration| RelayOptions {
+            managed: None,
             box_name: "gpu".into(),
             hub_key: KEY,
             replace: false,
@@ -2650,6 +2699,68 @@ mod tests {
             .map(|a| a.to_str().unwrap())
             .collect();
         assert_eq!(tail, ["/b/$X%n/twr", "--daemon-socket", odd]);
+    }
+
+    /// The linked-runner service started with `systemd-run` gets the launchd allowlist only:
+    /// no API key or workspace of the process that happened to start it, but its proxy (by
+    /// name, its credentials removed from the value `systemd-run` gets), CA bundle, toolchain
+    /// and agent config locations.
+    #[test]
+    fn a_systemd_service_gets_only_the_allowlisted_environment() {
+        let env = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/u"),
+            ("LC_ALL", "C.UTF-8"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("TWR_CLAUDE_BIN", "/opt/claude"),
+            ("ANTHROPIC_API_KEY", "sk-secret"),
+            ("OPENAI_API_KEY", "sk-other"),
+            ("TWR_WORKSPACE", "work"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+            ("NODE_OPTIONS", "--require /tmp/x.js"),
+            ("LC_lower", "x"),
+            ("HTTPS_PROXY", "http://me:hunter2@proxy.corp:3128"),
+            ("no_proxy", "localhost,.corp"),
+            ("SSL_CERT_FILE", "/etc/corp-ca.pem"),
+            ("CARGO_HOME", "/opt/cargo"),
+            ("CLAUDE_CONFIG_DIR", "/home/u/.config/claude"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let env = launchd::service_env(env);
+        assert_eq!(env.stripped, ["HTTPS_PROXY"]);
+        let proxy = env.vars.iter().find(|(k, _)| k == "HTTPS_PROXY").unwrap();
+        assert_eq!(proxy.1, "http://proxy.corp:3128");
+        let args = systemd_service_args("twr-runner-0", Path::new("/t/twr"), &[], &env);
+        let set: Vec<String> = args
+            .iter()
+            .filter_map(|a| a.to_str()?.strip_prefix("--setenv=").map(String::from))
+            .collect();
+        assert_eq!(
+            set,
+            [
+                "CARGO_HOME",
+                "CLAUDE_CONFIG_DIR",
+                "HOME",
+                "HTTPS_PROXY",
+                "LC_ALL",
+                "PATH",
+                "SSL_CERT_FILE",
+                "TWR_CLAUDE_BIN",
+                "XDG_RUNTIME_DIR",
+                "no_proxy",
+            ]
+        );
+        assert_eq!(args[0], "--property=KillMode=process");
+        let all = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !all.contains("hunter2") && !all.contains("proxy.corp"),
+            "{all}"
+        );
     }
 
     /// The real `systemd-run --user` with [`systemd_run_args`] hands the service its

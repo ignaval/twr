@@ -99,6 +99,38 @@ fn block_kind_records(run: LadderRun) -> (BlockKind, Vec<DecisionMade>) {
     (kind, records)
 }
 
+/// What [`Core::due_retry`] read for a thread: its failed turn, as of its latest event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryRead {
+    seq: u64,
+    failed: u64,
+}
+
+/// Whether each thread's failed turn was classified `transient`, as last read from the log
+/// ([`Core::due_retry`]), with when it was read. Memory only: a cache of the log, read again
+/// once the thread has a later event, so the background ticker's check every second costs no
+/// read of a failure that waits for the user.
+#[derive(Debug, Default)]
+pub(super) struct RetryReads(
+    std::cell::RefCell<std::collections::HashMap<String, (RetryRead, bool)>>,
+);
+
+impl RetryReads {
+    fn get(&self, thread: &str, read: RetryRead) -> Option<bool> {
+        self.0
+            .borrow()
+            .get(thread)
+            .filter(|(r, _)| *r == read)
+            .map(|(_, t)| *t)
+    }
+
+    fn put(&self, thread: &str, read: RetryRead, transient: bool) {
+        self.0
+            .borrow_mut()
+            .insert(thread.to_string(), (read, transient));
+    }
+}
+
 /// Whether `view` is a worker thread the retry logic applies to.
 fn is_worker(view: &ThreadView) -> bool {
     view.id != HUB_THREAD && !view.is_orchestrator()
@@ -615,9 +647,17 @@ impl Core {
         let Some(failed) = view.failed_turn() else {
             return Ok(None);
         };
+        // The thread's events since its failure are what can change the answer (the turn's
+        // `block_kind` decision is recorded on it): read again only once one came.
+        let seq = self.seqs.get(thread).copied().unwrap_or(0);
+        let read = RetryRead { seq, failed };
+        if let Some(transient) = self.retry_reads.get(thread, read) {
+            return Ok(transient.then_some(failed));
+        }
         let done = store::turn_reactions(self.store.conn(), thread, failed)?;
         let transient =
             done.block_kind.as_deref().and_then(BlockKind::parse) == Some(BlockKind::Transient);
+        self.retry_reads.put(thread, read, transient);
         Ok(transient.then_some(failed))
     }
 
@@ -710,6 +750,70 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the log says of a failed turn is read once while the thread has no later event:
+    /// the background ticker asks every second. The turn's `block_kind` decision, recorded
+    /// on the thread, is read once it comes.
+    #[tokio::test]
+    async fn a_failed_turn_is_read_again_only_after_a_new_event() {
+        use super::super::{Hub, HubOptions, LOCAL_BOX};
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(HubOptions::new(
+            dir.path().join("twr.db"),
+            twr_core::config::Config::default(),
+        ))
+        .await
+        .unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let append = |turn, body| {
+            hub.append(t, turn, Source::Hub, body, None).unwrap();
+        };
+        append(
+            None,
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "api".into(),
+                box_name: LOCAL_BOX.into(),
+                runtime: "fake".into(),
+                ..Default::default()
+            }),
+        );
+        append(
+            Some(1),
+            EventBody::TurnStarted(TurnStarted {
+                prompt: "go".into(),
+                ..Default::default()
+            }),
+        );
+        append(
+            Some(1),
+            EventBody::TurnEnded(TurnEnded {
+                result: TurnResult::Error,
+                ..Default::default()
+            }),
+        );
+        let core = || hub.inner.core();
+        assert!(core().registry.get(t).unwrap().retry_eligible());
+        assert_eq!(core().due_retry(t).unwrap(), None, "not classified yet");
+        let seq = core().seqs[t];
+        assert_eq!(
+            core().retry_reads.get(t, RetryRead { seq, failed: 1 }),
+            Some(false),
+            "kept while nothing changed"
+        );
+        assert_eq!(core().due_retry(t).unwrap(), None);
+        append(
+            Some(1),
+            EventBody::DecisionMade(DecisionMade {
+                site: DecisionSite::BlockKind,
+                provider: DecisionProvider::Code,
+                options: vec!["transient".into(), "needs_you".into()],
+                chosen: "transient".into(),
+                confidence: 1.0,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(core().due_retry(t).unwrap(), Some(1));
+    }
 
     #[test]
     fn failure_details_come_from_ext() {

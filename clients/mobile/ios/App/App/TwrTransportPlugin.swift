@@ -1,6 +1,8 @@
 import Foundation
 import Security
 import Capacitor
+import AVFoundation
+import UIKit
 
 private final class SocketSendCompletion {
     private let lock=NSLock()
@@ -17,7 +19,7 @@ private final class SocketSendCompletion {
 public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTaskDelegate {
     public let identifier = "TwrTransportPlugin"
     public let jsName = "TwrTransport"
-    public let pluginMethods: [CAPPluginMethod] = ["listHubs", "pair", "connect", "send", "disconnect", "removeHub"].map { CAPPluginMethod(name: $0, returnType: CAPPluginReturnPromise) }
+    public let pluginMethods: [CAPPluginMethod] = ["listHubs", "pair", "connect", "send", "disconnect", "removeHub", "scanInvitation"].map { CAPPluginMethod(name: $0, returnType: CAPPluginReturnPromise) }
     private let connectionLock=NSLock()
     private var currentSocket: URLSessionWebSocketTask?
     private var socket: URLSessionWebSocketTask? {
@@ -75,6 +77,31 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
     }
     private func metadata(_ id: String, _ hub: [String: Any]) -> [String: Any] { ["id": id, "name": hub["name"] ?? "My hub", "url": hub["url"] ?? "", "scopes": hub["scopes"] ?? [], "gateway_id": hub["gateway_id"] ?? ""] }
     private struct Failure: LocalizedError { let message: String; init(_ message: String) { self.message = message }; var errorDescription: String? { message } }
+    private var invitationScanner: InvitationScanner?
+    private var scanningInvitation = false
+    @objc public func scanInvitation(_ call: CAPPluginCall) {
+        DispatchQueue.main.async { [self] in
+            guard !scanningInvitation else { call.reject("The QR scanner is already open", "SCAN_BUSY"); return }
+            scanningInvitation = true
+            AVCaptureDevice.requestAccess(for: .video) { [self] allowed in
+                DispatchQueue.main.async { [self] in
+                    guard allowed else { scanningInvitation = false; call.reject("Camera permission was denied. Allow it in Settings or enter the code manually.", "CAMERA_PERMISSION_DENIED"); return }
+                    guard let presenter = self.bridge?.viewController else { scanningInvitation = false; call.reject("The camera is unavailable. Enter the code manually.", "CAMERA_UNAVAILABLE"); return }
+                    guard presenter.presentedViewController == nil, presenter.viewIfLoaded?.window != nil else { scanningInvitation = false; call.reject("Another camera or dialog is already open", "SCAN_BUSY"); return }
+                    let scanner = InvitationScanner { [weak self] result in
+                        self?.invitationScanner = nil; self?.scanningInvitation = false
+                        switch result {
+                        case .success(let value):
+                            if value.utf8.count <= 2048 { call.resolve(["invitation": value]) } else { call.reject("Scan a twr pairing invitation") }
+                        case .failure(.cancelled): call.reject("QR scan cancelled", "SCAN_CANCELLED")
+                        case .failure(.unavailable): call.reject("This device has no available QR camera. Enter the code manually.", "CAMERA_UNAVAILABLE")
+                        }
+                    }
+                    invitationScanner = scanner; presenter.present(scanner, animated: true)
+                }
+            }
+        }
+    }
     @objc public func listHubs(_ call: CAPPluginCall) { do { call.resolve(["hubs": try vault().map { metadata($0.key, $0.value) }]) } catch { call.reject(error.localizedDescription) } }
     @objc public func pair(_ call: CAPPluginCall) {
         Task {
@@ -122,8 +149,14 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
                         self.notifyListeners("message", data: ["message": message])
                     }
                 } catch {
-                    if !authenticated { call.reject("Could not authenticate with the hub") }
-                    if self.socket === task { self.notifyListeners("message", data: ["message": ["type": "transport-closed", "connected": false, "error": "Remote hub connection closed"]]) }
+                    // Only 401 means the gateway no longer knows this token. A 403 and
+                    // 5xx are refusals the app retries like any other lost connection.
+                    let status = (task.response as? HTTPURLResponse)?.statusCode
+                    let revoked = status == 401
+                    let refused = !authenticated && status != nil && status != 101
+                    let message = revoked ? "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again." : refused ? "Gateway refused the connection (\(status!))" : "Remote hub connection closed"
+                    if !authenticated { call.reject(message, revoked ? "AUTH_REVOKED" : nil) }
+                    if self.socket === task { self.notifyListeners("message", data: ["message": ["type": "transport-closed", "connected": false, "error": message]]) }
                 }
             }
         } catch { call.reject(error.localizedDescription) }
@@ -146,4 +179,70 @@ public final class TwrTransportPlugin: CAPPlugin, CAPBridgedPlugin, URLSessionTa
     }
     @objc public func disconnect(_ call: CAPPluginCall) { socket?.cancel(with: .normalClosure, reason: nil); socket = nil; call.resolve() }
     @objc public func removeHub(_ call: CAPPluginCall) { do { let id = call.getString("id") ?? ""; var hubs = try vault(); hubs.removeValue(forKey: id); try save(hubs); if activeHub == id { socket?.cancel(with: .normalClosure, reason: nil); socket = nil }; call.resolve() } catch { call.reject(error.localizedDescription) } }
+}
+
+
+private enum InvitationScanFailure: Error { case cancelled, unavailable }
+/** Capture starts after presentation so an unavailable camera can always be dismissed. */
+private final class InvitationScanner: UIViewController, AVCaptureMetadataOutputObjectsDelegate, UIAdaptivePresentationControllerDelegate {
+    private let session = AVCaptureSession()
+    private let queue = DispatchQueue(label: "tools.twr.qr-camera")
+    private var preview: AVCaptureVideoPreviewLayer?
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotationObservation: NSKeyValueObservation?
+    private var finished = false
+    private var configured = false
+    private let completion: (Result<String, InvitationScanFailure>) -> Void
+    init(completion: @escaping (Result<String, InvitationScanFailure>) -> Void) { self.completion = completion; super.init(nibName: nil, bundle: nil) }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+    override func viewDidLoad() {
+        super.viewDidLoad(); view.backgroundColor = .black
+        let cancel = UIButton(type: .system); cancel.setTitle("Cancel scan", for: .normal); cancel.backgroundColor = .systemBackground
+        cancel.translatesAutoresizingMaskIntoConstraints = false; cancel.addTarget(self, action: #selector(cancelScan), for: .touchUpInside)
+        let layer = AVCaptureVideoPreviewLayer(session: session); layer.videoGravity = .resizeAspectFill; view.layer.addSublayer(layer); preview = layer
+        view.addSubview(cancel)
+        NSLayoutConstraint.activate([cancel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16), cancel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16), cancel.widthAnchor.constraint(equalToConstant: 140), cancel.heightAnchor.constraint(equalToConstant: 44)])
+        presentationController?.delegate = self
+    }
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated); guard !configured else { return }; configured = true
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let device = AVCaptureDevice.default(for: .video), let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else { DispatchQueue.main.async { self.finish(.failure(.unavailable)) }; return }
+            session.addInput(input)
+            DispatchQueue.main.async {
+                guard let preview = self.preview, !self.finished else { return }
+                let coordinator = AVCaptureDevice.RotationCoordinator(device: device, previewLayer: preview)
+                self.rotationCoordinator = coordinator
+                self.rotationObservation = coordinator.observe(\.videoRotationAngleForHorizonLevelPreview, options: [.initial, .new]) { [weak self] coordinator, _ in
+                    DispatchQueue.main.async {
+                        guard let connection = self?.preview?.connection else { return }
+                        let angle = coordinator.videoRotationAngleForHorizonLevelPreview
+                        if connection.isVideoRotationAngleSupported(angle) { connection.videoRotationAngle = angle }
+                    }
+                }
+            }
+            let output = AVCaptureMetadataOutput()
+            guard session.canAddOutput(output) else { DispatchQueue.main.async { self.finish(.failure(.unavailable)) }; return }
+            session.addOutput(output)
+            guard output.availableMetadataObjectTypes.contains(.qr) else { DispatchQueue.main.async { self.finish(.failure(.unavailable)) }; return }
+            output.setMetadataObjectsDelegate(self, queue: .main); output.metadataObjectTypes = [.qr]; session.startRunning()
+        }
+    }
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews(); preview?.frame = view.bounds
+        if let angle = rotationCoordinator?.videoRotationAngleForHorizonLevelPreview, let connection = preview?.connection, connection.isVideoRotationAngleSupported(angle) { connection.videoRotationAngle = angle }
+    }
+    @objc private func cancelScan() { finish(.failure(.cancelled)) }
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) { finish(.failure(.cancelled)) }
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        guard let value = metadataObjects.compactMap({ ($0 as? AVMetadataMachineReadableCodeObject)?.stringValue }).first else { return }; finish(.success(value))
+    }
+    private func finish(_ result: Result<String, InvitationScanFailure>) {
+        guard !finished else { return }; finished = true
+        rotationObservation = nil; rotationCoordinator = nil
+        queue.async { [session] in if session.isRunning { session.stopRunning() } }
+        if presentingViewController != nil { dismiss(animated: true) { [completion] in completion(result) } }
+        else { completion(result) }
+    }
 }

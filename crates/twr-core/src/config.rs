@@ -220,6 +220,9 @@ pub struct Config {
     /// Reading messages aloud (`[speech]`): read by the speaker on the machine you listen on
     /// (`twr speak`, the TUI's own), not by the hub.
     pub speech: SpeechConfig,
+    /// Talking to the orchestrator (`[voice]`, `docs/voice.md`): how speech is turned into
+    /// text, read on the machine with the microphone (`twr voice`), not by the hub.
+    pub voice: VoiceConfig,
     /// Folders `thread.new` searches for a project given by its repository folder name (a
     /// plain name that is neither a configured project nor an absolute path): `<root>/<name>`
     /// and `<root>/*/<name>`, a git repository. A leading `~` is the home directory. `None`:
@@ -274,6 +277,7 @@ impl Default for Config {
             notify: NotifyConfig::default(),
             tui: TuiConfig::default(),
             speech: SpeechConfig::default(),
+            voice: VoiceConfig::default(),
             project_roots: None,
             accounts: BTreeMap::new(),
             account_policy: BTreeMap::new(),
@@ -562,7 +566,9 @@ pub struct SpeechConfig {
     pub rate: u32,
     /// Volume, 0.0 to 1.0, where the engine has one.
     pub volume: f32,
-    /// Which texts are read: `replies` (a turn's last text), `commentary` (texts before it).
+    /// Which texts are read: `replies` (a turn's last text), `commentary` (texts before it),
+    /// `attention` (a short announcement when something needs you: `api needs your
+    /// permission`).
     pub read: Vec<crate::speech::ReadKind>,
     /// Whose turns: `all`, or `mine` (the turns you started).
     pub turn_from: crate::speech::TurnsRead,
@@ -616,7 +622,9 @@ impl SpeechConfig {
             );
         }
         if self.read.is_empty() {
-            anyhow::bail!("speech.read: name at least one of \"replies\", \"commentary\"");
+            anyhow::bail!(
+                "speech.read: name at least one of \"replies\", \"commentary\", \"attention\""
+            );
         }
         if self.catchup_secs > crate::speech::CATCHUP_MAX {
             anyhow::bail!(
@@ -629,6 +637,99 @@ impl SpeechConfig {
             .flatten()
         {
             anyhow::bail!(e);
+        }
+        Ok(())
+    }
+}
+
+/// `[voice] engine`: what turns speech into text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VoiceEngine {
+    /// `whisper` when whisper.cpp's CLI and a model are there, else `command` when one is
+    /// set, else none.
+    #[default]
+    Auto,
+    /// whisper.cpp's CLI (`whisper-cli`), on this machine: no audio leaves it.
+    Whisper,
+    /// `[voice] command`: a program of yours, the recording (16 kHz mono WAV) on its stdin and
+    /// the text on its stdout. For a hosted recognizer through your own script.
+    Command,
+}
+
+/// `[voice]`: speech to text for talking to the orchestrator (`docs/voice.md`). Read on the
+/// machine with the microphone; the hub reads none of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VoiceConfig {
+    /// What recognizes ([`VoiceEngine`]).
+    pub engine: VoiceEngine,
+    /// whisper.cpp's CLI; empty: `whisper-cli` (or `whisper-cpp`) on `PATH`.
+    pub whisper: String,
+    /// The whisper model file (ggml); empty: `voice/ggml-base.en.bin` in twr's data directory.
+    pub model: String,
+    /// The language spoken, as whisper names it (`en`, `es`), or `auto`.
+    pub language: String,
+    /// `engine = "command"`: the program and its arguments, run without a shell.
+    pub command: Vec<String>,
+    /// How long recognizing one recording may take, in seconds.
+    pub timeout_secs: u64,
+    /// Hands-free: the silence that ends an utterance (and sends it), in milliseconds.
+    pub pause_ms: u64,
+    /// Hands-free keeps listening while replies are read aloud, so talking interrupts them.
+    /// Off (the default), it stops listening until they end: their echo is never sent.
+    pub listen_while_speaking: bool,
+}
+
+/// `[voice] pause_ms`'s default: a pause to think mid-sentence doesn't end the message.
+pub const VOICE_PAUSE_MS: u64 = 2000;
+/// `[voice] pause_ms`'s bounds.
+pub const VOICE_PAUSE_MS_RANGE: std::ops::RangeInclusive<u64> = 500..=10_000;
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        VoiceConfig {
+            engine: VoiceEngine::Auto,
+            whisper: String::new(),
+            model: String::new(),
+            language: "en".into(),
+            command: Vec::new(),
+            timeout_secs: 60,
+            pause_ms: VOICE_PAUSE_MS,
+            listen_while_speaking: false,
+        }
+    }
+}
+
+impl VoiceConfig {
+    /// Checks what the types allow but a recognizer can't use.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.engine == VoiceEngine::Command
+            && self.command.first().is_none_or(|p| p.trim().is_empty())
+        {
+            anyhow::bail!("voice.command: engine = \"command\" needs a program to run");
+        }
+        let lang = self.language.as_str();
+        if !(lang == "auto"
+            || (2..=8).contains(&lang.len()) && lang.bytes().all(|b| b.is_ascii_lowercase()))
+        {
+            anyhow::bail!(
+                "voice.language: {lang:?} is not a language code (en, es, ...) or \"auto\""
+            );
+        }
+        if !(1..=600).contains(&self.timeout_secs) {
+            anyhow::bail!(
+                "voice.timeout_secs: {} is not 1 to 600 seconds",
+                self.timeout_secs
+            );
+        }
+        if !VOICE_PAUSE_MS_RANGE.contains(&self.pause_ms) {
+            anyhow::bail!(
+                "voice.pause_ms: {} is not {} to {} milliseconds",
+                self.pause_ms,
+                VOICE_PAUSE_MS_RANGE.start(),
+                VOICE_PAUSE_MS_RANGE.end()
+            );
         }
         Ok(())
     }
@@ -872,6 +973,11 @@ impl BoxConfig {
             }
         }
         match transport {
+            BoxTransport::Link => {
+                if self.token.is_some() || self.ssh.is_some() || self.build.is_some() {
+                    anyhow::bail!("boxes.{name}: a linked runner uses machine trust and an exact build, not token, ssh or build overrides");
+                }
+            }
             BoxTransport::Command => {
                 let Some(argv) = &self.command else {
                     anyhow::bail!(
@@ -1165,6 +1271,8 @@ impl fmt::Debug for BoxConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BoxTransport {
+    /// A machine-owned runner paired by its one-time code.
+    Link,
     /// The box's runner (`twr runner --hub <url>`) connects to the hub's listener (`[hub]
     /// listen`) and both prove they know the box's `token`. For a box the hub cannot reach by
     /// ssh.
@@ -1635,6 +1743,7 @@ pub fn check_env_name(name: &str) -> Result<(), String> {
 /// twr-cli test keeps them equal).
 pub const DEFAULT_PARK_DISPOSABLE: &[&str] = &[
     "target/",
+    ".twr-uploads/",
     "node_modules/",
     "dist/",
     "build/",
@@ -1761,6 +1870,7 @@ impl Config {
             b.check(name)?;
         }
         self.speech.validate()?;
+        self.voice.validate()?;
         match parse_span(&self.tui.summary_every_span) {
             Some(d) if d >= MIN_SUMMARY_EVERY => {}
             _ => anyhow::bail!(
@@ -2259,9 +2369,18 @@ impl BoxesFile {
     /// (created exclusively, mode 0600), synced, renamed over `path`, and the directory
     /// synced so the rename survives a crash. The directory is created when missing. Callers
     /// that read, change and save hold [`BoxesFile::lock`] across all three.
+    ///
+    /// A box the file has is no removed box: its name comes out of the removal record
+    /// ([`BoxesFile::removed`]), after the save, so `twr box add` of a box removed before
+    /// has no hub forget it. A failure to rewrite the record is only logged: a hub takes no
+    /// removal of a box it has in its config.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let body = toml::to_string(self).context("writing boxes.toml")?;
-        Self::save_body(path, &body)
+        Self::save_body(path, &body)?;
+        if let Err(e) = Self::unmark_removed(path, self.boxes.keys().map(String::as_str)) {
+            tracing::warn!(error = %format!("{e:#}"), "cannot take added boxes out of the removal record");
+        }
+        Ok(())
     }
 
     /// Removes box `name` from `path` without reading the rest as boxes ([`BoxesFile::save`]'s
@@ -2269,6 +2388,8 @@ impl BoxesFile {
     /// box with settings twr refuses (or that another twr version wrote) can be taken out, and
     /// every other table stays as it was (comments aside). Its table, as found, when it was
     /// there; `None` when not (nothing written). An error when the file is no TOML at all.
+    /// A box taken out is first named in the removal record ([`BoxesFile::removed`]): the
+    /// evidence a hub needs to forget what its runner sent it.
     pub fn remove_box(path: &Path, name: &str) -> anyhow::Result<Option<toml::Value>> {
         let text = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -2287,6 +2408,10 @@ impl BoxesFile {
             .and_then(|boxes| boxes.remove(name));
         if removed.is_some() {
             let body = toml::to_string(&table).context("writing boxes.toml")?;
+            // Recorded first (`BoxesFile::removed`): a removal that fails leaves the box in
+            // the file, and a record naming a box the file still has is taken out without a
+            // forget; a removal never recorded would leave its watermarks behind for good.
+            Self::mark_removed(path, name)?;
             Self::save_body(path, &body)?;
         }
         Ok(removed)
@@ -2308,50 +2433,152 @@ impl BoxesFile {
 
     /// Replaces `path` with the header and `body`, atomically ([`BoxesFile::save`]).
     fn save_body(path: &Path, body: &str) -> anyhow::Result<()> {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let dir = match path.parent() {
-            Some(d) if !d.as_os_str().is_empty() => d,
-            _ => Path::new("."),
+        write_private_atomically(path, &format!("{BOXES_FILE_HEADER}\n{body}"))
+    }
+
+    /// The removal record next to `boxes_file` (`boxes.removed`, see [`BoxesFile::removed`]).
+    pub fn removed_path(boxes_file: &Path) -> PathBuf {
+        boxes_file.with_file_name(REMOVED_FILE)
+    }
+
+    /// The boxes the removal record next to `boxes_file` names: the boxes `twr box remove`
+    /// took out of `boxes_file` whose runners' frames a hub has yet to forget (`twr-hub`
+    /// forgets a box only when it is named here and is in neither config file as the hub
+    /// starts). One box name per line; empty lines and lines starting with `#` are skipped.
+    /// Missing: none. A line that is no box name is an error naming the file (a hub then
+    /// takes no removal from it, with a warning).
+    pub fn removed(boxes_file: &Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let path = Self::removed_path(boxes_file);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "boxes.toml".into());
-        let nonce = crate::runner::new_nonce()?;
-        let tmp = dir.join(format!(".{name}.{}.tmp", &nonce[..16]));
-        // Removes the temporary file unless it was renamed into place.
-        struct Tmp<'a>(&'a Path, bool);
-        impl Drop for Tmp<'_> {
-            fn drop(&mut self) {
-                if !self.1 {
-                    let _ = std::fs::remove_file(self.0);
-                }
+        let mut names = std::collections::BTreeSet::new();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
             }
+            crate::runner::validate_box_name(line)
+                .with_context(|| format!("{} line {}", path.display(), n + 1))?;
+            names.insert(line.to_string());
         }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        let mut guard = Tmp(&tmp, false);
-        f.write_all(BOXES_FILE_HEADER.as_bytes())
-            .and_then(|()| f.write_all(b"\n"))
-            .and_then(|()| f.write_all(body.as_bytes()))
-            .and_then(|()| f.sync_all())
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        drop(f);
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
-        guard.1 = true;
-        std::fs::File::open(dir)
-            .and_then(|d| d.sync_all())
-            .with_context(|| format!("syncing {}", dir.display()))?;
+        Ok(names)
+    }
+
+    /// Adds `name` to the removal record next to `boxes_file` ([`BoxesFile::removed`]),
+    /// atomically, under the caller's [`BoxesFile::lock`]. A record that does not read is
+    /// replaced (it named nothing a hub would take).
+    pub fn mark_removed(boxes_file: &Path, name: &str) -> anyhow::Result<()> {
+        crate::runner::validate_box_name(name)?;
+        let mut names = Self::removed(boxes_file).unwrap_or_default();
+        if names.insert(name.to_string()) {
+            Self::save_removed(boxes_file, &names)?;
+        }
         Ok(())
     }
 
+    /// Takes `names` out of the removal record next to `boxes_file` ([`BoxesFile::removed`]),
+    /// atomically, under the caller's [`BoxesFile::lock`]; the record goes once it names
+    /// nothing. Nothing is written when it names none of them (or does not read).
+    pub fn unmark_removed<'a>(
+        boxes_file: &Path,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> anyhow::Result<()> {
+        let Ok(mut left) = Self::removed(boxes_file) else {
+            return Ok(());
+        };
+        let before = left.len();
+        for n in names {
+            left.remove(n);
+        }
+        if left.len() == before {
+            return Ok(());
+        }
+        Self::save_removed(boxes_file, &left)
+    }
+
+    /// Writes the removal record next to `boxes_file` with `names` (removed when empty).
+    fn save_removed(
+        boxes_file: &Path,
+        names: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        let path = Self::removed_path(boxes_file);
+        if names.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+            };
+        }
+        let mut body = REMOVED_FILE_HEADER.to_string();
+        for n in names {
+            body.push_str(n);
+            body.push('\n');
+        }
+        write_private_atomically(&path, &body)
+    }
+}
+
+/// The name of the removal record next to `boxes.toml` ([`BoxesFile::removed`]).
+pub const REMOVED_FILE: &str = "boxes.removed";
+
+/// What the removal record ([`BoxesFile::removed`]) starts with.
+const REMOVED_FILE_HEADER: &str = "\
+# Written by twr: the boxes `twr box remove` took out of boxes.toml, one per line. A hub that
+# starts without a box named here forgets what its runner sent it, and takes the name out;
+# `twr box add` takes it out too. Leave it to twr.
+";
+
+/// Replaces `path` with `text`, atomically: a reader sees the old file or the new one, never a
+/// part. The text goes to a temporary file in the same directory (created exclusively, mode
+/// 0600), synced, renamed over `path`, and the directory synced so the rename survives a
+/// crash. The directory is created when missing.
+fn write_private_atomically(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "boxes.toml".into());
+    let nonce = crate::runner::new_nonce()?;
+    let tmp = dir.join(format!(".{name}.{}.tmp", &nonce[..16]));
+    // Removes the temporary file unless it was renamed into place.
+    struct Tmp<'a>(&'a Path, bool);
+    impl Drop for Tmp<'_> {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    let mut guard = Tmp(&tmp, false);
+    f.write_all(text.as_bytes())
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
+    guard.1 = true;
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing {}", dir.display()))?;
+    Ok(())
+}
+
+impl BoxesFile {
     /// Takes the lock of `path` (`<path>.lock`, an exclusive `flock`; the file is created
     /// with mode 0600, and its directory when missing), waiting for whoever holds it: twr
     /// commands that change `boxes.toml` hold it from reading the file to saving it, so two
@@ -2496,6 +2723,13 @@ mod tests {
         assert_eq!(c.speech.engine, SpeechEngine::Command);
         assert_eq!(c.speech.local, SpeechLocal::Off);
         assert_eq!(c.speech.read, vec![crate::speech::ReadKind::Replies]);
+        let c = Config::from_toml_str(
+            "[speech]\nread = [\"replies\", \"commentary\", \"attention\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.speech.read.len(), 3);
+        let c = Config::from_toml_str("[speech]\nread = [\"attention\"]\n").unwrap();
+        assert_eq!(c.speech.read, vec![crate::speech::ReadKind::Attention]);
         for bad in [
             "[speech]\nengine = \"command\"\n",
             "[speech]\nvolume = 2.0\n",
@@ -2821,7 +3055,7 @@ mod tests {
         for (rt, m) in [
             ("claude-code", "sonnet"),
             ("claude-code", "claude-opus-5-5"),
-            ("claude-code", "claude-fable-5-1"),
+            ("claude-code", "claude-fable-5-2"),
             ("claude-code", "default"),
             ("codex", "gpt-6.1-sol"),
             ("codex", "gpt-6-astra"),
@@ -3839,6 +4073,63 @@ account = "gpu-work"
         assert!(!BoxesFile::names_box(&file, "gpu"));
     }
 
+    /// The removal record (`boxes.removed`): a box `remove_box` takes out is named there
+    /// (only one it took out), a save of boxes.toml takes the names it has out again, and the
+    /// record goes once it names nothing. Comments and empty lines are skipped; a line that is
+    /// no box name makes the record an error, which a later mark replaces. An older twr reads
+    /// only boxes.toml, which the record never touches.
+    #[test]
+    fn removed_boxes_are_recorded_until_added_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("boxes.toml");
+        let record = BoxesFile::removed_path(&file);
+        assert_eq!(record, dir.path().join("boxes.removed"));
+        let names = |f: &Path| {
+            BoxesFile::removed(f)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert!(names(&file).is_empty());
+        let mut b = BoxesFile::default();
+        for n in ["gpu", "cpu"] {
+            b.boxes.insert(n.into(), BoxConfig::default());
+        }
+        b.save(&file).unwrap();
+        assert!(!record.exists());
+        assert!(BoxesFile::remove_box(&file, "gpu").unwrap().is_some());
+        assert_eq!(BoxesFile::remove_box(&file, "nope").unwrap(), None);
+        assert_eq!(names(&file), ["gpu"]);
+        assert!(BoxesFile::remove_box(&file, "cpu").unwrap().is_some());
+        assert_eq!(names(&file), ["cpu", "gpu"]);
+        let text = std::fs::read_to_string(&record).unwrap();
+        assert!(text.starts_with("# Written by twr"), "{text}");
+        assert!(text.ends_with("cpu\ngpu\n"), "{text}");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&record).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // An older twr's boxes.toml loads as ever: the record is a file of its own.
+        assert!(BoxesFile::load(&file).unwrap().boxes.is_empty());
+        // Added again: out of the record.
+        let mut again = BoxesFile::load(&file).unwrap();
+        again.boxes.insert("gpu".into(), BoxConfig::default());
+        again.save(&file).unwrap();
+        assert_eq!(names(&file), ["cpu"]);
+        BoxesFile::unmark_removed(&file, ["nope"]).unwrap();
+        assert_eq!(names(&file), ["cpu"]);
+        BoxesFile::unmark_removed(&file, ["cpu"]).unwrap();
+        assert!(!record.exists(), "an empty record goes");
+        // Hand-edited: comments and blank lines skipped, anything else an error.
+        std::fs::write(&record, "# note\n\n  gpu  \n").unwrap();
+        assert_eq!(names(&file), ["gpu"]);
+        std::fs::write(&record, "gpu\nnot a box\n").unwrap();
+        let e = format!("{:#}", BoxesFile::removed(&file).unwrap_err());
+        assert!(e.contains("boxes.removed line 2"), "{e}");
+        BoxesFile::mark_removed(&file, "cpu").unwrap();
+        assert_eq!(names(&file), ["cpu"]);
+        assert!(BoxesFile::mark_removed(&file, "../x").is_err());
+    }
+
     /// `boxes.toml` next to `config.toml`: merged into `[boxes]`, a box in both is an error
     /// naming both files, and the merged config is checked.
     #[test]
@@ -4115,6 +4406,20 @@ account = "gpu-work"
             "[notify]\nevents = [\"everything\"]\n",
             "[notify]\nurl = \"https://ntfy.sh/x\"\n",
         ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn voice_listening_settings_default_and_are_checked() {
+        let c = Config::default();
+        assert_eq!(c.voice.pause_ms, 2000);
+        assert!(!c.voice.listen_while_speaking);
+        let c = Config::from_toml_str("[voice]\npause_ms = 3500\nlisten_while_speaking = true\n")
+            .unwrap();
+        assert_eq!(c.voice.pause_ms, 3500);
+        assert!(c.voice.listen_while_speaking);
+        for bad in ["[voice]\npause_ms = 100\n", "[voice]\npause_ms = 60000\n"] {
             assert!(Config::from_toml_str(bad).is_err(), "{bad}");
         }
     }

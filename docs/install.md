@@ -20,7 +20,9 @@ To read the script before it runs, or to check its signature first ([Checking th
 
 The script picks the release build for your machine, checks it against the release's `sha256sums.txt` and installs it for the current user, without sudo. On Apple silicon it installs the native build even when the shell runs under Rosetta. With `gh` signed in to github.com it downloads through `gh release download -R github.com/ignaval/twr`. Otherwise it uses curl, over https only (TLS 1.2 or newer), or, without curl, wget with its own defaults. A `file://` base in `TWR_DOWNLOAD_URL` is copied directly and needs neither.
 
-`sha256sums.txt` is signed. The script holds the release public key (the one in [`release/signing-key.pub`](../release/signing-key.pub)) and checks `sha256sums.txt.sig` with `openssl` when the `openssl` on your machine can verify Ed25519 signatures (OpenSSL 3.0 or newer). It tests that first on a signature built into the script. If it can, a missing or bad signature stops the install: every release is signed, so either means the release's files were changed or are incomplete. If it can't (macOS ships LibreSSL, which can't), the script prints `the checksums were not signature-checked` and goes on: the checksums then guard against a broken download, not against a changed release. `twr update` checks the signatures itself, with the key built into twr, whatever `openssl` you have.
+`sha256sums.txt` is signed. The script holds the release public key (the one in [`release/signing-key.pub`](../release/signing-key.pub)) and checks `sha256sums.txt.sig` with `openssl` when the `openssl` on your machine can verify Ed25519 signatures (OpenSSL 3.0 or newer). It tests that first on a signature built into the script. If it can, a missing or bad signature stops the install: every release is signed, so either means the release's files were changed or are incomplete. If it can't (macOS ships LibreSSL, which can't), it checks a second signature instead (next paragraph). With no `openssl` that checks either, the script prints `the checksums were not signature-checked` and goes on: the checksums then guard against a broken download, not against a changed release. `twr update` checks the signatures itself, with the key built into twr, whatever `openssl` you have.
+
+The script holds a second release key, ECDSA P-256 (`release/signing-key-p256.pub`), which LibreSSL can check. A release after v0.3.0 also carries `sha256sums.txt.p256.sig`, and where `openssl` can't verify Ed25519 the script checks that signature instead, the same way: a missing or bad one stops the install. v0.3.0 and older releases have no P-256 signature, so on a Mac without OpenSSL 3 the script refuses them; install one of those with OpenSSL 3 on your `PATH`, or by hand ([Release builds](#release-builds)).
 
 `sha256sums.txt` starts with a line naming its release, `# twr release v0.2.0`, signed with the rest. The script refuses checksums that name another release than the `TWR_VERSION` you asked for, so the signed files of an older release can't pass for the one you named. `twr update` checks the same, and also that the release's `install.sh` is the one `sha256sums.txt` lists.
 
@@ -31,7 +33,7 @@ It reads these environment variables:
 | `TWR_VERSION` | the latest release | install this release, e.g. `v0.2.0`; needed for a prerelease |
 | `TWR_INSTALL_DIR` | `~/.local/bin` | where `twr` goes; a relative path is taken from the current directory. Write `$HOME`, not a quoted `~`, which the script refuses |
 | `TWR_DOWNLOAD_URL` | GitHub | a base URL with `twr-<target>.tar.gz`, `sha256sums.txt` and `sha256sums.txt.sig`, or `file:///tmp/release` for a local directory. Any scheme curl or wget fetches is used as you give it, `http://` included |
-| `TWR_REQUIRE_SIGNATURE` | unset | `1`: stop when the signature can't be checked (no `openssl` that verifies Ed25519), except with `TWR_SHA256SUMS_FILE`, which the caller (`twr update`) has verified |
+| `TWR_REQUIRE_SIGNATURE` | unset | `1`: stop when the signature can't be checked (no `openssl` that verifies Ed25519, nor P-256 when the script holds a P-256 key), except with `TWR_SHA256SUMS_FILE`, which the caller (`twr update`) has verified |
 | `TWR_SHA256SUMS_FILE` | unset | use this `sha256sums.txt` instead of downloading it, and skip the signature check, even with `TWR_REQUIRE_SIGNATURE=1`: the caller (`twr update`) passes the one it verified |
 | `TWR_UPDATE` | unset | `1` when `twr update` runs the script: it says "Updating" and leaves out the advice for a first install |
 
@@ -72,6 +74,37 @@ xattr -d com.apple.quarantine twr
 
 `curl` sets no such flag, so the install script and `twr update` don't need this.
 
+### Desktop app
+
+Stable releases also carry the desktop app, built from the same commit:
+
+| File | Platform |
+|---|---|
+| `twr-<version>-arm64.dmg` | macOS on Apple silicon, 13 or newer |
+| `twr-<version>.AppImage` | Linux x86_64 (glibc 2.35+), any distribution |
+| `twr-desktop_<version>_amd64.deb` | Debian, Ubuntu 22.04 or newer |
+| `twr-desktop-<version>-1-x86_64.pkg.tar.zst` | Arch Linux, Omarchy |
+
+On Linux, the AppImage runs on any distribution and updates itself; the `.deb` and the Arch
+package install with your package manager (`sudo apt install ./twr-desktop_<version>_amd64.deb`,
+`sudo pacman -U twr-desktop-<version>-1-x86_64.pkg.tar.zst`). An AUR package,
+`twr-desktop-bin`, is built and checked with each release and will be published to the AUR
+with them once the maintainer registers it; until then, use the AppImage or the Arch package.
+`desktop-sha256sums.txt` lists the desktop files' checksums. The app updates itself or tells
+you how to, depending on how it was installed. See [desktop updates](desktop.md#updates).
+
+The Mac disk image is signed ad hoc, not with an Apple Developer ID, and not notarized
+(releases are, once the maintainer has the Apple credentials: [desktop.md](desktop.md#releases)).
+So:
+
+- Gatekeeper blocks the app the first time you open it. Open it once, then choose
+  **Open Anyway** in System Settings › Privacy & Security, or remove the quarantine flag
+  after copying the app to Applications: `xattr -dr com.apple.quarantine /Applications/twr.app`.
+- It doesn't update itself: macOS only swaps in updates signed by the same Developer ID. It
+  tells you when a new release is out and links its disk image; install that the same way.
+- Each such build has a signature of its own, so after a manual update macOS may ask again
+  for the microphone (voice mode) and the other permissions you gave it.
+
 ### Checking the signature
 
 The checksums are only as good as the file they come from. To check that `sha256sums.txt` is the one the release workflow signed, save the release public key, [`release/signing-key.pub`](../release/signing-key.pub) in the repository, as `signing-key.pub`, download `sha256sums.txt.sig` next to `sha256sums.txt`, and run, with OpenSSL 3.0 or newer:
@@ -82,7 +115,15 @@ openssl pkeyutl -verify -rawin -pubin -inkey signing-key.pub \
   -sigfile sha256sums.txt.sig.bin -in sha256sums.txt
 ```
 
-It prints `Signature Verified Successfully`. `install.sh` and `install.sh.sig` check the same way. macOS's `openssl` is LibreSSL, which can't do this; install OpenSSL 3 (for example with Homebrew) or check on a Linux machine.
+It prints `Signature Verified Successfully`. `install.sh` and `install.sh.sig` check the same way. macOS's `openssl` is LibreSSL, which can't do this; install OpenSSL 3 (for example with Homebrew) or check on a Linux machine. A release that carries `sha256sums.txt.p256.sig` (those after v0.3.0) can be checked with LibreSSL too, against `release/signing-key-p256.pub` saved as `signing-key-p256.pub`:
+
+```sh
+openssl base64 -d -A -in sha256sums.txt.p256.sig -out sha256sums.txt.p256.sig.bin
+openssl dgst -sha256 -verify signing-key-p256.pub \
+  -signature sha256sums.txt.p256.sig.bin sha256sums.txt
+```
+
+It prints `Verified OK`.
 
 The releases also carry build provenance attestations, from v0.2.0 on, so the GitHub CLI can check that an archive was built by the release workflow from this repository:
 
@@ -91,15 +132,28 @@ gh attestation verify twr-x86_64-unknown-linux-musl.tar.gz --repo ignaval/twr \
   --signer-workflow ignaval/twr/.github/workflows/release.yml
 ```
 
+The desktop files are covered the same way from the first release after v0.3.0. `desktop-sha256sums.txt` starts with `# twr desktop release <tag>` and is signed with the same key, in `desktop-sha256sums.txt.sig`; each installer it lists has a build provenance attestation:
+
+```sh
+openssl base64 -d -A -in desktop-sha256sums.txt.sig -out desktop-sha256sums.txt.sig.bin
+openssl pkeyutl -verify -rawin -pubin -inkey signing-key.pub \
+  -sigfile desktop-sha256sums.txt.sig.bin -in desktop-sha256sums.txt
+sha256sum -c desktop-sha256sums.txt --ignore-missing
+gh attestation verify twr-<version>.AppImage --repo ignaval/twr \
+  --signer-workflow ignaval/twr/.github/workflows/release.yml
+```
+
+On macOS, check the disk image with `grep ' twr-<version>-arm64.dmg$' desktop-sha256sums.txt | shasum -a 256 -c`.
+
 ## From source
 
-You need a stable Rust toolchain, 1.89 or newer, and git. The repository's `rust-toolchain.toml` pins the Rust that CI and the releases use (1.98.1). With rustup, cargo installs that version and uses it in the repository. To build with another toolchain, run `cargo +<toolchain> ...`.
+You need a stable Rust toolchain, 1.98 or newer, and git. The repository's `rust-toolchain.toml` pins the Rust that CI and the releases use (1.98.1). With rustup, cargo installs that version and uses it in the repository. To build with another toolchain, run `cargo +<toolchain> ...`.
 
 ```sh
 cargo install --locked --git https://github.com/ignaval/twr twr-cli
 ```
 
-builds the latest commit of the default branch, `dev`, where development happens. Add `--tag v0.2.0` (or another release tag) to build a release, or `--branch main` for the latest one. From a clone of the repository:
+builds the latest commit of the default branch, `dev`, where development happens. Add `--tag v0.2.0` (or another release tag) to build a release. (`--branch main` builds `main`, which can be ahead of the latest release with site and installer changes.) From a clone of the repository:
 
 ```sh
 git clone https://github.com/ignaval/twr
@@ -127,6 +181,29 @@ RUSTFLAGS="-C target-feature=+crt-static" \
 ```
 
 A static glibc build still loads glibc's name-service libraries at runtime when it resolves a host name, as a runner does when it reaches its hub by name. If that matters, build for `x86_64-unknown-linux-musl` with `cargo build`, which needs `musl-gcc` for the bundled SQLite.
+
+## Shell completions
+
+`twr completions <shell>` prints a completion script for twr's commands and options, for
+`bash`, `zsh`, `fish`, `elvish` or `powershell`. It needs no hub. Write it where your shell
+looks, then open a new shell:
+
+```sh
+# bash (with the bash-completion package)
+mkdir -p ~/.local/share/bash-completion/completions
+twr completions bash > ~/.local/share/bash-completion/completions/twr
+
+# zsh: a directory on $fpath, before `compinit` in ~/.zshrc
+mkdir -p ~/.zfunc
+twr completions zsh > ~/.zfunc/_twr
+# and in ~/.zshrc, once: fpath=(~/.zfunc $fpath); autoload -Uz compinit; compinit
+
+# fish
+mkdir -p ~/.config/fish/completions
+twr completions fish > ~/.config/fish/completions/twr.fish
+```
+
+Run it again after `twr update` to pick up new commands.
 
 ## Where twr keeps things
 

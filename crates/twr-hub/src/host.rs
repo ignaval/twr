@@ -48,6 +48,18 @@ pub fn builtin_adapters() -> AdapterLookup {
 
 /// A box that can run thread runtimes.
 pub trait ThreadHost: Send + Sync {
+    /// Stage an attachment under the trusted thread root on this box.
+    fn upload(
+        &self,
+        _scope: String,
+        _thread: String,
+        _root: PathBuf,
+        _registered_repository: bool,
+        _request: twr_core::upload::Request,
+    ) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> {
+        async { anyhow::bail!("This host does not support attachments") }.boxed()
+    }
+
     /// Whether `runtime` can run here.
     fn has_runtime(&self, runtime: &str) -> bool;
 
@@ -199,6 +211,7 @@ pub trait ThreadHost: Send + Sync {
 /// Runs adapters as local child processes (box `local`).
 pub struct LocalHost {
     adapters: AdapterLookup,
+    uploads: Arc<std::sync::Mutex<twr_core::upload::Manager>>,
     git: Arc<LocalGit>,
     worktrees: PathBuf,
     branch_namespace: Option<String>,
@@ -216,6 +229,7 @@ impl LocalHost {
         let worktrees = worktrees.into();
         LocalHost {
             adapters,
+            uploads: twr_core::upload::Manager::shared(),
             // Stale worktree records are cleared only under the box's own worktrees.
             git: Arc::new(LocalGit::default().with_managed_root(worktrees.clone())),
             worktrees,
@@ -278,6 +292,39 @@ impl LocalHost {
 }
 
 impl ThreadHost for LocalHost {
+    fn upload(
+        &self,
+        scope: String,
+        thread: String,
+        root: PathBuf,
+        registered_repository: bool,
+        request: twr_core::upload::Request,
+    ) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> {
+        let uploads = self.uploads.clone();
+        let git = self.git.clone();
+        async move {
+            twr_core::upload::Manager::start_cleanup(&uploads);
+            tokio::task::spawn_blocking(move || {
+                let root = twr_core::upload::resolve_root(&root, registered_repository)
+                    .map_err(|e| twr_core::upload::reject_begin(&request, e))?;
+                let _workdir = git
+                    .workdirs()
+                    .begin_use(&root, &format!("upload:{}", request.id))
+                    .map_err(|e| {
+                        twr_core::upload::reject_begin(
+                            &request,
+                            anyhow::anyhow!(
+                                e.replace("cannot start a runtime in", "cannot upload files to")
+                            ),
+                        )
+                    })?;
+                twr_core::upload::Manager::request_shared(&uploads, &scope, &thread, &root, request)
+            })
+            .await?
+        }
+        .boxed()
+    }
+
     fn has_runtime(&self, runtime: &str) -> bool {
         (self.adapters)(runtime).is_some()
     }

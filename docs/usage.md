@@ -43,7 +43,7 @@ twr thread new ~/code/api --name gem --runtime 'acp:gemini --experimental-acp'
 twr thread new ~/code/api --name aider --runtime 'pty:aider --model sonnet'
 ```
 
-`twr thread list` shows every thread with its status, runtime, permission mode, model, project, turns, what its turns spent (`SPENT`: `1.2M tok $3.40`, see [Subscription usage](#subscription-usage)), how much disk its worktree takes (`DISK`, [worktrees.md](worktrees.md#disk-use)), open items, queued prompts and, last, its activity: one line on what it is doing now, such as `implementing scroll anchoring · running tests` or `waiting for permission: Bash: git push` ([tui.md](tui.md#the-activity-line)), cut to 60 characters. Parked threads are left out, and a line under the table names them (`2 parked threads hidden: old, older (twr thread list --all)`). `--all` (`-a`) lists them too.
+`twr thread list` shows every thread with its status, runtime, permission mode, model, project, turns, what its turns spent (`SPENT`: `1.2M tok $3.40`, see [Subscription usage](#subscription-usage)), how much disk its worktree takes (`DISK`, [worktrees.md](worktrees.md#disk-use)), open items, queued prompts and, last, its activity: one line on what it is doing now, such as `implementing scroll anchoring · running tests` or `waiting for permission: Bash: git push` ([tui.md](tui.md#the-activity-line)), cut to 60 characters. Parked threads are left out, and a line under the table names them (`2 parked threads hidden: old, older (twr thread list --all)`). `--all` (`-a`) lists them too. `--json` prints the threads it lists (the same rule for parked ones) as a JSON array, each as the hub's `thread.list` returns it, for scripts.
 
 ### Change a thread's mode
 
@@ -57,7 +57,7 @@ The mode goes into the log (`thread.mode_changed`). A thread that is idle restar
 
 ```sh
 twr model api                              # show api's model and reasoning effort
-twr model api claude-fable-5-1 --effort high
+twr model api claude-fable-5-2 --effort high
 twr model api --effort default             # back to the runtime's default effort
 twr model api gpt-6.1-sol --effort xhigh --runtime codex   # move api to Codex
 ```
@@ -172,9 +172,10 @@ twr respond 01J...:1:perm-3@42 deny   # answer that revision of an item
 twr respond 01J...:1:q-1@57 2 -m "use the staging DB"   # option 2, with a message
 twr attention --all                   # also reviews, errors, stalled notices, routing questions
 twr attention dismiss 01J...@57       # close one of those without answering it (dismiss in the TUI's popup)
+twr attention --json                  # for scripts: each item, with "target": "<attn_id>@<revision>"
 ```
 
-An answer is an option label (`allow`, `deny`) or its number. A question without options takes free text.
+An answer is an option label (`allow`, `deny`) or its number. A question without options takes free text. `twr attention --json` (with `--all` too) prints the items it would list as a JSON array, each as the hub's `attention.list` returns it plus `target`, the `<attn_id>@<revision>` to pass to `twr respond` or `twr attention dismiss`.
 
 `twr say` never answers a permission or question. It can't tell which ones you had seen. A message that looks like an answer ("yes", "allow", "2", "allow both", "@api yes, @web no", "allow api and then summarize") while one is pending isn't sent anywhere either, not even to the orchestrator. `say` lists what's pending and the `twr respond <id>@<rev>` that answers it. The TUI's input line does answer the card on screen, because the TUI tells the hub what you had seen.
 
@@ -398,7 +399,8 @@ It is not a sandbox. A process that both starts itself again without the variabl
 twr hub stop     # stop the hub and wait until it has exited (30 s, or --timeout S)
 twr hub stop --all # stop all workspace hubs in this home; timeout applies to each
 twr update       # install the latest release over this twr
-twr update --version v0.2.0
+twr update --version v0.4.0
+twr update --version v0.2.0 --allow-downgrade   # an older release, only by name
 ```
 
 Stopping the hub stops every local thread's runtime first, so a running turn ends. Threads on a remote box keep running under their runner, and the next hub picks them up. With no hub running, `twr hub stop` says so and exits 0. Bare `twr` starts a new hub.
@@ -410,6 +412,8 @@ The command covers the current home: the usual directories, or the instance sele
 An invalid config reports failure for `default` while named workspaces are still processed. If workspaces cannot be listed, that failure is reported and `default` is still processed. A hub already shutting down reports `not running` once its workspace lock is free and its local runtimes are stopped. At the deadline, one final process check gets at most 100 ms to confirm an exit in the last polling interval.
 
 `twr update` picks the release (`--version`, else the latest on GitHub), downloads its `install.sh` and `sha256sums.txt` with their signatures, and checks both signatures with the release key built into twr. Only then does it run that `install.sh`, with the checksums it verified, for the directory this `twr` is in, so it replaces this binary wherever it lives. A missing or bad signature stops it before anything runs, and so do checksums that name another release than the one it picked, or that don't list the `install.sh` it downloaded. It won't touch a `twr` in cargo's bin directory. Update that one with `cargo install --path crates/twr-cli`, or remove it with `cargo uninstall twr-cli` and use the installer. The hub keeps running the old version. If its version differs from the new one, `twr update` tells you, and you restart it with `twr hub stop`, then `twr`. It doesn't restart the hub for you, because that would stop your agents. `TWR_INSTALL_SCRIPT_URL` points it at another copy of the installer, a mirror or a local `file:///` path. Its signature is then `<that URL>.sig`, and `sha256sums.txt`, its signature and the archive come from the installer's directory, checked the same way, so the mirror's release is the one installed.
+
+It installs only a release newer than itself, in semantic versioning's order, where a prerelease comes before its release (`v0.4.0-rc.1` before `v0.4.0`, after `v0.3.9`). The same release prints `twr 0.4.0 is up to date` and exits 0. An older one is refused before its installer runs, signed or not, from GitHub or a mirror: GitHub's latest release leaves out prereleases, so a twr on `v0.4.0-rc.1` would otherwise get `v0.3.x` back, and a mirror could serve an old release with a known bug. To install an older release anyway, name it and pass `--allow-downgrade`: `twr update --version v0.3.2 --allow-downgrade`. An older twr may refuse the database this one wrote (below).
 
 When several workspaces are running, use `twr hub stop --all`, then reopen the workspaces you need (`twr`, `twr -w NAME`). The development installer (`docs/tools/dev-install.sh`) suggests this too. Pick a moment when stopping their local runtimes is appropriate.
 

@@ -120,12 +120,11 @@ pub(super) struct DeletedRt {
     account_env_dir: Option<std::path::PathBuf>,
     session_settings: Option<super::restart::RunSettings>,
     closed_runtimes: u64,
-    /// The trash item of its deletion (`thread.deleted` `trash`), if it has one.
+    /// The trash item of its deletion (`thread.deleted` `trash`), if it has one. Once that
+    /// item is purged (`trash.purged`) the thread cannot be restored any more, and its entry
+    /// goes (`Registry::is_purged` says so from then on).
     #[serde(default)]
     pub(super) item: Option<String>,
-    /// That item is purged (`trash.purged`): the thread cannot be restored any more.
-    #[serde(default)]
-    pub(super) purged: bool,
 }
 
 impl DeletedRt {
@@ -140,7 +139,6 @@ impl DeletedRt {
             session_settings: rt.session_settings,
             closed_runtimes: rt.closed_runtimes,
             item: None,
-            purged: false,
         }
     }
 
@@ -306,7 +304,17 @@ impl Core {
             ..Default::default()
         });
         match self.append(hub, HUB_THREAD, None, Source::Hub, body) {
-            Ok(_) => true,
+            Ok(_) => {
+                // Not restorable any more: a box's frames of it are strays acked without a
+                // watermark (`hub::runners`, `Core::tracks`), so its watermarks go. A failure
+                // only leaves rows nothing reads.
+                if self.registry.is_purged(thread) {
+                    if let Err(e) = self.store.forget_runner_acks(thread) {
+                        tracing::warn!(thread, error = %format!("{e:#}"), "cannot forget a purged thread's runner watermarks");
+                    }
+                }
+                true
+            }
             Err(e) => {
                 tracing::warn!(item, thread, error = %format!("{e:#}"), "cannot record a purged trash item");
                 self.trash.remove(item);
@@ -1080,7 +1088,7 @@ impl Hub {
             // that item is purged: what its agent did is archived by then. (An older item of
             // it, one whose deletion was not recorded, does not bring it back.)
             let current = core.deleted_rt.get(&thread);
-            if current.is_some_and(|d| d.purged) {
+            if core.registry.is_purged(&thread) {
                 return Err(rpc(
                     codes::CONFLICT,
                     format!(
@@ -1393,8 +1401,89 @@ mod tests {
         assert_eq!(shown, [item]);
         {
             let core = hub.inner.core();
-            assert!(!core.deleted_rt["t-a"].purged);
+            assert!(!core.registry.is_purged("t-a") && core.deleted_rt.contains_key("t-a"));
         }
+        hub.shutdown().await;
+    }
+
+    /// A thread purged from the trash keeps who it was alone, and the same live, after a
+    /// replay of the log and from a checkpoint: in the registry, in the state a client's
+    /// snapshot is made of, and with nothing set aside for its restore, which is refused. A
+    /// deleted thread still in the trash keeps its whole view.
+    #[tokio::test]
+    async fn a_purged_thread_is_who_it_was_live_on_replay_and_from_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = Hub::open(HubOptions::new(&db, Config::default()))
+            .await
+            .unwrap();
+        let last;
+        {
+            let inner = &hub.inner;
+            let mut core = inner.core();
+            for (t, name) in [("t-a", "api"), ("t-b", "web")] {
+                for body in [
+                    EventBody::ThreadCreated(ThreadCreated {
+                        name: name.into(),
+                        ..Default::default()
+                    }),
+                    EventBody::TurnStarted(TurnStarted {
+                        prompt: "go".into(),
+                        ..Default::default()
+                    }),
+                    EventBody::ThreadDeleted(ThreadDeleted {
+                        name: name.into(),
+                        trash: Some(format!("item-{name}")),
+                        ..Default::default()
+                    }),
+                ] {
+                    core.append(inner, t, None, Source::Hub, body).unwrap();
+                }
+            }
+            assert!(core.record_purged(inner, "item-api", "t-a", false));
+            last = crate::store::read_control(&inner.reader(), 0, usize::MAX)
+                .unwrap()
+                .last()
+                .unwrap()
+                .1
+                .id
+                .clone();
+        }
+        let state = |hub: &Hub| {
+            let core = hub.inner.core();
+            assert!(core.registry.is_purged("t-a") && !core.deleted_rt.contains_key("t-a"));
+            assert!(!core.registry.is_purged("t-b") && core.deleted_rt.contains_key("t-b"));
+            let a = core.registry.deleted_view("t-a").unwrap();
+            assert_eq!((a.name.as_str(), a.turns), ("api", 0));
+            assert_eq!(core.registry.deleted_view("t-b").unwrap().turns, 1);
+            assert_eq!(
+                core.client.registry.deleted_view("t-a"),
+                Some(&a.identity())
+            );
+            (
+                serde_json::to_value(&core.registry).unwrap(),
+                serde_json::to_value(&core.client).unwrap(),
+            )
+        };
+        let live = state(&hub);
+        hub.shutdown().await;
+        drop(hub);
+        let hub = Hub::open(HubOptions::new(&db, Config::default()))
+            .await
+            .unwrap();
+        assert_eq!(hub.inner.core().replayed.checkpoint, None);
+        assert_eq!(state(&hub), live);
+        hub.shutdown().await;
+        drop(hub);
+        let written =
+            super::super::checkpoint::write_upto(&db, &Default::default(), 1, Some(&last))
+                .unwrap()
+                .unwrap();
+        let hub = Hub::open(HubOptions::new(&db, Config::default()))
+            .await
+            .unwrap();
+        assert_eq!(hub.inner.core().replayed.checkpoint, Some(written.id));
+        assert_eq!(state(&hub), live);
         hub.shutdown().await;
     }
 

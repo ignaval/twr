@@ -7,6 +7,11 @@ const fake = vi.hoisted(() => ({
   addListener: vi.fn(),
 }));
 vi.mock("@capacitor/core", () => ({ registerPlugin: () => fake }));
+vi.mock("../mobile/src/offline", () => ({
+  secureRead: async () => null,
+  secureWrite: async () => {},
+  secureDelete: async () => {},
+}));
 import { RemoteHost } from "../mobile/src/transport";
 const hub = {
   id: "local",
@@ -241,6 +246,191 @@ describe("mobile reconnect", () => {
       await host.stop();
     },
   );
+  it.each([
+    "Gateway refused the connection (403)",
+    "Gateway refused the connection (503)",
+    "Remote hub connection closed",
+  ])("keeps retrying after %s", async (refusal) => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((event) => events.push(event));
+      fake.connect.mockRejectedValue(new Error(refusal));
+      fake.listener({
+        message: { type: "transport-closed", connected: false, error: refusal },
+      });
+      await vi.advanceTimersByTimeAsync(1100);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(fake.connect).toHaveBeenCalledTimes(3);
+      fake.connect.mockResolvedValue(undefined);
+      await vi.advanceTimersByTimeAsync(4100);
+      expect(fake.connect).toHaveBeenCalledTimes(4);
+      await expect(host.api().rpc("hub.info")).resolves.toEqual({});
+      expect(events.some((event) => /AUTH_REVOKED/.test(event.error))).toBe(
+        false,
+      );
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("announces every successful workspace connection, switches and reconnects included", async () => {
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    await host.start();
+    const connected: string[] = [];
+    host.onWorkspaceConnected((workspace) => connected.push(workspace));
+    await host.api().connect("default");
+    await host.api().connect("work");
+    fake.listener({ message: { type: "transport-closed" } });
+    await host.resume();
+    expect(connected).toEqual(["default", "work", "work"]);
+    // A failed connection announces nothing.
+    fake.send.mockImplementation(async ({ message }) => {
+      const call = JSON.parse(message);
+      fake.listener({
+        message:
+          call.method === "connect"
+            ? { id: call.id, error: "No such workspace" }
+            : { id: call.id, result: {} },
+      });
+    });
+    await expect(host.api().connect("missing")).rejects.toThrow("workspace");
+    expect(connected).toEqual(["default", "work", "work"]);
+    await host.stop();
+  });
+  it("closes the socket 30 s into the background and sends pending mutations once on resume", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((event) => events.push(event));
+      const original = fake.send.getMockImplementation()!;
+      const sends: any[] = [];
+      let replyToSend = false;
+      fake.send.mockImplementation(async (payload) => {
+        const call = JSON.parse(payload.message);
+        sends.push(call);
+        if (call.method === "rpc" && call.params.method === "thread.send") {
+          if (replyToSend) reply(call.id, { sent: true });
+          return;
+        }
+        await original(payload);
+      });
+      // A mutation whose reply is lost when the app leaves.
+      const pending = host.request("rpc", {
+        method: "thread.send",
+        params: { thread: "worker", prompt: "once" },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      host.setForeground(false);
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(fake.disconnect).not.toHaveBeenCalled();
+      // Within the grace period the gateway's heartbeats are still answered.
+      fake.listener({ message: { type: "heartbeat" } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sends.at(-1).method).toBe("heartbeat");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "connection", connected: false }),
+      );
+      const sent = sends.length;
+      fake.listener({ message: { type: "heartbeat" } });
+      await vi.advanceTimersByTimeAsync(120_000);
+      // Parked: no heartbeat answers, no client heartbeats, no reconnects.
+      expect(sends.length).toBe(sent);
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      replyToSend = true;
+      host.setForeground(true);
+      await host.resume();
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      expect(await pending).toEqual({ sent: true });
+      const mutations = sends.filter(
+        (call) => call.method === "rpc" && call.params.method === "thread.send",
+      );
+      expect(new Set(mutations.map((call) => call.id)).size).toBe(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("keeps the socket when the app returns within the grace period", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      host.setForeground(false);
+      await vi.advanceTimersByTimeAsync(20_000);
+      host.setForeground(true);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fake.disconnect).not.toHaveBeenCalled();
+      expect(fake.connect).toHaveBeenCalledTimes(1);
+      host.setForeground(false);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fake.disconnect).toHaveBeenCalledTimes(1);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
+  it("stops retrying once the gateway reports the token revoked (401)", async () => {
+    vi.useFakeTimers();
+    const host = new RemoteHost(
+      hub,
+      () => {},
+      async () => null,
+    );
+    try {
+      await host.start();
+      await host.api().connect("default");
+      const events: any[] = [];
+      host.api().onEvent((event) => events.push(event));
+      fake.connect.mockRejectedValue(
+        new Error(
+          "AUTH_REVOKED: This device no longer has access to the hub. Forget it and pair again.",
+        ),
+      );
+      fake.listener({ message: { type: "transport-closed" } });
+      await vi.advanceTimersByTimeAsync(1100);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "connection",
+          connected: false,
+          error: expect.stringContaining("AUTH_REVOKED"),
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(fake.connect).toHaveBeenCalledTimes(2);
+    } finally {
+      await host.stop();
+      vi.useRealTimers();
+    }
+  });
   it("resyncs terminal views when the socket returns, even with no further output", async () => {
     const host = new RemoteHost(
       hub,

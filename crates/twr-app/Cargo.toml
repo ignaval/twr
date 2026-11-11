@@ -9,6 +9,10 @@ description = "Shared desktop application projection and authenticated hub compa
 
 [dependencies]
 twr-core.workspace = true
+twr-link.workspace = true
+twr-hub.workspace = true
+# A phone's own speaker, run by the gateway (`remote::voice`).
+twr-speech.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -19,6 +23,9 @@ sha2.workspace = true
 hex.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+# Only hyper's timer (already in the graph through axum-server): without one, hyper never
+# runs its header read timeout.
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
 futures.workspace = true
 portable-pty.workspace = true
 subtle = "2.6.1"
@@ -27,11 +34,14 @@ uuid = { workspace = true, features = ["v4"] }
 ring.workspace = true
 base64 = "0.23.1"
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
-reqwest = { workspace = true, features = ["http2"] }
+reqwest = { workspace = true, features = ["http2", "form"] }
 rustls.workspace = true
+webpki-roots.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tokio::time::pause`: the phone speaker's timeouts in virtual time.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bin]]
 name = "twr-desktop-bridge"

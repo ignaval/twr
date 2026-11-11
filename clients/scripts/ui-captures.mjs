@@ -37,7 +37,10 @@ export async function captureUI(page, { hubPids } = {}) {
     return manage.getByRole("button", { name, exact: true }).click();
   };
   const primary = (name) =>
-    page.locator(".primary-nav").getByRole("button", { name }).click();
+    (String(name) === String(/^Orchestrator/)
+      ? page.locator(".workspace-entry.current .workspace-orchestrator")
+      : page.locator(".primary-nav").getByRole("button", { name })
+    ).click();
   const closeDialog = () =>
     page
       .getByRole("dialog")
@@ -506,19 +509,20 @@ export async function captureUI(page, { hubPids } = {}) {
     )
       systemAppearance = "dark";
   } catch {}
-  const nativeControls = await page
-    .locator("#workspace-select")
-    .evaluate((element) => {
-      const root = getComputedStyle(document.documentElement),
-        style = getComputedStyle(element);
-      return {
-        appAppearance: document.documentElement.dataset.theme,
-        webColorScheme: root.colorScheme,
-        selectColorScheme: style.colorScheme,
-        selectColor: style.color,
-        selectBackground: style.backgroundColor,
-      };
-    });
+  // A select styled as the app's are: the sidebar no longer shows one.
+  const nativeControls = await page.evaluate(() => {
+    const element = document.body.appendChild(document.createElement("select"));
+    const root = getComputedStyle(document.documentElement),
+      style = getComputedStyle(element);
+    queueMicrotask(() => element.remove());
+    return {
+      appAppearance: document.documentElement.dataset.theme,
+      webColorScheme: root.colorScheme,
+      selectColorScheme: style.colorScheme,
+      selectColor: style.color,
+      selectBackground: style.backgroundColor,
+    };
+  });
   const nativeThemeSource = [
     "desktop/main.ts",
     "desktop/preload.ts",

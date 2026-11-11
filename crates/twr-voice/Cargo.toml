@@ -1,0 +1,24 @@
+[package]
+name = "twr-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr's speech to text: a recording of the user's voice into the text of a message (`twr voice`)"
+
+[dependencies]
+twr-core.workspace = true
+twr-speech.workspace = true
+anyhow.workspace = true
+# Process groups of the recognizers' programs.
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+# The recording's private copy for whisper.cpp, which reads a file.
+tempfile.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -16,7 +16,9 @@
 //! `error{unauthorized}`. All of that within one deadline from the connection's accept
 //! ([`HELLO_TIMEOUT`], see [`crate::listener`]). Once it is good the connection gets the full
 //! message size, the hub says `authenticated` and waits (as long again) for the runner's
-//! `inventory`, which may be large. The token never crosses the connection and never appears
+//! `inventory`, which may be large; one naming a running session or spooled frames of
+//! something with no thread id's shape is refused `error{protocol}`, as such a frame closes
+//! the connection (below). The token never crosses the connection and never appears
 //! in logs or events. Both proofs are over one reading of the box's token
 //! ([`RemoteBox::token_snapshot`]), and the connection is accepted only while that is still
 //! the box's token: one whose handshake overlapped a change (`box.token`,
@@ -26,7 +28,31 @@
 //! committed) and gets a new epoch. The `welcome{epoch, watermarks}` carries only durable
 //! watermarks: under the lock that fences the previous connection, the store is synced
 //! ([`crate::store::Store::sync`], covering that connection's open ack batch) before they are
-//! read; a sync that fails refuses the connection. Before the welcome goes out, the hub
+//! read; a sync that fails refuses the connection.
+//!
+//! **Box generations** ([`twr_core::runner::SpoolStamp`], `runner_boxes` in
+//! [`crate::store`]). Watermarks are kept per generation of a box: made the first time the box
+//! is welcomed, and replaced when the hub forgets the box (it was removed: a hub that starts
+//! without it while the removal record `twr box remove` writes names it,
+//! [`Core::sweep_runner_acks`], or `box.token` finding it gone from the files),
+//! which deletes its watermarks in the same transaction and marks the new generation
+//! forgotten. The welcome names the generation (read under the same lock, made durable by the
+//! same sync) to a runner whose inventory has a spool stamp; such a runner forgets the frames
+//! and the numbering it has from another generation (or from none, while the box is
+//! forgotten) before it applies the watermarks, so a removed box added again never replays
+//! old frames against watermarks that are gone (a gap on every connection) or into its
+//! threads. Such a forgetting welcome ends the box's sessions as far as the hub is
+//! concerned (`Conn::forgets`): what they did since the removal is gone, so the hub takes
+//! over none of them, and the reconciliation stops every run the runner still has (as strays:
+//! their later frames, those spooled after the inventory included, are never recorded) and
+//! closes every session of the box the hub holds, its open turn ended, as a crash saying the
+//! box was removed, without the crash's hold on the queue: the next prompt starts the runtime
+//! again on its session. The mark is cleared once a runner has taken the generation: at its
+//! `synced`, or an inventory stamped with it. A runner without a stamp (an older twr) gets no generation
+//! and is served as before, except while its box is forgotten: it is refused
+//! `error{protocol}` before it is connected (nothing changes), noted on the box, and a sealed
+//! one's end says so ([`SealedEnd::spool_refused`]), so its daemon or worker is replaced as
+//! one of another protocol. Before the welcome goes out, the hub
 //! takes over the sessions the inventory reports that its log shows as live but that it has no
 //! runtime for (after a hub restart), unless that runtime's exit is being recorded: their
 //! frames are then recorded like any other. An exit closes the runtime of the log its session
@@ -77,7 +103,10 @@
 //! runner has confirmed a run the hub named (a frame of it), an exit naming none may still be
 //! the session's (a restarted runner's, for the run its predecessor left behind). A frame for a
 //! thread the hub runs no session for (a stray) is committed as a watermark only; after the
-//! replay the stray session is stopped. Events reach the log only
+//! replay the stray session is stopped. A stray of a thread the hub keeps no watermark of (one
+//! the log never had, one of another box deleted, one purged: `Core::tracks`) is acked without
+//! a commit or a classification, so nothing of a made-up thread is kept; a frame whose thread
+//! has no thread id's shape closes the connection. Events reach the log only
 //! here: the session's `AdapterHandle` carries commands out and never events in
 //! ([`crate::remote`]), so nothing is appended twice. A frame whose commit keeps failing
 //! closes the connection unacked (the runner sends it again), and so does any frame once the
@@ -167,7 +196,7 @@ use twr_core::runner::{
     Op, RunnerMsg, Secret, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
-use super::supervisor::{close_exited, give_up_runtime, persist, supervise, Closed};
+use super::supervisor::{close_exited, give_up_runtime, persist, supervise, sync_wal, Closed};
 use super::{box_switch, git, Batch, Core, Exit, Hub, HubState, Inner, Live, PendingExit};
 use crate::remote::{self, BoxToken, ConnTx, Connect, RemoteBox, SEND_QUEUE};
 use crate::store::{self, RunnerAck};
@@ -191,6 +220,24 @@ pub const ACK_BATCH_FRAMES: usize = 256;
 
 /// Longest a committed frame waits for its batch to be synced and acked.
 pub const ACK_BATCH_DELAY: Duration = Duration::from_millis(50);
+
+/// Longest thread id a runner frame may name: the hub's ids are ULIDs (26 characters).
+pub const MAX_THREAD_ID_BYTES: usize = 64;
+
+/// Most strays one connection remembers having stopped ([`Conn::stop_stray`]); past that it
+/// forgets them all (a stray seen again is told to stop again, which does nothing more).
+const MAX_STOPPED: usize = 1024;
+
+/// Whether `thread` has the shape of a thread id the hub makes (a ULID; at most
+/// [`MAX_THREAD_ID_BYTES`] ASCII letters, digits, `-` and `_`). A frame naming anything else
+/// closes its connection: nothing of it could be the hub's.
+fn thread_id_shaped(thread: &str) -> bool {
+    !thread.is_empty()
+        && thread.len() <= MAX_THREAD_ID_BYTES
+        && thread
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
 
 /// A runner connection's right to commit: it holds while the connection is the box's current
 /// one. Checked under the core lock (where a newer connection replaces it, see [`serve`]),
@@ -307,6 +354,16 @@ struct Conn {
     ///
     /// [`HubOptions::ack_batch_delay`]: crate::HubOptions::ack_batch_delay
     batch_delay: Duration,
+    /// Syncs the store's write-ahead log without the core lock ([`flush_acks`]).
+    wal: store::WalSync,
+    /// The box's generation, when the welcome sent it while the box was forgotten: the runner
+    /// took it once it says `synced` (it does so after the welcome), and the box is no longer
+    /// forgotten then ([`store::Store::confirm_runner_box`]).
+    confirm: Option<String>,
+    /// The welcome had the runner forget its spool (the box was removed, and what its runner
+    /// had not delivered is gone): the hub adopted none of its sessions, and the
+    /// reconciliation ends every one of them ([`reconcile`]).
+    forgets: bool,
 }
 
 impl Conn {
@@ -347,7 +404,13 @@ impl Conn {
     /// Stops run `run` of a stray session once per connection (only once the box is ready:
     /// before that, the reconciliation stops what is left).
     fn stop_stray(&mut self, thread: &str, run: Option<String>) {
-        if self.synced && self.stopped.insert((thread.to_string(), run.clone())) {
+        if !self.synced || self.stopped.contains(&(thread.to_string(), run.clone())) {
+            return;
+        }
+        if self.stopped.len() >= MAX_STOPPED {
+            self.stopped.clear();
+        }
+        if self.stopped.insert((thread.to_string(), run.clone())) {
             self.rbox.stop_stray(self.epoch, thread, run);
         }
     }
@@ -560,6 +623,31 @@ pub(super) enum Admission {
     Sealed(String),
 }
 
+/// What [`Core::sweep_runner_acks`] forgot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Swept {
+    /// Boxes forgotten (removed: recorded, and the hub started without them).
+    pub boxes: usize,
+    /// Their watermarks.
+    pub box_watermarks: usize,
+    /// Watermarks of threads the hub does not track.
+    pub thread_watermarks: usize,
+    /// The names of the removal record the sweep is done with: forgotten (now or before), or
+    /// configured again. They can come out of the record once the forgets are durable.
+    pub settled: BTreeSet<String>,
+}
+
+/// Why an authenticated connection was not welcomed ([`serve`]).
+enum Unwelcome {
+    /// [`RemoteBox::connect`] did not take it.
+    Connect(Connect),
+    /// The hub forgot the box (it was removed) and its runner is too old to forget its spool
+    /// ([`Inventory::spool`] absent).
+    Stale,
+    /// The box's generation could not be read or made.
+    Generation(anyhow::Error),
+}
+
 /// Why a handshake ended without an authenticated connection.
 pub(super) enum Refused {
     /// The runner speaks runner protocol `.0`, not the hub's.
@@ -581,6 +669,10 @@ pub struct SealedEnd {
     /// Welcomed, and its runner speaks this older protocol, which the hub only drains
     /// (`hub::drain`).
     pub legacy: Option<u32>,
+    /// Refused after authenticating: the hub forgot the box when it was removed, and its
+    /// runner is a twr too old to forget what it spooled for it (it speaks the hub's protocol,
+    /// or one the hub drains). The hub can't serve it, as one of another protocol.
+    pub spool_refused: bool,
 }
 
 /// What a connection's handshake ([`handshake`]) gives once it authenticated.
@@ -651,10 +743,31 @@ where
             return Err(Refused::Other);
         }
     };
+    // A name no box can have is never looked up, logged or echoed (it may be 8 KiB of
+    // anything, before authentication).
+    if twr_core::runner::validate_box_name(&hello.box_name).is_err() {
+        tracing::warn!(
+            peer,
+            len = hello.box_name.len(),
+            "runner refused: its hello names no valid box"
+        );
+        let m = refuse(
+            hub_errors::PROTOCOL,
+            "malformed hello: its box name is not a valid box name".into(),
+        );
+        refuse_unauthenticated(ws, permit, Some(m)).await;
+        return Err(Refused::Other);
+    }
+    // What a refusal before authentication notes on the box it named: on a listener's
+    // connection anyone who reaches the listener may have sent it, which the note says.
+    let unauthenticated = |reason: String| match &bound {
+        None => format!("{reason} (an unauthenticated connection from {peer})"),
+        Some(_) => reason,
+    };
     // Before anything else: a runner of another version need not speak this handshake. One of
     // an older protocol the hub drains does (`DRAINABLE_PROTOCOLS`), and goes on.
     if hello.protocol != PROTOCOL_VERSION && !drainable(hello.protocol) {
-        tracing::warn!(peer, box_name = %hello.box_name, protocol = hello.protocol, "runner refused: protocol mismatch");
+        tracing::warn!(peer, box_name = ?hello.box_name, protocol = hello.protocol, "runner refused: protocol mismatch");
         let update = if hello.protocol < PROTOCOL_VERSION {
             format!("update twr on box `{}`", hello.box_name)
         } else {
@@ -664,11 +777,11 @@ where
             .remote(&hello.box_name)
             .filter(|b| bound.as_deref().is_none_or(|n| n == b.name()));
         if let Some(b) = named {
-            b.note_refusal(format!(
+            b.note_refusal(unauthenticated(format!(
                 "a runner speaking protocol {} was refused (the hub's is {PROTOCOL_VERSION}): \
                  {update}",
                 hello.protocol
-            ));
+            )));
         }
         let m = refuse(
             hub_errors::PROTOCOL,
@@ -690,7 +803,7 @@ where
         return Err(Refused::Other);
     }
     if let Some(b) = bound.as_deref().filter(|b| *b != hello.box_name) {
-        tracing::warn!(peer, box_name = %hello.box_name, bound = %b, "runner refused: a sealed connection named another box");
+        tracing::warn!(peer, box_name = ?hello.box_name, bound = %b, "runner refused: a sealed connection named another box");
         let m = refuse(
             hub_errors::UNAUTHORIZED,
             format!("this connection is box {b}'s"),
@@ -698,11 +811,12 @@ where
         refuse_unauthenticated(ws, permit, Some(m)).await;
         return Err(Refused::Other);
     }
-    // A listener's connection naming a box the hub dials (ssh or command) is one naming a box
-    // the hub does not know; a sealed one is its box's.
+    // A listener's connection naming a box the hub dials (ssh or command) or a linked one is
+    // one naming a box the hub does not know; a sealed one is its box's (a linked box's worker
+    // is reached through the runner service on a sealed connection too, `hub::linked`).
     let rbox = hub.remote(&hello.box_name).filter(|b| match &bound {
         None => b.transport() == BoxTransport::Token,
-        Some(_) => b.transport().dialed(),
+        Some(_) => b.transport().dialed() || b.transport() == BoxTransport::Link,
     });
     // A token box's token, once: both proofs are over it, and the connection is taken only
     // while it is still the box's (`RemoteBox::connect`).
@@ -753,12 +867,13 @@ where
         }
         Next::Closed => {
             // A runner that did not accept the hub's proof leaves without a word.
-            tracing::warn!(peer, box_name = %hello.box_name, "runner left before it authenticated (did it refuse the hub's proof? its token may differ from the hub's)");
+            tracing::warn!(peer, box_name = ?hello.box_name, "runner left before it authenticated (did it refuse the hub's proof? its token may differ from the hub's)");
             if let (Some(b), None) = (&rbox, &bound) {
-                b.note_refusal(
+                b.note_refusal(unauthenticated(
                     "a runner left after the hub's challenge: it did not accept the hub's \
-                     proof, so its token likely differs from this box's token",
-                );
+                     proof, so its token likely differs from this box's token"
+                        .into(),
+                ));
             }
             return Err(Refused::Other);
         }
@@ -776,14 +891,18 @@ where
         };
         if !ok {
             b.note_refusal(match &bound {
-                None => "a runner was refused: its proof does not match this box's token",
-                Some(_) => "the box's runner was refused: it sent a proof on a sealed connection",
+                None => unauthenticated(
+                    "a runner was refused: its proof does not match this box's token".into(),
+                ),
+                Some(_) => {
+                    "the box's runner was refused: it sent a proof on a sealed connection".into()
+                }
             });
         }
         ok
     });
     let Some(rbox) = rbox else {
-        tracing::warn!(peer, box_name = %hello.box_name, "runner refused: unknown box or bad token");
+        tracing::warn!(peer, box_name = ?hello.box_name, "runner refused: unknown box or bad token");
         let m = refuse(hub_errors::UNAUTHORIZED, "unknown box or bad token".into());
         refuse_unauthenticated(ws, permit, Some(m)).await;
         return Err(Refused::Other);
@@ -812,6 +931,16 @@ where
         return Err(Refused::Other);
     }
     let refused = match next_message(&mut ws, deadline).await {
+        // A session or a spool naming no thread id: refused, as a frame naming one closes its
+        // connection (nothing of it could be the hub's).
+        Next::Msg(RunnerMsg::Inventory(inv)) if unshaped_thread(&inv).is_some() => {
+            let len = unshaped_thread(&inv).map_or(0, str::len);
+            tracing::warn!(peer, box_name = %rbox.name(), len, "a runner inventory naming no thread id; refusing the connection");
+            Some(refuse(
+                hub_errors::PROTOCOL,
+                format!("the inventory names no thread id ({len} bytes)"),
+            ))
+        }
         Next::Msg(RunnerMsg::Inventory(inv)) => {
             let (inv, odd) = checked_inventory(inv);
             for why in odd {
@@ -845,6 +974,16 @@ where
     };
     refuse_unauthenticated(ws, None, refused).await;
     Err(Refused::Other)
+}
+
+/// The first thread `inv` names that has no thread id's shape ([`thread_id_shaped`]): of a
+/// session it runs, or of the frames it still has to replay.
+fn unshaped_thread(inv: &Inventory) -> Option<&str> {
+    inv.running
+        .iter()
+        .map(|r| r.thread.as_str())
+        .chain(inv.acks_needed.keys().map(String::as_str))
+        .find(|t| !thread_id_shaped(t))
 }
 
 /// Longest runner version an inventory may report ([`checked_inventory`]).
@@ -919,60 +1058,132 @@ where
     // A runner of an older protocol is drained (`hub::drain`).
     let legacy = (protocol != PROTOCOL_VERSION).then_some(protocol);
     let mut drain_note = None;
+    // The box's generation goes to a runner that takes one (its inventory says what its spool
+    // was written under); an older runner gets none, as before, unless the hub forgot the box
+    // since (it was removed): that runner would replay frames numbered against watermarks the
+    // hub no longer has, so it is refused.
+    let takes_generation = inv.spool.is_some();
+    let stamp = inv.spool.as_ref().and_then(|s| s.generation.clone());
     let connected = {
         let mut core = hub.core();
-        let c = rbox.connect(&inv, tx.clone(), token_gen, legacy);
-        let connected = c.epoch().map(|epoch| {
-            // Not ready until synced and reconciled.
-            core.online_boxes.remove(&box_name);
-            core.adopt_remote_sessions(&hub, &rbox, &inv);
-            // The runner deletes every frame at or below a watermark it is told about, so only
-            // durable commits may be: the fenced previous connection's open ack batch (frames
-            // committed without a sync, see the module docs) is synced first. Under the same
-            // lock as the fence, so nothing commits for the box in between.
-            let watermarks = core
-                .store
-                .sync()
-                .context("syncing the store before the welcome")
-                .and_then(|()| core.store.runner_watermarks(&box_name));
-            if watermarks.is_err() {
-                // Under the same lock: nothing else saw this connection.
-                rbox.disconnect(epoch);
-            } else if let Some(p) = legacy {
-                // Gated from now on, before anything is dispatched to it.
-                drain_note = core.enter_drain(&hub, &rbox, p, &inv.version);
+        match core
+            .store
+            .runner_box(&box_name, twr_core::runner::new_generation)
+        {
+            Err(e) => Err(Unwelcome::Generation(e)),
+            Ok(g) if g.forgotten && !takes_generation => Err(Unwelcome::Stale),
+            Ok(mut g) => {
+                // A runner that took the generation already (its last connection ended before
+                // `synced`): the box is no longer forgotten.
+                if g.forgotten && stamp.as_deref() == Some(g.generation.as_str()) {
+                    match core.store.confirm_runner_box(&box_name, &g.generation) {
+                        Ok(_) => g.forgotten = false,
+                        Err(e) => {
+                            tracing::warn!(box_name = %box_name, error = %format!("{e:#}"), "cannot record that the box's runner took its generation")
+                        }
+                    }
+                }
+                // This welcome has the runner forget what it spooled (the box was removed):
+                // none of its sessions is the hub's any more (`reconcile`).
+                let forgets = takes_generation
+                    && twr_core::runner::welcome_forgets(
+                        stamp.as_deref(),
+                        &g.generation,
+                        g.forgotten,
+                    );
+                let c = rbox.connect(&inv, tx.clone(), token_gen, legacy);
+                c.epoch()
+                    .map(|epoch| {
+                        // Not ready until synced and reconciled.
+                        core.online_boxes.remove(&box_name);
+                        if !forgets {
+                            core.adopt_remote_sessions(&hub, &rbox, &inv);
+                        }
+                        // The runner deletes every frame at or below a watermark it is told
+                        // about, so only durable commits may be: the fenced previous
+                        // connection's open ack batch (frames committed without a sync, see
+                        // the module docs) is synced first, and with it the box's generation
+                        // (a runner forgets its spool for a new one). Under the same lock as
+                        // the fence, so nothing commits for the box in between.
+                        let watermarks = core
+                            .store
+                            .sync()
+                            .context("syncing the store before the welcome")
+                            .and_then(|()| core.store.runner_watermarks(&box_name));
+                        if watermarks.is_err() {
+                            // Under the same lock: nothing else saw this connection.
+                            rbox.disconnect(epoch);
+                        } else if let Some(p) = legacy {
+                            // Gated from now on, before anything is dispatched to it.
+                            drain_note = core.enter_drain(&hub, &rbox, p, &inv.version);
+                        }
+                        (epoch, watermarks, g, forgets)
+                    })
+                    .ok_or(Unwelcome::Connect(c))
             }
-            (epoch, watermarks)
-        });
-        connected.ok_or(c)
+        }
     };
-    let (epoch, watermarks) = match connected {
+    let (epoch, watermarks, generation, forgets) = match connected {
         Ok(c) => c,
         Err(why) => {
             // Nothing changed: the current connection (if any) stays.
-            let m = if why == Connect::TokenChanged {
-                tracing::warn!(box_name = %box_name, peer, "runner refused: the box's token changed while it authenticated");
-                rbox.note_refusal(
-                    "a runner was refused: the box's token changed while it authenticated",
-                );
-                refuse(
-                    hub_errors::UNAUTHORIZED,
-                    "the box's token changed while this runner authenticated".into(),
-                )
-            } else {
-                tracing::error!(box_name = %box_name, "runner refused: no epoch left for another connection of the box (restart the hub)");
-                refuse(
-                    hub_errors::EXHAUSTED,
-                    "the hub cannot number another connection of this box; restart the hub".into(),
-                )
+            let stale = matches!(why, Unwelcome::Stale);
+            let m = match why {
+                Unwelcome::Connect(Connect::TokenChanged) => {
+                    tracing::warn!(box_name = %box_name, peer, "runner refused: the box's token changed while it authenticated");
+                    rbox.note_refusal(
+                        "a runner was refused: the box's token changed while it authenticated",
+                    );
+                    Some(refuse(
+                        hub_errors::UNAUTHORIZED,
+                        "the box's token changed while this runner authenticated".into(),
+                    ))
+                }
+                Unwelcome::Connect(_) => {
+                    tracing::error!(box_name = %box_name, "runner refused: no epoch left for another connection of the box (restart the hub)");
+                    Some(refuse(
+                        hub_errors::EXHAUSTED,
+                        "the hub cannot number another connection of this box; restart the hub"
+                            .into(),
+                    ))
+                }
+                Unwelcome::Stale => {
+                    tracing::warn!(box_name = %box_name, peer, version = %inv.version, "runner refused: the hub forgot the box when it was removed, and this runner is too old to forget what it spooled for it");
+                    rbox.note_refusal(format!(
+                        "a runner of twr {} was refused: the hub forgot this box's frames when \
+                         it was removed, and a runner that old can't forget the ones it still \
+                         has (it would send them again on every connection): update twr on the \
+                         box",
+                        inv.version
+                    ));
+                    Some(refuse(
+                        hub_errors::PROTOCOL,
+                        format!(
+                            "box {box_name} was removed from the hub, which forgot what its \
+                             runner had sent, and this runner's twr can't forget what it still \
+                             has for the hub; update twr on box `{box_name}` so both run the \
+                             same twr version"
+                        ),
+                    ))
+                }
+                Unwelcome::Generation(e) => {
+                    tracing::error!(box_name = %box_name, error = %format!("{e:#}"), "runner refused: cannot read or make the box's generation");
+                    None
+                }
             };
             let _ = tokio::time::timeout(FLUSH_TIMEOUT, async {
-                if flushed_send(&mut sink, text(&m)).await.is_ok() {
-                    let _ = sink.close().await;
+                if let Some(m) = m {
+                    if flushed_send(&mut sink, text(&m)).await.is_err() {
+                        return;
+                    }
                 }
+                let _ = sink.close().await;
             })
             .await;
-            return SealedEnd::default();
+            return SealedEnd {
+                spool_refused: stale,
+                ..Default::default()
+            };
         }
     };
     let watermarks = match watermarks {
@@ -998,7 +1209,12 @@ where
             None => tracing::info!(box_name = %box_name, "{note}"),
         }
     }
-    tx.send(HubMsg::Welcome { epoch, watermarks });
+    tx.send(HubMsg::Welcome {
+        epoch,
+        watermarks,
+        generation: takes_generation.then(|| generation.generation.clone()),
+        forgotten: takes_generation && generation.forgotten,
+    });
     // The box's agent CLIs, asked on this connection while it lasts (`hub::box_agents`); not
     // of a runner the hub only drains.
     let _agents = legacy.is_none().then(|| {
@@ -1013,6 +1229,7 @@ where
         protocol_refused: None,
         build: inv.build.clone(),
         legacy,
+        spool_refused: false,
     };
     if let Some(w) = welcomed {
         let _ = w.send((inv.build.clone(), legacy));
@@ -1057,6 +1274,9 @@ where
         batched: 0,
         batch_since: None,
         batch_delay: hub.ack_batch_delay,
+        wal: hub.core().store.wal_sync(),
+        confirm: (takes_generation && generation.forgotten).then_some(generation.generation),
+        forgets,
     };
     let mut state = hub.state.subscribe();
     // Only protocol messages keep the connection open: WebSocket pings (answered by the
@@ -1220,6 +1440,17 @@ pub(super) fn set_box_token(hub: &Arc<Inner>, rbox: &RemoteBox, token: Secret) -
 /// Handles one message; `Err(reason)` closes the connection.
 async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(), String> {
     match msg {
+        // Before anything logs or keeps the name (a frame may be 16 MiB).
+        RunnerMsg::Event { thread, .. } | RunnerMsg::Exited { thread, .. }
+            if !thread_id_shaped(&thread) =>
+        {
+            let shown: String = thread.chars().take(MAX_THREAD_ID_BYTES).collect();
+            tracing::warn!(box_name = %conn.box_name(), thread = ?shown, len = thread.len(), "a runner frame naming no thread id; closing the connection");
+            return Err(format!(
+                "a frame naming no thread id ({} bytes)",
+                thread.len()
+            ));
+        }
         RunnerMsg::Event { thread, rseq, .. } | RunnerMsg::Exited { thread, rseq, .. }
             if rseq == 0 =>
         {
@@ -1372,6 +1603,16 @@ async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(),
             if hub.core().shutting_down {
                 return Err("the hub is stopping".into());
             }
+            if let Some(g) = conn.confirm.take() {
+                // The runner took the welcome's generation before it replayed (and forgot its
+                // spool then): the box's runners no longer need telling.
+                let core = hub.core();
+                if conn.fence().holds() {
+                    if let Err(e) = core.store.confirm_runner_box(conn.box_name(), &g) {
+                        tracing::warn!(box_name = %conn.box_name(), error = %format!("{e:#}"), "cannot record that the box's runner took its generation");
+                    }
+                }
+            }
             if !conn.synced {
                 reconcile(hub, conn).await;
             }
@@ -1467,16 +1708,18 @@ async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(),
 /// Ends the open ack batch of `conn`: syncs what its frames committed ([`store::Store::sync`])
 /// and then acks them (the highest rseq per thread). A sync that keeps failing closes the
 /// connection unacked (the runner sends the frames again; they are duplicates by then).
+///
+/// The frames were committed before this runs, so the sync needs no lock: it runs on a
+/// blocking thread while the hub serves everything else (an `F_FULLFSYNC` on macOS can take
+/// tens of milliseconds, and a streaming box flushes up to 20 times a second). Nothing is
+/// acked before it returns.
 async fn flush_acks(hub: &Arc<Inner>, conn: &mut Conn) -> Result<(), String> {
     conn.batched = 0;
     conn.batch_since = None;
     if conn.unacked.is_empty() {
         return Ok(());
     }
-    let synced = persist(hub, conn.box_name(), "syncing runner frames", |core| {
-        core.store.sync()
-    })
-    .await;
+    let synced = sync_wal(hub, conn.box_name(), "syncing runner frames", &conn.wal).await;
     if let Err(e) = synced {
         tracing::error!(box_name = %conn.box_name(), error = %format!("{e:#}"), "cannot sync runner frames; closing the connection (the runner sends them again)");
         return Err("store failure".into());
@@ -1516,6 +1759,14 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     // Threads whose runtime the runner lost and that crashed: they get their crash reactions
     // (and the automatic retry when it is due) but nothing from the queue.
     let mut crashed: HashSet<String> = HashSet::new();
+    // Threads closed because the welcome had the runner forget its spool (`Conn::forgets`):
+    // closed for the box's removal, not for anything they did, so their queue is not held.
+    let mut forgotten: HashSet<String> = HashSet::new();
+    let removed = format!(
+        "twr: box {box_name} was removed from the hub, and its runner forgot what this \
+         thread's runtime had done there that had not reached the hub: the session is closed \
+         (the next message resumes it)"
+    );
     let (exits, strays, threads) = {
         let mut core = hub.core();
         if !fence.holds() {
@@ -1542,6 +1793,61 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
                 .filter(|l| l.run_confirmed)
                 .and_then(|l| l.run.clone());
             let named_run = rt.and_then(|r| r.live.as_ref()).and_then(|l| l.run.clone());
+            // The runner forgot what it had not delivered (the box was removed): no session
+            // of the box is the hub's any more. Whatever the runner still runs is stopped (as
+            // a stray: its frames, including those it spooled after its inventory, are never
+            // recorded), and the hub's side of each session is closed, its open turn ended, so
+            // nothing waits for an end the runner forgot. The box was offline from the removal
+            // to this connection, so every session the hub holds is from before it.
+            if conn.forgets {
+                if let Some(run) = running {
+                    strays.push((v.id.clone(), run.clone()));
+                }
+                match generation {
+                    Some(g) => {
+                        tracing::warn!(thread = %v.id, box_name = %box_name, "closing a session of a removed box whose runner forgot its spool");
+                        if let Some(exit) =
+                            core.begin_exit_on(&v.id, g, None, removed.clone(), &fence)
+                        {
+                            forgotten.insert(v.id.clone());
+                            exits.push((v.id.clone(), exit));
+                        }
+                    }
+                    None if (process_live || v.has_work() || stop_requested)
+                        && !v.parked
+                        && v.attached.is_none() =>
+                    {
+                        tracing::warn!(thread = %v.id, box_name = %box_name, "closing a session of a removed box whose runner forgot its spool");
+                        let exit = if stop_requested {
+                            Exit::Stopped
+                        } else {
+                            Exit::Crashed {
+                                exit_code: None,
+                                stderr_tail: removed.clone(),
+                            }
+                        };
+                        let crash = matches!(exit, Exit::Crashed { .. });
+                        match core.close_process(hub, &v.id, exit) {
+                            Ok(()) => {
+                                forgotten.insert(v.id.clone());
+                                if let Some(rt) = core.rt.get_mut(&v.id) {
+                                    rt.restart_reason = None;
+                                }
+                                if crash {
+                                    if let Err(e) = core.react_to_failure(hub, &v.id) {
+                                        tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot react to a removed box's closed session");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot close a removed box's session")
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
             match (running, generation) {
                 (None, Some(g)) if process_live => {
                     tracing::warn!(thread = %v.id, box_name = %box_name, "the runner lost a live runtime");
@@ -1637,6 +1943,15 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     }
     conn.synced = true;
     let mut core = hub.core();
+    // Closed for the box's removal, not by a crash of their own: their queues go on (no crash
+    // hold, `ThreadRt::queue_held`, as for a runtime that died with the previous hub; a due
+    // retry still comes first), so the next prompt starts the runtime again on its session.
+    for thread in &forgotten {
+        if let Some(rt) = core.rt.get_mut(thread) {
+            rt.queue_held = false;
+            rt.crash_hold = None;
+        }
+    }
     // Fenced meanwhile (a token change included): the recorded commands are the newer
     // connection's to retire or send.
     if !fence.holds() {
@@ -1858,6 +2173,90 @@ impl Core {
         })
     }
 
+    /// Whether the hub keeps a watermark of `ack`'s thread from `ack`'s box: the thread is one
+    /// the registry has (on any box: one of another box is refused as foreign, below), or one
+    /// of that box deleted and still restorable (its trash item not purged), whose frames a
+    /// restore must not take for a gap. A frame of any other thread (one the log never had, or
+    /// one purged) is a stray acked without being recorded or classified: nothing of it is
+    /// kept, so a runner cannot fill `runner_acks` with made-up threads.
+    fn tracks(&self, ack: &RunnerAck) -> bool {
+        self.tracks_thread(&ack.box_name, &ack.thread)
+    }
+
+    /// [`Core::tracks`] of `thread` from box `box_name`.
+    fn tracks_thread(&self, box_name: &str, thread: &str) -> bool {
+        if self.registry.get(thread).is_some() {
+            return true;
+        }
+        self.registry
+            .deleted_view(thread)
+            .is_some_and(|v| v.box_name == box_name)
+            && !self.registry.is_purged(thread)
+    }
+
+    /// Forgets, as the hub opens (the log folded), the watermarks it keeps no longer: first
+    /// those of every box removed ([`Core::forget_box`]): named in the removal record
+    /// (`removed`, [`twr_core::config::BoxesFile::removed`]: `twr box remove` took it out of
+    /// `boxes.toml`) and not among the boxes the hub starts with (`boxes`, its config's), unless
+    /// it is forgotten already (`box.token` did it, or a start that ended before it took the
+    /// name out of the record). Then, of every box, those of threads it does not track
+    /// ([`Core::tracks`]): ones the log never had (a hub from before kept a watermark for any
+    /// frame's thread), purged, or deleted from another box. The next frame of such a thread
+    /// is a stray, acked without a watermark, so none of them can be taken for a gap.
+    ///
+    /// Only a recorded removal forgets a box: a box that is merely not in the config (a
+    /// config file missing or empty, another `XDG_CONFIG_HOME`, a box commented out by hand,
+    /// one removed before the record existed) keeps its watermarks, as its threads keep them,
+    /// should it come back. A removed box's watermarks can go only with its generation (in
+    /// the same transaction): its runner may still spool frames of its threads, numbered on
+    /// from where they were, and the box may be added again. Without its watermarks, a
+    /// thread's next frame would be a gap on every connection (the runner replays it, the hub
+    /// closes the connection, again); taking it as the start instead could record twice what
+    /// the hub committed but the runner never heard was acked. The new generation has the
+    /// runner forget its spool and number from 1 at its next welcome instead, or refuses a
+    /// runner too old to.
+    pub(super) fn sweep_runner_acks(
+        &mut self,
+        boxes: &BTreeSet<String>,
+        removed: &BTreeSet<String>,
+    ) -> anyhow::Result<Swept> {
+        let mut swept = Swept::default();
+        for b in removed {
+            // Configured again (by hand, in config.toml): no removal any more.
+            if !boxes.contains(b) && !self.store.runner_box_of(b)?.is_some_and(|g| g.forgotten) {
+                swept.box_watermarks += self.forget_box(b)?;
+                swept.boxes += 1;
+            }
+            swept.settled.insert(b.clone());
+        }
+        let stale: Vec<(String, String)> = self
+            .store
+            .runner_ack_keys()?
+            .into_iter()
+            .filter(|(b, t)| !self.tracks_thread(b, t))
+            .collect();
+        if !stale.is_empty() {
+            swept.thread_watermarks = self.store.forget_runner_acks_of(&stale)?;
+        }
+        Ok(swept)
+    }
+
+    /// Forgets box `box_name` (it was removed): its watermarks go and it gets a new generation,
+    /// in one transaction ([`store::Store::forget_runner_box`]), so the next runner of the box
+    /// forgets what it spooled under the old one ([`twr_core::runner::SpoolStamp`]). Returns
+    /// how many watermarks went.
+    pub(super) fn forget_box(&mut self, box_name: &str) -> anyhow::Result<usize> {
+        let generation = twr_core::runner::new_generation()?;
+        let n = self.store.forget_runner_box(box_name, &generation)?;
+        tracing::info!(
+            box_name,
+            watermarks = n,
+            "forgot a removed box's runner watermarks: its runner forgets its spool at its next \
+             welcome"
+        );
+        Ok(n)
+    }
+
     /// Whether `ack`'s thread is known and on another box than the frame's: then the frame is
     /// counted and logged (see the module docs).
     fn foreign(&self, ack: &RunnerAck, fence: &Fence) -> bool {
@@ -1909,6 +2308,9 @@ impl Core {
         }
         if !fence.holds() {
             return Ok(Ingested::Fenced);
+        }
+        if !self.tracks(ack) {
+            return Ok(Ingested::Stray);
         }
         match self.classify(ack)? {
             // A duplicate of another box's thread is refused like a new frame: nothing of the
@@ -2033,6 +2435,10 @@ impl Core {
         }
         if !fence.holds() {
             return Ok(Exited::Fenced);
+        }
+        // Nothing of the hub's ran it: acked, not recorded ([`Core::tracks`]).
+        if !self.tracks(ack) {
+            return Ok(Exited::Stray);
         }
         match self.classify(ack)? {
             Err((false, w)) if self.foreign(ack, fence) => return Ok(Exited::Foreign(w)),
@@ -2677,6 +3083,286 @@ mod tests {
             batched: 0,
             batch_since: None,
             batch_delay: ACK_BATCH_DELAY,
+            wal: store::WalSync::none(),
+            confirm: None,
+            forgets: false,
+        }
+    }
+
+    /// Closing an ack batch syncs the store without the core lock: while another task holds
+    /// the lock, the batch is synced and acked all the same (and only once synced). On several
+    /// workers: the hub's own tasks may wait for the lock meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ack_batch_is_synced_without_the_core_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        let (tx, mut rx) = mpsc::channel(8);
+        let (close, _close_rx) = watch::channel(None);
+        conn.tx = ConnTx::new(tx, close);
+        conn.wal = inner.core().store.wal_sync();
+        conn.ack(t, 3);
+        let syncs = hub.store_syncs();
+
+        // Another task holds the core lock (for up to 10 s, or until told to let go).
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (locked_tx, locked) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(AtomicBool::new(false));
+        let holder = {
+            let (inner, released) = (Arc::clone(&inner), Arc::clone(&released));
+            std::thread::spawn(move || {
+                let _core = inner.core();
+                locked_tx.send(()).unwrap();
+                let _ = held.recv_timeout(Duration::from_secs(10));
+                released.store(true, Ordering::SeqCst);
+            })
+        };
+        locked.recv().unwrap();
+        flush_acks(&inner, &mut conn).await.unwrap();
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the flush waited for the core lock"
+        );
+        let _ = release.send(());
+        holder.join().unwrap();
+        assert!(hub.store_syncs() > syncs, "acked without a sync");
+        match rx.try_recv() {
+            Ok(HubMsg::Ack { thread, rseq }) => assert_eq!((thread.as_str(), rseq), (t, 3)),
+            other => panic!("{other:?}"),
+        }
+        assert!(conn.unacked.is_empty());
+    }
+
+    fn frame_of(thread: &str, rseq: u64) -> RunnerMsg {
+        RunnerMsg::Event {
+            thread: thread.into(),
+            rseq,
+            turn: None,
+            body: EventBody::ThreadStarted(SessionPayload {
+                session_id: Some("s".into()),
+                ..Default::default()
+            }),
+            raw: None,
+            run: None,
+            at_ms: None,
+        }
+    }
+
+    /// A frame of a thread the log never had is a stray acked as it comes (nothing of it is
+    /// classified: no gap either) and leaves no watermark; a thread the hub has gets its
+    /// watermark as before. A frame naming no thread id closes the connection.
+    #[tokio::test]
+    async fn frames_of_made_up_threads_leave_no_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        for i in 0..50u64 {
+            let made_up = format!("01JMADEUP{i:017}");
+            // Any rseq: nothing is kept to compare it with.
+            handle(&inner, &mut conn, frame_of(&made_up, 1 + i * 7))
+                .await
+                .unwrap();
+            assert_eq!(conn.unacked.get(&made_up), Some(&(1 + i * 7)));
+        }
+        let made_up = "01JMADEUP00000000000000000";
+        handle(&inner, &mut conn, frame_of(made_up, 1000))
+            .await
+            .unwrap();
+        assert_eq!(conn.unacked.get(made_up), Some(&1000));
+        assert_eq!(conn.stopped.len(), 50, "each stray told to stop once");
+        let rows = || inner.core().store.runner_watermarks("gpu").unwrap();
+        assert!(rows().is_empty(), "{:?}", rows());
+        handle(&inner, &mut conn, frame_of(t, 1)).await.unwrap();
+        assert_eq!(rows(), BTreeMap::from([(t.to_string(), 1)]));
+
+        let long = "0".repeat(MAX_THREAD_ID_BYTES + 1);
+        for bad in [
+            "",
+            "01J TEST",
+            "01J\nforged log line",
+            "thréad",
+            long.as_str(),
+        ] {
+            let r = handle(&inner, &mut conn, frame_of(bad, 2)).await;
+            assert!(r.is_err(), "{bad:?}: {r:?}");
+            let exited = RunnerMsg::Exited {
+                thread: bad.into(),
+                rseq: 2,
+                code: None,
+                stderr_tail: String::new(),
+                run: None,
+                at_ms: None,
+            };
+            assert!(handle(&inner, &mut conn, exited).await.is_err(), "{bad:?}");
+        }
+        assert!(thread_id_shaped(&"0".repeat(MAX_THREAD_ID_BYTES)));
+        assert_eq!(rows().len(), 1);
+    }
+
+    /// A deleted thread of the box keeps its watermark while it can be restored (a restore
+    /// must not see the runner's next frame as a gap), and loses it once its trash item is
+    /// purged: its frames are strays then, acked and not recorded.
+    #[tokio::test]
+    async fn a_purged_thread_keeps_no_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        handle(&inner, &mut conn, frame_of(t, 1)).await.unwrap();
+        {
+            let mut core = inner.core();
+            core.rt(t).live = None;
+            let deleted = EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                name: "remote".into(),
+                trash: Some("item-1".into()),
+                ..Default::default()
+            });
+            core.append(&inner, t, None, Source::Hub, deleted).unwrap();
+        }
+        let rows = || inner.core().store.runner_watermarks("gpu").unwrap();
+        // Deleted, restorable: a stray of a thread the hub keeps the watermark of.
+        handle(&inner, &mut conn, frame_of(t, 2)).await.unwrap();
+        assert_eq!(rows().get(t), Some(&2));
+        assert!(inner.core().record_purged(&inner, "item-1", t, false));
+        assert!(inner.core().registry.is_purged(t) && !inner.core().deleted_rt.contains_key(t));
+        assert!(rows().is_empty(), "{:?}", rows());
+        handle(&inner, &mut conn, frame_of(t, 9)).await.unwrap();
+        assert_eq!(conn.unacked.get(t), Some(&9));
+        assert!(rows().is_empty(), "{:?}", rows());
+    }
+
+    /// As the hub opens it forgets the watermarks of threads it keeps none of (one the log
+    /// never had, one purged, one deleted from another box), as a hub from before may have
+    /// kept; those of its threads and of a deleted thread still restorable from its box stay,
+    /// and so does a box's watermark of another box's thread (the box's strays of it drain).
+    /// Every watermark of a box it starts without that the removal record names (`old`:
+    /// `twr box remove` took it out) goes too, and that box gets a forgotten generation; one
+    /// the record names that is configured again (`cpu`) is only settled, and one that merely
+    /// is not in the config (`kept`) keeps its watermarks. The next start finds nothing more
+    /// to forget.
+    #[tokio::test]
+    async fn stale_watermarks_are_forgotten_as_the_hub_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (deleted, purged, made_up) = (
+            "01JDELETED0000000000000001",
+            "01JPURGED00000000000000001",
+            "01JMADEUP00000000000000001",
+        );
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        {
+            let mut core = inner.core();
+            for (id, item) in [(deleted, "item-d"), (purged, "item-p")] {
+                let created = EventBody::ThreadCreated(ThreadCreated {
+                    name: id.to_lowercase(),
+                    box_name: "gpu".into(),
+                    runtime: "fake".into(),
+                    ..Default::default()
+                });
+                core.append(&inner, id, None, Source::Hub, created).unwrap();
+                let gone = EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                    name: id.to_lowercase(),
+                    trash: Some(item.into()),
+                    ..Default::default()
+                });
+                core.append(&inner, id, None, Source::Hub, gone).unwrap();
+            }
+        }
+        assert!(inner.core().record_purged(&inner, "item-p", purged, false));
+        let keep = [("gpu", t), ("gpu", deleted), ("cpu", t), ("kept", t)];
+        let stale = [
+            ("gpu", purged),
+            ("gpu", made_up),
+            ("cpu", deleted),
+            ("old", t),
+            ("old", deleted),
+        ];
+        {
+            let mut core = inner.core();
+            for (b, thread) in keep.iter().chain(&stale) {
+                let ack = RunnerAck {
+                    box_name: b.to_string(),
+                    thread: thread.to_string(),
+                    rseq: 4,
+                };
+                core.commit_ack(&inner, Some(&ack)).unwrap();
+            }
+        }
+        let keys = |inner: &Inner| {
+            let mut k = inner.core().store.runner_ack_keys().unwrap();
+            k.sort();
+            k
+        };
+        let owned = |set: &[(&str, &str)]| {
+            let mut k: Vec<(String, String)> = set
+                .iter()
+                .map(|(b, t)| (b.to_string(), t.to_string()))
+                .collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&inner).len(), 9);
+        drop(inner);
+        hub.shutdown().await;
+        drop(hub);
+        let mut cfg = Config::default();
+        for b in ["gpu", "cpu"] {
+            cfg.boxes.insert(
+                b.into(),
+                BoxConfig {
+                    token: Some(format!("{b}-token-0123456789abcdef")),
+                    ..Default::default()
+                },
+            );
+        }
+        let boxes: BTreeSet<String> = cfg.boxes.keys().cloned().collect();
+        let removed: BTreeSet<String> = ["old", "cpu"].map(String::from).into();
+        let mut opts = HubOptions::new(dir.path().join("twr.db"), cfg);
+        opts.removed_boxes = removed.clone();
+        let hub = crate::Hub::open(opts).await.unwrap();
+        assert_eq!(keys(&hub.inner), owned(&keep));
+        let generations = || hub.inner.core().store.runner_boxes().unwrap();
+        let old = generations();
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(old[0].0, "old");
+        assert!(old[0].1.forgotten);
+        assert_eq!(
+            hub.inner
+                .core()
+                .sweep_runner_acks(&boxes, &removed)
+                .unwrap(),
+            Swept {
+                settled: removed.clone(),
+                ..Default::default()
+            }
+        );
+        // A box removed for good stays forgotten, under the same generation.
+        assert_eq!(generations(), old);
+        hub.shutdown().await;
+    }
+
+    /// A connection remembers at most [`MAX_STOPPED`] strays it stopped.
+    #[tokio::test]
+    async fn the_strays_a_connection_stopped_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = "01JTESTTHREAD0000000000001";
+        let (hub, _) = hub_with_a_live_remote_runtime(dir.path(), t).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let mut conn = test_conn(&rbox, go_online(&inner, &rbox), true);
+        for i in 0..MAX_STOPPED * 2 + 3 {
+            conn.stop_stray(&format!("01JSTRAY{i:018}"), None);
+            assert!(conn.stopped.len() <= MAX_STOPPED);
         }
     }
 

@@ -209,7 +209,7 @@ final class RemoteHubTests: XCTestCase {
         attachment.lifetime = .keepAlways
         add(attachment)
         print("UI_BOUNDS " + String(describing: bounds))
-        var request = URLRequest(url: URL(string: "http://127.0.0.1:47323/screenshot?name=" + name)!, timeoutInterval: 15)
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:47423/screenshot?name=" + name)!, timeoutInterval: 15)
         request.httpMethod = "POST"
         request.httpBody = try XCTUnwrap(image.pngData())
         request.setValue("image/png", forHTTPHeaderField: "Content-Type")
@@ -225,10 +225,55 @@ final class RemoteHubTests: XCTestCase {
     }
 
     private func pose(_ name:String) async throws {
-        let request=URLRequest(url:URL(string:"http://127.0.0.1:47323/pose/"+name)!,timeoutInterval:240)
+        let request=URLRequest(url:URL(string:"http://127.0.0.1:47423/pose/"+name)!,timeoutInterval:240)
         let (data,response)=try await URLSession.shared.data(for:request)
         XCTAssertEqual((response as? HTTPURLResponse)?.statusCode,200,String(data:data,encoding:.utf8) ?? "Pose failed")
     }
+    /// Focused native typography regression; the host only changes this QA clone's OS setting.
+    func testNativeTextScale() async throws {
+        continueAfterFailure = false
+        var ready = URLRequest(url: URL(string: "http://127.0.0.1:47330/ready")!); ready.timeoutInterval = 1
+        guard let (_, fixtureResponse) = try? await URLSession.shared.data(for: ready), (fixtureResponse as? HTTPURLResponse)?.statusCode == 200 else { throw XCTSkip("Run the focused native-font QA fixture") }
+        for _ in 0..<100 {
+            let controller = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows).compactMap { $0.rootViewController as? TwrViewController }.first
+            web = controller?.webView
+            if web != nil { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTAssertNotNil(web)
+        try await until("return !!document.querySelector('.mobile-onboarding') && !!window.Capacitor?.Plugins?.TwrOffline")
+        for category in ["large", "accessibility-extra-large"] {
+            let (_, response) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47330/font?category=" + category)!)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            try await until("""
+              const native=await window.Capacitor.Plugins.TwrOffline.textScale();
+              const size=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--text-size'));
+              return native.scale >= \(category == "large" ? 0.9 : 1.8) && Math.abs(size-Math.min(44,13*Math.min(2.25,Math.max(.8,native.scale))))<.1;
+              """, seconds: 15)
+            let native = try await js("return await window.Capacitor.Plugins.TwrOffline.textScale()") as? [String: Any]
+            let scale = (native?["scale"] as? Double) ?? 0
+            if category == "large" { XCTAssertEqual(scale, 1, accuracy: 0.05) }
+            else { XCTAssertGreaterThan(scale, 1.8) }
+            let diagnostics = try await js("""
+              const root=document.documentElement,style=getComputedStyle(root);
+              const controls=[...document.querySelectorAll('.mobile-onboarding button,.mobile-onboarding input')].filter(e=>e.getClientRects().length);
+              const bounds=controls.map(e=>({label:e.getAttribute('aria-label')||e.textContent||e.name,box:e.getBoundingClientRect().toJSON()}));
+              return {native:await window.Capacitor.Plugins.TwrOffline.textScale(),size:style.fontSize,css:style.getPropertyValue('--text-size'),width:innerWidth,scroll:document.body.scrollWidth,controls:bounds};
+              """)
+            print("NATIVE_TEXT_SCALE category=\(category) " + String(describing: diagnostics))
+            _ = try await js("[...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub').click();return true")
+            try await until("return !!document.querySelector('input[name=code]')")
+            let targets = try await js("""
+              const controls=[...document.querySelectorAll('.pair-form button,.pair-form input')].filter(e=>e.getClientRects().length);
+              const bad=[];for(const e of controls){e.scrollIntoView({block:'center'});const box=e.getBoundingClientRect();if(box.height<43.5||box.width<43.5||box.left<-.5||box.right>innerWidth+.5)bad.push({label:e.textContent||e.name,box:box.toJSON()})}
+              return bad;
+              """) as? [Any]
+            XCTAssertEqual(targets?.count, 0, "Every pairing target must remain reachable at \(category): \(String(describing: targets))")
+            _ = try await js("[...document.querySelectorAll('.pair-form button')].find(e=>e.textContent==='Cancel').click();return true")
+        }
+    }
+
     func testRemoteHubEndToEnd() async throws {
         continueAfterFailure = false
         for _ in 0..<100 {
@@ -239,11 +284,12 @@ final class RemoteHubTests: XCTestCase {
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         XCTAssertNotNil(web)
-        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/fixture")!)
+        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47423/fixture")!)
         let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let code = try XCTUnwrap(fixture["code"] as? String)
         let hubURL = try XCTUnwrap(fixture["url"] as? String)
         let repo = try XCTUnwrap(fixture["repo"] as? String)
+        let expectedCatalogIds = try XCTUnwrap(fixture["catalogIds"] as? [String])
         if fixture["foldable"] as? Bool == true {try await pose("closed")}
 
         try await until("return !![...document.querySelectorAll('button')].find(e=>e.textContent==='Pair a hub')")
@@ -319,7 +365,7 @@ final class RemoteHubTests: XCTestCase {
         let uploaded = try await js("return window.__qaUpload") as? String
         XCTAssertTrue(uploaded?.contains(".twr-uploads/") == true)
         // A separate fixture endpoint verifies the uploaded bytes on the remote host.
-        let (verification, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/verify-upload")!)
+        let (verification, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47423/verify-upload")!)
         XCTAssertEqual(String(data: verification, encoding: .utf8), "IOS_UPLOAD_OK")
         _ = try await js("""
           await window.twr.rpc('thread.send',{thread:'ios-worker',prompt:'!ask Continue iOS QA?|Proceed|Wait\\nIOS_ANSWERED'});return true;
@@ -329,18 +375,27 @@ final class RemoteHubTests: XCTestCase {
           [...document.querySelectorAll('.mobile-tabs button,.primary-nav button')]
            .find(e=>e.getClientRects().length&&e.textContent.includes('Needs you')).click();return true;
           """)
-        try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed'))")
+        // A request's options answer only once they have been on screen for 600 ms (armed).
+        try await until("return !![...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')&&e.closest('.attention-options')?.getAttribute('data-armed')==='true')")
         _ = try await js("[...document.querySelectorAll('.attention-card button')].find(e=>e.textContent.includes('Proceed')).click();return true")
         try await until("return window.__qaEvents.some(e=>e.type==='thread' && e.event?.kind==='agent.text' && e.event?.data?.text?.includes('IOS_ANSWERED'))")
-        let commandCount = try await js("return (await window.twr.catalog()).length") as? Int
-        XCTAssertEqual(commandCount, 71)
+        let commandIds = try await js("return (await window.twr.catalog()).map(command => command.id).sort()") as? [String]
+        XCTAssertEqual(commandIds, expectedCatalogIds.sorted(), "The mobile catalog must match the generated CLI commands")
         let sizeGuard = try await js("""
           try { await window.Capacitor.Plugins.TwrTransport.send({message:'界'.repeat(750000)}); return false }
           catch(error) { return error.code==='REQUEST_TOO_LARGE' }
           """) as? Bool
         XCTAssertEqual(sizeGuard, true, "Native requests must be bounded by UTF-8 bytes without closing the socket")
-        _ = try await js("document.querySelector('button[aria-label=\"Open shell\"]').click();return true")
+        // Back to the conversation: the Chat tab on a phone, the open workspace's Orchestrator
+        // entry in the sidebar's workspace list on a wide layout.
+        _ = try await js("[...document.querySelectorAll('.mobile-tabs button,.workspace-entry.current .workspace-orchestrator,.primary-nav button')].find(e=>e.getClientRects().length&&(e.textContent==='Chat'||e.textContent.includes('Orchestrator'))).click();return true")
+        try await until("return !!document.querySelector('.composer textarea')")
+        _ = try await js("const shell=[...document.querySelectorAll('button[aria-label=\"Open shell\"]')].find(e=>e.getClientRects().length);if(shell)shell.click();else{document.querySelector('.conversation-menu summary').click();[...document.querySelectorAll('.conversation-menu button')].find(e=>e.textContent.includes('Open shell')).click();}return true")
         try await until("return !!document.querySelector('.terminal-session .xterm-helper-textarea') && !!document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]')")
+        let (fontScript, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47423/typography-script")!)
+        let typography = try await js(String(decoding: fontScript, as: UTF8.self)) as? [String: Any]
+        XCTAssertEqual(typography?["pass"] as? Bool, true, "Connected large-text terminal and composer must remain usable")
+        print("CONNECTED_TYPOGRAPHY " + String(describing: typography))
         _ = try await js("""
           window.__qaTerminal={id:document.querySelector('.terminal-session').dataset.sessionId};
           const command="printf 'ORDER_%s\\\\n' '0123456789abcdefghijklmnopqrstuvwxyz'\\r";
@@ -348,13 +403,14 @@ final class RemoteHubTests: XCTestCase {
           """)
         try await until("return (await window.twr.terminalRead(window.__qaTerminal.id)).data.includes('ORDER_0123456789abcdefghijklmnopqrstuvwxyz')")
         // Reset the real TCP connection, keeping the gateway and its PTY alive.
-        _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/drop-socket")!)
+        _ = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47423/drop-socket")!)
         try await until("try{return (await window.twr.terminalRead(window.__qaTerminal.id)).data.includes('ORDER_0123456789abcdefghijklmnopqrstuvwxyz')}catch{return false}", seconds: 45)
+        print("RECONNECT_PASS ordered PTY survived socket reset")
         // Close through the app so both the remote PTY and its local pane disappear.
         // Calling the host API alone intentionally leaves the terminal's UI history open.
         _ = try await js("document.querySelector('.terminal-tab.active button[aria-label^=\"Close \"]').click();return true")
         try await until("return !!document.querySelector('[role=dialog]')")
-        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(e=>e.textContent==='Continue').click();return true")
+        _ = try await js("[...document.querySelectorAll('[role=dialog] button')].find(e=>['Close terminal','Remove tab'].includes(e.textContent.trim())).click();return true")
         try await until("return !document.querySelector('.terminal-dock')")
         _ = try await js("await window.Capacitor.Plugins.Keyboard.hide();return true")
         // Keep the socket active beyond the former 40 second resource timeout.
@@ -362,6 +418,7 @@ final class RemoteHubTests: XCTestCase {
         try await Task.sleep(nanoseconds: 45_000_000_000)
         let drops = try await js("window.__qaWatch();return window.__qaDisconnects") as? Int
         XCTAssertEqual(drops, 0, "Long-lived native WebSocket must remain connected")
+        print("LIVENESS_PASS 45-second native socket")
         // Drive actual simulator hinge events, then inspect the app's native region bridge.
         if fixture["foldable"] as? Bool == true {
             try await dismissKeyboard()
@@ -425,7 +482,7 @@ final class RemoteHubTests: XCTestCase {
             XCTAssertEqual(restoredDraft, "FOLD_TRANSITION_DRAFT")
         }
         try await dismissKeyboard()
-        let (scriptData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47323/performance-script")!)
+        let (scriptData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:47423/performance-script")!)
         let performanceResult: Any?
         do {
             performanceResult = try await js(try XCTUnwrap(String(data: scriptData, encoding: .utf8)))
@@ -439,7 +496,7 @@ final class RemoteHubTests: XCTestCase {
         let performanceAttachment = XCTAttachment(data: performanceData, uniformTypeIdentifier: "public.json")
         performanceAttachment.name = "twr-performance";performanceAttachment.lifetime = .keepAlways;add(performanceAttachment)
         print("PERFORMANCE_JSON " + (String(data: performanceData, encoding: .utf8) ?? "{}"))
-        var performanceRequest = URLRequest(url: URL(string: "http://127.0.0.1:47323/performance")!, timeoutInterval: 15)
+        var performanceRequest = URLRequest(url: URL(string: "http://127.0.0.1:47423/performance")!, timeoutInterval: 15)
         performanceRequest.httpMethod = "POST"
         performanceRequest.httpBody = performanceData
         performanceRequest.setValue("close", forHTTPHeaderField: "Connection")

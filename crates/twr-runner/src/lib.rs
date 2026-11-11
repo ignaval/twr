@@ -15,6 +15,7 @@
 //! - [`client`]: the WebSocket connection loop behind `twr runner` ([`run`]).
 //! - [`daemon`]: an SSH box's daemon (`twr runner --daemon`): its Unix socket, the requests
 //!   made on it, and the hub's sealed connections it takes from it.
+//! - [`gone`]: noticing that the twr home a long-lived process serves is gone, and ending.
 //! - [`relay`]: what the hub's `ssh` runs on an SSH box (`twr runner --stdio`): starts the
 //!   daemon when needed, then relays bytes between ssh and the daemon's socket.
 //! - [`repos`]: a box's side of `twr box project`: finding a project's repository on the box
@@ -25,8 +26,10 @@
 pub mod agents;
 pub mod client;
 pub mod daemon;
+pub mod gone;
 pub mod lbox;
 pub mod local;
+pub mod managed;
 pub mod reap;
 pub mod relay;
 pub mod repos;

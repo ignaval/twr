@@ -19,7 +19,7 @@ use twr_core::config::Config;
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 use twr_hub::hub::ControlSubscription;
-use twr_hub::{Caller, Hub, HubOptions, NewThread, Relay};
+use twr_hub::{Caller, Hub, HubOptions, NewThread, Relay, SayOrigin};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -87,7 +87,7 @@ impl OrchRt {
 }
 
 /// The model the test orchestrator runtime reports (`thread.started` `ext.claude.model`).
-const ORCH_MODEL: &str = "claude-haiku-4-5-20251001";
+const ORCH_MODEL: &str = "claude-haiku-5-5";
 
 /// `claude-code` for the tests: every session goes to the test through a channel.
 struct OrchAdapter(mpsc::UnboundedSender<OrchRt>);
@@ -3570,14 +3570,17 @@ async fn a_lone_answer_goes_on_the_card() {
     hub.shutdown().await;
 }
 
-/// The orchestrator starts a thread at a path only inside a git repository, and never in one
-/// that is or holds the home folder, or holds or is in twr's data directory or a credentials
-/// folder: such a thread's worktree would be that folder itself. The user may.
+/// The orchestrator starts a thread at a path in a git repository or in a folder outside git,
+/// but never in a folder or repository that is or holds the home folder, or holds or is in
+/// twr's data directory or a credentials folder: such a thread's worktree would be that
+/// folder itself, or one inside it. The user may.
 #[tokio::test]
-async fn the_orchestrator_starts_threads_only_in_git_repositories() {
+async fn the_orchestrator_starts_threads_only_outside_the_home_and_data_folders() {
     let env = Env::new();
     let plain = env.path().join("plain");
     std::fs::create_dir_all(&plain).unwrap();
+    let plain_in_data = env.path().join("data").join("plain");
+    std::fs::create_dir_all(&plain_in_data).unwrap();
     let hub = env
         .hub_with(|c| c.default_runtime = "claude-code".into())
         .await;
@@ -3588,24 +3591,35 @@ async fn the_orchestrator_starts_threads_only_in_git_repositories() {
     };
     let refused = async |dir: &Path, why: &str| {
         let e = hub
-            .new_thread_by(req("a", dir), &Caller::Orchestrator)
+            .new_thread_by(req("x", dir), &Caller::Orchestrator)
             .await
             .unwrap_err();
         assert_eq!(e.code, codes::BAD_REQUEST, "{dir:?}");
         assert!(e.message.contains(why), "{e:?}");
-        assert!(hub.resolve("a").is_err());
+        assert!(
+            e.message.contains("the orchestrator starts threads only"),
+            "{e:?}"
+        );
+        assert!(hub.resolve("x").is_err());
     };
-    refused(&plain, "not in a git repository").await;
-    refused(Path::new("/"), "not in a git repository").await;
+    // A folder outside git: fine, unless it holds the home folder or twr's data, or is in it.
+    hub.new_thread_by(req("a", &plain), &Caller::Orchestrator)
+        .await
+        .unwrap();
+    refused(Path::new("/"), "the folder / holds").await;
+    refused(env.path(), "holds").await;
+    refused(&plain_in_data, "is in").await;
     // The user may start one there.
-    hub.new_thread_by(req("b", &plain), &tui()).await.unwrap();
+    hub.new_thread_by(req("b", &plain_in_data), &tui())
+        .await
+        .unwrap();
     // In a git repository: fine.
     hub.new_thread_by(req("c", &env.repo()), &Caller::Orchestrator)
         .await
         .unwrap();
     // Not in one that holds the hub's data directory (`<env>/data`).
     Env::git_init(env.path());
-    refused(&plain, "holds").await;
+    refused(&plain, "the repository").await;
     hub.shutdown().await;
 }
 
@@ -4172,14 +4186,19 @@ async fn a_suggested_message_is_never_applied_as_a_command() {
     for m in ["allow api", "set web to plan mode"] {
         let seen = hub.control_read(0, 1000).unwrap().1;
         let e = hub
-            .say_to_orchestrator_as(m, Some(seen), &tui(), true)
+            .say_to_orchestrator_as(m, Some(seen), &tui(), SayOrigin::Suggested)
             .unwrap_err();
         assert_eq!(e.code, codes::BAD_REQUEST, "{m}: {e:?}");
         assert!(e.message.contains("nothing was sent"), "{m}: {e:?}");
     }
     let seen = hub.control_read(0, 1000).unwrap().1;
     let r = hub
-        .say_to_orchestrator_as("and update the docs", Some(seen), &tui(), true)
+        .say_to_orchestrator_as(
+            "and update the docs",
+            Some(seen),
+            &tui(),
+            SayOrigin::Suggested,
+        )
         .unwrap();
     assert_eq!(r["action"], "delegate", "{r}");
     let (prompt, t) = rt.next_turn().await;
@@ -4191,7 +4210,7 @@ async fn a_suggested_message_is_never_applied_as_a_command() {
     for m in ["allow api", "set web to plan mode"] {
         let seen = hub.control_read(0, 1000).unwrap().1;
         let r = hub
-            .say_to_orchestrator_as(m, Some(seen), &tui(), false)
+            .say_to_orchestrator_as(m, Some(seen), &tui(), SayOrigin::Typed)
             .unwrap();
         assert_eq!(r["action"], "command", "{m}: {r}");
     }

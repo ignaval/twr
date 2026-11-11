@@ -1,3 +1,4 @@
+import { MessageReceipts } from "./message-receipts";
 import {
   app,
   BrowserWindow,
@@ -6,7 +7,10 @@ import {
   dialog,
   shell,
   clipboard,
+  crashReporter,
   nativeTheme,
+  screen,
+  systemPreferences,
 } from "electron";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -15,18 +19,24 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
-  copyFileSync,
-  chmodSync,
   renameSync,
-  statSync,
 } from "node:fs";
 import { join, resolve, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { pathToFileURL } from "node:url";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
 import { z } from "zod";
 import { Bridge } from "./bridge";
+import { SecureStore } from "./secure-store";
+import { DesktopTransport } from "./remote-transport";
+import { GatewaySetup } from "./gateway-setup";
+import {
+  coalesceInboxSources,
+  localInboxSources,
+  WorkspaceListing,
+} from "./inbox";
+import { localUploadRequest } from "./upload-request";
 import {
   cliArgs,
   nonInteractiveArgs,
@@ -36,14 +46,51 @@ import {
   workspaceSchema,
 } from "./validation";
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
-import { ENGINE_BINARIES, EngineDigests, cleanupEngines } from "./engines";
+import { ENGINE_BINARIES, cleanupEngines, stageEngines } from "./engines";
+import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
+import { AppServices } from "./app-services";
+import { DesktopVoice } from "./voice";
+import { RendererRecovery } from "./crash-recovery";
+import { testAutomation } from "./automation";
+import { contextMenuTemplate } from "./context-menu";
+import {
+  MIN_WINDOW,
+  restoreWindow,
+  windowStateSchema,
+  type RestoredWindow,
+} from "./window-state";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
+// Omarchy uses GNOME's secret service under Hyprland, which Chromium does not
+// recognize as a keyring desktop. Respect an explicit user-selected backend.
+if (
+  process.platform === "linux" &&
+  !app.commandLine.hasSwitch("password-store") &&
+  existsSync(
+    join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "omarchy"),
+  )
+)
+  app.commandLine.appendSwitch("password-store", "gnome-libsecret");
+// TWR_DESKTOP_TEST_AUTOMATION is honoured by development runs, and by a packaged build only
+// when its own bundle carries the QA marker (desktop/automation.ts). Otherwise it is removed
+// here, so nothing below, nor the hub or a terminal, sees it.
+const automationIgnored =
+  process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" &&
+  !testAutomation({
+    packaged: app.isPackaged,
+    env: process.env,
+    resourcesPath: process.resourcesPath,
+  });
+if (automationIgnored) delete process.env.TWR_DESKTOP_TEST_AUTOMATION;
 if (app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION !== "1") {
   app.commandLine.removeSwitch("remote-debugging-port");
   app.commandLine.removeSwitch("remote-debugging-pipe");
+  // Chromium's fake microphone and its permission bypass are for tests only.
+  app.commandLine.removeSwitch("use-fake-ui-for-media-stream");
+  app.commandLine.removeSwitch("use-fake-device-for-media-stream");
+  app.commandLine.removeSwitch("use-file-for-fake-audio-capture");
 }
 
 let window: BrowserWindow;
@@ -55,8 +102,16 @@ let quitRequested = false;
 let connectTail: Promise<any> = Promise.resolve();
 let loginEnv: NodeJS.ProcessEnv = { ...process.env };
 let workspaceReady = false;
+let localGeneration = 0;
 const exec = promisify(execFile);
 let openingTerminals = 0;
+let remoteTransport: DesktopTransport;
+let services: AppServices | undefined;
+let hubVersion: string | undefined;
+let voice: DesktopVoice | undefined;
+// The microphone is granted only after the user turned voice mode on (`voice-arm`), and only
+// for audio, to the app's own page.
+let microphoneArmed = false;
 const terminals = new Map<
   string,
   {
@@ -120,6 +175,8 @@ function applyNativeAppearance() {
 const devUrl = !app.isPackaged ? process.env.TWR_DESKTOP_DEV_URL : undefined;
 if (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
   app.setPath("userData", resolve(process.env.TWR_DESKTOP_TEST_USER_DATA));
+// Crash reports stay on this machine (app.getPath("crashDumps")); nothing is uploaded.
+crashReporter.start({ uploadToServer: false });
 const appFile = resolve(__dirname, "../dist/index.html");
 const env = (): NodeJS.ProcessEnv => ({
   ...loginEnv,
@@ -157,17 +214,36 @@ function trusted(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent) {
   )
     throw new Error("Untrusted desktop page");
 }
-function handle(channel: string, callback: (...args: any[]) => any) {
-  ipcMain.handle(`twr:${channel}`, (event, ...args) => {
+// The login environment and the staged engines. The window opens before they are
+// ready; every handler that runs a program or uses its PATH waits for them, so
+// nothing ever runs with the launch environment by mistake.
+let markEnvReady!: () => void;
+let failEnv!: (error: unknown) => void;
+const envReady = new Promise<void>((resolve, reject) => {
+  markEnvReady = resolve;
+  failEnv = reject;
+});
+envReady.catch(() => {});
+function handle(
+  channel: string,
+  callback: (...args: any[]) => any,
+  needsEnvironment = false,
+) {
+  ipcMain.handle(`twr:${channel}`, async (event, ...args) => {
     trusted(event);
+    if (needsEnvironment) await envReady;
     return callback(...args);
   });
 }
+const handleWithEnvironment = (
+  channel: string,
+  callback: (...args: any[]) => any,
+) => handle(channel, callback, true);
 function companion() {
   if (!bridge) throw new Error("Connect to a workspace first");
   return bridge;
 }
-function findBinaries() {
+async function findBinaries() {
   const dirs = app.isPackaged
     ? [join(process.resourcesPath, "bin")]
     : ([
@@ -185,31 +261,9 @@ function findBinaries() {
     );
   // Persistent hubs must never depend on an AppImage mount or macOS app translocation.
   const root = join(app.getPath("userData"), "engines");
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  const cache = new EngineDigests(join(root, "digests.json"));
-  const sourceHashes = new Map(
-    ENGINE_BINARIES.map((name) => [name, cache.digest(join(dir, name))]),
-  );
-  const digest = createHash("sha256")
-    .update(JSON.stringify([...sourceHashes]))
-    .digest("hex");
-  const stable = join(app.getPath("userData"), "engines", digest);
-  mkdirSync(stable, { recursive: true, mode: 0o700 });
-  for (const name of ENGINE_BINARIES) {
-    const target = join(stable, name);
-    const source = join(dir, name);
-    if (
-      !existsSync(target) ||
-      cache.digest(target) !== sourceHashes.get(name)
-    ) {
-      const scratch = join(stable, `.${name}-${randomUUID()}`);
-      copyFileSync(source, scratch);
-      chmodSync(scratch, 0o755);
-      renameSync(scratch, target);
-      cache.digest(target);
-    }
-  }
-  cache.save();
+  // A packaged build ships its engines' digests; a development checkout's
+  // binaries change under it, so they are always hashed.
+  const stable = await stageEngines(dir, root, app.isPackaged);
   setTimeout(
     () =>
       void cleanupEngines(
@@ -240,36 +294,38 @@ function findBinaries() {
 async function loadLoginEnvironment() {
   if (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA) return;
   const program = process.env.SHELL || "/bin/sh";
-  if (!isAbsolute(program) || !existsSync(program)) return;
-  try {
-    const { stdout } = await exec(
-      program,
-      ["-ilc", "printf '\\0TWR_DESKTOP_ENV\\0'; /usr/bin/env -0"],
-      { timeout: 8000, maxBuffer: 4 * 1024 * 1024 },
+  if (!isAbsolute(program) || !existsSync(program)) {
+    services?.log.warn(
+      "environment",
+      `Login shell ${program} was not found; using the launch environment`,
     );
-    const marker = "\0TWR_DESKTOP_ENV\0";
-    const start = stdout.indexOf(marker);
-    if (start < 0) return;
-    for (const entry of stdout.slice(start + marker.length).split("\0")) {
-      const equals = entry.indexOf("=");
-      if (equals <= 0) continue;
-      const key = entry.slice(0, equals);
-      // Preserve identity and harness controls; never turn an agent-launched process into a user.
-      if (
-        /^(?:TWR_AGENT$|TWR_ORCH_TOKEN|TWR_TEST_USER_TOKEN_FILE$|TWR_DESKTOP_|ELECTRON_|NODE_OPTIONS$|NODE_PATH$)/.test(
-          key,
-        )
-      )
-        continue;
-      if (
-        ["TWR_HOME", "TWR_WORKSPACE"].includes(key) &&
-        process.env[key] !== undefined
-      )
-        continue;
-      loginEnv[key] = entry.slice(equals + 1);
+    return;
+  }
+  const started = Date.now();
+  try {
+    const values = parseLoginEnvironment(
+      await runLoginShell(program),
+      process.env,
+    );
+    if (!values) {
+      services?.log.warn(
+        "environment",
+        `${program} printed no environment; using the launch environment`,
+      );
+      return;
     }
-  } catch {
-    /* A broken login shell does not prevent opening settings or diagnosing it. */
+    Object.assign(loginEnv, values);
+    services?.log.info(
+      "environment",
+      `Read the login environment from ${program} in ${Date.now() - started} ms`,
+    );
+  } catch (error) {
+    // A broken login shell does not prevent opening settings or diagnosing it.
+    services?.log.warn(
+      "environment",
+      `Could not read the login environment from ${program}; using the launch environment`,
+      error,
+    );
   }
 }
 async function cli(args: unknown) {
@@ -300,11 +356,19 @@ async function cli(args: unknown) {
 }
 async function connect(name: unknown) {
   const next = workspaceSchema.parse(name);
-  const task = connectTail.then(() => connectWorkspace(next));
+  const generation = localGeneration;
+  // The generation is taken before waiting, so leaving the local hub while the
+  // environment loads still cancels this connection.
+  const task = connectTail.then(async () => {
+    await envReady;
+    if (generation !== localGeneration)
+      throw new Error("This hub connection was closed");
+    return connectWorkspace(next, generation);
+  });
   connectTail = task.catch(() => {});
   return task;
 }
-async function connectWorkspace(next: string) {
+async function connectWorkspace(next: string, generation: number) {
   workspaceReady = false;
   emit({ type: "connection", connected: false });
   const previous = bridge;
@@ -323,6 +387,10 @@ async function connectWorkspace(next: string) {
     const hubInfo = await current.call("desktop.ensure_hub", {
       binary: binaries.twr,
     });
+    if (generation !== localGeneration || bridge !== current) {
+      current.close();
+      throw new Error("This hub connection was closed");
+    }
     workspace = next;
     workspaceReady = true;
     emit({ type: "connection", connected: true });
@@ -330,6 +398,7 @@ async function connectWorkspace(next: string) {
       .call("notify.looking", { looking: window?.isFocused() || false })
       .catch(() => {});
     saveDesktopSettings({ workspace: next });
+    hubVersion = hubInfo.version;
     return {
       ...paths,
       hubVersion: hubInfo.version,
@@ -337,9 +406,38 @@ async function connectWorkspace(next: string) {
     };
   } catch (error) {
     // Retain the companion for config repair, while blocking workspace-bound commands.
+    services?.log.warn("hub", `Could not open workspace ${next}`, error);
     emit({ type: "config-available", error: String(error) });
     throw error;
   }
+}
+/** The third-party notices every package carries (scripts/notices.mjs), in the browser. */
+const noticesPath = () =>
+  app.isPackaged
+    ? join(process.resourcesPath, "THIRD-PARTY-LICENSES.html")
+    : resolve(__dirname, "../dist-notices/THIRD-PARTY-LICENSES.html");
+function openNotices() {
+  const path = noticesPath();
+  // Automated QA (scripts/integration.mjs) reads what would have opened.
+  if (process.env.TWR_DESKTOP_TEST_AUTOMATION === "1") {
+    (globalThis as { __twrOpenedNotices?: object }).__twrOpenedNotices = {
+      path,
+      exists: existsSync(path),
+    };
+    return;
+  }
+  if (!existsSync(path)) {
+    dialog.showErrorBox(
+      "Third-party licences not found",
+      app.isPackaged
+        ? `This copy of twr has no ${path}. Reinstall it from the release page.`
+        : "Write them with node scripts/notices.mjs in clients/.",
+    );
+    return;
+  }
+  void shell.openPath(path).then((error) => {
+    if (error) dialog.showErrorBox("Could not open the licences", error);
+  });
 }
 function omarchyTheme(): Record<string, string> | null {
   if (process.platform !== "linux") return null;
@@ -363,6 +461,168 @@ function omarchyTheme(): Record<string, string> | null {
   }
 }
 function register() {
+  services!.register(handle, (channel, callback) =>
+    ipcMain.on(`twr:${channel}`, (event, ...args) => {
+      try {
+        trusted(event);
+        callback(...args);
+      } catch (error) {
+        services?.logRejected(channel, error);
+      }
+    }),
+  );
+  const vault = new SecureStore(
+    join(app.getPath("userData"), "secure", "connections"),
+  );
+  const offlineVault = new SecureStore(
+    join(app.getPath("userData"), "secure", "offline"),
+  );
+  remoteTransport = new DesktopTransport(
+    vault,
+    (message) => {
+      if (window && !window.isDestroyed())
+        window.webContents.send("twr:remote-message", { message });
+    },
+    !app.isPackaged,
+  );
+  // Created once the engines are staged; every gateway handler waits for them.
+  let gatewaySetup: GatewaySetup | undefined;
+  const gateway = () =>
+    (gatewaySetup ||= new GatewaySetup(
+      binaries.gateway,
+      env,
+      join(app.getPath("userData"), "gateway.log"),
+      (url, timeout) => remoteTransport.check(url, timeout),
+      (settings) => saveDesktopSettings({ gateway: settings }),
+      desktopSettings.gateway,
+    ));
+  const messageReceipts = new MessageReceipts(
+    new SecureStore(join(app.getPath("userData"), "secure", "receipts")),
+  );
+  handle("send-message", (input) => {
+    const message = z
+      .object({
+        id: z.uuid(),
+        workspace: z.string().min(1).max(100),
+        method: z.enum(["say", "thread.send"]),
+        params: z.record(z.string(), z.unknown()),
+        createdAt: z.number().finite(),
+      })
+      .parse(input);
+    if (!workspaceReady || message.workspace !== workspace)
+      throw new Error(
+        "Connect to this message’s workspace before delivering it",
+      );
+    if (JSON.stringify(message.params).length > 2 * 1024 * 1024)
+      throw new Error("Message exceeds 2 MiB");
+    const currentBridge = companion();
+    return messageReceipts.send(message, () =>
+      currentBridge.call(message.method, message.params),
+    );
+  });
+  handle("secure-read", (key) =>
+    offlineVault.read(z.string().max(512).parse(key)),
+  );
+  handle("secure-write", (key, value) =>
+    offlineVault.write(
+      z.string().max(512).parse(key),
+      z
+        .string()
+        .max(8 * 1024 * 1024)
+        .parse(value),
+    ),
+  );
+  handle("secure-delete", (key) =>
+    offlineVault.delete(z.string().max(512).parse(key)),
+  );
+  const workspaceListing = new WorkspaceListing(
+    async (timeout, detail) =>
+      JSON.parse(
+        (
+          await exec(
+            binaries.twr,
+            ["ws", "list", "--json", ...(detail ? ["--detail"] : [])],
+            {
+              env: env(),
+              timeout,
+              // With --detail it carries every running workspace's threads and requests.
+              maxBuffer: (detail ? 64 : 1) * 1024 * 1024,
+            },
+          )
+        ).stdout,
+      ),
+    5000,
+  );
+  handleWithEnvironment(
+    "inbox-sources",
+    // One refresh at a time: a request during a refresh shares its result.
+    // The listing has its own 5 s budget and reads every running workspace once; a
+    // workspace it could not read that way (an older CLI, a listing that failed) is read
+    // on its own, and those reads then get 4 s.
+    coalesceInboxSources(async () =>
+      localInboxSources(
+        await workspaceListing.get(),
+        (name) => {
+          // The open workspace is read over its own connection: a second bridge process
+          // and hub connection for it cost ~300 ms and a peer check on every refresh.
+          const live = bridge;
+          if (live && workspaceReady && name === workspace)
+            return {
+              call: (method: string, params?: any) =>
+                live.call(method, params, 5000),
+              close: () => {},
+            };
+          return new Bridge(
+            binaries.bridge,
+            name,
+            { ...env(), TWR_BRIDGE_READ_ONLY: "1" },
+            () => {},
+          );
+        },
+        4000,
+      ),
+    ),
+  );
+  handle("remote-list", () => remoteTransport.listHubs());
+  handle("remote-pair", (request) => remoteTransport.pair(request));
+  handle("remote-connect", (request) => remoteTransport.connect(request));
+  handle("remote-send", (request) => remoteTransport.send(request));
+  handle("remote-disconnect", () => remoteTransport.disconnect());
+  handle("remote-remove", (request) => remoteTransport.removeHub(request));
+  handle("remote-reset", () => remoteTransport.resetSavedHubs());
+  handleWithEnvironment("gateway-status", () => gateway().status());
+  handleWithEnvironment("gateway-cancel-invitation", () =>
+    gateway().cancelInvitation(),
+  );
+  handleWithEnvironment("gateway-stop", () => gateway().stop());
+  handleWithEnvironment("gateway-settings", () => gateway().saved());
+  handle("gateway-check", (request) => remoteTransport.check(request.url));
+  handleWithEnvironment("gateway-setup", (request) => gateway().setup(request));
+  handleWithEnvironment("gateway-restart", (request) =>
+    gateway().restart(request),
+  );
+  handleWithEnvironment("gateway-invite", (request) =>
+    gateway().invite(request),
+  );
+  handle("deactivate-local", async () => {
+    ++localGeneration;
+    workspaceReady = false;
+    void bridge?.call("notify.looking", { looking: false }).catch(() => {});
+    bridge?.close();
+    bridge = undefined;
+    // Native PTYs remain owned by the app and are restored on returning locally.
+    // Switching a hub never discards a running shell, editor, or build.
+    for (const session of terminals.values()) {
+      session.outstanding = 0;
+      if (!session.exited) {
+        try {
+          session.process.resume();
+        } catch {
+          /* Exit notification may still be queued. */
+        }
+      }
+    }
+  });
   handle("set-appearance", (value) => {
     const next = appearanceSchema.parse(value);
     appearance = next;
@@ -381,8 +641,36 @@ function register() {
   handle("quit", () => {
     app.quit();
   });
+  voice = new DesktopVoice(() => binaries.twr, env, emit);
+  handleWithEnvironment("voice-status", () => voice!.status());
+  handleWithEnvironment("voice-setup", () => voice!.setup());
+  handle("voice-arm", async (on) => {
+    microphoneArmed = z.boolean().parse(on);
+    // Voice QA (scripts/voice-qa.mjs) plays a recording as the microphone in a development
+    // build: no system access is asked for. A packaged build always asks.
+    const voiceQa =
+      !app.isPackaged && process.env.TWR_DESKTOP_TEST_AUTOMATION === "1";
+    if (microphoneArmed && process.platform === "darwin" && !voiceQa) {
+      // macOS asks once; after that its answer stands until changed in System Settings.
+      const access = systemPreferences.getMediaAccessStatus("microphone");
+      const granted =
+        access === "granted" ||
+        (access === "not-determined" &&
+          (await systemPreferences.askForMediaAccess("microphone")));
+      if (!granted) {
+        microphoneArmed = false;
+        throw new Error(
+          "Microphone access is off for twr. Turn it on in System Settings > Privacy & Security > Microphone.",
+        );
+      }
+    }
+  });
+  handleWithEnvironment("voice-transcribe", (recording, hint) =>
+    voice!.transcribe(recording, hint),
+  );
+  handleWithEnvironment("voice-speaker", (op) => voice!.speakerControl(op));
   let catalog: ReturnType<typeof discoverCatalog> | undefined;
-  handle(
+  handleWithEnvironment(
     "catalog",
     () =>
       (catalog ||= discoverCatalog(
@@ -399,7 +687,7 @@ function register() {
           items.filter(
             (item) =>
               !["update", "mcp"].includes(item.cli?.[0] || "") &&
-              item.cli?.join(" ") !== "hub",
+              !["hub", "voice transcribe"].includes(item.cli?.join(" ") || ""),
           ),
         )
         .catch((error) => {
@@ -409,6 +697,7 @@ function register() {
   );
   handle("bootstrap", () => ({
     workspace,
+    hostId: "local",
     platform: process.platform,
     home: homedir(),
     version: app.getVersion(),
@@ -421,14 +710,27 @@ function register() {
     })),
   }));
   handle("connect", connect);
+  handle(
+    "upload-request",
+    localUploadRequest(() => ({
+      workspace,
+      ready: workspaceReady,
+      bridge: companion(),
+    })),
+  );
   handle("rpc", (method, params) => {
     z.string().max(100).parse(method);
-    if (method === "desktop.check_updates") return checkUpdates();
+    if (method === "desktop.check_updates") return services!.updater.check();
+    if (method === "desktop.runner.use")
+      return companion().call(method, { binary: binaries.twr });
     if (
       method.startsWith("desktop.") &&
       ![
         "desktop.subscribe",
         "desktop.preferences",
+        "desktop.runner.use",
+        "desktop.runner.cancel",
+        "desktop.runner.status",
         "desktop.retry_attention",
         "desktop.parse_slash",
         "desktop.slash_commands",
@@ -443,7 +745,7 @@ function register() {
       throw new Error("Request too large");
     return companion().call(method, params);
   });
-  handle("cli", cli);
+  handleWithEnvironment("cli", cli);
   handle("config-read", () => companion().call("desktop.config.read"));
   handle("config-save", (content, hash) =>
     companion().call("desktop.config.save", {
@@ -492,7 +794,7 @@ function register() {
     if (!result.canceled && result.filePath)
       writeFileSync(result.filePath, text, { mode: 0o600 });
   });
-  handle("terminal-open", async (request) => {
+  handleWithEnvironment("terminal-open", async (request) => {
     if (!workspaceReady)
       throw new Error("Connect to the workspace before starting a terminal");
     const terminalWorkspace = workspace;
@@ -564,6 +866,10 @@ function register() {
         const data = session.pending;
         session.pending = "";
         session.sequence++;
+        if (!workspaceReady) {
+          session.outstanding = 0;
+          return;
+        }
         session.outstanding += data.length;
         emit({ type: "terminal-data", id, data, sequence: session.sequence });
         if (session.outstanding > 512 * 1024) session.process.pause();
@@ -670,40 +976,131 @@ function register() {
     } catch {}
   });
 }
-async function checkUpdates() {
-  const response = await fetch(
-    "https://api.github.com/repos/ignaval/twr/releases/latest",
-    {
-      headers: { Accept: "application/vnd.github+json" },
-      signal: AbortSignal.timeout(15000),
-    },
-  );
-  if (!response.ok)
-    throw new Error(
-      `Could not check releases (${response.status}). Try again later.`,
-    );
-  const release = (await response.json()) as any;
-  const assets = (release.assets || [])
-    .filter((a: any) => /\.dmg$|\.AppImage$|\.pkg\.tar\.zst$/.test(a.name))
-    .map((a: any) => ({ name: a.name, url: a.browser_download_url }));
-  return {
-    installed: app.getVersion(),
-    latest: release.tag_name,
-    release_page: release.html_url,
-    desktop_installers: assets,
-    message: assets.length
-      ? "Download the desktop installer for your platform. The application and bundled engine must be updated together."
-      : "This release does not contain desktop installers yet. The current bundled engine has not been changed.",
-  };
+function showWindow() {
+  // During a quit (including an update restart) a relaunch hands over to this
+  // process; never reopen a window that is closing.
+  if (quitRequested) return;
+  if (!window || window.isDestroyed()) {
+    void createWindow();
+    return;
+  }
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
 }
-async function createWindow() {
+const rendererRecovery = new RendererRecovery();
+let reloadRequested = false;
+let crashDialogOpen = false;
+function loadApp(target: BrowserWindow) {
+  return devUrl ? target.loadURL(devUrl) : target.loadFile(appFile);
+}
+async function recoverRenderer(target: BrowserWindow, reason: string) {
+  const requested = reloadRequested;
+  reloadRequested = false;
+  const action = rendererRecovery.gone(reason, {
+    quitting: quitting || quitRequested || target.isDestroyed(),
+    requested,
+  });
+  if (action === "ignore") return;
+  const reload = () => {
+    if (!target.isDestroyed())
+      loadApp(target).catch((error) =>
+        services?.log.error("renderer", "Could not reload the window", error),
+      );
+  };
+  if (action === "reload") {
+    services?.log.warn("renderer", `Reloading the window (${reason})`);
+    reload();
+    return;
+  }
+  if (crashDialogOpen) return;
+  crashDialogOpen = true;
+  try {
+    services?.log.error(
+      "renderer",
+      `The window ended repeatedly (${reason}); asking before reloading`,
+    );
+    // A question on a hidden background window would never be seen.
+    if (!target.isVisible()) target.show();
+    const { response } = await dialog.showMessageBox(target, {
+      type: "error",
+      message: "twr's window keeps stopping",
+      detail: `The window ended unexpectedly (${reason}) several times in the last few minutes. The hub, its agents and open terminals keep running. Help › Copy Diagnostics records what happened.`,
+      buttons: ["Reload", "Quit twr"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (response === 1) app.quit();
+    else reload();
+  } finally {
+    crashDialogOpen = false;
+  }
+}
+/** Restores maximized/full-screen state and saves the window's placement as it changes. */
+function rememberPlacement(
+  target: BrowserWindow,
+  placement: RestoredWindow,
+  hidden: boolean,
+) {
+  const restoreState = () => {
+    if (placement.fullscreen) target.setFullScreen(true);
+    else if (placement.maximized) target.maximize();
+  };
+  // maximize() would also show a window that starts hidden.
+  if (hidden) target.once("show", restoreState);
+  else restoreState();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const save = () => {
+    clearTimeout(timer);
+    timer = undefined;
+    if (target.isDestroyed() || target.isMinimized()) return;
+    const state = {
+      ...target.getNormalBounds(),
+      maximized: target.isMaximized(),
+      fullscreen: target.isFullScreen(),
+    };
+    const parsed = windowStateSchema.safeParse(state);
+    if (
+      parsed.success &&
+      JSON.stringify(parsed.data) !== JSON.stringify(desktopSettings.window)
+    )
+      try {
+        saveDesktopSettings({ window: parsed.data });
+      } catch (error) {
+        services?.log.warn("window", "Could not save the window size", error);
+      }
+  };
+  const later = () => {
+    clearTimeout(timer);
+    timer = setTimeout(save, 500);
+  };
+  for (const name of [
+    "resize",
+    "move",
+    "maximize",
+    "unmaximize",
+    "enter-full-screen",
+    "leave-full-screen",
+  ] as const)
+    target.on(name as "resize", later);
+  target.on("close", save);
+}
+async function createWindow(hidden = false) {
   quitting = false;
   applyNativeAppearance();
+  const primary = screen.getPrimaryDisplay();
+  const placement = restoreWindow(desktopSettings.window, [
+    primary.workArea,
+    ...screen
+      .getAllDisplays()
+      .filter((display) => display.id !== primary.id)
+      .map((display) => display.workArea),
+  ]);
   window = new BrowserWindow({
-    width: 1360,
-    height: 900,
-    minWidth: 420,
-    minHeight: 480,
+    show: !hidden,
+    ...placement.bounds,
+    minWidth: MIN_WINDOW.width,
+    minHeight: MIN_WINDOW.height,
     title: "twr",
     backgroundColor: appearance.background,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
@@ -717,13 +1114,100 @@ async function createWindow() {
     },
   });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  rememberPlacement(window, placement, hidden);
+  window.webContents.on(
+    "did-start-navigation",
+    (_event, _url, _inPlace, mainFrame) => {
+      if (mainFrame) void remoteTransport?.disconnect();
+    },
+  );
+  const current = window;
+  // Electron has no default right-click menu; a page that handles the event
+  // itself (preventDefault) does not get this one.
+  window.webContents.on("context-menu", (_event, params) => {
+    const template = contextMenuTemplate(params, {
+      copyText: (text) => clipboard.writeText(text),
+      replaceMisspelling: (word) =>
+        current.webContents.replaceMisspelling(word),
+    });
+    if (template.length)
+      Menu.buildFromTemplate(template).popup({
+        window: current,
+        x: params.x,
+        y: params.y,
+      });
+  });
+  window.webContents.on("render-process-gone", (_event, details) => {
+    void remoteTransport?.disconnect();
+    void recoverRenderer(current, details.reason);
+  });
+  let hang: AbortController | undefined;
+  window.on("unresponsive", async () => {
+    if (hang || current.isDestroyed()) return;
+    services?.log.warn("renderer", "The window stopped responding");
+    hang = new AbortController();
+    const signal = hang.signal;
+    try {
+      if (!current.isVisible()) current.show();
+      const { response } = await dialog.showMessageBox(current, {
+        type: "warning",
+        message: "twr is not responding",
+        detail:
+          "You can wait for the window to respond or reload it. The hub, its agents and open terminals keep running.",
+        buttons: ["Wait", "Reload"],
+        defaultId: 0,
+        cancelId: 0,
+        signal,
+      });
+      if (response === 1 && !signal.aborted && !current.isDestroyed()) {
+        services?.log.warn("renderer", "Reloading the unresponsive window");
+        // A hung renderer cannot reload itself: end it, and the
+        // render-process-gone handler loads the page again.
+        reloadRequested = true;
+        current.webContents.forcefullyCrashRenderer();
+      }
+    } finally {
+      hang = undefined;
+    }
+  });
+  // The dialog closes on its own once the window answers again.
+  window.on("responsive", () => hang?.abort());
   window.webContents.on("will-navigate", (event, url) => {
     if (url !== (devUrl || pathToFileURL(appFile).href)) event.preventDefault();
   });
+  // Only the microphone, only for audio, only for the app's own main frame, only once the
+  // user turned voice mode on. Everything else stays refused.
+  const appPage = (url: string) => {
+    try {
+      return devUrl
+        ? new URL(url).origin === new URL(devUrl).origin
+        : new URL(url).href === pathToFileURL(appFile).href;
+    } catch {
+      return false;
+    }
+  };
   window.webContents.session.setPermissionRequestHandler(
-    (_contents, _permission, callback) => callback(false),
+    (contents, permission, callback, details) => {
+      const media = details as { mediaTypes?: string[]; isMainFrame?: boolean };
+      callback(
+        permission === "media" &&
+          microphoneArmed &&
+          contents === window.webContents &&
+          media.isMainFrame !== false &&
+          Boolean(media.mediaTypes?.length) &&
+          media.mediaTypes!.every((t) => t === "audio") &&
+          appPage(contents.getURL()),
+      );
+    },
   );
-  window.webContents.session.setPermissionCheckHandler(() => false);
+  window.webContents.session.setPermissionCheckHandler(
+    (contents, permission, _origin, details) =>
+      permission === "media" &&
+      microphoneArmed &&
+      contents === window.webContents &&
+      (details as { mediaType?: string }).mediaType === "audio" &&
+      appPage(contents.getURL()),
+  );
   window.webContents.on("will-prevent-unload", (event) => {
     const choice = dialog.showMessageBoxSync(window, {
       type: "question",
@@ -741,14 +1225,26 @@ async function createWindow() {
     }
   });
   window.on("focus", () => {
-    void bridge?.call("notify.looking", { looking: true }).catch(() => {});
+    services?.focused();
+    if (workspaceReady)
+      void bridge?.call("notify.looking", { looking: true }).catch(() => {});
   });
   window.on("blur", () => {
-    void bridge?.call("notify.looking", { looking: false }).catch(() => {});
+    if (workspaceReady)
+      void bridge?.call("notify.looking", { looking: false }).catch(() => {});
   });
   window.on("close", async (event) => {
+    // Background mode: keep the renderer, hub connection and terminals alive.
+    if (!quitting && !quitRequested && services?.background) {
+      event.preventDefault();
+      services.log.info("window", "Hiding the window (background mode)");
+      window.hide();
+      return;
+    }
     if (!quitting && [...terminals.values()].some((t) => !t.exited)) {
       event.preventDefault();
+      // Quitting from the tray while hidden: the question must be visible.
+      if (!window.isVisible()) window.show();
       const result = await dialog.showMessageBox(window, {
         type: "question",
         message: "Close active terminal sessions?",
@@ -766,23 +1262,21 @@ async function createWindow() {
     }
   });
   window.on("closed", () => {
+    services?.closed();
+    ++localGeneration;
+    workspaceReady = false;
+    void remoteTransport.disconnect();
     bridge?.close();
     bridge = undefined;
     for (const session of terminals.values())
       if (!session.exited) session.process.kill();
     terminals.clear();
   });
-  if (devUrl) await window.loadURL(devUrl);
-  else await window.loadFile(appFile);
+  await loadApp(window);
 }
 if (!app.requestSingleInstanceLock()) app.quit();
 else {
-  app.on("second-instance", () => {
-    if (window) {
-      if (window.isMinimized()) window.restore();
-      window.focus();
-    }
-  });
+  app.on("second-instance", () => showWindow());
   app
     .whenReady()
     .then(async () => {
@@ -805,8 +1299,68 @@ else {
       );
       if (savedAppearance.success) appearance = savedAppearance.data;
       applyNativeAppearance();
-      await loadLoginEnvironment();
-      binaries = findBinaries();
+      services = new AppServices(
+        {
+          window: () => (window && !window.isDestroyed() ? window : undefined),
+          showWindow,
+          emit,
+          settings: () => desktopSettings,
+          save: saveDesktopSettings,
+          prepareQuit: () => {
+            quitting = true;
+            quitRequested = true;
+          },
+          cancelQuit: () => {
+            quitting = false;
+            quitRequested = false;
+          },
+          activeTerminals: () =>
+            [...terminals.values()].filter((t) => !t.exited).length,
+          facts: () => ({
+            window:
+              window && !window.isDestroyed()
+                ? { visible: window.isVisible(), focused: window.isFocused() }
+                : "closed",
+            workspace: workspaceReady ? "connected" : "not connected",
+            hubVersion,
+            terminals: [...terminals.values()].filter((t) => !t.exited).length,
+            // What Help › Third-Party Licences opens.
+            licences: existsSync(noticesPath()) ? "present" : "missing",
+          }),
+        },
+        // Automated runs, and any run given its own --user-data-dir, keep their log with
+        // that isolated user data instead of the installed app's.
+        process.env.TWR_DESKTOP_TEST_AUTOMATION === "1" ||
+          app.commandLine.hasSwitch("user-data-dir") ||
+          (!app.isPackaged && process.env.TWR_DESKTOP_TEST_USER_DATA)
+          ? join(app.getPath("userData"), "logs")
+          : app.getPath("logs"),
+      );
+      services.start();
+      if (automationIgnored)
+        services.log.warn(
+          "app",
+          "Ignored TWR_DESKTOP_TEST_AUTOMATION: this build has no QA marker",
+        );
+      // The login shell and the engine copy run while the window opens.
+      void (async () => {
+        await loadLoginEnvironment();
+        binaries = await findBinaries();
+      })().then(
+        () => {
+          services?.log.info(
+            "app",
+            `Environment and engines ready ${Math.round(process.uptime() * 1000)} ms after launch`,
+          );
+          markEnvReady();
+        },
+        (error) => {
+          failEnv(error);
+          services?.log.error("app", "Startup failed", error);
+          dialog.showErrorBox("Could not open twr", String(error));
+          app.quit();
+        },
+      );
       register();
       if (process.platform === "linux") {
         let previous = JSON.stringify(omarchyTheme());
@@ -841,6 +1395,11 @@ else {
               },
               { type: "separator" as const },
               { role: "close" as const },
+              // macOS has Quit in the app menu; Linux needs it here so a
+              // background-mode window can always end the app.
+              ...(process.platform === "darwin"
+                ? []
+                : [{ role: "quit" as const, accelerator: "Ctrl+Q" }]),
             ],
           },
           { role: "editMenu" },
@@ -859,6 +1418,27 @@ else {
             label: "Help",
             submenu: [
               {
+                label: "Check for Updates…",
+                click: () => {
+                  showWindow();
+                  void services?.updater.check();
+                  emit({ type: "menu-settings" });
+                },
+              },
+              {
+                label: "Copy Diagnostics",
+                click: () => {
+                  if (services) clipboard.writeText(services.diagnostics());
+                },
+              },
+              {
+                label: "Open Log Folder",
+                click: () => {
+                  if (services) void shell.openPath(services.log.directory);
+                },
+              },
+              { type: "separator" as const },
+              {
                 label: "twr Documentation",
                 click: () => {
                   void shell.openExternal(
@@ -866,16 +1446,38 @@ else {
                   );
                 },
               },
+              {
+                label: "Third-Party Licences",
+                click: () => openNotices(),
+              },
             ],
           },
         ]),
       );
-      await createWindow();
+      // Packaged QA closes the window the way the title-bar button does.
+      // Synthetic input cannot reach native menu accelerators.
+      if (process.env.TWR_DESKTOP_TEST_AUTOMATION === "1")
+        process.on("SIGUSR2", () => {
+          services?.log.info("test", "Closing the window (SIGUSR2)");
+          if (window && !window.isDestroyed()) window.close();
+        });
+      await createWindow(services.startHidden);
+      services.log.info(
+        "app",
+        `Window loaded ${Math.round(process.uptime() * 1000)} ms after launch`,
+      );
+      void services
+        .probe()
+        .catch((error) =>
+          services?.log.warn("app", "Startup checks failed", error),
+        );
       app.on("activate", () => {
-        if (BrowserWindow.getAllWindows().length === 0) void createWindow();
+        services?.log.info("window", "Activated; showing the window");
+        showWindow();
       });
     })
     .catch((error) => {
+      services?.log.error("app", "Startup failed", error);
       dialog.showErrorBox("Could not open twr", String(error));
       app.quit();
     });
@@ -884,5 +1486,6 @@ else {
   });
   app.on("before-quit", () => {
     quitRequested = true;
+    voice?.dispose();
   });
 }

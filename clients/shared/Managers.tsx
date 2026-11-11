@@ -1,3 +1,7 @@
+import { RunnerPanel } from "./RunnerPanel";
+import { OfflineOptions } from "./OfflineOptions";
+import { AppOptions } from "./AppOptions";
+import { LayoutOptions } from "./LayoutOptions";
 import { errorMessage } from "./errors";
 import { AppearanceOptions } from "./AppearanceOptions";
 import { useHostAPI } from "./host";
@@ -19,16 +23,19 @@ import {
   Download,
 } from "lucide-react";
 import { numberSetting } from "./settings";
+import { modelChoices, type Choice } from "./models";
 import type { Json } from "./types";
 import {
   DataView,
   Empty,
+  ModelSelect,
   Spinner,
   formatNumber,
   Markdown,
   ResourceTable,
 } from "./ui";
 import { useEditorSessions } from "./editors";
+import { setTerminalScreenReader, terminalScreenReader } from "./a11y";
 export type Section =
   | "chat"
   | "grid"
@@ -51,6 +58,7 @@ export interface ManagerProps {
   action: (id: string, initial?: Json) => void;
   cliAction: (path: string, initial?: Json) => void;
   fail: (error: unknown) => void;
+  canAdmin?: boolean;
 }
 const meta: Record<
   string,
@@ -128,7 +136,14 @@ export function Manager(props: ManagerProps) {
     return () => clearInterval(timer);
   }, [section, load]);
   if (section === "settings")
-    return <Settings fail={fail} rpc={rpc} action={action} />;
+    return (
+      <Settings
+        fail={fail}
+        rpc={rpc}
+        action={action}
+        canAdmin={props.canAdmin !== false}
+      />
+    );
   if (!info) return null;
   const inspect = async (method: string, params: Json = {}) => {
     try {
@@ -149,12 +164,14 @@ export function Manager(props: ManagerProps) {
           className="icon-button"
           onClick={() => void load()}
           aria-label="Refresh"
+          title="Refresh"
+          aria-busy={loading || undefined}
         >
           {loading ? <Spinner /> : <RefreshCw size={18} />}
         </button>
       </header>
       {error && (
-        <div className="error-banner">
+        <div className="error-banner" role="alert">
           {error}
           <button onClick={() => void load()}>Try again</button>
         </div>
@@ -305,6 +322,9 @@ export function Manager(props: ManagerProps) {
       )}
       {section === "boxes" && data && (
         <div className="cards">
+          {props.canAdmin !== false && (
+            <RunnerPanel rpc={rpc} refresh={() => void load()} />
+          )}
           {(data.boxes || []).map((box: Json) => (
             <article className="resource-card" key={box.name}>
               <div className="card-heading">
@@ -659,9 +679,9 @@ export function Manager(props: ManagerProps) {
         </>
       )}
       {detail !== undefined && (
-        <section className="detail-result">
+        <section className="detail-result" aria-labelledby="twr-detail-title">
           <header>
-            <h2>Details</h2>
+            <h2 id="twr-detail-title">Details</h2>
             <button onClick={() => setDetail(undefined)}>Close</button>
           </header>
           {detail.kind === "job-log" ? (
@@ -771,7 +791,9 @@ function Settings({
   fail,
   rpc,
   action,
+  canAdmin,
 }: {
+  canAdmin: boolean;
   fail: ManagerProps["fail"];
   rpc: ManagerProps["rpc"];
   action: ManagerProps["action"];
@@ -788,7 +810,9 @@ function Settings({
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [loaded, setLoaded] = useState<Json>();
+  const [catalog, setCatalog] = useState<Json>();
   useEffect(() => {
+    if (!canAdmin) return;
     void hostApi
       .configRead()
       .then((c) => {
@@ -797,9 +821,13 @@ function Settings({
       })
       .catch(fail);
     void rpc("config.show").then(setLoaded).catch(fail);
-  }, [rpc, fail]);
+    // The default model's picker: an older hub has no list, and it stays free text.
+    void rpc("orchestrator.show")
+      .then((show) => setCatalog(show?.models))
+      .catch(() => {});
+  }, [rpc, fail, canAdmin]);
   useEffect(() => {
-    if (text === config?.content) return;
+    if (!config || text === config.content) return;
     const listener = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = "";
@@ -807,6 +835,18 @@ function Settings({
     window.addEventListener("beforeunload", listener);
     return () => window.removeEventListener("beforeunload", listener);
   }, [text, config]);
+  if (!canAdmin)
+    return (
+      <div className="manager">
+        <header className="section-heading">
+          <div>
+            <h1>Settings</h1>
+            <p>Preferences for this device.</p>
+          </div>
+        </header>
+        <ClientPreferences />
+      </div>
+    );
   return (
     <div className="manager">
       <header className="section-heading">
@@ -816,15 +856,7 @@ function Settings({
           <p>Make twr feel at home.</p>
         </div>
       </header>
-      <section className="settings-section">
-        <h2 id="settings-appearance-title">Appearance</h2>
-        <p>
-          {document.documentElement.dataset.mobile === "true"
-            ? "System follows your device."
-            : "System follows your desktop. On Omarchy, its current theme is used when available."}
-        </p>
-        <AppearanceOptions labelledBy="settings-appearance-title" />
-      </section>
+      <ClientPreferences />
       <section className="settings-section">
         <h2>Orchestrator</h2>
         <p>
@@ -845,6 +877,7 @@ function Settings({
         {loaded && (
           <SettingControls
             loaded={config?.settings || loaded}
+            catalog={catalog}
             fail={fail}
             saved={() => {
               void hostApi
@@ -871,6 +904,7 @@ function Settings({
               <button
                 className="icon-button"
                 aria-label="Show configuration file"
+                title="Show configuration file"
                 onClick={() => void hostApi.reveal(config.path)}
               >
                 <FolderOpen size={16} />
@@ -934,11 +968,9 @@ function Settings({
               >
                 Reload from disk
               </button>
-              {saved && (
-                <span className="success-text">
-                  Saved. Restart the hub to apply hub settings.
-                </span>
-              )}
+              <span className="success-text" role="status">
+                {saved ? "Saved. Restart the hub to apply hub settings." : ""}
+              </span>
             </div>
           </>
         )}
@@ -1009,9 +1041,14 @@ export function JobLog({
           Export log
         </button>
       </div>
-      {error && <p className="error-text">{error}</p>}
+      {error && (
+        <p className="error-text" role="alert">
+          {error}
+        </p>
+      )}
       <pre
         ref={output}
+        aria-label={`Job output ${job.slice(-8)}`}
         onScroll={() => {
           const p = output.current!;
           follow.current = p.scrollHeight - p.scrollTop - p.clientHeight < 48;
@@ -1027,7 +1064,7 @@ const scalarSettings: {
   table: string[];
   key: string;
   label: string;
-  kind: "string" | "number" | "boolean";
+  kind: "string" | "number" | "boolean" | "model";
   options?: string[];
 }[] = [
   {
@@ -1064,7 +1101,7 @@ const scalarSettings: {
     label: "Separate worktrees",
     kind: "boolean",
   },
-  { table: ["threads"], key: "model", label: "Default model", kind: "string" },
+  { table: ["threads"], key: "model", label: "Default model", kind: "model" },
   {
     table: ["threads"],
     key: "thinking",
@@ -1129,13 +1166,17 @@ const scalarSettings: {
 ];
 function SettingControls({
   loaded,
+  catalog,
   fail,
   saved,
 }: {
   loaded: Json;
+  catalog?: Json;
   fail: ManagerProps["fail"];
   saved: () => void;
 }) {
+  // `[threads] model` applies to threads of every runtime: the default runtime's models.
+  const models = modelChoices(catalog, loaded?.default_runtime);
   return (
     <div className="setting-controls">
       {scalarSettings.map((setting) => {
@@ -1146,6 +1187,7 @@ function SettingControls({
             key={setting.table.join(".") + setting.key}
             setting={setting}
             initial={value?.[setting.key]}
+            models={models}
             fail={fail}
             saved={saved}
           />
@@ -1157,11 +1199,13 @@ function SettingControls({
 function ScalarSetting({
   setting,
   initial,
+  models,
   fail,
   saved,
 }: {
   setting: (typeof scalarSettings)[number];
   initial: Json;
+  models: Choice[];
   fail: ManagerProps["fail"];
   saved: () => void;
 }) {
@@ -1220,6 +1264,16 @@ function ScalarSetting({
             setDone(false);
           }}
         />
+      ) : setting.kind === "model" && models.length ? (
+        <ModelSelect
+          label={setting.label}
+          value={value}
+          choices={models}
+          onChange={(v) => {
+            setValue(v);
+            setDone(false);
+          }}
+        />
       ) : setting.options ? (
         <select
           aria-label={setting.label}
@@ -1251,5 +1305,50 @@ function ScalarSetting({
         {busy ? <Spinner /> : done ? "Saved" : "Save"}
       </button>
     </form>
+  );
+}
+
+function ClientPreferences() {
+  return (
+    <>
+      <section className="settings-section">
+        <h2 id="settings-appearance-title">Appearance</h2>
+        <p>
+          {document.documentElement.dataset.mobile === "true"
+            ? "System follows your device."
+            : "System follows your desktop. On Omarchy, its current theme is used when available."}
+        </p>
+        <AppearanceOptions labelledBy="settings-appearance-title" />
+      </section>
+      <LayoutOptions />
+      <AccessibilityOptions />
+      <OfflineOptions />
+      <AppOptions />
+    </>
+  );
+}
+
+function AccessibilityOptions() {
+  const [reader, setReader] = useState(terminalScreenReader);
+  return (
+    <section className="settings-section">
+      <h2>Accessibility</h2>
+      <p>
+        Screen reader support lets VoiceOver, Orca and TalkBack read terminal
+        output. It can slow very busy terminals, so it is off by default.
+      </p>
+      <label className="field check-field" htmlFor="terminal-screen-reader">
+        <span>Terminal screen reader support</span>
+        <input
+          id="terminal-screen-reader"
+          type="checkbox"
+          checked={reader}
+          onChange={(event) => {
+            setReader(event.target.checked);
+            setTerminalScreenReader(event.target.checked);
+          }}
+        />
+      </label>
+    </section>
   );
 }

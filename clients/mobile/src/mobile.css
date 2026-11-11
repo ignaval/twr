@@ -1,6 +1,8 @@
 :root {
   -webkit-tap-highlight-color: transparent;
-  --mobile-bottom: calc(56px + env(safe-area-inset-bottom));
+  --mobile-bottom: calc(
+    max(56px, 1.384615rem + 34px) + env(safe-area-inset-bottom)
+  );
 }
 html,
 body,
@@ -37,7 +39,7 @@ select {
 [data-mobile="true"] input:not([type="checkbox"]),
 [data-mobile="true"] textarea,
 [data-mobile="true"] select {
-  font-size: 16px;
+  font-size: 1.230769rem;
   min-height: 44px;
 }
 [data-mobile="true"] button,
@@ -49,8 +51,8 @@ select {
   min-width: 44px;
 }
 [data-mobile="true"] .topbar {
-  min-height: 48px;
-  height: 48px;
+  min-height: max(48px, 2.4rem);
+  height: auto;
   padding-inline: 12px;
   gap: 8px;
 }
@@ -58,9 +60,9 @@ select {
   gap: 4px;
 }
 [data-mobile="true"] .topbar-title {
-  font-size: 15px;
+  font-size: 1.153846rem;
   font-weight: 600;
-  line-height: 20px;
+  line-height: 1.5;
 }
 [data-mobile="true"] .topbar-accessory {
   flex: 0 1 auto;
@@ -80,7 +82,7 @@ select {
   border-radius: 6px;
   background: transparent;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.923077rem;
   gap: 6px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -99,6 +101,9 @@ select {
 .mobile-hub-switch .status-dot {
   flex-shrink: 0;
 }
+.mobile-hub-switch .status-dot.reconnecting {
+  background: var(--warning);
+}
 [data-mobile="true"] .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -112,8 +117,8 @@ select {
   min-height: 44px;
 }
 [data-mobile="true"] .destination-chip {
-  height: 32px;
   min-height: 32px;
+  height: auto;
   padding: 0 8px;
   max-width: 100%;
 }
@@ -138,8 +143,8 @@ select {
   min-height: 44px;
   max-height: 120px;
   padding: 10px 12px;
-  font-size: 16px;
-  line-height: 24px;
+  font-size: 1.230769rem;
+  line-height: 1.5;
 }
 [data-mobile="true"] .composer-bottom {
   grid-column: 2;
@@ -199,11 +204,12 @@ select {
   opacity: 1;
 }
 [data-mobile="true"] .terminal-tabs {
-  height: 44px;
+  height: auto;
   min-height: 44px;
 }
 .terminal-accessory {
   display: flex;
+  flex-shrink: 0;
   gap: 4px;
   padding: 4px;
   background: var(--terminal-panel);
@@ -252,9 +258,18 @@ select {
   border: 0;
   background: transparent;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 16px;
+  font-size: 0.923077rem;
+  line-height: 1.5;
   font-weight: 500;
+  min-width: 0;
+}
+.mobile-tabs button > span {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .mobile-tabs button[aria-current="page"] {
   color: var(--accent);
@@ -291,18 +306,18 @@ select {
   overflow: auto;
 }
 .mobile-onboarding .wordmark {
-  font-size: 28px;
+  font-size: 2.153846rem;
   margin-bottom: 24px;
 }
 .mobile-onboarding h1 {
-  font-size: 24px;
-  line-height: 32px;
+  font-size: 1.846154rem;
+  line-height: 1.5;
   margin-top: 24px;
   margin-bottom: 8px;
 }
 .mobile-onboarding p {
   color: var(--muted);
-  font-size: 14px;
+  font-size: 1.076923rem;
   line-height: 1.6;
 }
 .mobile-onboarding > .primary {
@@ -319,12 +334,12 @@ select {
 .mobile-folder label {
   display: grid;
   gap: 8px;
-  font-size: 13px;
+  font-size: 1rem;
   font-weight: 500;
 }
 .pair-form input {
   min-height: 48px;
-  font-size: 16px;
+  font-size: 1.230769rem;
 }
 .pair-form .button-row {
   display: flex;
@@ -340,7 +355,7 @@ select {
   background: var(--panel);
 }
 .hub-connect small {
-  font-size: 12px;
+  font-size: 0.923077rem;
   overflow-wrap: anywhere;
 }
 .hub-connect span {
@@ -353,7 +368,7 @@ select {
   display: block;
   margin-top: 12px;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 0.923077rem;
   line-height: 1.6;
 }
 .mobile-hub-sheet,
@@ -381,7 +396,7 @@ select {
   background: var(--overlay);
   box-shadow: var(--shadow-pop);
   color: var(--danger);
-  font-size: 13px;
+  font-size: 1rem;
   line-height: 1.5;
 }
 .mobile-error button {
@@ -523,9 +538,9 @@ select {
     white-space: nowrap;
     color: var(--muted);
     font-family: var(--font-mono);
-    font-size: 11px;
+    font-size: 0.846154rem;
     font-weight: 400;
-    line-height: 14px;
+    line-height: 1.5;
   }
 }
 [data-fold="vertical"] .mobile-runtime,
@@ -537,9 +552,9 @@ select {
   white-space: nowrap;
   color: var(--muted);
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.846154rem;
   font-weight: 400;
-  line-height: 14px;
+  line-height: 1.5;
 }
 
 /* A separating hinge owns the gap: each pane retains independent controls. */
@@ -700,7 +715,7 @@ select {
 :root[data-mobile="true"].tiny-content .sidebar {
   overflow-y: auto;
 }
-:root[data-mobile="true"].tiny-content .thread-list {
+:root[data-mobile="true"].tiny-content .workspace-tree {
   flex: none;
   overflow: visible;
 }
@@ -758,4 +773,92 @@ select {
 }
 .mobile-onboarding > .mobile-appearance {
   margin-top: 32px;
+}
+
+/* Keep large-text controls readable in narrow and partially folded windows. */
+[data-mobile="true"] .topbar-title {
+  line-height: 1.25;
+}
+[data-mobile="true"] .composer > textarea {
+  max-height: max(120px, 4.5em);
+}
+[data-mobile="true"].tiny-content .composer > textarea {
+  max-height: max(64px, 3em);
+}
+[data-mobile="true"] .toast {
+  max-height: 40%;
+}
+[data-mobile="true"].tiny-content .toast > span {
+  max-height: 5em;
+  overflow: auto;
+}
+@media (max-width: 799px) {
+  [data-mobile="true"] .topbar-actions > [aria-label="Open shell"] {
+    display: none;
+  }
+}
+
+:root[data-mobile="true"].tiny-content .composer > textarea {
+  height: auto;
+  min-height: 44px;
+  max-height: max(64px, 3em);
+}
+:root[data-mobile="true"].tiny-content .toast {
+  max-height: min(40%, 6em);
+}
+:root[data-mobile="true"].tiny-content .toast > span {
+  max-height: 5em;
+}
+
+[data-mobile="true"] .terminal-dock.collapsed {
+  height: auto !important;
+  min-height: 44px;
+  flex: 0 0 auto;
+}
+[data-mobile="true"] .terminal-tabs {
+  height: auto;
+  min-height: 44px;
+  flex-shrink: 0;
+}
+/* A mobile terminal is an explicit workspace. Give its output the available
+   height rather than shrinking it behind growing accessibility controls. */
+:root[data-mobile="true"]:not([data-fold="horizontal"])
+  .app:has(.terminal-dock:not(.collapsed))
+  .work-area {
+  display: none;
+}
+:root[data-mobile="true"]:not([data-fold="horizontal"])
+  .terminal-dock:not(.collapsed) {
+  flex: 1;
+  height: auto;
+  max-height: none;
+  min-height: 0;
+  resize: none;
+}
+[data-mobile="true"] .terminal-search > input {
+  font-size: var(--code-size);
+}
+[data-mobile="true"] .terminal-search {
+  flex-shrink: 0;
+  gap: 8px;
+}
+[data-mobile="true"] .terminal-search > span {
+  min-width: 0;
+  max-width: 50%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* Native keyboards can leave a foldable with a short, wide viewport. Keep
+   terminal controls at their content height and leave room for output. */
+:root[data-mobile="true"].short-content
+  .app:has(.terminal-dock:not(.collapsed))
+  .topbar {
+  display: none;
+}
+[data-mobile="true"] .composer > textarea {
+  max-height: min(40dvh, calc(4lh + 20px));
+}
+:root[data-mobile="true"].tiny-content .composer > textarea {
+  max-height: min(40dvh, calc(3lh + 20px));
 }

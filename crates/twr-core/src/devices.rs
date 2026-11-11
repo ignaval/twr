@@ -83,6 +83,11 @@ impl Auth {
                 .all(|s| ["read", "operate", "terminal", "admin"].contains(&s.as_str())),
             "Unknown device scope"
         );
+        // Admin writes configuration, which can name commands the hub runs.
+        anyhow::ensure!(
+            !scopes.iter().any(|s| s == "admin") || scopes.iter().any(|s| s == "terminal"),
+            "Admin access includes running commands; grant terminal access with it"
+        );
         let mut bytes = [0u8; 10];
         SystemRandom::new().fill(&mut bytes).expect("OS entropy");
         let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -99,6 +104,20 @@ impl Auth {
         });
         self.save(&db)?;
         Ok(code)
+    }
+    /// Cancel exactly this invitation; closing an old window cannot cancel a newer code.
+    pub fn cancel_pairing(&self, code: &str) -> Result<bool> {
+        let _lock = self.lock()?;
+        let mut db = self.read()?;
+        let cancelled = db
+            .pairing
+            .as_ref()
+            .is_some_and(|pairing| pairing.hash == digest(code));
+        if cancelled {
+            db.pairing = None;
+            self.save(&db)?;
+        }
+        Ok(cancelled)
     }
     fn read(&self) -> Result<Database> {
         use std::os::unix::fs::MetadataExt;
@@ -180,23 +199,37 @@ impl Auth {
         self.save(&db)?;
         Ok((device, token))
     }
-    pub fn authenticate(&self, token: &str) -> Result<Device> {
-        anyhow::ensure!(token.len() == 64, "Unauthorized");
-        self.read()?
+    /// The device this token belongs to. `Ok(None)` means definitely no paired device has it
+    /// (never paired, revoked or replaced); `Err` means the device list could not be read,
+    /// which says nothing about the token and must not be reported as a revocation.
+    pub fn authenticate(&self, token: &str) -> Result<Option<Device>> {
+        if token.len() != 64 {
+            return Ok(None);
+        }
+        Ok(self
+            .read()?
             .devices
             .into_iter()
-            .find(|d| matches(&d.token_hash, token))
-            .context("Unauthorized")
+            .find(|d| matches(&d.token_hash, token)))
     }
     pub fn devices(&self) -> Result<serde_json::Value> {
         Ok(serde_json::json!(self.read()?.devices.into_iter().map(|d|serde_json::json!({"id":d.id,"name":d.name,"created":d.created,"scopes":d.scopes})).collect::<Vec<_>>()))
     }
-    pub fn current(&self, device: &Device) -> bool {
-        self.read().is_ok_and(|db| {
-            db.devices
-                .iter()
-                .any(|d| d.id == device.id && d.token_hash == device.token_hash)
-        })
+    /// Whether `device` is still paired with the same credential. Only
+    /// [`Standing::Revoked`] is a reason to disconnect it.
+    pub fn current(&self, device: &Device) -> Standing {
+        match self.read() {
+            Ok(db)
+                if db
+                    .devices
+                    .iter()
+                    .any(|d| d.id == device.id && d.token_hash == device.token_hash) =>
+            {
+                Standing::Current
+            }
+            Ok(_) => Standing::Revoked,
+            Err(_) => Standing::Unknown,
+        }
     }
     pub fn revoke(&self, id: &str) -> Result<()> {
         let _lock = self.lock()?;
@@ -205,10 +238,61 @@ impl Auth {
         self.save(&db)
     }
 }
+/// A paired device's standing, from a fresh read of the device list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Still paired with the same credential.
+    Current,
+    /// Definitely gone: revoked, or paired again with another credential.
+    Revoked,
+    /// The device list could not be read (an I/O error, no free file descriptor, a damaged
+    /// file). Nothing is known: keep the connection, refuse new work until it reads again.
+    Unknown,
+}
+impl Standing {
+    /// The standing of `device` through `auth`, which itself failed to open when `Err`.
+    pub fn of(auth: Result<Auth>, device: &Device) -> Self {
+        auth.map_or(Self::Unknown, |auth| auth.current(device))
+    }
+    pub fn revoked(self) -> bool {
+        self == Self::Revoked
+    }
+}
+
+/// The permission modes a device without `admin` may give a new thread (`thread.new` /
+/// `thread.spawn` `mode`): every other one widens what the thread does without asking, and
+/// choosing it is a mode change, which needs `admin`.
+pub const OPERATE_MODES: &[&str] = &["manual", "plan", "read-only", "dontAsk"];
+
+/// Whether `scopes` (a device's grant) include `scope`.
+pub fn grants(scopes: &[String], scope: &str) -> bool {
+    scopes.iter().any(|s| s == scope)
+}
+
+/// Whether runtime spec `spec` is a command line (`pty:<command>`, `acp:<command>`, or the bare
+/// `pty` / `acp`), which runs a program of the caller's choosing on the host: a device needs
+/// `terminal` to name one. The hub checks the rest of the rule (an agent runtime or a
+/// configured preset only) against its configuration.
+pub fn is_command_runtime(spec: &str) -> bool {
+    let spec = spec.trim();
+    ["pty", "acp"].iter().any(|kind| {
+        spec.strip_prefix(kind)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    })
+}
+
 impl Device {
     pub fn allows(&self, method: &str) -> bool {
-        method_scope(method).is_some_and(|scope| self.scopes.iter().any(|s| s == scope))
+        method_scope(method).is_some_and(|scope| self.has(scope))
     }
+    /// Whether the device holds `scope`.
+    pub fn has(&self, scope: &str) -> bool {
+        grants(&self.scopes, scope)
+    }
+    /// [`Device::allows`], and the parameters that widen what a method does past its scope:
+    /// a new thread's mode outside [`OPERATE_MODES`] and `outside_pin` need `admin`; a command
+    /// line runtime ([`is_command_runtime`]) needs `terminal`. The hub applies the same rules,
+    /// and the rest of them (presets, moves, modes as canonicalized), where it decides.
     pub fn allows_params(&self, method: &str, params: &serde_json::Value) -> bool {
         if !self.allows(method) {
             return false;
@@ -218,12 +302,25 @@ impl Device {
         } else {
             params
         };
+        if !matches!(
+            method,
+            "thread.new" | "thread.spawn" | "thread.set_model" | "orchestrator.use"
+        ) {
+            return true;
+        }
         if matches!(method, "thread.new" | "thread.spawn")
             && request["mode"]
                 .as_str()
-                .is_some_and(|mode| !["manual", "plan", "read-only", "dontAsk"].contains(&mode))
+                .is_some_and(|mode| !OPERATE_MODES.contains(&mode))
+            && !self.has("admin")
         {
-            return self.scopes.iter().any(|s| s == "admin");
+            return false;
+        }
+        if request["outside_pin"].as_bool() == Some(true) && !self.has("admin") {
+            return false;
+        }
+        if request["runtime"].as_str().is_some_and(is_command_runtime) && !self.has("terminal") {
+            return false;
         }
         true
     }
@@ -244,6 +341,8 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "thread.activity",
             "thread.events",
             "thread.transcript",
+            "conversation.search",
+            "thread.event_context",
             "thread.spawn_status",
             "thread.queue",
             "attention.list",
@@ -286,6 +385,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "device.revoke",
             "device.pair_begin",
             "device.pair_complete",
+            "device.pair_cancel",
             "account.list",
             "account.status",
             "account.add",
@@ -304,6 +404,13 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "box.restart",
             "box.token",
             "box.add",
+            "thread.pull",
+            "runner.manage",
+            "runner.status",
+            "runner.connect",
+            "runner.recover",
+            "runner.revoke",
+            "runner.forget",
         ],
     ),
     (
@@ -315,6 +422,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "thread.new",
             "thread.spawn",
             "thread.send",
+            "thread.upload",
             "thread.send_cancel",
             "thread.stop",
             "thread.park",
@@ -353,17 +461,140 @@ use std::os::unix::fs::MetadataExt;
 mod tests {
     use super::*;
     #[test]
+    fn cancelling_an_invitation_never_cancels_its_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let first = auth.begin(vec!["read".into()]).unwrap();
+        let second = auth.begin(vec!["read".into()]).unwrap();
+        assert!(!auth.cancel_pairing(&first).unwrap());
+        assert!(!auth.cancel_pairing("wrong").unwrap());
+        assert!(auth.pair(&second, "reader").is_ok());
+        let third = auth.begin(vec!["read".into()]).unwrap();
+        assert!(auth.cancel_pairing(&third).unwrap());
+        assert!(!auth.cancel_pairing(&third).unwrap());
+        assert!(auth.pair(&third, "reader").is_err());
+    }
+    #[test]
+    fn admin_invitations_include_terminal_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let error = auth
+            .begin(vec!["read".into(), "operate".into(), "admin".into()])
+            .unwrap_err();
+        assert!(error.to_string().contains("terminal"));
+        let scopes = ["read", "operate", "terminal", "admin"].map(String::from);
+        let code = auth.begin(scopes.to_vec()).unwrap();
+        assert_eq!(auth.pair(&code, "owner").unwrap().0.scopes, scopes);
+    }
+    #[test]
+    fn read_only_history_access_cannot_answer_or_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = Auth::open(dir.path()).unwrap();
+        let code = auth.begin(vec!["read".into()]).unwrap();
+        let (device, _) = auth.pair(&code, "reader").unwrap();
+        assert!(device.allows("conversation.search"));
+        assert!(device.allows("thread.event_context"));
+        assert!(!device.allows("attention.respond"));
+        assert!(!device.allows("thread.send"));
+    }
+    fn device(scopes: &[&str]) -> Device {
+        Device {
+            id: "d".into(),
+            name: "phone".into(),
+            created: 0,
+            token_hash: String::new(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    #[test]
+    fn command_line_runtimes_need_terminal_and_widening_parameters_admin() {
+        use serde_json::json;
+        let operate = device(&["read", "operate"]);
+        let terminal = device(&["read", "operate", "terminal"]);
+        let admin = device(&["read", "operate", "admin"]);
+        for spec in [
+            "pty:/bin/sh -c id",
+            "acp:my-agent --flag",
+            " acp:x",
+            "pty",
+            "acp",
+        ] {
+            for (method, params) in [
+                ("thread.new", json!({"project": "p", "runtime": spec})),
+                (
+                    "thread.spawn",
+                    json!({"operation_id": "o", "request": {"project": "p", "runtime": spec}}),
+                ),
+                ("thread.set_model", json!({"thread": "t", "runtime": spec})),
+            ] {
+                assert!(!operate.allows_params(method, &params), "{method} {spec}");
+                assert!(!admin.allows_params(method, &params), "{method} {spec}");
+                assert!(terminal.allows_params(method, &params), "{method} {spec}");
+            }
+        }
+        for spec in ["claude-code", "codex:work", "my-preset", "acpx", "ptyhon"] {
+            let params = json!({"project": "p", "runtime": spec});
+            assert!(operate.allows_params("thread.new", &params), "{spec}");
+        }
+        let outside = json!({"thread": "t", "account": "work", "outside_pin": true});
+        assert!(!operate.allows_params("thread.set_model", &outside));
+        assert!(!terminal.allows_params("thread.set_model", &outside));
+        assert!(admin.allows_params("thread.set_model", &outside));
+        let outside = json!({"project": "p", "account": "work", "outside_pin": true});
+        assert!(!operate.allows_params("thread.new", &outside));
+        assert!(admin.allows_params("thread.new", &outside));
+        let bypass = json!({"project": "p", "mode": "bypassPermissions"});
+        assert!(!operate.allows_params("thread.new", &bypass));
+        assert!(admin.allows_params("thread.new", &bypass));
+        assert!(operate.allows_params("thread.new", &json!({"project": "p", "mode": "plan"})));
+        // `orchestrator.use` is admin's, and a command line there needs terminal too.
+        let acp = json!({"runtime": "acp:agent"});
+        assert!(!admin.allows_params("orchestrator.use", &acp));
+        assert!(device(&["admin", "terminal"]).allows_params("orchestrator.use", &acp));
+    }
+    #[test]
     fn pairing_is_one_use_and_revocation_is_immediate() {
         let dir = tempfile::tempdir().unwrap();
         let a = Auth::open(dir.path()).unwrap();
         let code = a.begin(vec!["read".into(), "operate".into()]).unwrap();
         assert!(a.pair("wrong", "phone").is_err());
         let (d, t) = a.pair(&code, "phone").unwrap();
-        assert_eq!(a.authenticate(&t).unwrap().id, d.id);
+        assert_eq!(a.authenticate(&t).unwrap().unwrap().id, d.id);
         assert!(a.pair(&code, "second").is_err());
         assert!(!d.allows("shell.run"));
         assert!(d.allows("thread.send"));
+        assert_eq!(a.current(&d), Standing::Current);
         a.revoke(&d.id).unwrap();
-        assert!(a.authenticate(&t).is_err());
+        assert!(a.authenticate(&t).unwrap().is_none());
+        assert_eq!(a.current(&d), Standing::Revoked);
+    }
+    #[test]
+    fn an_unreadable_device_list_is_not_a_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Auth::open(dir.path()).unwrap();
+        let code = a.begin(vec!["read".into()]).unwrap();
+        let (device, token) = a.pair(&code, "phone").unwrap();
+        // A token of the wrong shape is unknown without reading anything.
+        assert!(a.authenticate("short").unwrap().is_none());
+        let path = dir.path().join("devices.json");
+        let saved = std::fs::read(&path).unwrap();
+        for broken in [b"{\"devices\":[".as_slice(), b"".as_slice()] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(a.authenticate(&token).is_err());
+            assert!(a.authenticate(&"0".repeat(64)).is_err());
+            assert_eq!(a.current(&device), Standing::Unknown);
+            assert!(!a.current(&device).revoked());
+        }
+        std::fs::write(&path, &saved).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(a.current(&device), Standing::Unknown);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            Standing::of(Err(anyhow::anyhow!("no free descriptor")), &device),
+            Standing::Unknown
+        );
+        assert_eq!(a.authenticate(&token).unwrap().unwrap().id, device.id);
+        assert_eq!(a.current(&device), Standing::Current);
+        assert!(a.authenticate(&"0".repeat(64)).unwrap().is_none());
     }
 }

@@ -586,6 +586,7 @@ fn contexts_of(dir: &Path, args: &[OsString]) -> (Vec<PathBuf>, bool, Option<Pat
 /// keep the worktree. See [`LocalGit::with_park_disposable`].
 pub const DEFAULT_PARK_DISPOSABLE: &[&str] = &[
     "target/",
+    ".twr-uploads/",
     "node_modules/",
     "dist/",
     "build/",
@@ -11071,7 +11072,11 @@ mod tests {
     /// and report an error.
     #[tokio::test]
     async fn an_unsearchable_worktree_is_never_treated_as_gone() {
-        let dir = tempfile::tempdir().unwrap();
+        // With its links resolved (macOS's temporary directory is under `/var`, a link to
+        // `/private/var`): git records the worktree resolved, and a record that cannot be
+        // resolved is judged as written against the managed root.
+        let dir =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let g = LocalGit::default().with_managed_root(dir.path().join("worktrees"));
         let repo = init_repo(&dir.path().join("repo"));
         let parent = dir.path().join("worktrees/p");

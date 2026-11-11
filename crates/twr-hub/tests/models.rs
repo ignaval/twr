@@ -601,7 +601,7 @@ async fn bad_model_requests() {
     assert_eq!(hub.control_read(0, 1).unwrap().1, head, "nothing recorded");
     // Canonical spelling; no runtime yet, so the next start takes it.
     let r = hub
-        .set_model("cc", Some("claude-fable-5-1"), Some("HIGH"), &user())
+        .set_model("cc", Some("claude-fable-5-2"), Some("HIGH"), &user())
         .unwrap();
     assert_eq!(
         (r["effort"].clone(), r["applies"].clone()),
@@ -610,7 +610,7 @@ async fn bad_model_requests() {
     let v: Value = hub.get_thread("cc").unwrap();
     assert_eq!(
         (v["model"].clone(), v["effort"].clone()),
-        (json!("claude-fable-5-1"), json!("high"))
+        (json!("claude-fable-5-2"), json!("high"))
     );
     // `default` clears the model too.
     let r = hub.set_model("cc", Some("Default"), None, &user()).unwrap();

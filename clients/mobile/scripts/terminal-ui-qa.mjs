@@ -1,7 +1,8 @@
 import { expect } from "@playwright/test";
 import assert from "node:assert/strict";
+import { shellAction } from "./native-actions.mjs";
 export async function terminalUIQA(page) {
-  await page.getByRole("button", { name: "Open shell", exact: true }).click();
+  await (await shellAction(page)).click();
   const session = page.locator(".terminal-session").filter({ visible: true });
   await session
     .locator(".xterm-helper-textarea")
@@ -72,7 +73,7 @@ export async function terminalUIQA(page) {
     .click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   await expect(page.locator(".terminal-session")).toHaveCount(0);
   console.log(

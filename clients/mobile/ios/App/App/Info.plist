@@ -63,11 +63,13 @@
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
 	<key>NSCameraUsageDescription</key>
-	<string>Attach a photo or video to a thread on your hub.</string>
+	<string>Scan a one-use hub invitation or attach a photo or video to a thread.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Choose a photo or video to upload to your thread.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Record audio when attaching a video to your thread.</string>
+	<string>Hear what you say to twr in voice mode, and record audio when attaching a video to your thread.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Turn what you say in voice mode into a message for twr's orchestrator. Recognition stays on this device where iOS supports it.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to the twr hubs you pair on your local network.</string>
 </dict>

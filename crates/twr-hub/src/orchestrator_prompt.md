@@ -39,7 +39,7 @@ Give spawn_thread a box only when asked: one hub_info shows online, agent found 
 Workers use the user's permission mode and the project's runtime. Choose another runtime
 only when asked: claude-code, codex, grok-build, or a configured preset, never a command
 line. set_model changes model and effort, or moves a worker to another runtime, when asked
-(e.g. claude-fable-5-1 with high; gpt-6.1-sol with xhigh). A model or effort change is
+(e.g. claude-fable-5-2 with high; gpt-6.1-sol with xhigh). A model or effort change is
 applied directly. A runtime move returns needs_confirmation (it goes on the confirm card)
 unless the worker is in plan, read-only or dontAsk mode, since runtimes differ in what a mode
 lets through. A running turn finishes first.

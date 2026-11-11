@@ -6,6 +6,8 @@ import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import type { TerminalSession } from "./types";
+import { terminalReaderEvent, terminalScreenReader } from "./a11y";
+import { useOpenLink } from "./ui";
 export function Terminal({
   session,
   visible,
@@ -21,6 +23,9 @@ export function Terminal({
   const [controlPressed, setControlPressed] = useState(false);
   const search = useRef<SearchAddon>(null);
   const resize = useRef<() => void>(() => {});
+  const open = useOpenLink();
+  const openLink = useRef(open);
+  openLink.current = open;
   useEffect(() => {
     const term = new XTerm({
       fontFamily:
@@ -31,10 +36,26 @@ export function Terminal({
       lineHeight: 1.25,
       scrollback: 10000,
       cursorBlink: true,
+      // Renders output into an accessible buffer for VoiceOver, Orca and TalkBack.
+      screenReaderMode: terminalScreenReader(),
       allowProposedApi: false,
+      // A program sets an OSC 8 hyperlink's text and its address separately: when they
+      // differ, the address is shown for confirmation before it opens.
       linkHandler: {
-        activate: (_event, uri) =>
-          void hostApi.openExternal(uri).catch(() => {}),
+        activate: (_event, uri, range) => {
+          const buffer = term.buffer.active;
+          let text = "";
+          for (let y = range.start.y; y <= range.end.y; y++)
+            text +=
+              buffer
+                .getLine(y - 1)
+                ?.translateToString(
+                  true,
+                  y === range.start.y ? range.start.x - 1 : 0,
+                  y === range.end.y ? range.end.x : undefined,
+                ) || "";
+          openLink.current(uri, text, true);
+        },
       },
       theme: {
         background: "#0b0d0f",
@@ -48,9 +69,7 @@ export function Terminal({
     term.loadAddon(addon);
     term.loadAddon(finder);
     term.loadAddon(
-      new WebLinksAddon(
-        (_event, url) => void hostApi.openExternal(url).catch(() => {}),
-      ),
+      new WebLinksAddon((_event, url) => openLink.current(url, url)),
     );
     term.open(node.current!);
     const colorContext = document.createElement("canvas").getContext("2d");
@@ -76,7 +95,30 @@ export function Terminal({
       previousTheme = signature;
       term.options.theme = theme;
     };
+    const applyTypography = () => {
+      const size =
+        parseFloat(
+          getComputedStyle(document.documentElement).getPropertyValue(
+            "--code-size",
+          ),
+        ) || 13;
+      if (term.options.fontSize !== size) {
+        term.options.fontSize = size;
+        resize.current();
+      }
+    };
+    let typographyTimer: ReturnType<typeof setTimeout> | undefined;
+    const updateTypography = () => {
+      clearTimeout(typographyTimer);
+      typographyTimer = setTimeout(applyTypography, 100);
+    };
     updateTheme();
+    applyTypography();
+    const updateReader = () => {
+      term.options.screenReaderMode = terminalScreenReader();
+    };
+    window.addEventListener(terminalReaderEvent, updateReader);
+    window.addEventListener("twr:typography", updateTypography);
     const themeObserver = new MutationObserver(updateTheme);
     themeObserver.observe(document.documentElement, { attributes: true });
     const scheme = matchMedia("(prefers-color-scheme: light)");
@@ -204,6 +246,9 @@ export function Terminal({
       input.dispose();
       observer.disconnect();
       themeObserver.disconnect();
+      window.removeEventListener("twr:typography", updateTypography);
+      window.removeEventListener(terminalReaderEvent, updateReader);
+      clearTimeout(typographyTimer);
       scheme.removeEventListener("change", updateTheme);
       hostApi.terminalFocus(false);
       terminal.current = null;
@@ -227,11 +272,11 @@ export function Terminal({
       aria-label={`${session.title}${session.exited ? " (exited)" : ""}`}
     >
       <div className="terminal-search">
-        <span>
+        <span aria-hidden="true">
           {session.workspace} / {session.title}
         </span>
         <input
-          aria-label="Search terminal"
+          aria-label={`Search terminal ${session.title}`}
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
@@ -245,12 +290,18 @@ export function Terminal({
       </div>
       <div
         className="terminal-surface"
+        role="group"
+        aria-label={`Terminal ${session.title}${session.exited ? " (exited)" : ""}`}
         ref={node}
         onFocus={() => hostApi.terminalFocus(true)}
         onBlur={() => hostApi.terminalFocus(false)}
       />
       {document.documentElement.dataset.mobile === "true" && (
-        <div className="terminal-accessory" aria-label="Terminal keys">
+        <div
+          className="terminal-accessory"
+          role="group"
+          aria-label="Terminal keys"
+        >
           <button
             onPointerDown={(e) => e.preventDefault()}
             onClick={() => {

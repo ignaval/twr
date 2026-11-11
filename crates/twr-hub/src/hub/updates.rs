@@ -42,6 +42,19 @@ fn mark(ext: Option<JsonMap>, value: Value) -> Option<JsonMap> {
     Some(ext)
 }
 
+/// Whether an event of `body`'s kind can make an update of [`Core::conversation_updates`]
+/// (every kind its arms match).
+fn may_update(body: &EventBody) -> bool {
+    matches!(
+        body,
+        EventBody::AttentionRaised(_)
+            | EventBody::ReportReady(_)
+            | EventBody::TaskUpdated(_)
+            | EventBody::ConversationUpdate(_)
+            | EventBody::AttentionResolved(_)
+    )
+}
+
 /// Whether `batch` ends a turn of `thread`.
 fn ended(batch: &[BatchEvent], thread: &str) -> bool {
     batch
@@ -114,10 +127,21 @@ impl Core {
         let Some(orch) = self.orch.thread.as_ref() else {
             return Vec::new();
         };
+        // Only the threads with an event of a kind that can be said ([`may_update`]) need
+        // their view replayed through the batch: most batches (a runtime's text, tool calls
+        // and results) have none, and cost no copy of a view or of a body.
+        let said: std::collections::HashSet<&str> = events
+            .iter()
+            .filter(|e| may_update(&e.body))
+            .map(|e| e.thread.as_str())
+            .collect();
+        if said.is_empty() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         let mut views = std::collections::HashMap::new();
         for e in events {
-            if self.is_orch(&e.thread) {
+            if !said.contains(e.thread.as_str()) || self.is_orch(&e.thread) {
                 continue;
             }
             let view = views
@@ -627,6 +651,81 @@ mod tests {
             [Some(json!(ROUTINE_AUTO_WAKE)), Some(Value::Null)],
             "{evs:#?}"
         );
+    }
+
+    /// A batch with nothing that can be said makes no update; one that can is read with the
+    /// events before it of its own thread (a task started and ended in one batch: its end is
+    /// said), whatever other threads' events come between.
+    #[tokio::test]
+    async fn only_threads_with_something_to_say_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(HubOptions::new(
+            dir.path().join("twr.db"),
+            Config::default(),
+        ))
+        .await
+        .unwrap();
+        hub.inner.core().orch.switching = true;
+        for (id, name, twr) in [
+            ("o1", "orchestrator", json!({"role": "orchestrator"})),
+            ("w1", "api", json!({})),
+            ("w2", "web", json!({})),
+        ] {
+            hub.append(
+                id,
+                None,
+                Source::Hub,
+                EventBody::ThreadCreated(ThreadCreated {
+                    name: name.into(),
+                    box_name: LOCAL_BOX.into(),
+                    runtime: "fake".into(),
+                    ext: twr_ext_map(twr),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        }
+        let ev = |thread: &str, body: EventBody| BatchEvent {
+            thread: thread.into(),
+            turn: None,
+            source: Source::Adapter("fake".into()),
+            body,
+            raw: None,
+        };
+        let text = || {
+            EventBody::AgentText(AgentText {
+                text: "hello".into(),
+                ..Default::default()
+            })
+        };
+        let task = |running| {
+            EventBody::TaskUpdated(TaskUpdated {
+                task_id: "bg1".into(),
+                running,
+                description: "build".into(),
+                ..Default::default()
+            })
+        };
+        let core = hub.inner.core();
+        assert!(core
+            .conversation_updates(&[ev("w1", text()), ev("w2", text())])
+            .is_empty());
+        let out = core.conversation_updates(&[
+            ev("w1", task(true)),
+            ev("w2", text()),
+            ev("w2", task(true)),
+            ev("w1", text()),
+            ev("w1", task(false)),
+        ]);
+        let said: Vec<String> = out
+            .iter()
+            .map(|e| match &e.body {
+                EventBody::ConversationUpdate(p) => p.text.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(said, ["api background work finished."]);
     }
 
     /// The routine mark joins whatever `ext` had.

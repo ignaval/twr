@@ -310,6 +310,107 @@ mod proc_faults {
     }
 }
 
+/// The variable [`skip_if_test_environs_hidden`] reads: when set, a hidden environment fails
+/// the test instead of skipping it (CI sets it, so its runs never skip these tests).
+#[doc(hidden)]
+pub const TEST_REQUIRE_ENVIRONS_ENV: &str = "TWR_TEST_REQUIRE_PROCESS_ENV";
+
+/// Test support (doc-hidden: nothing in twr calls it outside tests): why the tests that read
+/// the environment of the processes they start (`sleep` and `sh`, found on `PATH`, as stand-ins
+/// for runtimes, attached CLIs and agents) cannot run on this machine, if they cannot. The
+/// first of these programs whose environment, as this process set it, still does not show once
+/// the program runs (its command line shows it exec'd): macOS 27 withholds the environment of
+/// Apple's platform binaries (`/bin/sleep`, `/bin/sh`) from every other process, those of the
+/// same user included (`KERN_PROCARGS2`, which `ps -E` reads, returns only their arguments),
+/// while it still shows that of other programs. `None` where both show (Linux, earlier macOS),
+/// and when a probe never exec'd (that is not this). Probed once per process.
+#[doc(hidden)]
+pub fn test_environs_hidden() -> Option<&'static str> {
+    static HIDDEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HIDDEN
+        .get_or_init(|| {
+            [("sleep", &["30"][..]), ("sh", &["-c", "read x"][..])]
+                .into_iter()
+                .find_map(|(program, args)| environ_hidden_from(program, args))
+        })
+        .as_deref()
+}
+
+/// [`test_environs_hidden`] for one `program`, run with `args` (and its standard input a pipe
+/// it may wait on): why its environment does not show, if it does not.
+///
+/// It reads the process table a few times only: with `ps` each read forks this process, and
+/// until the fork execs `ps` it holds every descriptor of this process, the listening sockets
+/// of the tests running meanwhile too (one that a test dropped then still accepts).
+fn environ_hidden_from(program: &str, args: &[&str]) -> Option<String> {
+    use std::process::{Command, Stdio};
+    const PROBE: &str = "TWR_TEST_ENVIRON_PROBE";
+    let mut child = Command::new(program)
+        .args(args)
+        .env(PROBE, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let pid = child.id();
+    let shown = || sys::environ(pid).is_ok_and(|e| environ_has(&e, PROBE, "1"));
+    // Until the child has exec'd, its environment may still be this process's.
+    let exec_d = || {
+        use std::os::unix::ffi::OsStrExt;
+        sys::cmdline(pid).is_some_and(|c| {
+            let argv0 = c.split(|&b| b == 0).next().unwrap_or_default();
+            std::path::Path::new(std::ffi::OsStr::from_bytes(argv0))
+                .file_name()
+                .is_some_and(|n| n == program)
+        })
+    };
+    // Shown: not hidden. Not shown in three reads over a second once it runs: hidden (a `ps`
+    // that failed now and then shows it in one of them). Never exec'd: not this.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let hidden = loop {
+        if shown() {
+            break false;
+        }
+        if exec_d() {
+            break !(0..3).any(|_| {
+                std::thread::sleep(Duration::from_millis(330));
+                shown()
+            });
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    hidden.then(|| {
+        format!(
+            "this machine does not show the environment of `{program}` (pid {pid}), a process \
+             this test run started, to this user (macOS 27 hides those of Apple's platform \
+             binaries, /bin/sleep and /bin/sh among them)"
+        )
+    })
+}
+
+/// Test support (doc-hidden): whether test `test`, which reads the environment of the `sleep`
+/// or `sh` processes it starts, skips because this machine hides them
+/// ([`test_environs_hidden`]). It then prints why and returns `true`; with
+/// [`TEST_REQUIRE_ENVIRONS_ENV`] set it panics instead.
+#[doc(hidden)]
+pub fn skip_if_test_environs_hidden(test: &str) -> bool {
+    let Some(why) = test_environs_hidden() else {
+        return false;
+    };
+    assert!(
+        std::env::var_os(TEST_REQUIRE_ENVIRONS_ENV).is_none(),
+        "{test}: {why}, and {TEST_REQUIRE_ENVIRONS_ENV} is set"
+    );
+    eprintln!("skipping {test}: {why}");
+    true
+}
+
 /// A process a recovery scan found ([`leftover`]): its pid and status, and its environment
 /// (`None`: this user's, but it cannot be read).
 type Candidate = (u32, ProcStat, Option<Vec<u8>>);
@@ -935,7 +1036,7 @@ pub fn is_marked(environ: &[u8], thread: &str, gen: Option<&str>) -> bool {
 /// Live processes marked for `thread` (and `gen`, when given, see [`is_marked`]) that started
 /// at or after `min_start`, as `(pid, start time, process group)` (never this process); `None`
 /// when the process table cannot be read.
-fn marked_processes(
+pub(crate) fn marked_processes(
     thread: &str,
     min_start: u64,
     gen: Option<&str>,
@@ -1267,6 +1368,46 @@ pub fn process_liveness(pid: u32, start_time: Option<u64>) -> Alive {
     alive_of(read_stat(pid), start_time)
 }
 
+/// [`process_liveness`] of each `(pid, start_time)` in `procs`, in order, from one read of the
+/// process table: on Linux one `/proc/<pid>/stat` read each, with `ps` (macOS) one call for
+/// all of them rather than one each. A batched call that fails falls back to one call each, so
+/// one unreadable process never makes the others unknown. Blocks.
+pub fn processes_liveness(procs: &[(u32, Option<u64>)]) -> Vec<Alive> {
+    #[cfg(all(target_os = "linux", not(twr_ps)))]
+    {
+        let table = sys::Table::default();
+        procs
+            .iter()
+            .map(|(pid, start)| alive_of(sys::stat_in(*pid, &table), *start))
+            .collect()
+    }
+    #[cfg(any(not(target_os = "linux"), twr_ps))]
+    {
+        if procs.len() <= 1 {
+            return procs
+                .iter()
+                .map(|(pid, start)| process_liveness(*pid, *start))
+                .collect();
+        }
+        let mut pids: Vec<u32> = procs.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        pids.dedup();
+        match ps::table_of(&pids) {
+            Some(table) => procs
+                .iter()
+                .map(|(pid, start)| {
+                    let look = table.get(pid).map_or(Lookup::Gone, |s| Lookup::Found(*s));
+                    alive_of(look, *start)
+                })
+                .collect(),
+            None => procs
+                .iter()
+                .map(|(pid, start)| process_liveness(*pid, *start))
+                .collect(),
+        }
+    }
+}
+
 /// [`process_liveness`] of what the process table said.
 fn alive_of(look: Lookup, start_time: Option<u64>) -> Alive {
     match look {
@@ -1464,7 +1605,10 @@ pub enum ChainMarker {
 /// same-user ancestor's (`PR_SET_DUMPABLE` 0 hides `/proc/<pid>/environ` from the process's
 /// own user). With `ps` an environment it does not show for a process it lists counts as
 /// unreadable, an empty one too (`ps` shows nothing for it either), and only the effective
-/// user id is compared, and a process `ps` does not list is gone.
+/// user id is compared, and a process `ps` does not list is gone. Also with `ps`, a hidden
+/// environment of this user's below a process that shows one, does not carry the marker and is
+/// not a `twr` does not count ([`hidden_below`]): macOS 27 hides the environment of Apple's own
+/// programs, the user's `/bin/zsh` under tmux, an editor or the desktop app included.
 ///
 /// On Linux one `/proc/<pid>/environ` read per process, up to the first carrier (and the
 /// `status` of a process whose environment cannot be read, and of its parent; the `stat` of
@@ -1515,10 +1659,68 @@ pub fn first_agent_marker(pids: &[u32]) -> ChainMarker {
                 {
                     EnvRead::Skipped
                 }
-                None => EnvRead::Hidden,
+                None => hidden_below(pids, i, &listed, |pid| {
+                    may_mark(ps::cmdline(pid).as_deref())
+                }),
             },
         })
     }
+}
+
+/// With `ps`: whether the environment of `pids[i]`, a process of this user (not the peer) that
+/// `ps` does not show, counts ([`first_agent_marker`]), given what `ps` listed and whether a
+/// process may add the marker to what it starts (`marks`, [`may_mark`]).
+///
+/// It does not when the nearest process above it whose environment does show (past any others
+/// of this user that do not) is this user's, not init, does not carry [`AGENT_ENV`] and is not
+/// one that adds it to what it starts: an environment comes from the process that started it,
+/// so one that hides below such a process cannot carry the marker (unless that process added
+/// the variable itself, which only makes it an agent). macOS 27 shows no process the
+/// environment of Apple's own programs (`/bin/zsh`, `/bin/sh`): the user's shell under tmux, an
+/// editor or the desktop app is such a process. A shell the hub starts for a job or a hook, or
+/// that a runner or `twr attach` starts with the marker, still counts, and so does one whose
+/// parent is gone, init (it left the process that started it) or another user's.
+#[cfg(any(not(target_os = "linux"), test, twr_ps))]
+fn hidden_below(
+    pids: &[u32],
+    i: usize,
+    listed: &ps::ChainEnvirons,
+    marks: impl Fn(u32) -> bool,
+) -> EnvRead {
+    let mut child = pids[i];
+    for &pid in &pids[i + 1..] {
+        let parent_of_child = listed.procs.get(&child).map(|c| c.ppid);
+        let Some(p) = listed.procs.get(&pid) else {
+            return EnvRead::Hidden;
+        };
+        if parent_of_child != Some(pid) || pid <= 1 || p.uid != listed.uid {
+            return EnvRead::Hidden;
+        }
+        match &p.environ {
+            None => child = pid,
+            Some(environ) if environ_value(environ, AGENT_ENV).is_none() && !marks(pid) => {
+                return EnvRead::Skipped
+            }
+            Some(_) => return EnvRead::Hidden,
+        }
+    }
+    EnvRead::Hidden
+}
+
+/// Whether a process whose program (`argv[0]`, as `ps` shows it) is `program` may add
+/// [`AGENT_ENV`] to the processes it starts: `twr` (a hub, its runners, `twr attach`), and a
+/// program `ps` did not show. A macOS application's own executable is not, though the desktop
+/// app's is named `twr` too (`twr.app/Contents/MacOS/twr`): it starts the user's terminals.
+#[cfg(any(not(target_os = "linux"), test, twr_ps))]
+fn may_mark(program: Option<&[u8]>) -> bool {
+    let Some(program) = program else {
+        return true;
+    };
+    let base = program.rsplit(|b| *b == b'/').next().unwrap_or_default();
+    let bundled = program
+        .windows(b".app/Contents/MacOS/".len())
+        .any(|w| w == b".app/Contents/MacOS/");
+    base == b"twr" && !bundled
 }
 
 /// One process's environment as [`first_agent_marker`] sees it.
@@ -2065,6 +2267,11 @@ mod tests {
     /// time where they are not (`ps`: a clock set back puts a survivor below the bound).
     #[test]
     fn leftovers_are_not_ruled_out_by_missing_markers_or_unordered_times() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::leftovers_are_not_ruled_out_by_missing_markers_or_unordered_times",
+        ) {
+            return;
+        }
         let spawn = |marker: Option<&str>| {
             let mut c = std::process::Command::new("sleep");
             c.arg("30");
@@ -2314,6 +2521,11 @@ mod tests {
 
     #[test]
     fn runtime_running_sees_the_recorded_process_and_the_marked_ones() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::runtime_running_sees_the_recorded_process_and_the_marked_ones",
+        ) {
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new("sleep")
             .arg("30")
@@ -2355,6 +2567,11 @@ mod tests {
     /// runtime (both carry the thread's marker; only their generations differ).
     #[test]
     fn reap_marked_with_a_generation_spares_the_threads_other_runtimes() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::reap_marked_with_a_generation_spares_the_threads_other_runtimes",
+        ) {
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let spawn = |gen: &str| {
             std::process::Command::new("sleep")
@@ -2399,6 +2616,11 @@ mod tests {
     /// that run still running.
     #[test]
     fn a_recorded_process_of_another_generation_is_never_signalled() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::a_recorded_process_of_another_generation_is_never_signalled",
+        ) {
+            return;
+        }
         use std::os::unix::process::CommandExt;
         let mut c = std::process::Command::new("sleep")
             .arg("30")
@@ -2433,6 +2655,9 @@ mod tests {
 
     #[test]
     fn reaps_only_the_marked_process() {
+        if skip_if_test_environs_hidden("reap::tests::reaps_only_the_marked_process") {
+            return;
+        }
         use std::os::unix::process::{CommandExt, ExitStatusExt};
         use std::process::{Child, Command};
 
@@ -2590,6 +2815,10 @@ mod tests {
 
     #[test]
     fn reaps_group_members_that_outlive_the_leader() {
+        if skip_if_test_environs_hidden("reap::tests::reaps_group_members_that_outlive_the_leader")
+        {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
 
         // The leader dies on SIGTERM; its child ignores it and must still be killed.
@@ -2733,6 +2962,10 @@ mod tests {
     /// refused.
     #[test]
     fn a_just_spawned_attach_process_is_recognized() {
+        if skip_if_test_environs_hidden("reap::tests::a_just_spawned_attach_process_is_recognized")
+        {
+            return;
+        }
         use std::process::{Command, Stdio};
         let spawn = || {
             Command::new("sh")
@@ -2767,6 +3000,11 @@ mod tests {
     /// `ps` with `--cfg twr_ps`), `None` without it, an error once the process is gone.
     #[test]
     fn the_agent_marker_is_read_from_the_environment() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::the_agent_marker_is_read_from_the_environment",
+        ) {
+            return;
+        }
         use std::process::Command;
         let spawn = |marker: Option<&str>| {
             let mut c = Command::new("sleep");
@@ -2812,6 +3050,9 @@ mod tests {
     /// `--cfg twr_ps`).
     #[test]
     fn the_agent_marker_is_found_on_an_ancestor() {
+        if skip_if_test_environs_hidden("reap::tests::the_agent_marker_is_found_on_an_ancestor") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
         let mut sh = std::process::Command::new("sh")
@@ -2866,6 +3107,9 @@ mod tests {
     /// hidden.
     #[test]
     fn an_exited_process_is_not_an_absent_marker() {
+        if skip_if_test_environs_hidden("reap::tests::an_exited_process_is_not_an_absent_marker") {
+            return;
+        }
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3026,6 +3270,183 @@ mod tests {
         assert_eq!(gone, ChainMarker::Gone { pid });
     }
 
+    /// With `ps`, a hidden environment of this user's counts unless the nearest process above
+    /// it that shows one is this user's, not init, unmarked and not a `twr` that marks what it
+    /// starts ([`hidden_below`]).
+    #[test]
+    fn a_hidden_shell_below_an_unmarked_process_hides_nothing() {
+        let me = 501;
+        let proc_ = |ppid: u32, uid: u32, environ: Option<&[u8]>| ps::Listed {
+            uid,
+            ppid,
+            environ: environ.map(<[u8]>::to_vec),
+        };
+        // peer 10 <- hidden shell 11 <- 12 <- 13 (pids nearest first).
+        let chain = |parent: ps::Listed, beyond: Option<ps::Listed>| {
+            let mut procs = std::collections::HashMap::from([
+                (10, proc_(11, me, Some(b"A=1"))),
+                (11, proc_(12, me, None)),
+                (12, parent),
+            ]);
+            if let Some(b) = beyond {
+                procs.insert(13, b);
+            }
+            ps::ChainEnvirons { uid: me, procs }
+        };
+        let pids = [10, 11, 12, 13];
+        let not_twr = |_: u32| false;
+        let twr = |_: u32| true;
+        let read = |l: &ps::ChainEnvirons, marks: &dyn Fn(u32) -> bool| {
+            matches!(hidden_below(&pids, 1, l, marks), EnvRead::Skipped)
+        };
+        // tmux, an editor or the desktop app above the user's shell: nothing hidden.
+        assert!(read(&chain(proc_(13, me, Some(b"TERM=x")), None), &not_twr));
+        // The hub (or a runner, or `twr attach`) started the shell: it may carry the marker.
+        assert!(!read(&chain(proc_(13, me, Some(b"TERM=x")), None), &twr));
+        // A marked parent: the shell inherited it.
+        assert!(!read(
+            &chain(proc_(13, me, Some(b"TWR_AGENT=01T:1")), None),
+            &not_twr
+        ));
+        // Init (it left its parent), another user's process, or gone: it counts.
+        let mut init = chain(proc_(13, me, Some(b"A=1")), None);
+        init.procs.get_mut(&11).unwrap().ppid = 1;
+        assert!(!matches!(
+            hidden_below(&[10, 11, 1], 1, &init, not_twr),
+            EnvRead::Skipped
+        ));
+        assert!(!read(&chain(proc_(13, 0, Some(b"A=1")), None), &not_twr));
+        assert!(!matches!(
+            hidden_below(&[10, 11, 99], 1, &chain(proc_(13, me, None), None), not_twr),
+            EnvRead::Skipped
+        ));
+        // A run of hidden processes of this user is passed until one shows.
+        assert!(read(
+            &chain(proc_(13, me, None), Some(proc_(14, me, Some(b"A=1")))),
+            &not_twr
+        ));
+        assert!(!read(
+            &chain(proc_(13, me, None), Some(proc_(14, me, Some(b"A=1")))),
+            &|pid| pid == 13
+        ));
+        // Nothing above it shows an environment: it counts.
+        assert!(!read(&chain(proc_(13, me, None), None), &not_twr));
+        // A chain whose parent links do not match what `ps` listed counts.
+        let mut moved = chain(proc_(13, me, Some(b"A=1")), None);
+        moved.procs.get_mut(&11).unwrap().ppid = 77;
+        assert!(!read(&moved, &not_twr));
+    }
+
+    #[test]
+    fn only_twr_itself_marks_what_it_starts() {
+        assert!(may_mark(Some(b"twr")));
+        assert!(may_mark(Some(
+            b"/Users/u/Library/Application Support/twr/engines/ab/twr"
+        )));
+        assert!(may_mark(Some(
+            b"/Applications/twr.app/Contents/Resources/bin/twr"
+        )));
+        assert!(may_mark(None));
+        assert!(!may_mark(Some(b"/Applications/twr.app/Contents/MacOS/twr")));
+        assert!(!may_mark(Some(b"tmux")));
+        assert!(!may_mark(Some(
+            b"/Applications/Visual Studio Code.app/Contents/MacOS/Electron"
+        )));
+        assert!(!may_mark(Some(b"twr-mobile-gateway")));
+    }
+
+    /// On a machine that hides the environment of Apple's own programs (macOS 27), the user's
+    /// shell under a process that is neither marked nor `twr` hides nothing, while the same
+    /// shell under a `twr` still counts. The readable processes are ad hoc signed copies of
+    /// `sleep` and `bash`, which the system shows like any other program.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_users_shell_under_tmux_is_not_an_agent_on_macos() {
+        if test_environs_hidden().is_none()
+            || environ_value(
+                &sys::environ(std::process::id()).unwrap_or_default(),
+                AGENT_ENV,
+            )
+            .is_some()
+        {
+            eprintln!("skipping: this machine shows every environment, or this run is marked");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = |from: &str, to: &str| {
+            let path = dir.path().join(to);
+            std::fs::copy(from, &path).unwrap();
+            let signed = std::process::Command::new("/usr/bin/codesign")
+                .args(["-f", "-s", "-"])
+                .arg(&path)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            signed.then_some(path)
+        };
+        let (Some(sleep), Some(tmux), Some(twr)) = (
+            copy("/bin/sleep", "sleep-copy"),
+            copy("/bin/bash", "tmux"),
+            copy("/bin/bash", "twr"),
+        ) else {
+            eprintln!("skipping: codesign could not sign the copies");
+            return;
+        };
+        let run = |parent: &std::path::Path| {
+            let script = format!("/bin/zsh -c '{} 30; :'; :", sleep.display());
+            let mut top = std::process::Command::new(parent)
+                .args(["-c", &script])
+                .env_remove(AGENT_ENV)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let chain = loop {
+                assert!(Instant::now() < deadline, "the chain never started");
+                let found = ps::chain_environs(&[top.id()]).and_then(|_| {
+                    let leaf = std::process::Command::new("/usr/bin/pgrep")
+                        .args(["-x", "sleep-copy"])
+                        .output()
+                        .ok()?;
+                    let leaf: u32 = String::from_utf8_lossy(&leaf.stdout)
+                        .lines()
+                        .filter_map(|l| l.trim().parse().ok())
+                        .find(|&pid| {
+                            pid != top.id() && ancestry(pid).chain.iter().any(|p| p.pid == top.id())
+                        })?;
+                    Some(
+                        ancestry(leaf)
+                            .chain
+                            .iter()
+                            .map(|p| p.pid)
+                            .collect::<Vec<_>>(),
+                    )
+                });
+                // The leaf, the hidden zsh and the readable parent all exec'd.
+                if let Some(chain) = found.filter(|c| {
+                    c.len() > 3
+                        && c[2] == top.id()
+                        && sys::environ(c[0]).is_ok()
+                        && sys::environ(top.id()).is_ok()
+                        && sys::environ(c[1]).is_err()
+                }) {
+                    break chain;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let found = first_agent_marker(&chain);
+            let _ = std::process::Command::new("/bin/kill")
+                .arg(chain[0].to_string())
+                .status();
+            let _ = top.kill();
+            let _ = top.wait();
+            (found, chain[1])
+        };
+        let (under_tmux, _) = run(&tmux);
+        let (under_twr, shell) = run(&twr);
+        assert_eq!(under_tmux, ChainMarker::Absent);
+        assert_eq!(under_twr, ChainMarker::Hidden { pid: shell });
+    }
+
     /// This test process's own chain (the terminal, multiplexer or session it runs in) hides
     /// nothing: whatever unreadable environments it has are another user's, older than this
     /// process, or a session's entry point.
@@ -3035,6 +3456,19 @@ mod tests {
         assert!(a.end.is_whole(), "{a:?}");
         let pids: Vec<u32> = a.chain.iter().map(|p| p.pid).collect();
         let found = first_agent_marker(&pids);
+        // On a machine that hides the environments of the system's own programs, a shell of
+        // this user in the chain whose nearest readable ancestor is a `twr`, init or gone
+        // (not a terminal multiplexer or an editor: [`hidden_below`]) still counts.
+        if let ChainMarker::Hidden { pid } = found {
+            let test = format!(
+                "reap::tests::this_processs_own_chain_hides_nothing (pid {pid} of its chain, \
+                 {:?})",
+                process_cmdline(pid).map(|c| String::from_utf8_lossy(&c).into_owned())
+            );
+            if skip_if_test_environs_hidden(&test) {
+                return;
+            }
+        }
         assert!(
             !matches!(found, ChainMarker::Hidden { .. }),
             "{found:?}: {a:?}"

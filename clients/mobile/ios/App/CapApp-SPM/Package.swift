@@ -12,15 +12,15 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ionic-team/capacitor-swift-pm.git", exact: "8.6.0"),
-        .package(name: "CapacitorApp", path: "../../../../node_modules/@capacitor/app"),
-        .package(name: "CapacitorBrowser", path: "../../../../node_modules/@capacitor/browser"),
-        .package(name: "CapacitorClipboard", path: "../../../../node_modules/@capacitor/clipboard"),
-        .package(name: "CapacitorDialog", path: "../../../../node_modules/@capacitor/dialog"),
-        .package(name: "CapacitorFilesystem", path: "../../../../node_modules/@capacitor/filesystem"),
-        .package(name: "CapacitorKeyboard", path: "../../../../node_modules/@capacitor/keyboard"),
-        .package(name: "CapacitorLocalNotifications", path: "../../../../node_modules/@capacitor/local-notifications"),
-        .package(name: "CapacitorPushNotifications", path: "../../../../node_modules/@capacitor/push-notifications"),
-        .package(name: "CapacitorShare", path: "../../../../node_modules/@capacitor/share")
+        .package(name: "CapacitorApp", path: "../../../../../../../../clients/node_modules/@capacitor/app"),
+        .package(name: "CapacitorBrowser", path: "../../../../../../../../clients/node_modules/@capacitor/browser"),
+        .package(name: "CapacitorClipboard", path: "../../../../../../../../clients/node_modules/@capacitor/clipboard"),
+        .package(name: "CapacitorDialog", path: "../../../../../../../../clients/node_modules/@capacitor/dialog"),
+        .package(name: "CapacitorFilesystem", path: "../../../../../../../../clients/node_modules/@capacitor/filesystem"),
+        .package(name: "CapacitorKeyboard", path: "../../../../../../../../clients/node_modules/@capacitor/keyboard"),
+        .package(name: "CapacitorLocalNotifications", path: "../../../../../../../../clients/node_modules/@capacitor/local-notifications"),
+        .package(name: "CapacitorPushNotifications", path: "../../../../../../../../clients/node_modules/@capacitor/push-notifications"),
+        .package(name: "CapacitorShare", path: "../../../../../../../../clients/node_modules/@capacitor/share")
     ],
     targets: [
         .target(

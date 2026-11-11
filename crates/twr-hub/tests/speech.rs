@@ -3,7 +3,8 @@
 //! replies and commentary told apart by the turn or by Codex; capped texts whole; a watermark's
 //! catch-up and what it missed; the orchestrator followed across switches), requests (their
 //! batches whole and in order, also two at once; a delta's seq), controls and status, one
-//! speaker per device, the user only, and nothing written to the log.
+//! speaker per device, the user only, and nothing written to the log. A speaker that reads
+//! `attention` also hears, live only, a fixed sentence when an attention item is raised.
 //!
 //! The orchestrator here is a thread whose `thread.created` says so, its events appended by
 //! the test (no runtime runs): what the feed reads is exactly what the test wrote. The
@@ -1821,4 +1822,191 @@ async fn switches_are_followed_in_order() {
         });
     }
     assert_eq!(seen, ["to ob", "From B.", "to oc", "From C."]);
+}
+
+/// A worker thread `id` called so (stopped: nothing runs).
+fn worker(hub: &Hub, id: &str) {
+    hub.append(
+        id,
+        None,
+        Source::Hub,
+        EventBody::ThreadCreated(ThreadCreated {
+            name: id.into(),
+            box_name: "local".into(),
+            runtime: "fake".into(),
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+    hub.append(
+        id,
+        None,
+        Source::Hub,
+        EventBody::ThreadStopped(Default::default()),
+        None,
+    )
+    .unwrap();
+}
+
+/// Attention item `attn` of `thread` raised for `reason`, its summary words no announcement
+/// may say.
+fn raise(hub: &Hub, thread: &str, attn: &str, reason: AttentionReason) {
+    hub.append(
+        thread,
+        None,
+        Source::Hub,
+        EventBody::AttentionRaised(AttentionRaised {
+            attn_id: attn.into(),
+            reason,
+            summary: "Bash rm -rf SECRET".into(),
+            options: vec!["allow".into(), "deny".into()],
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+}
+
+/// Attention item `attn` of `thread` answered.
+fn resolve(hub: &Hub, thread: &str, attn: &str) {
+    hub.append(
+        thread,
+        None,
+        Source::Hub,
+        EventBody::AttentionResolved(AttentionResolved {
+            attn_id: attn.into(),
+            answer: Some(twr_core::adapter::Answer::allow()),
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+}
+
+/// A speaker of `device` reading everything and announcements.
+fn listener(device: &str) -> SpeechAttachParams {
+    SpeechAttachParams {
+        read: vec![ReadKind::Replies, ReadKind::Commentary, ReadKind::Attention],
+        ..speaker(device)
+    }
+}
+
+fn announce(key: &str, text: &str) -> SpeechItem {
+    SpeechItem::Announce {
+        key: key.into(),
+        text: text.into(),
+    }
+}
+
+/// Only a speaker that reads `attention` hears that something needs the user, in a fixed
+/// sentence with the thread's name (never the item's words): a thread's raises close together
+/// are one announcement, of the most urgent; one raised again while open is no news; one
+/// answered within the hold is never said; the hub's own items are twr's; and once every item
+/// an announcement said is answered, it is retracted.
+#[tokio::test]
+async fn attention_is_announced_to_speakers_that_ask() {
+    let th = start().await;
+    let h = &th.hub;
+    for w in ["api", "docs", "web"] {
+        worker(h, w);
+    }
+    let (_, mut ears) = attach(&th, &listener("ears")).await.unwrap();
+    let (_, mut plain) = attach(&th, &speaker("plain")).await.unwrap();
+
+    raise(h, "api", "api:q1", AttentionReason::Question);
+    raise(h, "api", "api:p1", AttentionReason::Permission);
+    let item = next(&mut ears).await;
+    assert_eq!(item, announce("api", "api needs your permission"));
+    // Raised again while open (new input): no news.
+    raise(h, "api", "api:p1", AttentionReason::Permission);
+    // Answered at once: never said, though raised before the hub's question.
+    raise(h, "web", "web:p1", AttentionReason::Permission);
+    resolve(h, "web", "web:p1");
+    raise(
+        h,
+        twr_core::event::HUB_THREAD,
+        "hub:route1",
+        AttentionReason::Question,
+    );
+    assert_eq!(
+        next(&mut ears).await,
+        announce(twr_core::event::HUB_THREAD, "twr has a question for you")
+    );
+    raise(h, "docs", "docs:s1", AttentionReason::Stalled);
+    assert_eq!(next(&mut ears).await, announce("docs", "docs is stalled"));
+
+    // The plain speaker heard none of it: its next item is the next message.
+    exchange(h, ORCH, 1, "Hello.");
+    said(&mut plain, "Hello.", MsgKind::Message, Origin::Live).await;
+    said(&mut ears, "Hello.", MsgKind::Message, Origin::Live).await;
+
+    // One of api's two answered: still open. Both: retracted.
+    resolve(h, "api", "api:p1");
+    resolve(h, "api", "api:q1");
+    assert_eq!(
+        next(&mut ears).await,
+        SpeechItem::Retract { key: "api".into() }
+    );
+    // A thread stopped closes its blocking items, and so its announcement.
+    raise(h, "web", "web:p2", AttentionReason::Permission);
+    assert_eq!(
+        next(&mut ears).await,
+        announce("web", "web needs your permission")
+    );
+    h.append(
+        "web",
+        None,
+        Source::Hub,
+        EventBody::ThreadStopped(Default::default()),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        next(&mut ears).await,
+        SpeechItem::Retract { key: "web".into() }
+    );
+    exchange(h, ORCH, 2, "Bye.");
+    said(&mut ears, "Bye.", MsgKind::Message, Origin::Live).await;
+    said(&mut plain, "Bye.", MsgKind::Message, Origin::Live).await;
+    drop((ears, plain));
+    th.stop().await;
+}
+
+/// Announcements are live only: an item raised while the speaker was away is never said when
+/// it attaches again (the messages said meanwhile are caught up, none counted for it), and
+/// what comes after is.
+#[tokio::test]
+async fn announcements_are_never_caught_up() {
+    let th = start().await;
+    let h = &th.hub;
+    for w in ["api", "docs", "web"] {
+        worker(h, w);
+    }
+    let (ack, mut ears) = attach(&th, &listener("ears")).await.unwrap();
+    raise(h, "api", "api:p1", AttentionReason::Permission);
+    assert_eq!(
+        next(&mut ears).await,
+        announce("api", "api needs your permission")
+    );
+    drop(ears);
+    th.detached("ears").await;
+
+    exchange(h, ORCH, 1, "While away.");
+    raise(h, "web", "web:p1", AttentionReason::Permission);
+    let p = SpeechAttachParams {
+        watermarks: BTreeMap::from([(ORCH.to_string(), ack.head)]),
+        ..listener("ears")
+    };
+    let (_, mut ears) = attach(&th, &p).await.unwrap();
+    said(&mut ears, "While away.", MsgKind::Message, Origin::Catchup).await;
+    raise(h, "docs", "docs:q1", AttentionReason::Question);
+    assert_eq!(
+        next(&mut ears).await,
+        announce("docs", "docs has a question")
+    );
+    exchange(h, ORCH, 2, "Back.");
+    said(&mut ears, "Back.", MsgKind::Message, Origin::Live).await;
+    drop(ears);
+    th.stop().await;
 }

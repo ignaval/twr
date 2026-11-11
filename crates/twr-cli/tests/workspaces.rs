@@ -285,6 +285,34 @@ fn workspaces_are_separate_hubs_in_one_repository() {
     assert_eq!(row("a")["hub"], "running");
     assert_eq!(row("a")["threads"], 2);
     assert_eq!(row("a")["current"], true);
+    assert!(row("a").get("detail").is_none(), "{listed}");
+    // `--detail` adds what each hub listed: the same reads, printed whole.
+    let detailed: Value =
+        serde_json::from_str(&ok(home, &["ws", "list", "--json", "--detail"])).unwrap();
+    for (row, names) in detailed
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([["api", "a"], ["api", "x"]])
+    {
+        assert_eq!(row["hub"], "running", "{row}");
+        assert_eq!(row["threads"], 2, "{row}");
+        assert!(row.get("detail_error").is_none(), "{row}");
+        let mut listed: Vec<&str> = row["detail"]["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["role"] != "orchestrator")
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        listed.sort();
+        let mut names = names.to_vec();
+        names.sort();
+        assert_eq!(listed, names, "{row}");
+        assert!(row["detail"]["attention"].is_array(), "{row}");
+    }
+    let e = fails(home, &["ws", "list", "--detail"]);
+    assert!(e.contains("--json"), "{e}");
     let table = ok(home, &["ws"]);
     assert!(table.contains("* default"), "{table}");
     assert!(table.contains("  a "), "{table}");
@@ -293,6 +321,12 @@ fn workspaces_are_separate_hubs_in_one_repository() {
     let e = fails(home, &["ws", "rm", "a"]);
     assert!(e.contains("stop it first with `twr -w a hub stop`"), "{e}");
     ok(home, &["-w", "a", "hub", "stop"]);
+    let detailed: Value =
+        serde_json::from_str(&ok(home, &["ws", "list", "--json", "--detail"])).unwrap();
+    assert_eq!(
+        detailed[1],
+        serde_json::json!({"hub": "stopped", "name": "a", "current": false})
+    );
     let e = fails(home, &["ws", "rm", "a"]);
     assert!(e.contains("still has 2 threads (api, x)"), "{e}");
     assert!(a.data_dir.is_dir());
@@ -314,7 +348,29 @@ fn ws_rm_removes_an_empty_workspace_and_keeps_a_trash() {
         let _hub = start_hub(home, Some("b"));
     }
     assert!(b.db_file().exists());
-    assert_eq!(ok(home, &["ws", "rm", "b"]).trim(), "removed workspace b");
+    // Without a terminal to ask on, only with --yes: the refusal lists what would go.
+    std::fs::create_dir_all(b.data_dir.join("memory")).unwrap();
+    std::fs::write(b.data_dir.join("memory/short-replies.md"), "be brief\n").unwrap();
+    std::fs::create_dir_all(b.worktrees_dir().join("proj/old")).unwrap();
+    std::fs::write(b.worktrees_dir().join("proj/old/notes.txt"), "unsaved\n").unwrap();
+    let e = fails(home, &["ws", "rm", "b"]);
+    assert!(
+        e.contains("not removing workspace b without confirmation")
+            && e.contains("twr ws rm b --yes"),
+        "{e}"
+    );
+    assert!(e.contains("This removes workspace b for good"), "{e}");
+    assert!(e.contains("its orchestrator's 1 memory note"), "{e}");
+    assert!(e.contains("its log ("), "{e}");
+    assert!(
+        e.contains("1 worktree directory left in its worktrees/ (proj/old"),
+        "{e}"
+    );
+    assert!(b.db_file().exists());
+    assert_eq!(
+        ok(home, &["ws", "rm", "b", "--yes"]).trim(),
+        "removed workspace b, with its orchestrator's 1 memory note"
+    );
     assert!(!b.data_dir.exists());
     let names: Vec<Value> = workspaces(home).iter().map(|r| r["name"].clone()).collect();
     assert_eq!(names, ["default", "c"]);
@@ -531,6 +587,7 @@ fn the_hub_twr_starts_has_no_controlling_terminal() {
             c.env_remove(k);
         }
     }
+    twr_core::fork::prepare_fork();
     // SAFETY: setsid(2) and ioctl(2) are async-signal-safe and nothing is allocated: a new
     // session whose controlling terminal is the pseudo-terminal on stdin (TIOCSCTTY).
     unsafe {
@@ -603,7 +660,10 @@ fn ws_rm_refuses_a_hub_on_another_socket() {
     assert!(b.db_file().exists());
     let _ = hub.0.kill();
     let _ = hub.0.wait();
-    assert_eq!(ok(home, &["ws", "rm", "b"]).trim(), "removed workspace b");
+    assert_eq!(
+        ok(home, &["ws", "rm", "b", "-y"]).trim(),
+        "removed workspace b"
+    );
 }
 
 /// A `hub.socket` among the workspaces' sockets is refused where the default workspace uses

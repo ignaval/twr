@@ -1,12 +1,29 @@
+import {
+  appendDraft,
+  messageDraft,
+  offlineJournal,
+  type OfflineJournal,
+} from "./offline";
+import { TerminalSnapshots } from "./terminalSnapshots";
+import { Outbox } from "./Outbox";
+import { UploadController } from "./uploads";
+import { AttachmentManager } from "./AttachmentManager";
+import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
 import { MessageBody } from "./MessageBody";
+import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
+import { PaneResize } from "./LayoutOptions";
+import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
+import { attentionSummary } from "./attentionSummary";
 import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
+  memo,
   useRef,
   useState,
   lazy,
@@ -14,6 +31,7 @@ import {
   type CSSProperties,
   type FormEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -21,7 +39,6 @@ import {
   Wrench,
   Database,
   ListTodo,
-  ArrowUp,
   ArrowLeft,
   ArrowDown,
   ArrowUpRight,
@@ -49,16 +66,16 @@ import {
   Trash2,
   Volume2,
   Command as CommandIcon,
+  Check,
   CheckCircle2,
   Circle,
-  Copy,
   ExternalLink,
   Download,
-  Paperclip,
   Eye,
   EyeOff,
   Filter,
   AlertCircle,
+  FolderPlus,
 } from "lucide-react";
 import {
   commands as applicationCommands,
@@ -68,6 +85,7 @@ import {
 } from "./commands";
 import type {
   Attention,
+  InboxSource,
   DesktopEvent,
   HubEvent,
   Json,
@@ -75,17 +93,45 @@ import type {
   Thread,
   ViewState,
 } from "./types";
-import { DataView, Dialog, Empty, FieldInput, Markdown, Spinner } from "./ui";
+import {
+  CopyButton,
+  DataView,
+  Dialog,
+  Empty,
+  FieldInput,
+  LinkConfirm,
+  Markdown,
+  Spinner,
+} from "./ui";
+import { effortChoices, formRuntime, modelChoices } from "./models";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
-import { blocksOf, mergeEvents, foldRoutineBlocks } from "./transcript";
+import { announcements, voiceHint } from "./voice";
+import {
+  blocksOf,
+  mergeEvents,
+  foldRoutineBlocks,
+  messageTime,
+} from "./transcript";
 import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
+import { armed, armsIn, hidden, mayAnswer, shown, type Arming } from "./arming";
+import {
+  announce,
+  attentionAnnouncement,
+  focusableWithin,
+  handleRovingKey,
+  prepareAnnouncer,
+  scrollBehavior,
+  turnAnnouncement,
+  useModal,
+} from "./a11y";
 const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
 
+const noAttention: Attention[] = [];
 const initial: ViewState = {
   threads: [],
   attention: [],
@@ -129,6 +175,17 @@ function operationAction(command: Command, again: boolean) {
   };
   const label = labels[command.id] || command.title.replace(/…$/, "");
   return again ? `${label} again` : label;
+}
+/** A list of strings saved in local storage; anything else there reads as empty. */
+function storedList(key: string): string[] {
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "[]");
+    return Array.isArray(saved)
+      ? saved.filter((v): v is string => typeof v === "string").slice(0, 256)
+      : [];
+  } catch {
+    return [];
+  }
 }
 function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
   const root = document.documentElement;
@@ -204,13 +261,17 @@ export default function App({
   const visibleNav = nav.filter(
     (n) =>
       !(
-        ["accounts", "boxes", "settings", "maintenance"].includes(n.id) &&
+        ["accounts", "boxes", "maintenance"].includes(n.id) &&
         !permitted("admin")
       ),
   );
 
   const [view, setView] = useState(initial);
   const [workspace, setWorkspace] = useState("default");
+  const [hostId, setHostId] = useState("local");
+  const [inboxSources, setInboxSources] = useState<InboxSource[]>([]);
+  const [inboxRefreshing, setInboxRefreshing] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [homePath, setHomePath] = useState("");
   const [workspaces, setWorkspaces] = useState<Json[]>([]);
   const [paths, setPaths] = useState<Json>();
@@ -221,50 +282,143 @@ export default function App({
   const [error, setError] = useState("");
   const [section, setSection] = useState<Section>("chat");
   const [sidebar, setSidebar] = useState(() => window.innerWidth > 800);
+  const [narrow, setNarrow] = useState(
+    () => window.matchMedia("(max-width:800px)").matches,
+  );
+  const sidebarRef = useRef<HTMLElement>(null);
+  // On narrow layouts the sidebar is an overlay sheet ("More"): treat it as modal.
+  const sidebarModal = narrow && sidebar;
+  useModal(sidebarRef, {
+    active: sidebarModal,
+    onClose: () => setSidebar(false),
+    inertBackground: false,
+    initialFocus: (root) =>
+      focusableWithin(root).find((node) =>
+        node.matches('[aria-current="page"]'),
+      ),
+  });
   const [hovering, setHovering] = useState(false);
   const [focus, setFocus] = useState(false);
   const [parked, setParked] = useState(false);
-  const [pins, setPins] = useState<string[]>(() =>
-    JSON.parse(localStorage.getItem("twr.pins") || "[]"),
+  const [collapsed, setCollapsed] = useState<string[]>(() =>
+    storedList("twr.sidebar.collapsed"),
   );
+  const pendingOpen = useRef<{
+    workspace: string;
+    thread?: string;
+    talk: boolean;
+    then?: () => void;
+  }>(undefined);
+  /** Opens Needs you at a thread's request, in its workspace (the tray, notifications). */
+  const openAttention = useRef<(workspace?: string, thread?: string) => void>(
+    () => {},
+  );
+  const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
   const observedDestination = useRef<string | undefined>(undefined);
-  const mobileDraftKey = useRef(
-    `twr.mobile.drafts.${document.documentElement.dataset.hub || ""}`,
-  ).current;
-  const [drafts, setDrafts] = useState<Record<string, string>>(() => {
-    if (document.documentElement.dataset.mobile !== "true") return {};
-    try {
-      const value = JSON.parse(localStorage.getItem(mobileDraftKey) || "{}");
-      return value && typeof value === "object" && !Array.isArray(value)
-        ? Object.fromEntries(
-            Object.entries(value).filter(
-              (entry): entry is [string, string] =>
-                typeof entry[1] === "string",
-            ),
-          )
-        : {};
-    } catch {
-      return {};
-    }
-  });
+  // The message drafts, by destination: outside React state, so that typing re-renders
+  // the composer alone (Composer.tsx).
+  const [drafts] = useState(() => new Drafts());
+  const [composer] = useState(composerMemory);
+  const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
+  const pendingEnqueue = useRef<
+    { key: string; text: string; saved: boolean } | undefined
+  >(undefined);
+  const [journal, setJournal] = useState<OfflineJournal>();
+  const [offlineNotice, setOfflineNotice] = useState("");
   useEffect(() => {
-    if (document.documentElement.dataset.mobile === "true") {
-      try {
-        localStorage.setItem(mobileDraftKey, JSON.stringify(drafts));
-      } catch {}
-    }
-  }, [drafts, mobileDraftKey]);
+    const reset = (event: Event) => {
+      if ((event as CustomEvent).detail?.hostId === hostId) {
+        drafts.update(() => ({}));
+        setJournal(offlineJournal(hostApi, hostId));
+        setOfflineNotice("");
+      }
+    };
+    const ready = (event: Event) => {
+      if ((event as CustomEvent).detail?.hostId !== hostId) return;
+      const saved = offlineJournal(hostApi, hostId);
+      void saved
+        .load()
+        .then(() => {
+          drafts.update((current) => ({
+            ...saved.snapshot.drafts,
+            ...current,
+          }));
+          setJournal(saved);
+          setOfflineNotice("");
+        })
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    };
+    window.addEventListener("twr:offline-ready", ready);
+    window.addEventListener("twr:offline-reset", reset);
+    return () => {
+      window.removeEventListener("twr:offline-reset", reset);
+      window.removeEventListener("twr:offline-ready", ready);
+    };
+  }, [hostId]);
+  const liveView = useRef(false);
+  const hasLiveSnapshot = useRef(false);
+  const [uploads] = useState(
+    () =>
+      new UploadController(hostApi, (attachment) => {
+        const key = attachment.workspace + ":" + attachment.thread;
+        const orchKey = attachment.workspace + ":orchestrator";
+        const targetKey =
+          attachment.thread ===
+          currentOrchestrator.current[attachment.workspace]
+            ? orchKey
+            : key;
+        drafts.set(targetKey, (old) =>
+          `${old || ""}\nUploaded file: ${attachment.file.name}\n${attachment.path}\n`.trimStart(),
+        );
+      }),
+  );
+  const currentOrchestrator = useRef<Record<string, string | undefined>>({});
+  useEffect(() => () => uploads.dispose(), [uploads]);
+  useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
+  // Saves the drafts on this device 350 ms after the last change to any of them, into
+  // the storage epoch of that change.
+  useEffect(() => {
+    if (!journal) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const changed = () => {
+      const pending = pendingEnqueue.current;
+      if (pending?.saved && drafts.get(pending.key) !== pending.text)
+        pendingEnqueue.current = undefined;
+      const epoch = journal.epoch;
+      const persist = () => {
+        if (pendingEnqueue.current) {
+          timer = setTimeout(persist, 100);
+          draftSaveTimer.current = timer;
+          return;
+        }
+        void journal
+          .drafts(drafts.all(), epoch)
+          .then(() => setOfflineNotice(""))
+          .catch((error) => setOfflineNotice(errorMessage(error)));
+      };
+      clearTimeout(timer);
+      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      timer = setTimeout(persist, 350);
+      draftSaveTimer.current = timer;
+    };
+    changed();
+    const unsubscribe = drafts.subscribe(changed);
+    return () => {
+      unsubscribe();
+      clearTimeout(timer);
+      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+    };
+  }, [journal, drafts]);
   const [sending, setSending] = useState(false);
   const slashPending = useRef(false);
   const [queued, setQueued] = useState<Json[]>([]);
   const [queueInfo, setQueueInfo] = useState<Json>({});
   const [shellCwd, setShellCwd] = useState<string>();
   const [shellJobs, setShellJobs] = useState<Json[]>([]);
-  const [slashHidden, setSlashHidden] = useState(false);
-  const [mentionIndex, setMentionIndex] = useState(0);
-  const [mentionHidden, setMentionHidden] = useState(false);
   const [palette, setPalette] = useState(false);
   const [query, setQuery] = useState("");
   const [paletteIndex, setPaletteIndex] = useState(0);
@@ -288,11 +442,16 @@ export default function App({
   const [transcriptRefresh, setTranscriptRefresh] = useState(0);
   const [queueRefresh, setQueueRefresh] = useState(0);
   const [terminals, setTerminals] = useState<TerminalSession[]>([]);
+  const terminalSnapshots = useRef(new TerminalSnapshots());
   const [activeTerminal, setActiveTerminal] = useState<string>();
   const [terminalVisible, setTerminalVisible] = useState(true);
   const [confirmation, setConfirmation] = useState<{
     title: string;
     detail: string;
+    /** The confirming button's label: the action it takes. */
+    action: string;
+    /** Something stops, goes or is interrupted: the button says so in danger style. */
+    destructive?: boolean;
     run: () => void;
   }>();
   const [workspaceModal, setWorkspaceModal] = useState(false);
@@ -307,6 +466,8 @@ export default function App({
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
+  /** The conversation whose transcript on screen was loaded live from the hub. */
+  const liveTranscript = useRef<string | undefined>(undefined);
   const activeSubscription = useRef("");
   const pendingEvents = useRef<HubEvent[]>([]);
   const eventTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -323,12 +484,51 @@ export default function App({
     [],
   );
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
+  currentOrchestrator.current[workspace] = orchestrator?.id;
   const target = destination
     ? view.threads.find((t) => t.id === destination)
     : orchestrator;
   const draftKey = workspace + ":" + (destination || "orchestrator");
-  const draft = drafts[draftKey] || "";
+  // Whether the box is empty, not what it says: App renders again when typing starts or
+  // the box is cleared, never on each key.
+  const hasDraft = useHasDraft(drafts, draftKey);
   const selectedThread = view.threads.find((t) => t.id === selected);
+  // The desktop tray/menu bar, Dock badge and notifications mirror what needs the user in
+  // every workspace: this one's live view and the others' latest reads. The live view's
+  // stream starts over on each (re)connection and resync, so what it lists first is not
+  // taken for news (desktop/notify-state.ts).
+  const [resyncs, setResyncs] = useState(0);
+  const liveStream = useRef({ epoch: 0, connected: false, resyncs: 0 });
+  useEffect(() => {
+    if (!window.twrApp) return;
+    const stream = liveStream.current;
+    if ((connected && !stream.connected) || resyncs !== stream.resyncs)
+      stream.epoch++;
+    stream.connected = connected;
+    stream.resyncs = resyncs;
+    window.twrApp.setAttention(
+      attentionSummary({
+        current: workspace,
+        hubId: hostId,
+        live: connecting
+          ? undefined
+          : { threads: view.threads, attention: view.attention },
+        liveStream: connected
+          ? `live:${hostId}:${workspace}:${stream.epoch}`
+          : undefined,
+        sources: inboxSources,
+      }),
+    );
+  }, [
+    view.threads,
+    view.attention,
+    inboxSources,
+    workspace,
+    hostId,
+    connected,
+    connecting,
+    resyncs,
+  ]);
   const [visibleRoutines, setVisibleRoutines] = useState<string[]>([]);
   const presentedEvents = useMemo(() => {
     const resolved = new Set(view.went_on || []);
@@ -344,21 +544,23 @@ export default function App({
     visible: section === "chat",
     target,
     events: presentedEvents,
-    draft,
+    hasDraft,
     refresh,
     visibleRoutines,
     threads: view.threads,
   });
-  const [acceptedSuggestion, setAcceptedSuggestion] = useState<{
-    key: string;
-    text: string;
-  }>();
+  // The suggestion taken into the box, until it is edited: a message sent as it was
+  // suggested says so. Only `send` reads it, so it is not state.
+  const acceptedSuggestion = useRef<{ key: string; text: string }>(undefined);
   function acceptSuggestion() {
     if (!assistance.suggestion) return;
-    setDrafts((old) => ({ ...old, [draftKey]: assistance.suggestion }));
-    setAcceptedSuggestion({ key: draftKey, text: assistance.suggestion });
+    drafts.set(draftKey, assistance.suggestion);
+    acceptedSuggestion.current = { key: draftKey, text: assistance.suggestion };
     input.current?.focus();
   }
+  const forgetAcceptedSuggestion = useCallback(() => {
+    acceptedSuggestion.current = undefined;
+  }, []);
   async function setAssistance(key: "suggest" | "summaries", value: boolean) {
     try {
       await hostApi.configSet(["tui"], key, value);
@@ -394,9 +596,18 @@ export default function App({
     },
     [target?.worktree, target?.repo, target?.box_name, homePath],
   );
+  const infoRef = useRef(info);
+  infoRef.current = info;
   const action = useCallback(
     (id: string, initialValues: Json = {}) => {
       const command = commands.find((c) => c.id === id);
+      // Choosing the first orchestrator starts from the one the hub would start: its
+      // runtime, and the runtime's default model unless one is picked.
+      const o = infoRef.current?.orchestrator;
+      if (id === "orch" && !initialValues.runtime && o && !o.thread) {
+        const runtime = o.configured?.runtime || o.runtime;
+        if (runtime) initialValues = { ...initialValues, runtime };
+      }
       if (command) openOperation(command, initialValues);
     },
     [openOperation, commands],
@@ -424,19 +635,98 @@ export default function App({
     const value = await rpc("hub.info");
     setInfo(value);
   }, [rpc]);
+  // What the model pickers offer (`orchestrator.show` `models`), once per hub: a list that
+  // changes only with twr. An older hub has none, and its model fields stay free text.
+  const [modelCatalog, setModelCatalog] = useState<Json>();
+  useEffect(() => {
+    setModelCatalog(undefined);
+    if (!connected) return;
+    let live = true;
+    void rpc("orchestrator.show")
+      .then((show) => {
+        if (live) setModelCatalog(show?.models);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [connected, workspace, rpc]);
   const refreshWorkspaces = useCallback(async () => {
     const value = await hostApi.cli(["ws", "list", "--json"]);
     if (value.code !== 0) throw new Error(value.stderr || value.stdout);
     const parsed = JSON.parse(value.stdout);
     setWorkspaces(Array.isArray(parsed) ? parsed : parsed.workspaces || []);
   }, []);
+  const inboxGeneration = useRef(0);
+  // `quiet`: the sidebar's background reads, which neither show progress nor report errors.
+  const refreshInboxSources = useCallback(
+    async (quiet = false) => {
+      if (!hostApi.inboxSources) return;
+      const generation = ++inboxGeneration.current;
+      if (!quiet) setInboxRefreshing(true);
+      try {
+        const sources = await hostApi.inboxSources();
+        if (generation === inboxGeneration.current)
+          setInboxSources(
+            sources.map((source) => ({
+              ...source,
+              updatedAt:
+                source.updatedAt ||
+                (!source.cached && !source.error && source.running !== false
+                  ? Date.now()
+                  : undefined),
+            })),
+          );
+      } catch (error) {
+        if (generation === inboxGeneration.current) {
+          setInboxSources((old) =>
+            old.map((source) => ({ ...source, cached: true })),
+          );
+          if (!quiet) fail(error);
+        }
+      } finally {
+        if (generation === inboxGeneration.current) setInboxRefreshing(false);
+      }
+    },
+    [hostApi, fail],
+  );
+  useEffect(() => {
+    if (section === "attention" && connected) void refreshInboxSources();
+  }, [section, connected, workspace, refreshInboxSources]);
+  // The sidebar lists every workspace's threads, as the TUI's does: while it shows, the other
+  // workspaces are re-read now and then, all of them from one `twr ws list --json --detail`.
+  const sidebarReads = sidebar && connected && workspaces.length > 1;
+  useEffect(() => {
+    if (!sidebarReads) return;
+    const read = () => {
+      if (document.visibilityState !== "hidden") void refreshInboxSources(true);
+    };
+    read();
+    const timer = setInterval(read, WORKSPACE_REFRESH_MS);
+    document.addEventListener("visibilitychange", read);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", read);
+    };
+  }, [sidebarReads, workspace, refreshInboxSources]);
+  // The desktop also reads them on its main process's beat (`inbox-poll`), whatever the
+  // sidebar shows and while the window is hidden, so that its tray, badge and
+  // notifications cover every workspace. A shown sidebar reads on its own timer.
+  const inboxPoll = useRef(() => {});
+  inboxPoll.current = () => {
+    if (!connected || workspaces.length < 2) return;
+    if (sidebarReads && document.visibilityState !== "hidden") return;
+    void refreshInboxSources(true);
+  };
   const openTerminal = useCallback(
     async (
       request: Parameters<typeof hostApi.terminalOpen>[0],
       throwOnFailure = false,
     ) => {
       try {
+        terminalSnapshots.current.changed();
         const session = await hostApi.terminalOpen(request);
+        terminalSnapshots.current.changed();
         setTerminals((old) => [...old, session]);
         setActiveTerminal(session.id);
         setTerminalVisible(true);
@@ -455,6 +745,14 @@ export default function App({
       activeThread.current = undefined;
       connectionRef.current = false;
       setWorkspace(name);
+      setSearchOpen(false);
+      inboxGeneration.current++;
+      setInboxRefreshing(false);
+      setInboxSources((old) =>
+        old.map((source) => ({ ...source, cached: true })),
+      );
+      liveView.current = false;
+      hasLiveSnapshot.current = false;
       setView(initial);
       setConnected(false);
       setConnecting(true);
@@ -501,14 +799,29 @@ export default function App({
   }, [connect, workspace]);
   useEffect(() => {
     let refreshingTerminals = false;
+    let terminalsDirty = false;
+    let stopped = false;
     const api = hostApi;
     const refreshTerminals = () => {
-      if (refreshingTerminals) return;
+      if (stopped) return;
+      if (refreshingTerminals) {
+        terminalsDirty = true;
+        return;
+      }
       refreshingTerminals = true;
+      const revision = terminalSnapshots.current.begin();
       void api
         .bootstrap()
         .then((boot) => {
-          const sessions = boot.terminals || [];
+          const sessions = terminalSnapshots.current.apply(
+            revision,
+            boot.terminals || [],
+          );
+          if (stopped) return;
+          if (!sessions) {
+            terminalsDirty = true;
+            return;
+          }
           setTerminals(sessions);
           setActiveTerminal((id) =>
             sessions.some((session) => session.id === id)
@@ -519,18 +832,31 @@ export default function App({
         .catch(() => {})
         .finally(() => {
           refreshingTerminals = false;
+          if (terminalsDirty && !stopped) {
+            terminalsDirty = false;
+            refreshTerminals();
+          }
         });
     };
     const unsubscribe = hostApi.onEvent((event) => {
       if (event.type === "resync" && event.scope !== "control")
         refreshTerminals();
-      if (event.type === "resync" && event.scope !== "terminal")
+      if (event.type === "resync" && event.scope !== "terminal") {
         setTranscriptRefresh((n) => n + 1);
-      if (event.type === "state" && event.state) setView(event.state);
+        setResyncs((n) => n + 1);
+      }
+      if (event.type === "inbox-poll") inboxPoll.current();
+      if (event.type === "state" && event.state) {
+        liveView.current = true;
+        hasLiveSnapshot.current = true;
+        setView(event.state);
+        if (connectionRef.current) setConnected(true);
+      }
       if (event.type === "connection") {
         const restored = event.connected && !connectionRef.current;
         connectionRef.current = !!event.connected;
-        setConnected(!!event.connected);
+        if (!event.connected) liveView.current = false;
+        setConnected(!!event.connected && liveView.current);
         setConnectionError(event.error || "");
         if (restored) {
           refreshTerminals();
@@ -574,25 +900,71 @@ export default function App({
         setConnectionError(event.error || "Configuration needs repair");
         setSection("settings");
       }
-      if (event.type === "terminal-exit")
+      if (event.type === "terminal-exit") {
+        terminalSnapshots.current.changed();
         setTerminals((old) =>
           old.map((t) => (t.id === event.id ? { ...t, exited: true } : t)),
         );
-      if (event.type === "terminal-removed")
+      }
+      if (event.type === "terminal-removed") {
+        if (event.id) terminalSnapshots.current.removed(event.id);
         setTerminals((old) => old.filter((t) => t.id !== event.id));
+      }
       if (event.type === "menu-new") actionRef.current("new");
+      if (event.type === "menu-settings") {
+        setSection("settings");
+        setSidebar(false);
+      }
+      if (event.type === "menu-attention")
+        openAttention.current(event.workspace, event.thread);
       if (event.type === "menu-palette") {
         setPalette(true);
         setQuery("");
       }
     });
+    const initialTerminalRevision = terminalSnapshots.current.begin();
     void hostApi
       .bootstrap()
       .then((boot) => {
+        if (stopped) return;
+        const id = boot.hostId || "local";
+        setHostId(id);
+        const saved = offlineJournal(hostApi, id);
+        void saved
+          .load()
+          .then(async () => {
+            // Migrate previous mobile message drafts into device-encrypted storage.
+            const oldKey = `twr.mobile.drafts.${document.documentElement.dataset.hub || ""}`;
+            let legacy: Record<string, string> = {};
+            try {
+              legacy = JSON.parse(localStorage.getItem(oldKey) || "{}");
+            } catch {}
+            const previous = Object.fromEntries(
+              Object.entries(legacy || {}).filter(
+                (entry): entry is [string, string] =>
+                  typeof entry[1] === "string",
+              ),
+            );
+            const restored = { ...previous, ...saved.snapshot.drafts };
+            if (Object.keys(previous).length) {
+              await saved.drafts(restored);
+              localStorage.removeItem(oldKey);
+            }
+            drafts.update((current) => ({ ...restored, ...current }));
+            setJournal(saved);
+            setOfflineNotice(saved.historyError);
+          })
+          .catch((error) => setOfflineNotice(errorMessage(error)));
         setAllowedMethods(boot.allowed_methods);
         document.documentElement.dataset.platform = boot.platform;
-        setTerminals(boot.terminals || []);
-        setActiveTerminal(boot.terminals?.at(-1)?.id);
+        const sessions = terminalSnapshots.current.apply(
+          initialTerminalRevision,
+          boot.terminals || [],
+        );
+        if (sessions) {
+          setTerminals(sessions);
+          setActiveTerminal(sessions.at(-1)?.id);
+        } else refreshTerminals();
         document.documentElement.dataset.theme = savedAppearance();
         applyOmarchyTheme(boot.theme);
         setHomePath(boot.home);
@@ -601,6 +973,7 @@ export default function App({
       .catch(fail);
     void hostApi.catalog().then(setCliCommands).catch(fail);
     return () => {
+      stopped = true;
       unsubscribe();
       if (eventTimer.current) clearTimeout(eventTimer.current);
       eventTimer.current = undefined;
@@ -608,8 +981,68 @@ export default function App({
     };
   }, []);
   useEffect(() => {
+    if (!journal || connected || hasLiveSnapshot.current) return;
+    const cached = journal.snapshot.workspaces[workspace];
+    if (cached) {
+      setView(cached.view);
+      setEvents(
+        cached.transcripts[
+          target?.id ||
+            cached.view.threads.find((t) => t.is_orchestrator)?.id ||
+            ""
+        ] || [],
+      );
+    }
+  }, [journal, connected, workspace, target?.id]);
+  const latestCache = useRef({
+    view,
+    events,
+    thread: activeThread.current,
+    transcriptLoading,
+    transcriptError,
+  });
+  latestCache.current = {
+    view,
+    events,
+    thread: activeThread.current,
+    transcriptLoading,
+    transcriptError,
+  };
+  useEffect(() => {
+    if (!journal || !hasLiveSnapshot.current) return;
+    let saved: typeof latestCache.current | undefined;
+    const save = () => {
+      const latest = latestCache.current;
+      if (
+        saved?.view === latest.view &&
+        saved.events === latest.events &&
+        saved.thread === latest.thread
+      )
+        return;
+      void journal
+        .cache(
+          workspace,
+          latest.view,
+          !latest.transcriptLoading && !latest.transcriptError
+            ? latest.thread
+            : undefined,
+          latest.events,
+        )
+        .then(() => {
+          saved = latest;
+        })
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    };
+    // Flush on loss and throttle streaming history instead of postponing it forever.
+    save();
+    if (!connected) return;
+    const timer = setInterval(save, 5000);
+    return () => clearInterval(timer);
+  }, [journal, workspace, connected]);
+  useEffect(() => {
     const media = window.matchMedia("(max-width:800px)");
     const change = () => {
+      setNarrow(media.matches);
       if (media.matches) setSidebar(false);
     };
     media.addEventListener("change", change);
@@ -625,11 +1058,34 @@ export default function App({
   }, [connected, refreshInfo, refreshWorkspaces]);
   useEffect(() => {
     const id = target?.id;
+    const previousThread = activeThread.current;
     activeThread.current = id;
     const generation = ++transcriptGeneration.current;
-    setEvents([]);
+    const buffered = pendingEvents.current.splice(0);
+    const shownEvents = latestCache.current.events;
+    // Only a change of conversation clears the transcript.
+    const kept =
+      connected &&
+      id &&
+      previousThread === id &&
+      liveTranscript.current === id &&
+      shownEvents.length
+        ? mergeEvents(shownEvents, buffered)
+        : undefined;
+    // A disconnect keeps the live transcript on screen; its reconnect catches up.
+    if (previousThread !== id || !hasLiveSnapshot.current)
+      liveTranscript.current = undefined;
+    setEvents((previous) =>
+      kept
+        ? mergeEvents(previous, buffered)
+        : !connected && hasLiveSnapshot.current && previousThread === id
+          ? mergeEvents(previous, buffered)
+          : !connected && journal && id
+            ? journal.snapshot.workspaces[workspace]?.transcripts[id] || []
+            : [],
+    );
     setTranscriptError("");
-    setEarliestTurn(undefined);
+    if (!kept) setEarliestTurn(undefined);
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -640,6 +1096,41 @@ export default function App({
     }
     setTranscriptLoading(true);
     void (async () => {
+      // The same conversation again (a reconnect, a resync, a retry after a transcript
+      // error): keep what is on screen and catch up from its last event, so the view,
+      // its older turns and its scroll position stay. Far behind, reload it instead.
+      if (kept?.length) {
+        const last = kept[kept.length - 1].seq;
+        let page = await rpc("thread.transcript", {
+          thread: id,
+          since_seq: last,
+          limit: 500,
+        });
+        const fresh: HubEvent[] = [...page.events];
+        for (let pages = 1; page.more && pages < 8; pages++) {
+          page = await rpc("thread.transcript", {
+            thread: id,
+            since_seq: page.next,
+            limit: 500,
+          });
+          if (generation !== transcriptGeneration.current) return;
+          fresh.push(...page.events);
+        }
+        if (generation !== transcriptGeneration.current) return;
+        if (!page.more) {
+          setEvents((old) => mergeEvents(old, fresh));
+          liveTranscript.current = id;
+          const subscription = String(generation);
+          activeSubscription.current = subscription;
+          await rpc("desktop.subscribe", {
+            thread: id,
+            since: page.next || last,
+            subscription,
+          });
+          return;
+        }
+        setEarliestTurn(undefined);
+      }
       let page: Json;
       try {
         page = await rpc("thread.transcript", { thread: id, limit: 500 });
@@ -698,6 +1189,7 @@ export default function App({
       if (generation !== transcriptGeneration.current) return;
       setEarliestTurn(firstTurn);
       setEvents(all);
+      liveTranscript.current = id;
       const subscription = String(generation);
       activeSubscription.current = subscription;
       await rpc("desktop.subscribe", {
@@ -708,7 +1200,7 @@ export default function App({
     })()
       .catch((e) => {
         if (generation === transcriptGeneration.current)
-          setTranscriptError(String(e));
+          setTranscriptError(errorMessage(e));
       })
       .finally(() => {
         if (generation === transcriptGeneration.current)
@@ -772,6 +1264,16 @@ export default function App({
         return;
       }
       const mod = mac ? event.metaKey : event.ctrlKey;
+      if (
+        mod &&
+        event.key.toLowerCase() === "f" &&
+        !event.shiftKey &&
+        !(event.target as HTMLElement)?.closest(".terminal-surface")
+      ) {
+        event.preventDefault();
+        if (connectionRef.current && liveView.current) setSearchOpen(true);
+        return;
+      }
       const inTerminal = (event.target as HTMLElement)?.closest(
         ".terminal-surface",
       );
@@ -842,6 +1344,68 @@ export default function App({
         held: !!selected || hovering,
       }).catch(() => {});
   }, [pins, selected, hovering, connected, rpc]);
+  useEffect(() => prepareAnnouncer(), []);
+  // Screen-reader announcements. The transcript itself is not a live region, so
+  // streaming output never floods the reader; only state changes are spoken.
+  const connectionAnnounced = useRef("");
+  useEffect(() => {
+    if (connecting) return;
+    const key = workspace + ":" + connected;
+    const previous = connectionAnnounced.current;
+    if (key === previous) return;
+    connectionAnnounced.current = key;
+    if (connected) announce(`Connected to ${workspace}`);
+    else if (previous)
+      announce(
+        `Disconnected from ${workspace}${connectionError ? ". " + connectionError : ""}`,
+      );
+    else if (connectionError)
+      announce(`Could not connect to ${workspace}. ${connectionError}`);
+  }, [connected, connecting, workspace]);
+  const knownAttention = useRef<{ workspace: string; ids: Set<string> }>(
+    undefined,
+  );
+  useEffect(() => {
+    if (!connected) return;
+    const ids = new Set(view.attention.map((item) => item.attn_id));
+    const known = knownAttention.current;
+    knownAttention.current = { workspace, ids };
+    if (!known || known.workspace !== workspace) return;
+    const fresh = view.attention.filter((item) => !known.ids.has(item.attn_id));
+    for (const item of fresh.slice(0, 3))
+      announce(
+        attentionAnnouncement({
+          reason: item.reason,
+          summary: item.summary,
+          threadName: view.threads.find((t) => t.id === item.thread)?.name,
+        }),
+      );
+    if (fresh.length > 3)
+      announce(`${fresh.length - 3} more requests need you`);
+  }, [view.attention, connected, workspace]);
+  const turnBaseline = useRef<{ thread?: string; end?: string }>({});
+  useEffect(() => {
+    const end = events.findLast((event) => event.kind === "turn.ended");
+    const id = end ? end.id || String(end.seq) : undefined;
+    const baseline = turnBaseline.current;
+    turnBaseline.current = { thread: target?.id, end: id };
+    if (
+      transcriptLoading ||
+      !end ||
+      baseline.thread !== target?.id ||
+      baseline.end === id
+    )
+      return;
+    announce(
+      turnAnnouncement(
+        destination ? target?.name || "Thread" : "Orchestrator",
+        end.data?.result,
+      ),
+    );
+  }, [events, transcriptLoading, target?.id]);
+  useEffect(() => {
+    if (result !== undefined && operation) announce(`${operation.title}: done`);
+  }, [result]);
   const execute = async () => {
     if (!operation) return;
     const run = async () => {
@@ -896,13 +1460,21 @@ export default function App({
       setConfirmation({
         title: operation.title,
         detail: operation.confirm,
+        action: operationAction(operation, false),
+        destructive: true,
         run: () => void run(),
       });
     else await run();
   };
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
-    if (!permitted("operate") || !draft.trim() || sending || !connected) return;
+    const draft = drafts.get(draftKey);
+    if (!permitted("operate") || !draft.trim() || sending) return;
+    if (
+      !connected &&
+      (!journal || draft.startsWith("/") || draft.startsWith("!"))
+    )
+      return;
     if (draft.startsWith("/") && !draft.startsWith("//")) {
       await submitSlash(draft);
       return;
@@ -949,24 +1521,68 @@ export default function App({
             [...old, { job: response.job, command }].slice(-5),
           );
         }
-      } else
-        response = destination
-          ? await rpc("thread.send", { thread: destination, prompt: text })
-          : await rpc("say", {
+      } else {
+        const method = destination ? "thread.send" : "say";
+        const params = destination
+          ? { thread: destination, prompt: text }
+          : {
               message: text,
               seen_gseq: view.head,
               to: "orchestrator",
               suggested:
-                acceptedSuggestion?.key === key &&
-                acceptedSuggestion.text === text,
+                acceptedSuggestion.current?.key === key &&
+                acceptedSuggestion.current.text === text,
+            };
+        // Live replies to a waiting request use only the current visible head.
+        // They never enter the delayed message outbox or receive automatic retries.
+        const liveReply =
+          !destination &&
+          connected &&
+          liveView.current &&
+          view.attention.some(
+            (item) =>
+              item.reason === "permission" || item.reason === "question",
+          );
+        if (journal && hostApi.sendMessage && !liveReply) {
+          const pending = { key, text: draft, saved: false };
+          pendingEnqueue.current = pending;
+          const epoch = journal.epoch;
+          clearTimeout(draftSaveTimer.current);
+          draftSaveTimer.current = undefined;
+          const message = await journal
+            .enqueue(workspace, method, params, draft)
+            .catch((error) => {
+              if (pendingEnqueue.current === pending)
+                pendingEnqueue.current = undefined;
+              void journal.drafts(drafts.all(), epoch).catch(() => {});
+              throw error;
             });
+          pending.saved = true;
+          drafts.set(key, (old) => (old === draft ? "" : old));
+          if (connected) response = await journal.deliver(message);
+          else response = { saved_offline: true };
+        } else response = await rpc(method, params);
+      }
+
+      for (const restored of response.restored_drafts || [])
+        drafts.set(restored.key, (old) => appendDraft(old, restored.text));
       if (response.action === "pending") {
+        drafts.set(key, (old) => appendDraft(old, draft));
         setSection("attention");
         throw new Error(
           "Message not sent. Review the waiting requests and answer the exact item shown.",
         );
       }
-      setDrafts((old) => ({ ...old, [key]: "" }));
+      drafts.set(key, (old) => (old === draft ? "" : old));
+      if (!response.saved_offline && target)
+        uploads.dismissReady(target.id, workspace, draft);
+      announce(
+        response.saved_offline
+          ? "Message saved on this device. It sends when the hub reconnects."
+          : text.startsWith("!") && !text.startsWith("!!!")
+            ? "Shell command started"
+            : "Message sent",
+      );
       setQueueRefresh((n) => n + 1);
     } catch (e) {
       fail(e);
@@ -975,6 +1591,41 @@ export default function App({
       input.current?.focus();
     }
   };
+  // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
+  // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
+  // not through the offline outbox: it is said now, about what is on screen now.
+  const submitVoice = async (text: string): Promise<Json> => {
+    if (!orchestrator)
+      throw new Error("Choose an orchestrator before talking to it.");
+    const response = await rpc("say", {
+      message: text,
+      seen_gseq: view.head,
+      to: "orchestrator",
+      voice: true,
+    });
+    if (response.action === "pending") {
+      setSection("attention");
+      throw new Error(
+        "Not sent: review the waiting requests and answer the exact item shown.",
+      );
+    }
+    setQueueRefresh((n) => n + 1);
+    return response;
+  };
+  const voiceHintWords = useMemo(() => voiceHint(view.threads), [view.threads]);
+  // What this device may have read aloud lately, for voice mode's echo check: the
+  // orchestrator's last messages (kept while a worker's conversation is on screen) and the
+  // sentences a speaker announces.
+  // Read only when voice checks an utterance: not folded again on every event batch.
+  const orchestratorEvents = useRef<HubEvent[]>([]);
+  if (!destination && orchestrator) orchestratorEvents.current = events;
+  const spokenLately = () => [
+    ...blocksOf(orchestratorEvents.current)
+      .filter((b) => b.kind === "assistant")
+      .slice(-3)
+      .map((b) => b.text),
+    ...announcements(view.threads),
+  ];
   async function submitSlash(text: string) {
     if (slashPending.current) return;
     slashPending.current = true;
@@ -990,7 +1641,7 @@ export default function App({
       };
       if (extraRoutes[rawName]) {
         setSection(extraRoutes[rawName]);
-        setDrafts((old) => ({ ...old, [draftKey]: "" }));
+        drafts.set(draftKey, "");
         return;
       }
       const parsed = await rpc("desktop.parse_slash", { line: text });
@@ -1023,7 +1674,7 @@ export default function App({
             throw new Error(
               "No message can be taken back in this conversation.",
             );
-          setDrafts((old) => ({ ...old, [draftKey]: "" }));
+          drafts.set(draftKey, "");
           await takeBack({ ref });
           return;
         }
@@ -1191,6 +1842,9 @@ export default function App({
         case "Decisions":
           setSection((old) => (old === "decisions" ? "chat" : "decisions"));
           break;
+        case "Runner":
+          setSection("boxes");
+          break;
         case "Accounts":
           setSection("accounts");
           break;
@@ -1269,7 +1923,7 @@ export default function App({
         default:
           throw new Error("No desktop action for this command.");
       }
-      setDrafts((old) => ({ ...old, [draftKey]: "" }));
+      drafts.set(draftKey, "");
     } catch (error) {
       fail(error);
     } finally {
@@ -1304,7 +1958,27 @@ export default function App({
       fail(error);
     }
   }
-  async function takeBack(message: Json) {
+  // A queued message's Take back / Send now run once at a time: its buttons are disabled
+  // while its request is in flight.
+  const [queueBusy, setQueueBusy] = useState<unknown[]>([]);
+  const queueInFlight = useRef(new Set<unknown>());
+  async function queueAction(message: Json, run: () => Promise<void>) {
+    const ref = message.ref;
+    if (queueInFlight.current.has(ref)) return;
+    queueInFlight.current.add(ref);
+    setQueueBusy([...queueInFlight.current]);
+    try {
+      await run();
+    } finally {
+      queueInFlight.current.delete(ref);
+      setQueueBusy([...queueInFlight.current]);
+    }
+  }
+  const takeBack = (message: Json) =>
+    queueAction(message, () => withdrawMessage(message));
+  const sendNow = (message: Json) =>
+    queueAction(message, () => sendMessageNow(message));
+  async function withdrawMessage(message: Json) {
     try {
       const response = await rpc("message.withdraw", {
         thread: target?.id,
@@ -1314,18 +1988,17 @@ export default function App({
         throw new Error(
           response.message || "This message can no longer be taken back.",
         );
-      setDrafts((old) => ({
-        ...old,
-        [draftKey]:
-          (old[draftKey] ? old[draftKey] + "\n\n" : "") + response.prompt,
-      }));
+      drafts.set(
+        draftKey,
+        (old) => (old ? old + "\n\n" : "") + response.prompt,
+      );
       setQueueRefresh((n) => n + 1);
       input.current?.focus();
     } catch (error) {
       fail(error);
     }
   }
-  async function sendNow(message: Json) {
+  async function sendMessageNow(message: Json) {
     try {
       const response = await rpc("message.send_now", {
         thread: target?.id,
@@ -1348,7 +2021,9 @@ export default function App({
       const next = old.includes(id)
         ? old.filter((p) => p !== id)
         : [...old, id];
-      localStorage.setItem("twr.pins", JSON.stringify(next));
+      try {
+        localStorage.setItem("twr.pins", JSON.stringify(next));
+      } catch {}
       return next;
     });
   const workers = view.threads.filter((t) => !t.is_orchestrator);
@@ -1359,35 +2034,151 @@ export default function App({
         ["running", "background", "waiting", "error"].includes(t.status) ||
         view.attention.some((a) => a.thread === t.id)),
   );
-  const attentionFor = (id: string) =>
-    view.attention.filter((a) => a.thread === id);
-  const respond = async (item: Attention, answer: string, message?: string) => {
-    if (!permitted("operate")) return;
-    try {
+  const attentionByThread = useMemo(() => {
+    const byThread = new Map<string, Attention[]>();
+    for (const item of view.attention)
+      byThread.set(item.thread, [...(byThread.get(item.thread) || []), item]);
+    return byThread;
+  }, [view.attention]);
+  const attentionFor = (id: string) => attentionByThread.get(id) || noAttention;
+  const selectThread = useCallback((id: string) => setSelected(id), []);
+  const openThread = useCallback((id: string) => {
+    setDestination(id);
+    setSection("chat");
+    setSelected(undefined);
+  }, []);
+  // While a workspace connects, its entry keeps the rows it had (a double-click's second
+  // click lands on the row the first one chose).
+  const entries = workspaceEntries(
+    workspaces,
+    workspace,
+    hostId,
+    inboxSources,
+    connecting
+      ? undefined
+      : { threads: view.threads, attention: view.attention },
+  );
+  const toggleCollapsed = (name: string) =>
+    setCollapsed((old) => {
+      const next = old.includes(name)
+        ? old.filter((n) => n !== name)
+        : [...old, name];
+      try {
+        localStorage.setItem("twr.sidebar.collapsed", JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  /**
+   * Opens a workspace's orchestrator (no `thread`) or one of its threads from the sidebar,
+   * switching to the workspace first when it is another one. `talk` makes the thread the
+   * message destination (a double-click); otherwise it is selected, opening its inspector.
+   * Clicks while the switch connects update the pending request instead of switching again.
+   * `then` runs once it is open (a new thread's form, the grid).
+   */
+  const openIn = (
+    name: string,
+    thread?: string,
+    talk = false,
+    then?: () => void,
+  ) => {
+    const show = (
+      id: string | undefined,
+      toThread: boolean,
+      after?: () => void,
+    ) => {
+      setSection("chat");
+      if (!id) {
+        setDestination(undefined);
+        setSelected(undefined);
+      } else if (toThread) {
+        setDestination(id);
+        setSelected(undefined);
+      } else setSelected(id);
+      after?.();
+    };
+    // `connect` names the new workspace at once: until it finishes, clicks there update
+    // what opens once it has.
+    const pending = pendingOpen.current;
+    if (pending?.workspace === name) {
+      pendingOpen.current = {
+        workspace: name,
+        thread,
+        talk: pending.thread === thread ? pending.talk || talk : talk,
+        then,
+      };
+      return;
+    }
+    if (name === workspace) return show(thread, talk, then);
+    pendingOpen.current = { workspace: name, thread, talk, then };
+    const switched = connect(name);
+    // A later switch (here, the workspaces dialog, `/ws`) supersedes this one.
+    const generation = connectGeneration.current;
+    void switched.then(() => {
+      const wanted = pendingOpen.current;
+      if (wanted?.workspace !== name) return;
+      pendingOpen.current = undefined;
+      if (generation === connectGeneration.current)
+        show(wanted.thread, wanted.talk, wanted.then);
+    });
+  };
+  // Another workspace's request switches to it first, as the sidebar does.
+  openAttention.current = (name, thread) => {
+    const show = () => {
+      setSection("attention");
+      setSidebar(false);
+      if (thread) setSelected(thread);
+    };
+    if (name && name !== workspace) openIn(name, thread, false, show);
+    else show();
+  };
+  // Every attention answer (conversation cards, Needs you, the inspector, mobile) goes
+  // through here: only a live hub view, never a cached one, can authorize it.
+  const liveAnswerCheck = useCallback(() => {
+    if (!connectionRef.current || !liveView.current)
+      throw new Error(
+        "Not connected to the live hub. Reconnect and review the current request.",
+      );
+    if (deviceScopes && !deviceScopes.includes("operate"))
+      throw new Error("This device has read-only access.");
+  }, [deviceScopes]);
+  const respond = useCallback(
+    async (item: Attention, answer: string, message?: string) => {
+      liveAnswerCheck();
       await rpc("attention.respond", {
         attn_id: item.attn_id,
         revision: item.revision,
         answer,
         ...(message ? { message } : {}),
       });
-    } catch (e) {
-      fail(e);
-    }
-  };
-  const earlier = async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !target || earlierBusy) return;
+    },
+    [liveAnswerCheck, rpc],
+  );
+  const dismissAttention = useCallback(
+    async (item: Attention) => {
+      liveAnswerCheck();
+      await rpc("attention.dismiss", {
+        attn_id: item.attn_id,
+        revision: item.revision,
+      });
+    },
+    [liveAnswerCheck, rpc],
+  );
+  const earlierTarget = target?.id;
+  const earlier = useCallback(async () => {
+    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+      return;
     const generation = transcriptGeneration.current;
     setEarlierBusy(true);
     try {
       let page = await rpc("thread.transcript", {
-        thread: target.id,
+        thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
-          thread: target.id,
+          thread: earlierTarget,
           turn: earliestTurn - 1,
           since_seq: page.next,
           limit: 500,
@@ -1402,26 +2193,8 @@ export default function App({
     } finally {
       setEarlierBusy(false);
     }
-  };
-  function chooseMention(thread: Thread) {
-    setDrafts((old) => ({
-      ...old,
-      [draftKey]: draft.replace(/@[\w-]*$/, "@" + thread.name + " "),
-    }));
-    setMentionHidden(true);
-    input.current?.focus();
-  }
-  const mentions = draft.match(/(?:^|\s)@([\w-]*)$/)
-    ? workers
-        .filter((t) => t.name.startsWith(draft.match(/@([\w-]*)$/)?.[1] || ""))
-        .slice(0, 6)
-    : [];
-  const slashMatches =
-    draft.startsWith("/") && !draft.startsWith("//")
-      ? (slashCommands.length ? slashCommands : commands)
-          .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
-          .slice(0, 6)
-      : [];
+  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   useEffect(() => {
     setPaletteIndex(0);
   }, [query]);
@@ -1447,23 +2220,42 @@ export default function App({
   return (
     <div className={`app ${sidebar ? "" : "sidebar-hidden"}`} style={rootStyle}>
       <button
+        type="button"
+        className="skip-link"
+        onClick={() => {
+          const composer = input.current;
+          if (composer && !composer.disabled && section === "chat")
+            composer.focus();
+          else document.getElementById("twr-main")?.focus();
+        }}
+      >
+        Skip to {section === "chat" ? "message composer" : "main content"}
+      </button>
+      <button
         className="sidebar-backdrop"
         aria-label="Close navigation"
+        tabIndex={-1}
         onClick={() => setSidebar(false)}
         style={{ display: sidebar ? undefined : "none" }}
       />
       <aside
         className="sidebar"
+        id="twr-sidebar"
+        ref={sidebarRef}
+        aria-label={sidebarModal ? "Navigation" : "Sidebar"}
+        role={sidebarModal ? "dialog" : undefined}
+        aria-modal={sidebarModal ? true : undefined}
         onClick={(event) => {
           if (
             window.innerWidth <= 800 &&
             (event.target as HTMLElement).closest(
-              ".primary-nav button,.thread-card,.sidebar-secondary button,.sidebar-footer button",
+              ".primary-nav button,.thread-card,.workspace-orchestrator,.workspace-thread,.sidebar-secondary button,.sidebar-footer button",
             )
           )
             setSidebar(false);
         }}
       >
+        <PaneResize pane="sidebar" />
         <div className="brand drag-region">
           <span className="wordmark">
             twr<span>_</span>
@@ -1472,147 +2264,284 @@ export default function App({
           <button
             className="icon-button no-drag"
             aria-label="Hide sidebar"
+            aria-controls="twr-sidebar"
+            aria-expanded={true}
+            title="Hide sidebar"
             onClick={() => setSidebar(false)}
           >
             <PanelLeftClose size={16} />
           </button>
         </div>
-        <div className="workspace-picker">
-          <label htmlFor="workspace-select">Workspace</label>
-          <div>
-            <select
-              id="workspace-select"
-              value={workspace}
-              disabled={connecting}
-              onChange={(e) => void connect(e.target.value)}
-            >
-              {[
-                ...new Set([
-                  workspace,
-                  ...workspaces.map((w) =>
-                    typeof w === "string" ? w : w.name,
-                  ),
-                ]),
-              ]
-                .filter(Boolean)
-                .map((w) => (
-                  <option key={w} value={w}>
-                    {w}
-                  </option>
-                ))}
-            </select>
-            <button
-              className="icon-button"
-              aria-label="Manage workspaces"
-              onClick={() => setWorkspaceModal(true)}
-            >
-              <Plus size={16} />
-            </button>
-          </div>
-        </div>
-        <nav className="primary-nav">
-          <button
-            className={section === "chat" && !destination ? "active" : ""}
-            onClick={() => {
-              setSection("chat");
-              setDestination(undefined);
-            }}
-          >
-            <MessageSquare size={17} />
-            Orchestrator
-          </button>
+        <nav className="primary-nav" aria-label="Primary">
           <button
             className={section === "attention" ? "active" : ""}
+            aria-current={section === "attention" ? "page" : undefined}
             onClick={() => setSection("attention")}
           >
             <Bell size={17} />
             Needs you
             {view.attention.length > 0 && (
-              <span className="count attention-count">
-                {view.attention.length}
-              </span>
+              <>
+                {" "}
+                <span className="count attention-count">
+                  {view.attention.length}
+                </span>
+              </>
             )}
           </button>
           <button
             className={section === "grid" ? "active" : ""}
+            aria-current={section === "grid" ? "page" : undefined}
             onClick={() => setSection("grid")}
           >
             <LayoutGrid size={17} />
-            Thread grid<span className="count">{workers.length}</span>
+            Thread grid <span className="count">{workers.length}</span>
           </button>
         </nav>
         <div className="threads-heading">
-          <span>Threads</span>
+          <span role="heading" aria-level={2} id="twr-workspaces-heading">
+            Workspaces
+          </span>
           <div>
             <button
               className={`icon-button ${focus ? "on" : ""}`}
               title="Only active threads"
               aria-label="Toggle focus filter"
+              aria-pressed={focus}
               onClick={() => setFocus((v) => !v)}
             >
               <Filter size={13} />
             </button>
             <button
               className="icon-button"
-              aria-label="New thread"
-              disabled={!permitted("operate")}
-              onClick={() => action("new")}
+              aria-label="Manage workspaces"
+              title="New or remove workspaces"
+              aria-haspopup="dialog"
+              onClick={() => setWorkspaceModal(true)}
             >
-              <Plus size={16} />
+              <FolderPlus size={15} />
             </button>
           </div>
         </div>
         <div
-          className="thread-list"
-          onMouseEnter={() => setHovering(true)}
-          onMouseLeave={() => setHovering(false)}
+          className="workspace-tree"
+          aria-labelledby="twr-workspaces-heading"
+          role="group"
         >
-          {visible.map((thread) => (
-            <ThreadCard
-              key={thread.id}
-              thread={thread}
-              items={attentionFor(thread.id)}
-              dived={destination === thread.id}
-              selected={selected === thread.id}
-              pinned={pins.includes(thread.id)}
-              onSelect={() => setSelected(thread.id)}
-              onOpen={() => {
-                setDestination(thread.id);
-                setSection("chat");
-                setSelected(undefined);
-              }}
-            />
-          ))}
-          {!visible.length && (
-            <p className="sidebar-empty">
-              {workers.length
-                ? "No threads match your filters."
-                : "Threads appear here as your agents start working."}
-            </p>
-          )}
-        </div>
-        {workers.some((t) => t.status === "parked") && (
+          {entries.map((entry) => {
+            const shut = collapsed.includes(entry.name);
+            const headingId = `twr-ws-${entry.name}`;
+            const status =
+              entry.running === false
+                ? "hub not running"
+                : [
+                    entry.waiting ? `${entry.waiting} waiting on you` : "",
+                    entry.working ? `${entry.working} working` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(", ") || (entry.stale ? "not refreshed" : "idle");
+            const talkingToOrchestrator =
+              entry.current && section === "chat" && !destination;
+            return (
+              <section
+                key={entry.name}
+                className={`workspace-entry ${entry.current ? "current" : ""} ${entry.running === false ? "stopped" : ""}`}
+                data-workspace={entry.name}
+                aria-labelledby={headingId}
+              >
+                <div className="workspace-entry-head">
+                  <button
+                    className="workspace-toggle"
+                    id={headingId}
+                    aria-expanded={!shut}
+                    aria-current={entry.current ? "true" : undefined}
+                    title={`${entry.name}: ${status}`}
+                    onClick={() => toggleCollapsed(entry.name)}
+                  >
+                    {shut ? (
+                      <ChevronRight size={14} aria-hidden="true" />
+                    ) : (
+                      <ChevronDown size={14} aria-hidden="true" />
+                    )}
+                    <span className="workspace-name">{entry.name}</span>
+                    <span className="visually-hidden">, {status}</span>
+                    <span className="workspace-badges" aria-hidden="true">
+                      {entry.running === false ? (
+                        <span className="workspace-stopped">○</span>
+                      ) : (
+                        <>
+                          {entry.waiting > 0 && (
+                            <span className="workspace-waiting">
+                              ⚠{entry.waiting}
+                            </span>
+                          )}
+                          {entry.working > 0 && (
+                            <span className="workspace-working">
+                              ●{entry.working}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </span>
+                  </button>
+                  <button
+                    className="icon-button"
+                    aria-label={
+                      entry.current
+                        ? "New thread"
+                        : `New thread in ${entry.name}`
+                    }
+                    title={`New thread in ${entry.name}`}
+                    disabled={!permitted("operate")}
+                    onClick={() =>
+                      openIn(entry.name, undefined, false, () =>
+                        actionRef.current("new"),
+                      )
+                    }
+                  >
+                    <Plus size={15} />
+                  </button>
+                </div>
+                {!shut && (
+                  <>
+                    <button
+                      className={`workspace-orchestrator ${talkingToOrchestrator ? "active" : ""}`}
+                      aria-current={talkingToOrchestrator ? "page" : undefined}
+                      onClick={() => openIn(entry.name)}
+                    >
+                      <MessageSquare size={15} />
+                      Orchestrator
+                    </button>
+                    {entry.current && !connecting ? (
+                      <>
+                        <div
+                          className="thread-list"
+                          role="list"
+                          aria-label={`Threads in ${entry.name}`}
+                          onMouseEnter={() => setHovering(true)}
+                          onMouseLeave={() => setHovering(false)}
+                        >
+                          {visible.map((thread) => (
+                            <ThreadCard
+                              listItem
+                              key={thread.id}
+                              thread={thread}
+                              items={attentionFor(thread.id)}
+                              dived={destination === thread.id}
+                              selected={selected === thread.id}
+                              pinned={pins.includes(thread.id)}
+                              onSelect={selectThread}
+                              onOpen={openThread}
+                            />
+                          ))}
+                          {!visible.length && (
+                            <p className="sidebar-empty" role="listitem">
+                              {connecting
+                                ? "Connecting…"
+                                : workers.length
+                                  ? "No threads match your filters."
+                                  : "Threads appear here as your agents start working."}
+                            </p>
+                          )}
+                        </div>
+                        {workers.some((t) => t.status === "parked") && (
+                          <button
+                            className="parked-toggle"
+                            aria-pressed={parked}
+                            onClick={() => setParked((v) => !v)}
+                          >
+                            {parked
+                              ? "Hide parked"
+                              : `${workers.filter((t) => t.status === "parked").length} parked threads hidden`}
+                          </button>
+                        )}
+                      </>
+                    ) : (
+                      <ul
+                        className="workspace-peek"
+                        aria-label={`Threads in ${entry.name}`}
+                      >
+                        {entry.threads.map((thread) => (
+                          <li key={thread.id}>
+                            <button
+                              className="workspace-thread"
+                              style={
+                                {
+                                  "--thread-color": thread.accent,
+                                } as CSSProperties
+                              }
+                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
+                              onClick={(event) =>
+                                openIn(entry.name, thread.id, event.detail > 1)
+                              }
+                            >
+                              {thread.accent && (
+                                <span
+                                  className="thread-color-dot"
+                                  aria-hidden="true"
+                                />
+                              )}
+                              <span className="workspace-thread-name">
+                                {thread.name}
+                              </span>
+                              <span className="visually-hidden">, </span>
+                              <span
+                                className={`thread-status status-${thread.status}`}
+                              >
+                                {thread.status_label || thread.status}
+                              </span>
+                            </button>
+                          </li>
+                        ))}
+                        {entry.more > 0 && (
+                          <li>
+                            <button
+                              className="workspace-thread workspace-more"
+                              onClick={() =>
+                                openIn(entry.name, undefined, false, () =>
+                                  setSection("grid"),
+                                )
+                              }
+                            >
+                              +{entry.more} more
+                            </button>
+                          </li>
+                        )}
+                      </ul>
+                    )}
+                  </>
+                )}
+              </section>
+            );
+          })}
           <button
-            className="parked-toggle"
-            onClick={() => setParked((v) => !v)}
+            className="workspace-add"
+            aria-haspopup="dialog"
+            onClick={() => setWorkspaceModal(true)}
           >
-            {parked
-              ? "Hide parked"
-              : `${workers.filter((t) => t.status === "parked").length} parked threads hidden`}
+            <Plus size={14} />
+            New workspace
           </button>
-        )}
+        </div>
         <details className="sidebar-secondary manage-nav">
           <summary>Manage</summary>
-          <nav>
+          <nav aria-label="Manage">
             {visibleNav
               .filter((n) => n.id !== "settings")
               .map((n) => (
-                <button key={n.id} onClick={() => setSection(n.id)}>
+                <button
+                  key={n.id}
+                  aria-current={section === n.id ? "page" : undefined}
+                  onClick={() => setSection(n.id)}
+                >
                   <n.icon size={15} />
                   {n.label}
                 </button>
               ))}
-            <button onClick={() => setSection("decisions")}>
+            <button
+              aria-current={section === "decisions" ? "page" : undefined}
+              onClick={() => setSection("decisions")}
+            >
               <CheckCircle2 size={15} />
               Decisions
             </button>
@@ -1620,6 +2549,7 @@ export default function App({
         </details>
         <div className="sidebar-footer">
           <button
+            aria-haspopup="dialog"
             onClick={() => {
               setQuery("");
               setPalette(true);
@@ -1634,30 +2564,50 @@ export default function App({
             </span>
           </button>
           <button
-            disabled={!permitted("admin")}
+            aria-current={section === "settings" ? "page" : undefined}
             onClick={() => setSection("settings")}
           >
             <Settings2 size={15} />
             Settings
           </button>
           <div className="connection-status">
-            <span className={`status-dot ${connected ? "online" : ""}`} />
+            <span
+              className={`status-dot ${connected ? "online" : ""}`}
+              aria-hidden="true"
+            />
             {connected
               ? "Hub connected"
               : connecting
                 ? "Connecting…"
                 : "Disconnected"}
-            <span>v{paths?.version || "0.3.0"}</span>
+            <span>v{paths?.version || "0.4.0"}</span>
           </div>
         </div>
       </aside>
-      <main className="main-shell">
+      <main className="main-shell" id="twr-main" tabIndex={-1}>
+        {!connected && journal?.snapshot.workspaces[workspace] && (
+          <div className="offline-banner" role="status">
+            Offline · saved{" "}
+            {new Date(
+              journal.snapshot.workspaces[workspace].savedAt,
+            ).toLocaleString()}
+            . Requests need a live connection before you can answer.
+          </div>
+        )}
+        {offlineNotice && (
+          <div className="offline-banner" role="status">
+            {offlineNotice}
+          </div>
+        )}
         <header className="topbar drag-region">
           <div className="topbar-left no-drag">
             {!sidebar && (
               <button
                 className="icon-button"
                 aria-label="Show sidebar"
+                aria-controls="twr-sidebar"
+                aria-expanded={false}
+                title="Show sidebar"
                 onClick={() => setSidebar(true)}
               >
                 <PanelLeftOpen size={18} />
@@ -1667,6 +2617,7 @@ export default function App({
               <button
                 className="icon-button mobile-back-button"
                 aria-label="Return to orchestrator"
+                title="Return to orchestrator"
                 onClick={() => setDestination(undefined)}
               >
                 <ArrowLeft size={18} />
@@ -1674,6 +2625,7 @@ export default function App({
             )}
             <span className="workspace-breadcrumb">{workspace}</span>
             <ChevronRight size={13} />
+            <span className="visually-hidden">,</span>
             <span className="topbar-title">
               {destination
                 ? target?.name
@@ -1695,6 +2647,7 @@ export default function App({
               <span
                 className="live-indicator"
                 title="Hub connected"
+                role="img"
                 aria-label="Live connection"
               >
                 <span />
@@ -1705,6 +2658,15 @@ export default function App({
             <div className="topbar-accessory no-drag">{headerAccessory}</div>
           )}
           <div className="topbar-actions no-drag">
+            <button
+              className="icon-button"
+              aria-label="Search conversations"
+              title="Search conversations (⌘/Ctrl F)"
+              disabled={!connected}
+              onClick={() => setSearchOpen(true)}
+            >
+              <Search size={17} />
+            </button>
             <button
               className="icon-button"
               aria-label="Open shell"
@@ -1726,6 +2688,8 @@ export default function App({
             <button
               className="icon-button"
               aria-label="Open command palette"
+              title="Commands (⌘/Ctrl K)"
+              aria-haspopup="dialog"
               onClick={() => {
                 setPalette(true);
                 setQuery("");
@@ -1733,74 +2697,131 @@ export default function App({
             >
               <CommandIcon size={17} />
             </button>
-            {section === "chat" && (
-              <details className="conversation-menu">
-                <summary aria-label="Thread actions">
-                  <MoreHorizontal size={18} />
-                </summary>
-                <div
-                  onClick={(event) =>
-                    (
-                      event.currentTarget.parentElement as HTMLDetailsElement
-                    ).removeAttribute("open")
+            <details
+              className="conversation-menu"
+              onToggle={(event) => {
+                const menu = event.currentTarget;
+                // Keyboard users land on the first action; pointer users keep focus.
+                if (menu.open && menu.dataset.keyboard === "true")
+                  menu
+                    .querySelector<HTMLElement>("div > button:not(:disabled)")
+                    ?.focus();
+                delete menu.dataset.keyboard;
+              }}
+            >
+              <summary
+                aria-label={
+                  section === "chat" ? "Thread actions" : "More actions"
+                }
+                title={section === "chat" ? "Thread actions" : "More actions"}
+                onKeyDown={(event) => {
+                  const menu = event.currentTarget
+                    .parentElement as HTMLDetailsElement;
+                  if (["Enter", " "].includes(event.key))
+                    menu.dataset.keyboard = "true";
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    menu.dataset.keyboard = "true";
+                    if (!menu.open) menu.open = true;
+                    else
+                      menu
+                        .querySelector<HTMLElement>(
+                          "div > button:not(:disabled)",
+                        )
+                        ?.focus();
+                  }
+                }}
+              >
+                <MoreHorizontal size={18} />
+              </summary>
+              <div
+                onKeyDown={(event) =>
+                  handleRovingKey(event, event.currentTarget, ":scope > button")
+                }
+                onClick={(event) =>
+                  (
+                    event.currentTarget.parentElement as HTMLDetailsElement
+                  ).removeAttribute("open")
+                }
+              >
+                <button
+                  aria-controls="twr-sidebar"
+                  onClick={() => setSidebar(true)}
+                >
+                  <PanelLeftOpen size={16} />
+                  Threads and navigation
+                </button>
+                <button
+                  disabled={!permitted("operate")}
+                  onClick={() => action("new")}
+                >
+                  <Plus size={16} />
+                  New thread
+                </button>
+                <button
+                  disabled={!permitted("terminal")}
+                  onClick={() =>
+                    void openTerminal({
+                      shell: true,
+                      cwd: localWorkingDirectory(target, homePath) || undefined,
+                    })
                   }
                 >
-                  <button onClick={() => setSidebar(true)}>
-                    <PanelLeftOpen size={16} />
-                    Threads and navigation
-                  </button>
-                  <button
-                    disabled={!permitted("operate")}
-                    onClick={() => action("new")}
-                  >
-                    <Plus size={16} />
-                    New thread
-                  </button>
-                  <button
-                    aria-pressed={showTools}
-                    onClick={() => setShowTools((v) => !v)}
-                  >
-                    <Wrench size={16} />
-                    Tool calls
-                  </button>
-                  <button
-                    aria-pressed={showThinking}
-                    onClick={() => setShowThinking((v) => !v)}
-                  >
-                    <Eye size={16} />
-                    Reasoning
-                  </button>
-                  {target && (
-                    <button onClick={() => void exportConversation()}>
-                      <Download size={16} />
-                      Export conversation
+                  <TerminalSquare size={16} />
+                  Open shell
+                </button>
+                {section === "chat" && (
+                  <>
+                    <button
+                      aria-pressed={showTools}
+                      onClick={() => setShowTools((v) => !v)}
+                    >
+                      <Wrench size={16} />
+                      Tool calls
                     </button>
-                  )}
-                  <button
-                    onClick={() =>
-                      action(
-                        destination ? "model" : "orch",
-                        destination ? { thread: destination } : {},
-                      )
-                    }
-                  >
-                    <Settings2 size={16} />
-                    {destination ? "Thread settings" : "Orchestrator settings"}
-                  </button>
-                  <button
-                    onClick={() => {
-                      setPalette(true);
-                      setQuery("");
-                    }}
-                  >
-                    <Search size={16} />
-                    Commands
-                  </button>
-                </div>
-              </details>
-            )}
+                    <button
+                      aria-pressed={showThinking}
+                      onClick={() => setShowThinking((v) => !v)}
+                    >
+                      <Eye size={16} />
+                      Reasoning
+                    </button>
+                    {target && (
+                      <button onClick={() => void exportConversation()}>
+                        <Download size={16} />
+                        Export conversation
+                      </button>
+                    )}
+                    <button
+                      onClick={() =>
+                        action(
+                          destination ? "model" : "orch",
+                          destination ? { thread: destination } : {},
+                        )
+                      }
+                    >
+                      <Settings2 size={16} />
+                      {destination
+                        ? "Thread settings"
+                        : "Orchestrator settings"}
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => {
+                    setPalette(true);
+                    setQuery("");
+                  }}
+                >
+                  <Search size={16} />
+                  Commands
+                </button>
+              </div>
+            </details>
             <button
               className="topbar-new-thread"
+              aria-label="New thread"
+              title="New thread"
               disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
@@ -1823,6 +2844,7 @@ export default function App({
         {(connectionError || connecting) && (
           <div
             className={`connection-banner ${connectionError ? "warning" : ""}`}
+            aria-busy={connecting || undefined}
           >
             {connecting ? <Spinner /> : <AlertCircle size={15} />}
             <span>
@@ -1843,6 +2865,7 @@ export default function App({
                       <button
                         className="icon-button"
                         aria-label="Back to orchestrator"
+                        title="Back to orchestrator"
                         onClick={() => setDestination(undefined)}
                       >
                         <ArrowLeft size={17} />
@@ -1850,6 +2873,7 @@ export default function App({
                     )}
                     <span
                       className={`destination-symbol ${destination ? "worker" : ""}`}
+                      aria-hidden="true"
                     >
                       {destination ? (
                         <ArrowUpRight size={18} />
@@ -1870,6 +2894,7 @@ export default function App({
                     <button
                       className={`icon-button ${showTools ? "on" : ""}`}
                       aria-label="Toggle tool calls"
+                      aria-pressed={showTools}
                       title="Show tool calls"
                       onClick={() => setShowTools((v) => !v)}
                     >
@@ -1878,6 +2903,7 @@ export default function App({
                     <button
                       className={`icon-button ${showThinking ? "on" : ""}`}
                       aria-label="Toggle reasoning"
+                      aria-pressed={showThinking}
                       title="Show reasoning"
                       onClick={() => setShowThinking((v) => !v)}
                     >
@@ -1887,6 +2913,7 @@ export default function App({
                       <button
                         className="icon-button"
                         aria-label="Export conversation"
+                        title="Export conversation"
                         onClick={() => void exportConversation()}
                       >
                         <Download size={16} />
@@ -1894,7 +2921,17 @@ export default function App({
                     )}
                     <button
                       className="icon-button"
-                      aria-label="Orchestrator settings"
+                      aria-label={
+                        destination
+                          ? "Thread settings"
+                          : "Orchestrator settings"
+                      }
+                      title={
+                        destination
+                          ? "Thread settings"
+                          : "Orchestrator settings"
+                      }
+                      aria-haspopup="dialog"
                       onClick={() =>
                         action(
                           destination ? "model" : "orch",
@@ -1906,7 +2943,17 @@ export default function App({
                     </button>
                   </div>
                 </header>
-                <div className="conversation-attention">
+                <div
+                  className="conversation-attention"
+                  role={
+                    view.attention.some(
+                      (a) => a.thread === "hub" || a.thread === target?.id,
+                    )
+                      ? "region"
+                      : undefined
+                  }
+                  aria-label="Requests for this conversation"
+                >
                   {view.attention
                     .filter(
                       (a) => a.thread === "hub" || a.thread === target?.id,
@@ -1916,8 +2963,9 @@ export default function App({
                         key={item.attn_id + ":" + item.revision}
                         item={item}
                         thread={view.threads.find((t) => t.id === item.thread)}
-                        readOnly={!permitted("operate")}
+                        readOnly={!connected || !permitted("operate")}
                         onRespond={respond}
+                        onDismiss={dismissAttention}
                         rpc={rpc}
                         fail={fail}
                       />
@@ -1928,14 +2976,14 @@ export default function App({
                   events={presentedEvents}
                   showTools={showTools}
                   showThinking={showThinking}
-                  loading={transcriptLoading}
+                  loading={transcriptLoading && !presentedEvents.length}
                   error={transcriptError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
                   }
                   earlierBusy={earlierBusy}
                   target={target}
-                  onSetup={() => action("orch")}
+                  onSetup={setupOrchestrator}
                   connected={connected}
                   summaries={assistance.summaries}
                   onError={fail}
@@ -1950,16 +2998,54 @@ export default function App({
                     {workers
                       .filter((t) => t.last_report)
                       .map((t) => (
-                        <button key={t.id} onClick={() => setSelected(t.id)}>
+                        <button
+                          key={t.id}
+                          aria-controls="twr-inspector"
+                          onClick={() => setSelected(t.id)}
+                        >
                           <span style={{ color: t.accent }}>{t.name}</span>
+                          <span className="visually-hidden">: </span>
                           <span>{t.last_report.summary}</span>
                           <ArrowUpRight size={14} />
                         </button>
                       ))}
                   </details>
                 )}
+                <Outbox
+                  journal={journal}
+                  workspace={workspace}
+                  connected={connected}
+                  threads={view.threads}
+                  onSent={(result) => {
+                    setQueueRefresh((n) => n + 1);
+                    for (const restored of [
+                      ...(result.restored_drafts || []),
+                      ...(result.restored_draft ? [result.restored_draft] : []),
+                    ])
+                      drafts.set(restored.key, (old) =>
+                        appendDraft(old, restored.text),
+                      );
+                  }}
+                  onCopy={(message) => {
+                    const key =
+                      message.workspace +
+                      ":" +
+                      (message.method === "say"
+                        ? "orchestrator"
+                        : message.params.thread);
+                    const text = messageDraft(message);
+                    drafts.set(key, (old) => appendDraft(old, text));
+                  }}
+                />
+                {target && (
+                  <AttachmentManager
+                    controller={uploads}
+                    thread={target.id}
+                    workspace={workspace}
+                  />
+                )}
                 {queued.length > 0 && (
-                  <div className="queue">
+                  <section className="queue" aria-label="Queued messages">
                     <div className="eyebrow">
                       QUEUED MESSAGES · {queueInfo.total || queued.length}
                       {queueInfo.held ? " · Held after a failure" : ""}
@@ -1975,18 +3061,22 @@ export default function App({
                             JSON.stringify(message)}
                         </span>
                         <button
-                          disabled={!message.mine}
+                          disabled={
+                            !message.mine || queueBusy.includes(message.ref)
+                          }
                           onClick={() => void takeBack(message)}
                         >
                           Take back
                         </button>
                         <button
-                          disabled={i !== 0}
+                          disabled={i !== 0 || queueBusy.includes(message.ref)}
                           onClick={() => {
                             setConfirmation({
                               title: "Send this message now?",
                               detail:
                                 "The running turn will be interrupted so this message can start.",
+                              action: "Send now",
+                              destructive: true,
                               run: () => void sendNow(message),
                             });
                           }}
@@ -1995,7 +3085,7 @@ export default function App({
                         </button>
                       </div>
                     ))}
-                  </div>
+                  </section>
                 )}
                 <div className="shell-runs">
                   {shellJobs.map((job) => (
@@ -2013,7 +3103,8 @@ export default function App({
                         Stop…
                       </button>
                       <button
-                        aria-label="Hide shell output"
+                        aria-label={`Hide shell command ${job.command}`}
+                        title="Hide"
                         onClick={() =>
                           setShellJobs((old) =>
                             old.filter((j) => j.job !== job.job),
@@ -2046,269 +3137,45 @@ export default function App({
                     <button
                       onClick={assistance.clearNotice}
                       aria-label="Dismiss assistance notice"
+                      title="Dismiss"
                     >
                       <X size={12} />
                     </button>
                   </div>
                 )}
-                {!draft && assistance.suggestion && (
-                  <button
-                    className="suggested-message"
-                    onClick={acceptSuggestion}
-                  >
-                    <span>{assistance.suggestion}</span>
-                    <kbd>Tab to use</kbd>
-                  </button>
-                )}
-                <form
-                  className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
-                  onSubmit={(event) => void send(event)}
-                >
-                  <div className="composer-label">
-                    <span className="destination-chip">
-                      <span className="destination-dot" />
-                      To:{" "}
-                      <b>
-                        {draft.startsWith("!") && !draft.startsWith("!!!")
-                          ? "Shell · " +
-                            (destination
-                              ? target?.name
-                              : shellCwd || "workspace folder") +
-                            (draft.startsWith("!!") ? " · share result" : "")
-                          : destination
-                            ? target?.name
-                            : "Orchestrator"}
-                      </b>
-                      {destination && (
-                        <button
-                          type="button"
-                          aria-label="Return to orchestrator"
-                          onClick={() => setDestination(undefined)}
-                        >
-                          <X size={12} />
-                        </button>
-                      )}
-                    </span>
-
-                    <span>
-                      {!connected
-                        ? "Disconnected"
-                        : target
-                          ? target.status_label || target.status
-                          : "Choose an orchestrator"}
-                    </span>
-                    {onDismissKeyboard && (
-                      <button
-                        type="button"
-                        className="keyboard-dismiss"
-                        aria-label="Dismiss keyboard"
-                        onClick={onDismissKeyboard}
-                      >
-                        <ChevronDown size={18} />
-                      </button>
-                    )}
-                  </div>
-                  <textarea
-                    ref={input}
-                    aria-label={
-                      destination
-                        ? `Message ${target?.name} directly`
-                        : "Message orchestrator"
-                    }
-                    value={draft}
-                    onChange={(e) => {
-                      setAcceptedSuggestion(undefined);
-                      setDrafts((old) => ({
-                        ...old,
-                        [draftKey]: e.target.value,
-                      }));
-                      setSlashHidden(false);
-                      setMentionHidden(false);
-                      setMentionIndex(0);
-                    }}
-                    placeholder={
-                      document.documentElement.dataset.mobile === "true"
-                        ? "Message…"
-                        : destination
-                          ? `Message ${target?.name} directly…`
-                          : "Ask your orchestrator to build something…"
-                    }
-                    rows={Math.min(
-                      6,
-                      Math.max(
-                        document.documentElement.dataset.mobile === "true"
-                          ? 1
-                          : 2,
-                        draft.split("\n").length,
-                      ),
-                    )}
-                    disabled={!connected || !permitted("operate")}
-                    onKeyDown={(e) => {
-                      if (e.nativeEvent.isComposing || e.keyCode === 229)
-                        return;
-                      if (e.key === "Tab" && !draft && assistance.suggestion) {
-                        e.preventDefault();
-                        acceptSuggestion();
-                        return;
-                      }
-                      if (mentions.length && !mentionHidden) {
-                        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-                          e.preventDefault();
-                          setMentionIndex(
-                            (i) =>
-                              (i +
-                                (e.key === "ArrowDown"
-                                  ? 1
-                                  : mentions.length - 1)) %
-                              mentions.length,
-                          );
-                          return;
-                        }
-                        if (
-                          (e.key === "Enter" && !e.shiftKey) ||
-                          e.key === "Tab"
-                        ) {
-                          e.preventDefault();
-                          chooseMention(
-                            mentions[mentionIndex % mentions.length],
-                          );
-                          return;
-                        }
-                        if (e.key === "Escape") {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          setMentionHidden(true);
-                          return;
-                        }
-                      }
-                      if (
-                        e.key === "Escape" &&
-                        slashMatches.length &&
-                        !slashHidden
-                      ) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        setSlashHidden(true);
-                        return;
-                      }
-                      if (
-                        e.key === "Enter" &&
-                        !e.shiftKey &&
-                        document.documentElement.dataset.mobile !== "true" &&
-                        !e.nativeEvent.isComposing
-                      ) {
-                        e.preventDefault();
-                        void send();
-                      }
-                    }}
-                  />
-                  <div className="composer-bottom">
-                    {hostApi.uploadFile && permitted("operate") && (
-                      <label
-                        className="attachment-button"
-                        title="Upload files to this thread"
-                      >
-                        <Paperclip size={18} />
-                        <span className="sr-only">Upload files</span>
-                        <input
-                          type="file"
-                          aria-label="Upload files"
-                          multiple
-                          disabled={!connected || !target || sending}
-                          onChange={async (event) => {
-                            const files = Array.from(event.target.files || []);
-                            event.target.value = "";
-                            if (!target) return;
-                            const thread = target.id;
-                            const key = draftKey;
-                            setSending(true);
-                            try {
-                              for (const file of files) {
-                                const uploaded = await hostApi.uploadFile!(
-                                  file,
-                                  thread,
-                                );
-                                setDrafts((old) => ({
-                                  ...old,
-                                  [key]:
-                                    `${old[key] || ""}\nUploaded file: ${file.name}\n${uploaded.path}\n`.trimStart(),
-                                }));
-                              }
-                            } catch (error) {
-                              fail(error);
-                            } finally {
-                              setSending(false);
-                            }
-                          }}
-                        />
-                      </label>
-                    )}
-                    <span>
-                      <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd>{" "}
-                      reference a thread <span>·</span> Shift Enter for a new
-                      line
-                      {assistance.stats && (
-                        <small
-                          title={`${assistance.stats.calls} calls · ${assistance.stats.failures} failed`}
-                        >
-                          {" "}
-                          · {assistance.stats.source} $
-                          {Number(assistance.stats.cost_usd || 0).toFixed(4)}{" "}
-                          USD
-                        </small>
-                      )}
-                    </span>
-                    <button
-                      className="send-button"
-                      type="submit"
-                      disabled={
-                        !permitted("operate") ||
-                        !draft.trim() ||
-                        !connected ||
-                        (!target && !draft.startsWith("/")) ||
-                        sending
-                      }
-                      aria-label="Send message"
-                    >
-                      {sending ? <Spinner /> : <ArrowUp size={18} />}
-                    </button>
-                  </div>
-                  {mentions.length > 0 && !mentionHidden && (
-                    <div className="mentions">
-                      {mentions.map((t, i) => (
-                        <button
-                          className={i === mentionIndex ? "active" : ""}
-                          type="button"
-                          key={t.id}
-                          onClick={() => chooseMention(t)}
-                        >
-                          {" "}
-                          @{t.name}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  {slashMatches.length > 0 && !slashHidden && (
-                    <div className="mentions slash-suggestions">
-                      {slashMatches.map((command) => (
-                        <button
-                          type="button"
-                          key={command.id}
-                          onClick={() =>
-                            submitSlash(
-                              "/" +
-                                command.id +
-                                draft.slice(1).replace(/^\S+/, ""),
-                            )
-                          }
-                        >
-                          <b>/{command.id}</b>
-                          <span>{command.title}</span>
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </form>
+                <Composer
+                  drafts={drafts}
+                  draftKey={draftKey}
+                  memory={composer}
+                  input={input}
+                  hostApi={hostApi}
+                  rpc={rpc}
+                  operate={permitted("operate")}
+                  connected={connected}
+                  journal={journal}
+                  sending={sending}
+                  workspace={workspace}
+                  target={target}
+                  destination={destination}
+                  setDestination={setDestination}
+                  orchestrator={orchestrator}
+                  workers={workers}
+                  slashCommands={
+                    slashCommands.length ? slashCommands : commands
+                  }
+                  shellCwd={shellCwd}
+                  assistance={assistance}
+                  acceptSuggestion={acceptSuggestion}
+                  onEdit={forgetAcceptedSuggestion}
+                  send={send}
+                  submitSlash={submitSlash}
+                  uploads={uploads}
+                  submitVoice={submitVoice}
+                  voiceHint={voiceHintWords}
+                  spokenLately={spokenLately}
+                  onDismissKeyboard={onDismissKeyboard}
+                  fail={fail}
+                />
               </>
             )}
             {section === "grid" && (
@@ -2330,33 +3197,38 @@ export default function App({
                     New thread
                   </button>
                 </header>
-                <div className="manager-actions">
+                <div
+                  className="manager-actions"
+                  role="group"
+                  aria-label="Thread filters"
+                >
                   <button
                     className={focus ? "active" : ""}
+                    aria-pressed={focus}
                     onClick={() => setFocus((v) => !v)}
                   >
                     <Filter size={14} />
                     Focus {focus ? "on" : "off"}
                   </button>
-                  <button onClick={() => setParked((v) => !v)}>
+                  <button
+                    aria-pressed={parked}
+                    onClick={() => setParked((v) => !v)}
+                  >
                     {parked ? "Hide" : "Show"} parked
                   </button>
                 </div>
-                <div className="thread-grid">
+                <div className="thread-grid" role="list" aria-label="Threads">
                   {visible.map((t) => (
                     <ThreadCard
+                      listItem
                       key={t.id}
                       thread={t}
                       items={attentionFor(t.id)}
                       dived={destination === t.id}
                       selected={selected === t.id}
                       pinned={pins.includes(t.id)}
-                      onSelect={() => setSelected(t.id)}
-                      onOpen={() => {
-                        setDestination(t.id);
-                        setSection("chat");
-                        setSelected(undefined);
-                      }}
+                      onSelect={selectThread}
+                      onOpen={openThread}
                       large
                     />
                   ))}
@@ -2370,40 +3242,72 @@ export default function App({
               </div>
             )}
             {section === "attention" && (
-              <div className="manager">
-                <header className="section-heading">
-                  <div>
-                    <span className="eyebrow">Your attention</span>
-                    <h1>
-                      Needs you{" "}
-                      <span className="heading-count">
-                        {view.attention.length}
-                      </span>
-                    </h1>
-                    <p>
-                      Review the request, then decide. Your agents will take it
-                      from there.
-                    </p>
-                  </div>
-                </header>
-                {view.attention.map((item) => (
+              <NeedsYouInbox
+                source={{
+                  hubId: hostId,
+                  cached: !connected,
+                  provisional:
+                    !connected &&
+                    !hasLiveSnapshot.current &&
+                    !journal?.snapshot.workspaces[workspace],
+                  updatedAt: !connected
+                    ? journal?.snapshot.workspaces[workspace]?.savedAt
+                    : undefined,
+                  hubName:
+                    hostId === "local"
+                      ? "This computer"
+                      : String(
+                          inboxSources.find((source) => source.hubId === hostId)
+                            ?.hubName ||
+                            info?.hostname ||
+                            hostId,
+                        ),
+                  workspace,
+                  attention:
+                    !connected && !hasLiveSnapshot.current
+                      ? journal?.snapshot.workspaces[workspace]?.view
+                          .attention || view.attention
+                      : view.attention,
+                  threads:
+                    !connected && !hasLiveSnapshot.current
+                      ? journal?.snapshot.workspaces[workspace]?.view.threads ||
+                        view.threads
+                      : view.threads,
+                }}
+                sources={inboxSources}
+                refreshing={inboxRefreshing}
+                onRefresh={() => void refreshInboxSources()}
+                onOpenSource={(source) => {
+                  if (source.hubId === hostId)
+                    void connect(source.workspace).then(() =>
+                      setSection("attention"),
+                    );
+                  else
+                    window.dispatchEvent(
+                      new CustomEvent("twr:select-host", {
+                        detail: {
+                          hubId: source.hubId,
+                          workspace: source.workspace,
+                          attention: true,
+                        },
+                      }),
+                    );
+                }}
+                renderItem={(item) => (
                   <AttentionCard
                     key={item.attn_id + ":" + item.revision}
                     item={item}
-                    thread={view.threads.find((t) => t.id === item.thread)}
-                    readOnly={!permitted("operate")}
+                    thread={view.threads.find(
+                      (thread) => thread.id === item.thread,
+                    )}
+                    readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
-                ))}
-                {!view.attention.length && (
-                  <Empty
-                    title="You’re all caught up"
-                    description="Questions, permissions, and completed work will appear here."
-                  />
                 )}
-              </div>
+              />
             )}
             {section === "decisions" && (
               <div className="manager">
@@ -2428,6 +3332,7 @@ export default function App({
               <Manager
                 key={workspace + ":" + section}
                 section={section}
+                canAdmin={permitted("admin")}
                 workspace={workspace}
                 refreshKey={refresh}
                 rpc={rpc}
@@ -2438,12 +3343,18 @@ export default function App({
             )}
           </div>
           {selectedThread && (
-            <aside className="inspector">
+            <aside
+              className="inspector"
+              id="twr-inspector"
+              aria-label={`Thread details: ${selectedThread.name}`}
+            >
+              <PaneResize pane="inspector" />
               <header>
                 <span className="eyebrow">Thread details</span>
                 <button
                   className="icon-button"
                   aria-label="Close thread details"
+                  title="Close thread details"
                   onClick={() => setSelected(undefined)}
                 >
                   <X size={17} />
@@ -2499,6 +3410,7 @@ export default function App({
                   <span>Worktree</span>
                   <button
                     className="text-button path"
+                    title="Reveal worktree"
                     onClick={() =>
                       void hostApi
                         .reveal(
@@ -2515,8 +3427,9 @@ export default function App({
                     key={item.attn_id + ":" + item.revision}
                     item={item}
                     thread={selectedThread}
-                    readOnly={!permitted("operate")}
+                    readOnly={!connected || !permitted("operate")}
                     onRespond={respond}
+                    onDismiss={dismissAttention}
                     rpc={rpc}
                     fail={fail}
                   />
@@ -2528,7 +3441,10 @@ export default function App({
                   </section>
                 )}
                 <div className="inspector-actions">
-                  <button onClick={() => togglePin(selectedThread.id)}>
+                  <button
+                    aria-pressed={pins.includes(selectedThread.id)}
+                    onClick={() => togglePin(selectedThread.id)}
+                  >
                     <Pin size={14} />
                     {pins.includes(selectedThread.id) ? "Unpin" : "Pin"} thread
                   </button>
@@ -2564,8 +3480,9 @@ export default function App({
             </aside>
           )}
         </div>
-        <nav className="compact-nav">
+        <nav className="compact-nav" aria-label="Sections">
           <button
+            aria-current={section === "chat" ? "page" : undefined}
             onClick={() => {
               setSection("chat");
             }}
@@ -2573,18 +3490,31 @@ export default function App({
             <MessageSquare size={15} />
             Chat
           </button>
-          <button onClick={() => setSection("attention")}>
+          <button
+            aria-current={section === "attention" ? "page" : undefined}
+            onClick={() => setSection("attention")}
+          >
             <Bell size={15} />
             Needs you
             {view.attention.length > 0 && (
-              <span className="count">{view.attention.length}</span>
+              <>
+                {" "}
+                <span className="count">{view.attention.length}</span>
+              </>
             )}
           </button>
-          <button onClick={() => setSection("grid")}>
+          <button
+            aria-current={section === "grid" ? "page" : undefined}
+            onClick={() => setSection("grid")}
+          >
             <LayoutGrid size={15} />
             Threads
           </button>
-          <button onClick={() => setSidebar((v) => !v)}>
+          <button
+            aria-expanded={sidebar}
+            aria-controls="twr-sidebar"
+            onClick={() => setSidebar((v) => !v)}
+          >
             <MoreHorizontal size={16} />
             More
           </button>
@@ -2593,6 +3523,7 @@ export default function App({
         {terminals.length > 0 && (
           <section
             className={`terminal-dock ${terminalVisible ? "" : "collapsed"}`}
+            aria-label="Terminals"
           >
             <div className="terminal-tabs">
               <button
@@ -2600,6 +3531,11 @@ export default function App({
                 aria-label={
                   terminalVisible ? "Collapse terminals" : "Expand terminals"
                 }
+                title={
+                  terminalVisible ? "Collapse terminals" : "Expand terminals"
+                }
+                aria-expanded={terminalVisible}
+                aria-controls="twr-terminal-content"
                 onClick={() => setTerminalVisible((v) => !v)}
               >
                 <ChevronDown size={15} />
@@ -2610,6 +3546,7 @@ export default function App({
                   key={t.id}
                 >
                   <button
+                    aria-current={t.id === activeTerminal ? "true" : undefined}
                     onClick={() => {
                       setActiveTerminal(t.id);
                       setTerminalVisible(true);
@@ -2621,19 +3558,27 @@ export default function App({
                       <TerminalSquare size={13} />
                     )}
                     <span>{t.title}</span>
+                    {t.exited && (
+                      <span className="visually-hidden"> (exited)</span>
+                    )}
                   </button>
                   <button
                     aria-label={`Close ${t.title}`}
+                    title={`Close ${t.title}`}
                     onClick={() =>
                       setConfirmation({
                         title: "Close terminal?",
                         detail: t.exited
                           ? "Remove this terminal tab?"
                           : "Its interactive program will exit. The hub and other agents keep running.",
+                        action: t.exited ? "Remove tab" : "Close terminal",
+                        destructive: !t.exited,
                         run: () => {
+                          terminalSnapshots.current.changed();
                           void hostApi
                             .terminalClose(t.id)
                             .then(() => {
+                              terminalSnapshots.current.removed(t.id);
                               setTerminals((old) =>
                                 old.filter((s) => s.id !== t.id),
                               );
@@ -2654,6 +3599,7 @@ export default function App({
               <button
                 className="icon-button"
                 aria-label="New shell terminal"
+                title="New shell terminal"
                 onClick={() => void openTerminal({ shell: true })}
               >
                 <Plus size={15} />
@@ -2661,6 +3607,7 @@ export default function App({
             </div>
             <div
               className="terminal-content"
+              id="twr-terminal-content"
               style={{ display: terminalVisible ? "block" : "none" }}
             >
               <Suspense
@@ -2684,10 +3631,14 @@ export default function App({
         )}
       </main>
       {error && (
-        <div role="alert" className="toast">
+        <div role="alert" className="toast" data-modal-keep="">
           <AlertCircle size={17} />
           <span>{error}</span>
-          <button aria-label="Dismiss error" onClick={() => setError("")}>
+          <button
+            aria-label="Dismiss error"
+            title="Dismiss"
+            onClick={() => setError("")}
+          >
             <X size={15} />
           </button>
         </div>
@@ -2703,6 +3654,13 @@ export default function App({
             <input
               autoFocus
               aria-label="Search commands"
+              aria-controls="twr-palette-list"
+              aria-autocomplete="list"
+              aria-activedescendant={
+                matching[paletteIndex]
+                  ? `twr-palette-${paletteIndex}`
+                  : undefined
+              }
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search commands, settings, or CLI actions…"
@@ -2725,27 +3683,43 @@ export default function App({
             />
           </div>
           <div className="palette-list">
-            {matching.map((command, index) => (
-              <button
-                data-cli={command.cli ? "true" : undefined}
-                data-palette-active={index === paletteIndex}
-                className={index === paletteIndex ? "active" : ""}
-                key={command.id}
-                onClick={() =>
-                  openOperation(command, {
-                    thread: selected || destination || "",
-                  })
-                }
-              >
-                <span>
-                  <b>{command.title}</b>
-                  <small>{command.description.slice(0, 130)}</small>
-                </span>
-                <span className="command-group">{command.group}</span>
-                <ChevronRight size={15} />
-              </button>
-            ))}
-            {!matching.length && <p className="muted">No matching commands.</p>}
+            <div
+              className="palette-options"
+              id="twr-palette-list"
+              role="listbox"
+              aria-label="Commands"
+            >
+              {matching.map((command, index) => (
+                <button
+                  data-cli={command.cli ? "true" : undefined}
+                  data-palette-active={index === paletteIndex}
+                  className={index === paletteIndex ? "active" : ""}
+                  role="option"
+                  id={`twr-palette-${index}`}
+                  aria-selected={index === paletteIndex}
+                  tabIndex={-1}
+                  key={command.id}
+                  onClick={() =>
+                    openOperation(command, {
+                      thread: selected || destination || "",
+                    })
+                  }
+                >
+                  <span>
+                    <b>{command.title}</b>
+                    <small>{command.description.slice(0, 130)}</small>
+                  </span>
+                  <span className="visually-hidden">, </span>
+                  <span className="command-group">{command.group}</span>
+                  <ChevronRight size={15} />
+                </button>
+              ))}
+            </div>
+            {!matching.length && (
+              <p className="muted" role="status">
+                No matching commands.
+              </p>
+            )}
             {!cliCommands.length && (
               <button
                 onClick={() =>
@@ -2803,12 +3777,35 @@ export default function App({
                             ]),
                           ],
                         }
-                      : field.key === "mode" && !permitted("admin")
+                      : field.type === "model" || field.type === "effort"
                         ? {
                             ...field,
-                            options: ["manual", "plan", "read-only", "dontAsk"],
+                            choices: (field.type === "model"
+                              ? modelChoices
+                              : effortChoices)(
+                              modelCatalog,
+                              formRuntime(
+                                operation,
+                                values,
+                                view.threads,
+                                info?.orchestrator?.configured?.explicit ===
+                                  false
+                                  ? info.orchestrator.configured.runtime
+                                  : undefined,
+                              ),
+                            ),
                           }
-                        : field
+                        : field.key === "mode" && !permitted("admin")
+                          ? {
+                              ...field,
+                              options: [
+                                "manual",
+                                "plan",
+                                "read-only",
+                                "dontAsk",
+                              ],
+                            }
+                          : field
                   }
                   value={values[field.key]}
                   onChange={(value) =>
@@ -2846,14 +3843,24 @@ export default function App({
                   ) : operation.id === "app-update" ? (
                     <>
                       <DataView value={result} />
-                      <button
-                        onClick={() =>
-                          void hostApi
-                            .openExternal(result.release_page)
-                            .catch(fail)
-                        }
-                      >
-                        Open release downloads <ExternalLink size={14} />
+                      {result?.releaseUrl && (
+                        <button
+                          onClick={() =>
+                            void hostApi
+                              .openExternal(
+                                result.download?.url || result.releaseUrl,
+                              )
+                              .catch(fail)
+                          }
+                        >
+                          {result.download
+                            ? `Download ${result.download.name}`
+                            : "Open release page"}{" "}
+                          <ExternalLink size={14} aria-hidden="true" />
+                        </button>
+                      )}
+                      <button onClick={() => setSection("settings")}>
+                        Update settings
                       </button>
                     </>
                   ) : operation.id === "context-read" ? (
@@ -2914,18 +3921,36 @@ export default function App({
             <div>
               <button onClick={() => setConfirmation(undefined)}>Cancel</button>
               <button
-                className="primary"
+                className={confirmation.destructive ? "danger" : "primary"}
                 onClick={() => {
                   const run = confirmation.run;
                   setConfirmation(undefined);
                   run();
                 }}
               >
-                Continue
+                {confirmation.action}
               </button>
             </div>
           </footer>
         </Dialog>
+      )}
+      {searchOpen && (
+        <ConversationSearch
+          rpc={rpc}
+          workspace={workspace}
+          hubName={
+            hostId === "local"
+              ? "This computer"
+              : String(
+                  inboxSources.find((source) => source.hubId === hostId)
+                    ?.hubName ||
+                    info?.hostname ||
+                    hostId,
+                )
+          }
+          threads={view.threads}
+          onClose={() => setSearchOpen(false)}
+        />
       )}
       {workspaceModal && (
         <Dialog
@@ -2937,17 +3962,20 @@ export default function App({
             {workspaces.map((w) => (
               <div className="workspace-row" key={w.name}>
                 <button
+                  aria-current={w.name === workspace ? "true" : undefined}
                   onClick={() => {
                     setWorkspaceModal(false);
                     void connect(w.name);
                   }}
                 >
                   {w.name}
+                  <span className="visually-hidden">, </span>
                   <span>{w.state || w.status}</span>
                 </button>
                 <button
                   className="icon-button danger-quiet"
                   aria-label={`Remove workspace ${w.name}`}
+                  title={`Remove workspace ${w.name}`}
                   onClick={() => {
                     setWorkspaceModal(false);
                     cliAction("ws rm", { name: w.name });
@@ -2976,11 +4004,16 @@ export default function App({
                 <input
                   value={newWorkspace}
                   onChange={(e) => setNewWorkspace(e.target.value)}
+                  aria-describedby="twr-workspace-name-hint"
                   pattern="[a-z0-9][a-z0-9-]{0,31}"
                   maxLength={32}
                   required
                   placeholder="e.g. client-project"
                 />
+                <span className="visually-hidden" id="twr-workspace-name-hint">
+                  Lowercase letters, numbers and hyphens, starting with a letter
+                  or number; up to 32 characters.
+                </span>
               </label>
               <button className="primary">
                 <Plus size={15} />
@@ -3000,7 +4033,7 @@ export default function App({
             }}
           >
             <MessageSquare size={19} />
-            Chat
+            <span>Chat</span>
           </button>
           <button
             aria-current={section === "attention" ? "page" : undefined}
@@ -3010,8 +4043,10 @@ export default function App({
             }}
           >
             <Bell size={19} />
-            Needs you
-            {view.attention.length ? ` · ${view.attention.length}` : ""}
+            <span>
+              Needs you
+              {view.attention.length ? ` · ${view.attention.length}` : ""}
+            </span>
           </button>
           <button
             aria-current={section === "grid" ? "page" : undefined}
@@ -3021,19 +4056,29 @@ export default function App({
             }}
           >
             <LayoutGrid size={19} />
-            Threads
+            <span>Threads</span>
           </button>
-          <button aria-expanded={sidebar} onClick={() => setSidebar((v) => !v)}>
+          <button
+            aria-expanded={sidebar}
+            aria-controls="twr-sidebar"
+            onClick={() => setSidebar((v) => !v)}
+          >
             <MoreHorizontal size={19} />
-            More
+            <span>More</span>
           </button>
         </nav>
       )}
+      <LinkConfirm onError={fail} />
+      <span id="twr-thread-open-hint" hidden>
+        Details shown. Press Enter to open this conversation.
+      </span>
     </div>
   );
 }
 
-function ThreadCard({
+/** Memoized, with stable `onSelect`/`onOpen` taking the thread's id and `items` shared
+ * per thread: typing and streaming don't redraw every card. */
+const ThreadCard = memo(function ThreadCard({
   thread,
   items,
   selected,
@@ -3042,15 +4087,56 @@ function ThreadCard({
   onSelect,
   onOpen,
   large = false,
+  listItem = false,
 }: {
   thread: Thread;
   items: Attention[];
   selected: boolean;
   dived?: boolean;
   pinned: boolean;
+  onSelect: (id: string) => void;
+  onOpen: (id: string) => void;
+  large?: boolean;
+  listItem?: boolean;
+}) {
+  const card = (
+    <ThreadCardButton
+      thread={thread}
+      items={items}
+      selected={selected}
+      dived={dived}
+      pinned={pinned}
+      onSelect={() => onSelect(thread.id)}
+      onOpen={() => onOpen(thread.id)}
+      large={large}
+    />
+  );
+  return listItem ? (
+    <div role="listitem" className="thread-item">
+      {card}
+    </div>
+  ) : (
+    card
+  );
+});
+function ThreadCardButton({
+  thread,
+  items,
+  selected,
+  dived,
+  pinned,
+  onSelect,
+  onOpen,
+  large,
+}: {
+  thread: Thread;
+  items: Attention[];
+  selected: boolean;
+  dived: boolean;
+  pinned: boolean;
   onSelect: () => void;
   onOpen: () => void;
-  large?: boolean;
+  large: boolean;
 }) {
   const git = thread.git || thread.git_snapshot;
   const report = thread.last_report;
@@ -3058,6 +4144,7 @@ function ThreadCard({
     <button
       className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
       aria-current={dived ? "location" : undefined}
+      aria-describedby={selected ? "twr-thread-open-hint" : undefined}
       style={{ "--thread-color": thread.accent } as CSSProperties}
       onClick={onSelect}
       onDoubleClick={onOpen}
@@ -3069,7 +4156,7 @@ function ThreadCard({
       }}
     >
       <div className="thread-card-title">
-        <span className="thread-color-dot" />
+        <span className="thread-color-dot" aria-hidden="true" />
         <b>{thread.name}</b>
         {dived && (
           <ArrowUpRight
@@ -3079,16 +4166,19 @@ function ThreadCard({
             aria-label="Current destination"
           />
         )}
-        {pinned && <Pin size={11} />}
+        {pinned && <Pin size={11} role="img" aria-label="Pinned" />}
+        <span className="visually-hidden">, </span>
         <span className={`thread-status status-${thread.status}`}>
           {statusIcon(thread.status)}
           {thread.status_label || thread.status}
         </span>
       </div>
 
+      <span className="visually-hidden">. </span>
       {items[0] ? (
         <span className="thread-card-request">
           <AlertCircle size={12} />
+          <span className="visually-hidden">Request: </span>
           {items[0].summary}
         </span>
       ) : report && ["done", "idle", "parked"].includes(thread.status) ? (
@@ -3104,6 +4194,7 @@ function ThreadCard({
             "Ready for a task"}
         </span>
       )}
+      <span className="visually-hidden">. </span>
       <span className="thread-card-runtime">
         {thread.runtime}
         {thread.box_name !== "local" ? " @" + thread.box_name : ""} ·{" "}
@@ -3122,58 +4213,132 @@ function ThreadCard({
     </button>
   );
 }
+/** Tracks how long an attention card's options have been on screen: from mount, or from
+ * when they scroll into view, and again from zero after they leave it or the window is
+ * hidden. `identity` restarts it for a new item or revision. */
+function useArming(target: RefObject<HTMLElement | null>, identity: string) {
+  const state = useRef<Arming>({});
+  const [isArmed, setArmed] = useState(false);
+  useEffect(() => {
+    state.current = hidden();
+    setArmed(false);
+    const node = target.current;
+    const observable = !!node && typeof IntersectionObserver !== "undefined";
+    let onScreen = !observable;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const update = () => {
+      clearTimeout(timer);
+      const now = performance.now();
+      state.current =
+        onScreen && document.visibilityState !== "hidden"
+          ? shown(state.current, now)
+          : hidden();
+      setArmed(armed(state.current, now));
+      const wait = armsIn(state.current, now);
+      if (wait) timer = setTimeout(update, wait);
+    };
+    let observer: IntersectionObserver | undefined;
+    if (observable) {
+      observer = new IntersectionObserver((entries) => {
+        onScreen = entries[entries.length - 1].isIntersecting;
+        update();
+      });
+      observer.observe(node);
+    } else update();
+    document.addEventListener("visibilitychange", update);
+    return () => {
+      clearTimeout(timer);
+      observer?.disconnect();
+      document.removeEventListener("visibilitychange", update);
+    };
+  }, [identity]);
+  return { armed: isArmed, state: () => state.current };
+}
 function AttentionCard({
   item,
   readOnly = false,
   thread,
   onRespond,
+  onDismiss,
   rpc,
   fail,
 }: {
   item: Attention;
   readOnly?: boolean;
   thread?: Thread;
+  /** Answers through App's live-view guard; rejects when it can't be answered now. */
   onRespond: (
     item: Attention,
     answer: string,
     message?: string,
   ) => Promise<void>;
+  onDismiss: (item: Attention) => Promise<void>;
   rpc: (method: string, params?: Json) => Promise<Json>;
   fail: (e: unknown) => void;
 }) {
   const [answer, setAnswer] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  // Once an answer is accepted the card stays answered until the next state removes it:
+  // a second click would only meet the stale revision.
+  const [sent, setSent] = useState(false);
   const [requestError, setRequestError] = useState("");
   const options = item.options || [];
-  const respond = async (value: string) => {
-    if (readOnly || !canRespond(item, busy)) return;
+  const ids = useId();
+  const response = useRef<HTMLDivElement>(null);
+  const arming = useArming(response, item.attn_id + ":" + item.revision);
+  const pending = useRef(false);
+  const answered = useRef(false);
+  const settle = async (run: () => Promise<void>) => {
+    // Clicks and keys that land before the options have been on screen for 600 ms were
+    // meant for whatever was there before (a card that just slid away, the previous
+    // revision): they answer nothing.
+    if (
+      pending.current ||
+      answered.current ||
+      !canRespond(item, busy) ||
+      !mayAnswer({
+        arming: arming.state(),
+        now: performance.now(),
+        busy,
+        sent,
+        readOnly,
+      })
+    )
+      return;
+    pending.current = true;
     setBusy(true);
     setRequestError("");
     try {
-      await rpc("attention.respond", {
-        attn_id: item.attn_id,
-        revision: item.revision,
-        answer: value,
-        ...(message ? { message } : {}),
-      });
+      await run();
+      answered.current = true;
+      setSent(true);
     } catch (e) {
       setRequestError(errorMessage(e));
     } finally {
+      pending.current = false;
       setBusy(false);
     }
   };
+  const respond = (value: string) =>
+    settle(() => onRespond(item, value, message || undefined));
+  const locked = readOnly || busy || sent || !item.revision || item.incomplete;
+  const waiting = !locked && !arming.armed;
   return (
     <article
       className={`attention-card attention-${item.reason}`}
       tabIndex={0}
+      aria-labelledby={`${ids}-kind ${ids}-thread`}
+      aria-describedby={`${ids}-summary`}
+      aria-keyshortcuts={
+        options.length && !readOnly
+          ? options.map((_, i) => String(i + 1)).join(" ")
+          : undefined
+      }
       onKeyDown={(event) => {
         if (
           event.target !== event.currentTarget ||
-          readOnly ||
-          busy ||
-          item.incomplete ||
-          !item.revision ||
+          locked ||
           event.ctrlKey ||
           event.metaKey ||
           event.altKey
@@ -3187,7 +4352,7 @@ function AttentionCard({
       }}
     >
       <header>
-        <span className="attention-kind">
+        <span className="attention-kind" id={`${ids}-kind`}>
           <AlertCircle size={14} />
           {item.reason === "permission"
             ? "Permission requested"
@@ -3195,7 +4360,7 @@ function AttentionCard({
               ? "Question for you"
               : item.reason}
         </span>
-        <span>{thread?.name || "twr"}</span>
+        <span id={`${ids}-thread`}>{thread?.name || "twr"}</span>
       </header>
       <div className="attention-body">
         {item.incomplete && (
@@ -3214,7 +4379,9 @@ function AttentionCard({
             </button>
           </p>
         )}
-        <pre className="attention-summary">{item.summary}</pre>
+        <pre className="attention-summary" id={`${ids}-summary`}>
+          {item.summary}
+        </pre>
         {item.context?.task && (
           <details>
             <summary>Task</summary>
@@ -3237,22 +4404,28 @@ function AttentionCard({
         {item.note && <p className="attention-note">{item.note}</p>}
       </div>
       {readOnly && <p className="muted">This device has read-only access.</p>}
-      <div className="attention-response">
+      <div className="attention-response" ref={response}>
         <input
           aria-label="Optional message with your decision"
+          aria-describedby={requestError ? `${ids}-error` : undefined}
           placeholder="Add a note (optional)…"
           value={message}
           onChange={(e) => setMessage(e.target.value)}
-          disabled={readOnly || busy}
+          disabled={readOnly || busy || sent}
         />
-        <div className="attention-options">
+        <div
+          className={`attention-options ${waiting ? "arming" : ""}`}
+          data-armed={arming.armed && !locked ? "true" : "false"}
+        >
           {options.map((option, i) => (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
               key={option + ":" + i}
+              aria-keyshortcuts={String(i + 1)}
               onClick={() => void respond(option)}
             >
-              <kbd>{i + 1}</kbd>
+              <kbd aria-hidden="true">{i + 1}</kbd>
               {option === "allow"
                 ? "Allow"
                 : option === "deny"
@@ -3270,19 +4443,17 @@ function AttentionCard({
               >
                 <input
                   aria-label="Your answer"
+                  aria-required="true"
+                  aria-describedby={requestError ? `${ids}-error` : undefined}
+                  aria-invalid={requestError ? true : undefined}
                   value={answer}
                   onChange={(e) => setAnswer(e.target.value)}
                   placeholder="Your answer…"
-                  disabled={readOnly || busy}
+                  disabled={readOnly || busy || sent}
                 />
                 <button
-                  disabled={
-                    readOnly ||
-                    busy ||
-                    !answer.trim() ||
-                    !item.revision ||
-                    item.incomplete
-                  }
+                  disabled={locked || !answer.trim()}
+                  aria-disabled={waiting || undefined}
                 >
                   Answer
                 </button>
@@ -3290,24 +4461,23 @@ function AttentionCard({
             )}
           {!["permission", "question"].includes(item.reason) && (
             <button
-              disabled={readOnly || busy || !item.revision || item.incomplete}
-              onClick={() => {
-                setBusy(true);
-                void rpc("attention.dismiss", {
-                  attn_id: item.attn_id,
-                  revision: item.revision,
-                })
-                  .catch(fail)
-                  .finally(() => setBusy(false));
-              }}
+              disabled={locked}
+              aria-disabled={waiting || undefined}
+              onClick={() => void settle(() => onDismiss(item))}
             >
               Dismiss
             </button>
           )}
           {busy && <Spinner />}
+          {sent && (
+            <span className="attention-sent" role="status">
+              <Check size={14} aria-hidden="true" />
+              Sent
+            </span>
+          )}
         </div>
         {requestError && (
-          <p role="alert" className="error-text">
+          <p role="alert" className="error-text" id={`${ids}-error`}>
             {requestError} Review the current request before trying again.
           </p>
         )}
@@ -3315,7 +4485,8 @@ function AttentionCard({
     </article>
   );
 }
-function Conversation({
+/** Memoized: typing in the composer doesn't redraw the transcript. */
+const Conversation = memo(function Conversation({
   events,
   showTools,
   showThinking,
@@ -3349,6 +4520,20 @@ function Conversation({
   const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
+  // Expanded messages and open tool details, by block: rows scrolled out of the virtual
+  // list unmount, and come back as they were left.
+  const [opened, setOpened] = useState<ReadonlyMap<string, boolean>>(
+    () => new Map(),
+  );
+  const setOpen = useCallback((key: string, open: boolean) => {
+    setOpened((old) => {
+      if ((old.get(key) ?? false) === open) return old;
+      const next = new Map(old);
+      if (open) next.set(key, true);
+      else next.delete(key);
+      return next;
+    });
+  }, []);
   const blocks = useMemo(
     () =>
       foldRoutineBlocks(blocksOf(events), events, summaries).filter(
@@ -3420,6 +4605,10 @@ function Conversation({
     <div
       className="conversation-scroll"
       ref={parent}
+      role="region"
+      aria-label={`Conversation with ${target?.name || "orchestrator"}`}
+      aria-busy={loading || undefined}
+      tabIndex={0}
       onScroll={() => {
         const p = parent.current!;
         follow.current = p.scrollHeight - p.scrollTop - p.clientHeight < 100;
@@ -3437,7 +4626,11 @@ function Conversation({
           {earlierBusy ? <Spinner /> : null}Load earlier turn
         </button>
       )}
-      {error && <div className="error-banner">{error}</div>}
+      {error && (
+        <div className="error-banner" role="status">
+          {error}
+        </div>
+      )}
       {loading && (
         <div className="transcript-loading">
           <Spinner />
@@ -3504,7 +4697,7 @@ function Conversation({
               }}
             >
               <div className="message-meta">
-                <span className="message-avatar">
+                <span className="message-avatar" aria-hidden="true">
                   {block.kind === "user" ? (
                     <span aria-hidden="true">›</span>
                   ) : block.kind === "tool" ? (
@@ -3526,11 +4719,11 @@ function Conversation({
                           ? "twr"
                           : target?.name || "Agent"}
                 </b>
-                <time>
-                  {new Date(block.ts).toLocaleTimeString([], {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
+                <time
+                  dateTime={block.ts}
+                  title={new Date(block.ts).toLocaleString()}
+                >
+                  {messageTime(block.ts)}
                 </time>
                 {block.pending && <Spinner />}
                 {block.kind === "assistant" && !block.pending && target && (
@@ -3550,18 +4743,22 @@ function Conversation({
                     <Volume2 size={13} />
                   </button>
                 )}
-                <button
+                <CopyButton
                   className="icon-button copy-message"
-                  aria-label="Copy message"
-                  onClick={() =>
-                    void hostApi.copyText(block.detail || block.text)
-                  }
-                >
-                  <Copy size={13} />
-                </button>
+                  label="Copy message"
+                  size={13}
+                  text={() => block.detail || block.text}
+                  onError={onError}
+                />
               </div>
               {block.children ? (
-                <details className="routine-updates">
+                <details
+                  className="routine-updates"
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.text}
                     <span>
@@ -3572,22 +4769,35 @@ function Conversation({
                   </summary>
                   {block.children.map((entry) => (
                     <div key={entry.id}>
-                      <time>{new Date(entry.ts).toLocaleTimeString()}</time>
+                      <time dateTime={entry.ts}>{messageTime(entry.ts)}</time>
                       <Markdown text={entry.text} />
                     </div>
                   ))}
                 </details>
               ) : block.kind === "tool" ? (
-                <details>
+                <details
+                  open={opened.get("details:" + block.id) ?? false}
+                  onToggle={(event) =>
+                    setOpen("details:" + block.id, event.currentTarget.open)
+                  }
+                >
                   <summary>
                     {block.detail?.split("\n")[0] || "Tool call"}
                   </summary>
-                  <MessageBody text={block.detail || ""} mono />
+                  <MessageBody
+                    text={block.detail || ""}
+                    mono
+                    expanded={opened.get(block.id) ?? false}
+                    onExpandedChange={(open) => setOpen(block.id, open)}
+                  />
                 </details>
               ) : (
                 <MessageBody
                   text={block.text}
                   clamp={block.kind === "user" || block.kind === "notice"}
+                  streaming={block.kind === "assistant" && !!block.pending}
+                  expanded={opened.get(block.id) ?? false}
+                  onExpandedChange={(open) => setOpen(block.id, open)}
                 />
               )}
             </article>
@@ -3602,7 +4812,7 @@ function Conversation({
             setFollowing(true);
             parent.current?.scrollTo({
               top: parent.current.scrollHeight,
-              behavior: "smooth",
+              behavior: scrollBehavior(),
             });
           }}
         >
@@ -3612,7 +4822,7 @@ function Conversation({
       )}
     </div>
   );
-}
+});
 function ContextEditor({
   value,
   project,

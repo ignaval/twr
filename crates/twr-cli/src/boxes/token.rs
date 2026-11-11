@@ -227,21 +227,47 @@ fn add_lines(name: &str, url: &str, listen: &str, file: &Path, version: &str) ->
              runner prove they know it; it never crosses the connection.",
             file.display()
         ),
-        format!("- The box needs the hub's twr: {}.", update_hint(version)),
+        format!(
+            "- The box needs the hub's twr: {}.",
+            update_hint(version, None)
+        ),
     ]
 }
 
 /// How a box gets the hub's twr `version`: a release's `twr update`, or a development build of
-/// its commit.
-pub(super) fn update_hint(version: &str) -> String {
-    match dev_commit(version) {
-        Some(commit) => format!(
+/// its commit. `installed`, the twr the box runs when that is known, says which `twr update`:
+/// one older than the box's own is a downgrade, which `twr update` refuses without
+/// `--allow-downgrade`, and one of the box's version over a development build of it is a
+/// release `twr update` takes for up to date (the installer replaces it). Not known, the hint
+/// covers both.
+pub(super) fn update_hint(version: &str, installed: Option<&str>) -> String {
+    use std::cmp::Ordering;
+    if let Some(commit) = dev_commit(version) {
+        return format!(
             "a build of commit {commit} (the hub runs a development build: \
              docs/tools/dev-install.sh in a checkout of that commit, on the box)"
-        ),
-        None => {
-            format!("twr {version} (`twr update --version v{version}` there, or the installer)")
+        );
+    }
+    let update = format!("twr update --version v{version}");
+    let installer =
+        format!("`curl -fsSL https://twr.tools/install.sh | TWR_VERSION=v{version} sh`");
+    let order = installed.and_then(|i| crate::runner_update::compare_versions(version, i));
+    match (order, installed) {
+        (Some(Ordering::Greater), _) => {
+            format!("twr {version} (`{update}` there, or the installer)")
         }
+        (Some(Ordering::Less), Some(i)) => format!(
+            "twr {version} (`{update} --allow-downgrade` there, since the box's twr {i} is \
+             newer, or the installer)"
+        ),
+        (Some(Ordering::Equal), Some(i)) if dev_commit(i).is_some() => format!(
+            "twr {version} (the box runs {i}, a development build of that version, which `twr \
+             update` leaves as it is: {installer} there)"
+        ),
+        _ => format!(
+            "twr {version} (`{update}` there, adding `--allow-downgrade` when the box's twr is \
+             newer, or the installer)"
+        ),
     }
 }
 
@@ -262,7 +288,7 @@ pub(super) fn refusal_fix(name: &str, reason: &str, version: &str) -> Option<Str
     if reason.contains("protocol") {
         Some(format!(
             "on the box: {}, then restart its runner ({})",
-            update_hint(version),
+            update_hint(version, None),
             restart_hint(name)
         ))
     } else if reason.contains("proof") || reason.contains("token") {
@@ -486,7 +512,7 @@ fn no_token_box(name: &str, cfg: &BoxConfig) -> Option<String> {
         BoxTransport::Command => Some(format!(
             "box {name} is a command box: it has no token (the hub reaches it through its command)"
         )),
-        BoxTransport::Token => None,
+        BoxTransport::Token | BoxTransport::Link => None,
     }
 }
 
@@ -891,7 +917,7 @@ mod tests {
                 "- A new token (32 random bytes) goes into [boxes.gpu] in /h/boxes.toml (mode \
                  0600). Hub and runner prove they know it; it never crosses the connection.",
                 "- The box needs the hub's twr: twr 0.2.0 (`twr update --version v0.2.0` there, \
-                 or the installer).",
+                 adding `--allow-downgrade` when the box's twr is newer, or the installer).",
             ]
         );
         let dev = add_lines("gpu", "u", "l", Path::new("/f"), "0.2.0+dev.abc1234");
@@ -908,6 +934,35 @@ mod tests {
             box_command("gpu", None, None),
             "twr runner install-token gpu"
         );
+    }
+
+    /// The hint to bring a box to the hub's twr: a plain `twr update --version` for an older
+    /// box, with `--allow-downgrade` for a newer one, the installer over a development build
+    /// of the same version, and both cases when the box's twr is not known.
+    #[test]
+    fn the_update_hint_says_which_update_the_box_needs() {
+        let plain = "twr 0.4.0 (`twr update --version v0.4.0` there, or the installer)";
+        assert_eq!(update_hint("0.4.0", Some("0.3.2")), plain);
+        assert_eq!(update_hint("0.4.0", Some("0.4.0-rc.1")), plain);
+        assert_eq!(update_hint("0.4.0", Some("0.3.0+dev.abc1234")), plain);
+        assert_eq!(
+            update_hint("0.3.0", Some("0.4.0")),
+            "twr 0.3.0 (`twr update --version v0.3.0 --allow-downgrade` there, since the box's \
+             twr 0.4.0 is newer, or the installer)"
+        );
+        assert!(update_hint("0.4.0-rc.1", Some("0.4.0")).contains("--allow-downgrade"));
+        let dev = update_hint("0.3.0", Some("0.3.0+dev.abc1234"));
+        assert!(
+            dev.contains("development build")
+                && dev.contains("TWR_VERSION=v0.3.0 sh")
+                && !dev.contains("--allow-downgrade"),
+            "{dev}"
+        );
+        let unknown = "twr 0.3.0 (`twr update --version v0.3.0` there, adding \
+                       `--allow-downgrade` when the box's twr is newer, or the installer)";
+        assert_eq!(update_hint("0.3.0", None), unknown);
+        assert_eq!(update_hint("0.3.0", Some("an unknown version")), unknown);
+        assert!(update_hint("0.3.0+dev.abc1234", Some("0.4.0")).contains("commit abc1234"));
     }
 
     /// The token is printed only on a terminal; otherwise where to get it.
@@ -1083,9 +1138,15 @@ mod tests {
         assert!(matches!(found, Found::None), "no data directory");
 
         std::fs::create_dir_all(&paths.data_dir).unwrap();
+        // Retried until the forks of this process made meanwhile have exec'd (another test's
+        // spawn): until then a fork still holds the lock of the file this test let go.
         let hold = || {
             let f = std::fs::File::create(paths.data_dir.join(twr_hub::LOCK_FILE)).unwrap();
-            f.try_lock().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while let Err(e) = f.try_lock() {
+                assert!(std::time::Instant::now() < deadline, "{e:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
             f
         };
         let lock = hold();

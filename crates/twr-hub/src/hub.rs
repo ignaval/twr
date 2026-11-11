@@ -119,6 +119,7 @@ mod box_agents;
 mod box_switch;
 mod boxes;
 mod checkpoint;
+mod linked;
 pub use checkpoint::{build_key as checkpoint_build, prewarm as prewarm_checkpoint, Prewarm};
 mod closing;
 mod coalesce;
@@ -130,6 +131,7 @@ mod context;
 /// a file that must be neither a symlink swapped in nor a FIFO that blocks the open.
 pub use context::OPEN_FLAGS as OPEN_NOFOLLOW_NONBLOCK;
 mod delete;
+mod device_scope;
 mod disk;
 mod drain;
 mod find_project;
@@ -155,8 +157,10 @@ mod rename;
 mod restart;
 mod retry;
 mod route;
+pub use route::SayOrigin;
 mod runners;
 mod runtime_spec;
+mod search;
 mod shell;
 mod spawn;
 mod speech;
@@ -173,6 +177,7 @@ mod thread_account;
 mod threads;
 mod trash;
 mod updates;
+mod uploads;
 mod usage;
 mod wake;
 mod watches;
@@ -196,7 +201,9 @@ pub(crate) use boxes::WeakHub;
 pub use checkpoint::{CHECKPOINT_EVERY, CHECKPOINT_TICK};
 pub use config_view::config_view;
 pub use context::{injection, CONTEXT_DIR, CONTEXT_FILE, INJECT_MAX, SET_MAX};
+pub(crate) use device_scope::devices_unreadable;
 pub use disk::{DISK_TICK, NOT_NOW as DISK_NOT_NOW, TRIM as DISK_TRIM};
+pub(crate) use drain::to_hub_version;
 pub use git::{ParkOutcome, ResumeOutcome, GIT_TICK};
 pub use handoff::{
     is_handoff, SwitchOptions, CONVERSATION_MAX, HANDOFF_REPLY_TIMEOUT, SUMMARY_WAIT,
@@ -214,8 +221,10 @@ pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
 pub use shell::ShellRun;
+#[cfg(test)]
 pub(crate) use subscribe::stream_line;
 pub(crate) use subscribe::wait_state;
+use subscribe::Recorded;
 pub use subscribe::{ControlSubscription, ThreadSubscription, DECISIONS_MAX, SNAPSHOT_MAX};
 pub use supervisor::{adapter_may_emit, runtime_attn_id};
 pub use usage::SpentBy;
@@ -388,6 +397,12 @@ pub struct HubOptions {
     /// no hub on the socket did so before this hub read the files, so the hub reads its edit.
     /// `None`: nothing is held (tests, or a lock file `twr hub` could not open).
     pub boxes_lock: Option<twr_core::config::BoxesLock>,
+    /// The boxes the removal record next to `boxes.toml` named when `config` was read
+    /// ([`twr_core::config::BoxesFile::removed`], `twr hub` reads both under the same lock):
+    /// the hub forgets those it starts without (`Core::sweep_runner_acks`), and, the
+    /// `default` workspace's hub with a `config_file`, takes them out of the record once that
+    /// is durable. Empty (tests, or a record that does not read): nothing is forgotten.
+    pub removed_boxes: std::collections::BTreeSet<String>,
     /// The file `config` was read from: the hub warns when it holds secrets (a box token, a
     /// `[notify]` command) and other users can access it ([`Config::warnings`]). `None` (tests):
     /// only the config itself is checked.
@@ -460,6 +475,8 @@ pub struct HubOptions {
     /// no upload, no relay; [`crate::ssh_box::BoxDialer`]). Never set outside tests.
     #[doc(hidden)]
     pub box_dialer: Option<crate::ssh_box::BoxDialer>,
+    /// Immutable copy of the executable this hub runs, for linked-worker provisioning.
+    pub link_program: Option<PathBuf>,
     /// Test hook: awaited with the box's name by `box.add` and `box.projects` once they have
     /// read the config files, before they compare and apply what they read (a slow read).
     /// Never set outside tests.
@@ -551,6 +568,7 @@ impl HubOptions {
             prune_tick: None,
             job_slots_dir: None,
             boxes_lock: None,
+            removed_boxes: Default::default(),
             config_file: None,
             test_user_token: None,
             hello_timeout: runners::HELLO_TIMEOUT,
@@ -569,6 +587,7 @@ impl HubOptions {
             reap_job_group_hook: None,
             job_members_hook: None,
             box_dialer: None,
+            link_program: None,
             box_files_read_hook: None,
             pins_lookup_hook: None,
             socket_removed_hook: None,
@@ -766,8 +785,10 @@ struct Inner {
     /// ([`subscribe::CompactRows`]). Taken by a compacted subscription's selection only,
     /// never with the core lock held.
     compact_rows: Arc<Mutex<subscribe::CompactRows>>,
-    control_tx: broadcast::Sender<ControlItem>,
-    events_tx: broadcast::Sender<Arc<Event>>,
+    /// Every control item as it is committed, with its line's payload ([`Recorded`]).
+    control_tx: broadcast::Sender<(u64, Arc<Recorded>)>,
+    /// Every event as it is committed.
+    events_tx: broadcast::Sender<Arc<Recorded>>,
     /// [`HubOptions::snapshot_max`].
     snapshot_max: usize,
     live_count: watch::Sender<usize>,
@@ -798,6 +819,7 @@ struct Inner {
     box_switch: crate::ssh_box::SwitchTiming,
     /// [`HubOptions::box_dialer`].
     box_dialer: Option<crate::ssh_box::BoxDialer>,
+    link_program: Option<PathBuf>,
     /// The hub's own box's agent CLIs ([`HubOptions::agent_probe`], `hub::box_agents`).
     local_agents: Arc<box_agents::LocalAgents>,
     /// [`HubOptions::agents_poll`].
@@ -1607,8 +1629,10 @@ struct Core {
     /// before it, [`Core::event_time`]).
     last_ts: HashMap<String, DateTime<Utc>>,
     gseq: u64,
-    /// Every attn_id ever raised (to tell "already resolved" from "unknown").
-    known_attn: HashSet<String>,
+    /// Every attn_id ever raised (to tell "already resolved" from "unknown"), but those of a
+    /// thread purged from the trash, in its namespace (`<thread>:<id>`), which no one answers
+    /// again.
+    known_attn: std::collections::BTreeSet<String>,
     /// Open attention items raised by an adapter (answers are forwarded to it), with the
     /// turn of the event that raised it (last) ([`AdapterScope`]).
     adapter_attn: HashMap<String, Option<u64>>,
@@ -1636,6 +1660,10 @@ struct Core {
     ///
     /// [`persist`]: supervisor::persist
     persist_retries: u64,
+    /// What [`Core::due_retry`] last read of a thread's failed turn from the log, while the
+    /// thread has no later event: so the ticker (`hub::background`) does not read it every
+    /// second for a failure that waits for the user (`hub::retry`).
+    retry_reads: retry::RetryReads,
     /// Orchestrator bookkeeping (rebuilt from the log; the token lives only here).
     orch: orch::OrchState,
     /// Hub questions (`attention.raised` on [`HUB_THREAD`] from `say`) still open, with the
@@ -2804,18 +2832,34 @@ fn spawn_config(
 
 impl Hub {
     pub(crate) fn device_auth(&self) -> anyhow::Result<twr_core::devices::Auth> {
-        let config = self
-            .inner
-            .config_file
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Device pairing requires a configured hub"))?;
-        twr_core::devices::Auth::open(&config.with_file_name("mobile"))
+        self.inner.device_auth()
     }
     /// How many times the store was synced to disk so far ([`store::Store::sync`]). For
     /// tests of what is durable when.
     #[doc(hidden)]
     pub fn store_syncs(&self) -> u64 {
         self.inner.core().store.sync_count()
+    }
+
+    /// Box `box_name`'s committed runner watermarks (`runner_acks`), by thread. For tests.
+    #[doc(hidden)]
+    pub fn runner_watermarks(
+        &self,
+        box_name: &str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, u64>> {
+        self.inner.core().store.runner_watermarks(box_name)
+    }
+
+    /// Box `box_name`'s generation and whether it is forgotten (`runner_boxes`), when it has
+    /// one. For tests.
+    #[doc(hidden)]
+    pub fn runner_generation(&self, box_name: &str) -> anyhow::Result<Option<(String, bool)>> {
+        Ok(self
+            .inner
+            .core()
+            .store
+            .runner_box_of(box_name)?
+            .map(|b| (b.generation, b.forgotten)))
     }
 
     /// Appends an event through the single writer (no hub reactions). Returns the stored

@@ -241,3 +241,39 @@ fn handshake_proofs_match_the_pinned_vectors() {
         assert_eq!(sealed["key_prefix"], twr_core::sealed::KEY_PREFIX);
     }
 }
+
+/// Attachment operations are deliberately separate from the older runners' drain-safe set.
+#[test]
+fn attachment_commands_pin_both_registered_repository_policies() {
+    let captured = fixture(8, "upload-ops.json");
+    let mut policies = BTreeSet::new();
+    let mut actions = BTreeSet::new();
+    for sample in captured["samples"].as_array().unwrap() {
+        let frame = &sample["frame"];
+        let message: HubMsg = serde_json::from_value(frame.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&message).unwrap(), *frame);
+        let HubMsg::Cmd {
+            op:
+                twr_core::runner::Op::Upload {
+                    registered_repository,
+                    ..
+                },
+            ..
+        } = message
+        else {
+            panic!("upload fixture contains another operation")
+        };
+        policies.insert(registered_repository);
+        actions.insert(
+            frame["op"]["request"]["action"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
+    assert_eq!(policies, BTreeSet::from([false, true]));
+    assert_eq!(
+        actions,
+        BTreeSet::from(["begin", "chunk", "status", "commit", "cancel"].map(String::from))
+    );
+}

@@ -1,3 +1,5 @@
+import { forgetOfflineHost } from "../../shared/offline";
+import { initializeLayout } from "../../shared/layoutPreferences";
 import { AppearanceOptions } from "../../shared/AppearanceOptions";
 import { errorMessage } from "../../shared/errors";
 import { Keyboard } from "@capacitor/keyboard";
@@ -9,14 +11,27 @@ import { Dialog as NativeDialog } from "@capacitor/dialog";
 import { App as NativeApp } from "@capacitor/app";
 import App from "../../shared/App";
 import { Dialog } from "../../shared/ui";
+import { ErrorBoundary } from "../../shared/ErrorBoundary";
 import {
   EditorSessionsProvider,
   useEditorSessions,
 } from "../../shared/editors";
-import { RemoteHost, Transport, type Hub } from "./transport";
+import { RemoteHost, Transport, sweepExports, type Hub } from "./transport";
+import {
+  autoConnectTarget,
+  forgetLastHub,
+  linkState,
+  readLastHub,
+  rememberLastHub,
+  type LinkState,
+} from "./connection";
+import { mobileVoice } from "./voice";
 import { observeLayout } from "./layout";
+import { observeTextScale, secureDelete } from "./offline";
+import { parseInvitation } from "../../shared/connections";
 import {
   notificationListeners,
+  clearDeliveredNotifications,
   testNotification,
   enablePush,
   disablePush,
@@ -27,6 +42,8 @@ import {
 import "../../shared/style.css";
 import "./mobile.css";
 
+initializeLayout();
+
 function Mobile() {
   const editors = useEditorSessions();
   const [hubs, setHubs] = useState<Hub[]>([]);
@@ -34,7 +51,26 @@ function Mobile() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [pairing, setPairing] = useState(false);
+  const [pairName, setPairName] = useState("");
+  const [scanned, setScanned] = useState<{
+    url: string;
+    code: string;
+    expiresAt?: number;
+  }>();
+  const [pairingNow, setPairingNow] = useState(Date.now());
+  useEffect(() => {
+    if (!pairing) {
+      setScanned(undefined);
+      setPairName("");
+      return;
+    }
+    if (!scanned?.expiresAt) return;
+    setPairingNow(Date.now());
+    const timer = setInterval(() => setPairingNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [pairing, scanned?.expiresAt]);
   const [hubSheet, setHubSheet] = useState(false);
+  const [link, setLink] = useState<LinkState>("reconnecting");
   const [notice, setNotice] = useState("");
   const [folder, setFolder] = useState<{
     path: string;
@@ -46,6 +82,7 @@ function Mobile() {
   }>();
   const folderGeneration = useRef(0);
   const host = useRef<RemoteHost>(null);
+  const voice = useRef<ReturnType<typeof mobileVoice>>(undefined);
   const switchTail = useRef<Promise<unknown>>(Promise.resolve());
   function queueSwitch<T>(job: () => Promise<T>): Promise<T> {
     const pending = switchTail.current.catch(() => {}).then(job);
@@ -56,23 +93,46 @@ function Mobile() {
   const [readyHubId, setReadyHubId] = useState<string>();
   const [pendingNotification, setPendingNotification] =
     useState<Record<string, string>>();
+  const autoConnectTried = useRef(false);
   async function load() {
     try {
-      setHubs((await Transport.listHubs()).hubs);
+      const { hubs, notice } = await Transport.listHubs();
+      setHubs(hubs);
+      if (notice) setError(notice);
+      return hubs;
     } catch (e) {
       setError(errorMessage(e));
+      return undefined;
     }
   }
   useEffect(() => {
-    void load();
+    void load().then((hubs) => {
+      // Cold launch: back to the hub used last, once. Unreachable, it opens with its
+      // saved history like a tap on Connect; a failure leaves the hub list and its error.
+      const target = autoConnectTarget(
+        hubs || [],
+        readLastHub(),
+        autoConnectTried.current,
+      );
+      autoConnectTried.current = true;
+      if (target)
+        void queueSwitch(() =>
+          // A notification tap may have chosen a hub meanwhile.
+          activeHub.current ? Promise.resolve(false) : connectNow(target),
+        );
+    });
+    // Exports a previous run left behind (the app was killed while sharing).
+    void sweepExports();
     return () => {
       void host.current?.stop();
     };
   }, []);
   useEffect(() => {
+    const textScale = observeTextScale();
     const stop = observeLayout();
     return () => {
       void stop.then((fn) => fn());
+      void textScale.then((fn) => fn());
     };
   }, []);
   useEffect(() => {
@@ -121,7 +181,30 @@ function Mobile() {
     }
   }, [active, readyHubId, pendingNotification]);
   useEffect(() => {
+    const navigate = (event: Event) => {
+      const detail = (
+        event as CustomEvent<{ hubId: string; workspace?: string }>
+      ).detail;
+      void (async () => {
+        if (activeHub.current?.id !== detail.hubId) {
+          const hub = (await Transport.listHubs()).hubs.find(
+            (hub) => hub.id === detail.hubId,
+          );
+          if (!hub) throw new Error("Saved hub no longer exists");
+          if (!(await connect(hub))) return;
+        }
+        setPendingNotification(
+          detail.workspace ? { workspace: detail.workspace } : {},
+        );
+      })().catch((error) => setError(errorMessage(error)));
+    };
+    window.addEventListener("twr:select-host", navigate);
+    return () => window.removeEventListener("twr:select-host", navigate);
+  }, []);
+  useEffect(() => {
+    void clearDeliveredNotifications();
     const listener = NativeApp.addListener("appStateChange", ({ isActive }) => {
+      if (isActive) void clearDeliveredNotifications();
       if (host.current) {
         host.current.setForeground(isActive);
         if (isActive) {
@@ -151,7 +234,9 @@ function Mobile() {
       void listener.then((handle) => handle.remove());
     };
   }, []);
+  /** An explicit disconnect (Switch hub): the next launch opens the hub list. */
   async function disconnect() {
+    rememberLastHub(undefined);
     return queueSwitch(disconnectNow);
   }
   async function disconnectNow() {
@@ -167,14 +252,19 @@ function Mobile() {
       old?.resolve(null);
       return undefined;
     });
+    voice.current?.dispose();
+    voice.current = undefined;
     Reflect.deleteProperty(window, "twr");
     await previous?.stop();
   }
   async function forgetLocal(hub: Hub) {
+    await forgetOfflineHost(hub.id, { secureDelete });
+    await sweepExports();
     await Transport.removeHub({ id: hub.id });
     editors.forget(hub.id);
     localStorage.removeItem(`twr.mobile.drafts.${hub.id}`);
     localStorage.removeItem(pushPreferenceKey(hub.id));
+    forgetLastHub(hub.id);
   }
   async function forget(hub: Hub) {
     return queueSwitch(() => forgetNow(hub));
@@ -241,11 +331,35 @@ function Mobile() {
       );
       await remote.start();
       host.current = remote;
-      window.twr = remote.api();
+      const started = remote;
+      // The gateway registers push per device and workspace: refresh after the
+      // first connection, every in-app workspace switch and every reconnect.
+      started.onWorkspaceConnected(() => {
+        if (host.current === started) setLink("online");
+        if (host.current === started && activeHub.current?.id === hub.id)
+          void refreshPush(started, hub.id).catch((error) => {
+            if (host.current === started) setNotice(errorMessage(error));
+          });
+      });
+      const api = remote.api();
+      setLink(started.socketConnected ? "online" : "reconnecting");
+      api.onEvent((event) => {
+        if (event.type !== "connection" || host.current !== started) return;
+        setLink(linkState(!!event.connected, started.revoked, event.error));
+      });
+      // Voice mode where the app has the native recognizer and voice (docs/mobile.md).
+      voice.current = mobileVoice({
+        request: (method, params, timeout) =>
+          started.request(method, params, timeout),
+        onEvent: api.onEvent,
+      });
+      if (voice.current) api.nativeVoice = voice.current;
+      window.twr = api;
       document.documentElement.dataset.mobile = "true";
       document.documentElement.dataset.hub = hub.id;
       activeHub.current = hub;
       setActive(hub);
+      rememberLastHub(hub.id);
       return true;
     } catch (e) {
       await remote?.stop().catch(() => {});
@@ -296,20 +410,13 @@ function Mobile() {
           <button
             className="mobile-hub-switch"
             onClick={() => setHubSheet(true)}
-            aria-label={`Remote hub settings: ${active.name}`}
+            aria-label={`Remote hub settings: ${active.name}${link === "online" ? "" : ` (${link})`}`}
           >
-            <span className="status-dot online" aria-hidden="true" />
+            <span className={`status-dot ${link}`} aria-hidden="true" />
             <span className="mobile-hub-name">{active.name}</span>
           </button>
         }
-        onReady={() => {
-          setReadyHubId(active.id);
-          const remote = host.current;
-          if (remote && activeHub.current?.id === active.id)
-            void refreshPush(remote, active.id).catch((error) =>
-              setNotice(errorMessage(error)),
-            );
-        }}
+        onReady={() => setReadyHubId(active.id)}
       />
 
       {hubSheet && (
@@ -530,12 +637,34 @@ function Mobile() {
             Start pairing from your computer, then enter its address and one-use
             code.
           </p>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setBusy(true);
+              setError("");
+              void Transport.scanInvitation()
+                .then(({ invitation }) => {
+                  const value = parseInvitation(invitation);
+                  setScanned(value);
+                  setPairName((name) => name || new URL(value.url).hostname);
+                })
+                .catch((e) => {
+                  if (e?.code !== "SCAN_CANCELLED") setError(errorMessage(e));
+                })
+                .finally(() => setBusy(false));
+            }}
+          >
+            Scan QR code
+          </button>
           <label>
             Hub name
             <input
               name="hubName"
               required
               maxLength={80}
+              value={pairName}
+              onChange={(event) => setPairName(event.target.value)}
               placeholder="My workstation"
             />
           </label>
@@ -543,6 +672,14 @@ function Mobile() {
             Hub URL
             <input
               name="url"
+              value={scanned?.url ?? ""}
+              onChange={(e) =>
+                setScanned((old) => ({
+                  ...old,
+                  url: e.target.value,
+                  code: old?.code || "",
+                }))
+              }
               required
               type="url"
               autoCapitalize="none"
@@ -554,6 +691,13 @@ function Mobile() {
             Pairing code
             <input
               name="code"
+              value={scanned?.code ?? ""}
+              onChange={(e) =>
+                setScanned((old) => ({
+                  url: old?.url || "",
+                  code: e.target.value,
+                }))
+              }
               required
               autoCapitalize="none"
               autoCorrect="off"
@@ -561,6 +705,13 @@ function Mobile() {
               spellCheck={false}
             />
           </label>
+          {scanned?.expiresAt && (
+            <p role="status">
+              {scanned.expiresAt > pairingNow
+                ? `Expiry estimate: ${Math.ceil((scanned.expiresAt - pairingNow) / 1000)} seconds. Device clocks can differ; the hub checks expiry.`
+                : "This invitation may have expired. The hub will check it when pairing; device clocks can differ."}
+            </p>
+          )}
           <label>
             This device
             <input
@@ -600,7 +751,9 @@ initializeAppearance();
 const stopAppearance = observeNativeAppearance();
 import.meta.hot?.dispose(stopAppearance);
 createRoot(document.getElementById("root")!).render(
-  <EditorSessionsProvider>
-    <Mobile />
-  </EditorSessionsProvider>,
+  <ErrorBoundary>
+    <EditorSessionsProvider>
+      <Mobile />
+    </EditorSessionsProvider>
+  </ErrorBoundary>,
 );

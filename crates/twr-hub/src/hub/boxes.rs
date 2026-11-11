@@ -31,7 +31,12 @@
 //! `box.restart {box}` has such a box's supervisor restart its daemon ([`crate::ssh_box`],
 //! "Restarting the daemon"); `box.token {box}` has a token box take its token from them again,
 //! or none when they no longer give it one (`twr box token --rotate`, `twr box remove`), and
-//! drops its runner connection when that changed it: rotation and revocation are live. The
+//! drops its runner connection when that changed it: rotation and revocation are live. When
+//! the files no longer have the box at all, it also forgets the box's runner watermarks
+//! (`Core::forget_box`), and takes it out of the removal record `twr box remove` named it in
+//! (`twr_core::config::BoxesFile::removed`); a box the hub dials, or a linked one, is
+//! forgotten when the hub next starts without it and finds it in that record
+//! (`Core::sweep_runner_acks`). The
 //! four that read the files (`box.add`, `box.install`, `box.projects`, `box.token`) run one
 //! at a time, each from its read to its change (`Inner::box_files_lock`): a removal's
 //! `box.token` never runs between a `box.add`'s read of the removed box and its registration.
@@ -219,6 +224,9 @@ pub(super) fn register_box(
 ) -> Result<(RemoteBox, Option<Arc<SshBox>>), AddBoxError> {
     let warning = admit_box(name, &cfg).map_err(AddBoxError::Refused)?;
     let rbox = match cfg.transport() {
+        BoxTransport::Link => {
+            RemoteBox::new_linked(name).with_branch_namespace(inner.worktree_namespace.clone())
+        }
         BoxTransport::Token => {
             let token = Secret::new(cfg.token.clone().unwrap_or_default());
             if token.is_empty() {
@@ -268,6 +276,9 @@ pub(super) fn register_box(
 /// Starts what a registered box runs: the settling of its orphaned commands
 /// ([`runners::settle_orphans`]) and, for a box the hub dials, its supervisor.
 pub(super) fn start_box(inner: &Arc<Inner>, rbox: RemoteBox, ssh: Option<Arc<SshBox>>) {
+    if rbox.transport() == BoxTransport::Link {
+        super::linked::start(inner, rbox.clone());
+    }
     tokio::spawn(runners::settle_orphans(
         Arc::downgrade(inner),
         rbox.clone(),
@@ -303,15 +314,6 @@ impl Hub {
                 "only the user adds boxes (`twr box add`)",
             ));
         }
-        if let Some(w) = &self.inner.workspace {
-            return Err(rpc(
-                codes::UNSUPPORTED,
-                format!(
-                    "boxes belong to the default workspace's hub, not workspace {w}'s: add it \
-                     without -w"
-                ),
-            ));
-        }
         let Some(file) = self.inner.config_file.clone() else {
             return Err(rpc(
                 codes::UNSUPPORTED,
@@ -341,6 +343,12 @@ impl Hub {
             ));
         };
         let transport = cfg.transport();
+        if self.inner.workspace.is_some() && transport != BoxTransport::Link {
+            return Err(rpc(
+                codes::UNSUPPORTED,
+                "SSH, command and token boxes belong to the default workspace",
+            ));
+        }
         let already = match add_box(&self.inner, name, cfg.clone()) {
             Ok(()) => {
                 tracing::info!(box_name = %name, ?transport, "box added");
@@ -350,8 +358,17 @@ impl Hub {
             // started, after `twr box add` wrote them, say): nothing to do. Other settings:
             // a conflict (the hub takes a box's new settings when it restarts).
             Err(AddBoxError::Conflict(n))
-                if self.inner.box_config(name).as_ref().map(without_build)
-                    == Some(without_build(&cfg)) =>
+                if self.inner.box_config(name).as_ref().map(|old| {
+                    if cfg.transport() == BoxTransport::Link {
+                        connection(old)
+                    } else {
+                        without_build(old)
+                    }
+                }) == Some(if cfg.transport() == BoxTransport::Link {
+                    connection(&cfg)
+                } else {
+                    without_build(&cfg)
+                }) =>
             {
                 tracing::debug!(box_name = %n, "box.add of a box the hub has as it is");
                 true
@@ -598,7 +615,10 @@ impl Hub {
     /// [`twr_core::runner::TOKEN_MIN_LEN`] is not taken: the old one is revoked all the same,
     /// and the answer is `bad_request` with why; a short one is taken with a warning, as at
     /// startup. A change drops the box's runner connection at once (the box goes offline) and
-    /// refuses a handshake that proved the old token (`hub::runners`). Nothing else of the box
+    /// refuses a handshake that proved the old token (`hub::runners`). When the files no longer
+    /// have the box at all (`twr box remove`), the hub also forgets its runner watermarks and
+    /// gives it a new generation (`Core::forget_box`), so a runner of the box that comes back
+    /// once it is added again forgets what it spooled before. Nothing else of the box
     /// changes; the configuration the hub compares `box.add`, `box.install` and
     /// `box.projects` against takes the same token. Returns `{box, changed, accepting}`
     /// (`accepting`: the box has a token now), never the token. Serialized with `box.add`,
@@ -647,8 +667,9 @@ impl Hub {
                 ),
             ));
         }
+        let read = file.clone();
         let config = tokio::task::spawn_blocking(move || {
-            Config::load_with_boxes(&file).map_err(|e| error_without_values(&e))
+            Config::load_with_boxes(&read).map_err(|e| error_without_values(&e))
         })
         .await
         .map_err(|e| rpc(codes::INTERNAL, format!("reading the config: {e}")))?
@@ -669,11 +690,33 @@ impl Hub {
             None => (None, None, None),
         };
         let accepting = token.is_some();
+        let removed = !config.boxes.contains_key(name);
         let changed = runners::set_box_token(
             &self.inner,
             &rbox,
             Secret::new(token.clone().unwrap_or_default()),
         );
+        // Gone from the files (`twr box remove`): its runner is refused from now on, so its
+        // watermarks go, with a new generation that has the runner forget its spool should the
+        // box be added again (`Core::forget_box`). A failure leaves them; the next hub start
+        // forgets them, as the removal record names the box (`Core::sweep_runner_acks`). Once
+        // forgotten, durably, the record is done with it; a name left behind forgets nothing
+        // twice (the box is forgotten already).
+        if removed {
+            let forgotten = {
+                let mut core = self.inner.core();
+                core.forget_box(name).and_then(|_| core.store.sync())
+            };
+            match forgotten {
+                Ok(()) => {
+                    let names = std::iter::once(name.to_string()).collect();
+                    super::lifecycle::settle_removed(&file, &names).await;
+                }
+                Err(e) => {
+                    tracing::warn!(box_name = %name, error = %format!("{e:#}"), "cannot forget the removed box's runner watermarks");
+                }
+            }
+        }
         if let Some(c) = self.inner.boxes_mut().configs.get_mut(name) {
             c.token = token;
         }
@@ -873,8 +916,26 @@ fn connection(c: &BoxConfig) -> BoxConfig {
 /// How `hub.info` and `box.add` name a transport.
 pub(super) fn transport_name(t: BoxTransport) -> &'static str {
     match t {
+        BoxTransport::Link => "link",
         BoxTransport::Token => "token",
         BoxTransport::Ssh => "ssh",
         BoxTransport::Command => "command",
+    }
+}
+
+impl Inner {
+    pub(super) fn set_link_project(
+        &self,
+        name: &str,
+        project: &str,
+        repo: std::path::PathBuf,
+    ) -> Result<(), RpcError> {
+        let mut boxes = self.boxes_mut();
+        let config = boxes
+            .configs
+            .get_mut(name)
+            .ok_or_else(|| rpc(codes::BOX_OFFLINE, "linked runner was removed"))?;
+        config.projects.entry(project.into()).or_default().repo = repo;
+        Ok(())
     }
 }

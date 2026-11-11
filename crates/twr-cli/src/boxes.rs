@@ -103,6 +103,23 @@ const BATCH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Subcommand)]
 pub(super) enum BoxCmd {
+    /// Show the hubs that can use a paired runner.
+    Access { name: String },
+    /// Finish a saved pairing after an interrupted acknowledgement or box registration.
+    Recover { name: String },
+    /// Show a one-time code to invite another hub to this runner.
+    Invite { name: String },
+    /// Revoke a hub's full machine public key on this runner.
+    Revoke { name: String, machine: String },
+    /// Pair a runner using its one-time code (read from the terminal, outside shell history).
+    Pair {
+        name: String,
+        #[arg(long)]
+        code_stdin: bool,
+        /// Explicitly replace this machine's old grant if recovery is unavailable (stops its workers).
+        #[arg(long)]
+        replace: bool,
+    },
     /// Add a box the hub reaches over SSH, or through a command (--command: a container):
     /// no token, listener or tunnel. Probes the box with ssh in this terminal (ssh may ask
     /// about its host key or for a passphrase), checks that ssh also works without prompting
@@ -364,6 +381,22 @@ pub(super) async fn run(
                 add(config, paths, socket, &name, command, words, yes).await?
             }
         }
+        BoxCmd::Recover { name } => super::runner_link::recover(paths, name).await?,
+        BoxCmd::Access { name } => {
+            super::runner_link::manage(paths, name, twr_link::service::Admin::Status).await?
+        }
+        BoxCmd::Invite { name } => {
+            super::runner_link::manage(paths, name, twr_link::service::Admin::Invite).await?
+        }
+        BoxCmd::Revoke { name, machine } => {
+            super::runner_link::manage(paths, name, twr_link::service::Admin::Revoke { machine })
+                .await?
+        }
+        BoxCmd::Pair {
+            name,
+            code_stdin,
+            replace,
+        } => super::runner_link::pair(paths, name, code_stdin, replace).await?,
         BoxCmd::List { json } => list(socket, json).await?,
         BoxCmd::Status { name, json } => status(config, socket, &name, json).await?,
         BoxCmd::Token {
@@ -682,7 +715,7 @@ fn same_target(probe: &ssh_box::Probe) -> bool {
 
 /// The release target of a box of OS `os` and CPU `arch` (Rust's names), for twr's release
 /// archives (`twr-<target>.tar.gz`).
-fn release_target(os: &str, arch: &str) -> Option<&'static str> {
+pub(super) fn release_target(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
@@ -1613,7 +1646,7 @@ pub(super) fn drain_text(name: &str, b: &Value, hub: &Value) -> Option<(String, 
     let update = match hub["version"].as_str() {
         Some(v) => format!(
             "on the box: {}, then restart its runner ({})",
-            token::update_hint(v),
+            token::update_hint(v, b["version"].as_str()),
             token::restart_hint(name)
         ),
         None => format!(
@@ -1802,7 +1835,7 @@ async fn install(
         bail!(
             "box {name} is a token box: its runner connects to the hub, and twr can't reach it \
              to install twr. On the box: {}; then restart its runner ({})",
-            token::update_hint(&hub.version),
+            token::update_hint(&hub.version, None),
             token::restart_hint(name)
         );
     };
@@ -2573,6 +2606,32 @@ pub(super) async fn remove(paths: &Paths, socket: &Path, name: &str) -> anyhow::
     refuse_agent_action("remove boxes")?;
     default_workspace_only(paths, "remove")?;
     let file = paths.boxes_file();
+    // Persist local retirement before removing the recovery handle from configuration.
+    let raw = {
+        let _lock = BoxesFile::lock(&file)?;
+        std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+    };
+    let is_link = raw
+        .as_ref()
+        .and_then(|v| v.get("boxes"))
+        .and_then(|v| v.get(name))
+        .and_then(|v| v.get("transport"))
+        .and_then(toml::Value::as_str)
+        == Some("link");
+    let forgotten = if is_link {
+        twr_link::bootstrap::start(paths, &std::env::current_exe()?).await?;
+        Some(
+            twr_link::bootstrap::request(
+                paths,
+                &twr_link::service::Request::Forget { name: name.into() },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let removed = {
         let _lock = BoxesFile::lock(&file)?;
         match BoxesFile::remove_box(&file, name)? {
@@ -2591,6 +2650,15 @@ pub(super) async fn remove(paths: &Paths, socket: &Path, name: &str) -> anyhow::
         }
     };
     outln!("removed box {name} from {}", file.display());
+    if removed.get("transport").and_then(|v| v.as_str()) == Some("link") {
+        let result = forgotten
+            .context("box transport changed during removal; retry after checking runner status")?;
+        outln!(
+            "Runner disconnected. Worker data is retained. Revocation acknowledgement pending: {}",
+            result["pending_acknowledgement"]
+        );
+        return Ok(());
+    }
     outln!("The running hub keeps the box until it restarts (`twr hub stop`, then `twr`).");
     // A token box: the running hub takes it out of what it accepts at once (`box.token`).
     // Asked whatever the removed table says its transport is (edited since the hub read it,

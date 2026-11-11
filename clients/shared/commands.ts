@@ -10,9 +10,15 @@ export interface Field {
     | "boolean"
     | "directory"
     | "select"
-    | "words";
+    | "words"
+    | "model"
+    | "effort";
   required?: boolean;
   options?: string[];
+  /** A `model` or `effort` field's choices, from the hub's catalog (`shared/models.ts`). */
+  choices?: { value: string; description?: string }[];
+  /** A `model` or `effort` field left empty keeps the thread's; `default` clears it. */
+  keep?: boolean;
   placeholder?: string;
   description?: string;
   initial?: any;
@@ -56,6 +62,32 @@ const cmd = (
   confirm?: string,
 ): Command => ({ id, title, group, method, fields, description, confirm });
 export const commands: Command[] = [
+  cmd(
+    "conversation-search",
+    "Search saved conversations",
+    "History",
+    "conversation.search",
+    [
+      f("query", "Search text", { required: true }),
+      f("thread", "Thread (optional)"),
+      f("before", "Before event ID"),
+      f("limit", "Results (1–100)", { type: "number", initial: 30 }),
+    ],
+    "Search messages, tool output and decisions in the selected workspace, including archived output.",
+  ),
+  cmd(
+    "event-context",
+    "Read exact conversation event",
+    "History",
+    "thread.event_context",
+    [
+      thread,
+      f("event_id", "Event ID", { required: true }),
+      f("before", "Earlier events (0–30)", { type: "number", initial: 12 }),
+      f("after", "Later events (0–30)", { type: "number", initial: 12 }),
+    ],
+    "Read the selected event and its surrounding history without changing the message destination.",
+  ),
   cmd("device-list", "Paired devices", "Devices", "device.list"),
   cmd(
     "device-revoke",
@@ -90,8 +122,8 @@ export const commands: Command[] = [
       f("name", "Name", { placeholder: "e.g. api-health-check" }),
       { ...runtime, required: false },
       f("box", "Box", { placeholder: "local" }),
-      f("model", "Model"),
-      f("effort", "Reasoning effort"),
+      f("model", "Model", { type: "model" }),
+      f("effort", "Reasoning effort", { type: "effort" }),
       f("mode", "Permission mode", {
         type: "select",
         options: [
@@ -144,10 +176,8 @@ export const commands: Command[] = [
       f("runtime", "Runtime", {
         placeholder: "Keep current, or claude-code / codex / grok-build",
       }),
-      f("model", "Model", { placeholder: "Keep current, or default" }),
-      f("effort", "Reasoning effort", {
-        placeholder: "Keep current, or default",
-      }),
+      f("model", "Model", { type: "model", keep: true }),
+      f("effort", "Reasoning effort", { type: "effort", keep: true }),
       f("account", "Account or pool"),
       f("outside_pin", "Allow outside account pins", { type: "boolean" }),
     ],
@@ -227,7 +257,7 @@ export const commands: Command[] = [
   ),
   cmd("orch", "Switch orchestrator", "Orchestrator", "orchestrator.use", [
     runtime,
-    f("model", "Model"),
+    f("model", "Model", { type: "model" }),
     f("summary", "Include a handoff summary", {
       type: "boolean",
       initial: true,
@@ -497,7 +527,10 @@ export function parameters(
 ): Record<string, any> {
   const result: Record<string, any> = {};
   for (const field of command.fields) {
-    const value = values[field.key];
+    let value = values[field.key];
+    // A custom model id is typed: spaces around it are no part of it.
+    if (field.type === "model" && typeof value === "string")
+      value = value.trim();
     if (field.required && (value === undefined || value === ""))
       throw new Error(`${field.label} is required`);
     if (

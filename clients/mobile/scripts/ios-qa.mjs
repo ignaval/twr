@@ -1,3 +1,5 @@
+import { clientProtocol } from "../../scripts/client-protocol.mjs";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createInterface } from "node:readline";
@@ -5,6 +7,7 @@ import { createServer } from "node:http";
 import { createServer as createProxy, connect as connectTCP } from "node:net";
 import {
   mkdtempSync,
+  realpathSync,
   mkdirSync,
   writeFileSync,
   readFileSync,
@@ -62,22 +65,82 @@ const deviceKind = (device) =>
       : device.name.includes("iPhone")
         ? "phone"
         : undefined;
+const usableRuntimes = iosRuntimes.filter(
+  (runtime) => runtime.isAvailable === true,
+);
+const hasDevice = (runtime, family) =>
+  available.some(
+    (device) =>
+      device.runtime === runtime.identifier && deviceKind(device) === family,
+  );
+// The general runtime (`iOS-27-2`), not a device-specific one (`iOS-27-2-iPhone19-4`).
+const isPlain = (runtime) =>
+  /^com\.apple\.CoreSimulator\.SimRuntime\.iOS-\d+-\d+$/.test(
+    runtime.identifier,
+  );
+const newestFirst = (a, b) => {
+  const [x, y] = [a, b].map((r) => r.version.split(".").map(Number));
+  for (let i = 0; i < Math.max(x.length, y.length); i++)
+    if ((y[i] || 0) !== (x[i] || 0)) return (y[i] || 0) - (x[i] || 0);
+  return 0;
+};
+/**
+ * The one runtime among `candidates` for `family`: one with a device of that kind,
+ * preferring the plain runtime for phone and tablet when several share a version
+ * (Xcode 27.2 installs `iOS-27-2` and the Duo's `iOS-27-2-iPhone19-4`, both 27.2).
+ */
+const runtimeFor = (family, candidates) => {
+  const withDevice = candidates.filter((runtime) => hasDevice(runtime, family));
+  const plain = withDevice.filter(isPlain);
+  return family !== "fold" && plain.length >= 1 && withDevice.length > 1
+    ? plain
+    : withDevice;
+};
 // Runtime/device-type compatibility is not interchangeable: the fold runtime
 // can reject phone and tablet types. Validate every requested family up front.
 const selected = requestedKinds.map((family) => {
-  const requestedRuntime = runtimeOverride || defaultRuntimes[family];
-  const matchingRuntimes = iosRuntimes.filter(
-    (runtime) =>
-      runtime.isAvailable === true &&
-      (runtime.identifier === requestedRuntime ||
-        runtime.version === requestedRuntime),
-  );
-  assert.equal(
-    matchingRuntimes.length,
-    1,
-    `Requested ${family} iOS Simulator runtime '${requestedRuntime}' must identify exactly one installed, available runtime. Install it in Xcode Settings > Components, or explicitly set TWR_IOS_RUNTIME to an installed iOS runtime identifier/version. Inspect: xcrun simctl list runtimes --json. No alternate runtime will be selected.`,
-  );
-  const runtime = matchingRuntimes[0];
+  let runtime;
+  if (runtimeOverride?.startsWith("com.apple.CoreSimulator.SimRuntime.")) {
+    // An explicit identifier is taken as it is, or the run fails.
+    runtime = usableRuntimes.find((r) => r.identifier === runtimeOverride);
+    assert(
+      runtime,
+      `TWR_IOS_RUNTIME '${runtimeOverride}' is not an installed, available runtime. Install it in Xcode Settings > Components. Inspect: xcrun simctl list runtimes --json. No alternate runtime will be selected.`,
+    );
+  } else {
+    const version = runtimeOverride || defaultRuntimes[family];
+    const matching = runtimeFor(
+      family,
+      usableRuntimes.filter((r) => r.version === version),
+    );
+    if (runtimeOverride)
+      assert.equal(
+        matching.length,
+        1,
+        `TWR_IOS_RUNTIME version '${runtimeOverride}' must identify exactly one installed, available runtime with a ${family} Simulator device. Set it to a runtime identifier instead, or install one in Xcode Settings > Components. Inspect: xcrun simctl list runtimes --json and xcrun simctl list devices available --json.`,
+      );
+    runtime = matching[0];
+    if (!runtime) {
+      // The default is not installed (Xcode installs only its own runtimes):
+      // the newest installed runtime with a device of this kind.
+      const newest = usableRuntimes
+        .filter((r) => hasDevice(r, family))
+        .sort(newestFirst)[0];
+      runtime =
+        newest &&
+        runtimeFor(
+          family,
+          usableRuntimes.filter((r) => r.version === newest.version),
+        )[0];
+      assert(
+        runtime,
+        `No installed iOS Simulator runtime has a ${family} device. Install one in Xcode Settings > Components. Inspect: xcrun simctl list runtimes --json and xcrun simctl list devices available --json.`,
+      );
+      console.log(
+        `iOS runtime ${version} for ${family} is not installed; using the newest installed runtime with a ${family} device: ${runtime.identifier} (${runtime.version}). Set TWR_IOS_RUNTIME to choose another.`,
+      );
+    }
+  }
   console.log(
     "IOS_SIMULATOR_RUNTIME_SELECTED",
     JSON.stringify({ kind: family, ...runtimeDescription(runtime) }),
@@ -125,7 +188,7 @@ for (const [
       runtime: runtimeDescription(selectedRuntime),
     }),
   );
-  const fixture = mkdtempSync(join(tmpdir(), "twr-ios-"));
+  const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-ios-")));
   const screenshot = `test-results/ios/${kind || "all"}-${index}-screen.png`;
   const performanceLabel = device.name.includes("Duo")
     ? "ios-fold"
@@ -301,7 +364,7 @@ for (const [
     }
     gateway = spawn(
       join(bin, "twr-mobile-gateway"),
-      ["--development", "--binary-dir", bin, "--listen", "127.0.0.1:47321"],
+      ["--development", "--binary-dir", bin, "--listen", "127.0.0.1:47421"],
       { env, stdio: ["ignore", "pipe", "pipe"] },
     );
     let stderr = "";
@@ -350,7 +413,7 @@ for (const [
       });
     const hello = await ownerCall("hello", {
       client: "ios-qa-owner",
-      protocol: 1,
+      protocol: clientProtocol,
       user_token: readFileSync(token, "utf8").trim(),
     });
     assert(hello.identity.startsWith("user:"));
@@ -381,7 +444,7 @@ for (const [
       process.env.DEVELOPER_DIR ||
       execFileSync("xcode-select", ["-p"], { encoding: "utf8" }).trim();
     const applications = join(developer, "Applications");
-    if (existsSync(applications)) {
+    if (process.env.TWR_IOS_HEADLESS !== "1" && existsSync(applications)) {
       console.log(
         "Simulator UI applications",
         readdirSync(applications).filter((name) => name.endsWith(".app")),
@@ -420,8 +483,14 @@ for (const [
             JSON.stringify({
               repo,
               code,
-              url: "http://127.0.0.1:47324",
+              url: "http://127.0.0.1:47424",
               foldable: device.name.includes("Duo"),
+              catalogIds: JSON.parse(
+                readFileSync(
+                  new URL("../catalog.json", import.meta.url),
+                  "utf8",
+                ),
+              ).map((command) => command.id),
             }),
           );
         } catch (error) {
@@ -466,6 +535,10 @@ for (const [
       } else if (req.url === "/drop-socket") {
         for (const socket of proxySockets) socket.destroy();
         res.end("ok");
+      } else if (req.url === "/typography-script") {
+        res.end(
+          readFileSync(new URL("./connected-typography.js", import.meta.url)),
+        );
       } else if (req.url === "/performance-script") {
         res.end(readFileSync(new URL("./ios-performance.js", import.meta.url)));
       } else if (req.url === "/performance" && req.method === "POST") {
@@ -518,9 +591,9 @@ for (const [
         res.end();
       }
     });
-    await new Promise((r) => server.listen(47323, "127.0.0.1", r));
+    await new Promise((r) => server.listen(47423, "127.0.0.1", r));
     proxy = createProxy((socket) => {
-      const upstream = connectTCP(47321, "127.0.0.1");
+      const upstream = connectTCP(47421, "127.0.0.1");
       for (const current of [socket, upstream]) {
         proxySockets.add(current);
         current.on("close", () => {
@@ -536,7 +609,7 @@ for (const [
       socket.pipe(upstream);
       upstream.pipe(socket);
     });
-    await new Promise((resolve) => proxy.listen(47324, "127.0.0.1", resolve));
+    await new Promise((resolve) => proxy.listen(47424, "127.0.0.1", resolve));
     const result = `test-results/ios/${kind || "all"}-${index}-${device.name.replaceAll(" ", "-")}.xcresult`;
     rmSync(result, { recursive: true, force: true });
     const test = spawn(
@@ -553,6 +626,10 @@ for (const [
         `platform=iOS Simulator,id=${device.udid}`,
         "-derivedDataPath",
         "mobile/ios/App/DerivedData",
+        "-packageAuthorizationProvider",
+        "netrc",
+        "-disableAutomaticPackageResolution",
+        "-onlyUsePackageVersionsFromResolvedFile",
         "-resultBundlePath",
         result,
         "-parallel-testing-enabled",
@@ -631,6 +708,7 @@ for (const [
       stdio: "ignore",
     });
     await delay(250);
+    stopFixture(join(bin, "twr"), env);
     rmSync(fixture, { recursive: true, force: true });
   }
 }

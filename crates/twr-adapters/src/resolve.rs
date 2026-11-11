@@ -533,13 +533,18 @@ mod tests {
     #[tokio::test]
     async fn failing_shells_give_no_login_path() {
         let dir = tempfile::tempdir().unwrap();
-        let ask = |body: &str, name: &str| {
+        // Only the hanging shell is about the time limit: the others get the real one, since
+        // starting a shell on a loaded machine can take longer than a short limit.
+        let ask_within = |body: &str, name: &str, limit: Duration| {
             let sh = shell(dir.path(), name, body);
-            async move { ask_login_path(&LoginShell::Posix(sh), Duration::from_millis(500)).await }
+            async move { ask_login_path(&LoginShell::Posix(sh), limit).await }
         };
+        let ask = |body: &str, name: &str| ask_within(body, name, LOGIN_PATH_TIMEOUT);
         let started = std::time::Instant::now();
-        let e = ask("sleep 30", "sh").await.unwrap_err();
-        assert!(e.contains("did not answer within"), "{e}");
+        let e = ask_within("sleep 30", "sh", Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert_eq!(e, "it did not answer within 500ms");
         assert!(started.elapsed() < Duration::from_secs(10));
         let e = ask("yes banner | head -c 100000", "dash")
             .await

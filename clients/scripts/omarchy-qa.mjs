@@ -2,6 +2,7 @@
 // node scripts/omarchy-qa.mjs
 // All hubs, credentials, settings and Omarchy themes live in a disposable HOME.
 import { _electron as electron, expect } from "@playwright/test";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import { spawn, execFileSync } from "node:child_process";
 import {
   mkdtempSync,
@@ -420,5 +421,8 @@ try {
     ]);
     if (hub.exitCode === null) hub.kill("SIGKILL");
   }
+  stopFixture(join(env.TWR_DESKTOP_BINARY_DIR, "twr"), env, {
+    workspaces: [],
+  });
   rmSync(fixture, { recursive: true, force: true });
 }

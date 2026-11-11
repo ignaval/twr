@@ -30,7 +30,13 @@
 //! user's (`sshd`'s per-connection process, which switched to the user without exec'ing). See
 //! [`reap::first_agent_marker`]. So a hidden ancestor older than the hub (left running by an
 //! agent of an earlier hub) or started by a privileged daemon is not noticed, and
-//! on macOS (`ps`) a process with an empty environment counts as hidden.
+//! on macOS (`ps`) a process with an empty environment counts as hidden. On macOS 27, which
+//! hides the environment of Apple's own programs (`/bin/zsh`, `/bin/sh`) even from their user,
+//! a hidden ancestor of the user's does not count either when the nearest process above it
+//! that shows its environment is the user's, does not carry the marker and is not a `twr`
+//! (a hub, a runner or `twr attach`, which add it): an environment comes from the process that
+//! started it, so the user's shell under tmux, an editor or the desktop app hides nothing,
+//! while a shell the hub starts for a job or a hook still counts.
 //!
 //! An agent's connection may call only the server's `AGENT_METHODS`: reads, and starting and
 //! cancelling its own thread's jobs (`hub::jobs`) when it is, or descends from, a process twr

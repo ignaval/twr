@@ -1,4 +1,5 @@
 import { spawn, execFileSync } from "node:child_process";
+import { stopFixture } from "../../scripts/fixture-cleanup.mjs";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { expect } from "@playwright/test";
@@ -170,18 +171,15 @@ export async function multiHubQA({
     });
     for (let i = 0; i < 100 && !existsSync(join(home, "ws", "work.sock")); i++)
       await new Promise((r) => setTimeout(r, 100));
-    await expect
-      .poll(
-        () => page.locator('#workspace-select option[value="work"]').count(),
-        { timeout: 15000 },
-      )
-      .toBe(1);
+    // The sidebar lists every workspace, re-read every 15 s while it shows.
     const showSidebar = page.getByRole("button", {
       name: "Show sidebar",
       exact: true,
     });
     if (await showSidebar.isVisible()) await showSidebar.click();
-    await page.locator("#workspace-select").selectOption("work");
+    const work = page.locator('.workspace-entry[data-workspace="work"]');
+    await expect(work).toHaveCount(1, { timeout: 40000 });
+    await work.locator(".workspace-orchestrator").click();
     await expect
       .poll(() =>
         page.evaluate(async () => {
@@ -251,13 +249,28 @@ export async function multiHubQA({
     gateway.kill();
     await new Promise((resolve) => gateway.once("exit", resolve));
     await notification(secondGateway, "work", "twr · offline hub QA");
-    await expect(page.locator(".mobile-onboarding")).toBeVisible({
+    // The previously visited hub can reopen its encrypted cache even though
+    // its gateway is unavailable. Verify its identity and disabled authority.
+    await expect(page.locator(".offline-banner")).toContainText("Offline", {
       timeout: 40000,
     });
-    await expect(page.locator(".mobile-onboarding [role=alert]")).toContainText(
-      /connect|authenticate/i,
-    );
+    await expect(
+      page.getByRole("button", { name: /^Remote hub settings:/ }),
+    ).toHaveText("Second hub QA");
+    await expect(
+      page.getByRole("button", { name: "Search conversations", exact: true }),
+    ).toBeDisabled();
     assert.equal(await page.locator(".live-mark").count(), 0);
+    const dismissError = page.getByRole("button", {
+      name: "Dismiss error",
+      exact: true,
+    });
+    if (await dismissError.isVisible()) await dismissError.click();
+    const dismissConnection = page.locator(".mobile-error button");
+    if (await dismissConnection.isVisible()) await dismissConnection.click();
+    await page.getByRole("button", { name: /^Remote hub settings:/ }).click();
+    await page.getByRole("button", { name: "Switch hub", exact: true }).click();
+    await expect(page.locator(".mobile-onboarding")).toBeVisible();
     await page
       .locator(".hub-connect")
       .filter({ hasText: "QA workstation" })
@@ -266,11 +279,14 @@ export async function multiHubQA({
       page.getByRole("button", { name: /^Remote hub settings:/ }),
     ).toHaveText("QA workstation");
     console.log(
-      "PASS: a failed notification hub switch returns to the hub list and reconnects cleanly",
+      "PASS: an offline notification hub opens its own cache without live authority and switches back cleanly",
     );
   } finally {
     gateway?.kill();
     hub?.kill();
     workHub?.kill();
+    stopFixture(join(bin, "twr"), remoteEnv, {
+      workspaces: ["default", "work"],
+    });
   }
 }

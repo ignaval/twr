@@ -1,6 +1,7 @@
 // Verify real native Electron appearance and persistence against an isolated hub.
 // Run after `npm run build`: node scripts/native-appearance-qa.mjs.
 import { _electron as electron, expect } from "@playwright/test";
+import { stopFixture } from "./fixture-cleanup.mjs";
 import {
   mkdtempSync,
   mkdirSync,
@@ -203,5 +204,8 @@ try {
     ]);
     if (hub.exitCode === null) hub.kill("SIGKILL");
   }
+  stopFixture(join(env.TWR_DESKTOP_BINARY_DIR, "twr"), env, {
+    workspaces: [],
+  });
   rmSync(fixture, { recursive: true, force: true });
 }

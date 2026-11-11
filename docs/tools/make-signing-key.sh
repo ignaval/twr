@@ -14,12 +14,25 @@
 # It prints the public key and the command that stores the private key as the `release`
 # environment's secret, which the release workflow signs with. It never prints the private
 # key. Needs OpenSSL 3.0 or newer (`pkeyutl -rawin`).
+#
+#   docs/tools/make-signing-key.sh --p256 [dir]
+#
+# makes the second, ECDSA P-256 key pair the same way, for the openssl that can't check Ed25519
+# (macOS's LibreSSL): DIR/signing-key-p256.pem, release/signing-key-p256.pub and install.sh's
+# P-256 block (`# --- release key p256 ---`). The release workflow signs sha256sums.txt with it
+# too (sha256sums.txt.p256.sig) once the secret it prints is set. Any openssl does, LibreSSL
+# included. docs/development.md ("A P-256 release key") has the steps.
 
 set -eu
 
 repo="ignaval/twr"
 probe_message="twr signature probe"
 
+mode=ed25519
+if [ "${1:-}" = --p256 ]; then
+    mode=p256
+    shift
+fi
 root=$(cd "$(dirname "$0")/../.." && pwd)
 if [ -z "${1:-}" ] && [ -z "${HOME:-}" ]; then
     echo "make-signing-key: HOME is not set; name the key's directory" >&2
@@ -30,8 +43,19 @@ case "$dir" in
     /*) ;;
     *) dir="$(pwd)/$dir" ;;
 esac
-key="$dir/signing-key.pem"
-pub="$root/release/signing-key.pub"
+if [ "$mode" = p256 ]; then
+    key="$dir/signing-key-p256.pem"
+    pub="$root/release/signing-key-p256.pub"
+    begin="# --- release key p256 ---"
+    end="# --- end release key p256 ---"
+    secret=TWR_RELEASE_SIGNING_KEY_P256
+else
+    key="$dir/signing-key.pem"
+    pub="$root/release/signing-key.pub"
+    begin="# --- release key ---"
+    end="# --- end release key ---"
+    secret=TWR_RELEASE_SIGNING_KEY
+fi
 installer="$root/install.sh"
 
 err() {
@@ -71,11 +95,15 @@ made_err() {
     err "$*; the new key $key was removed: run this again"
 }
 
-command -v openssl > /dev/null 2>&1 || err "needs openssl (3.0 or newer)"
-starts=$(grep -c '^# --- release key ---$' "$installer" || true)
-ends=$(grep -c '^# --- end release key ---$' "$installer" || true)
+if [ "$mode" = p256 ]; then
+    command -v openssl > /dev/null 2>&1 || err "needs openssl"
+else
+    command -v openssl > /dev/null 2>&1 || err "needs openssl (3.0 or newer)"
+fi
+starts=$(grep -cxF "$begin" "$installer" || true)
+ends=$(grep -cxF "$end" "$installer" || true)
 if [ "$starts" != 1 ] || [ "$ends" != 1 ]; then
-    err "$installer has no single release key block (# --- release key --- ... # --- end release key ---)"
+    err "$installer has no single release key block ($begin ... $end)"
 fi
 
 umask 077
@@ -91,7 +119,12 @@ tmp=$(mktemp -d) || err "could not create a temporary directory"
 # there (a file, a dangling symlink, a FIFO), so the key is never written through something
 # already in place.
 fresh=$(mktemp "$dir/.signing-key.XXXXXX") || err "could not create a file in $dir"
-openssl genpkey -algorithm ed25519 > "$fresh" || err "openssl could not make an Ed25519 key"
+if [ "$mode" = p256 ]; then
+    openssl ecparam -name prime256v1 -genkey -noout > "$fresh" ||
+        err "openssl could not make a P-256 key"
+else
+    openssl genpkey -algorithm ed25519 > "$fresh" || err "openssl could not make an Ed25519 key"
+fi
 ln "$fresh" "$key" 2> /dev/null || err "$exists"
 made=1
 rm -f "$fresh"
@@ -101,29 +134,51 @@ openssl pkey -in "$key" -pubout -out "$tmp/signing-key.pub" ||
 
 # The probe: install.sh verifies this signature before it trusts openssl to check a release.
 printf '%s' "$probe_message" > "$tmp/probe.msg"
-openssl pkeyutl -sign -rawin -inkey "$key" -in "$tmp/probe.msg" -out "$tmp/probe.sig" ||
-    made_err "openssl could not sign (OpenSSL 3.0 or newer is needed for pkeyutl -rawin)"
+if [ "$mode" = p256 ]; then
+    openssl dgst -sha256 -sign "$key" -out "$tmp/probe.sig" "$tmp/probe.msg" ||
+        made_err "openssl could not sign"
+    openssl dgst -sha256 -verify "$tmp/signing-key.pub" -signature "$tmp/probe.sig" \
+        "$tmp/probe.msg" > /dev/null || made_err "the new key's own signature does not verify"
+else
+    openssl pkeyutl -sign -rawin -inkey "$key" -in "$tmp/probe.msg" -out "$tmp/probe.sig" ||
+        made_err "openssl could not sign (OpenSSL 3.0 or newer is needed for pkeyutl -rawin)"
+fi
 probe_sig=$(openssl base64 -A -in "$tmp/probe.sig") || made_err "openssl could not encode the probe"
-openssl pkeyutl -verify -rawin -pubin -inkey "$tmp/signing-key.pub" -sigfile "$tmp/probe.sig" \
-    -in "$tmp/probe.msg" > /dev/null || made_err "the new key's own signature does not verify"
+if [ "$mode" = ed25519 ]; then
+    openssl pkeyutl -verify -rawin -pubin -inkey "$tmp/signing-key.pub" -sigfile "$tmp/probe.sig" \
+        -in "$tmp/probe.msg" > /dev/null || made_err "the new key's own signature does not verify"
+fi
 
-{
-    echo "# --- release key ---"
-    echo "# The public key releases are signed with (release/signing-key.pub), and a fixed message"
-    echo "# signed with it: openssl must verify that before it is trusted to check a release."
-    echo "# docs/tools/make-signing-key.sh writes this block."
-    printf "RELEASE_KEY='%s'\n" "$(cat "$tmp/signing-key.pub")"
-    printf "PROBE_MESSAGE='%s'\n" "$probe_message"
-    printf "PROBE_SIGNATURE='%s'\n" "$probe_sig"
-    echo "# --- end release key ---"
-} > "$tmp/block" || made_err "could not write the release key block"
-awk -v block="$tmp/block" '
-    $0 == "# --- release key ---" {
+if [ "$mode" = p256 ]; then
+    {
+        echo "$begin"
+        echo "# The ECDSA P-256 public key (release/signing-key-p256.pub) of sha256sums.txt.p256.sig, checked"
+        echo "# where openssl can't check Ed25519 (macOS's LibreSSL), and PROBE_MESSAGE signed with it (base64"
+        echo "# of the DER signature). Empty: releases have no P-256 signature yet, and such an openssl checks"
+        echo "# nothing. docs/tools/make-signing-key.sh --p256 writes this block."
+        printf "RELEASE_KEY_P256='%s'\n" "$(cat "$tmp/signing-key.pub")"
+        printf "PROBE_SIGNATURE_P256='%s'\n" "$probe_sig"
+        echo "$end"
+    } > "$tmp/block" || made_err "could not write the release key block"
+else
+    {
+        echo "$begin"
+        echo "# The public key releases are signed with (release/signing-key.pub), and a fixed message"
+        echo "# signed with it: openssl must verify that before it is trusted to check a release."
+        echo "# docs/tools/make-signing-key.sh writes this block."
+        printf "RELEASE_KEY='%s'\n" "$(cat "$tmp/signing-key.pub")"
+        printf "PROBE_MESSAGE='%s'\n" "$probe_message"
+        printf "PROBE_SIGNATURE='%s'\n" "$probe_sig"
+        echo "$end"
+    } > "$tmp/block" || made_err "could not write the release key block"
+fi
+awk -v block="$tmp/block" -v begin="$begin" -v end="$end" '
+    $0 == begin {
         while ((getline line < block) > 0) print line
         skip = 1
         next
     }
-    $0 == "# --- end release key ---" { skip = 0; next }
+    $0 == end { skip = 0; next }
     !skip { print }
 ' "$installer" > "$tmp/install.sh" || made_err "could not rewrite $installer (it is unchanged)"
 # Written in place, so install.sh keeps its mode.
@@ -135,7 +190,11 @@ fi
 # The repository holds the new key's public half: the key stays.
 made=""
 
-echo "Made the release signing key."
+if [ "$mode" = p256 ]; then
+    echo "Made the P-256 release signing key."
+else
+    echo "Made the release signing key."
+fi
 echo
 echo "Private key: $key (keep it there, and a backup offline; it is not in the repository)"
 echo "Public key:  $pub, and install.sh's release key block (commit both):"
@@ -145,9 +204,19 @@ echo
 echo "Store the private key as the release environment's secret (needs the GitHub CLI, signed"
 echo "in as a repository admin):"
 echo
-echo "  gh secret set TWR_RELEASE_SIGNING_KEY --env release --repo $repo < $(sh_word "$key")"
+echo "  gh secret set $secret --env release --repo $repo < $(sh_word "$key")"
 echo
-echo "twr embeds the public key too: set RELEASE_KEY in crates/twr-cli/src/main.rs to"
-echo
-openssl pkey -pubin -in "$pub" -outform DER | od -An -v -j12 -tx1 |
-    awk '{ for (i = 1; i <= NF; i++) printf "0x%s,%s", $i, (++n % 8 ? " " : "\n") }'
+if [ "$mode" = p256 ]; then
+    # A P-256 SubjectPublicKeyInfo is a 26-byte header and the 65-byte uncompressed point.
+    echo "For twr to check the P-256 signature too (optional: twr update checks the Ed25519 one"
+    echo "itself, whatever openssl there is), its uncompressed public point is"
+    echo
+    openssl pkey -pubin -in "$pub" -outform DER | od -An -v -j26 -tx1 |
+        awk '{ for (i = 1; i <= NF; i++) printf "0x%s,%s", $i, (++n % 8 ? " " : "\n") }'
+    echo
+else
+    echo "twr embeds the public key too: set RELEASE_KEY in crates/twr-cli/src/main.rs to"
+    echo
+    openssl pkey -pubin -in "$pub" -outform DER | od -An -v -j12 -tx1 |
+        awk '{ for (i = 1; i <= NF; i++) printf "0x%s,%s", $i, (++n % 8 ? " " : "\n") }'
+fi

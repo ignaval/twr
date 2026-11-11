@@ -31,11 +31,16 @@ pub const BLOB_CHUNK_MAX: usize = 1024 * 1024;
 ///
 /// 1: `turn.started` `from: runtime`. A twr from before it stops reading a stream at the first
 /// such turn.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 2: `box_capacity` stops retire a runtime while keeping its thread resumable.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Well-known error codes.
 pub mod codes {
     /// Malformed request or params.
+    /// Attachment begin rejected without accepting a new upload.
+    pub const UPLOAD_REJECTED: &str = "upload_rejected";
+    /// The attachment commit failed definitively and its staging/reservation was removed.
+    pub const UPLOAD_FAILED: &str = "upload_failed";
     pub const BAD_REQUEST: &str = "bad_request";
     /// Unknown method.
     pub const METHOD_NOT_FOUND: &str = "method_not_found";

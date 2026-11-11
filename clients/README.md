@@ -18,4 +18,4 @@ npm --prefix clients test
 npm --prefix clients run mobile:build
 ```
 
-See [desktop development](../docs/desktop.md), [mobile development](../docs/mobile.md), and [performance measurements](../docs/performance.md). Generated installers, native QA captures, and measurements are under ignored `release/` and `test-results/`.
+See [desktop development](../docs/desktop.md), [mobile development](../docs/mobile.md), [remote pairing](../docs/remote-clients.md), [attachments](../docs/attachments.md), and [performance measurements](../docs/performance.md). Generated installers, native QA captures, and measurements are under ignored `release/` and `test-results/`.

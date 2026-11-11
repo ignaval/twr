@@ -130,4 +130,7 @@ mkdir -p "$dest"
 for f in runner.json hub-accepts.json auth-vectors.json; do
     cp "$scratch/out/$f" "$dest/$f"
 done
+if [ -f "$scratch/out/upload-ops.json" ]; then
+    cp "$scratch/out/upload-ops.json" "$dest/upload-ops.json"
+fi
 echo "Wrote $dest (from $described); check \`git diff -- $dest\` before committing."

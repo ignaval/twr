@@ -661,8 +661,8 @@ async fn the_orchestrator_opens_threads_on_agent_runtimes() {
     let dir = tempfile::tempdir().unwrap();
     let rec = Recorder::default();
     let hub = Hub::open(opts(dir.path(), &rec)).await.unwrap();
-    // A git repository: the orchestrator starts threads only in one (not the one holding the
-    // hub's data directory).
+    // A git repository of its own: the orchestrator starts no thread in a folder or repository
+    // that holds the hub's data directory.
     let repo = dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     for args in [

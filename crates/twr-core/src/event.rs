@@ -779,6 +779,8 @@ pub const TRIM_RESTART_REASON: &str = "trim";
 /// runner protocol): every runtime of the box is stopped, the daemon replaced, and the thread
 /// does not count as stopped; its next prompt resumes the session on the new daemon.
 pub const BOX_UPGRADE_REASON: &str = "box_upgrade";
+/// Idle resumable runtime retired to free a machine-wide runner slot.
+pub const BOX_CAPACITY_REASON: &str = "box_capacity";
 
 /// `task.updated` `task_id` prefix of a job (`twr job run`, the hub's `job.start`): a command
 /// the hub runs for a thread, recorded as one of its background tasks by the hub
@@ -1021,6 +1023,7 @@ pub fn is_settings_restart(p: &SessionPayload) -> bool {
                 | ACCOUNT_RESTART_REASON
                 | TRIM_RESTART_REASON
                 | BOX_UPGRADE_REASON
+                | BOX_CAPACITY_REASON
         )
     )
 }
@@ -2457,7 +2460,7 @@ mod tests {
                 ..Default::default()
             }),
             EventBody::ThreadModelChanged(ThreadModelChanged {
-                model: Some("claude-fable-5-1".into()),
+                model: Some("claude-fable-5-2".into()),
                 effort: Some("high".into()),
                 previous_model: None,
                 previous_effort: Some("low".into()),
@@ -2927,7 +2930,7 @@ mod tests {
         assert!(body.is_control());
         // A cleared value is null; a log line without the effort fields reads them as `None`.
         let body = EventBody::ThreadModelChanged(ThreadModelChanged {
-            model: Some("claude-fable-5-1".into()),
+            model: Some("claude-fable-5-2".into()),
             effort: None,
             previous_model: None,
             previous_effort: Some("high".into()),
@@ -2938,7 +2941,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"kind":"thread.model_changed",
-                "data":{"model":"claude-fable-5-1","effort":null,"previous_model":null,
+                "data":{"model":"claude-fable-5-2","effort":null,"previous_model":null,
                     "previous_effort":"high","by":"orchestrator"}})
         );
         assert!(body.is_control());

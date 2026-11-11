@@ -1,0 +1,138 @@
+.inbox-toolbar,
+.inbox-navigation,
+.inbox-filters {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.inbox-toolbar {
+  justify-content: space-between;
+  margin-bottom: 24px;
+}
+.inbox-filters button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--accent-fg, var(--bg));
+}
+.inbox-group {
+  margin-bottom: 24px;
+}
+.inbox-group > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.inbox-group h2 {
+  font-size: 1.153846rem;
+  margin: 0;
+}
+.inbox-group h2 span,
+.inbox-group > header > span {
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.inbox-source-request {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 7px;
+  padding: 14px;
+  margin-bottom: 8px;
+}
+.inbox-source-request span {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.conversation-search-input {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.conversation-search-input input {
+  width: 100%;
+  min-width: 0;
+}
+.search-thread-filter {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 12px;
+}
+.search-thread-filter select {
+  min-width: 0;
+  max-width: 100%;
+}
+.search-hit {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 14px;
+  margin: 8px 0;
+}
+.search-hit > span,
+.search-event > header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+}
+.search-hit p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.search-hit time,
+.search-hit small,
+.search-event time {
+  font-size: 0.846154rem;
+  color: var(--muted);
+}
+.search-context {
+  overflow-anchor: none;
+}
+.search-event {
+  padding: 14px;
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow-wrap: anywhere;
+}
+.search-event.selected {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 var(--accent);
+}
+.search-event pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.needs-inbox [data-inbox-key]:focus-within > .attention-card {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@media (max-width: 800px) {
+  .inbox-group > header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .inbox-navigation {
+    width: 100%;
+  }
+  .inbox-navigation button {
+    min-height: 44px;
+    flex: 1;
+  }
+  .inbox-filters button {
+    min-height: 44px;
+  }
+  .search-thread-filter {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

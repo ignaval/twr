@@ -1,8 +1,26 @@
 import { contextBridge, ipcRenderer } from "electron";
-import type { DesktopAPI, DesktopEvent } from "../shared/types";
+import type {
+  DesktopAPI,
+  DesktopAppAPI,
+  DesktopEvent,
+  UpdateStatus,
+} from "../shared/types";
+import type { DesktopConnections } from "../shared/connections";
 const api: DesktopAPI = {
+  inboxSources: () => ipcRenderer.invoke("twr:inbox-sources"),
+  sendMessage: (message) => ipcRenderer.invoke("twr:send-message", message),
+  secureRead: (key) => ipcRenderer.invoke("twr:secure-read", key),
+  secureWrite: (key, value) =>
+    ipcRenderer.invoke("twr:secure-write", key, value),
+  secureDelete: (key) => ipcRenderer.invoke("twr:secure-delete", key),
   setAppearance: (appearance) =>
     ipcRenderer.invoke("twr:set-appearance", appearance),
+  voiceStatus: () => ipcRenderer.invoke("twr:voice-status"),
+  voiceSetup: () => ipcRenderer.invoke("twr:voice-setup"),
+  voiceArm: (on) => ipcRenderer.invoke("twr:voice-arm", on),
+  voiceTranscribe: (recording, hint) =>
+    ipcRenderer.invoke("twr:voice-transcribe", recording, hint),
+  voiceSpeaker: (op) => ipcRenderer.invoke("twr:voice-speaker", op),
   quit: () => ipcRenderer.invoke("twr:quit"),
   copyText: (text) => ipcRenderer.invoke("twr:copy-text", text),
   bootstrap: () => ipcRenderer.invoke("twr:bootstrap"),
@@ -34,4 +52,62 @@ const api: DesktopAPI = {
     return () => ipcRenderer.removeListener("twr:event", listener);
   },
 };
-contextBridge.exposeInMainWorld("twr", api);
+contextBridge.exposeInMainWorld("twrLocal", api);
+const connections: DesktopConnections = {
+  listHubs: () => ipcRenderer.invoke("twr:remote-list"),
+  pair: (request) => ipcRenderer.invoke("twr:remote-pair", request),
+  connect: (request) => ipcRenderer.invoke("twr:remote-connect", request),
+  send: (request) => ipcRenderer.invoke("twr:remote-send", request),
+  disconnect: () => ipcRenderer.invoke("twr:remote-disconnect"),
+  removeHub: (request) => ipcRenderer.invoke("twr:remote-remove", request),
+  resetSavedHubs: () => ipcRenderer.invoke("twr:remote-reset"),
+  gatewayStatus: () => ipcRenderer.invoke("twr:gateway-status"),
+  cancelInvitation: () => ipcRenderer.invoke("twr:gateway-cancel-invitation"),
+  stopGateway: () => ipcRenderer.invoke("twr:gateway-stop"),
+  settings: () => ipcRenderer.invoke("twr:gateway-settings"),
+  check: (request) => ipcRenderer.invoke("twr:gateway-check", request),
+  setup: (request) => ipcRenderer.invoke("twr:gateway-setup", request),
+  restart: (request) => ipcRenderer.invoke("twr:gateway-restart", request),
+  invite: (request) => ipcRenderer.invoke("twr:gateway-invite", request),
+  deactivateLocal: () => ipcRenderer.invoke("twr:deactivate-local"),
+  addListener: async (_event, callback) => {
+    const listener = (_: unknown, value: any) => callback(value);
+    ipcRenderer.on("twr:remote-message", listener);
+    return {
+      remove: async () => {
+        ipcRenderer.removeListener("twr:remote-message", listener);
+      },
+    };
+  },
+};
+contextBridge.exposeInMainWorld("twrRemote", connections);
+
+contextBridge.exposeInMainWorld(
+  "twrUploadRequest",
+  (workspace: string, method: string, params: unknown) =>
+    ipcRenderer.invoke("twr:upload-request", workspace, method, params),
+);
+
+const application: DesktopAppAPI = {
+  settings: () => ipcRenderer.invoke("twr:app-settings"),
+  setLaunchAtLogin: (enabled) => ipcRenderer.invoke("twr:app-login", enabled),
+  setTray: (enabled) => ipcRenderer.invoke("twr:app-tray", enabled),
+  setNotifications: (enabled) =>
+    ipcRenderer.invoke("twr:app-notifications", enabled),
+  setBackground: (enabled) => ipcRenderer.invoke("twr:app-background", enabled),
+  setAutoUpdate: (enabled) =>
+    ipcRenderer.invoke("twr:app-auto-update", enabled),
+  checkForUpdates: () => ipcRenderer.invoke("twr:app-update-check"),
+  downloadUpdate: () => ipcRenderer.invoke("twr:app-update-download"),
+  installUpdate: () => ipcRenderer.invoke("twr:app-update-install"),
+  setAttention: (summary) => ipcRenderer.send("twr:app-attention", summary),
+  reportError: (report) => ipcRenderer.send("twr:app-error", report),
+  diagnostics: () => ipcRenderer.invoke("twr:app-diagnostics"),
+  openLogs: () => ipcRenderer.invoke("twr:app-open-logs"),
+  onUpdate: (callback) => {
+    const listener = (_: unknown, status: UpdateStatus) => callback(status);
+    ipcRenderer.on("twr:app-update", listener);
+    return () => ipcRenderer.removeListener("twr:app-update", listener);
+  },
+};
+contextBridge.exposeInMainWorld("twrApp", application);

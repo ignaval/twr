@@ -247,6 +247,57 @@ pub fn start_error(
     ))
 }
 
+/// Puts back the system's default crash handling of this process (macOS: its task exception
+/// ports), whatever it inherited. On macOS a process inherits its parent's exception ports,
+/// and keeps them across `exec`: a twr started, however indirectly, from the desktop app (a
+/// shell in its terminal tab, which Electron starts itself) holds those of the app's crash
+/// reporter (Crashpad). A hub, runner service or box daemon started from there would keep the
+/// app's crash handler, and the app's stdout and stderr it holds, alive after the app quit,
+/// and its own crashes would be filed as the app's. Every twr process calls this first thing
+/// (`twr`'s `main`, the desktop's binaries), so what it starts uses the system's crash
+/// reporting. Nothing elsewhere.
+pub fn forget_inherited_crash_handler() {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            // This task's port: what <mach/mach_init.h>'s mach_task_self() reads.
+            static mach_task_self_: u32;
+            // <mach/task.h>; the types are those of <mach/exception_types.h>.
+            fn task_set_exception_ports(
+                task: u32,
+                exception_mask: u32,
+                new_port: u32,
+                behavior: i32,
+                new_flavor: i32,
+            ) -> i32;
+        }
+        // EXC_MASK_ALL | EXC_MASK_CRASH | EXC_MASK_CORPSE_NOTIFY, then without the last for a
+        // system that refuses it.
+        const MASKS: [u32; 2] = [0x3ffe, 0x1ffe];
+        const EXCEPTION_DEFAULT: i32 = 1;
+        #[cfg(target_arch = "aarch64")]
+        const THREAD_STATE_NONE: i32 = 5;
+        #[cfg(not(target_arch = "aarch64"))]
+        const THREAD_STATE_NONE: i32 = 13;
+        for mask in MASKS {
+            // SAFETY: a Mach call on this task's own exception ports; MACH_PORT_NULL (0) puts
+            // back the default handler. No memory is passed.
+            let result = unsafe {
+                task_set_exception_ports(
+                    mach_task_self_,
+                    mask,
+                    0,
+                    EXCEPTION_DEFAULT,
+                    THREAD_STATE_NONE,
+                )
+            };
+            if result == 0 {
+                break;
+            }
+        }
+    }
+}
+
 /// Starts `cmd` in a session of its own (`setsid`): without a controlling terminal, so a
 /// process that tries to use one (an interactive login shell, a CLI asking a question, a
 /// command reading `/dev/tty`) gets an error instead of being stopped by the terminal of
@@ -255,6 +306,7 @@ pub fn start_error(
 /// together with `process_group(0)`: a group leader cannot start a session (`EPERM`). A
 /// process it starts that makes a session of its own (`setsid`, a daemon) leaves that group.
 pub fn new_session(cmd: &mut tokio::process::Command) {
+    twr_core::fork::prepare_fork();
     // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
     unsafe {
         cmd.pre_exec(setsid);
@@ -264,6 +316,7 @@ pub fn new_session(cmd: &mut tokio::process::Command) {
 /// [`new_session`] for a `std` command.
 pub fn new_session_std(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
+    twr_core::fork::prepare_fork();
     // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
     unsafe {
         cmd.pre_exec(setsid);
@@ -647,6 +700,60 @@ pub fn head_response_id(head: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// An exception handler this process was given (as by its parent) is gone once
+    /// [`forget_inherited_crash_handler`] ran (a child inherits what this process has then).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_inherited_crash_handler_is_forgotten() {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn mach_port_allocate(task: u32, right: u32, name: *mut u32) -> i32;
+            fn mach_port_insert_right(task: u32, name: u32, poly: u32, poly_type: u32) -> i32;
+            fn task_set_exception_ports(task: u32, mask: u32, port: u32, b: i32, f: i32) -> i32;
+            fn task_get_exception_ports(
+                task: u32,
+                mask: u32,
+                masks: *mut u32,
+                count: *mut u32,
+                ports: *mut u32,
+                behaviors: *mut i32,
+                flavors: *mut i32,
+            ) -> i32;
+        }
+        const EXC_MASK_BAD_ACCESS: u32 = 1 << 1;
+        // SAFETY: Mach calls on this task's own ports; the arrays outlive the call.
+        let handlers = || unsafe {
+            let (mut masks, mut ports) = ([0u32; 32], [0u32; 32]);
+            let (mut behaviors, mut flavors) = ([0i32; 32], [0i32; 32]);
+            let mut count = 32u32;
+            let kr = task_get_exception_ports(
+                mach_task_self_,
+                EXC_MASK_BAD_ACCESS,
+                masks.as_mut_ptr(),
+                &mut count,
+                ports.as_mut_ptr(),
+                behaviors.as_mut_ptr(),
+                flavors.as_mut_ptr(),
+            );
+            assert_eq!(kr, 0);
+            ports[..count as usize].iter().filter(|p| **p != 0).count()
+        };
+        // SAFETY: as above; the port is this task's own, a receive right with a send right.
+        unsafe {
+            let mut port = 0u32;
+            assert_eq!(mach_port_allocate(mach_task_self_, 1, &mut port), 0);
+            assert_eq!(mach_port_insert_right(mach_task_self_, port, port, 20), 0);
+            let flavor = if cfg!(target_arch = "aarch64") { 5 } else { 13 };
+            assert_eq!(
+                task_set_exception_ports(mach_task_self_, EXC_MASK_BAD_ACCESS, port, 1, flavor),
+                0
+            );
+        }
+        assert_eq!(handlers(), 1);
+        forget_inherited_crash_handler();
+        assert_eq!(handlers(), 0);
+    }
 
     /// Under a wrapper, a runtime program that is not there is still said to be missing,
     /// with what to do.

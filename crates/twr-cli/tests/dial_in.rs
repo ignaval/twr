@@ -320,6 +320,7 @@ fn on_a_pty(
     c.stdin(slave.try_clone().unwrap())
         .stdout(slave.try_clone().unwrap())
         .stderr(slave.try_clone().unwrap());
+    twr_core::fork::prepare_fork();
     // SAFETY: setsid(2) and ioctl(2) are async-signal-safe and nothing is allocated: a new
     // session whose controlling terminal is the pseudo-terminal on stdin (TIOCSCTTY), so
     // `/dev/tty` is it.
@@ -944,7 +945,98 @@ fn a_starting_hub_takes_a_removal_or_rotation_made_meanwhile() {
     assert!(out.contains("accepts no runner of it"), "{out}");
     let out = ok(&home, &["box", "token", "gpu", "--reload"]);
     assert!(out.contains("nothing changed"), "{out}");
+    // The running hub forgot lab at once, and the removal record is done with it.
+    assert!(!home.join("boxes.removed").exists());
 
+    ok(&home, &["hub", "stop"]);
+    hub.wait(wait, "the hub");
+}
+
+/// The removal record (`boxes.removed`, next to boxes.toml): `twr box remove` names the box
+/// there, `twr box add` takes it out again. A hub that starts with a record that does not
+/// read starts all the same, says so, and forgets nothing (the record stays as it is); one
+/// that starts without a box the record names forgets it and takes it out of the record, and
+/// a running hub that drops a removed token box's token does so at once.
+#[test]
+fn a_box_removal_is_recorded_until_a_hub_or_an_add_takes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let home = dir.join("hub");
+    std::fs::create_dir_all(&home).unwrap();
+    listening_config(&home);
+    let record = home.join("boxes.removed");
+    let text_of = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+    let wait = Duration::from_secs(60);
+    let up = || {
+        poll("the hub", wait, || {
+            piped(&home, &["thread", "list"], "")
+                .status
+                .success()
+                .then_some(())
+        })
+    };
+    let add = || {
+        ok(
+            &home,
+            &[
+                "box",
+                "add",
+                "lab",
+                "--dial-in",
+                "--hub",
+                "ws://127.0.0.1:1",
+                "--yes",
+            ],
+        )
+    };
+    let mut hub = start_hub(&home, &dir.join("hub0.log"), None);
+    up();
+    add();
+    ok(&home, &["hub", "stop"]);
+    hub.wait(wait, "the hub");
+    // No hub runs: the removal is recorded for the next one.
+    ok(&home, &["box", "remove", "lab"]);
+    assert_eq!(
+        text_of(&record)
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>(),
+        ["lab"],
+        "{}",
+        text_of(&record)
+    );
+    assert_eq!(mode(&record), 0o600);
+    // Added again before any hub saw the removal: nothing to forget.
+    let mut hub = start_hub(&home, &dir.join("hub1.log"), None);
+    up();
+    add();
+    assert!(!record.exists(), "{}", text_of(&record));
+    ok(&home, &["hub", "stop"]);
+    hub.wait(wait, "the hub");
+    ok(&home, &["box", "remove", "lab"]);
+    assert!(record.exists());
+
+    // A record that does not read: no removal, a warning, and the hub runs.
+    std::fs::write(&record, "lab\nnot a box name\n").unwrap();
+    let log = dir.join("hub2.log");
+    let mut hub = start_hub(&home, &log, None);
+    up();
+    ok(&home, &["hub", "stop"]);
+    hub.wait(wait, "the hub");
+    let said = text_of(&log);
+    assert!(said.contains("ignoring the removal record"), "{said}");
+    assert_eq!(text_of(&record), "lab\nnot a box name\n");
+
+    // A record that reads: the hub, which starts without lab, forgets it and takes it out.
+    std::fs::write(&record, "lab\n").unwrap();
+    let mut hub = start_hub(&home, &dir.join("hub3.log"), None);
+    up();
+    assert!(!record.exists(), "{}", text_of(&record));
+
+    // A running hub forgets a removed token box at once (`box.token`): nothing is left.
+    add();
+    ok(&home, &["box", "remove", "lab"]);
+    assert!(!record.exists(), "{}", text_of(&record));
     ok(&home, &["hub", "stop"]);
     hub.wait(wait, "the hub");
 }

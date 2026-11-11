@@ -40,7 +40,10 @@ export class Bridge {
           if (!request) return;
           this.pending.delete(message.id);
           clearTimeout(request.timer);
-          if (message.error) request.reject(new Error(message.error));
+          if (message.error)
+            request.reject(
+              Object.assign(new Error(message.error), { delivery: "rejected" }),
+            );
           else request.resolve(message.result);
         } else {
           if (message.type === "connection" && message.connected)
@@ -92,14 +95,18 @@ export class Bridge {
     });
     return child;
   }
-  call(method: string, params: any = {}): Promise<any> {
+  call(method: string, params: any = {}, timeout = 660_000): Promise<any> {
     if (
       this.closed ||
       this.restart ||
       this.child.exitCode !== null ||
       this.child.signalCode !== null
     )
-      return Promise.reject(new Error("Workspace connection is closed"));
+      return Promise.reject(
+        Object.assign(new Error("Workspace connection is closed"), {
+          delivery: "not-sent",
+        }),
+      );
     const id = ++this.next;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -109,7 +116,7 @@ export class Bridge {
             "No reply from the hub. The operation may have completed; check its state before retrying.",
           ),
         );
-      }, 660_000);
+      }, timeout);
       this.pending.set(id, { resolve, reject, timer });
       this.child.stdin.write(
         JSON.stringify({ id, method, params }) + "\n",

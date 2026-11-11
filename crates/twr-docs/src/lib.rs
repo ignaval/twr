@@ -24,6 +24,14 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("docs/tui.md", include_str!("../../../docs/tui.md")),
     ("docs/desktop.md", include_str!("../../../docs/desktop.md")),
     (
+        "docs/remote-clients.md",
+        include_str!("../../../docs/remote-clients.md"),
+    ),
+    (
+        "docs/attachments.md",
+        include_str!("../../../docs/attachments.md"),
+    ),
+    (
         "docs/desktop-qa.md",
         include_str!("../../../docs/desktop-qa.md"),
     ),
@@ -36,6 +44,7 @@ pub const BUNDLED: &[(&str, &str)] = &[
         "docs/read-aloud.md",
         include_str!("../../../docs/read-aloud.md"),
     ),
+    ("docs/voice.md", include_str!("../../../docs/voice.md")),
     (
         "docs/configuration.md",
         include_str!("../../../docs/configuration.md"),
@@ -65,6 +74,10 @@ pub const BUNDLED: &[(&str, &str)] = &[
         include_str!("../../../docs/workspaces.md"),
     ),
     ("docs/runners.md", include_str!("../../../docs/runners.md")),
+    (
+        "docs/runner-links.md",
+        include_str!("../../../docs/runner-links.md"),
+    ),
     (
         "docs/architecture.md",
         include_str!("../../../docs/architecture.md"),

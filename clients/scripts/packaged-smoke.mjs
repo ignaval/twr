@@ -1,10 +1,12 @@
 // Launch the actual release app through LaunchServices so macOS supplies a real user
 // process ancestry. This exercises production authentication, not the debug test token.
 import { performanceAudit } from "./performance.mjs";
-import { chromium } from "@playwright/test";
-import { execFileSync } from "node:child_process";
+import { stopFixture } from "./fixture-cleanup.mjs";
+import { chromium, _electron as electron } from "@playwright/test";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
+  realpathSync,
   mkdirSync,
   writeFileSync,
   existsSync,
@@ -12,17 +14,227 @@ import {
   readFileSync,
 } from "node:fs";
 import { createServer } from "node:net";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import assert from "node:assert/strict";
 
 if (process.platform !== "darwin" || process.arch !== "arm64")
   throw new Error(
     "This packaged launcher smoke test runs on Apple Silicon macOS.",
   );
-const application = resolve("release/mac-arm64/twr.app");
-assert(existsSync(application), "Build the Mac application first");
-const fixture = mkdtempSync(join(tmpdir(), "twr-package-"));
+const release = resolve("release/mac-arm64/twr.app");
+assert(existsSync(release), "Build the Mac application first");
+const resources = join(release, "Contents/Resources");
+// How the app under test is signed decides its update policy: `package:mac` signs ad hoc,
+// a release with the Apple credentials with a Developer ID (desktop.yml).
+const signing = (() => {
+  const shown = spawnSync(
+    "/usr/bin/codesign",
+    ["--display", "--verbose=2", release],
+    { encoding: "utf8" },
+  );
+  const text = `${shown.stdout}${shown.stderr}`;
+  if (/^Signature=adhoc$/m.test(text)) return "adhoc";
+  if (
+    /^Authority=Developer ID Application: /m.test(text) &&
+    /^TeamIdentifier=[A-Z0-9]{10}$/m.test(text)
+  )
+    return "developer-id";
+  throw new Error(
+    `The app is neither ad hoc nor Developer ID signed:\n${text}`,
+  );
+})();
+console.log(`Testing a ${signing} signed app`);
+// A packaged build honours TWR_DESKTOP_TEST_AUTOMATION only when its bundle carries this
+// marker (desktop/automation.ts). Release packaging never writes it: this test checks that
+// the release app ignores the variable, then drives a copy of it that has the marker.
+const QA_MARKER = "twr-qa-automation";
+assert(
+  !existsSync(join(resources, QA_MARKER)),
+  `The release app must not carry the QA marker ${QA_MARKER}`,
+);
+// The menu bar icon and electron-updater's feed configuration ship in the bundle.
+for (const name of ["trayTemplate.png", "trayTemplate@2x.png"])
+  assert(
+    existsSync(join(resources, "tray", name)),
+    `Missing menu bar icon ${name}`,
+  );
+{
+  const feed = readFileSync(join(resources, "app-update.yml"), "utf8");
+  for (const line of ["provider: github", "owner: ignaval", "repo: twr"])
+    assert(feed.split("\n").includes(line), `app-update.yml lacks ${line}`);
+}
+// twr's licence and the third-party notices (scripts/notices.mjs) the Help menu opens.
+for (const name of ["LICENSE", "NOTICE", "THIRD-PARTY-LICENSES.html"])
+  assert(existsSync(join(resources, name)), `The app bundle has no ${name}`);
+{
+  const notices = readFileSync(
+    join(resources, "THIRD-PARTY-LICENSES.html"),
+    "utf8",
+  );
+  for (const name of ["react", "@xterm/xterm", "electron-updater", "node-pty"])
+    assert(
+      notices.includes(`data-package="${name}"`),
+      `THIRD-PARTY-LICENSES.html does not list ${name}`,
+    );
+  if (!notices.includes('id="rust-crates"'))
+    console.log(
+      "WARNING: THIRD-PARTY-LICENSES.html lists no Rust crates: it was packaged without cargo-about",
+    );
+  // The page as a browser shows it: one document with both parts and every package. It is
+  // loaded in a window of the Electron the app is built with (the development copy).
+  const scratch = mkdtempSync(join(tmpdir(), "twr-notices-"));
+  const viewerMain = join(scratch, "main.cjs");
+  writeFileSync(
+    viewerMain,
+    `const { app, BrowserWindow } = require("electron");
+app.whenReady().then(() =>
+  new BrowserWindow({ show: false, webPreferences: { javascript: true } }).loadURL(
+    ${JSON.stringify(pathToFileURL(join(resources, "THIRD-PARTY-LICENSES.html")).href)},
+  ),
+);\n`,
+  );
+  const viewer = await electron.launch({
+    args: [viewerMain, `--user-data-dir=${join(scratch, "user-data")}`],
+  });
+  {
+    try {
+      const page = await viewer.firstWindow();
+      await page.waitForLoadState("load");
+      const shown = await page.evaluate(() => ({
+        title: document.title,
+        mains: document.querySelectorAll("main").length,
+        rust: !!document.getElementById("rust-crates"),
+        // The crates each Rust licence lists as using it (about.hbs), before the npm part.
+        crates: document.getElementById("rust-crates")
+          ? document
+              .querySelectorAll(".licenses-list")[0]
+              .querySelectorAll("ul li a").length
+          : 0,
+        npm: !!document.getElementById("npm-packages"),
+        packages: document.querySelectorAll("li[data-package]").length,
+        // Every npm entry inside the main column, after the npm heading.
+        outside: [...document.querySelectorAll("li[data-package]")].filter(
+          (li) => !li.closest("main"),
+        ).length,
+      }));
+      assert.equal(shown.mains, 1, "The notices page has one main column");
+      assert(
+        shown.npm &&
+          shown.packages > 50 &&
+          shown.outside === 0 &&
+          (!shown.rust || shown.crates > 50),
+        JSON.stringify(shown),
+      );
+      console.log(`Notices page: ${JSON.stringify(shown)}`);
+    } finally {
+      await viewer.close().catch(() => {});
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+}
+const fixture = realpathSync(mkdtempSync(join(tmpdir(), "twr-package-")));
+function launcherPID(app, userData, port) {
+  for (const line of execFileSync("/bin/ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+  }).split("\n")) {
+    const match = line.trim().match(/^(\d+) (.+)$/);
+    if (
+      match &&
+      match[2].startsWith(app + "/Contents/MacOS/twr ") &&
+      match[2].includes(`--user-data-dir=${userData}`) &&
+      match[2].includes(`--remote-debugging-port=${port}`)
+    )
+      return Number(match[1]);
+  }
+  return undefined;
+}
+async function freePort() {
+  return await new Promise((resolvePort, reject) => {
+    const socket = createServer();
+    socket.on("error", reject);
+    socket.listen(0, "127.0.0.1", () => {
+      const port = socket.address().port;
+      socket.close(() => resolvePort(port));
+    });
+  });
+}
+// Without the marker, the release app must start normally and keep its debugging port shut.
+{
+  const home = join(fixture, "unmarked");
+  mkdirSync(home);
+  writeFileSync(
+    join(home, "config.toml"),
+    `[orchestrator]\nautostart = false\n[tui]\nsuggest = false\nsummaries = false\n`,
+    { mode: 0o600 },
+  );
+  const userData = join(home, "user-data");
+  const port = await freePort();
+  const twr = join(resources, "bin/twr");
+  const hubEnv = { ...process.env, HOME: home, TWR_HOME: home };
+  delete hubEnv.TWR_DESKTOP_TEST_AUTOMATION;
+  execFileSync("/usr/bin/open", [
+    "-n",
+    "-a",
+    release,
+    "--env",
+    `TWR_HOME=${home}`,
+    "--env",
+    `HOME=${home}`,
+    "--env",
+    "TWR_DESKTOP_TEST_AUTOMATION=1",
+    "--env",
+    "SHELL=/bin/sh",
+    "--env",
+    "PATH=/usr/bin:/bin",
+    "--args",
+    `--user-data-dir=${userData}`,
+    `--remote-debugging-port=${port}`,
+  ]);
+  try {
+    // The app is up once it has started this fixture's hub.
+    let started = false;
+    for (let attempt = 0; attempt < 300 && !started; attempt++) {
+      try {
+        execFileSync(twr, ["info", "--json"], { env: hubEnv, stdio: "pipe" });
+        started = true;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+    assert(started, "The release app did not start its hub");
+    assert(
+      launcherPID(release, userData, port),
+      "The release app exited instead of ignoring the automation variable",
+    );
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
+      signal: AbortSignal.timeout(2000),
+    }).catch((error) => error);
+    assert(
+      response instanceof Error,
+      "The release app opened remote debugging without the QA marker",
+    );
+    const log = readFileSync(join(userData, "logs/twr-desktop.log"), "utf8");
+    assert.match(log, /Ignored TWR_DESKTOP_TEST_AUTOMATION/);
+    console.log(
+      "PASS: without the QA marker the release app ignores TWR_DESKTOP_TEST_AUTOMATION and keeps remote debugging shut",
+    );
+  } finally {
+    const pid = launcherPID(release, userData, port);
+    if (pid) process.kill(pid, "SIGKILL");
+    stopFixture(twr, hubEnv);
+  }
+}
+// The copy under test, with the marker. It is not re-signed: the added file breaks the
+// bundle's seal, which macOS checks only for a quarantined (downloaded) app.
+const application = join(fixture, "twr.app");
+execFileSync("/usr/bin/ditto", [release, application]);
+writeFileSync(
+  join(application, "Contents/Resources", QA_MARKER),
+  "This copy of twr is a QA build: it honours TWR_DESKTOP_TEST_AUTOMATION. Never ship it.\n",
+);
 const repository = join(fixture, "repo");
 const speechScript = join(fixture, "speech-sink.sh");
 const spoken = join(fixture, "spoken.txt");
@@ -58,6 +270,23 @@ const port = await new Promise((resolvePort, reject) => {
     socket.close(() => resolvePort(port));
   });
 });
+function fixtureLauncherPID() {
+  for (const line of execFileSync("/bin/ps", ["-axo", "pid=,command="], {
+    encoding: "utf8",
+  }).split("\n")) {
+    const match = line.trim().match(/^(\d+) (.+)$/);
+    if (
+      match &&
+      match[2].startsWith(application + "/Contents/MacOS/twr ") &&
+      match[2].includes(`--user-data-dir=${join(fixture, "user-data")}`) &&
+      match[2].includes(`--remote-debugging-port=${port}`)
+    )
+      return Number(match[1]);
+  }
+  throw new Error(
+    "Could not identify this fixture's app process for foreground evidence",
+  );
+}
 let browser;
 let hubPid;
 const hubPids = new Set();
@@ -143,12 +372,65 @@ try {
     existsSync(join(fixture, "user-data", "engines")),
     "Engine pair must be cached outside the app bundle",
   );
+  // The Mac app ships no bin/digests.json (scripts/after-pack.mjs: signing changes the
+  // engines). Its engines are staged in the directory named from their actual digests, and
+  // the app's digest cache keeps them, keyed by the bundle's stable paths.
+  {
+    assert(
+      !existsSync(join(application, "Contents/Resources/bin/digests.json")),
+      "The Mac app must not ship engine digests that its signature invalidates",
+    );
+    const names = ["twr", "twr-desktop-bridge", "twr-mobile-gateway"];
+    const actual = names.map((name) => [
+      name,
+      createHash("sha256")
+        .update(readFileSync(join(application, "Contents/Resources/bin", name)))
+        .digest("hex"),
+    ]);
+    const directory = createHash("sha256")
+      .update(JSON.stringify(actual))
+      .digest("hex");
+    assert(
+      existsSync(join(fixture, "user-data/engines", directory, "twr")),
+      "The engines must be staged under their digests",
+    );
+    const cached = JSON.parse(
+      readFileSync(join(fixture, "user-data/engines/digests.json"), "utf8"),
+    );
+    for (const [name, digest] of actual)
+      assert.equal(
+        cached[join(application, "Contents/Resources/bin", name)]?.hash,
+        digest,
+        `The digest cache must hold the bundle's ${name}`,
+      );
+    console.log(
+      "PASS: the packaged app stages its engines under their digests and caches the bundle's",
+    );
+  }
   await page.evaluate(() =>
     window.twr.rpc("thread.new", {
       project: "demo",
       name: "packaged",
       runtime: "fake",
     }),
+  );
+  const attachmentPath = await page.evaluate(async () => {
+    const thread = await window.twr.rpc("thread.get", { thread: "packaged" });
+    const result = await window.twr.uploadFile(
+      new File(["PACKAGED_ATTACHMENT_✓"], "packaged-attachment.txt", {
+        type: "text/plain",
+      }),
+      thread.id,
+    );
+    return result.path;
+  });
+  assert(
+    attachmentPath.startsWith(fixture + "/"),
+    "Packaged upload must remain in its isolated fixture",
+  );
+  assert.equal(readFileSync(attachmentPath, "utf8"), "PACKAGED_ATTACHMENT_✓");
+  console.log(
+    "PASS: packaged local File upload reached the pinned worktree through production authentication",
   );
   await page
     .locator(".thread-card")
@@ -164,6 +446,178 @@ try {
     .locator(".block-assistant")
     .getByText("PACKAGED_AGENT_OK", { exact: true })
     .waitFor();
+  const directComposer = page.getByRole("textbox", {
+    name: "Message packaged directly",
+    exact: true,
+  });
+  const assistantMessages = await page.locator(".block-assistant").count();
+  await page.getByLabel("Upload files", { exact: true }).setInputFiles({
+    name: "preview.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from(
+      "PLAIN_TEXT_PREVIEW_<script>window.unsafePreview=true</script>",
+    ),
+  });
+  const attachment = page
+    .locator(".attachment-item")
+    .filter({ hasText: "preview.txt" });
+  await attachment.getByText("Ready to send", { exact: false }).waitFor();
+  await attachment.getByText("Preview text", { exact: false }).click();
+  assert(
+    (await attachment.locator("pre").innerText()).includes(
+      "<script>window.unsafePreview=true</script>",
+    ),
+  );
+  assert.equal(
+    await page.evaluate(() => window.unsafePreview),
+    undefined,
+    "Text previews must remain inert",
+  );
+  assert(
+    (await directComposer.inputValue()).includes("Uploaded file: preview.txt"),
+  );
+  assert.equal(
+    await page.locator(".block-assistant").count(),
+    assistantMessages,
+    "Selecting a file must not send a prompt",
+  );
+  await attachment
+    .getByRole("button", { name: "Dismiss", exact: true })
+    .click();
+  await directComposer.fill("");
+  console.log(
+    "PASS: packaged attachment preview is inert, progresses to ready, and waits for explicit send",
+  );
+  // Application services: settings, background mode, diagnostics and the
+  // update policy of the build's signature. Launch at login is not toggled
+  // here because macOS login items belong to the real user session.
+  {
+    let settings = await page.evaluate(() => window.twrApp.settings());
+    assert.equal(settings.update.kind, "mac");
+    if (signing === "adhoc") {
+      assert.equal(
+        settings.update.automatic,
+        false,
+        "Ad hoc builds must not self-update",
+      );
+      assert.match(settings.update.manualReason, /Developer ID/);
+    } else {
+      // The app finds its signature with codesign after the window shows.
+      for (
+        let i = 0;
+        i < 100 && !settings.update.automatic && !settings.update.manualReason;
+        i++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        settings = await page.evaluate(() => window.twrApp.settings());
+      }
+      assert.equal(
+        settings.update.automatic,
+        true,
+        "A Developer ID build updates itself",
+      );
+      assert.equal(
+        settings.update.manualReason,
+        undefined,
+        "A Developer ID build has no reason to update by hand",
+      );
+    }
+    assert.equal(settings.login.supported, true);
+    assert.equal(settings.tray.available, true);
+    assert.equal(settings.tray.enabled, true);
+    const trayOff = await page.evaluate(() => window.twrApp.setTray(false));
+    assert.equal(trayOff.tray.enabled, false);
+    await page.evaluate(() => window.twrApp.setTray(true));
+    await page.evaluate(() =>
+      window.twrApp.setAttention({
+        count: 2,
+        items: [
+          {
+            workspace: "default",
+            thread: "packaged",
+            title: "packaged",
+            summary: "QA",
+            id: "packaged-qa",
+            revision: 1,
+            reason: "permission",
+          },
+        ],
+        workspaces: [{ name: "default" }],
+      }),
+    );
+    // Background mode: closing the window hides it and keeps the renderer live.
+    await page.evaluate(() => window.twrApp.setBackground(true));
+    // The automation-only SIGUSR2 hook calls BrowserWindow.close(), the path
+    // of the title-bar button and File › Close. (Synthetic keystrokes do not
+    // reach native menu accelerators, and a script's window.close() skips the
+    // window's close event.)
+    process.kill(fixtureLauncherPID(), "SIGUSR2");
+    const windowState = async () =>
+      JSON.parse(
+        /^window: (.*)$/m.exec(
+          await page.evaluate(() => window.twrApp.diagnostics()),
+        )[1],
+      );
+    for (let i = 0; i < 50 && (await windowState()).visible; i++)
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      (await windowState()).visible,
+      false,
+      "Background mode must hide the window instead of closing it",
+    );
+    // Launching again (a launcher, the Dock or a login item) hands over to the
+    // running instance, which shows its hidden window and then exits.
+    execFileSync(
+      join(application, "Contents/MacOS/twr"),
+      [`--user-data-dir=${join(fixture, "user-data")}`],
+      {
+        stdio: "ignore",
+        timeout: 30000,
+        env: {
+          ...process.env,
+          HOME: fixture,
+          TWR_HOME: fixture,
+          TWR_DESKTOP_TEST_AUTOMATION: "1",
+        },
+      },
+    );
+    for (let i = 0; i < 50 && !(await windowState()).visible; i++)
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    if (!(await windowState()).visible)
+      console.log(await page.evaluate(() => window.twrApp.diagnostics()));
+    assert.equal((await windowState()).visible, true);
+    await page
+      .locator(".connection-status")
+      .filter({ hasText: "Hub connected" })
+      .waitFor({ timeout: 10000 });
+    await page.evaluate(() => window.twrApp.setBackground(false));
+    await page.evaluate(() =>
+      window.twrApp.reportError({
+        message: "packaged QA probe token=SHOULD_NOT_APPEAR",
+        source: "qa",
+      }),
+    );
+    const diagnostics = await page.evaluate(() => window.twrApp.diagnostics());
+    assert.match(diagnostics, /^install: mac$/m);
+    // The file Help › Third-Party Licences opens, as the packaged app resolves it.
+    assert.match(diagnostics, /^licences: present$/m);
+    assert.match(diagnostics, /packaged QA probe token=\[redacted\]/);
+    assert(!diagnostics.includes("SHOULD_NOT_APPEAR"));
+    assert(
+      !diagnostics.includes(fixture),
+      "Diagnostics must hide the home path",
+    );
+    await page
+      .getByRole("button", { name: "Settings", exact: true })
+      .first()
+      .click();
+    await page.getByRole("heading", { name: "Application" }).waitFor();
+    await page.getByRole("switch", { name: "Launch at login" }).waitFor();
+    await page.getByRole("heading", { name: "Diagnostics" }).waitFor();
+    console.log(
+      `PASS: packaged tray settings, background close/reopen, redacted diagnostics and ${signing === "adhoc" ? "ad hoc" : "Developer ID"} update policy`,
+    );
+  }
   if (process.env.TWR_DESKTOP_EXTENDED_QA === "1") {
     const { runMacQA } = await import("./qa-scenarios.mjs");
     await runMacQA(page, { fixture, hubPids });
@@ -196,7 +650,7 @@ try {
   await page.getByRole("button", { name: "Close Shell", exact: true }).click();
   await page
     .getByRole("dialog", { name: "Close terminal?", exact: true })
-    .getByRole("button", { name: "Continue", exact: true })
+    .getByRole("button", { name: /^(Close terminal|Remove tab)$/ })
     .click();
   const terminal = await page.evaluate(() =>
     window.twr.terminalOpen({ shell: true, title: "Packaged terminal" }),
@@ -217,8 +671,65 @@ try {
   }
   await page.evaluate((id) => window.twr.terminalClose(id), terminal.id);
   mkdirSync("test-results", { recursive: true });
-  if (process.env.TWR_PERF === "1")
+  if (process.env.TWR_PERF === "1") {
+    const helper = join(fixture, "mac-foreground");
+    execFileSync(
+      "/usr/bin/xcrun",
+      [
+        "swiftc",
+        fileURLToPath(new URL("./mac-foreground.swift", import.meta.url)),
+        "-module-cache-path",
+        join(fixture, "swift-modules"),
+        "-o",
+        helper,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const pid = fixtureLauncherPID();
+    const sample = (activate = false) =>
+      JSON.parse(
+        execFileSync(
+          helper,
+          [String(pid), ...(activate ? ["--activate"] : [])],
+          { encoding: "utf8" },
+        ),
+      );
+    await page.bringToFront();
+    const before = sample(true);
+    const foreground = (state) =>
+      state.targetActive &&
+      state.targetOnScreen &&
+      state.frontmostPID === pid &&
+      state.overlappingHigherWindows === 0;
+    const requireForeground = process.env.TWR_PERF_REQUIRE_FOREGROUND === "1";
+    writeFileSync(
+      "test-results/packaged-native-foreground.json",
+      JSON.stringify({ before, after: null }, null, 2) + "\n",
+    );
+    if (requireForeground)
+      assert(
+        foreground(before),
+        "Performance requires this fixture app foreground and unoccluded: " +
+          JSON.stringify(before),
+      );
     await performanceAudit(page, "mac-packaged");
+    const after = sample();
+    const classification =
+      foreground(before) && foreground(after)
+        ? "foreground-unoccluded"
+        : "occluded-or-inactive";
+    const evidence = { before, after, classification };
+    writeFileSync(
+      "test-results/packaged-native-foreground.json",
+      JSON.stringify(evidence, null, 2) + "\n",
+    );
+    console.log("PERFORMANCE_CONTEXT", JSON.stringify(evidence));
+    if (requireForeground)
+      assert(
+        foreground(after),
+        "Native foreground changed during the performance audit",
+      );
+  }
   await page.screenshot({ path: "test-results/packaged-macos.png" });
   if (process.env.TWR_UI_CAPTURES === "1") {
     const { captureUI } = await import("./ui-captures.mjs");
@@ -305,6 +816,12 @@ try {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
+  // Then the runner service the app's release hub started for this home.
+  stopFixture(
+    join(resources, "bin/twr"),
+    { ...process.env, HOME: fixture, TWR_HOME: fixture },
+    { workspaces: [] },
+  );
   rmSync(fixture, {
     recursive: true,
     force: true,

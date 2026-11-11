@@ -1,6 +1,6 @@
 # Workspaces
 
-A workspace is a separate twr on the same machine: its own hub, orchestrator conversation, threads, worktrees and trash. Use one per client, side project or experiment, and switch between them the way you switch tabs. `default` is the twr you already have; it stays exactly as it was.
+Workspaces run separate hubs on one machine. Each workspace has its own hub, orchestrator conversation, threads, worktrees and trash. Use one per client, side project or experiment, and switch between them the way you switch tabs. `default` is the twr you already have; it stays exactly as it was. Workspaces share the machine's runner service and paired machine trust; each keeps its own key and worker data on a linked runner.
 
 ```sh
 twr ws new client-x          # create a workspace
@@ -9,6 +9,8 @@ twr -w client-x thread list  # any command, in that workspace
 export TWR_WORKSPACE=client-x  # or select it for the whole shell
 twr ws                       # list them
 ```
+
+`twr ws` asks every running hub at once how many threads it has, how many run and how many requests wait on you; `twr ws list --json` prints the same as JSON, and `--json --detail` adds each hub's whole thread list and requests, which is how the desktop app reads every workspace in one go ([SKILL.md](../SKILL.md#cli-equivalents) has the fields).
 
 `-w` (`--workspace`) wins over `TWR_WORKSPACE`, which wins over `default`. `--socket` still picks the socket. A workspace that doesn't exist is an error that says how to create it, so a typo never makes a new one. Names are 1 to 32 lowercase letters, digits or `-`, starting and ending with a letter or digit.
 
@@ -20,12 +22,12 @@ Threads, the sidebar on the left, lists every workspace, a card each, with its t
  THREADS                            ‹
 ▌_ default                      ⚠1 ●2
 ▌  working · waiting on you
-▌ ┌ beta ─────── sonnet-4-5 ─ manual ┐
+▌ ┌ beta ─────── sonnet-5-5 ─ manual ┐
 ▌ │waiting                           │
 ▌ │ PERMISSION  Bash: rm -rf target  │
 ▌ │1 allow  2 deny                   │
 ▌ └──────────────────────────────────┘
-▌ ┌ alpha ────── sonnet-4-5 ─ manual ┐
+▌ ┌ alpha ────── sonnet-5-5 ─ manual ┐
 ▌ │_ running                         │
 ▌ └──────────────────────────────────┘
 
@@ -111,7 +113,8 @@ It covers the default hub's configured `hub.socket` (or its standard socket), an
 
 ```sh
 twr -w client-x hub stop
-twr ws rm client-x
+twr ws rm client-x      # lists what goes, asks y/N
+twr ws rm client-x -y   # without asking
 ```
 
-`twr ws rm` removes the workspace's data: its log, its orchestrator's conversation and memory, and its input history. It refuses while the workspace's hub runs (on any socket: it holds a lock on the workspace's data), while it has threads (delete them first) and while its trash holds deleted threads (`twr -w client-x trash empty --all`), whose commits stay referenced in their repositories until purged. Branches stay in your repositories, and a Claude Code orchestrator's own memory directory stays in `~/.claude/projects/`. `default` can't be removed.
+`twr ws rm` removes the workspace's data for good: its log, its orchestrator's conversation and memory, and its input history. It first lists what goes (the orchestrator's conversation with its turns, how many memory notes, the log's size, any worktree directories a failed deletion left in its `worktrees/`, and the data directory's size in all) and asks `Remove workspace client-x? This cannot be undone. [y/N]`. Without a terminal it removes nothing unless you pass `-y` (`--yes`), and the error lists what would go. It refuses while the workspace's hub runs (on any socket: it holds a lock on the workspace's data), while it has threads (delete them first) and while its trash holds deleted threads (`twr -w client-x trash empty --all`), whose commits stay referenced in their repositories until purged. Branches stay in your repositories, and a Claude Code orchestrator's own memory directory stays in `~/.claude/projects/`. `default` can't be removed.

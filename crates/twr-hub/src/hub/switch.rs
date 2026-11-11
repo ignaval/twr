@@ -255,6 +255,8 @@ impl Core {
                 if caller.is_orchestrator() {
                     orch::check_orchestrator_runtime(spec, &hub.config)?;
                 }
+                // A device names a command line only with `terminal` (`hub::device_scope`).
+                hub.check_caller_runtime(caller, spec)?;
                 runtime_spec::resolve(spec, &hub.config)?
             }
             None => RuntimeSpec {
@@ -285,6 +287,19 @@ impl Core {
             }
         };
         let runtime_changed = new.runtime != view.runtime || !same_agent;
+        // Runtimes differ in what one mode lets through: a device moves a thread to another
+        // only with `admin`, as it changes modes; and goes outside the pins only with it
+        // (`hub::device_scope`). A move between accounts within them is operate's.
+        if runtime_changed {
+            hub.require_scope(caller, &format!("move {name} to another runtime"), "admin")?;
+        }
+        if outside_pin {
+            hub.require_scope(
+                caller,
+                &format!("move {name} to an account outside its pins"),
+                "admin",
+            )?;
+        }
         // The same agent on the same account (in the same directory): no move.
         let account = self.account_move(hub, view, &new, account, outside_pin, caller)?;
         if !runtime_changed && account.is_none() {

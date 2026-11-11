@@ -285,7 +285,12 @@ async fn context_set_logs_then_writes_and_read_returns_it() {
     let hash = blob_ref(b"Deploys go through CI.\n");
     assert_eq!(r["changed"], true);
     assert_eq!(r["hash"], json!(hash));
-    let file = dir.path().join(".twr").join("context.md");
+    // The project's path resolved (macOS's temporary directory is under `/var`, a link to
+    // `/private/var`): the hub reports the file under it.
+    let file = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join(".twr")
+        .join("context.md");
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         "Deploys go through CI.\n"

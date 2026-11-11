@@ -122,6 +122,7 @@ const FRAME_MARGIN: usize = 64;
 
 /// Non-session ops (git, attach info) executing at once, at most.
 pub const MAX_CONCURRENT_OPS: usize = 8;
+pub const MAX_CONCURRENT_UPLOADS: usize = 4;
 
 /// Strings of an oversized event's placeholder are cut to this many bytes.
 const PLACEHOLDER_STRING: usize = 4 << 10;
@@ -151,6 +152,7 @@ const SPOOL_RETRY: [Duration; 5] = [
 /// How a [`LocalBox`] is set up.
 #[derive(Clone)]
 pub struct LocalBoxOptions {
+    pub managed: Option<crate::managed::Managed>,
     /// The spool database (`<data>/runner-<box>.db`).
     pub spool_path: PathBuf,
     /// Bound of the spool's outbox in bytes.
@@ -198,6 +200,7 @@ impl LocalBoxOptions {
     /// bound, and worktrees under `<data_dir>/worktrees`.
     pub fn new(data_dir: &std::path::Path, box_name: &str) -> Self {
         LocalBoxOptions {
+            managed: None,
             spool_path: spool_path(data_dir, box_name),
             spool_max_bytes: DEFAULT_MAX_BYTES,
             worktrees: data_dir.join("worktrees"),
@@ -216,6 +219,7 @@ impl LocalBoxOptions {
 
 /// A live runtime session.
 struct Live {
+    _lease: Option<crate::managed::Lease>,
     gen: u64,
     /// The run's id ([`RunningSession::run`]).
     run: String,
@@ -298,17 +302,20 @@ impl Shared {
 }
 
 struct Inner {
+    managed: Option<crate::managed::Managed>,
     shared: Arc<Shared>,
     /// The box's locks ([`lock_box`]), held for as long as the box.
     _locks: Vec<std::fs::File>,
     adapters: AdapterLookup,
     runtimes: Vec<String>,
     git: LocalGit,
+    uploads: Arc<Mutex<twr_core::upload::Manager>>,
     worktrees: PathBuf,
     next_gen: AtomicU64,
     inflight: Mutex<HashMap<String, watch::Receiver<Option<CmdResult>>>>,
     /// Bounds the non-session ops executing at once ([`MAX_CONCURRENT_OPS`]).
     op_permits: tokio::sync::Semaphore,
+    upload_permits: tokio::sync::Semaphore,
     /// Repository changes received from the hub and not finished ([`LocalBox::begin_change`]).
     changes: watch::Sender<usize>,
     /// [`LocalBox::hold_change_receipts`] (tests).
@@ -412,6 +419,9 @@ impl LocalBox {
     /// the module docs; refused when one survives); this blocks for as long as that takes
     /// (bounded, a few seconds per process).
     pub fn open(opts: LocalBoxOptions) -> anyhow::Result<LocalBox> {
+        if let Some(managed) = &opts.managed {
+            managed.active()?;
+        }
         if let Some(parent) = opts.spool_path.parent() {
             twr_core::paths::ensure_private_dir(parent)?;
         }
@@ -425,6 +435,7 @@ impl LocalBox {
         let start_time = reap::own_start_time();
         Ok(LocalBox {
             inner: Arc::new(Inner {
+                managed: opts.managed,
                 shared: Arc::new(Shared {
                     spool,
                     notify: Notify::new(),
@@ -449,10 +460,12 @@ impl LocalBox {
                         None => git.with_trash_root(&opts.trash),
                     }
                 },
+                uploads: twr_core::upload::Manager::shared(),
                 worktrees: opts.worktrees,
                 next_gen: AtomicU64::new(1),
                 inflight: Mutex::new(HashMap::new()),
                 op_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_OPS),
+                upload_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_UPLOADS),
                 changes: watch::Sender::new(0),
                 receipt_hold: Mutex::new(None),
                 agents: BoxAgents::new(opts.env),
@@ -634,7 +647,8 @@ impl LocalBox {
         v
     }
 
-    /// Runs command `cmd_id` once: a repeated id returns the first execution's result.
+    /// Runs a command once using its recorded result. Upload commands instead use their
+    /// transfer identity, offsets, and terminal receipt for idempotence, without a spool row.
     ///
     /// What the command waits for before it runs (the login shell's `PATH`, asked once) is
     /// waited for before the command is recorded as running: a connection replaced meanwhile
@@ -642,6 +656,13 @@ impl LocalBox {
     /// repeat of the id runs it. A command dropped later, part way ([`Settle`]), is settled
     /// all the same: not in flight any more, and run again when repeated if it had not begun.
     pub async fn handle_cmd(&self, cmd_id: &str, op: Op) -> CmdResult {
+        if matches!(op, Op::Upload { .. }) {
+            // Upload IDs, exact chunk offsets/data and terminal receipts provide their own
+            // idempotence. Streaming chunks must not evict ordinary durable command results.
+            let _permit = self.inner.upload_permits.acquire().await.ok();
+            return CmdResult::new(cmd_id, self.execute(op).await);
+        }
+
         enum Plan {
             Wait(watch::Receiver<Option<CmdResult>>),
             Done(CmdResult),
@@ -713,6 +734,30 @@ impl LocalBox {
                     settle.begun = true;
                     self.execute_with(op, login.as_deref()).await
                 };
+                // Admission never began execution. Forgetting this id is safe and prevents
+                // capacity retries from accumulating unbounded command-result rows.
+                if outcome
+                    .as_ref()
+                    .is_err_and(|e| e.code == cmd_errors::BOX_FULL)
+                {
+                    if let Err(e) = self.spool().cmd_forget(cmd_id) {
+                        self.inner
+                            .shared
+                            .fail(format!("cannot forget unadmitted command: {e}"));
+                        return CmdResult::new(
+                            cmd_id,
+                            Err(CmdError::new(
+                                cmd_errors::FAILED,
+                                "runner admission state could not be saved",
+                            )),
+                        );
+                    }
+                    let result = CmdResult::new(cmd_id, outcome);
+                    settle.armed = false;
+                    let _ = tx.send(Some(result.clone()));
+                    self.forget_inflight(cmd_id);
+                    return result;
+                }
                 let mut result = CmdResult::new(cmd_id, outcome);
                 // Published only once stored: a result the hub saw but the spool lacks would
                 // let a repeat of the id run again after a restart.
@@ -782,6 +827,12 @@ impl LocalBox {
         login: Option<&twr_adapters::resolve::LoginPath>,
     ) -> Result<Value, CmdError> {
         let failed = |e: anyhow::Error| CmdError::new(cmd_errors::FAILED, format!("{e:#}"));
+        if let Some(managed) = &self.inner.managed {
+            managed.check(&op).map_err(|e| {
+                let code = if matches!(&op, Op::Upload { request, .. } if matches!(request.action, twr_core::upload::Action::Begin {..})) { cmd_errors::UPLOAD_REJECTED } else { cmd_errors::FAILED };
+                CmdError::new(code, format!("{e:#}"))
+            })?;
+        }
         let git = &self.inner.git;
         match op {
             Op::Spawn {
@@ -795,6 +846,7 @@ impl LocalBox {
                 cfg.thread = thread.clone();
                 twr_adapters::resolve::with_login_path(&mut cfg.env, login);
                 self.start(&thread, &runtime, cfg, run, |a, cfg| a.spawn(cfg, prompt))
+                    .await
             }
             Op::Resume {
                 thread,
@@ -809,6 +861,7 @@ impl LocalBox {
                 self.start(&thread, &runtime, cfg, run, |a, cfg| {
                     a.resume(cfg, session_id)
                 })
+                .await
             }
             Op::Send {
                 thread,
@@ -863,6 +916,15 @@ impl LocalBox {
                 self.command(&thread, AdapterCmd::Respond { attn_id, answer })
             }
             Op::Stop { thread, run } => {
+                if let Some(managed) = self.inner.managed.clone() {
+                    let (cancelled, cancelled_run) = (thread.clone(), run.clone());
+                    tokio::task::spawn_blocking(move || {
+                        managed.cancel_admission(&cancelled, cancelled_run.as_deref())
+                    })
+                    .await
+                    .map_err(|e| CmdError::new(cmd_errors::FAILED, e.to_string()))?
+                    .map_err(|e| CmdError::new(cmd_errors::FAILED, e.to_string()))?;
+                }
                 let other_run = run.is_some_and(|r| {
                     self.inner
                         .shared
@@ -1012,6 +1074,48 @@ impl LocalBox {
             .await
             .map(|o| json!(o))
             .map_err(failed),
+            Op::Upload {
+                scope,
+                thread,
+                root,
+                registered_repository,
+                request,
+            } => {
+                let uploads = self.inner.uploads.clone();
+                let git = self.inner.git.clone();
+                twr_core::upload::Manager::start_cleanup(&uploads);
+                tokio::task::spawn_blocking(move || {
+                    let root = twr_core::upload::resolve_root(&root, registered_repository)
+                        .map_err(|e| twr_core::upload::reject_begin(&request, e))?;
+                    let _workdir = git
+                        .workdirs()
+                        .begin_use(&root, &format!("upload:{}", request.id))
+                        .map_err(|e| {
+                            twr_core::upload::reject_begin(
+                                &request,
+                                anyhow::anyhow!(e.replace(
+                                    "cannot start a runtime in",
+                                    "cannot upload files to"
+                                )),
+                            )
+                        })?;
+                    twr_core::upload::Manager::request_shared(
+                        &uploads, &scope, &thread, &root, request,
+                    )
+                })
+                .await
+                .map_err(|e| failed(e.into()))?
+                .map_err(|e| {
+                    let code = if e.downcast_ref::<twr_core::upload::Rejected>().is_some() {
+                        cmd_errors::UPLOAD_REJECTED
+                    } else if e.downcast_ref::<twr_core::upload::Failed>().is_some() {
+                        cmd_errors::UPLOAD_FAILED
+                    } else {
+                        cmd_errors::FAILED
+                    };
+                    CmdError::new(code, format!("{e:#}"))
+                })
+            }
             // As last probed, unless asked for a fresh look (or none was made yet).
             Op::Agents { refresh } => {
                 let agents = if refresh || !self.inner.agents.probed() {
@@ -1060,7 +1164,7 @@ impl LocalBox {
     /// Spawns or resumes a session (`go` with `cfg`, marked for the thread and the new run,
     /// [`mark`]) and starts its pump. The run's id is `run` (the hub's) when given, else a
     /// fresh one.
-    fn start(
+    async fn start(
         &self,
         thread: &str,
         runtime: &str,
@@ -1077,11 +1181,56 @@ impl LocalBox {
         let cwd = cfg.cwd.clone();
         let adapter = self.adapter(runtime)?;
         let shared = &self.inner.shared;
-        let mut sessions = shared.sessions();
-        if sessions.contains_key(thread) {
-            return Err(CmdError::new(
+        let already = || {
+            CmdError::new(
                 cmd_errors::ALREADY_RUNNING,
                 format!("thread {thread} already has a running session on this box"),
+            )
+        };
+        if shared.sessions().contains_key(thread) {
+            return Err(already());
+        }
+        let run = run.unwrap_or_else(twr_core::event::new_id);
+        // Admission takes machine-wide file locks other workers share and may retire an
+        // orphan runtime first: it runs on a blocking thread, before the session table is
+        // locked, so nothing else of this box waits for it. (Session ops reach a box in
+        // order, so a stop of this run arrives only after this start has returned.)
+        let lease = match self.inner.managed.clone() {
+            None => None,
+            Some(managed) => {
+                let (admitted, admitted_run) = (thread.to_string(), run.clone());
+                let lease =
+                    tokio::task::spawn_blocking(move || managed.admit(&admitted, &admitted_run))
+                        .await
+                        .map_err(|e| {
+                            CmdError::new(cmd_errors::FAILED, format!("runner admission: {e}"))
+                        })?
+                        .map_err(|e| {
+                            CmdError::new(
+                                if e.is::<crate::managed::Capacity>()
+                                    || e.is::<crate::managed::Busy>()
+                                {
+                                    cmd_errors::BOX_FULL
+                                } else {
+                                    cmd_errors::FAILED
+                                },
+                                e.to_string(),
+                            )
+                        })?;
+                Some(lease)
+            }
+        };
+        let mut sessions = shared.sessions();
+        // A start of the same thread that finished while this one was admitted: the lease
+        // just taken is released with it.
+        if sessions.contains_key(thread) {
+            return Err(already());
+        }
+        if self.inner.managed.is_some() && self.spool().bytes() >= self.spool().max_bytes() * 8 / 10
+        {
+            return Err(CmdError::new(
+                cmd_errors::BOX_FULL,
+                "runner spool reached its high-water mark",
             ));
         }
         // Held for as long as the session lives: no worktree change removes `cwd` under it.
@@ -1107,7 +1256,6 @@ impl LocalBox {
                     format!("runner spool: cannot record the start: {e:#}"),
                 )
             })?;
-        let run = run.unwrap_or_else(twr_core::event::new_id);
         mark(&mut cfg, &run);
         // The runtime, permission mode, model and reasoning effort the session starts with go
         // with its start event, so a hub that takes the session over later knows them
@@ -1146,6 +1294,7 @@ impl LocalBox {
         sessions.insert(
             thread.to_string(),
             Live {
+                _lease: lease,
                 gen,
                 run,
                 runtime: runtime.to_string(),
@@ -1232,8 +1381,13 @@ impl LocalBox {
 /// in a runtime's environment (replacing whatever the hub sent): what finds its processes
 /// after a runner crash, and tells them from another run's.
 fn mark(cfg: &mut SpawnConfig, run: &str) {
+    cfg.env.retain(|(k, _)| {
+        k != reap::THREAD_ENV && k != reap::RUNTIME_GEN_ENV && k != reap::AGENT_ENV
+    });
+    cfg.env_remove
+        .retain(|k| k != reap::THREAD_ENV && k != reap::RUNTIME_GEN_ENV && k != reap::AGENT_ENV);
     cfg.env
-        .retain(|(k, _)| k != reap::THREAD_ENV && k != reap::RUNTIME_GEN_ENV);
+        .push((reap::AGENT_ENV.to_string(), format!("{}:{run}", cfg.thread)));
     cfg.env
         .push((reap::THREAD_ENV.to_string(), cfg.thread.clone()));
     cfg.env
@@ -2037,4 +2191,83 @@ async fn pump(
     tracing::info!(thread = %thread, "runtime exited");
     shared.notify.notify_waiters();
     shared.ended.notify_waiters();
+}
+
+#[cfg(test)]
+mod upload_lane_tests {
+    use super::*;
+    #[tokio::test]
+    async fn an_upload_refused_before_reservation_has_a_definitive_rejection() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let owned = root.join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        let mut opts = LocalBoxOptions::new(&owned, "managed-uploads");
+        opts.managed = Some(crate::managed::Managed {
+            root: owned,
+            resources: root.join("leases"),
+            revocation: root.join("revoked"),
+        });
+        let lbox = LocalBox::open(opts).unwrap();
+        let reply = lbox
+            .handle_cmd(
+                "outside",
+                Op::Upload {
+                    scope: "owner".into(),
+                    thread: "thread".into(),
+                    root: root.clone(),
+                    registered_repository: false,
+                    request: twr_core::upload::Request {
+                        id: twr_core::event::new_id(),
+                        sha256: "a".repeat(64),
+                        action: twr_core::upload::Action::Begin {
+                            name: "x".into(),
+                            size: 1,
+                        },
+                    },
+                },
+            )
+            .await;
+        assert_eq!(reply.error.unwrap().code, cmd_errors::UPLOAD_REJECTED);
+        assert!(!root.join(".twr-uploads").exists());
+    }
+    #[tokio::test]
+    async fn uploads_and_ordinary_operations_have_independent_execution_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let lbox = LocalBox::open(LocalBoxOptions::new(directory.path(), "upload-lanes")).unwrap();
+        let uploads = (0..MAX_CONCURRENT_UPLOADS)
+            .map(|_| lbox.inner.upload_permits.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(1),
+            lbox.handle_cmd(
+                "ordinary",
+                Op::WorktreeExists {
+                    path: directory.path().join("missing"),
+                },
+            ),
+        )
+        .await
+        .expect("ordinary operation blocked behind uploads");
+        assert!(reply.ok);
+        drop(uploads);
+        let ordinary = (0..MAX_CONCURRENT_OPS)
+            .map(|_| lbox.inner.op_permits.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let request = Op::Upload {
+            scope: "owner".into(),
+            thread: "thread".into(),
+            root: directory.path().into(),
+            registered_repository: false,
+            request: twr_core::upload::Request {
+                id: "missing".into(),
+                sha256: "a".repeat(64),
+                action: twr_core::upload::Action::Status,
+            },
+        };
+        tokio::time::timeout(Duration::from_secs(1), lbox.handle_cmd("upload", request))
+            .await
+            .expect("upload operation blocked behind ordinary operations");
+        drop(ordinary);
+    }
 }

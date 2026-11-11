@@ -29,6 +29,10 @@ type Committed = (String, u64, String);
 struct HubState {
     epoch: u64,
     watermarks: BTreeMap<String, u64>,
+    /// The box generation the welcome names (none: a hub from before generations), and its
+    /// `forgotten` flag.
+    generation: Option<String>,
+    forgotten: bool,
     hellos: Vec<Hello>,
     /// The inventories of the connections that authenticated.
     inventories: Vec<Inventory>,
@@ -155,6 +159,8 @@ impl FakeHub {
                 HubMsg::Welcome {
                     epoch: s.epoch,
                     watermarks: s.watermarks.clone(),
+                    generation: s.generation.clone(),
+                    forgotten: s.forgotten,
                 },
                 s.drop_after.take(),
             )
@@ -470,6 +476,8 @@ async fn a_peer_that_cannot_prove_the_token_gets_nothing_but_the_hello() {
                                 HubMsg::Welcome {
                                     epoch: 1,
                                     watermarks: BTreeMap::new(),
+                                    generation: None,
+                                    forgotten: false,
                                 },
                                 HubMsg::Cmd {
                                     cmd_id: "c-evil".into(),
@@ -609,6 +617,49 @@ async fn acks_delete_spooled_frames() {
     assert_eq!(lbox.spool().bytes(), 0);
     hub.state().manual_acks = false;
     run.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_repeated_spawn_on_a_full_managed_box_is_already_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let worktree = root.join("worktrees/test");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let resources = root.join("leases");
+    std::fs::create_dir(&resources).unwrap();
+    std::fs::write(resources.join("slots.json"), b"1").unwrap();
+    let mut options = with_fake(LocalBoxOptions::new(&root, BOX));
+    options.managed = Some(twr_runner::managed::Managed {
+        root: root.clone(),
+        resources,
+        revocation: root.join("revoked"),
+    });
+    let lbox = LocalBox::open(options).unwrap();
+    let spawn = |thread: &str| Op::Spawn {
+        thread: thread.into(),
+        runtime: "fake".into(),
+        cfg: WireSpawnConfig {
+            cwd: worktree.clone(),
+            ..Default::default()
+        },
+        prompt: None,
+        run: Some(twr_core::event::new_id()),
+    };
+    lbox.execute(spawn("resident")).await.unwrap();
+    assert_eq!(
+        lbox.execute(spawn("resident")).await.unwrap_err().code,
+        cmd_errors::ALREADY_RUNNING
+    );
+    assert_eq!(
+        lbox.execute(spawn("waiting")).await.unwrap_err().code,
+        cmd_errors::BOX_FULL
+    );
+    lbox.execute(Op::Stop {
+        thread: "resident".into(),
+        run: None,
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -784,6 +835,182 @@ async fn a_restarted_runner_replays_its_spool_and_continues_rseq() {
         lbox.spool().next_rseq("t1").unwrap(),
         hub.committed("t1").len() as u64 + 1
     );
+}
+
+/// The box generation of the welcome. A hub from before it sends none: the runner keeps its
+/// spool and takes nothing (its inventory says its spool took no generation). A hub's first
+/// generation is taken with the spool kept. A welcome of another generation (the hub forgot
+/// the box: it was removed, then added again) makes the runner forget the frames it still had
+/// and number the thread's frames from 1 again, so the hub, which has no watermark left, gets
+/// no gap and none of the old frames.
+#[tokio::test]
+async fn a_new_box_generation_forgets_the_spool_and_numbers_from_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let lbox = open_box(dir.path());
+    let r = lbox.handle_cmd("c1", spawn_op("t1", "one two three")).await;
+    assert!(r.ok, "{r:?}");
+    let ended = |lbox: &LocalBox, n: usize| {
+        spooled(lbox, "t1")
+            .iter()
+            .filter(|f| f.1 == "turn.ended")
+            .count()
+            == n
+    };
+    wait_for("the turn spooled", || ended(&lbox, 1)).await;
+    let t1 = spooled(&lbox, "t1");
+
+    // A hub of no generation: as before.
+    let hub = FakeHub::start().await;
+    {
+        let mut s = hub.state();
+        s.watermarks.insert("t1".into(), 2);
+        s.manual_acks = true;
+    }
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("replay", |s| s.synced == 1).await;
+    assert_eq!(
+        hub.state().inventories[0].spool,
+        Some(twr_core::runner::SpoolStamp { generation: None })
+    );
+    assert_eq!(hub.committed("t1"), t1[2..].to_vec());
+    assert_eq!(lbox.spool().generation().unwrap(), None);
+    run.crash().await;
+
+    // A second turn while disconnected, then a hub's first generation: taken, nothing
+    // forgotten (the new frames replay above the watermark).
+    let r = lbox
+        .handle_cmd(
+            "c2",
+            Op::Send {
+                thread: "t1".into(),
+                turn: 2,
+                text: "four five".into(),
+                run: None,
+            },
+        )
+        .await;
+    assert!(r.ok, "{r:?}");
+    wait_for("the second turn spooled", || ended(&lbox, 2)).await;
+    hub.state().generation = Some("0123456789abcdef0123456789abcdef".into());
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("replay", |s| s.synced == 2).await;
+    let before = hub.committed("t1");
+    assert_contiguous(&before, 3);
+    assert_eq!(
+        before.iter().filter(|f| f.1 == "turn.ended").count(),
+        2,
+        "{before:?}"
+    );
+    assert_eq!(
+        lbox.spool().generation().unwrap().as_deref(),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+    assert!(lbox.spool().len().unwrap() > 0, "nothing acked");
+    run.crash().await;
+
+    // The hub forgot the box: a new generation, no watermarks. The frames still spooled are
+    // never sent, and the thread's next frames start at 1.
+    {
+        let mut s = hub.state();
+        s.generation = Some("fedcba9876543210fedcba9876543210".into());
+        s.forgotten = true;
+        s.watermarks.clear();
+        s.committed.clear();
+        s.received.clear();
+        s.manual_acks = false;
+    }
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("synced", |s| s.synced == 3).await;
+    {
+        let s = hub.state();
+        assert_eq!(
+            s.inventories[2]
+                .spool
+                .as_ref()
+                .unwrap()
+                .generation
+                .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            s.inventories[2].acks_needed.get("t1"),
+            Some(&(before.len() as u64 + 2))
+        );
+        assert!(s.received.is_empty(), "{:?}", s.received);
+    }
+    assert!(lbox.spool().is_empty().unwrap());
+    assert_eq!(lbox.spool().next_rseq("t1").unwrap(), 1);
+    // The session still runs: its next frames (a stop's exit, then a new session's) are
+    // numbered from 1, with no gap the hub would close the connection on.
+    hub.cmd(
+        "c3",
+        Op::Stop {
+            thread: "t1".into(),
+            run: None,
+        },
+    );
+    hub.wait("the exit", |s| s.committed.iter().any(|c| c.2 == "exited"))
+        .await;
+    hub.cmd("c4", spawn_op("t1", "six"));
+    hub.wait("the new turn", |s| {
+        s.committed.iter().any(|c| c.2 == "turn.ended")
+    })
+    .await;
+    let frames = hub.committed("t1");
+    assert_contiguous(&frames, 1);
+    assert_eq!(frames[0].1, "exited");
+    assert_eq!(hub.state().connections, 3, "no connection closed on a gap");
+    run.shutdown().await;
+    // Taken for good: numbering goes on, nothing more forgotten.
+    assert_eq!(
+        lbox.spool().generation().unwrap().as_deref(),
+        Some("fedcba9876543210fedcba9876543210")
+    );
+    assert_eq!(
+        lbox.spool().next_rseq("t1").unwrap(),
+        hub.committed("t1").len() as u64 + 1
+    );
+}
+
+/// A welcome that has the runner forget its spool may still carry watermarks (of its new
+/// generation: a runner with another spool took it and delivered frames before it said
+/// `synced`, so the box is still marked forgotten). They apply after the forgetting: the
+/// thread's next frame is numbered above them, not from 1, so the hub takes it instead of
+/// dropping it as a duplicate.
+#[tokio::test]
+async fn a_forgetting_welcome_still_numbers_above_its_watermarks() {
+    let dir = tempfile::tempdir().unwrap();
+    let lbox = open_box(dir.path());
+    let r = lbox.handle_cmd("c1", spawn_op("t1", "one two")).await;
+    assert!(r.ok, "{r:?}");
+    wait_for("the turn spooled", || {
+        spooled(&lbox, "t1").iter().any(|f| f.1 == "turn.ended")
+    })
+    .await;
+    let hub = FakeHub::start().await;
+    {
+        let mut s = hub.state();
+        s.generation = Some("0123456789abcdef0123456789abcdef".into());
+        s.forgotten = true;
+        s.watermarks.insert("t1".into(), 50);
+    }
+    let run = start(opts(&hub, dir.path()), lbox.clone());
+    hub.wait("synced", |s| s.synced == 1).await;
+    let received = hub.state().received.clone();
+    assert!(received.is_empty(), "{received:?}");
+    assert!(lbox.spool().is_empty().unwrap());
+    assert_eq!(lbox.spool().next_rseq("t1").unwrap(), 51);
+    hub.cmd(
+        "c2",
+        Op::Stop {
+            thread: "t1".into(),
+            run: None,
+        },
+    );
+    hub.wait("the exit", |s| s.committed.iter().any(|c| c.2 == "exited"))
+        .await;
+    assert_eq!(hub.committed("t1"), [(51, "exited".to_string())]);
+    run.shutdown().await;
 }
 
 /// A test's box asks no login shell and probes no agent CLI, though a runner's own box
@@ -1577,6 +1804,11 @@ fn child_runner(dir: &Path, runtime: &str, thread: &str) -> (std::process::Child
 
 #[tokio::test]
 async fn a_runner_killed_while_its_runtime_initializes_leaves_nothing_behind() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_runner_killed_while_its_runtime_initializes_leaves_nothing_behind",
+    ) {
+        return;
+    }
     let _one = RECOVERY.lock().await;
     let dir = tempfile::tempdir().unwrap();
     // Recovery finds the runtime by its thread marker alone, machine-wide: a thread id no
@@ -1612,6 +1844,11 @@ async fn a_runner_killed_while_its_runtime_initializes_leaves_nothing_behind() {
 
 #[tokio::test]
 async fn a_stop_for_another_run_leaves_the_session_alone() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_stop_for_another_run_leaves_the_session_alone",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let lbox = sleeper_box(dir.path());
     let spawn = |id: &str| {
@@ -1672,6 +1909,9 @@ async fn a_stop_for_another_run_leaves_the_session_alone() {
 
 #[tokio::test]
 async fn a_killed_runner_leaves_no_runtime_behind() {
+    if twr_runner::reap::skip_if_test_environs_hidden("a_killed_runner_leaves_no_runtime_behind") {
+        return;
+    }
     let _one = RECOVERY.lock().await;
     let dir = tempfile::tempdir().unwrap();
     // A real runner process (this test binary, running only `runner_child_process`).
@@ -1837,6 +2077,11 @@ fn record_runtime(
 /// its exit recorded.
 #[tokio::test]
 async fn a_recorded_runtime_without_a_start_time_is_not_taken_for_gone() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "a_recorded_runtime_without_a_start_time_is_not_taken_for_gone",
+    ) {
+        return;
+    }
     // A thread id of this test run only (recovery finds marked processes machine-wide).
     let t = format!("t-nostart-{}", twr_core::event::new_id());
     let _one = RECOVERY.lock().await;
@@ -1882,7 +2127,8 @@ fn nondumpable_child_process() {
     // SAFETY: prctl(PR_SET_DUMPABLE, 0) only changes this process's dumpable flag.
     assert_eq!(unsafe { prctl(PR_SET_DUMPABLE, 0u64, 0u64, 0u64, 0u64) }, 0);
     let dir = std::path::PathBuf::from(dir);
-    std::fs::write(dir.join("ready"), std::process::id().to_string()).unwrap();
+    std::fs::write(dir.join("ready.tmp"), std::process::id().to_string()).unwrap();
+    std::fs::rename(dir.join("ready.tmp"), dir.join("ready")).unwrap();
     std::thread::sleep(Duration::from_secs(300));
 }
 
@@ -2202,6 +2448,11 @@ async fn wait_overflowed(stops: &std::sync::atomic::AtomicUsize) {
 /// A runner that dies in between still has the next one kill it (its row stays).
 #[tokio::test]
 async fn an_overflowed_runtime_stays_live_until_it_really_exits() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "an_overflowed_runtime_stays_live_until_it_really_exits",
+    ) {
+        return;
+    }
     use twr_core::runner::{decode_result, WireRemoveOutcome};
     let dir = tempfile::tempdir().unwrap();
     let release = Arc::new(tokio::sync::Notify::new());
@@ -2621,6 +2872,11 @@ impl twr_core::adapter::Adapter for Mute {
 /// (found by its thread and run markers).
 #[tokio::test]
 async fn shutdown_records_an_exit_only_once_the_runtime_is_gone() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "shutdown_records_an_exit_only_once_the_runtime_is_gone",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let (lbox, pid) = mute_box(dir.path(), false).await;
     // Past execve: its marker is visible.
@@ -2683,6 +2939,11 @@ async fn mute_box(dir: &Path, vanish: bool) -> (LocalBox, u32) {
 /// the exit.
 #[tokio::test]
 async fn an_adapter_that_vanishes_has_its_process_killed_before_the_exit_is_recorded() {
+    if twr_runner::reap::skip_if_test_environs_hidden(
+        "an_adapter_that_vanishes_has_its_process_killed_before_the_exit_is_recorded",
+    ) {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let (lbox, pid) = mute_box(dir.path(), true).await;
     wait_for("the exit", || {
@@ -2885,4 +3146,247 @@ async fn non_session_ops_are_bounded() {
     let max = *counts.iter().max().unwrap();
     assert!(max <= twr_runner::lbox::MAX_CONCURRENT_OPS, "{counts:?}");
     assert!(max >= 2, "ops should still run concurrently: {counts:?}");
+}
+
+/// Attachments use the mutually authenticated runner connection, retain their staged offset
+/// across a connection interruption, and become visible only after checksum verification.
+#[tokio::test]
+async fn remote_attachments_resume_and_commit_over_authenticated_runner_protocol() {
+    use sha2::{Digest, Sha256};
+    use twr_core::upload::{Action, Request};
+    let dir = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let hub = FakeHub::start().await;
+    let lbox = open_box(&dir.path().join("runner"));
+    let runner = start(opts(&hub, dir.path()), lbox);
+    hub.wait("authenticated and synced", |s| s.synced == 1)
+        .await;
+    let root = dir.path().join("remote-thread");
+    std::fs::create_dir(&root).unwrap();
+    let checksum = Sha256::digest(b"hello")
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let upload = |action| Op::Upload {
+        scope: "device:phone".into(),
+        thread: "t1".into(),
+        root: root.clone(),
+        registered_repository: false,
+        request: Request {
+            id: "remote-file".into(),
+            sha256: checksum.clone(),
+            action,
+        },
+    };
+    hub.cmd(
+        "upload-begin",
+        upload(Action::Begin {
+            name: "hello.txt".into(),
+            size: 5,
+        }),
+    );
+    hub.wait("upload begin", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-begin")
+    })
+    .await;
+    assert!(
+        hub.state()
+            .results
+            .iter()
+            .find(|r| r.cmd_id == "upload-begin")
+            .unwrap()
+            .ok
+    );
+    hub.cmd(
+        "upload-first",
+        upload(Action::Chunk {
+            offset: 0,
+            data: twr_core::b64::encode(b"he"),
+        }),
+    );
+    hub.wait("first chunk", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-first")
+    })
+    .await;
+    *hub.conn.lock().unwrap() = None;
+    hub.wait("reconnected upload session", |s| s.synced == 2)
+        .await;
+    hub.cmd("upload-status", upload(Action::Status));
+    hub.wait("resume status", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-status")
+    })
+    .await;
+    let status = hub
+        .state()
+        .results
+        .iter()
+        .find(|r| r.cmd_id == "upload-status")
+        .unwrap()
+        .clone()
+        .into_outcome()
+        .unwrap();
+    assert_eq!(status["received"], 2);
+    assert_eq!(
+        status["prefix_sha256"],
+        Sha256::digest(b"he")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    assert!(status["path"].is_null());
+    hub.cmd(
+        "upload-last",
+        upload(Action::Chunk {
+            offset: 2,
+            data: twr_core::b64::encode(b"llo"),
+        }),
+    );
+    hub.wait("last chunk", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-last")
+    })
+    .await;
+    hub.cmd("upload-commit", upload(Action::Commit));
+    hub.wait("atomic commit", |s| {
+        s.results.iter().any(|r| r.cmd_id == "upload-commit")
+    })
+    .await;
+    let result = hub
+        .state()
+        .results
+        .iter()
+        .find(|r| r.cmd_id == "upload-commit")
+        .unwrap()
+        .clone()
+        .into_outcome()
+        .unwrap();
+    let path = Path::new(result["path"].as_str().unwrap());
+    assert!(path.starts_with(root.join(".twr-uploads")));
+    assert_eq!(std::fs::read(path).unwrap(), b"hello");
+    runner.shutdown().await;
+}
+
+#[tokio::test]
+async fn explicit_worktree_removal_discards_thread_attachments_by_default() {
+    use twr_core::upload::{Action, Request};
+    let directory =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let lbox = open_box(&directory.path().join("runner"));
+    let repo = twr_core::testkit::git::init_repo(&directory.path().join("repo"));
+    let root = lbox.worktrees().join("repo/t1");
+    lbox.execute(Op::WorktreeCreate {
+        repo: repo.clone(),
+        path: root.clone(),
+        branch: "twr/t1".into(),
+        base: None,
+    })
+    .await
+    .unwrap();
+    let upload = |action| Op::Upload {
+        scope: "uid:owner".into(),
+        thread: "t1".into(),
+        root: root.clone(),
+        registered_repository: false,
+        request: Request {
+            id: "cleanup".into(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            action,
+        },
+    };
+    lbox.execute(upload(Action::Begin {
+        name: "file.txt".into(),
+        size: 0,
+    }))
+    .await
+    .unwrap();
+    let result = lbox.execute(upload(Action::Commit)).await.unwrap();
+    assert!(Path::new(result["path"].as_str().unwrap()).exists());
+    let removed = lbox
+        .execute(Op::WorktreeRemove {
+            repo,
+            path: root.clone(),
+            branch: Some("twr/t1".into()),
+            disposable: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(removed["outcome"], "removed");
+    assert!(!root.exists());
+}
+
+#[tokio::test]
+async fn uploading_25_mib_preserves_ordinary_command_receipts_and_replays_chunks() {
+    use sha2::{Digest, Sha256};
+    use twr_core::upload::{Action, Request, MAX_CHUNK};
+    let directory =
+        tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let lbox = open_box(&directory.path().join("runner"));
+    let root = directory.path().join("thread");
+    std::fs::create_dir(&root).unwrap();
+    assert!(
+        lbox.handle_cmd(
+            "ordinary-receipt",
+            Op::WorktreeExists {
+                path: directory.path().join("missing")
+            }
+        )
+        .await
+        .ok
+    );
+    let initial = lbox.spool().cmd_results_len().unwrap();
+    let bytes = vec![42u8; MAX_CHUNK];
+    let mut hash = Sha256::new();
+    for _ in 0..400 {
+        hash.update(&bytes);
+    }
+    let checksum = hash
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let upload = |action| Op::Upload {
+        scope: "owner".into(),
+        thread: "thread".into(),
+        root: root.clone(),
+        registered_repository: false,
+        request: Request {
+            id: "large".into(),
+            sha256: checksum.clone(),
+            action,
+        },
+    };
+    assert!(
+        lbox.handle_cmd(
+            "upload-begin",
+            upload(Action::Begin {
+                name: "file.bin".into(),
+                size: 400 * MAX_CHUNK
+            })
+        )
+        .await
+        .ok
+    );
+    let data = twr_core::b64::encode(&bytes);
+    for index in 0..400 {
+        let id = format!("chunk-{index}");
+        let request = upload(Action::Chunk {
+            offset: index * MAX_CHUNK,
+            data: data.clone(),
+        });
+        assert!(lbox.handle_cmd(&id, request.clone()).await.ok);
+        if index == 0 {
+            assert!(lbox.handle_cmd(&id, request).await.ok);
+        }
+    }
+    let status = lbox
+        .handle_cmd("status", upload(Action::Status))
+        .await
+        .into_outcome()
+        .unwrap();
+    assert_eq!(status["received"], 400 * MAX_CHUNK);
+    assert!(lbox.handle_cmd("commit", upload(Action::Commit)).await.ok);
+    assert_eq!(lbox.spool().cmd_results_len().unwrap(), initial);
+    assert!(lbox
+        .spool()
+        .cmd_result("ordinary-receipt")
+        .unwrap()
+        .is_some());
 }

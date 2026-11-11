@@ -6,6 +6,8 @@ mod accounts;
 mod boxes;
 mod dial_in;
 mod pretty;
+mod runner_link;
+mod runner_update;
 mod speech;
 #[cfg(test)]
 mod test_support;
@@ -91,6 +93,10 @@ const RELEASE_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long one probe waits for `hub.info`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long `twr ws list --detail` waits for each hub: as long as the desktop app gave each
+/// workspace's own read-only connection before it read them all through this listing.
+const DETAIL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Page size for non-following `events` / `control`.
 const PAGE: u64 = 1000;
 
@@ -126,11 +132,16 @@ enum Cmd {
     /// directory this `twr` is in. Nothing runs unless both signatures verify and the checksums
     /// name the release asked for and list the installer. A running hub keeps its version
     /// until you restart it (`twr hub stop`, then `twr`). A `twr` installed by cargo is not
-    /// touched: update it with cargo.
+    /// touched: update it with cargo. A release older than this `twr` is refused, and the
+    /// same one says it is up to date.
     Update {
         /// The release to install, e.g. v0.2.0 (default: the latest).
         #[arg(long, value_name = "VERSION")]
         version: Option<String>,
+        /// Install the `--version` asked for even when it is older than this `twr`. An older
+        /// twr may refuse the database this one wrote.
+        #[arg(long, requires = "version")]
+        allow_downgrade: bool,
     },
     /// Show what the running hub reports about itself (`hub.info`): version, boxes,
     /// orchestrator, and warnings about the config it started with (a short box token, a
@@ -265,6 +276,10 @@ enum Cmd {
         /// Also list error, review and stalled items.
         #[arg(long)]
         all: bool,
+        /// Print the listed items as JSON, each as `attention.list` returns it plus `target`,
+        /// the `<attn_id>@<revision>` that `twr respond` and `twr attention dismiss` take.
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
         cmd: Option<AttentionCmd>,
     },
@@ -281,7 +296,7 @@ enum Cmd {
     },
     /// Show or set a thread's runtime, model and reasoning effort. With only the thread, shows
     /// them. The model is the runtime's own id or alias (Claude Code: `fable`, `opus`,
-    /// `sonnet`, or a full id such as `claude-fable-5-1`); `default` returns the model or the
+    /// `sonnet`, or a full id such as `claude-fable-5-2`); `default` returns the model or the
     /// effort to the runtime's default (once the thread has a session, only where a resumed
     /// session takes it: Claude Code's effort; the hub refuses the rest, except with
     /// `--runtime`). A running runtime finishes its turn first, then restarts on the same
@@ -443,6 +458,21 @@ enum Cmd {
         /// and the commands to install it; installs nothing.
         #[arg(long)]
         print_service: bool,
+        /// For a program that drives the speaker (the desktop app's voice mode): controls on
+        /// stdin, one per line (`pause`, `resume`, `stop`, `skip`, `quit`), and what it plays
+        /// on stdout, one JSON object per line. Its notes stay on stderr.
+        #[arg(long, value_name = "MODE", value_parser = ["stdio"], conflicts_with = "print_service")]
+        control: Option<String>,
+        /// Also say when something needs you ("api needs your permission"), as `"attention"`
+        /// in `[speech] read` does.
+        #[arg(long)]
+        announce: bool,
+    },
+    /// Speech to text for talking to the orchestrator (docs/voice.md): what the desktop app
+    /// runs on the machine with the microphone, with `[voice]` of this machine's config.
+    Voice {
+        #[command(subcommand)]
+        cmd: VoiceCmd,
     },
     /// `mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak
     /// --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's
@@ -515,6 +545,14 @@ enum Cmd {
         #[arg(long)]
         print: bool,
     },
+    /// Print the shell completion script for twr's commands and options to stdout, e.g.
+    /// `twr completions zsh > ~/.zfunc/_twr` (docs/install.md says where each shell reads
+    /// it). Needs no hub.
+    Completions {
+        /// The shell.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// List, create or remove workspaces: separate hubs on this machine, each with its own
     /// orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name>
     /// <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual
@@ -549,6 +587,12 @@ enum Cmd {
     /// `[boxes.<name>] token`.
     #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Runner {
+        #[arg(long, hide = true, requires = "daemon")]
+        managed_root: Option<PathBuf>,
+        #[arg(long, hide = true, requires = "managed_root")]
+        resource_root: Option<PathBuf>,
+        #[arg(long, hide = true, requires = "managed_root")]
+        revocation_file: Option<PathBuf>,
         #[command(subcommand)]
         cmd: Option<RunnerCmd>,
         /// Hub URL: `wss://host:port`, or `ws://` to a loopback host (`localhost`, an address
@@ -831,7 +875,66 @@ enum Cmd {
 }
 
 #[derive(Debug, Subcommand)]
+enum VoiceCmd {
+    /// Whether a recognizer is set up (`[voice]`), and how to set one up if not.
+    Status {
+        /// One JSON object: `{available, engine, local, problem, setup}`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download whisper.cpp's base.en model (148 MB) to `voice/ggml-base.en.bin` in twr's data
+    /// directory, the model `[voice] model` left empty means.
+    Setup,
+    /// The text of one recording: a 16 kHz mono 16-bit WAV on stdin (at most two minutes),
+    /// its text on stdout (empty when nothing was said).
+    Transcribe {
+        /// One JSON object, `{"text": ...}`, rather than the text alone.
+        #[arg(long)]
+        json: bool,
+        /// Words to expect (thread names), space- or comma-separated: plain words of
+        /// `[A-Za-z0-9._-]` only, the rest left out.
+        #[arg(long = "expect", value_name = "WORDS")]
+        hint: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RunnerCmd {
+    /// Reclaim unused compiled worker, source and hub build caches; retains work and trust.
+    Prune,
+    /// Limit resident runtimes across all linked hubs (1–64). Active work is never preempted.
+    Capacity { slots: u32 },
+    /// Allow macOS to sleep even while linked worker runtimes exist.
+    AllowSleep,
+    /// Keep macOS awake while linked worker runtimes exist (default).
+    KeepAwake,
+    #[command(hide = true)]
+    FetchService {
+        #[arg(long)]
+        slot: PathBuf,
+    },
+    /// Run the independent service and show a one-time code to pair from another hub.
+    Up,
+    /// Show this machine's runner service and saved links.
+    Status,
+    /// Stop the machine service. Worker data is retained.
+    Stop,
+    /// Enable or disable automatic runner service startup.
+    Enable {
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Revoke a paired hub's full machine public key.
+    Revoke { machine: String },
+    /// Cancel the current one-time pairing code.
+    CancelPairing,
+    #[command(hide = true)]
+    Service {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        socket: PathBuf,
+    },
     /// Print a new random token (32 bytes from the OS, hex): put it in the hub's
     /// `[boxes.<name>] token` and in the runner's `--token-file` (`chmod 600`).
     Token,
@@ -892,6 +995,11 @@ enum WsCmd {
         /// Print JSON.
         #[arg(long)]
         json: bool,
+        /// With --json: also print what each running hub listed, its `thread.list` and
+        /// `attention.list` (`detail`), when it recognizes this process as your user, or why
+        /// not (`detail_error`). Waits up to 3 s per hub instead of 1 s.
+        #[arg(long, requires = "json")]
+        detail: bool,
     },
     /// Create a workspace (1-32 of [a-z0-9-], starting and ending with a letter or digit).
     /// Its hub starts on first use: `twr -w <name>`.
@@ -899,13 +1007,17 @@ enum WsCmd {
         /// The workspace's name.
         name: String,
     },
-    /// Remove a workspace's data: its log, orchestrator conversation and history. Refused
-    /// while its hub runs, while it has threads (delete them first) or while its trash holds
-    /// deleted threads (`twr -w <name> trash empty --all`). Branches stay in their
+    /// Remove a workspace's data for good: its log, orchestrator conversation and memory, and
+    /// history. Refused while its hub runs, while it has threads (delete them first) or while
+    /// its trash holds deleted threads (`twr -w <name> trash empty --all`). Lists what goes and
+    /// asks y/N on a terminal (without one, only with --yes). Branches stay in their
     /// repositories.
     Rm {
         /// The workspace's name.
         name: String,
+        /// Remove without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -970,6 +1082,9 @@ enum SpeechCmd {
         /// The line protocol (the default); for `twr speak --ssh`.
         #[arg(long, conflicts_with = "text")]
         proto: bool,
+        /// With `--text`, also a line when something needs you ("api needs your permission").
+        #[arg(long, requires = "text")]
+        attention: bool,
         /// Every workspace of this machine, not only the current one (`-w`).
         #[arg(long)]
         all_workspaces: bool,
@@ -1167,6 +1282,8 @@ enum MemoryCmd {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum ThreadCmd {
+    /// Pull committed runner results into a separate ref, preserving your checkout.
+    Pull { thread: String },
     /// Create a thread on a project (a configured project name or a directory).
     New {
         /// Project name from the config, or a path.
@@ -1224,6 +1341,9 @@ enum ThreadCmd {
         /// Also list parked threads.
         #[arg(long, short)]
         all: bool,
+        /// Print the listed threads as JSON, each as `thread.list` returns it.
+        #[arg(long)]
+        json: bool,
     },
     /// Show what a thread has in flight now, as the hub reads it (`work` of `thread.get`): its
     /// reading (working, waiting on its background work, on a tool call, nothing in flight,
@@ -1240,6 +1360,37 @@ enum ThreadCmd {
 }
 
 fn main() -> ExitCode {
+    // Before anything starts: a twr run from the desktop app's terminal (Electron starts its
+    // shells itself) would keep the app's crash handler, and pass it to the hub, runner
+    // service or box daemon it starts (macOS; nothing elsewhere).
+    twr_adapters::process::forget_inherited_crash_handler();
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--link-service-version"))
+    {
+        println!(
+            "{}",
+            serde_json::json!({"protocol":1,"state_schema":1,"worker_protocol":twr_core::runner::PROTOCOL_VERSION,"worker_features":twr_link::worker::REQUIRED_FEATURES})
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--export-worker-source"))
+    {
+        use std::io::Write;
+        let manifest = include_bytes!(concat!(env!("OUT_DIR"), "/worker-source.json"));
+        let bundle = include_bytes!(concat!(env!("OUT_DIR"), "/worker-source.bundle"));
+        let mut out = std::io::stdout().lock();
+        return if out
+            .write_all(&(manifest.len() as u32).to_be_bytes())
+            .and_then(|_| out.write_all(manifest))
+            .and_then(|_| out.write_all(bundle))
+            .is_ok()
+        {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
     // A job's start gate (`twr_hub::job_gate`), as the hub runs it: before anything else, so
     // nothing of twr's (arguments, logging, a runtime) touches the job's process.
     if std::env::args_os().nth(1).as_deref() == Some(twr_hub::job_gate::GATE_ARG.as_ref()) {
@@ -1383,8 +1534,18 @@ fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
 
 /// Refuses `--socket` and `--workspace` with `twr runner`: a runner never uses the hub's
 /// socket (it connects to `--hub`) and serves whichever hub that is, so the flags would be
-/// silently ignored.
+/// silently ignored. Not for the hidden `twr runner service`, whose own `--socket` (where the
+/// runner service listens) has the global flag's name, so clap fills both from it.
 fn refuse_runner_socket(cli: &Cli) -> anyhow::Result<()> {
+    if matches!(
+        cli.cmd,
+        Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::Service { .. }),
+            ..
+        })
+    ) {
+        return Ok(());
+    }
     if matches!(cli.cmd, Some(Cmd::Runner { .. })) {
         if cli.socket.is_some() {
             bail!("--socket does not apply to `twr runner`: it connects to the hub at --hub");
@@ -1496,9 +1657,40 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // From the command definition alone: no twr home, config or hub.
+    if let Some(Cmd::Completions { shell }) = &cli.cmd {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        clap_complete::generate(*shell, &mut command, "twr", &mut std::io::stdout());
+        return Ok(ExitCode::SUCCESS);
+    }
     // An SSH box's relay and daemon need no twr home: every path comes from the box's
     // environment (the relay) or the relay (the daemon).
     let cli = match cli.cmd {
+        Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::FetchService { slot }),
+            ..
+        }) => {
+            runner_update::fetch(&slot).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::Service { root, socket }),
+            ..
+        }) => {
+            let log = twr_core::paths::open_private_append(&root.join("machine/service.log"))?;
+            let _ = tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(log))
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .try_init();
+            twr_link::service::run(
+                root,
+                socket,
+                std::sync::Arc::new(|pid| twr_hub::local_agent(pid).is_none()),
+            )
+            .await?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Some(Cmd::Runner {
             cmd: None,
             agents: true,
@@ -1608,6 +1800,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(Cmd::Runner {
             cmd: None,
             daemon: true,
+            managed_root,
+            resource_root,
+            revocation_file,
             box_name: Some(box_name),
             hub_key: Some(hub_key),
             daemon_socket: Some(socket),
@@ -1617,7 +1812,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             ..
         }) => {
             let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
-            let opts = twr_runner::RunnerOptions::for_daemon(
+            let mut opts = twr_runner::RunnerOptions::for_daemon(
                 box_name,
                 data_dir,
                 twr_runner::DaemonOptions {
@@ -1628,6 +1823,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     launch: Some(twr_runner::daemon::own_launch()),
                 },
             );
+            if let Some(root) = managed_root {
+                opts.managed = Some(twr_runner::managed::Managed {
+                    root,
+                    resources: resource_root.context("managed worker needs resource root")?,
+                    revocation: revocation_file.context("managed worker needs revocation fence")?,
+                });
+            }
             run_box_daemon(opts, &log).await?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -1660,6 +1862,39 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
     });
     let cli = match cli.cmd {
+        Some(Cmd::Runner {
+            cmd:
+                Some(
+                    cmd @ (RunnerCmd::Up
+                    | RunnerCmd::Status
+                    | RunnerCmd::Stop
+                    | RunnerCmd::Enable { .. }
+                    | RunnerCmd::Revoke { .. }
+                    | RunnerCmd::CancelPairing
+                    | RunnerCmd::AllowSleep
+                    | RunnerCmd::Capacity { .. }
+                    | RunnerCmd::Prune
+                    | RunnerCmd::KeepAwake),
+                ),
+            ..
+        }) => {
+            use twr_link::service::Request;
+            let request = match cmd {
+                RunnerCmd::Up => Request::UseAsRunner,
+                RunnerCmd::Status => Request::Status,
+                RunnerCmd::Stop => Request::Stop,
+                RunnerCmd::Enable { disable } => Request::SetEnabled { enabled: !disable },
+                RunnerCmd::Revoke { machine } => Request::Revoke { machine },
+                RunnerCmd::CancelPairing => Request::CancelPairing { session: None },
+                RunnerCmd::Prune => Request::Prune { aggressive: true },
+                RunnerCmd::Capacity { slots } => Request::SetCapacity { slots },
+                RunnerCmd::AllowSleep => Request::SetAllowSleep { allow: true },
+                RunnerCmd::KeepAwake => Request::SetAllowSleep { allow: false },
+                _ => unreachable!(),
+            };
+            runner_link::control(&paths, request).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
         Some(Cmd::Runner {
             cmd: Some(RunnerCmd::Token),
             ..
@@ -1716,8 +1951,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         // Before the config is loaded: a config this twr cannot read must not stop an update
         // (the new one may read it).
-        Some(Cmd::Update { version }) => {
-            update(version, cli.socket, &paths).await?;
+        Some(Cmd::Update {
+            version,
+            allow_downgrade,
+        }) => {
+            update(version, allow_downgrade, cli.socket, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
         // About the terminal, not a hub: no config needed.
@@ -1766,6 +2004,8 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             voice,
             rate,
             print_service,
+            control,
+            announce,
         }) => {
             refuse_agent_action("start a speaker")?;
             if cli.socket.is_some() {
@@ -1781,10 +2021,19 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     voice,
                     rate,
                     print_service,
+                    control_stdio: control.is_some(),
+                    announce,
                 },
                 &paths,
             )
             .await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        // The machine's own `[voice]` (the root's), as a speaker's `[speech]`: no hub. It
+        // records nothing (the app with the microphone does) and sends nothing anywhere: it
+        // turns a recording it is given into text, which an agent may do as well as you.
+        Some(Cmd::Voice { cmd }) => {
+            voice(cmd, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
         Some(Cmd::Remote {
@@ -1890,11 +2139,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 SpeechCmd::Feed {
                     text,
                     proto: _,
+                    attention,
                     all_workspaces,
                 },
         } => {
             if text {
-                speech::text(speech::workspace_sockets(&paths, &[], all_workspaces)?).await?;
+                let sockets = speech::workspace_sockets(&paths, &[], all_workspaces)?;
+                speech::text(sockets, attention).await?;
             } else {
                 speech::proxy(&paths, all_workspaces, speech::proxy_idle()).await?;
             }
@@ -1922,8 +2173,10 @@ async fn run_simple(
         | Cmd::Boxes { .. }
         | Cmd::Speech { .. }
         | Cmd::Speak { .. }
+        | Cmd::Voice { .. }
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
+        | Cmd::Completions { .. }
         | Cmd::Account { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
@@ -1940,7 +2193,11 @@ async fn run_simple(
             let mut ask = ask_on_stderr;
             respond(&socket, &target, &answer, message, consent(yes, &mut ask)).await
         }
-        Cmd::Attention { all, cmd: None } => attention(&socket, all).await,
+        Cmd::Attention {
+            all,
+            json,
+            cmd: None,
+        } => attention(&socket, all, json).await,
         Cmd::Attention {
             cmd: Some(AttentionCmd::Dismiss { target }),
             ..
@@ -2005,8 +2262,18 @@ async fn run_simple(
             cmd: Some(HubCmd::Stop { all: true, .. }),
         } => unreachable!("bulk stop handled before selecting a workspace"),
         Cmd::Thread {
-            cmd: ThreadCmd::List { all },
-        } => thread_list(&socket, all).await,
+            cmd: ThreadCmd::Pull { thread },
+        } => {
+            let result = connect(&socket)
+                .await?
+                .call("thread.pull", json!({"thread":thread}))
+                .await?;
+            outln!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        Cmd::Thread {
+            cmd: ThreadCmd::List { all, json },
+        } => thread_list(&socket, all, json).await,
         Cmd::Thread {
             cmd: ThreadCmd::Show { thread, json },
         } => thread_show(&socket, &thread, json).await,
@@ -3039,8 +3306,9 @@ fn resume_outcome(thread: &str, r: &Value) -> String {
     out
 }
 
-/// `twr hub`: the hub of `paths` on `socket`, in the foreground. Its config is read again
-/// under boxes.toml's lock ([`read_config_locked`]), held until the socket is bound.
+/// `twr hub`: the hub of `paths` on `socket`, in the foreground. Its config, and the removal
+/// record next to boxes.toml, are read again under boxes.toml's lock ([`read_config_locked`]),
+/// held until the socket is bound.
 async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -3051,17 +3319,40 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         )
         .init();
     twr_core::paths::ensure_private_dir(&paths.data_dir)?;
+    let link_program = if test_token_trusted() {
+        None
+    } else {
+        match twr_link::bootstrap::snapshot_hub(&paths) {
+            Ok(program) => Some(program),
+            Err(e) => {
+                tracing::warn!("cannot retain this hub build for linked workers: {e:#}");
+                None
+            }
+        }
+    };
+    // A runner failure leaves the local hub available.
+    if let Some(program) = &link_program {
+        let service_paths = paths.clone();
+        let program = program.clone();
+        tokio::spawn(async move {
+            if let Err(e) = twr_link::bootstrap::ensure(&service_paths, &program).await {
+                tracing::warn!("runner service unavailable: {e:#}");
+            }
+        });
+    }
     // A named workspace's orchestrator works in a directory of its own (`Config::in_workspace`).
     if let Some(dir) = paths.orchestrator_dir() {
         twr_core::paths::ensure_private_dir(&dir)?;
     }
-    let (config, boxes_lock) = {
+    let (config, boxes_lock, removed_boxes) = {
         let paths = paths.clone();
         tokio::task::spawn_blocking(move || read_config_locked(&paths)).await??
     };
     twr_core::trace::mark("hub: config read");
     let mut opts = HubOptions::new(paths.db_file(), config);
+    opts.link_program = link_program;
     opts.boxes_lock = boxes_lock;
+    opts.removed_boxes = removed_boxes;
     opts.config_file = Some(paths.config_file.clone());
     opts.instance_name = paths.instance_name();
     opts.workspace = paths.workspace.clone();
@@ -3106,9 +3397,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
 /// they wait for a hub or for the user. A lock file that can't be opened (a read-only config
 /// directory) is logged and the hub starts without it: no twr command can edit boxes.toml
 /// there either, since each takes the lock first.
-fn read_config_locked(
-    paths: &Paths,
-) -> anyhow::Result<(Config, Option<twr_core::config::BoxesLock>)> {
+fn read_config_locked(paths: &Paths) -> anyhow::Result<LockedConfig> {
     let file = paths.boxes_file();
     let lock = BoxesFile::lock(&file)
         .inspect_err(|e| {
@@ -3117,9 +3406,23 @@ fn read_config_locked(
         })
         .ok();
     let config = Config::load_from(paths)?;
+    // A record that does not read names no removal: the hub forgets nothing, as for a box
+    // that merely is not in the config.
+    let removed = BoxesFile::removed(&file).unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "ignoring the removal record: no removed box is forgotten");
+        Default::default()
+    });
     hub_test_gate(HUB_START_GATE_ENV);
-    Ok((config, lock))
+    Ok((config, lock, removed))
 }
+
+/// What [`read_config_locked`] read: the config, the lock of `boxes.toml` (when it could be
+/// taken) and the boxes the removal record names ([`BoxesFile::removed`]).
+type LockedConfig = (
+    Config,
+    Option<twr_core::config::BoxesLock>,
+    std::collections::BTreeSet<String>,
+);
 
 /// `TWR_TEST_HUB_START_GATE=<file>`, for tests of a starting hub: right after it read its
 /// config ([`read_config_locked`]), the hub waits at the gate ([`hub_test_gate`]).
@@ -3660,6 +3963,7 @@ async fn hub_stop_all(root: &Paths, timeout: Duration) -> anyhow::Result<()> {
 /// how to restart it; it never restarts the hub itself (that stops every thread's runtime).
 async fn update(
     version: Option<String>,
+    allow_downgrade: bool,
     socket: Option<PathBuf>,
     paths: &Paths,
 ) -> anyhow::Result<()> {
@@ -3676,6 +3980,18 @@ async fn update(
     let (script, sums) = fetch_verified(&source, &key).await?;
     let tag = release_of(&source, &script, &sums)?;
     check_script(&source.script, &script)?;
+    let current = env!("CARGO_PKG_VERSION");
+    match update_plan(&tag, current, source.tag.is_some(), allow_downgrade)? {
+        UpdatePlan::UpToDate => {
+            outln!("twr {current} is up to date ({tag} is this release)");
+            return Ok(());
+        }
+        UpdatePlan::Downgrade => errln!(
+            "installing {tag}, older than this twr ({current}), as --allow-downgrade asks: an \
+             older twr may refuse the database this one wrote, as newer than itself"
+        ),
+        UpdatePlan::Install => {}
+    }
     let tmp = PrivateDir::create("twr-update")?;
     let script_file = tmp.write("install.sh", &script)?;
     let sums_file = tmp.write("sha256sums.txt", &sums)?;
@@ -3708,6 +4024,56 @@ async fn update(
     prewarm_installed(&dir.join("twr")).await;
     hub_version_note(&dir.join("twr"), socket, paths).await;
     Ok(())
+}
+
+/// What `twr update` does with the release it verified, from [`update_plan`].
+#[derive(Debug, PartialEq)]
+enum UpdatePlan {
+    /// It is newer than this twr: install it.
+    Install,
+    /// It is this twr's release: nothing to do.
+    UpToDate,
+    /// It is older, and `--version` with `--allow-downgrade` asked for it: install it, saying
+    /// what that risks.
+    Downgrade,
+}
+
+/// Whether `twr update` installs release `tag` over this twr (version `current`), in semantic
+/// versioning's order ([`runner_update::compare_versions`]: a prerelease comes before its
+/// release). The same release is up to date. An older one (the latest release, for a twr on a
+/// newer prerelease, since GitHub's latest leaves prereleases out; or what a mirror serves) is
+/// refused unless it was `asked` for by `--version` with `allow_downgrade`: an older twr may
+/// refuse the database this one wrote.
+fn update_plan(
+    tag: &str,
+    current: &str,
+    asked: bool,
+    allow_downgrade: bool,
+) -> anyhow::Result<UpdatePlan> {
+    use std::cmp::Ordering;
+    let Some(order) = runner_update::compare_versions(tag, current) else {
+        bail!("cannot compare release {tag} with this twr ({current}); nothing was run");
+    };
+    Ok(match order {
+        Ordering::Greater => UpdatePlan::Install,
+        Ordering::Equal => UpdatePlan::UpToDate,
+        Ordering::Less if asked && allow_downgrade => UpdatePlan::Downgrade,
+        Ordering::Less => {
+            let what = if asked {
+                format!("{tag} is older than this twr ({current})")
+            } else {
+                format!(
+                    "the release found, {tag}, is older than this twr ({current}) (GitHub's \
+                     latest release leaves out prereleases)"
+                )
+            };
+            bail!(
+                "{what}; nothing was run. An older twr may refuse the database this one wrote, \
+                 as newer than itself. To install it anyway, run `twr update --version {tag} \
+                 --allow-downgrade`"
+            )
+        }
+    })
 }
 
 /// Where `twr update` gets the release: `tag` (for install.sh's `TWR_VERSION`), the installer's
@@ -3799,11 +4165,30 @@ fn is_release_tag(tag: &str) -> bool {
         })
 }
 
+/// A builder for twr's own HTTPS clients (`twr update`, `twr voice` downloads): rustls with
+/// ring, trusting the Mozilla roots of `webpki-roots` and nothing from the system. reqwest
+/// 0.13's own rustls setup verifies with the platform's verifier (and defaults to aws-lc-rs),
+/// so the TLS configuration is built here. HTTP/1.1 only: twr-cli doesn't enable reqwest's `http2`.
+fn https_client() -> reqwest::ClientBuilder {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let mut tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("ring supports TLS 1.2 and 1.3")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    reqwest::Client::builder().tls_backend_preconfigured(tls)
+}
+
 /// The latest release's tag: `<releases>/latest` redirects to `<releases>/tag/<tag>` (no API
 /// token needed). The redirect is read, not followed.
 async fn latest_tag() -> anyhow::Result<String> {
     let url = format!("{GITHUB}{RELEASES_PATH}/latest");
-    let client = reqwest::Client::builder()
+    let client = https_client()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(RELEASE_FILE_TIMEOUT)
@@ -3989,12 +4374,20 @@ async fn fetch_release_archive(tag: &str, target: &str) -> anyhow::Result<(Vec<u
     let mirror = std::env::var(INSTALL_SCRIPT_URL_ENV)
         .ok()
         .filter(|u| !u.trim().is_empty());
+    fetch_release_archive_from(tag, target, &key, mirror).await
+}
+async fn fetch_release_archive_from(
+    tag: &str,
+    target: &str,
+    key: &[u8; 32],
+    mirror: Option<String>,
+) -> anyhow::Result<(Vec<u8>, String)> {
     let source = update_source(Some(tag), mirror).await?;
     let sums_url = format!("{}/sha256sums.txt", source.base);
     let sig_url = format!("{sums_url}.sig");
     let sums = fetch_release_file(&sums_url).await?;
     let signature = fetch_signature(&sig_url).await?;
-    check_signature(&key, &sums, &signature, &sums_url, &sig_url)?;
+    check_signature(key, &sums, &signature, &sums_url, &sig_url)?;
     sums_release(&source, &sums)?;
     let asset = format!("twr-{target}.tar.gz");
     let Some(want) = listed_sha256(&sums, &asset).map(str::to_ascii_lowercase) else {
@@ -4181,7 +4574,7 @@ async fn fetch_limited(url: &str, max: usize, timeout: Duration) -> anyhow::Resu
     if !url.starts_with("https://") {
         bail!("{url}: twr only downloads over https:// (or reads file:///)");
     }
-    let client = reqwest::Client::builder()
+    let client = https_client()
         .https_only(true)
         .timeout(timeout)
         .build()
@@ -4376,9 +4769,10 @@ async fn run_runner(
 /// `twr runner --daemon`: an SSH box's daemon ([`twr_runner::daemon`]), started by its relay
 /// with every path as an argument, its stdout and stderr `/dev/null`: it logs to `log`
 /// (appended, 0600, in its private data directory), its failure included, and runs until a
-/// `stop` request, SIGINT or SIGTERM. Those signals are listened for from the start: one that
-/// comes while it starts (its relay stopped meanwhile, say) stops it before it binds its socket
-/// ([`twr_runner::run`]).
+/// `stop` request, SIGINT or SIGTERM (a linked runner's worker also until its grant is revoked
+/// or its twr home is gone: [`twr_runner::managed::revoked`]). Those signals are listened for
+/// from the start: one that comes while it starts (its relay stopped meanwhile, say) stops it
+/// before it binds its socket ([`twr_runner::run`]).
 async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::Result<()> {
     let shutdown = twr_runner::Shutdown::install();
     if let Some(dir) = log.parent() {
@@ -4403,6 +4797,11 @@ async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::
     let r = twr_runner::run(opts, shutdown).await;
     if let Err(e) = &r {
         tracing::error!(error = %format!("{e:#}"), "the box daemon failed");
+    }
+    // A linked runner's worker whose twr home is gone: no relay will ever start or boot out
+    // its launchd job again, so it takes the job away itself.
+    if twr_runner::managed::root_gone() {
+        twr_runner::gone::unregister_own_job();
     }
     r
 }
@@ -5116,7 +5515,7 @@ fn is_blocking(item: &Value) -> bool {
     matches!(item["reason"].as_str(), Some("permission" | "question"))
 }
 
-async fn attention(socket: &Path, all: bool) -> anyhow::Result<()> {
+async fn attention(socket: &Path, all: bool, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     // Every item: an empty default listing still says what `--all` would show.
     let items = c.call("attention.list", json!({ "all": true })).await?;
@@ -5126,6 +5525,20 @@ async fn attention(socket: &Path, all: bool) -> anyhow::Result<()> {
         .filter(|i| all || is_blocking(i))
         .cloned()
         .collect();
+    if json {
+        let items: Vec<Value> = items
+            .into_iter()
+            .map(|mut i| {
+                let target = revisioned_id(&i);
+                if let Some(o) = i.as_object_mut() {
+                    o.insert("target".into(), json!(target));
+                }
+                i
+            })
+            .collect();
+        outln!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
     if items.is_empty() {
         match every.len() {
             0 => outln!("nothing needs you"),
@@ -6559,10 +6972,15 @@ fn show_text(t: &Value) -> String {
     out.join("\n")
 }
 
-async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
+async fn thread_list(socket: &Path, all: bool, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let threads = c.call("thread.list", Value::Null).await?;
     let threads = threads.as_array().cloned().unwrap_or_default();
+    if json {
+        let (threads, _) = listed(threads, all);
+        outln!("{}", serde_json::to_string_pretty(&threads)?);
+        return Ok(());
+    }
     if threads.is_empty() {
         outln!(
             "no threads (create one with `twr{} thread new <project>`)",
@@ -7425,19 +7843,26 @@ async fn control(socket: &Path, follow: bool, since: u64, pretty: bool) -> anyho
 
 /// `twr ws`: lists, creates or removes the root's workspaces (whichever workspace `paths` is in).
 async fn ws(cmd: Option<WsCmd>, paths: &Paths) -> anyhow::Result<()> {
-    let cmd = cmd.unwrap_or(WsCmd::List { json: false });
+    let cmd = cmd.unwrap_or(WsCmd::List {
+        json: false,
+        detail: false,
+    });
     if matches!(cmd, WsCmd::Rm { .. }) {
         refuse_agent()?;
     }
     match cmd {
-        WsCmd::List { json } => ws_list(paths, json).await,
+        WsCmd::List { json, detail } => ws_list(paths, json, detail).await,
         WsCmd::New { name } => ws_new(paths, &name),
-        WsCmd::Rm { name } => ws_rm(paths, &name).await,
+        WsCmd::Rm { name, yes } => {
+            // As for `twr trash empty`: only a terminal can confirm, else --yes.
+            let mut ask = ask_on_stderr;
+            ws_rm(paths, &name, consent(yes, &mut ask)).await
+        }
     }
 }
 
 /// `twr ws list`: every workspace (`default` first), with what its hub reports when it runs.
-async fn ws_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
+async fn ws_list(paths: &Paths, json: bool, detail: bool) -> anyhow::Result<()> {
     let root = paths.root();
     // The root's config: its `hub.socket` is the `default` workspace's socket.
     let config = Config::load_from(&root)?;
@@ -7446,10 +7871,18 @@ async fn ws_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
         root.named_workspaces()
             .with_context(|| format!("listing {}", root.workspaces_dir().display()))?,
     );
+    // Every hub is asked at once: a slow one delays the listing by its own wait only.
+    let mut probes = Vec::new();
+    for name in &names {
+        let socket = config.socket_path(&root.workspace(name)?);
+        let name = name.clone();
+        probes.push(tokio::spawn(async move {
+            ws_status(&socket, &name, detail).await
+        }));
+    }
     let mut rows = Vec::new();
-    for name in names {
-        let ws = root.workspace(&name)?;
-        let mut row = ws_status(&config.socket_path(&ws), &name).await;
+    for (name, probe) in names.into_iter().zip(probes) {
+        let mut row = probe.await?;
         row["name"] = json!(name);
         row["current"] = json!(name == paths.workspace_name());
         rows.push(row);
@@ -7492,27 +7925,64 @@ async fn ws_list(paths: &Paths, json: bool) -> anyhow::Result<()> {
 /// used (another user's, say), `"busy"` when it does not answer in time, `"other"` when it
 /// serves another workspace, else `"running"` with its worker threads, how many run, and how
 /// many items block on you.
-async fn ws_status(socket: &Path, name: &str) -> Value {
+///
+/// With `detail` (`twr ws list --json --detail`, the desktop app's one read of every workspace
+/// per refresh) it waits [`DETAIL_PROBE_TIMEOUT`], and a row whose hub isn't stopped also has
+/// `detail`, `{"threads": <thread.list>, "attention": <attention.list {all: true}>}` as the
+/// hub answered them, or `detail_error`, why not. `detail` needs the hub to have recognized
+/// this process as the user (`hello`'s `identity` is `user:...`), as the desktop's read-only
+/// companion does: what it lists never goes past what that companion could read.
+async fn ws_status(socket: &Path, name: &str, detail: bool) -> Value {
+    let unread = |mut row: Value, why: &str| {
+        if detail {
+            row["detail_error"] = json!(why);
+        }
+        row
+    };
     let mut c = match Client::connect(socket).await {
         Ok(c) => c,
         Err(e) if nothing_listens(&e) => return json!({ "hub": "stopped" }),
-        Err(e) if backlog_full(&e) => return json!({ "hub": "busy" }),
-        Err(e) => return json!({ "hub": "error", "error": format!("{e:#}") }),
+        Err(e) if backlog_full(&e) => {
+            return unread(
+                json!({ "hub": "busy" }),
+                "Workspace is too busy to answer (its socket's backlog is full)",
+            )
+        }
+        Err(e) => {
+            let error = format!("{e:#}");
+            return unread(json!({ "hub": "error", "error": error }), &error);
+        }
     };
-    let answer = tokio::time::timeout(PROBE_TIMEOUT, async {
+    let wait = if detail {
+        DETAIL_PROBE_TIMEOUT
+    } else {
+        PROBE_TIMEOUT
+    };
+    let answer = tokio::time::timeout(wait, async {
         let hello = c.hello(json!({ "client": "cli" })).await?;
         if !hub_serves(&hello, name) {
             return Ok(None);
         }
+        let user = hello["identity"]
+            .as_str()
+            .is_some_and(|i| i.starts_with("user:"));
         let threads = c.call("thread.list", Value::Null).await?;
         let items = c.call("attention.list", json!({ "all": true })).await?;
-        anyhow::Ok(Some((threads, items)))
+        anyhow::Ok(Some((threads, items, user)))
     })
     .await;
-    let (threads, items) = match answer {
+    let (threads, items, user) = match answer {
         Ok(Ok(Some(answer))) => answer,
-        Ok(Ok(None)) => return json!({ "hub": "other" }),
-        _ => return json!({ "hub": "busy" }),
+        Ok(Ok(None)) => {
+            return unread(json!({ "hub": "other" }), "Socket serves another workspace")
+        }
+        Ok(Err(e)) => return unread(json!({ "hub": "busy" }), &format!("{e:#}")),
+        Err(_) => {
+            return unread(
+                json!({ "hub": "busy" }),
+                "Workspace did not answer within 3 seconds",
+            )
+        }
     };
     let workers: Vec<&Value> = threads
         .as_array()
@@ -7530,12 +8000,24 @@ async fn ws_status(socket: &Path, name: &str) -> Value {
         .flatten()
         .filter(|i| is_blocking(i))
         .count();
-    json!({
+    let row = json!({
         "hub": "running",
         "threads": workers.len(),
         "running": running,
         "waiting": waiting,
-    })
+    });
+    match (detail, user) {
+        (false, _) => row,
+        (true, true) => {
+            let mut row = row;
+            row["detail"] = json!({ "threads": threads, "attention": items });
+            row
+        }
+        (true, false) => unread(
+            row,
+            "The hub did not recognize this process as your user. Open twr from your desktop launcher or a terminal of your own.",
+        ),
+    }
 }
 
 /// `twr ws new`: makes the workspace's data directory (private, like every data directory).
@@ -7549,6 +8031,226 @@ fn ws_new(paths: &Paths, name: &str) -> anyhow::Result<()> {
 /// this process refuses to when it is one ([`twr_hub::local_agent`]).
 fn refuse_agent() -> anyhow::Result<()> {
     refuse_agent_action("create or remove workspaces")
+}
+
+/// `twr voice`.
+async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    let root = paths.root();
+    let config = Config::load_from(&root)?;
+    let path = std::env::var_os("PATH");
+    match cmd {
+        VoiceCmd::Status { json } => {
+            let s = twr_voice::status(&config.voice, &root.data_dir, path.as_deref());
+            if json {
+                println!("{}", serde_json::to_string(&s)?);
+            } else if s.available {
+                println!(
+                    "voice: {} ({})",
+                    s.engine.as_deref().unwrap_or("?"),
+                    if s.local {
+                        "on this machine"
+                    } else {
+                        "your program: the audio goes where it sends it"
+                    }
+                );
+            } else {
+                println!("voice: {}", s.problem.as_deref().unwrap_or("unavailable"));
+            }
+        }
+        VoiceCmd::Setup => {
+            voice_setup(&config.voice, &root.data_dir).await?;
+            let s = twr_voice::status(&config.voice, &root.data_dir, path.as_deref());
+            match (s.available, s.problem) {
+                (true, _) => println!("voice: ready"),
+                (false, Some(p)) => println!("voice: {p}"),
+                (false, None) => println!("voice: unavailable"),
+            }
+        }
+        VoiceCmd::Transcribe { json, hint } => {
+            let kind = twr_voice::resolve(&config.voice, &root.data_dir, path.as_deref())?;
+            let mut recording = Vec::new();
+            std::io::stdin()
+                .lock()
+                .take(twr_voice::wav::MAX_BYTES as u64 + 1)
+                .read_to_end(&mut recording)
+                .context("reading the recording from stdin")?;
+            let timeout = std::time::Duration::from_secs(config.voice.timeout_secs);
+            // SIGTERM or SIGINT (the app giving up on it) drops the recognition: its process
+            // group is killed and its private copy of the recording removed before exiting.
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .context("handling SIGTERM")?;
+            let text = tokio::select! {
+                text = twr_voice::transcribe(&kind, &recording, timeout, &hint) => text?,
+                _ = term.recv() => anyhow::bail!("recognition stopped"),
+                _ = tokio::signal::ctrl_c() => anyhow::bail!("recognition stopped"),
+            };
+            let mut out = std::io::stdout().lock();
+            if json {
+                writeln!(out, "{}", serde_json::json!({ "text": text }))?;
+            } else {
+                writeln!(out, "{text}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What `twr voice setup` checks of the model as it downloads ([`ModelCheck::update`], each
+/// chunk before it is written) and once it has it all ([`ModelCheck::finish`], before the file
+/// is renamed into place): no more than `len` bytes, ggml's magic first, then exactly `len`
+/// bytes whose SHA-256 is `sha256` ([`twr_voice::engine::MODEL_SHA256`]). whisper.cpp's parser
+/// reads the file, so nothing else may reach its place.
+struct ModelCheck {
+    len: u64,
+    sha256: &'static str,
+    got: u64,
+    head: Vec<u8>,
+    digest: ring::digest::Context,
+}
+
+impl ModelCheck {
+    fn new(len: u64, sha256: &'static str) -> ModelCheck {
+        ModelCheck {
+            len,
+            sha256,
+            got: 0,
+            head: Vec::with_capacity(4),
+            digest: ring::digest::Context::new(&ring::digest::SHA256),
+        }
+    }
+
+    fn update(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        use twr_voice::engine::{is_model, MODEL_URL};
+        if self.head.len() < 4 {
+            self.head.extend(chunk.iter().take(4 - self.head.len()));
+            if self.head.len() == 4 && !is_model(&self.head) {
+                bail!("{MODEL_URL} did not send a whisper model; nothing was kept");
+            }
+        }
+        self.got += chunk.len() as u64;
+        if self.got > self.len {
+            bail!(
+                "{MODEL_URL} sent more than the model's {} bytes; nothing was kept",
+                self.len
+            );
+        }
+        self.digest.update(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        use twr_voice::engine::{is_model, MODEL_URL};
+        if self.got != self.len || !is_model(&self.head) {
+            bail!(
+                "{MODEL_URL} did not send a whole whisper model ({} of {} bytes); nothing was kept",
+                self.got,
+                self.len
+            );
+        }
+        let actual: String = self
+            .digest
+            .finish()
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if actual != self.sha256 {
+            bail!(
+                "{MODEL_URL} is not the model twr expects: its SHA-256 is {actual}, not {}; \
+                 nothing was kept",
+                self.sha256
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] (pinned to a commit) to the default
+/// model's place, through a private file beside it, renamed into place only once whole and its
+/// SHA-256 the one twr expects ([`ModelCheck`]).
+async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_BYTES, MODEL_SHA256, MODEL_URL};
+    if !cfg.model.trim().is_empty() {
+        bail!(
+            "[voice] model names your own model ({}): `twr voice setup` only downloads the \
+             default one; leave [voice] model empty to use it",
+            cfg.model.trim()
+        );
+    }
+    let target = data_dir.join(DEFAULT_MODEL);
+    if std::fs::File::open(&target)
+        .and_then(|mut f| {
+            let mut head = [0u8; 4];
+            std::io::Read::read_exact(&mut f, &mut head).map(|_| head)
+        })
+        .is_ok_and(|head| is_model(&head))
+    {
+        eprintln!("twr: the model is already at {}", target.display());
+        return Ok(());
+    }
+    let dir = target.parent().context("the model's directory")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let client = https_client()
+        .https_only(true)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("setting up the HTTP client")?;
+    eprintln!("twr: downloading {MODEL_URL}");
+    let mut resp = client
+        .get(MODEL_URL)
+        .send()
+        .await
+        .with_context(|| format!("downloading {MODEL_URL}"))?;
+    if !resp.status().is_success() {
+        bail!("downloading {MODEL_URL} failed: HTTP {}", resp.status());
+    }
+    if let Some(total) = resp.content_length().filter(|n| *n != MODEL_BYTES) {
+        bail!("{MODEL_URL} is {total} bytes, not the model's {MODEL_BYTES}; nothing was kept");
+    }
+    let part = target.with_extension(format!("bin.part-{}", std::process::id()));
+    let download = async {
+        let mut file =
+            std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+        let mut check = ModelCheck::new(MODEL_BYTES, MODEL_SHA256);
+        let mut shown = 0;
+        let chunk_wait = std::time::Duration::from_secs(60);
+        while let Some(chunk) = tokio::time::timeout(chunk_wait, resp.chunk())
+            .await
+            .map_err(|_| anyhow!("the download stalled"))?
+            .context("downloading the model")?
+        {
+            check.update(&chunk)?;
+            file.write_all(&chunk)
+                .with_context(|| format!("writing {}", part.display()))?;
+            let pct = check.got * 100 / MODEL_BYTES;
+            if pct >= shown + 10 {
+                shown = pct - pct % 10;
+                eprintln!("twr: {shown}%");
+            }
+        }
+        check.finish()?;
+        file.sync_all().context("writing the model")?;
+        std::fs::rename(&part, &target)
+            .with_context(|| format!("moving the model to {}", target.display()))?;
+        anyhow::Ok(())
+    };
+    // Stopped (Ctrl-C, or the desktop app giving up): the partial file goes too.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("handling SIGTERM")?;
+    let result = tokio::select! {
+        r = download => r,
+        _ = term.recv() => Err(anyhow!("download stopped")),
+        _ = tokio::signal::ctrl_c() => Err(anyhow!("download stopped")),
+    };
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result?;
+    eprintln!("twr: the model is at {}", target.display());
+    Ok(())
 }
 
 fn refuse_agent_action(action: &str) -> anyhow::Result<()> {
@@ -7623,8 +8325,12 @@ fn create_workspace(root: &Paths, name: &str) -> anyhow::Result<Paths> {
 
 /// `twr ws rm`: removes a named workspace's data directory once nothing in it can be lost by
 /// accident: its hub is not running, it has no threads, and its trash is empty (a trash item's
-/// commits stay referenced in its repository until it is purged).
-async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
+/// commits stay referenced in its repository until it is purged), and `consent` allows it: what
+/// goes, the orchestrator's conversation and memory notes, the log and any worktree directories
+/// left behind ([`ws_rm_question`]), is listed and asked about on a terminal, else needs
+/// `--yes`. The workspace's lock is held from the checks through the removal, so no hub opens
+/// it while the question waits.
+async fn ws_rm(paths: &Paths, name: &str, consent: Consent<'_>) -> anyhow::Result<()> {
     if name == DEFAULT_WORKSPACE {
         bail!("the {DEFAULT_WORKSPACE} workspace cannot be removed");
     }
@@ -7646,7 +8352,7 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
         Some(lock) => lock,
         None => return Err(running()),
     };
-    let threads = ws_threads(&ws)?;
+    let (threads, conversation) = ws_threads(&ws)?;
     if !threads.is_empty() {
         bail!(
             "workspace {name} still has {} thread{} ({}): delete them first (`twr -w {name} \
@@ -7682,6 +8388,38 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
                 .count()
         })
         .unwrap_or(0);
+    let goes = WsRemoval {
+        conversation,
+        notes,
+        log_bytes: std::fs::read_dir(&ws.data_dir)
+            .with_context(|| format!("reading {}", ws.data_dir.display()))?
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("twr.db") || n.starts_with("archive.db")
+            })
+            .map(|e| tree_bytes(&e.path()))
+            .sum(),
+        worktrees: leftover_worktrees(&ws.worktrees_dir()),
+        worktree_bytes: tree_bytes(&ws.worktrees_dir()),
+        total_bytes: tree_bytes(&ws.data_dir),
+    };
+    match consent {
+        Consent::Yes => {}
+        Consent::Ask(ask) => {
+            let reply = ask(&ws_rm_question(name, &ws.data_dir, &goes))?;
+            if !matches!(reply.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                outln!("nothing removed");
+                return Ok(());
+            }
+        }
+        Consent::NoTerminal => bail!(
+            "not removing workspace {name} without confirmation (no terminal to ask on). {}Run \
+             `twr ws rm {name} --yes` to remove it",
+            ws_rm_listing(name, &ws.data_dir, &goes)
+        ),
+    }
     // Moved aside first (a name no workspace can have), so a half-removed directory is never
     // taken for the workspace.
     let doomed = ws
@@ -7704,7 +8442,7 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
 
 /// The exclusive lock on workspace `ws`'s data directory (`twr.lock`, which its hub holds
 /// while it runs); `None` when a hub holds it.
-fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<std::fs::File>> {
+fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<WorkspaceLock>> {
     let path = ws.data_dir.join(twr_hub::LOCK_FILE);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -7714,13 +8452,26 @@ fn lock_workspace(ws: &Paths) -> anyhow::Result<Option<std::fs::File>> {
         .with_context(|| format!("opening {}", path.display()))?;
     // Also `None` when the file left its path before it was locked (another `ws rm`): a hub
     // may hold the new one's.
-    twr_hub::lock_opened(file, &path)
+    Ok(twr_hub::lock_opened(file, &path)?.map(WorkspaceLock))
+}
+
+/// A workspace's lock taken by [`lock_workspace`], let go when this is dropped: unlocked, not
+/// only closed. A process another thread starts meanwhile shares the open file until it execs
+/// (or for good, without exec), and the lock stays on the file while anyone has it open: a
+/// workspace merely looked at would then seem to have a running hub, to this process's next
+/// look and to a hub starting there.
+struct WorkspaceLock(std::fs::File);
+
+impl Drop for WorkspaceLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 enum StopWorkspaceLock {
     Missing,
     Held,
-    Free(std::fs::File),
+    Free(WorkspaceLock),
 }
 
 /// A workspace removed after discovery (or during this open) has no hub. Other filesystem
@@ -7742,21 +8493,139 @@ fn stop_workspace_lock(ws: &Paths) -> anyhow::Result<StopWorkspaceLock> {
 }
 
 /// The names of the worker threads in the stopped workspace's log (deleted ones are gone; the
-/// orchestrator does not count).
-fn ws_threads(ws: &Paths) -> anyhow::Result<Vec<String>> {
+/// orchestrator does not count), and the orchestrator threads' conversation: how many there
+/// are (one per runtime it ran on) and their turns in all.
+fn ws_threads(ws: &Paths) -> anyhow::Result<(Vec<String>, (usize, u64))> {
     let db = ws.db_file();
     if !db.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), (0, 0)));
     }
     let store = twr_hub::store::Store::open(&db)?;
     let events = store.load_all()?;
     let registry = twr_core::reduce::Registry::from_events(&events);
-    Ok(registry
+    let (orchestrators, workers): (Vec<_>, Vec<_>) = registry
         .list()
         .into_iter()
-        .filter(|t| !t.is_orchestrator())
-        .map(|t| t.name.clone())
-        .collect())
+        .partition(|t| t.is_orchestrator());
+    Ok((
+        workers.into_iter().map(|t| t.name.clone()).collect(),
+        (
+            orchestrators.len(),
+            orchestrators.iter().map(|t| t.turns).sum(),
+        ),
+    ))
+}
+
+/// What `twr ws rm` removes with a workspace's data directory, for its question.
+#[derive(Debug, Default)]
+struct WsRemoval {
+    /// The orchestrator threads in its log and their turns ([`ws_threads`]).
+    conversation: (usize, u64),
+    /// The orchestrator's memory notes.
+    notes: usize,
+    /// `twr.db` and `archive.db` (with their journals).
+    log_bytes: u64,
+    /// Worktree directories still under its `worktrees/` ([`leftover_worktrees`]).
+    worktrees: Vec<String>,
+    worktree_bytes: u64,
+    /// The whole data directory.
+    total_bytes: u64,
+}
+
+/// The bytes of the files under `path` (or of `path`, a file), symlinks counted as themselves
+/// and never followed; what can't be read counts as nothing.
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .map(|d| d.flatten().map(|e| tree_bytes(&e.path())).sum())
+        .unwrap_or(0)
+}
+
+/// The worktree directories left under a workspace's `worktrees/` (`<project>/<thread>`, as
+/// the hub makes them), when it has no threads: what a failed deletion or a crash left, files
+/// of which go with the workspace. Sorted.
+fn leftover_worktrees(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for project in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = project.path();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        for t in std::fs::read_dir(&path).into_iter().flatten().flatten() {
+            found.push(format!(
+                "{}/{}",
+                project.file_name().to_string_lossy(),
+                t.file_name().to_string_lossy()
+            ));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One line per thing `twr ws rm` removes of workspace `name` (data directory `dir`).
+fn ws_rm_listing(name: &str, dir: &Path, goes: &WsRemoval) -> String {
+    let plural = |n: u64, one: &str, many: &str| {
+        if n == 1 {
+            format!("1 {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    };
+    let mut out = format!("This removes workspace {name} for good:\n");
+    let (orchestrators, turns) = goes.conversation;
+    if orchestrators > 0 {
+        out.push_str(&format!(
+            "  its orchestrator's conversation ({}, {})\n",
+            plural(orchestrators as u64, "thread", "threads"),
+            plural(turns, "turn", "turns")
+        ));
+    }
+    if goes.notes > 0 {
+        out.push_str(&format!(
+            "  its orchestrator's {}\n",
+            plural(goes.notes as u64, "memory note", "memory notes")
+        ));
+    }
+    out.push_str(&format!(
+        "  its log ({})\n",
+        twr_core::git::human_bytes(goes.log_bytes)
+    ));
+    if !goes.worktrees.is_empty() {
+        let mut shown: Vec<String> = goes.worktrees.iter().take(5).cloned().collect();
+        if goes.worktrees.len() > 5 {
+            shown.push(format!("+{} more", goes.worktrees.len() - 5));
+        }
+        out.push_str(&format!(
+            "  {} left in its worktrees/ ({}, {}), files included\n",
+            plural(
+                goes.worktrees.len() as u64,
+                "worktree directory",
+                "worktree directories"
+            ),
+            shown.join(", "),
+            twr_core::git::human_bytes(goes.worktree_bytes)
+        ));
+    }
+    out.push_str(&format!(
+        "  everything else in {} ({} in all)\n",
+        dir.display(),
+        twr_core::git::human_bytes(goes.total_bytes)
+    ));
+    out
+}
+
+/// The question `twr ws rm` asks before removing workspace `name`.
+fn ws_rm_question(name: &str, dir: &Path, goes: &WsRemoval) -> String {
+    format!(
+        "{}Remove workspace {name}? This cannot be undone. [y/N] ",
+        ws_rm_listing(name, dir, goes)
+    )
 }
 
 /// What a probe of the hub socket found.
@@ -8090,6 +8959,147 @@ mod tests {
         );
     }
     use super::*;
+
+    /// `twr voice setup` keeps only exactly the model it pinned: ggml's magic, its size and its
+    /// SHA-256, checked while it streams and before the rename.
+    #[test]
+    fn voice_setup_keeps_only_the_pinned_model() {
+        let model = b"lmggthe rest of a tiny model".to_vec();
+        let sha: &'static str = Box::leak(sha256_hex(&model).into_boxed_str());
+        let run = |chunks: &[&[u8]], len: u64| -> anyhow::Result<()> {
+            let mut check = ModelCheck::new(len, sha);
+            for c in chunks {
+                check.update(c)?;
+            }
+            check.finish()
+        };
+        let len = model.len() as u64;
+        // Whole, in any chunks.
+        run(&[&model], len).unwrap();
+        run(&[&model[..2], &model[2..3], &model[3..]], len).unwrap();
+        // Another file of the same size: refused at the end.
+        let mut other = model.clone();
+        *other.last_mut().unwrap() ^= 1;
+        let e = run(&[&other], len).unwrap_err().to_string();
+        assert!(
+            e.contains("is not the model twr expects") && e.contains(sha),
+            "{e}"
+        );
+        // Too short, too long, not a ggml file.
+        let e = run(&[&model[..10]], len).unwrap_err().to_string();
+        assert!(
+            e.contains("did not send a whole whisper model (10 of"),
+            "{e}"
+        );
+        let mut long = model.clone();
+        long.push(0);
+        let e = run(&[&long], len).unwrap_err().to_string();
+        assert!(e.contains("sent more than"), "{e}");
+        let e = run(&[b"<!doctype html>"], len).unwrap_err().to_string();
+        assert!(e.contains("did not send a whisper model"), "{e}");
+    }
+
+    /// `twr ws list --detail` prints a hub's lists only to a process the hub took for the user,
+    /// as the desktop's read-only companion reads them: an agent's gets the counts it always
+    /// got and why there is no detail. It reads each hub once, and only the two lists.
+    #[tokio::test]
+    async fn ws_detail_needs_the_hub_to_take_this_process_for_the_user() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        for (identity, workspace, detail) in [
+            ("user:cli", "review", true),
+            ("thread:api", "review", false),
+            ("user:cli", "other", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hub.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let mut methods = Vec::new();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let method = request["method"].as_str().unwrap().to_owned();
+                    let result = match method.as_str() {
+                        "hello" => json!({"identity": identity, "workspace": workspace}),
+                        "attention.list" => {
+                            assert_eq!(request["params"], json!({"all": true}));
+                            json!([{"attn_id": "a1", "reason": "question", "revision": 3}])
+                        }
+                        "thread.list" => json!([{"id": "t1", "name": "api", "status": "idle"}]),
+                        _ => panic!("ws list called {method}"),
+                    };
+                    methods.push(method);
+                    let line = json!({"id": request["id"], "result": result}).to_string() + "\n";
+                    writer.write_all(line.as_bytes()).await.unwrap();
+                }
+                methods
+            });
+            let row = ws_status(&path, "review", true).await;
+            let calls = server.await.unwrap();
+            if workspace == "other" {
+                assert_eq!(
+                    row,
+                    json!({"hub": "other", "detail_error": "Socket serves another workspace"})
+                );
+                assert_eq!(calls, ["hello"]);
+                continue;
+            }
+            assert_eq!(calls, ["hello", "thread.list", "attention.list"]);
+            assert_eq!(row["hub"], "running");
+            assert_eq!(row["threads"], 1);
+            assert_eq!(row["waiting"], 1);
+            if detail {
+                assert_eq!(row["detail"]["threads"][0]["name"], "api");
+                assert_eq!(row["detail"]["attention"][0]["attn_id"], "a1");
+                assert!(row.get("detail_error").is_none(), "{row}");
+            } else {
+                assert!(row.get("detail").is_none(), "{row}");
+                assert!(
+                    row["detail_error"].as_str().unwrap().contains("your user"),
+                    "{row}"
+                );
+            }
+        }
+        // A stopped hub is said by `hub` alone.
+        let dir = tempfile::tempdir().unwrap();
+        let row = ws_status(&dir.path().join("none.sock"), "review", true).await;
+        assert_eq!(row, json!({"hub": "stopped"}));
+    }
+
+    /// `twr ws rm` asks before it removes anything, naming what goes: anything but y/yes keeps
+    /// the workspace.
+    #[tokio::test]
+    async fn ws_rm_asks_first() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::with_home(home.path());
+        let ws = paths.workspace("a").unwrap();
+        std::fs::create_dir_all(ws.data_dir.join(twr_hub::MEMORY_DIR)).unwrap();
+        std::fs::write(ws.data_dir.join(twr_hub::MEMORY_DIR).join("x.md"), "n").unwrap();
+        std::fs::write(ws.data_dir.join("twr.db-wal"), [0u8; 2048]).unwrap();
+        let mut asked = Vec::new();
+        for reply in ["", "n\n", "no\n", "yes please\n"] {
+            let mut ask = |q: &str| {
+                asked.push(q.to_string());
+                Ok(reply.to_string())
+            };
+            ws_rm(&paths, "a", Consent::Ask(&mut ask)).await.unwrap();
+            assert!(ws.data_dir.is_dir(), "{reply:?} removed it");
+        }
+        let q = &asked[0];
+        assert!(q.starts_with("This removes workspace a for good:\n"), "{q}");
+        assert!(q.contains("  its orchestrator's 1 memory note\n"), "{q}");
+        assert!(q.contains("  its log (2 KB)\n"), "{q}");
+        assert!(!q.contains("worktree"), "{q}");
+        assert!(
+            q.ends_with("Remove workspace a? This cannot be undone. [y/N] "),
+            "{q}"
+        );
+        let mut yes = |_: &str| Ok("Y\n".to_string());
+        ws_rm(&paths, "a", Consent::Ask(&mut yes)).await.unwrap();
+        assert!(!ws.data_dir.exists());
+    }
 
     /// A workspace that was present during discovery can be moved aside by ws rm before
     /// the stop opens its lock. Absence is not a stop failure; other open errors are.
@@ -8488,6 +9498,20 @@ mod tests {
         assert!(refuse_runner_socket(&c).is_ok());
         let c = Cli::try_parse_from(["twr", "--socket", "/tmp/s", "attention"]).unwrap();
         assert!(refuse_runner_socket(&c).is_ok());
+        // The runner service is started with a `--socket` of its own: the one it listens on.
+        let service = [
+            "twr", "runner", "service", "--root", "/tmp/r", "--socket", "/tmp/s",
+        ];
+        let c = Cli::try_parse_from(service).unwrap();
+        assert!(refuse_runner_socket(&c).is_ok());
+        let Some(Cmd::Runner {
+            cmd: Some(RunnerCmd::Service { socket, .. }),
+            ..
+        }) = c.cmd
+        else {
+            panic!("not the runner service");
+        };
+        assert_eq!(socket, PathBuf::from("/tmp/s"));
     }
 
     /// `twr runner token` needs neither --hub nor --box, and takes no runner flag; `twr
@@ -8715,7 +9739,12 @@ mod tests {
         }
         // Hidden: the help shows none of them (as whole flags: `twr account remove --logout`
         // is not `--log`).
-        let help = cli_help_page().1;
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let help = command
+            .find_subcommand_mut("runner")
+            .unwrap()
+            .render_long_help()
+            .to_string();
         let shows = |flag: &str| {
             help.match_indices(flag).any(|(i, _)| {
                 !help[i + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
@@ -8981,6 +10010,17 @@ mod tests {
                 .cmd,
             Some(Cmd::Attention {
                 all: true,
+                json: false,
+                cmd: None
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["twr", "attention", "--json"])
+                .unwrap()
+                .cmd,
+            Some(Cmd::Attention {
+                all: false,
+                json: true,
                 cmd: None
             })
         ));
@@ -9007,7 +10047,7 @@ mod tests {
             "twr",
             "model",
             "web",
-            "claude-fable-5-1",
+            "claude-fable-5-2",
             "--effort",
             "high",
         ])
@@ -9016,7 +10056,7 @@ mod tests {
             c.cmd,
             Some(Cmd::Model { ref thread, ref model, ref effort, runtime: None, account: None,
                 outside_pin: false })
-                if thread == "web" && model.as_deref() == Some("claude-fable-5-1")
+                if thread == "web" && model.as_deref() == Some("claude-fable-5-2")
                     && effort.as_deref() == Some("high")
         ));
         let c = Cli::try_parse_from(["twr", "model", "web"]).unwrap();
@@ -9423,8 +10463,8 @@ mod tests {
         );
         assert_eq!(m(json!("o5"), json!("o5")), " model o5");
         assert_eq!(
-            m(json!("haiku"), json!("claude-haiku-4-5-20251001")),
-            " model haiku (runs claude-haiku-4-5-20251001)"
+            m(json!("haiku"), json!("claude-haiku-5-5")),
+            " model haiku (runs claude-haiku-5-5)"
         );
         assert_eq!(
             m(Value::Null, json!("gpt-5-codex")),
@@ -9432,13 +10472,13 @@ mod tests {
         );
         let shown = orchestrator_text(&json!({
             "available": true, "runtime": "claude-code", "model": null,
-            "model_actual": "claude-sonnet-4-5-20250929", "thread": "01NEW",
+            "model_actual": "claude-sonnet-5-5", "thread": "01NEW",
             "name": "orchestrator", "status": "idle", "live": true,
             "configured": {"runtime": "claude-code", "model": null}, "runtimes": [],
         }));
         assert!(
             shown.starts_with(
-                "orchestrator: claude-code model claude-sonnet-4-5-20250929 (the runtime's \
+                "orchestrator: claude-code model claude-sonnet-5-5 (the runtime's \
                  default)\n"
             ),
             "{shown}"
@@ -9447,7 +10487,7 @@ mod tests {
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
             "started": false,
             "previous": {"thread": "01OLD", "runtime": "claude-code", "model": "haiku",
-                         "model_actual": "claude-haiku-4-5-20251001",
+                         "model_actual": "claude-haiku-5-5",
                          "stopping": false, "dropped_prompts": 0},
         }));
         assert!(
@@ -9457,15 +10497,15 @@ mod tests {
         assert!(
             switched.contains(
                 "The previous orchestrator (claude-code model haiku (runs \
-                 claude-haiku-4-5-20251001), 01OLD)"
+                 claude-haiku-5-5), 01OLD)"
             ),
             "{switched}"
         );
 
         let cell = |t: Value| model_cell(&t);
         assert_eq!(
-            cell(json!({"model": "opus", "model_actual": "claude-opus-4-1-20250805"})),
-            "claude-opus-4-1-20250805"
+            cell(json!({"model": "opus", "model_actual": "claude-opus-5-5"})),
+            "claude-opus-5-5"
         );
         assert_eq!(cell(json!({"model": "opus"})), "opus (requested)");
         assert_eq!(
@@ -9527,14 +10567,14 @@ mod tests {
     #[test]
     fn model_outcomes_and_show() {
         let r = |applies: &str| {
-            json!({"thread_name": "orbit-webapp-1", "model": "claude-fable-5-1",
+            json!({"thread_name": "orbit-webapp-1", "model": "claude-fable-5-2",
                    "effort": "high", "previous_model": null, "previous_effort": null,
                    "changed": true, "applies": applies})
         };
         assert_eq!(
             model_outcome("web", &r("after_turn")),
             "orbit-webapp-1: model (runtime default), effort (runtime default) -> model \
-             claude-fable-5-1, effort high (its runtime finishes the current turn, then \
+             claude-fable-5-2, effort high (its runtime finishes the current turn, then \
              restarts on the same session)"
         );
         assert!(model_outcome("web", &r("now")).ends_with("restarts on the same session now)"));
@@ -9549,10 +10589,10 @@ mod tests {
         assert_eq!(
             model_show(
                 &json!({"name": "api", "runtime": "claude-code", "model": null,
-                               "effort": "low", "model_actual": "claude-sonnet-5"})
+                               "effort": "low", "model_actual": "claude-sonnet-5-5"})
             ),
             "api: runtime claude-code, model (runtime default), effort low (runs \
-             claude-sonnet-5)"
+             claude-sonnet-5-5)"
         );
         assert_eq!(
             model_show(
@@ -9885,7 +10925,7 @@ mod tests {
         ] {
             let c = Cli::try_parse_from(args).unwrap();
             assert!(
-                matches!(c.cmd, Some(Cmd::Thread { cmd: ThreadCmd::List { all } }) if all == want),
+                matches!(c.cmd, Some(Cmd::Thread { cmd: ThreadCmd::List { all, .. } }) if all == want),
                 "{args:?}"
             );
         }
@@ -10661,11 +11701,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("hub.sock");
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Absent);
-        assert_eq!(ws_status(&sock, "default").await["hub"], "stopped");
-        // A socket file nobody listens on: connection refused.
+        assert_eq!(ws_status(&sock, "default", false).await["hub"], "stopped");
+        // A socket file nobody listens on: connection refused (once the forks of this process
+        // made meanwhile, which hold the listener too, have exec'd).
         drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped listener still answers"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Absent);
-        assert_eq!(ws_status(&sock, "default").await["hub"], "stopped");
+        assert_eq!(ws_status(&sock, "default", false).await["hub"], "stopped");
         std::fs::remove_file(&sock).unwrap();
         slow_hub(&sock, Duration::from_secs(60));
         assert_eq!(probe_hub(&sock).await.unwrap(), Probe::Busy);
@@ -10690,9 +11739,13 @@ mod tests {
         ] {
             let e = format!("{:#}", probe_hub(&sock).await.unwrap_err());
             assert!(e.contains(why), "{e}");
-            let status = ws_status(&sock, "default").await;
+            let status = ws_status(&sock, "default", false).await;
             assert_eq!(status["hub"], "error", "{status}");
             assert!(status["error"].as_str().unwrap().contains(why), "{status}");
+            assert!(status.get("detail_error").is_none(), "{status}");
+            // `--detail` says why there is no detail: the same reason.
+            let status = ws_status(&sock, "default", true).await;
+            assert_eq!(status["detail_error"], status["error"], "{status}");
         }
     }
 
@@ -10812,7 +11865,79 @@ mod tests {
             }
         }
         let update = Cli::try_parse_from(["twr", "update", "--version", "v0.2.0"]).unwrap();
-        assert!(matches!(update.cmd, Some(Cmd::Update { version: Some(v) }) if v == "v0.2.0"));
+        assert!(matches!(
+            update.cmd,
+            Some(Cmd::Update { version: Some(v), allow_downgrade: false }) if v == "v0.2.0"
+        ));
+        let update =
+            Cli::try_parse_from(["twr", "update", "--version", "v0.2.0", "--allow-downgrade"])
+                .unwrap();
+        assert!(matches!(
+            update.cmd,
+            Some(Cmd::Update {
+                allow_downgrade: true,
+                ..
+            })
+        ));
+        // A downgrade is only ever to a release named.
+        assert!(Cli::try_parse_from(["twr", "update", "--allow-downgrade"]).is_err());
+    }
+
+    /// `twr update` installs only a newer release, in semver order with prereleases: the same
+    /// one is up to date, and an older one (also the latest stable release under a newer
+    /// prerelease) is refused unless `--version` and `--allow-downgrade` ask for it.
+    #[test]
+    fn update_never_downgrades_unasked() {
+        use UpdatePlan::*;
+        // Newer.
+        assert_eq!(
+            update_plan("v0.4.0", "0.3.0", false, false).unwrap(),
+            Install
+        );
+        assert_eq!(
+            update_plan("v0.4.0", "0.3.0", true, false).unwrap(),
+            Install
+        );
+        // Equal.
+        assert_eq!(
+            update_plan("v0.3.0", "0.3.0", false, false).unwrap(),
+            UpToDate
+        );
+        assert_eq!(
+            update_plan("v0.3.0", "0.3.0", true, true).unwrap(),
+            UpToDate
+        );
+        // Prerelease to its release, and release to a later prerelease: newer.
+        assert_eq!(
+            update_plan("v0.4.0", "0.4.0-rc.1", false, false).unwrap(),
+            Install
+        );
+        assert_eq!(
+            update_plan("v0.4.0-rc.1", "0.3.0", true, false).unwrap(),
+            Install
+        );
+        // Release to its own prerelease, and a prerelease to the stable latest before it.
+        for (tag, current) in [("v0.4.0-rc.1", "0.4.0"), ("v0.3.2", "0.4.0-rc.1")] {
+            for (asked, allow) in [(false, false), (true, false), (false, true)] {
+                let e = update_plan(tag, current, asked, allow)
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.contains("nothing was run"), "{e}");
+                assert!(e.contains("may refuse the database"), "{e}");
+                assert!(
+                    e.contains(&format!("twr update --version {tag} --allow-downgrade")),
+                    "{e}"
+                );
+                assert_eq!(e.contains("leaves out prereleases"), !asked, "{e}");
+            }
+            assert_eq!(update_plan(tag, current, true, true).unwrap(), Downgrade);
+        }
+        // Older.
+        assert!(update_plan("v0.2.9", "0.3.0", false, false).is_err());
+        assert_eq!(
+            update_plan("v0.2.9", "0.3.0", true, true).unwrap(),
+            Downgrade
+        );
     }
 
     /// `twr update` installs into the executable's own directory, and refuses cargo's bin

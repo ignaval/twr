@@ -4,19 +4,133 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-10
+
+Desktop apps for Apple Silicon macOS and Linux, and iOS and Android apps, on the same interface as the TUI; machines paired as runners with a short-lived code; voice mode; a grouped Needs you inbox with search; model pickers; the tray, badge and system notifications across every workspace; and an audit of the hub, gateway, runners and every client, with its security fixes.
+
+Upgrading: the runner protocol is now 8 and the client protocol 2, so update twr on a box or a client you set up yourself together with the hub; an SSH box of the hub's OS and CPU switches to the new build by itself, and a 0.3.0 runner is let finish its turns and then asked to update. The database stays at schema 9 (10 once it records an account), and the hub folds its log once on the first start (checkpoint format 4); copy the database first if you may go back to 0.3.0. `twr update` now installs only a newer release (`--version V --allow-downgrade` for an older one). On a Mac without OpenSSL 3, `install.sh` checks the release's new P-256 signature and so refuses 0.3.0 and older, which have none ([install.md](docs/install.md#the-install-script)). A paired device needs terminal access for a command-line runtime and admin access to change a thread's mode: pair it again with `--allow-terminal` or `--allow-admin` if it relied on either (Security, below).
+
 ### Added
+
+- Pair Linux and macOS machines as runners with a short-lived code from the CLI, TUI or desktop app. Local hubs start a private independent runner service; linked runners preserve workspace workers, synchronize exact Git commits and build the hub's recorded source when needed. Includes machine-wide runtime admission, idle-session retirement, durable revocation, offline forgetting and committed-result pulls. See [runner-links.md](docs/runner-links.md).
+- Guided remote gateway setup with expiring QR invitations and saved remote hubs on desktop, sharing the mobile gateway client.
+- A grouped Needs you inbox with request filters and keyboard/touch navigation, plus conversation search and exact archived event context.
+- Saved pane sizes, density and independent text/code sizing, with mobile system text scaling.
+- File previews, progress, cancellation and verified resume for local and remote-box uploads; runner protocol 8.
+- Device-encrypted recent history, persistent message drafts and a receipt-backed outbox that preserves message IDs across restarts and keeps uncertain deliveries for review.
+- Voice mode in the desktop, iOS and Android apps: push to talk or a hands-free session, with replies read aloud on the same computer. Speech is recognized on your machine with whisper.cpp (`twr voice`, `[voice]`) or a program of yours. Spoken messages go to the orchestrator marked `say {voice: true}` and never answer a request or change a mode by themselves; one that reads as such comes back to confirm. Phones use the platform's recognizer and voice, with a speaker the mobile gateway runs for each phone. `twr speak --control stdio` lets a program drive a speaker. See [voice.md](docs/voice.md).
+- Hearing when something needs you: with `"attention"` in `[speech] read`, a speaker says when an attention item is raised ("api needs your permission", "twr has a question for you"), a fixed sentence with the thread's name and never the item's words; live only, one per thread, dropped if answered before it is said. `twr speech feed --text --attention` prints them. New `speech.attach` items `announce` and `retract`, sent only to speakers that ask; a speaker attaches to an older hub without them. See [read-aloud.md](docs/read-aloud.md#hearing-when-something-needs-you).
 
 - Desktop hub clients for Apple Silicon macOS and x86_64 Linux, with embedded terminals, generated CLI forms, shared thread and attention views, and Dark, Light and System appearance. Linux packages include AppImage, Debian and Arch/Omarchy builds. See [desktop.md](docs/desktop.md).
 - iOS and Android hub clients using the same interface, with responsive folding layouts, paired remote hubs, native credential storage, file uploads and optional APNs/FCM push delivery. The separate gateway enforces device scopes and revocation; notifications open requests without answering them. See [mobile.md](docs/mobile.md).
+- Model pickers. The TUI's orchestrator picker (first run and `/orch`) asks for the model after the runtime, and `/model <thread>` opens a picker of the thread's model and effort. The desktop app's orchestrator, new-thread, thread-settings and default-model forms pick from a list too. Each lists the runtime's default first, the models twr knows the runtime has, and a custom id; `orchestrator.show` reports them as `models`. See [tui.md](docs/tui.md#choosing-the-orchestrator).
+- `twr completions <bash|zsh|fish|elvish|powershell>` prints a shell completion script. See [install.md](docs/install.md).
+- `--json` for `twr thread list` and `twr attention`; an attention item's `target` is the `<id>@<revision>` that `twr respond` takes.
+- `twr update --allow-downgrade`, with `--version`, for the rare install of an older release (below).
+- The mobile apps reconnect to the last hub on launch, and their header shows whether the hub is online, reconnecting or offline.
+- The desktop app's menu bar or tray icon and its Dock badge count and list what needs you in every workspace, grouped by workspace; choosing an item switches to it.
+- The desktop app posts a system notification for a new permission or question in any workspace while its window isn't in front. It names only the thread and the workspace, never the command or the question, and a click opens the request without answering it. Turn them off in Settings › Application. See [notifications.md](docs/notifications.md).
+- Right-click menus in the desktop app (Cut, Copy, Paste, Select All, Copy Link Address), and it remembers its window's size, position and maximized state.
+- `install.sh` and the release workflow can check a second, ECDSA P-256 signature of the checksums, for macOS's LibreSSL, which cannot verify Ed25519. Releases after v0.3.0 carry it (`sha256sums.txt.p256.sig`), and `install.sh` holds the key, so `curl … | sh` on a Mac checks the release's signature; on a Mac without OpenSSL 3 it refuses v0.3.0 and older, which have none ([install.md](docs/install.md#the-install-script)).
+- CI type-checks, tests, format-checks and audits the desktop and mobile TypeScript on every pull request and builds the Android app; Dependabot now covers the clients' npm tree and the Android Gradle build.
+- Desktop: every package carries `LICENSE`, `NOTICE` and `THIRD-PARTY-LICENSES.html` (Rust crates and npm packages), opened from Help › Third-Party Licences.
+- The linked-runner service, and a Mac box daemon's launchd job, pass on proxy and CA bundle variables (`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS` and the like), `CARGO_HOME`, `RUSTUP_HOME` and the agents' config directories (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`). A proxy URL's user name and password are removed, with a warning; give an authenticated proxy to agents with a paired hub's `[threads] env`. A linked runner's native worker build gets the proxy and CA bundle variables too, so cargo can fetch crates behind a proxy.
+- `twr ws list --json --detail` also prints each running hub's threads and requests (`detail`, its `thread.list` and `attention.list`), when the hub takes the process for you, or why not (`detail_error`). It waits up to 3 s per hub. A paired device can't run it through the gateway.
 
 ### Changed
 
+- The desktop sidebar lists every workspace with its threads nested under it, as the TUI's does, instead of a workspace selector. Opening a thread or orchestrator in another workspace switches to it in one step; each workspace has its own Orchestrator and New thread entries. See [desktop.md](docs/desktop.md#sidebar).
+- The desktop sidebar resizes by dragging anywhere along its right edge (200–440 px, default 260, saved across restarts). The handle used to be a small strip at the top, inside the title bar's window-drag area.
+- The TUI's sidebar is a little narrower: its cards take 28% of the screen, 32 to 44 columns (were 30%, 34 to 48), and 36%, 24 to 32 below 100 columns (were 40%, 24 to 34). See [tui.md](docs/tui.md#workspaces).
+- The desktop app shows a suggested next message the way the TUI does: greyed as the empty message box's placeholder, put in the box with `Tab` or `→` (not sent until you press Enter), typed over by anything else. It uses the hub's `suggest.next` and the same `[tui] suggest` setting. Phones keep a tap-to-use line. See [desktop.md](docs/desktop.md).
+- The first-use notice for suggestions, in the TUI and the desktop app, no longer quotes a price per call, and the desktop app no longer shows a running cost of suggestions beside the message box. It still says what is sent, where, and that calls count toward your plan's usage; [tui.md](docs/tui.md#suggestions) keeps the list prices.
+- Client protocol 2 requires updated CLI and native clients for resumable capacity retirement. Runner protocol 8 and its spool formats are inherited from the merged client baseline. The tested Rust compiler floor is 1.98.
 - Graphical clients and the TUI share command parsing, card ordering, configuration editing and routine-update handling. Hub RPC pooling, bounded message previews and executable hashing reduce startup allocation and streaming work. See [performance.md](docs/performance.md).
+- `twr update` installs only a newer release: the same release says so and exits 0, and an older one (a prerelease user offered the last stable release, or a mirror serving an old one) is refused unless you pass `--version V --allow-downgrade`.
+- `twr ws rm` lists what it removes (the orchestrator's conversation, memory notes, log, leftover worktrees) and asks y/N; without a terminal it needs `--yes`.
+- In the TUI, Ctrl-C with text in the input box clears it into the input history (Up brings it back) and says `Ctrl-C again quits`; with an empty box it quits as before.
+- The TUI draws Markdown tables as aligned columns (records on a narrow pane), and the phone-width slash-command popup shows each command's description.
+- In the desktop and mobile apps, a request's buttons and number keys answer only once its options have been on screen for 600 ms, as in the TUI, and an answered card shows `Sent`. A click or key meant for the item that was there a moment ago no longer answers the next one.
+- Links in agent output show their address; a link whose text names another host, a plain `http:` link and a terminal hyperlink whose text differs from its address ask before opening, and a path link is shown as copyable code instead of a dead link.
+- The desktop window opens at once; the login shell, the signature probe and the engine copy finish in the background.
+- `--allow-admin` on the mobile gateway now requires `--allow-terminal`: admin can change configuration that names commands the hub runs.
+- The mobile apps close their hub connection 30 s after leaving the foreground instead of answering heartbeats until the system stops them, and clear delivered notifications when opened; a new push replaces the one still shown.
+- On Linux the linked-runner service starts with the same environment allowlist as on macOS, instead of everything in the environment of the shell that first started a hub.
+- Idle threads are git-snapshotted less often (30 s doubling to 5 minutes) until something happens on them: a hand edit in an idle thread's worktree can take up to 5 minutes to show on its card.
+- `twr voice setup` downloads the speech model from a pinned revision and checks its SHA-256 before using it.
+- The runner service's sockets live in a private per-user directory (`$XDG_RUNTIME_DIR`, macOS's per-user temporary directory) instead of a predictable `/tmp` path.
+- The hub writes each event's payload once, for the log and every subscriber; live stream lines are now the same bytes a replay reads (keys inside `data` sorted).
+- The gateway's `cli` call runs only `ws list [--json]` (read access) and `ws new <name>` (operate access) for a device, exactly so.
+- twr's HTTP clients use reqwest 0.13, the version its other dependencies already used, so the binary carries one HTTP stack. They keep rustls with ring and Mozilla's root certificates.
+- Desktop: the tray and badge summary reads the open workspace over its existing connection instead of starting another process every 15 seconds.
+- `install.sh --pair` says what to run when the release it installed has no `twr runner up`, instead of naming a version.
+- `SKILL.md` documents `summary.thread`, and its lists of the methods the orchestrator and agents may call match the hub's.
+- A thread purged from the trash is remembered only by who it was (name, former names, aliases, colour, box), so control snapshots and checkpoints no longer grow with every thread ever deleted. Checkpoint format 4: the hub folds the log once after the upgrade.
+- Desktop: notifications for the orchestrator's confirm cards and for delete cards say what they ask ("Asks you to confirm what the orchestrator proposed", "Asks you to confirm a deletion") instead of "Has a question for you", without naming the threads.
+- The hub's hints to update an older runner or client name the hub's version (`twr update --version v…`), or the commit for a development hub.
+- Development: QA scripts stop the linked-runner service their fixture's hub started and remove its launchd job, so test runs no longer leave `tools.twr.box.*` jobs behind.
+- `twr ws list` asks every workspace's hub at once instead of one after another, so listing several running workspaces takes about as long as the slowest hub.
+- Desktop: the tray, badge, notifications and sidebar read every workspace with one `twr ws list --json --detail` per refresh, instead of listing the workspaces and then opening a read-only connection to each one. A refresh with four running workspaces takes about a quarter of a second instead of about one second.
+- Typing in the message box no longer re-renders the whole desktop and mobile app on each key: the composer and its drafts moved into their own component, and the rest of the window renders again only when the box goes from empty to a draft or back.
+- Removing a box makes the hub forget what its runner sent it: a token box's at once with `twr box remove`, any other box's when the hub next starts without it. `twr box remove` records the removal in `boxes.removed`, next to `boxes.toml`, and `twr box add` takes it out again; a box that is merely missing from the config (a missing or empty config file, a box commented out) is not forgotten. Added back under the same name, its runner drops the frames it had not delivered and numbers its threads' frames from 1 again; the box's sessions are closed (`thread.crashed`, saying why) and its runs stopped, and the next message resumes each thread. A runner from before this release is refused for such a box until twr on it is updated ([runners.md](docs/runners.md#removing-a-box)).
+- The orchestrator starts a thread in a folder outside git too, such as `~/notes`, where the thread works in the folder itself. It is still refused a folder or repository that is or holds the home folder, or holds or is inside twr's data, `TWR_HOME` or a credentials folder; add such a folder as a configured project to allow it.
 
 ### Fixed
 
+- Hands-free voice no longer sends a message when you pause mid-sentence: an utterance ends after 2 s of silence instead of 0.9 s, on the desktop (`[voice] pause_ms`) and on phones. See [voice.md](docs/voice.md).
+- Hands-free voice no longer sends the orchestrator's own reply back to it. Its voice, played by `twr speak` through the system, is out of reach of the browser's echo cancellation, and the echo check missed parts of it. Hands-free now stops listening while a reply is read aloud and for 0.8 s after; a reply that starts while you talk waits until what you said is sent. `[voice] listen_while_speaking = true` keeps the old talk-over behavior, for headphones. See [voice.md](docs/voice.md#what-you-hear-and-say).
+- Voice mode no longer asks you to paste a `mkdir`/`curl` command when the speech model is missing: `twr voice setup` downloads it, and the desktop app offers **Download model** in its place. See [voice.md](docs/voice.md#setting-up-recognition).
+- A new workspace's orchestrator no longer starts on a mistyped model. The desktop app's "Choose your orchestrator" form asked for the model as free text, and a name Claude Code doesn't know (`opus-5.5`) failed every message; the form now starts on the configured runtime and the runtime's default model, and picks other models from a list.
+- macOS CI review installers retain valid ad hoc signatures in pull-request builds; packaged verification rejects invalid signatures before upload.
 - Finished jobs release their slots immediately, even while a child process briefly retains an inherited file descriptor before exec.
+- Files attached in the orchestrator's conversation upload into its working directory (`orchestrator.cwd`) instead of failing with "Thread has no working directory".
 - Remote clients retain short bursts of live conversation events within byte and event-count limits, avoiding unnecessary resyncs during heavy tool output.
+- The linked-runner service starts again: every launch of `twr runner service` exited at once with "--socket does not apply to twr runner", because its own `--socket` was taken for the hub's.
+- The TUI reconnects after its hub is stopped, restarted or updated, with a band saying so meanwhile. It used to keep sending what you typed while showing no replies, cards or permission requests.
+- The TUI restores the terminal when it is killed (SIGTERM, SIGHUP, SIGQUIT), and a copy too large for the terminal's clipboard says so instead of silently failing.
+- Agent worktrees, the trash and a running native build's output no longer count against a linked runner's 10 GiB per-hub budget, which stopped new linked threads once one worktree had a large build directory.
+- Linked-runner admission no longer blocks a box, and the other workers of the machine, while one worker retires an orphan runtime.
+- twr builds from a sparse checkout or one with skip-worktree or assume-unchanged entries; such a build records no linked-worker source instead of failing.
+- A reconnect or resync keeps the conversation on screen in the desktop and mobile apps and catches up, instead of reloading it and losing earlier turns and the scroll position.
+- Expanded messages and tool details stay open when scrolled away, and long streaming replies no longer lag the desktop and mobile apps.
+- A render error or a damaged saved setting shows a Reload screen in the desktop and mobile apps instead of a blank window; the desktop app also reloads its window after a renderer crash.
+- The mobile gateway no longer unpairs every device and closes their terminals when it cannot read its device list: it answers 503 and clients retry. Clients take only a 401 as revoked.
+- Switching workspace in the mobile app registers it for push notifications.
+- iOS voice mode gives audio back to other apps when it stops, and handles calls, Siri and route changes.
+- Android: the saved-hub vault is excluded from backups and device transfers, and one that cannot be decrypted on a new phone resets with a notice instead of blocking pairing.
+- Cross-thread search, a thread's latest name and a message's turn read through the right index instead of scanning and sorting the log.
+- A streaming remote box no longer stalls every other request: a runner's ack batch is synced outside the hub's lock.
+- The desktop's workspace list tolerates a slow hub and keeps the last good list, and its tray is rebuilt only when what it shows changes.
+- `install.sh --pair` says so when the installed release is too old to pair, instead of failing on an unknown command.
+- The committed mobile command catalog matches the CLI again (`twr voice setup` was missing).
+- Desktop (macOS): a hub the app starts no longer keeps the app's crash reporter running after the app quits.
+- Desktop (macOS): launches no longer copy and hash the bundled engines every time because of a manifest that signing made invalid.
+- The hints that bring a box to the hub's twr add `--allow-downgrade` when the box runs a newer twr, use the installer over a development build of the hub's version, and name both cases when the box's version isn't known.
+- The hub forgets, as it starts, runner watermarks of threads it no longer keeps.
+- The mobile gateway works with a twr home whose path is too long for its administration socket, and prints a pairing code only once it is serving.
+- A runner service or linked-runner worker whose twr home was deleted without `twr runner stop` now ends, once the directory has been gone (its filesystem still there) for five looks over five minutes. A home that is only briefly unavailable (permission or I/O errors, a hung network filesystem, an unmounted volume) never counts. The service no longer re-creates lease files in a home that is gone.
+- `twr runner stop`, and any other end of the runner service, take its launchd job away, so stopped services no longer pile up as `tools.twr.box.*` labels in `launchctl list`.
+- Every `twr` drops an inherited macOS crash handler, so a hub, runner service or box daemon started from the desktop app's terminal no longer keeps the app's crash reporter alive.
+- Typing very fast in the desktop app's message box, or a tool that types for you, no longer drops characters.
+- `twr ws rm` and `twr hub stop` could take a workspace whose lock had just been let go for one with a running hub, and the mobile gateway's status could fail with "No such file or directory" right after it stopped: both locks are now released explicitly, not only by closing their file.
+- On macOS, a command twr started (git, `ps`, a runtime probe) could die before it ran, killed by SIGKILL and leaving a crash report of twr, when twr started it while another of its threads was first setting up a system service.
+
+### Security
+
+- A paired device without terminal access can no longer start or move a thread, or the orchestrator, onto a `pty:` or `acp:` command line: only onto an agent runtime or a configured preset, as the orchestrator may.
+- A paired device without admin access can no longer change a thread's mode or move it to another runtime by any route: a typed command, the orchestrator acting on its message, or Confirm on a card. `outside_pin` needs admin too.
+- The mobile gateway limits unauthenticated connections per address and in total and times them out, and rate-limits pairing and refused tokens per address, so one source cannot exhaust it or block pairing.
+- A runner's frames for thread ids the hub never had keep no watermark, and a malformed thread id closes the connection, so an authenticated runner cannot grow the hub's database without bound. A `hello` with an invalid box name is refused, and refusal notes say when they came from an unauthenticated connection.
+- The desktop installers' checksums are signed (`desktop-sha256sums.txt.sig`), each installer has a build provenance attestation, and desktop release builds use no CI caches.
+- twr.tools sends a Content-Security-Policy, `X-Frame-Options`, `X-Content-Type-Options` and `Referrer-Policy`.
+- The mobile apps delete transcript exports after sharing them.
+- twr's built-in SQLite is 3.54.1 (rusqlite 0.41), which no longer returns uninitialized memory for a database opened with a `-wal` file of another page size (RUSTSEC-2026-0459, CVE-2026-119375).
+- `twr mcp` is built on rmcp 3.9, past RUSTSEC-2026-0457, RUSTSEC-2026-0461 and RUSTSEC-2026-0462. Those are in rmcp's Streamable HTTP and OAuth code, which twr doesn't use (`twr mcp` speaks MCP over stdio), so no released twr was exposed.
+- Desktop: a packaged app ignores `TWR_DESKTOP_TEST_AUTOMATION` unless it is a QA build, so no process can reopen remote debugging in an installed app by setting it.
+- Desktop: AppImage self-updates install only an image listed in the release's signed `desktop-sha256sums.txt`, checked with the twr release key; a release without that signature is offered as a manual download.
+- A paired device's requests are refused with an error to try again while the hub cannot read the device list, instead of being served on the access it had when it connected.
+- A runner whose inventory names something that is not a thread id is refused before the welcome.
+- A paired device without admin access starts threads only in a configured project, or in a folder or git repository that is not, and does not hold, the home folder and is clear of twr's data and credentials folders. A folder outside git is allowed.
 
 ## [0.3.0] - 2026-10-30
 
