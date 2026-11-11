@@ -320,6 +320,7 @@ fn on_a_pty(
     c.stdin(slave.try_clone().unwrap())
         .stdout(slave.try_clone().unwrap())
         .stderr(slave.try_clone().unwrap());
+    twr_core::fork::prepare_fork();
     // SAFETY: setsid(2) and ioctl(2) are async-signal-safe and nothing is allocated: a new
     // session whose controlling terminal is the pseudo-terminal on stdin (TIOCSCTTY), so
     // `/dev/tty` is it.

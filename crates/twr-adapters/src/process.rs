@@ -306,6 +306,7 @@ pub fn forget_inherited_crash_handler() {
 /// together with `process_group(0)`: a group leader cannot start a session (`EPERM`). A
 /// process it starts that makes a session of its own (`setsid`, a daemon) leaves that group.
 pub fn new_session(cmd: &mut tokio::process::Command) {
+    twr_core::fork::prepare_fork();
     // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
     unsafe {
         cmd.pre_exec(setsid);
@@ -315,6 +316,7 @@ pub fn new_session(cmd: &mut tokio::process::Command) {
 /// [`new_session`] for a `std` command.
 pub fn new_session_std(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
+    twr_core::fork::prepare_fork();
     // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
     unsafe {
         cmd.pre_exec(setsid);

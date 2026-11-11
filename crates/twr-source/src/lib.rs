@@ -131,6 +131,7 @@ pub fn command(repo: &Path) -> tokio::process::Command {
     ] {
         cmd.arg("-c").arg(setting);
     }
+    twr_core::fork::prepare_fork();
     // A malicious pack cannot make one unbounded output file. Aggregate growth is monitored.
     unsafe {
         cmd.pre_exec(|| {
@@ -222,6 +223,7 @@ impl Repository {
         let result = async {
             let mut cmd = command(&self.0);
             cmd.args(["bundle", "create"]).arg(path).arg(&name);
+            twr_core::fork::prepare_fork();
             unsafe {
                 cmd.pre_exec(|| {
                     let limit = libc::rlimit {

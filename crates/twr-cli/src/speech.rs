@@ -1069,6 +1069,7 @@ fn start_speaker(args: &Remote, log: &std::fs::File) -> anyhow::Result<tokio::pr
     cmd.stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log.try_clone()?);
+    twr_core::fork::prepare_fork();
     // SAFETY: the closure runs in the child between fork and exec and calls only setsid, which
     // is async-signal-safe.
     unsafe {
