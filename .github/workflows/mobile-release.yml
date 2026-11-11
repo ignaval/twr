@@ -1,0 +1,164 @@
+name: Mobile release
+
+# Builds the store builds of the phone apps (application id `tools.twr.mobile`, no remote push)
+# from main: a signed Android App Bundle, kept as an artifact to upload to Google Play, and a
+# signed iOS build, sent to App Store Connect for TestFlight. Run it by hand from main:
+#
+#   gh workflow run mobile-release.yml --ref main -f build=0
+#
+# From any other branch it refuses. The version is the clients' (clients/package.json); `build`
+# tells two uploads of one version apart (mobile/scripts/build-number.mjs). The signing
+# material lives in the protected `release` environment, whose jobs wait for a maintainer's
+# approval; a job whose secrets are missing fails and says which. docs/mobile.md, Publishing.
+#
+# Actions are pinned to full commit SHAs (the comment names the release).
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: Build of this version, 0 to 99 (raise it to upload the same version again)
+        required: true
+        default: "0"
+
+permissions:
+  contents: read
+
+# One at a time: two runs could send the same build number.
+concurrency:
+  group: mobile-release
+  cancel-in-progress: false
+
+env:
+  TWR_MOBILE_BUILD_NUMBER: ${{ inputs.build }}
+
+jobs:
+  # The workflow file comes from the ref that started the run: only main may sign.
+  guard:
+    name: check the ref and the build number
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Releases run from main
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::mobile releases run from main, not $GITHUB_REF"
+            exit 1
+          fi
+          if ! [[ "$TWR_MOBILE_BUILD_NUMBER" =~ ^[0-9]{1,2}$ ]]; then
+            echo "::error::build must be 0 to 99"
+            exit 1
+          fi
+
+  android:
+    name: Android App Bundle
+    needs: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # gradlew runs the committed gradle-wrapper.jar: it must be one Gradle published.
+      - uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build the store UI and sync it into the native projects
+        working-directory: clients
+        run: |
+          npm ci
+          npm run mobile:build:store
+      - name: Build and sign the release bundle
+        working-directory: clients/mobile/android
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE }}
+          TWR_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          TWR_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          TWR_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+        run: |
+          for name in KEYSTORE_BASE64 TWR_ANDROID_KEYSTORE_PASSWORD TWR_ANDROID_KEY_ALIAS TWR_ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::the release environment lacks an Android upload key secret (ANDROID_UPLOAD_KEYSTORE, ANDROID_UPLOAD_KEYSTORE_PASSWORD, ANDROID_UPLOAD_KEY_ALIAS, ANDROID_UPLOAD_KEY_PASSWORD): docs/mobile.md, Publishing"
+              exit 1
+            fi
+          done
+          # In a private directory this step makes, recorded for the cleanup step.
+          keydir=$(mktemp -d "$RUNNER_TEMP/android-signing.XXXXXXXX")
+          echo "TWR_ANDROID_SIGNING_DIR=$keydir" >> "$GITHUB_ENV"
+          (umask 077 && set -C && printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$keydir/upload.jks")
+          TWR_ANDROID_KEYSTORE="$keydir/upload.jks" ./gradlew --no-daemon bundleRelease
+          bundle=app/build/outputs/bundle/release/app-release.aab
+          # An unsigned bundle would be refused by Play only after the upload.
+          if ! jarsigner -verify "$bundle" | grep -q '^jar verified'; then
+            echo "::error::$bundle is not signed"
+            exit 1
+          fi
+      - name: Remove the upload key
+        if: always()
+        run: |
+          if [ -n "${TWR_ANDROID_SIGNING_DIR:-}" ] && [ -d "$TWR_ANDROID_SIGNING_DIR" ] && [ ! -L "$TWR_ANDROID_SIGNING_DIR" ]; then
+            rm -rf "$TWR_ANDROID_SIGNING_DIR"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: twr-android-release
+          path: clients/mobile/android/app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+
+  ios:
+    name: iOS build to TestFlight
+    needs: guard
+    runs-on: xcode-27
+    timeout-minutes: 60
+    environment: release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "26.13.0"
+          cache: npm
+          cache-dependency-path: clients/package-lock.json
+      - name: Build the store UI and sync it into the native projects
+        working-directory: clients
+        run: |
+          npm ci
+          npm run mobile:build:store
+      # Xcode's automatic signing with an App Store Connect API key: xcodebuild makes the
+      # distribution certificate and profile, signs, and uploads (ios-release.mjs).
+      - name: Archive, sign and upload
+        working-directory: clients
+        shell: bash
+        env:
+          TWR_IOS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_API_KEY: ${{ secrets.ASC_API_KEY }}
+          TWR_ASC_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          TWR_ASC_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+        run: |
+          for name in TWR_IOS_TEAM_ID ASC_API_KEY TWR_ASC_KEY_ID TWR_ASC_ISSUER_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::the release environment lacks an iOS signing secret (APPLE_TEAM_ID, ASC_API_KEY, ASC_API_KEY_ID, ASC_API_ISSUER_ID): docs/mobile.md, Publishing"
+              exit 1
+            fi
+          done
+          keydir=$(mktemp -d "$RUNNER_TEMP/ios-signing.XXXXXXXX")
+          echo "TWR_IOS_SIGNING_DIR=$keydir" >> "$GITHUB_ENV"
+          (umask 077 && set -C && printf '%s\n' "$ASC_API_KEY" > "$keydir/AuthKey.p8")
+          TWR_ASC_KEY_PATH="$keydir/AuthKey.p8" node mobile/scripts/ios-release.mjs --upload
+      - name: Remove the API key
+        if: always()
+        run: |
+          if [ -n "${TWR_IOS_SIGNING_DIR:-}" ] && [ -d "$TWR_IOS_SIGNING_DIR" ] && [ ! -L "$TWR_IOS_SIGNING_DIR" ]; then
+            rm -rf "$TWR_IOS_SIGNING_DIR"
+          fi

@@ -4,6 +4,15 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- Store builds of the iOS and Android apps: `npm run mobile:release:android` and `npm run mobile:release:ios` make them (application id `tools.twr.mobile`, a build number made from the version, Android signed with your upload key, iOS archived and signed for your team), and the `mobile-release.yml` workflow makes both from `main` and sends the iOS build to TestFlight. A store build has no remote push and shows no **Enable remote push**. Development builds keep `tools.twr.mobile.dev`, so both install on one phone. See [mobile.md](docs/mobile.md#publishing).
+- [privacy.md](docs/privacy.md): what the apps do with your data.
+
+### Fixed
+
+- The iOS and Android apps could start with the wrong status bar and a black edge around the page: on a slow start they read the theme's colors before the stylesheet had applied, sent the native side a light theme on black, and never corrected it. They now wait for the stylesheet, and sync again once the page has loaded.
+
 ## [0.4.0] - 2026-11-10
 
 Desktop apps for Apple Silicon macOS and Linux, and iOS and Android apps, on the same interface as the TUI; machines paired as runners with a short-lived code; voice mode; a grouped Needs you inbox with search; model pickers; the tray, badge and system notifications across every workspace; and an audit of the hub, gateway, runners and every client, with its security fixes.

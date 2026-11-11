@@ -2,6 +2,6 @@
 <resources>
     <string name="app_name">twr</string>
     <string name="title_activity_main">twr</string>
-    <string name="package_name">tools.twr.mobile.dev</string>
-    <string name="custom_url_scheme">tools.twr.mobile.dev</string>
+    <string name="package_name">tools.twr.mobile</string>
+    <string name="custom_url_scheme">tools.twr.mobile</string>
 </resources>

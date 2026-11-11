@@ -1,0 +1,6 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <!-- A debug build's application id (build.gradle's applicationIdSuffix). -->
+    <string name="package_name">tools.twr.mobile.dev</string>
+    <string name="custom_url_scheme">tools.twr.mobile.dev</string>
+</resources>
