@@ -110,6 +110,11 @@ jobs:
       - name: Assemble the debug APK
         working-directory: clients/mobile/android
         run: ./gradlew --no-daemon assembleDebug
+      # The store build (application id tools.twr.mobile), unsigned here: mobile-release.yml
+      # signs it. Compiled so a change that breaks only the release variant fails in review.
+      - name: Assemble the release bundle (unsigned)
+        working-directory: clients/mobile/android
+        run: ./gradlew --no-daemon bundleRelease
       - name: Android lint
         working-directory: clients/mobile/android
         run: ./gradlew --no-daemon lint

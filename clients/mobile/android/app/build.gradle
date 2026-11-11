@@ -1,15 +1,38 @@
 apply plugin: 'com.android.application'
 
+// The version is the clients' (package.json). The version code a store asks to grow with every
+// upload is made from it and from TWR_MOBILE_BUILD_NUMBER (0 to 99, for a second upload of one
+// version): 0.4.0 build 0 is 40000, 1.2.3 build 4 is 1020304. mobile/scripts/build-number.mjs
+// gives iOS the same number.
+def twrVersion = new groovy.json.JsonSlurper().parse(rootProject.file('../../package.json')).version
+def twrVersionCode = {
+    def parts = (twrVersion =~ /^(\d+)\.(\d+)\.(\d+)/)
+    if (!parts.find()) throw new GradleException("package.json version ${twrVersion} is not major.minor.patch")
+    def build = (System.getenv('TWR_MOBILE_BUILD_NUMBER') ?: '0')
+    if (!(build ==~ /\d{1,2}/)) throw new GradleException("TWR_MOBILE_BUILD_NUMBER must be 0 to 99, not '${build}'")
+    def (major, minor, patch) = [parts.group(1), parts.group(2), parts.group(3)].collect { it as int }
+    if (minor > 99 || patch > 99) throw new GradleException("version ${twrVersion}: minor and patch must be under 100 for the version code")
+    return major * 1000000 + minor * 10000 + patch * 100 + (build as int)
+}()
+
+// A release build is signed for upload when TWR_ANDROID_KEYSTORE names a keystore file (with
+// TWR_ANDROID_KEYSTORE_PASSWORD, TWR_ANDROID_KEY_ALIAS and TWR_ANDROID_KEY_PASSWORD); without
+// it the release build is left unsigned, which is what CI compiles. docs/mobile.md, Publishing.
+def twrKeystore = System.getenv('TWR_ANDROID_KEYSTORE')
+
 android {
     buildFeatures { buildConfig true }
+    // The Java package of the app's code. The application id is separate: `tools.twr.mobile`
+    // in a release build, the store's; `tools.twr.mobile.dev` in a debug build, so a
+    // development build installs beside the store's app and keeps its own data.
     namespace = "tools.twr.mobile.dev"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "tools.twr.mobile.dev"
+        applicationId "tools.twr.mobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName new groovy.json.JsonSlurper().parse(rootProject.file('../../package.json')).version
+        versionCode twrVersionCode
+        versionName twrVersion
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -17,10 +40,24 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        if (twrKeystore) {
+            upload {
+                storeFile file(twrKeystore)
+                storePassword System.getenv('TWR_ANDROID_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('TWR_ANDROID_KEY_ALIAS')
+                keyPassword System.getenv('TWR_ANDROID_KEY_PASSWORD')
+            }
+        }
+    }
     buildTypes {
+        debug {
+            applicationIdSuffix ".dev"
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (twrKeystore) signingConfig signingConfigs.upload
         }
     }
 }

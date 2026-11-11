@@ -97,6 +97,52 @@ Omit either provider if unused. Enable remote push in the app after configuring 
 
 Dark is the first-launch default. Appearance controls in the hub sheet and pairing screen are local preferences available to every device scope; they do not require hub admin access. Native system bars and backgrounds follow Dark, Light and System. Keyboard-visible layouts hide the bottom navigation and retain a reachable dismiss-keyboard control.
 
+## Publishing
+
+The store builds are separate from the development builds:
+
+| | Development build | Store build |
+|---|---|---|
+| Application id | `tools.twr.mobile.dev` | `tools.twr.mobile` |
+| Made by | `npm run mobile:android`, `npm run mobile:ios` (Debug) | `npm run mobile:release:android`, `npm run mobile:release:ios` (Release) |
+| Remote push | Yours to configure ([Notifications](#notifications)) | None: no push entitlement or Firebase app, and the app shows no **Enable remote push** |
+| Plain HTTP to the phone itself | Allowed | Refused |
+
+Both can be installed on one phone; each keeps its own hubs and data. A store build has no remote push because only its publisher's Apple and Firebase keys can reach it, and a gateway you host has none of them: its notifications arrive while the app is connected. `npm run mobile:build:store` is the web layer of a store build (`TWR_MOBILE_APP_ID=tools.twr.mobile`, `VITE_TWR_REMOTE_PUSH=0`); the two release commands run it first.
+
+The version is the clients' (`clients/package.json`). The build number both stores want to grow with every upload is made from it: 0.4.0 is 40000, and `TWR_MOBILE_BUILD_NUMBER` (0 to 99) is added to it for another upload of the same version (`node mobile/scripts/build-number.mjs` prints it).
+
+### Android
+
+`npm run mobile:release:android` writes `clients/mobile/android/app/build/outputs/bundle/release/app-release.aab`. It is signed when `TWR_ANDROID_KEYSTORE` names a keystore file, with `TWR_ANDROID_KEYSTORE_PASSWORD`, `TWR_ANDROID_KEY_ALIAS` and `TWR_ANDROID_KEY_PASSWORD`; without them it is unsigned, which is what CI compiles. The keystore is the upload key: Google Play signs what phones install with its own key (Play App Signing). Make one once and keep it and its passwords outside the repository:
+
+```sh
+keytool -genkeypair -keystore ~/.config/twr-release/android-upload.jks -alias upload -keyalg RSA -keysize 4096 -validity 10000
+```
+
+A local `google-services.json` made for `tools.twr.mobile.dev` stops a release build, which looks in it for `tools.twr.mobile`: move it aside for the release build.
+
+### iOS
+
+`npm run mobile:release:ios` archives the Release configuration, signs it with Xcode's automatic signing for the team in `TWR_IOS_TEAM_ID`, and exports an `.ipa` to `clients/mobile/ios/App/output/`. After `npm run mobile:build:store`, `node mobile/scripts/ios-release.mjs --upload` sends it to App Store Connect instead, and `--check` archives without signing, with no Apple account. On a Mac whose Xcode is signed in to the team nothing else is needed. Elsewhere an App Store Connect API key signs and uploads: `TWR_ASC_KEY_PATH` (the `.p8` file, an absolute path), `TWR_ASC_KEY_ID` and `TWR_ASC_ISSUER_ID`. The app's record, with the bundle id `tools.twr.mobile`, has to exist in App Store Connect before the first upload.
+
+`Info.plist` declares `ITSAppUsesNonExemptEncryption` false: the app's only encryption is the system's (HTTPS, the Keychain, CryptoKit for its own files). Review that declaration if the app ever ships encryption of its own.
+
+### From GitHub
+
+`.github/workflows/mobile-release.yml` makes both store builds from `main`, by hand: `gh workflow run mobile-release.yml --ref main -f build=0`. Its jobs run in the protected `release` environment and wait for a maintainer's approval. The Android job keeps the signed bundle as the `twr-android-release` artifact, to upload in the Play Console, where a new app's first bundle has to be uploaded by hand. The iOS job uploads to App Store Connect, where the build appears in TestFlight once processed. The environment's secrets:
+
+- `ANDROID_UPLOAD_KEYSTORE` (the keystore file in base64), `ANDROID_UPLOAD_KEYSTORE_PASSWORD`, `ANDROID_UPLOAD_KEY_ALIAS`, `ANDROID_UPLOAD_KEY_PASSWORD`.
+- `APPLE_TEAM_ID` (the desktop app's signing uses it too), `ASC_API_KEY` (the contents of the `.p8` file), `ASC_API_KEY_ID`, `ASC_API_ISSUER_ID`. The key needs a role that may create signing certificates and upload builds (Admin does).
+
+A job whose secrets are missing fails and names them.
+
+### Not verified
+
+The signed paths have not run with real credentials: Xcode's signing and the upload to App Store Connect, the workflow, and a bundle accepted by Google Play. What has run: the store web layer, a release bundle signed with a throwaway key (application id `tools.twr.mobile`, version code 40003 for build 3), and an unsigned archive of the iOS Release configuration.
+
+Both stores also ask for things outside the repository: a privacy policy ([privacy.md](privacy.md)), screenshots, the stores' own privacy forms, and a way for their reviewers to use an app that does nothing until it is paired with a hub.
+
 ## Verification status
 
 Remote push can be disabled for a hub from its settings. Forget unregisters this device's push tokens when the hub is reachable; if it is offline, the app warns that host-side revocation is still needed. Forget and Revoke both remove that hub's local drafts and editor sessions.

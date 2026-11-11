@@ -25,8 +25,16 @@ export async function disablePush(host: RemoteHost, id: string) {
 export const pushPreferenceKey = (id: string) => `twr.mobile.push.${id}`;
 export const pushEnabled = (id: string) =>
   localStorage.getItem(pushPreferenceKey(id)) === "true";
+/**
+ * False in a store build (`VITE_TWR_REMOTE_PUSH=0`, set by `npm run mobile:build:store`).
+ * Such a build is signed without a push entitlement or a Firebase app: only its publisher's
+ * keys could reach it, and a self-hosted gateway has none. It offers no remote push and
+ * never registers for it; local notifications are unaffected.
+ */
+export const remotePushBuilt = () =>
+  import.meta.env.VITE_TWR_REMOTE_PUSH !== "0";
 export async function refreshPush(host: RemoteHost, id: string) {
-  if (pushEnabled(id)) await enablePush(host, id, false);
+  if (remotePushBuilt() && pushEnabled(id)) await enablePush(host, id, false);
 }
 /**
  * Removes the push and local notifications twr has delivered. Called when the app
@@ -109,7 +117,9 @@ export async function testNotification() {
       {
         id: Math.floor(Date.now() % 2147483647),
         title: "twr · local test",
-        body: "Tap to open Needs you. Remote push delivery needs your Apple or Firebase configuration.",
+        body: remotePushBuilt()
+          ? "Tap to open Needs you. Remote push delivery needs your Apple or Firebase configuration."
+          : "Tap to open Needs you.",
         channelId: "twr-attention",
         isExactNotification: false,
         extra: { event: "test" },
@@ -138,6 +148,8 @@ async function registerPush(
   id: string,
   allowPrompt: boolean,
 ) {
+  if (!remotePushBuilt())
+    throw new Error("This build of twr has no remote push.");
   const generation = generations.get(host) || 0;
   const current = () => (generations.get(host) || 0) === generation;
   const config = await host.request("push-status");

@@ -1,7 +1,9 @@
 import { KeyboardResize } from "@capacitor/keyboard";
 import type { CapacitorConfig } from "@capacitor/cli";
 const config: CapacitorConfig = {
-  appId: "tools.twr.mobile.dev",
+  // A development build's id. A store build is `tools.twr.mobile`: the release scripts set
+  // TWR_MOBILE_APP_ID for `cap sync`, and the native projects name it for their release builds.
+  appId: process.env.TWR_MOBILE_APP_ID || "tools.twr.mobile.dev",
   appName: "twr",
   backgroundColor: "#0e1013",
   loggingBehavior: "none",
