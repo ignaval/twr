@@ -105,6 +105,7 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
         .env_remove("TWR_DEVICE_TOKEN")
         .env_remove("TWR_MOBILE_TRANSPORT")
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
+    twr_core::fork::prepare_fork();
     // SAFETY: setsid is async-signal-safe and touches no Rust allocation or locks.
     unsafe {
         command.pre_exec(|| {

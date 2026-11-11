@@ -37,6 +37,7 @@ pub mod compact;
 pub mod config;
 pub mod config_edit;
 pub mod event;
+pub mod fork;
 pub mod fsread;
 pub mod git;
 pub mod gitremote;

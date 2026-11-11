@@ -325,6 +325,7 @@ struct BuildRecord {
 }
 fn inherit_build_lease(command: &mut tokio::process::Command, lease: &std::fs::File) {
     let fd = lease.as_raw_fd();
+    twr_core::fork::prepare_fork();
     // Change only the forked child's descriptor flags. Unrelated service children retain
     // CLOEXEC, while Cargo and its compiler descendants keep the single-build kernel lease.
     unsafe {

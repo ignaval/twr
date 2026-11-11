@@ -318,6 +318,7 @@ fn run_with_deadline(program: &str, args: &[&str]) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    crate::fork::prepare_fork();
     // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
