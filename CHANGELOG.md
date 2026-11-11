@@ -113,6 +113,7 @@ Upgrading: the runner protocol is now 8 and the client protocol 2, so update twr
 - Every `twr` drops an inherited macOS crash handler, so a hub, runner service or box daemon started from the desktop app's terminal no longer keeps the app's crash reporter alive.
 - Typing very fast in the desktop app's message box, or a tool that types for you, no longer drops characters.
 - `twr ws rm` and `twr hub stop` could take a workspace whose lock had just been let go for one with a running hub, and the mobile gateway's status could fail with "No such file or directory" right after it stopped: both locks are now released explicitly, not only by closing their file.
+- On macOS, a command twr started (git, `ps`, a runtime probe) could die before it ran, killed by SIGKILL and leaving a crash report of twr, when twr started it while another of its threads was first setting up a system service.
 
 ### Security
 
