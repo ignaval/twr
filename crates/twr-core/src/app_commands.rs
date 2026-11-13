@@ -25,6 +25,7 @@ pub fn validate(args: &[String]) -> Result<()> {
         "trash",
         "log",
         "job",
+        "loop",
         "speech",
         "speak",
         "voice",

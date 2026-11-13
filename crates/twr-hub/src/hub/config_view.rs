@@ -18,6 +18,7 @@ use twr_core::config::{
     LogConfig, NotifyConfig, OrchestratorConfig, ProjectConfig, RuntimePreset, ThreadsConfig,
     TrashConfig, TuiConfig, TuiNotifyConfig, DEFAULT_PROJECT_ROOTS,
 };
+use twr_core::loops::config::{LoopsConfig, ProfileConfig};
 
 /// A runtime as `config.show` shows it: a name as it is, a command line (`acp:<command>`,
 /// `pty:<command>`, which can carry credentials in its arguments) as its kind only.
@@ -50,6 +51,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         project_roots,
         accounts,
         account_policy,
+        loops,
         // The speaker's (`twr speak`, the TUI's), not the hub's: not shown (its `command` can
         // carry a hosted voice's key in its arguments).
         speech: _,
@@ -234,6 +236,40 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             (rt.clone(), json!({ "default": default }))
         })
         .collect();
+    // `[loops]`: models and limits, no secret (an account is a name).
+    let LoopsConfig {
+        profile: loop_profile,
+        implementer: loop_implementer,
+        reviewer: loop_reviewer,
+        workers: loop_workers,
+        commit: loop_commit,
+        sweep: loop_sweep,
+        max_audit_runs,
+        round_timeout_span,
+        max_rounds_per_tier,
+        offer_review,
+        profiles: loop_profiles,
+    } = loops;
+    let loop_profiles: Map<String, Value> = loop_profiles
+        .iter()
+        .map(|(name, p)| {
+            let ProfileConfig {
+                plan_check,
+                tiers,
+                sweep,
+                verify,
+            } = p;
+            (
+                name.clone(),
+                json!({
+                    "plan_check": plan_check,
+                    "tiers": tiers,
+                    "sweep": sweep,
+                    "verify": verify,
+                }),
+            )
+        })
+        .collect();
     let presets: Vec<&String> = runtimes
         .iter()
         .map(|(name, p)| {
@@ -297,6 +333,19 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "tls": tls.is_some(),
             "allow_insecure_remote": allow_insecure_remote,
         },
+        "loops": {
+            "profile": loop_profile,
+            "implementer": loop_implementer,
+            "reviewer": loop_reviewer,
+            "workers": loop_workers,
+            "commit": loop_commit,
+            "sweep": loop_sweep,
+            "max_audit_runs": max_audit_runs,
+            "round_timeout": round_timeout_span,
+            "max_rounds_per_tier": max_rounds_per_tier,
+            "offer_review": offer_review,
+            "profiles": loop_profiles,
+        },
         "tui": {
             "mouse": mouse,
             "animate": animate,
@@ -315,6 +364,33 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `[loops]` shows whole: models, limits and profiles.
+    #[test]
+    fn loops_show() {
+        let config = Config::from_toml_str(
+            r#"
+[loops]
+reviewer = "codex:team/gpt-6.1-sol"
+round_timeout = "90m"
+
+[loops.profiles.quick]
+tiers = [{ effort = "medium", max_rounds = 2 }]
+verify = { rounds = 1, effort = "medium" }
+"#,
+        )
+        .unwrap();
+        let v = config_view(&config, None);
+        assert_eq!(v["loops"]["reviewer"], "codex:team/gpt-6.1-sol");
+        assert_eq!(v["loops"]["round_timeout"], "90m");
+        assert_eq!(v["loops"]["implementer"], "thread");
+        assert_eq!(v["loops"]["commit"], "end");
+        assert_eq!(
+            v["loops"]["profiles"]["quick"],
+            json!({"plan_check": null, "tiers": [{"effort": "medium", "max_rounds": 2}],
+                "sweep": null, "verify": {"rounds": 1, "effort": "medium"}})
+        );
+    }
 
     #[test]
     fn secrets_never_show_and_names_do() {

@@ -31,7 +31,6 @@ import {
   type CSSProperties,
   type FormEvent,
   type ReactNode,
-  type RefObject,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -116,7 +115,29 @@ import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
-import { armed, armsIn, hidden, mayAnswer, shown, type Arming } from "./arming";
+import { mayAnswer } from "./arming";
+import { useArming } from "./useArming";
+import {
+  LoopChip,
+  LoopContext,
+  LoopEditorDialog,
+  LoopSetupCard,
+  LoopsSection,
+  ReviewLoopOffer,
+  type LoopActions,
+} from "./LoopViews";
+import {
+  endedLoops,
+  loopAccess,
+  loopSlash,
+  startedWords,
+  offerReviewSetting,
+  offersReview,
+  reviewRequest,
+  type EditorSource,
+  type LoopControlAction,
+  type ReviewRequest,
+} from "./loops";
 import {
   announce,
   attentionAnnouncement,
@@ -645,6 +666,21 @@ export default function App({
     void rpc("orchestrator.show")
       .then((show) => {
         if (live) setModelCatalog(show?.models);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [connected, workspace, rpc]);
+  // `[loops] offer_review` (`config.show`), once per connection: the Review loop button on
+  // a finished turn with changes. An older hub has no `loops`, and offers it.
+  const [offerReview, setOfferReview] = useState(true);
+  useEffect(() => {
+    if (!connected) return;
+    let live = true;
+    void rpc("config.show")
+      .then((config) => {
+        if (live) setOfferReview(offerReviewSetting(config));
       })
       .catch(() => {});
     return () => {
@@ -1376,6 +1412,8 @@ export default function App({
       announce(
         attentionAnnouncement({
           reason: item.reason,
+          loop_setup: item.loop_setup === true,
+          loop_stuck: item.loop_stuck === true,
           summary: item.summary,
           threadName: view.threads.find((t) => t.id === item.thread)?.name,
         }),
@@ -1383,6 +1421,20 @@ export default function App({
     if (fresh.length > 3)
       announce(`${fresh.length - 3} more requests need you`);
   }, [view.attention, connected, workspace]);
+  // A loop that ends is said, as a new request is: in any thread, not only the one shown.
+  const knownLoops = useRef<{ workspace: string; ids: Map<string, string> }>(
+    undefined,
+  );
+  useEffect(() => {
+    if (!connected) return;
+    const known = knownLoops.current;
+    const { said, known: ids } = endedLoops(
+      known?.workspace === workspace ? known.ids : undefined,
+      view.threads,
+    );
+    knownLoops.current = { workspace, ids };
+    for (const words of said.slice(0, 3)) announce(words);
+  }, [view.threads, connected, workspace]);
   const turnBaseline = useRef<{ thread?: string; end?: string }>({});
   useEffect(() => {
     const end = events.findLast((event) => event.kind === "turn.ended");
@@ -1909,6 +1961,26 @@ export default function App({
             });
           break;
         }
+        case "Review": {
+          const { thread: reviewed, ...request } = reviewRequest(args, chosen);
+          if (await startReview(reviewed, request)) drafts.set(draftKey, "");
+          return;
+        }
+        case "Loop": {
+          const what = loopSlash(args, chosen);
+          if (what.kind === "saved") setLoopEditor(what);
+          else {
+            const target = named(what.thread);
+            if (!target) throw new Error(`No thread named ${what.thread}.`);
+            if (what.kind === "status") showLoop(target.id);
+            else {
+              if (await controlLoop(target.id, what.action))
+                drafts.set(draftKey, "");
+              return;
+            }
+          }
+          break;
+        }
         case "Quit":
           await hostApi.quit();
           break;
@@ -2163,6 +2235,136 @@ export default function App({
     },
     [liveAnswerCheck, rpc],
   );
+  // Loops (shared/LoopViews.tsx): every start, control and settings save goes through these,
+  // under the same live-view guard as answers: nothing goes to the outbox.
+  const [loopEditor, setLoopEditor] = useState<EditorSource>();
+  const [loopSettingsVersion, setLoopSettingsVersion] = useState(0);
+  /** The thread whose inspector should bring its Loops section into view. */
+  const [loopFocus, setLoopFocus] = useState<string>();
+  const [notice, setNotice] = useState("");
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(""), 6000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+  const loopNavigation = useRef({
+    destination,
+    section,
+    narrow,
+    threads: view.threads,
+  });
+  loopNavigation.current = {
+    destination,
+    section,
+    narrow,
+    threads: view.threads,
+  };
+  /** The thread whose setup card, just raised, the inspector brings into view and focuses:
+   * the inspector opens at its top, with the card's buttons below the fold. */
+  const [revealSetup, setRevealSetup] = useState<string>();
+  useEffect(() => {
+    if (!revealSetup) return;
+    const card = [
+      ...document.querySelectorAll<HTMLElement>(
+        "#twr-inspector .attention-loop-setup",
+      ),
+    ].find((node) => node.dataset.thread === revealSetup);
+    if (!card) return;
+    card.scrollIntoView({ block: "nearest", behavior: scrollBehavior() });
+    card.focus({ preventScroll: true });
+    setRevealSetup(undefined);
+  }, [revealSetup, view.attention, selected]);
+  /** Selects thread `id` and brings its inspector's Loops section into view. */
+  const showLoop = useCallback((id: string) => {
+    setSelected(id);
+    setLoopFocus(id);
+  }, []);
+  const startReview = useCallback(
+    async (
+      thread: string,
+      options: Omit<ReviewRequest, "thread" | "kind"> = {},
+    ): Promise<boolean> => {
+      try {
+        liveAnswerCheck();
+        const request: ReviewRequest = { thread, kind: "review", ...options };
+        const result = await rpc("loop.request", request);
+        const nav = loopNavigation.current;
+        const found = nav.threads.find((t) =>
+          [t.id, t.name, ...(t.aliases || [])].includes(thread),
+        );
+        const name = found?.name || thread;
+        if (result?.status === "started") {
+          // What it runs on, as the hub tells the orchestrator: the models stay in sight.
+          const detail = await rpc("loop.get", { thread }).catch(
+            () => undefined,
+          );
+          const words = startedWords(detail?.started, found);
+          const line = words || result.loop?.line;
+          setNotice(`${name} started a review loop${line ? `: ${line}` : ""}.`);
+        } else if (result?.status === "needs_setup") {
+          // The card is the user's to answer: bring it into view, never answer it here.
+          if (!found) setSection("attention");
+          else if (nav.section === "chat" && nav.destination === found.id) {
+            // The conversation shows its thread's requests above the transcript.
+          } else if (nav.narrow) setSection("attention");
+          else {
+            setSelected(found.id);
+            setRevealSetup(found.id);
+          }
+          setNotice(`Choose ${name}'s loop settings on its setup card.`);
+        }
+        return true;
+      } catch (error) {
+        fail(error);
+        return false;
+      }
+    },
+    [liveAnswerCheck, rpc, fail],
+  );
+  const controlLoop = useCallback(
+    async (thread: string, action: LoopControlAction): Promise<boolean> => {
+      try {
+        liveAnswerCheck();
+        const result = await rpc("loop.control", { thread, action });
+        announce(
+          result?.running === false
+            ? "The loop stopped"
+            : `Loop ${action === "skip_to_verify" ? "skips to verify" : action === "pause" ? "paused" : action === "resume" ? "resumed" : action}`,
+        );
+        return true;
+      } catch (error) {
+        fail(error);
+        return false;
+      }
+    },
+    [liveAnswerCheck, rpc, fail],
+  );
+  const loopActions = useMemo<LoopActions>(
+    () => ({
+      rpc,
+      fail,
+      access: loopAccess({ scopes: deviceScopes, connected }),
+      offerReview,
+      catalog: modelCatalog,
+      startReview,
+      control: controlLoop,
+      openEditor: setLoopEditor,
+      confirm: setConfirmation,
+      settingsVersion: loopSettingsVersion,
+      settingsChanged: () => setLoopSettingsVersion((n) => n + 1),
+    }),
+    [
+      rpc,
+      fail,
+      deviceScopes,
+      connected,
+      offerReview,
+      modelCatalog,
+      startReview,
+      controlLoop,
+      loopSettingsVersion,
+    ],
+  );
   const earlierTarget = target?.id;
   const earlier = useCallback(async () => {
     if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
@@ -2217,7 +2419,7 @@ export default function App({
         "--destination": destination ? target.accent : "var(--accent)",
       } as CSSProperties)
     : {};
-  return (
+  const shell = (
     <div className={`app ${sidebar ? "" : "sidebar-hidden"}`} style={rootStyle}>
       <button
         type="button"
@@ -2432,6 +2634,8 @@ export default function App({
                               pinned={pins.includes(thread.id)}
                               onSelect={selectThread}
                               onOpen={openThread}
+                              onLoop={showLoop}
+                              offer={offersReview(thread, offerReview)}
                             />
                           ))}
                           {!visible.length && (
@@ -2988,6 +3192,11 @@ export default function App({
                   summaries={assistance.summaries}
                   onError={fail}
                   onVisibleRoutines={setVisibleRoutines}
+                  offer={
+                    destination && target && offersReview(target, offerReview)
+                      ? target
+                      : undefined
+                  }
                 />
                 {!destination && workers.some((t) => t.last_report) && (
                   <details className="reports">
@@ -2998,16 +3207,20 @@ export default function App({
                     {workers
                       .filter((t) => t.last_report)
                       .map((t) => (
-                        <button
-                          key={t.id}
-                          aria-controls="twr-inspector"
-                          onClick={() => setSelected(t.id)}
-                        >
-                          <span style={{ color: t.accent }}>{t.name}</span>
-                          <span className="visually-hidden">: </span>
-                          <span>{t.last_report.summary}</span>
-                          <ArrowUpRight size={14} />
-                        </button>
+                        <div className="report-row" key={t.id}>
+                          <button
+                            aria-controls="twr-inspector"
+                            onClick={() => setSelected(t.id)}
+                          >
+                            <span style={{ color: t.accent }}>{t.name}</span>
+                            <span className="visually-hidden">: </span>
+                            <span>{t.last_report.summary}</span>
+                            <ArrowUpRight size={14} />
+                          </button>
+                          {offersReview(t, offerReview) && (
+                            <ReviewLoopOffer thread={t} />
+                          )}
+                        </div>
                       ))}
                   </details>
                 )}
@@ -3229,6 +3442,10 @@ export default function App({
                       pinned={pins.includes(t.id)}
                       onSelect={selectThread}
                       onOpen={openThread}
+                      // A narrow window (a phone) has no sidebar list beside the grid: the
+                      // grid is where its cards are, so they carry the loop chip and offer.
+                      onLoop={narrow ? showLoop : undefined}
+                      offer={narrow && offersReview(t, offerReview)}
                       large
                     />
                   ))}
@@ -3339,6 +3556,7 @@ export default function App({
                 action={action}
                 cliAction={cliAction}
                 fail={fail}
+                connected={connected}
               />
             )}
           </div>
@@ -3434,6 +3652,15 @@ export default function App({
                     fail={fail}
                   />
                 ))}
+                {!selectedThread.is_orchestrator && (
+                  <LoopsSection
+                    key={selectedThread.id}
+                    thread={selectedThread}
+                    connected={connected}
+                    focus={loopFocus === selectedThread.id}
+                    onFocused={() => setLoopFocus(undefined)}
+                  />
+                )}
                 {selectedThread.last_report && (
                   <section className="inspector-report">
                     <h3>Latest report</h3>
@@ -3642,6 +3869,30 @@ export default function App({
             <X size={15} />
           </button>
         </div>
+      )}
+      {notice && !error && (
+        <div role="status" className="toast notice-toast" data-modal-keep="">
+          <Check size={17} aria-hidden="true" />
+          <span>{notice}</span>
+          <button
+            aria-label="Dismiss notice"
+            title="Dismiss"
+            onClick={() => setNotice("")}
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
+      {loopEditor && (
+        <LoopEditorDialog
+          source={loopEditor}
+          thread={
+            loopEditor.kind === "card"
+              ? view.threads.find((t) => t.id === loopEditor.thread)
+              : undefined
+          }
+          onClose={() => setLoopEditor(undefined)}
+        />
       )}
       {palette && (
         <Dialog
@@ -4074,6 +4325,9 @@ export default function App({
       </span>
     </div>
   );
+  return (
+    <LoopContext.Provider value={loopActions}>{shell}</LoopContext.Provider>
+  );
 }
 
 /** Memoized, with stable `onSelect`/`onOpen` taking the thread's id and `items` shared
@@ -4086,6 +4340,8 @@ const ThreadCard = memo(function ThreadCard({
   pinned,
   onSelect,
   onOpen,
+  onLoop,
+  offer = false,
   large = false,
   listItem = false,
 }: {
@@ -4096,6 +4352,11 @@ const ThreadCard = memo(function ThreadCard({
   pinned: boolean;
   onSelect: (id: string) => void;
   onOpen: (id: string) => void;
+  /** The loop chip's click: the sidebar's cards show the chip, and so do the grid's in a
+   * narrow window (a phone), where the grid is the thread list. */
+  onLoop?: (id: string) => void;
+  /** Offer a Review loop on the thread's finished turn with changes (where the chip shows). */
+  offer?: boolean;
   large?: boolean;
   listItem?: boolean;
 }) {
@@ -4108,15 +4369,24 @@ const ThreadCard = memo(function ThreadCard({
       pinned={pinned}
       onSelect={() => onSelect(thread.id)}
       onOpen={() => onOpen(thread.id)}
+      onLoop={onLoop && (() => onLoop(thread.id))}
       large={large}
     />
   );
-  return listItem ? (
-    <div role="listitem" className="thread-item">
+  const item = offer ? (
+    <>
       {card}
-    </div>
+      <ReviewLoopOffer thread={thread} className="thread-card-offer" />
+    </>
   ) : (
     card
+  );
+  return listItem ? (
+    <div role="listitem" className={`thread-item ${offer ? "has-offer" : ""}`}>
+      {item}
+    </div>
+  ) : (
+    item
   );
 });
 function ThreadCardButton({
@@ -4127,6 +4397,7 @@ function ThreadCardButton({
   pinned,
   onSelect,
   onOpen,
+  onLoop,
   large,
 }: {
   thread: Thread;
@@ -4136,6 +4407,7 @@ function ThreadCardButton({
   pinned: boolean;
   onSelect: () => void;
   onOpen: () => void;
+  onLoop?: () => void;
   large: boolean;
 }) {
   const git = thread.git || thread.git_snapshot;
@@ -4146,7 +4418,16 @@ function ThreadCardButton({
       aria-current={dived ? "location" : undefined}
       aria-describedby={selected ? "twr-thread-open-hint" : undefined}
       style={{ "--thread-color": thread.accent } as CSSProperties}
-      onClick={onSelect}
+      onClick={(event) => {
+        // A click on the loop chip opens the inspector at the loop's progress.
+        if (
+          onLoop &&
+          event.target instanceof Element &&
+          event.target.closest(".loop-chip")
+        )
+          onLoop();
+        else onSelect();
+      }}
       onDoubleClick={onOpen}
       onKeyDown={(e) => {
         if (e.key === "Enter" && selected) {
@@ -4174,6 +4455,12 @@ function ThreadCardButton({
         </span>
       </div>
 
+      {onLoop && thread.loop_line && (
+        <>
+          <span className="visually-hidden">. </span>
+          <LoopChip thread={thread} />
+        </>
+      )}
       <span className="visually-hidden">. </span>
       {items[0] ? (
         <span className="thread-card-request">
@@ -4212,47 +4499,6 @@ function ThreadCardButton({
       </span>
     </button>
   );
-}
-/** Tracks how long an attention card's options have been on screen: from mount, or from
- * when they scroll into view, and again from zero after they leave it or the window is
- * hidden. `identity` restarts it for a new item or revision. */
-function useArming(target: RefObject<HTMLElement | null>, identity: string) {
-  const state = useRef<Arming>({});
-  const [isArmed, setArmed] = useState(false);
-  useEffect(() => {
-    state.current = hidden();
-    setArmed(false);
-    const node = target.current;
-    const observable = !!node && typeof IntersectionObserver !== "undefined";
-    let onScreen = !observable;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const update = () => {
-      clearTimeout(timer);
-      const now = performance.now();
-      state.current =
-        onScreen && document.visibilityState !== "hidden"
-          ? shown(state.current, now)
-          : hidden();
-      setArmed(armed(state.current, now));
-      const wait = armsIn(state.current, now);
-      if (wait) timer = setTimeout(update, wait);
-    };
-    let observer: IntersectionObserver | undefined;
-    if (observable) {
-      observer = new IntersectionObserver((entries) => {
-        onScreen = entries[entries.length - 1].isIntersecting;
-        update();
-      });
-      observer.observe(node);
-    } else update();
-    document.addEventListener("visibilitychange", update);
-    return () => {
-      clearTimeout(timer);
-      observer?.disconnect();
-      document.removeEventListener("visibilitychange", update);
-    };
-  }, [identity]);
-  return { armed: isArmed, state: () => state.current };
 }
 function AttentionCard({
   item,
@@ -4324,6 +4570,15 @@ function AttentionCard({
     settle(() => onRespond(item, value, message || undefined));
   const locked = readOnly || busy || sent || !item.revision || item.incomplete;
   const waiting = !locked && !arming.armed;
+  if (item.loop_setup)
+    return (
+      <LoopSetupCard
+        item={item}
+        thread={thread}
+        readOnly={readOnly}
+        onRespond={onRespond}
+      />
+    );
   return (
     <article
       className={`attention-card attention-${item.reason}`}
@@ -4354,11 +4609,13 @@ function AttentionCard({
       <header>
         <span className="attention-kind" id={`${ids}-kind`}>
           <AlertCircle size={14} />
-          {item.reason === "permission"
-            ? "Permission requested"
-            : item.reason === "question"
-              ? "Question for you"
-              : item.reason}
+          {item.loop_stuck
+            ? "Loop stuck"
+            : item.reason === "permission"
+              ? "Permission requested"
+              : item.reason === "question"
+                ? "Question for you"
+                : item.reason}
         </span>
         <span id={`${ids}-thread`}>{thread?.name || "twr"}</span>
       </header>
@@ -4430,7 +4687,11 @@ function AttentionCard({
                 ? "Allow"
                 : option === "deny"
                   ? "Deny"
-                  : option}
+                  : item.loop_stuck
+                    ? // A stuck loop's `resume` and `stop`, worded as the loop's
+                      // own Resume and Stop.
+                      option.charAt(0).toUpperCase() + option.slice(1)
+                    : option}
             </button>
           ))}
           {!options.length &&
@@ -4459,15 +4720,16 @@ function AttentionCard({
                 </button>
               </form>
             )}
-          {!["permission", "question"].includes(item.reason) && (
-            <button
-              disabled={locked}
-              aria-disabled={waiting || undefined}
-              onClick={() => void settle(() => onDismiss(item))}
-            >
-              Dismiss
-            </button>
-          )}
+          {!["permission", "question"].includes(item.reason) &&
+            !item.loop_stuck && (
+              <button
+                disabled={locked}
+                aria-disabled={waiting || undefined}
+                onClick={() => void settle(() => onDismiss(item))}
+              >
+                Dismiss
+              </button>
+            )}
           {busy && <Spinner />}
           {sent && (
             <span className="attention-sent" role="status">
@@ -4500,7 +4762,10 @@ const Conversation = memo(function Conversation({
   summaries,
   onVisibleRoutines,
   onError,
+  offer,
 }: {
+  /** The thread whose finished turn with changes the conversation offers a review loop. */
+  offer?: Thread;
   onVisibleRoutines: (threads: string[]) => void;
   onError: (error: unknown) => void;
   summaries: Summary[];
@@ -4804,6 +5069,14 @@ const Conversation = memo(function Conversation({
           );
         })}
       </div>
+      {offer && !loading && (
+        <div className="loop-offer-row">
+          <span>
+            {offer.name}'s last turn left changes no loop has reviewed.
+          </span>
+          <ReviewLoopOffer thread={offer} />
+        </div>
+      )}
       {!following && (
         <button
           className="jump-latest"

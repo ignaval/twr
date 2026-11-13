@@ -274,6 +274,65 @@ final class RemoteHubTests: XCTestCase {
         }
     }
 
+    /// Review loops on the phone (mobile/scripts/loop-qa.mjs). The host drives: this test
+    /// runs what it is sent in the app's WKWebView (or turns the screen) and answers, until
+    /// the host says done. It runs after testRemoteHubEndToEnd, on the app that test paired.
+    func testReviewLoops() async throws {
+        continueAfterFailure = false
+        executionTimeAllowance = 1800
+        var begin = URLRequest(url: URL(string: "http://127.0.0.1:47423/loop/begin")!)
+        begin.timeoutInterval = 5
+        guard let (_, beginResponse) = try? await URLSession.shared.data(for: begin),
+              (beginResponse as? HTTPURLResponse)?.statusCode == 200
+        else { throw XCTSkip("Run mobile/scripts/ios-qa.mjs for the review-loop QA") }
+        for _ in 0..<100 {
+            let controller = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows).compactMap { $0.rootViewController as? TwrViewController }.first
+            web = controller?.webView
+            if web != nil { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTAssertNotNil(web)
+        while true {
+            var next = URLRequest(url: URL(string: "http://127.0.0.1:47423/loop/next")!)
+            next.timeoutInterval = 1200
+            let (data, _) = try await URLSession.shared.data(for: next)
+            let command = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            var reply: [String: Any] = ["id": command["id"] ?? 0]
+            switch command["op"] as? String {
+            case "done":
+                return
+            case "fail":
+                XCTFail(command["message"] as? String ?? "Review-loop QA failed")
+                return
+            case "js":
+                let source = command["source"] as? String ?? "async () => null"
+                // The page answers in JSON, its own exceptions included, so the host sees them.
+                let value = try? await js("""
+                  try { const value = await (\(source))(JSON.parse(arg)); return JSON.stringify({ value: value === undefined ? null : value }); }
+                  catch (error) { return JSON.stringify({ error: String(error?.stack || error) }); }
+                  """, ["arg": command["arg"] as? String ?? "null"])
+                reply["json"] = value as? String ?? "{\"error\":\"The page did not answer\"}"
+            case "orient":
+                let landscape = command["value"] as? String == "landscape"
+                let scene = try XCTUnwrap(web.window?.windowScene)
+                scene.requestGeometryUpdate(.iOS(interfaceOrientations: landscape ? .landscapeRight : .portrait)) { error in
+                    print("ORIENTATION_FAILED \(error)")
+                }
+                web.window?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+                reply["json"] = "{\"value\":true}"
+            default:
+                reply["json"] = "{\"error\":\"Unknown command\"}"
+            }
+            var result = URLRequest(url: URL(string: "http://127.0.0.1:47423/loop/result")!, timeoutInterval: 30)
+            result.httpMethod = "POST"
+            result.httpBody = try JSONSerialization.data(withJSONObject: reply)
+            result.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            _ = try await URLSession.shared.data(for: result)
+        }
+    }
+
     func testRemoteHubEndToEnd() async throws {
         continueAfterFailure = false
         for _ in 0..<100 {

@@ -53,10 +53,13 @@ pub enum Key {
     CodexAuto,
     /// `wake_after_secs`, the hub's (shown only).
     WakeAfter,
+    /// The saved loop settings, the hub's: opens the loop settings editor
+    /// ([`crate::loops`]).
+    Loops,
 }
 
 /// The rows, in order.
-pub const KEYS: [Key; 11] = [
+pub const KEYS: [Key; 12] = [
     Key::Suggest,
     Key::SuggestModel,
     Key::Summaries,
@@ -68,6 +71,7 @@ pub const KEYS: [Key; 11] = [
     Key::Colors,
     Key::CodexAuto,
     Key::WakeAfter,
+    Key::Loops,
 ];
 
 /// The compact widths a change steps through (0: never compact).
@@ -380,6 +384,26 @@ fn rows(state: &AppState, s: &Settings) -> Vec<Row> {
                 kept: "wake_after_secs · the hub's: edit the file, then restart the hub".into(),
                 editable: false,
             },
+            Key::Loops => Row {
+                key,
+                label: "Loops",
+                value: match state.loop_settings.as_ref() {
+                    Some(g) if g["settings"].is_object() => {
+                        let s = &g["settings"];
+                        format!(
+                            "{} · reviewer {}",
+                            s["profile"].as_str().unwrap_or("?"),
+                            s["reviewer"]["runtime"].as_str().unwrap_or("?")
+                        )
+                    }
+                    Some(_) => "nothing saved: the first loop shows its setup card".into(),
+                    None => "the review loops' settings".into(),
+                },
+                kept: "the hub's, per workspace or project · Enter opens the loop settings \
+                       editor"
+                    .into(),
+                editable: true,
+            },
         })
         .collect()
 }
@@ -431,7 +455,9 @@ pub fn step(state: &AppState, key: Key, forward: bool) -> Option<Change> {
             Change::CompactWidth(next)
         }
         Key::WsSidebar => Change::WsSidebar(v.sidebar_hidden),
-        Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter => return None,
+        Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter | Key::Loops => {
+            return None
+        }
     })
 }
 

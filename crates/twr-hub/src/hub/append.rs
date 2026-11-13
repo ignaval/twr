@@ -418,6 +418,7 @@ impl Core {
         self.track_orchestrator(ev);
         self.track_context(ev);
         self.track_stall(ev);
+        self.track_loops(ev);
         self.track_after(ev);
         self.track_idle_offer(ev);
         self.track_activity(ev);
@@ -538,6 +539,10 @@ impl Core {
             drop_queues,
             at,
         } = batch;
+        // A loop that ends takes its prompts still queued with it, each recorded as a withdrawn
+        // message is (`hub::loops::driver`).
+        let (withdrawals, withdraw) = self.loop_withdrawals(&events, dequeue, &drop_queues);
+        events.extend(withdrawals);
         // Original event indices remain stable; visible updates commit with their facts.
         let updates = self.conversation_updates(&events);
         events.extend(updates);
@@ -676,6 +681,7 @@ impl Core {
             data: &data,
             blobs: &blobs,
             dequeue,
+            withdraw: &withdraw,
             enqueue,
             runner_ack: runner_ack.as_ref(),
             defer_sync: self.defer_ack_sync,

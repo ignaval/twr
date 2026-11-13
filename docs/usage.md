@@ -99,7 +99,7 @@ twr wait web db --all --timeout 1h # until both have, at most an hour
 twr wait web --json                # {thread, name, state, turn, report, grade}
 ```
 
-A thread counts as finished when it has no turn running, no background work or job, no prompt queued for it (also one held by `--after`, even after a failed turn: it goes out by itself once the threads it waits for finish), and the report of its last turn written. When it ended a turn with background work still running, its runtime may start a turn of its own once that work ends, so twr waits five more seconds after the work ends; after a failure too, as an automatic retry may follow. A stopped or parked thread doesn't go on, whatever is queued for it, and counts at once. A thread on a [runner box](runners.md) that isn't connected doesn't count until its box is back and caught up. `--timeout` bounds the whole wait, the hub's answers included. The exit code says how it ended: 0 finished (the text says when its report says it gave up or needs verification), 2 waits on you (also on a card about a prompt held for it with `--after`), 3 failed, was interrupted, stopped or parked, 124 timed out. With several threads it returns at the first one; with `--all`, once each has, with the highest of their codes.
+A thread counts as finished when it has no turn running, no background work or job, no prompt queued for it (also one held by `--after`, even after a failed turn: it goes out by itself once the threads it waits for finish), and the report of its last turn written. When it ended a turn with background work still running, its runtime may start a turn of its own once that work ends, so twr waits five more seconds after the work ends; after a failure too, as an automatic retry may follow. A stopped or parked thread doesn't go on, whatever is queued for it, and counts at once. A thread running a [loop](#loops) is not finished until the loop's report is written. A thread on a [runner box](runners.md) that isn't connected doesn't count until its box is back and caught up. `--timeout` bounds the whole wait, the hub's answers included. The exit code says how it ended: 0 finished (the text says when its report says it gave up or needs verification), 2 waits on you (also on a card about a prompt held for it with `--after`), 3 failed, was interrupted, stopped or parked, 124 timed out. With several threads it returns at the first one; with `--all`, once each has, with the highest of their codes.
 
 An agent can run it too, since it only reads. Its own commands time out, so it waits inside a [job](#jobs): `twr job run --name wait-web -- twr wait web`. The job ends when web does, and the agent is told, with web's report in the job's output.
 
@@ -208,6 +208,97 @@ A worker's turn can end while work it started still runs: its runtime's backgrou
 The hub wakes a worker once per interim report, and at most 5 times in a row without a message from you or the orchestrator in between; past that it says it did not wake it, and the worker waits for a message. It doesn't wake a thread you stopped or parked, one attached, failed or waiting on you, or one that already has a message queued.
 
 With Claude Code, the end of a command the agent ran in the background opens the turn Claude starts for it right away, before its first output, which can take a minute. Nothing is written into that run meanwhile: since Claude Code 2.1.295, a message folded into a run Claude started itself ends without the `result` that closes the turn. If a turn's last message stopped and no `result` comes within 2 minutes anyway, the adapter ends the turn itself.
+
+## Loops
+
+A review loop has another model review a thread's work, round after round, until it finds nothing new. Each round, a reviewer (Codex, Claude Code or Grok Build) reads the thread's changes read-only and lists findings; the thread checks each one against the code, fixes it or dismisses it with a reason, runs its gates and says what it did; dismissed findings go into a ledger that every later round reads, so they are not raised again. The hub runs the rounds, counts and sequences them, and writes a report at the end ([the design](design/loops.md)). The thread is the implementer and the arbiter: it is the session that wrote the code. In this version loops are review loops, in a thread on the hub's own machine with a git workspace, in a mode that can edit (not `plan` or `read-only`: a loop never widens a mode).
+
+```sh
+twr loop review api                          # start a review loop on api's work
+twr loop review api --scope since:main       # what it reviews; also --profile, --reviewer, ... for this run
+twr loop review api --setup                  # show the settings card first
+twr loop list                                # the running loops
+twr loop show api                            # phases, rounds, findings and verdicts, ledger
+twr loop pause api                           # also resume, skip (to verification), stop
+twr loop report api                          # the last loop's report
+twr loop settings                            # the saved settings; --edit, --reset, `set`
+```
+
+In the desktop and mobile apps, a thread's inspector has the same actions, a finished turn with changes offers **Review loop**, and `/review` and `/loop` work in the composer ([desktop.md](desktop.md#loops)).
+
+### Starting a review loop
+
+`twr loop review <thread>` asks the hub for a loop. With saved settings that still hold, it starts at once and prints what it runs on: the loop line (`low · scope`), whose settings they are, and each setting. Otherwise the thread's settings card comes first ([below](#the-first-run-the-settings-card)).
+
+What a loop reviews is its scope, `--scope`:
+
+| Scope | Reviews | Default when |
+|---|---|---|
+| `branch` | the thread's branch since it left its base (the merge-base with its base ref), and its working tree | the thread has commits of its own |
+| `uncommitted` | what is not committed yet | it has none |
+| `since:<ref>` | everything after `<ref>` | never |
+| `last:<n>` | the last `n` commits (1 to 1000) | never |
+
+`since <ref>` in quotes and `since=<ref>` work too. Scope belongs to one run and is never saved.
+
+How much review a loop runs is its profile: `high` runs a medium-effort tier until it converges, then an `xhigh` tier, then a sweep and up to 5 verification rounds; `medium` one medium tier, a sweep and up to 2 verification rounds; `low` one medium round and one verification round, no sweep. A tier converges on a round with no findings, or one whose every finding repeats the ledger; two rounds in a row with nothing of a new class end the ladder early. When the last tier ends on a round with no findings, at the verification's effort, with no sweep to run and nothing changed in the worktree while that round ran, a verification round could only repeat it, so the loop skips the verification and goes to its report, clean: `low` after a clean first round, `high` after a clean `xhigh` round that followed a ladder that fixed nothing. You can change the built-in profiles and add your own in `[loops.profiles.<name>]` ([configuration.md](configuration.md#notes-on-some-keys)).
+
+`--profile`, `--reviewer` (`runtime[:account]/model`), `--implementer` (`thread`, or `runtime[:account]/model[:effort]` on the thread's own runtime), `--workers` (the implementer's subagents, `model[:effort]`) and `--commit` (`match` or `none`) change this run only and leave the saved settings alone. Before the first save they fill in the settings card instead. Each value is checked before anything is sent: a typo is an error that says what the value takes.
+
+While a loop runs, the hub sends the thread one prompt per step, each starting with `[twr loop <id> <step>]`: the scope step (run the gates, write a GOAL paragraph for the reviewer), each round's triage, the sweep, the report. A message you send the thread goes ahead of the loop's next prompt, and the loop goes on after that turn. While a round's review runs, the thread shows as `background`. Each step's turn has a report like any other turn; the loop's last one is its report ([below](#the-report)).
+
+### The first run: the settings card
+
+A loop runs only on settings you chose. The first loop, of either kind, shows a settings card that names the models: the profile, the scope, the implementer (the thread's own model by default), its workers, the reviewer, and where an answer saves them (all projects, or this thread's project). It also says when a runtime is missing and what it shows instead (`codex isn't installed: reviewing with claude-code · claude-opus-5-5 instead`), and when the reviewer and the implementer are the same model family.
+
+On a terminal, `twr loop review` shows the card and asks:
+
+```
+1 start and save  2 change…  3 cancel:
+```
+
+`1` starts the loop and saves what the card shows; later loops start on it without a card. `2` opens the settings in your editor (`$VISUAL`, else `$EDITOR`, else `vi`) as a short TOML document, with what the hub found installed in its comments; saving it raises the card again with the new values, and it asks again. `3` starts and saves nothing. Any other reply leaves the card open. Each answer applies to the revision of the card you saw: a card that changed meanwhile is refused, and you look again.
+
+Without a terminal (a script, `--json`), the card stays open: `twr loop review` prints it and the line that starts the loop from it, and exits 2.
+
+```sh
+twr respond 01JA...@3 "start and save these settings"
+```
+
+You can answer it there, in the apps, or with `twr loop review` again on a terminal. No flag skips the card. The card comes back, filled with the saved settings, when you ask for it (`--setup`), when a saved setting no longer holds (a runtime not installed or not logged in, a model or account it no longer has, a profile that was removed), and when the thread runs on another runtime than the saved implementer: a loop never moves a thread to another runtime.
+
+### Saved and per-project settings
+
+One set of settings serves every project of the workspace unless a project has its own; a project with its own uses that whole set. `twr loop settings` shows the set that applies, whose it is, the projects that have their own, warnings, problems that would bring the card back, and each runtime as the hub found it. Before anything is saved it shows what the first card would.
+
+```sh
+twr loop settings --project api              # the set api uses
+twr loop settings --edit                     # change the workspace's in your editor
+twr loop settings --edit --project api       # give api its own
+twr loop settings set --preset claude --profile medium   # change named settings, no editor
+twr loop settings --reset --project api      # api uses the workspace's again
+twr loop settings --reset                    # forget every saved set: the next loop shows the card
+```
+
+`--edit` opens the TOML document of the card's `2 change…` (without the card's own `save_for` and `scope`), on a private temporary copy: if saving fails, the copy is kept and its path printed. `set` takes `--profile`, `--implementer`, `--workers`, `--reviewer`, `--commit` and `--preset` (`claude-codex`: Claude Code implements and Codex reviews, the default; `claude`, `codex`, `grok`: all on one runtime), and saves the others as they apply now. `--reset` asks y/N on a terminal; without one, pass `--yes`. Only you save settings, from a client of yours: the orchestrator and the threads' agents cannot, and `[loops]` in the config file only sets what the first card shows ([configuration.md](configuration.md#notes-on-some-keys)).
+
+### Pause, stop, skip
+
+`twr loop pause <thread>` lets what runs finish and holds the next step until `twr loop resume`. `twr loop skip <thread>` ends the ladder after the round under way and goes to verification, without a sweep. `twr loop stop <thread>` ends the loop, `stopped`, and leaves the thread and its work as they are; it asks y/N on a terminal (`--yes` without one). Stopping, parking or deleting the thread ends its loop too. A loop that ends takes its prompts still queued with it: they never run.
+
+A step that fails (a review run that fails twice, a turn that fails, a triage block refused twice) makes the loop stuck: it raises an item on the thread's card with **resume**, which asks for that step again, and **stop**. Only you answer it. A loop survives a hub restart and goes on where it was.
+
+`twr loop list` lists the running loops, `twr loop show <thread>` the thread's running loop, else its last: its settings and where they came from, each phase, each round with its findings and the thread's verdicts, the ledger, the transition, and how it ended.
+
+### The report
+
+When the loop ends, the hub writes `report.md` in the loop's folder (`<data dir>/loops/<id>/`, with the round diffs, prompts, the reviewer's output and answers, the GOAL and the ledger): rounds per tier, the class breakdown, why the ladder ended, the sweep, how the loop ended, the ledger and the gates, then the thread's own summary of what was reviewed and what is left. That is the thread's report for its last turn, so the card, the conversation and `twr wait` show it. `twr loop report <thread>` prints the file; it reads it on the hub's machine, so from another machine use `twr loop show`.
+
+`twr wait <thread>` waits through a running loop and returns when its report is written (exit 0), when the loop is stuck or paused waiting on you, or the thread waits on you, its settings card included (exit 2), or when the thread failed or was stopped (exit 3).
+
+### What the reviewer can read
+
+The reviewer runs on the hub's machine as a program of yours, one headless call of its CLI per round, in the thread's working directory, on your own login (or the account the settings name), and counts against that login's usage; what it spent is added to the thread's. It runs read-only by flags no setting reaches, and without twr's tokens. Its prompt names the round's diffs, the GOAL and the ledger in the loop folder. Like any read-only program of yours it can read what your user can read, not only the diff, so run loops on repositories whose content you trust not to steer it. What it answers reaches the thread as another model's findings to verify, never as instructions, and only the thread's own final message answers a step ([security-model.md](security-model.md)).
 
 ## Attach
 

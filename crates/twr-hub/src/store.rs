@@ -567,6 +567,9 @@ pub struct AppendBatch<'a> {
     pub blobs: &'a [(String, Vec<u8>)],
     /// Pending prompt row to remove (dispatch).
     pub dequeue: Option<i64>,
+    /// More pending prompt rows to remove, each recorded `prompt.withdrawn` by an event of the
+    /// batch: a loop's prompts still queued when it ends (`hub::loops::driver`).
+    pub withdraw: &'a [i64],
     /// Prompts to queue, after the events.
     pub enqueue: Vec<NewPrompt>,
     /// A runner frame this batch commits: its watermark is raised in the same transaction.
@@ -703,6 +706,7 @@ impl Store {
             data: &[],
             blobs: extras.blobs,
             dequeue: extras.dequeue,
+            withdraw: &[],
             enqueue: Vec::new(),
             runner_ack: None,
             defer_sync: false,
@@ -766,6 +770,12 @@ impl Store {
             )?;
         }
         if let Some(id) = batch.dequeue {
+            let n = exec("DELETE FROM pending_prompts WHERE id = ?1", params![id])?;
+            if n != 1 {
+                bail!("pending prompt {id} is gone");
+            }
+        }
+        for id in batch.withdraw {
             let n = exec("DELETE FROM pending_prompts WHERE id = ?1", params![id])?;
             if n != 1 {
                 bail!("pending prompt {id} is gone");
@@ -2741,6 +2751,17 @@ pub fn withdrawn_turns(conn: &Connection, thread: &str) -> anyhow::Result<HashSe
     rows.map(|t| Ok(u64::try_from(t?)?)).collect()
 }
 
+/// Every `loop.*` event of `thread` (a review loop's steps, `hub::loops`), oldest first, as
+/// stored (possibly capped).
+pub fn loop_events(conn: &Connection, thread: &str) -> anyhow::Result<Vec<Event>> {
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT {EVENT_COLS} FROM events WHERE kind >= 'loop.' AND kind < 'loop/' AND thread = ?1
+         ORDER BY rowid"
+    ))?;
+    let rows = st.query_map(params![thread], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
 /// The latest `limit` events of kind `kind` of `thread`, newest first, as stored (possibly
 /// capped).
 pub fn latest_of_kind(
@@ -3631,6 +3652,7 @@ mod tests {
                 data: &[],
                 blobs: &[],
                 dequeue: None,
+                withdraw: &[],
                 enqueue: vec![prompt(None), prompt(Some(1))],
                 runner_ack: None,
                 defer_sync: false,
@@ -3658,6 +3680,7 @@ mod tests {
                 data: &[],
                 blobs: &[],
                 dequeue: Some(p.id),
+                withdraw: &[],
                 enqueue: vec![prompt(None)],
                 runner_ack: None,
                 defer_sync: false,
@@ -3825,6 +3848,7 @@ mod tests {
             data: &[],
             blobs: &[],
             dequeue: None,
+            withdraw: &[],
             enqueue,
             runner_ack: None,
             defer_sync: false,
@@ -4205,6 +4229,7 @@ mod tests {
             data: &[],
             blobs: &[],
             dequeue: None,
+            withdraw: &[],
             enqueue: vec![],
             runner_ack: None,
             defer_sync: false,

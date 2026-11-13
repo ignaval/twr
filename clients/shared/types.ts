@@ -33,6 +33,10 @@ export interface Attention {
   incomplete?: boolean;
   /** A confirm or delete card: the hub's own question only the user answers. */
   proposal?: boolean;
+  /** A loop's setup card: only the user answers it (Start and save, Cancel). */
+  loop_setup?: boolean;
+  /** A stuck loop's item: only the user answers it (resume, stop); never dismissed. */
+  loop_stuck?: boolean;
 }
 export interface ViewState {
   threads: Thread[];
@@ -201,9 +205,10 @@ export interface AttentionSummaryItem {
   reason: string;
   /**
    * The hub's own cards, which only the user answers: `confirm`, what the orchestrator
-   * proposed from your message; `delete`, a deletion of threads.
+   * proposed from your message; `delete`, a deletion of threads; `loop_setup`, the settings
+   * a loop starts on; `loop_stuck`, a loop that waits for you to resume or stop it.
    */
-  card?: "confirm" | "delete";
+  card?: "confirm" | "delete" | "loop_setup" | "loop_stuck";
   /** Still being raised: not notified until it is complete. */
   incomplete?: boolean;
 }

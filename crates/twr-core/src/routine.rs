@@ -1,6 +1,7 @@
 //! Classification shared by conversation renderers. Attention requests are never routine.
 use crate::event::{
     routine_of, JsonMap, ROUTINE_AUTO_WAKE, ROUTINE_BACKGROUND_DONE, ROUTINE_INTERIM, ROUTINE_KEY,
+    ROUTINE_LOOP,
 };
 
 /// What kind of routine update a hub update is in the conversation.
@@ -14,6 +15,8 @@ pub enum Routine {
     AutoWake,
     /// A stall that resolved by itself (only when the conversation is drawn: the caller).
     Stall,
+    /// A loop's round, phase change or control, or a loop turn's report ([`ROUTINE_LOOP`]).
+    Loop,
     /// A kind a newer hub marks routine that this TUI doesn't know.
     Other,
 }
@@ -29,6 +32,7 @@ impl Routine {
                 ROUTINE_INTERIM => Routine::Interim,
                 ROUTINE_BACKGROUND_DONE => Routine::BackgroundDone,
                 ROUTINE_AUTO_WAKE => Routine::AutoWake,
+                ROUTINE_LOOP => Routine::Loop,
                 _ => Routine::Other,
             });
         }

@@ -48,6 +48,12 @@ fn may_update(body: &EventBody) -> bool {
     matches!(
         body,
         EventBody::AttentionRaised(_)
+            | EventBody::LoopStarted(_)
+            | EventBody::LoopFindings(_)
+            | EventBody::LoopTransition(_)
+            | EventBody::LoopPhase(_)
+            | EventBody::LoopControl(_)
+            | EventBody::LoopEnded(_)
             | EventBody::ReportReady(_)
             | EventBody::TaskUpdated(_)
             | EventBody::ConversationUpdate(_)
@@ -79,6 +85,69 @@ fn hung_closed_text(name: &str, p: &AttentionResolved, turn_ended: bool) -> Stri
     format!(
         "{name}'s seems-hung card {} {how}; it is no longer a current alarm.",
         p.attn_id
+    )
+}
+
+/// The orchestrator's line when worker `v` starts loop `p` (`hub::loops`): what it runs on and
+/// where the settings came from, `api started a review loop: high · implementer
+/// claude-opus-5-5 high · reviewer codex gpt-6.1-sol (saved settings; /review --setup changes
+/// them)`.
+fn loop_started_text(v: &twr_core::reduce::ThreadView, p: &LoopStarted) -> String {
+    use twr_core::loops::settings::{SettingsOf, SettingsSource};
+    let s = &p.settings;
+    let implementer = match &s.implementer {
+        Some(m) => [Some(m.model.as_str()), m.effort.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => {
+            let own = [v.model.as_deref(), v.effort.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if own.is_empty() {
+                format!("{} (the thread's own)", v.runtime)
+            } else {
+                format!("{own} (the thread's own)")
+            }
+        }
+    };
+    let from = match (p.settings_from, p.settings_of) {
+        (SettingsSource::SetupItem, _) => {
+            "settings chosen on its setup card, now saved".to_string()
+        }
+        (SettingsSource::Saved, Some(SettingsOf::Project)) => format!(
+            "{}'s settings; /review --setup changes them",
+            v.project.as_deref().unwrap_or(&v.name)
+        ),
+        (SettingsSource::Saved, _) => "saved settings; /review --setup changes them".to_string(),
+    };
+    let mut run = Vec::new();
+    for (what, val) in [
+        ("profile", &p.overrides.profile),
+        ("implementer", &p.overrides.implementer),
+        ("workers", &p.overrides.workers),
+        ("reviewer", &p.overrides.reviewer),
+        ("commit", &p.overrides.commit),
+    ] {
+        if let Some(val) = val {
+            run.push(format!("{what} {val}"));
+        }
+    }
+    let run = if run.is_empty() {
+        String::new()
+    } else {
+        format!("; this run only: {}", run.join(", "))
+    };
+    let kind = match p.kind {
+        twr_core::loops::LoopKind::Review => "review",
+        twr_core::loops::LoopKind::Implement => "implementation",
+    };
+    format!(
+        "{} started a {kind} loop: {} · implementer {implementer} · reviewer {} {} ({from}{run})",
+        v.name, p.profile.name, s.reviewer.runtime, s.reviewer.model
     )
 }
 
@@ -149,6 +218,11 @@ impl Core {
                 .or_insert_with(|| self.registry.get(&e.thread).cloned());
             // The user's `!` commands are theirs: the orchestrator hears nothing of them.
             let had_background = view.as_ref().is_some_and(|v| v.own_background());
+            // The loop as it was before the event (a round's reviewer, its rounds so far).
+            let prev_loop = view
+                .as_ref()
+                .filter(|_| e.body.kind().starts_with("loop."))
+                .and_then(|v| v.r#loop.clone());
             if let Some(view) = view {
                 view.apply(&Event::new(
                     &e.thread,
@@ -160,6 +234,201 @@ impl Core {
             }
             let worker = view.as_ref().filter(|v| !v.is_orchestrator());
             let (text, about, ext) = match (&e.body, worker) {
+                // A loop's setup card (`hub::loops`): the user's to answer, like a question.
+                (EventBody::AttentionRaised(p), Some(v))
+                    if e.source == Source::Hub && is_loop_setup_card(&p.ext) =>
+                {
+                    (
+                        format!(
+                            "{} waits for the user to choose its loop's settings (setup card {}): {}",
+                            v.name,
+                            p.attn_id,
+                            cut(&p.summary, 600)
+                        ),
+                        Some(e.thread.clone()),
+                        twr_ext_map(json!({"attn_id": p.attn_id})),
+                    )
+                }
+                (EventBody::LoopStarted(p), Some(v)) => (
+                    loop_started_text(v, p),
+                    Some(e.thread.clone()),
+                    twr_ext_map(json!({"loop": p.id})),
+                ),
+                (EventBody::AttentionResolved(p), Some(v)) if self.loop_card(&p.attn_id) => {
+                    let outcome = p.answer.as_ref().map_or_else(
+                        || "closed with its thread".to_string(),
+                        |a| format!("answered: {}", cut(&a.decision, 80)),
+                    );
+                    (
+                        format!("{}'s loop setup card {} {outcome}.", v.name, p.attn_id),
+                        Some(e.thread.clone()),
+                        twr_ext_map(json!({"attn_id": p.attn_id, "resolved": true})),
+                    )
+                }
+                // A stuck loop's item: the user's to answer; not routine.
+                (EventBody::AttentionRaised(p), Some(v))
+                    if e.source == Source::Hub && is_loop_stuck_item(&p.ext) =>
+                {
+                    (
+                        format!(
+                            "{} waits for the user: {} (stuck item {}: resume or stop)",
+                            v.name,
+                            cut(&p.summary, 600),
+                            p.attn_id
+                        ),
+                        Some(e.thread.clone()),
+                        not_routine(twr_ext_map(json!({"attn_id": p.attn_id}))),
+                    )
+                }
+                (EventBody::AttentionResolved(p), Some(v)) if self.loop_stuck(&p.attn_id) => {
+                    let outcome = p.answer.as_ref().map_or_else(
+                        || "closed".to_string(),
+                        |a| format!("answered: {}", cut(&a.decision, 80)),
+                    );
+                    (
+                        format!("{}'s stuck loop item {} {outcome}.", v.name, p.attn_id),
+                        Some(e.thread.clone()),
+                        twr_ext_map(json!({"attn_id": p.attn_id, "resolved": true})),
+                    )
+                }
+                // A loop's rounds and phases: routine; a failed round and its end not.
+                (EventBody::LoopFindings(p), Some(v)) => {
+                    let (model, effort) = prev_loop
+                        .as_ref()
+                        .map(|l| {
+                            (
+                                l.reviewer.model.clone(),
+                                l.reviewer.effort.clone().unwrap_or_default(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    if p.failed {
+                        (
+                            format!(
+                                "{}: review round {} ({model} {effort}) failed: {}",
+                                v.name,
+                                p.round,
+                                cut(p.reason.as_deref().unwrap_or("the run failed"), 300)
+                            ),
+                            Some(e.thread.clone()),
+                            not_routine(twr_ext_map(json!({"loop": p.id, "round": p.round}))),
+                        )
+                    } else {
+                        let n = p.findings.len();
+                        (
+                            format!(
+                                "{}: review round {} · {model} {effort} · {n} finding{}",
+                                v.name,
+                                p.round,
+                                if n == 1 { "" } else { "s" }
+                            ),
+                            Some(e.thread.clone()),
+                            routine(
+                                twr_ext_map(json!({"loop": p.id, "round": p.round})),
+                                ROUTINE_LOOP,
+                            ),
+                        )
+                    }
+                }
+                (EventBody::LoopTransition(p), Some(v)) => (
+                    if p.round.is_empty() {
+                        format!(
+                            "{}: its review loop skipped to verification before any ladder round",
+                            v.name
+                        )
+                    } else {
+                        format!(
+                            "{}: its review loop's ladder ended after {}: {}{}",
+                            v.name,
+                            p.round,
+                            super::loops::transition_words(p.reason),
+                            if p.verify_skipped {
+                                "; verification skipped, since it could only repeat that round"
+                            } else {
+                                ""
+                            }
+                        )
+                    },
+                    Some(e.thread.clone()),
+                    routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
+                ),
+                // (Every `loop.phase` without problems is a change of phase; the first, to
+                // scope, goes with the start's own line.)
+                (EventBody::LoopPhase(p), Some(v))
+                    if prev_loop.is_some()
+                        && p.problems.is_empty()
+                        && p.phase != twr_core::loops::Phase::Scope =>
+                {
+                    (
+                        format!("{}: its review loop is in its {} now", v.name, p.phase),
+                        Some(e.thread.clone()),
+                        routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
+                    )
+                }
+                (EventBody::LoopControl(p), Some(v))
+                    if p.by != twr_core::loops::ControlBy::Hub =>
+                {
+                    (
+                        format!("{}'s review loop: {} by the user", v.name, p.action.as_str()),
+                        Some(e.thread.clone()),
+                        routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
+                    )
+                }
+                // How a loop ended, once: its last report says it when it wrote one.
+                (EventBody::LoopEnded(p), Some(v)) if p.report_path.is_none() => {
+                    let rounds = prev_loop.as_ref().map_or(0, |l| {
+                        l.rounds.len()
+                            - usize::from(matches!(l.wait, twr_core::loops::Wait::Review { .. }))
+                    });
+                    let why = p
+                        .reason
+                        .as_deref()
+                        .map(|r| format!(": {}", cut(r, 300)))
+                        .unwrap_or_default();
+                    (
+                        format!(
+                            "{}: {}{why}",
+                            v.name,
+                            super::loops::outcome_words(p.outcome, rounds)
+                        ),
+                        Some(e.thread.clone()),
+                        not_routine(twr_ext_map(json!({"loop": p.id, "outcome": p.outcome}))),
+                    )
+                }
+                // A loop's turn's report: routine but for the loop's last one, which is the
+                // thread's report of the loop (its outcome and `report.md`).
+                (EventBody::ReportReady(p), Some(v))
+                    if twr_ext(&p.ext).is_some_and(|t| t.contains_key(LOOP_REPORT_KEY)) =>
+                {
+                    let mark = twr_ext(&p.ext)
+                        .and_then(|t| t.get(LOOP_REPORT_KEY))
+                        .cloned()
+                        .unwrap_or_default();
+                    let step = mark["step"].as_str().unwrap_or_default().to_string();
+                    if step == "report" {
+                        (
+                            format!("{}: {}", v.name, p.summary),
+                            Some(e.thread.clone()),
+                            not_routine(p.ext.clone()),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "{} answered its review loop's {step} step ({}): {}",
+                                v.name,
+                                twr_decisions::grade_str(p.grade),
+                                p.summary
+                            ),
+                            Some(e.thread.clone()),
+                            routine(p.ext.clone(), ROUTINE_LOOP),
+                        )
+                    }
+                }
+                (EventBody::LoopFindings(_)
+                | EventBody::LoopTransition(_)
+                | EventBody::LoopPhase(_)
+                | EventBody::LoopControl(_)
+                | EventBody::LoopEnded(_), _) => continue,
                 (EventBody::AttentionRaised(p), Some(v)) => (
                     format!(
                         "{} {}: {}",
@@ -753,5 +1022,49 @@ mod tests {
             json!({"twr": {"background_tasks": 2, "routine": null}})
         );
         assert_eq!(routine_of(&not), None);
+    }
+
+    /// The orchestrator's line when a loop starts names what it runs on and where its
+    /// settings came from.
+    #[test]
+    fn a_loop_start_is_said_with_its_settings() {
+        use twr_core::loops::settings::{LoopSettings, Overrides, SettingsOf, SettingsSource};
+        let v = twr_core::reduce::ThreadView {
+            name: "api".into(),
+            project: Some("api".into()),
+            runtime: "claude-code".into(),
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("high".into()),
+            ..twr_core::reduce::ThreadView::new("t1")
+        };
+        let mut p = LoopStarted {
+            profile: twr_core::loops::config::Profile::builtin("high").unwrap(),
+            settings: LoopSettings::first_card(&Default::default()),
+            settings_from: SettingsSource::Saved,
+            settings_of: Some(SettingsOf::Workspace),
+            ..Default::default()
+        };
+        assert_eq!(
+            loop_started_text(&v, &p),
+            "api started a review loop: high · implementer claude-opus-5-5 high (the thread's \
+             own) · reviewer codex gpt-6.1-sol (saved settings; /review --setup changes them)"
+        );
+        p.settings_of = Some(SettingsOf::Project);
+        p.overrides = Overrides {
+            profile: Some("high".into()),
+            ..Default::default()
+        };
+        p.settings.implementer = Some(
+            twr_core::loops::config::ModelChoice::parse("claude-code/claude-sonnet-5-5").unwrap(),
+        );
+        assert_eq!(
+            loop_started_text(&v, &p),
+            "api started a review loop: high · implementer claude-sonnet-5-5 · reviewer codex \
+             gpt-6.1-sol (api's settings; /review --setup changes them; this run only: profile high)"
+        );
+        p.settings_from = SettingsSource::SetupItem;
+        assert!(loop_started_text(&v, &p).ends_with(
+            "(settings chosen on its setup card, now saved; this run only: profile high)"
+        ));
     }
 }

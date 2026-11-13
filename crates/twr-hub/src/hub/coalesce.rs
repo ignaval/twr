@@ -287,6 +287,7 @@ mod tests {
             updated_at: t0,
             started_seq: 1,
             job: false,
+            review: false,
             group: None,
             quiet: false,
             shell: false,
@@ -369,6 +370,7 @@ mod tests {
         );
         let job = BackgroundTask {
             job: true,
+            review: false,
             ..task.clone()
         };
         assert_eq!(due(Some(&job), Some(t0), &h, t0, every), beat);

@@ -972,8 +972,13 @@ impl Core {
 
     /// What job task `task` (`job:<id>`) does now, when this hub runs it: `job <name>: queued
     /// (N ahead)`, or `running` for how many whole minutes it ran (the line changes once a
-    /// minute, as the renewals once said it). `None` for any other task.
+    /// minute, as the renewals once said it); a review run's (`loop:<id>`), `reviewer <model>
+    /// <effort> · 6m` (`hub::loops`). `None` for any other task.
     pub(super) fn job_description(&self, task: &str) -> Option<String> {
+        // A review loop's review run: the reviewer, its effort, how long it ran.
+        if let Some(d) = self.review_description(task) {
+            return Some(d);
+        }
         let id = task.strip_prefix(JOB_TASK_PREFIX)?;
         let j = self.jobs.jobs.get(id)?;
         let what = if j.shell.is_some() { "!" } else { "job" };
@@ -1016,7 +1021,8 @@ impl Core {
             .flat_map(|v| {
                 v.background_tasks
                     .iter()
-                    .filter(|(_, t)| t.job)
+                    // (A review run is no job: its loop retries it, `hub::loops`.)
+                    .filter(|(_, t)| t.job && !t.review)
                     .map(|(task, t)| (v.id.clone(), task.clone(), t.clone()))
                     .collect::<Vec<_>>()
             })

@@ -138,6 +138,16 @@ describe("accessibility audit of the shared UI", () => {
     expect(sources.flatMap(audit)).toEqual([]);
   });
 
+  it("keeps a primary answer's accent background over the answers' raised one", () => {
+    // `.attention-options > button` is more specific than `.primary`: without its own rule
+    // a loop's Start and save had the accent's foreground on the raised background (white
+    // on white in the light theme).
+    const css = readFileSync(join(root, "shared/style.css"), "utf8");
+    const rule = /\.attention-options > button\.primary \{([^}]*)\}/.exec(css);
+    expect(rule?.[1]).toMatch(/background: var\(--accent\);/);
+    expect(rule?.[1]).toMatch(/color: var\(--accent-fg\);/);
+  });
+
   it("keeps a visible keyboard focus style and honours reduced motion", () => {
     const css = readFileSync(join(root, "shared/style.css"), "utf8");
     expect(css).toMatch(/(^|\n):focus-visible \{\s*outline: 2px solid/);
@@ -203,6 +213,7 @@ describe("theme contrast", () => {
         "warning",
         "danger",
         "success",
+        "loop",
       ])
         for (const bg of ["bg", "panel", "raised", "overlay"]) {
           const ratio = contrast(theme[fg], theme[bg]);
@@ -213,6 +224,35 @@ describe("theme contrast", () => {
       expect(contrast(theme["danger-fg"], theme.danger)).toBeGreaterThan(4.5);
       expect(failures).toEqual([]);
     });
+});
+
+describe("styles that keep controls usable", () => {
+  const css = readFileSync(join(root, "shared/style.css"), "utf8");
+  const mobile = readFileSync(join(root, "mobile/src/mobile.css"), "utf8");
+  const rule = (source: string, selector: string) => {
+    const at = source.indexOf(selector + " {");
+    return at < 0 ? "" : source.slice(at, source.indexOf("}", at));
+  };
+  it("keeps a primary request option's fill under the options' own background", () => {
+    // `.attention-options > button` sets a raised background; a `.primary` option (a loop
+    // setup card's Start and save) would keep its accent-fg label on it, unreadable.
+    expect(rule(css, ".attention-options > button")).toContain("background");
+    const primary = rule(css, ".attention-options > button.primary");
+    expect(primary).toContain("background: var(--accent)");
+    expect(primary).toContain("color: var(--accent-fg)");
+  });
+  it("gives the phone's disclosure rows and the model picker's list switch 44 points", () => {
+    expect(rule(mobile, '[data-mobile="true"] details > summary')).toContain(
+      "min-height: 44px",
+    );
+    expect(
+      rule(mobile, '[data-mobile="true"] .input-with-button > button'),
+    ).toContain("min-width: 44px");
+    // iOS ignores min-height on a menu select: its height must say 44.
+    expect(
+      rule(mobile, '[data-mobile="true"] select:not([multiple]):not([size])'),
+    ).toContain("height: max(44px");
+  });
 });
 
 describe("rendered markup", () => {

@@ -83,6 +83,10 @@ pub struct ClientFold {
     /// The open items whose current raise was folded as a capped preview: its revision and the
     /// raise, as stored.
     pub capped: BTreeMap<String, (u64, Event)>,
+    /// The saved loop settings (`loop.settings_saved`, `loop.settings_reset`): what a loop
+    /// would run on, for the settings line and editor.
+    #[serde(default)]
+    pub loop_settings: crate::loops::settings::SavedSettings,
     /// The control position folded up to.
     pub last_gseq: u64,
 }
@@ -102,6 +106,7 @@ impl Default for ClientFold {
             went_on: BTreeSet::new(),
             delete_cards: BTreeMap::new(),
             capped: BTreeMap::new(),
+            loop_settings: crate::loops::settings::SavedSettings::default(),
             last_gseq: 0,
         }
     }
@@ -131,6 +136,7 @@ impl ClientFold {
         }
         self.attention.apply_at(ev, gseq);
         self.usage.apply(ev);
+        self.loop_settings.apply(ev);
         if let Some(r) = started_ref(ev) {
             push_new(&mut self.started_refs, r, STARTED_REFS);
         }

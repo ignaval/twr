@@ -5,6 +5,7 @@ mod term;
 mod accounts;
 mod boxes;
 mod dial_in;
+mod loops;
 mod pretty;
 mod runner_link;
 mod runner_update;
@@ -422,6 +423,15 @@ enum Cmd {
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
+    },
+    /// Review loops: an adversarial reviewer (another model, read-only) reviews a thread's
+    /// work round after round while the thread verifies and fixes or dismisses each finding,
+    /// until the reviewer has nothing left. `twr loop review <thread>` starts one (the first
+    /// time, on a settings card you answer); `list`, `show`, `report` read them; `pause`,
+    /// `resume`, `stop`, `skip` control one; `settings` shows and changes the saved settings.
+    Loop {
+        #[command(subcommand)]
+        cmd: loops::LoopCmd,
     },
     /// Reading aloud, the hub machine's end (docs/read-aloud.md).
     Speech {
@@ -2131,6 +2141,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Boxes { cmd } => boxes::run(cmd, &config, &paths, &socket).await,
+        Cmd::Loop { cmd } => loops::run(cmd, &socket).await,
         Cmd::Account { cmd } => accounts::run(cmd, &paths, &socket)
             .await
             .map(|()| ExitCode::SUCCESS),
@@ -2171,6 +2182,7 @@ async fn run_simple(
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
+        | Cmd::Loop { .. }
         | Cmd::Speech { .. }
         | Cmd::Speak { .. }
         | Cmd::Voice { .. }
@@ -3374,6 +3386,13 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         // The accounts' logins too (`account.status`), on the same terms.
         opts.account_probe = Some(twr_hub::hub::own_account_probe());
     }
+    // A test's throwaway hub may be told what it found instead ([`TEST_AGENTS_ENV`]).
+    if let Some(agents) = test_agents(trusted) {
+        opts.agent_probe = Some(std::sync::Arc::new(move || {
+            let agents = agents.clone();
+            Box::pin(async move { agents })
+        }));
+    }
     // Named accounts without a `dir` of their own: the home's root's, every workspace's.
     opts.accounts_root = Some(paths.accounts_dir());
     opts.worktree_namespace = paths.worktree_namespace();
@@ -3451,6 +3470,22 @@ fn hub_test_gate(env: &str) {
     while gate.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// `TWR_TEST_AGENTS=<json>`, for tests of review loops: in a test's throwaway hub only
+/// ([`test_token_trusted`]: a debug build under `TWR_HOME`, which no installed twr is), the
+/// hub's own agent CLIs are the list it gives, as `twr runner --agents` reports them
+/// (`[{"runtime": "codex", "found": true, "login": "logged_in"}]`), and none is probed. The
+/// reviewer CLI a loop runs is then the runtime's `TWR_*_BIN` (`TWR_CODEX_BIN`), as anywhere.
+const TEST_AGENTS_ENV: &str = "TWR_TEST_AGENTS";
+
+/// The agents [`TEST_AGENTS_ENV`] lists, in a test's throwaway hub (`trusted`); a list that
+/// does not read is logged and ignored.
+fn test_agents(trusted: bool) -> Option<Vec<twr_core::runner::AgentInfo>> {
+    let raw = std::env::var(TEST_AGENTS_ENV).ok().filter(|_| trusted)?;
+    serde_json::from_str(&raw)
+        .inspect_err(|e| tracing::warn!(error = %e, "{TEST_AGENTS_ENV} does not read"))
+        .ok()
 }
 
 /// `TWR_AGENT_PROBE`: `off` keeps the hub from probing its own box's agent CLIs (no
@@ -6960,6 +6995,13 @@ fn show_text(t: &Value) -> String {
             a => format!(": {a}"),
         }
     )];
+    if let Ok(l) = serde_json::from_value::<twr_core::loops::LoopView>(t["loop"].clone()) {
+        out.push(format!(
+            "  {}  {}",
+            twr_core::loops::badge(l.kind),
+            twr_core::loops::line(&l)
+        ));
+    }
     match serde_json::from_value::<twr_core::work::Work>(t["work"].clone()) {
         Ok(w) => out.extend(w.lines().into_iter().map(|l| format!("  {l}"))),
         Err(_) => out.push("  (this hub does not say what the thread has in flight)".into()),
@@ -7157,6 +7199,26 @@ fn wait_state(t: &Value) -> (WaitState, bool) {
     if status == "waiting" {
         return (WaitState::Waiting, false);
     }
+    // A running loop goes on by itself: each of its steps' reports is interim, until its last
+    // one (the loop is over then). It waits on the user when it is stuck or paused with
+    // nothing running.
+    if let Some(l) = t["loop"].as_object() {
+        let on_user = !l.get("stuck").is_none_or(Value::is_null)
+            || (l.get("paused") == Some(&json!(true))
+                && l.get("waiting_on").and_then(Value::as_str) == Some("user"));
+        return if on_user {
+            (WaitState::Waiting, false)
+        } else {
+            (WaitState::Busy, false)
+        };
+    }
+    // A loop's settings card waits on the user too.
+    if t["attention"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|i| i["loop_setup"] == true))
+    {
+        return (WaitState::Waiting, false);
+    }
     if matches!(status, "running" | "background" | "attached") {
         return (WaitState::Busy, false);
     }
@@ -7227,6 +7289,32 @@ fn wait_line(t: &Value, state: WaitState) -> String {
                 (Some(n), true) => format!("{name} finished turn {n}{grade}"),
                 (None, _) => format!("{name} is idle"),
             }
+        }
+        WaitState::Waiting if t["status"] != "waiting" && t["loop"]["stuck"].is_string() => {
+            format!(
+                "{name}'s loop is stuck ({}): `twr{w} loop resume {name}` asks for that step \
+                 again, `twr{w} loop stop {name}` ends it",
+                t["loop"]["stuck"].as_str().unwrap_or_default(),
+                w = workspace_hint()
+            )
+        }
+        WaitState::Waiting if t["status"] != "waiting" && t["loop"]["paused"] == true => {
+            format!(
+                "{name}'s loop is paused: `twr{w} loop resume {name}` goes on",
+                w = workspace_hint()
+            )
+        }
+        WaitState::Waiting
+            if t["status"] != "waiting"
+                && t["attention"]
+                    .as_array()
+                    .is_some_and(|i| i.iter().any(|i| i["loop_setup"] == true)) =>
+        {
+            format!(
+                "{name}'s loop waits for its settings card: `twr{w} attention --all` shows it, \
+                 `twr{w} loop review {name}` answers it",
+                w = workspace_hint()
+            )
         }
         WaitState::Waiting => format!(
             "{name} waits on you: `twr{w} attention` shows what",
@@ -9255,6 +9343,49 @@ mod tests {
         assert_eq!(t(failed.clone()), (WaitState::Busy, false));
         failed["queued_after"] = json!([]);
         assert_eq!(t(failed).0, WaitState::Failed);
+    }
+
+    /// A running loop goes on by itself: an idle thread whose last report is one of its steps'
+    /// is still busy, until the loop ends (its report is the thread's last); a stuck loop, a
+    /// paused one with nothing running and a loop's settings card wait on the user.
+    #[test]
+    fn wait_waits_through_a_loop() {
+        let done = json!({"status": "idle", "pending": 0, "reported": true, "box_online": true,
+            "last_turn": {"turn": 2, "result": "completed"},
+            "last_report": {"turn": 2, "ext": {"twr": {"loop": {"id": "L", "step": "scope"}}}}});
+        let mut running = done.clone();
+        running["loop"] = json!({"id": "L", "phase": "ladder", "paused": false, "stuck": null,
+            "waiting_on": "review"});
+        assert_eq!(wait_state(&running), (WaitState::Busy, false));
+        // Paused while a review still runs: it finishes first.
+        let mut paused = running.clone();
+        paused["loop"]["paused"] = json!(true);
+        assert_eq!(wait_state(&paused).0, WaitState::Busy);
+        paused["loop"]["waiting_on"] = json!("user");
+        assert_eq!(wait_state(&paused).0, WaitState::Waiting);
+        assert!(wait_line(&paused, WaitState::Waiting).contains("loop is paused"));
+        let mut stuck = running.clone();
+        stuck["loop"]["stuck"] = json!("review round m1 failed twice");
+        stuck["loop"]["waiting_on"] = json!("user");
+        assert_eq!(wait_state(&stuck).0, WaitState::Waiting);
+        assert!(
+            wait_line(&stuck, WaitState::Waiting).contains("loop is stuck (review round m1"),
+            "{}",
+            wait_line(&stuck, WaitState::Waiting)
+        );
+        // A permission of the thread's, in a loop: that is what it waits on.
+        let mut asking = running.clone();
+        asking["status"] = json!("waiting");
+        assert_eq!(wait_state(&asking).0, WaitState::Waiting);
+        assert!(wait_line(&asking, WaitState::Waiting).contains("`twr"));
+        // Ended: its last report is the thread's.
+        let mut ended = done.clone();
+        ended["last_report"]["ext"]["twr"]["loop"]["step"] = json!("report");
+        assert_eq!(wait_state(&ended).0, WaitState::Done);
+        let mut card = done;
+        card["attention"] = json!([{"attn_id": "a", "loop_setup": true}]);
+        assert_eq!(wait_state(&card).0, WaitState::Waiting);
+        assert!(wait_line(&card, WaitState::Waiting).contains("settings card"));
     }
 
     fn unreported_orch(done: &Value) {

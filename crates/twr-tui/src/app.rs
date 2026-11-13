@@ -378,6 +378,9 @@ pub struct ViewState {
     pub new_ws: Option<String>,
     /// The settings overlay, while open ([`crate::settings`]).
     pub settings: Option<crate::settings::Settings>,
+    /// The loop settings editor, while open ([`crate::loops`]): over the settings overlay
+    /// when its Loops row opened it.
+    pub loop_editor: Option<crate::loops::LoopEditor>,
     /// `[tui.notify] terminal`, as in effect (the settings change it).
     pub notify_terminal: twr_core::config::TerminalAlert,
     /// `[tui] compact_width`: below it the compact layout is on ([`AppState::compact`]); 0:
@@ -973,6 +976,21 @@ pub enum ActionKind {
     Delete,
     /// Sends the next queued message now, interrupting the turn that runs.
     SendNow,
+    /// A loop's setup card: opens the loop settings editor on its draft (`change…`).
+    LoopChange,
+    /// Starts a review loop on the thread, as `/review` (`review loop`).
+    LoopStart,
+    /// Opens the loop settings editor on the settings the thread's project uses
+    /// (`loop settings…`).
+    LoopSettings,
+    /// Pauses the thread's loop.
+    LoopPause,
+    /// Resumes the thread's loop.
+    LoopResume,
+    /// Stops the thread's loop (asks `y`).
+    LoopStop,
+    /// Ends the ladder after this round and goes to verification.
+    LoopSkip,
 }
 
 /// One row of the action popup: what it does and what it says.
@@ -1410,6 +1428,15 @@ pub enum Action {
     /// Read what the config file says of the TUI's settings, for the settings overlay: the
     /// IO loop has the settings writer read it, off the loop.
     SettingsFile,
+    /// A call about loops (`loop.request`, `loop.control`, `loop.setup.get`,
+    /// `loop.setup.update`, `loop.settings.get`, `loop.settings.set`, `loop.settings.reset`;
+    /// [`crate::loops`]): its answer goes to [`AppState::loop_result`].
+    Loop {
+        /// The method.
+        method: &'static str,
+        /// Its params.
+        params: Value,
+    },
     /// Switch to workspace `name` (a tab, `/ws`): the IO loop opens its hub (starting it when
     /// needed) and shows it in place of this one.
     Workspace {
@@ -1538,6 +1565,27 @@ pub enum Entry {
         /// Text.
         text: String,
     },
+    /// A review loop's round, from the thread's `loop.findings` (and its `loop.triage` once
+    /// that came): one folded row (`review round m3 · gpt-6.1-sol medium · 2 findings`) that
+    /// opens to the findings and the thread's verdicts ([`crate::loops`]).
+    LoopRound {
+        /// The `loop.findings`'s seq (its first, when a failed run was retried).
+        seq: u64,
+        /// The loop.
+        loop_id: String,
+        /// The round (`m3`, `v1`).
+        round: String,
+        /// The reviewer's model and the round's effort (`gpt-6.1-sol medium`), as the
+        /// transcript's `loop.started` and `loop.review_started` said; `None` when they are
+        /// not in it.
+        reviewer: Option<String>,
+        /// The findings.
+        findings: Vec<twr_core::loops::contract::Finding>,
+        /// The run failed, and why.
+        failed: Option<String>,
+        /// The thread's verdicts, once its triage was taken.
+        triage: Vec<twr_core::loops::contract::TriageItem>,
+    },
 }
 
 /// Weight of a transcript notice.
@@ -1597,6 +1645,11 @@ pub struct Transcript {
     /// That move resumes the session the thread left on that account
     /// (`ext.twr.resume_session`): the stop's line says so instead of a new session.
     pub moved_resumes: bool,
+    /// The reviewer's model of the loop the events applied so far started (its id and the
+    /// model), for its rounds' rows ([`Entry::LoopRound`]).
+    pub loop_reviewer: Option<(String, String)>,
+    /// The effort of the latest review run started (its round and the effort).
+    pub loop_effort: Option<(String, String)>,
 }
 
 impl Transcript {
@@ -1783,6 +1836,28 @@ impl Transcript {
             EventBody::TaskUpdated(p) if ev.source == twr_core::event::Source::Hub => {
                 self.apply_shell(ev.seq, p)
             }
+            // A loop's rounds: one row each ([`Entry::LoopRound`]).
+            EventBody::LoopStarted(p) => {
+                self.loop_reviewer = Some((p.id.clone(), p.settings.reviewer.model.clone()));
+            }
+            EventBody::LoopReviewStarted(p) => {
+                self.loop_effort = Some((p.round.clone(), p.effort.clone()));
+            }
+            EventBody::LoopFindings(p) => self.apply_findings(ev.seq, p),
+            EventBody::LoopTriage(p) if p.problems.is_empty() => {
+                let round = self.entries.iter_mut().rev().find_map(|e| match e {
+                    Entry::LoopRound {
+                        loop_id,
+                        round,
+                        triage,
+                        ..
+                    } if *loop_id == p.id && *round == p.round => Some(triage),
+                    _ => None,
+                });
+                if let Some(triage) = round {
+                    *triage = p.items.clone();
+                }
+            }
             // The runtime compacted its context (or failed to): a line of its own, in a dive
             // and in the orchestrator's conversation alike. While it runs, the activity line
             // says so.
@@ -1968,6 +2043,57 @@ impl Transcript {
             self.entries.drain(..excess);
             self.ids.drain(..excess);
         }
+    }
+
+    /// A round's `loop.findings` (`p`, at `seq`): the round's row, or, for a round whose run
+    /// failed before and was retried, that row again with what the retry found.
+    fn apply_findings(&mut self, seq: u64, p: &twr_core::event::LoopFindings) {
+        let model = self
+            .loop_reviewer
+            .as_ref()
+            .filter(|(id, _)| *id == p.id)
+            .map(|(_, m)| m.clone());
+        let effort = self
+            .loop_effort
+            .as_ref()
+            .filter(|(r, _)| *r == p.round)
+            .map(|(_, e)| e.clone());
+        let reviewer = match (model, effort) {
+            (Some(m), Some(e)) => Some(format!("{m} {e}")),
+            (Some(m), None) => Some(m),
+            (None, Some(e)) => Some(e),
+            (None, None) => None,
+        };
+        let failed = p
+            .failed
+            .then(|| p.reason.clone().unwrap_or_else(|| "the run failed".into()));
+        let found = self.entries.iter_mut().rev().find(|e| {
+            matches!(e, Entry::LoopRound { loop_id, round, .. } if *loop_id == p.id && *round == p.round)
+        });
+        if let Some(Entry::LoopRound {
+            reviewer: r,
+            findings,
+            failed: f,
+            ..
+        }) = found
+        {
+            if reviewer.is_some() {
+                *r = reviewer;
+            }
+            *findings = p.findings.clone();
+            *f = failed;
+            return;
+        }
+        self.close_text();
+        self.push(Entry::LoopRound {
+            seq,
+            loop_id: p.id.clone(),
+            round: p.round.clone(),
+            reviewer,
+            findings: p.findings.clone(),
+            failed,
+            triage: Vec::new(),
+        });
     }
 
     /// A job's `task.updated` (`p`, at `seq`): a `!` command's starts its entry, its end
@@ -2905,6 +3031,15 @@ pub struct AppState {
     /// The thread's agent this TUI runs for, if it does: it creates no workspace and
     /// changes no setting (the CLI refuses an agent's workspace too).
     pub agent: Option<String>,
+    /// The last `loop.settings.get` for all projects: the profiles `/review --profile`
+    /// completes to ([`AppState::loop_profiles`]).
+    pub loop_settings: Option<Value>,
+    /// That call was sent on this connection, and no saved settings changed since
+    /// ([`AppState::loop_settings_call`]).
+    pub loop_settings_asked: bool,
+    /// Loop calls an answer asked for (a setup card reloaded after a conflict), for the IO
+    /// loop to send ([`AppState::take_loop_calls`]).
+    pub pending_loop: Vec<Action>,
     /// The control stream ended ([`AppState::control_ended`]): what the view holds of its hub
     /// is no longer news (its workspace's card goes by the polls then).
     pub control_lost: bool,
@@ -3306,6 +3441,13 @@ impl AppState {
             && !matches!(ev.body, EventBody::AccountUsage(_))
         {
             self.accounts_due = true;
+        }
+        // The saved loop settings changed: the profiles are asked for again.
+        if matches!(
+            ev.body,
+            EventBody::LoopSettingsSaved(_) | EventBody::LoopSettingsReset(_)
+        ) {
+            self.loop_settings_asked = false;
         }
         self.clear_transient_on(ev);
         self.track_sent(ev);
@@ -3713,6 +3855,7 @@ impl AppState {
                 }
             }
             "config.show" => self.settings_hub(result),
+            m if m.starts_with("loop.") => self.loop_result(m, result),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
             "orchestrator.reset" => {
@@ -5445,6 +5588,44 @@ impl AppState {
             Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
             Slash::Settings => return (self.open_settings(), true),
             Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
+            Slash::Review {
+                thread,
+                setup,
+                scope,
+                profile,
+                reviewer,
+                implementer,
+                workers,
+                commit,
+            } => {
+                let overrides = vec![
+                    ("profile", profile),
+                    ("reviewer", reviewer),
+                    ("implementer", implementer),
+                    ("workers", workers),
+                    ("commit", commit),
+                ];
+                return self.request_review(thread.as_deref(), setup, scope, overrides);
+            }
+            Slash::Loop {
+                thread,
+                action,
+                project,
+            } => {
+                use twr_core::slash::LoopAction;
+                let word = match action {
+                    LoopAction::Status => "status",
+                    LoopAction::Pause => "pause",
+                    LoopAction::Resume => "resume",
+                    LoopAction::Stop => "stop",
+                    LoopAction::SkipToVerify => "skip_to_verify",
+                    LoopAction::Settings => {
+                        let prefer = project.is_some();
+                        return (self.open_loop_settings(project, prefer), true);
+                    }
+                };
+                return self.control_loop(thread.as_deref(), word);
+            }
         }
         (Vec::new(), true)
     }
@@ -5844,6 +6025,10 @@ impl AppState {
         // [`crate::settings`]).
         if self.view.new_ws.is_some() {
             return self.new_ws_key(key);
+        }
+        // The loop settings editor, over the settings when their Loops row opened it.
+        if self.view.loop_editor.is_some() {
+            return self.loop_editor_key(key);
         }
         if self.view.settings.is_some() {
             return self.settings_key(key);
@@ -6761,7 +6946,10 @@ impl AppState {
     /// banner, Dismiss where the item allows it; for a request, Talk to its thread.
     pub fn action_rows(&self, target: &ActionTarget) -> Vec<ActionRow> {
         let item = self.selected_attention();
+        // A loop's item in a TUI an agent runs: shown, never answered from here.
+        let read_only = self.agent.is_some() && item.is_some_and(crate::loops::is_loop_item);
         let mut rows: Vec<ActionRow> = item
+            .filter(|_| !read_only)
             .map(|i| {
                 i.options
                     .iter()
@@ -6781,7 +6969,15 @@ impl AppState {
             kind,
             label: label.to_string(),
         };
-        let dismissable = item.is_some_and(|i| i.thread == HUB_THREAD || !i.reason.is_blocking());
+        // A loop's setup card: its draft changed in the editor, between its options and the
+        // thread's rows.
+        if item.is_some_and(|i| i.loop_setup) && !read_only {
+            rows.push(row(ActionKind::LoopChange, "change…"));
+        }
+        // A loop's items are answered, never dismissed.
+        let dismissable = item.is_some_and(|i| {
+            !crate::loops::is_loop_item(i) && (i.thread == HUB_THREAD || !i.reason.is_blocking())
+        });
         match target {
             ActionTarget::Queued(r) => {
                 let q = self.shown_queue();
@@ -6818,6 +7014,22 @@ impl AppState {
                 }
                 if dismissable {
                     rows.push(row(ActionKind::Dismiss, "dismiss"));
+                }
+                // With nothing waiting: start a review loop, or control the one it runs.
+                if let Some(t) = worker.filter(|_| item.is_none()) {
+                    match &t.r#loop {
+                        None => rows.push(row(ActionKind::LoopStart, "review loop")),
+                        Some(l) => {
+                            rows.push(if l.paused {
+                                row(ActionKind::LoopResume, "resume loop")
+                            } else {
+                                row(ActionKind::LoopPause, "pause loop")
+                            });
+                            rows.push(row(ActionKind::LoopStop, "stop loop"));
+                            rows.push(row(ActionKind::LoopSkip, "skip to verify"));
+                        }
+                    }
+                    rows.push(row(ActionKind::LoopSettings, "loop settings…"));
                 }
                 if let Some(t) = worker {
                     let pinned = self.view.pins.contains(&t.id);
@@ -7073,6 +7285,26 @@ impl AppState {
                     self.attach_via
                 ));
             }
+            ActionKind::LoopChange => {
+                let Some(item) = self.selected_attention().filter(|i| i.loop_setup) else {
+                    return Vec::new();
+                };
+                let attn = item.attn_id.clone();
+                return self.open_loop_card_editor(&attn, &thread);
+            }
+            ActionKind::LoopStart => {
+                return self
+                    .request_review(Some(&thread), false, None, Vec::new())
+                    .0;
+            }
+            ActionKind::LoopSettings => {
+                let project = self.registry.get(&thread).and_then(|t| t.project.clone());
+                return self.open_loop_settings(project, false);
+            }
+            ActionKind::LoopPause => return self.control_loop(Some(&thread), "pause").0,
+            ActionKind::LoopResume => return self.control_loop(Some(&thread), "resume").0,
+            ActionKind::LoopStop => return self.control_loop(Some(&thread), "stop").0,
+            ActionKind::LoopSkip => return self.control_loop(Some(&thread), "skip_to_verify").0,
             ActionKind::Answer(_)
             | ActionKind::Dismiss
             | ActionKind::Edit
@@ -7226,6 +7458,7 @@ impl AppState {
             account_runtime: self.thread_arg(None).ok().map(|t| t.runtime.clone()),
             project_runtimes,
             default_runtime: self.view.default_runtime.clone(),
+            profiles: self.loop_profiles(),
         }
     }
 
@@ -8014,6 +8247,10 @@ impl AppState {
                 Some("the runtime waits for this answer: answer it or stop the thread".into());
             return Vec::new();
         }
+        if crate::loops::is_loop_item(item) {
+            self.view.status = Some("a loop's card is answered, not dismissed".into());
+            return Vec::new();
+        }
         let action = Action::Dismiss {
             attn_id: item.attn_id.clone(),
             revision: item.revision,
@@ -8262,7 +8499,11 @@ impl AppState {
         // The picker is modal: its runtimes and its ✕ are tapped, the wheel picks. Only a tab
         // of the strip, which it does not cover, switches workspaces. So are the settings
         // (their rows) and the new-workspace dialog.
-        if self.picker_open() || self.view.settings.is_some() || self.view.new_ws.is_some() {
+        if self.picker_open()
+            || self.view.settings.is_some()
+            || self.view.loop_editor.is_some()
+            || self.view.new_ws.is_some()
+        {
             match ev.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     self.press(x, y);
@@ -8310,6 +8551,9 @@ impl AppState {
                     let arrow = KeyEvent::new(code, KeyModifiers::NONE);
                     if self.picker_open() {
                         return self.picker_key(arrow);
+                    }
+                    if self.view.loop_editor.is_some() {
+                        return self.loop_editor_key(arrow);
                     }
                     if self.view.settings.is_some() {
                         return self.settings_key(arrow);
@@ -8559,6 +8803,7 @@ impl AppState {
             Target::Settings => return self.ws_activate(WsRow::Settings),
             Target::WsSidebar => return self.toggle_workspaces(),
             Target::Setting(key) => return self.tap_setting(key),
+            Target::LoopRow(key) => return self.tap_loop_row(key),
             // Paged above.
             Target::More(_) => {}
             // A queued message: a tap selects it, a tap on the selected one opens its popup.
@@ -8649,7 +8894,10 @@ impl AppState {
         if self.picker_open() {
             return self.picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         }
-        if self.view.new_ws.take().is_some() || self.view.settings.take().is_some() {
+        if self.view.loop_editor.take().is_some()
+            || self.view.new_ws.take().is_some()
+            || self.view.settings.take().is_some()
+        {
             return Vec::new();
         }
         let closed = std::mem::take(&mut self.view.help)
@@ -9216,7 +9464,7 @@ impl AppState {
             }
             return;
         }
-        if self.picker_open() || self.view.settings.is_some() {
+        if self.picker_open() || self.view.settings.is_some() || self.view.loop_editor.is_some() {
             return;
         }
         self.view.selection = None;
@@ -9253,6 +9501,17 @@ impl AppState {
             self.view.status = Some("nothing to answer on this thread".into());
             return Vec::new();
         };
+        // Only the user answers a loop's card: a TUI an agent runs shows it, read-only.
+        if let Some(agent) = self
+            .agent
+            .as_ref()
+            .filter(|_| crate::loops::is_loop_item(item))
+        {
+            self.view.status = Some(format!(
+                "this TUI runs for {agent}: only the user answers a loop's card"
+            ));
+            return Vec::new();
+        }
         // Only the card the last frame drew in full, with its options, once the user has had
         // time to read it: one drawn just now replaced what the key was meant for, and one not
         // drawn (hidden in this view, scrolled away, cut short) was never read.
@@ -21312,13 +21571,15 @@ pub(crate) mod tests {
             .any(|d| d.attn_id == "pm1" && d.area == pop));
         assert_eq!(st.seen_gseq(), st.last_gseq);
         st.handle_key(key(KeyCode::Esc));
-        // Nothing waiting: no options, and Attach.
+        // Nothing waiting: no options, a review loop and its settings, and Attach.
         st.set_focus(Some("t-gamma".into()));
         popup_open(&mut st);
         assert_eq!(
             row_kinds(&st),
             [
                 ActionKind::Talk,
+                ActionKind::LoopStart,
+                ActionKind::LoopSettings,
                 ActionKind::Pin,
                 ActionKind::Stop,
                 ActionKind::Park,
@@ -23764,7 +24025,10 @@ pub(crate) mod tests {
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-gamma".into()));
             let pop = st.view.panes.get(&PaneId::Popup).unwrap().area;
             wheel_at(&mut st, 40, 20, pop.x + 1, pop.bottom() - 1, false);
-            assert_eq!(st.action_popup().and_then(|p| p.sel), Some(ActionKind::Pin));
+            assert_eq!(
+                st.action_popup().and_then(|p| p.sel),
+                Some(ActionKind::LoopStart)
+            );
         }
 
         /// The question waiting for `y`: `yes` runs it only once it has been on screen long

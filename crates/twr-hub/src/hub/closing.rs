@@ -81,15 +81,25 @@ impl Core {
                     ..Default::default()
                 }),
             }),
-            Exit::Park { source, keep } => plan.push_back(Planned {
-                turn: None,
-                source,
-                body: EventBody::ThreadParked(SessionPayload {
-                    session_id: view.session_id.clone(),
-                    ext: twr_ext_map(json!({ "keep": keep })),
-                    ..Default::default()
-                }),
-            }),
+            Exit::Park { source, keep } => {
+                // Its loop ends, and its setup card goes, with the park (`hub::loops`).
+                for body in self.loop_closing(thread, "parked") {
+                    plan.push_back(Planned {
+                        turn: None,
+                        source: Source::Hub,
+                        body,
+                    });
+                }
+                plan.push_back(Planned {
+                    turn: None,
+                    source,
+                    body: EventBody::ThreadParked(SessionPayload {
+                        session_id: view.session_id.clone(),
+                        ext: twr_ext_map(json!({ "keep": keep })),
+                        ..Default::default()
+                    }),
+                })
+            }
             // The log needs the stop (the process is gone); one the hub's shutdown asked for,
             // not the user, says so (`ext.twr.reason`), so viewers can fold those away, and so
             // does one the hub asked for to restart the runtime in new settings (`hub::restart`:
@@ -108,6 +118,17 @@ impl Core {
                     .and_then(|r| r.restart_reason)
                     .map(|why| moved_away.unwrap_or(why))
                     .or(shutdown.then_some(HUB_SHUTDOWN));
+                // Stopped by someone (not a restart in new settings, nor the hub's own
+                // shutdown): its loop ends, and its setup card goes, with it (`hub::loops`).
+                if reason.is_none() {
+                    for body in self.loop_closing(thread, "stopped") {
+                        plan.push_back(Planned {
+                            turn: None,
+                            source: Source::Hub,
+                            body,
+                        });
+                    }
+                }
                 plan.push_back(Planned {
                     turn: None,
                     source: Source::Hub,

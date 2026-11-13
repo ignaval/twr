@@ -88,6 +88,7 @@ as code with a copy button instead of a link that does nothing.
 | New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
 | Stop, park/resume, compact, trim, delete | Inspector actions; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
+| Review loops (`twr loop`, `/review`, `/loop`) | The inspector's Loops section, the Review loop button on a finished turn with changes, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |
 | Attach, PTY fallback, arbitrary shell | Embedded xterm.js terminals using the matching real CLI or login shell |
 | Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
@@ -137,6 +138,59 @@ all manager pages remain accessible through More. In short windows, expanding a 
 temporarily gives it the main area. Dark is the default. Light and System are available in Appearance; System follows
 the selected Omarchy theme on Linux. Native menus and window backgrounds follow
 the client preference, which is restored on the next launch.
+
+### Loops
+
+A review loop has a reviewer model check a thread's changes round by round while the thread
+fixes what holds up ([the design](design/loops.md)). The app starts and follows review loops
+in threads on the hub's own machine.
+
+- **Start one.** Select a thread: its inspector has a **Loops** section with a **Review
+  loop** button and, under it, the settings a loop would run on (profile, implementer,
+  reviewer, and whether they are this project's) or `first run: you will be asked to choose
+  models`. When a thread's turn ends with changes in its worktree (files not committed, or
+  commits ahead of its base) and no loop has reviewed them, its sidebar card, its
+  conversation and the orchestrator's **Latest thread reports** also show a **Review loop**
+  button (the grid's tiles do too in a narrow window such as a phone's, where the grid is
+  the thread list).
+  `[loops] offer_review = false` turns that button off. `/review` in the composer does the
+  same for the thread you talk to or have selected, and takes the CLI's options (`--setup`,
+  `--scope`, `--profile`, `--reviewer`, `--implementer`, `--workers`, `--commit`).
+- **The setup card.** The first loop, a loop you ask to check (`/review --setup`), or one
+  whose saved settings no longer hold, raises a setup card instead of starting. It shows in
+  Needs you, in the thread's conversation and in its inspector, ordered with questions. It
+  lists what the loop would run on, the hub's warnings, and anything to change first.
+  **Start and save** starts the loop and saves its settings; it waits while the card lists
+  something to change first. **Change…** opens the settings editor on the card; saving
+  there raises the card again with the new values. **Cancel** starts and saves nothing.
+  Start and Cancel answer the revision shown, under the same 600 ms rule as other requests.
+  The card has no Dismiss. On a phone it opens as a sheet.
+- **While it runs.** The thread's sidebar card (and in a narrow window its grid tile) shows the hub's loop badge and line
+  (`REVIEW LOOP high · ladder m3 · ledger 2`, wrapping on a narrow card rather than cut);
+  a click on it opens the inspector at its Loops section. There you see every phase with
+  the current one marked (and a sweep or verification the loop passed over as skipped), what
+  it runs on and whose settings they are, each round's findings and new-class count (the
+  round whose review still runs reads `under review`; open a round for its findings and the
+  thread's verdicts), the ledger, and whether it waits on the thread, the review or you. **Pause** or
+  **Resume**, **Skip to verify** and **Stop** (after a confirmation) control it, as do
+  `/loop pause|resume|skip|stop`. A stuck loop raises a card with **Resume** and **Stop**.
+  A loop started from the app says what it runs on (`api started a review loop: low ·
+  implementer … · reviewer … (saved settings)`), and a screen reader hears a setup card,
+  a stuck loop and a loop that ends (`api's review loop ended: clean`), in any thread.
+  Once it ended, **Open report** shows the report's path with a copy button.
+- **Settings.** **Change…** in the Loops section and `/loop settings` open the editor:
+  the four presets, the implementer (the thread's own, or a runtime, model and effort), its
+  workers where its runtime has subagents, the reviewer (runtime, model, and account where
+  it has several), the profile, an implementation loop's plan check and commits, what a
+  review loop commits, and **Save for** (all projects
+  or this project). Only runtimes that are installed and logged in can be chosen; the
+  others show why not. A hub that does not check its agent CLIs (`TWR_AGENT_PROBE=off`)
+  can't say, so every runtime can be chosen, marked `not checked`. **Settings › Loops** shows the same editor, the projects with their
+  own settings (open or remove them) and **Reset all**.
+
+Starting, controlling, answering a setup card and saving settings need a live connection
+and, on a paired device, the `operate` scope: none of them goes to the outbox. A read-only
+device sees the chip, the progress and the report path, with the actions disabled.
 
 ## Tray, login and background mode
 
@@ -291,7 +345,14 @@ Integration launches **real Electron and a real temporary hub**, with twr's dete
 fake adapter and a disposable login executable. It covers request revisions, streaming,
 first-turn streaming, small-model disclosure and suggestion acceptance,
 terminal input and attach, terminal keys/reload, interactive account login, config conflicts,
-memory, renderer boundaries, narrow navigation, and the independent hub lifetime. Debug
+memory, renderer boundaries, narrow navigation, and the independent hub lifetime. Its second
+script, `scripts/loops-integration.mjs`, drives a review loop through the app with a fake
+reviewer: the Review loop offer and `[loops] offer_review`, the setup card and its 600 ms
+rule, the editor, the chip, the inspector's progress and controls, the loop's end, a second
+run from `/review`, `/loop`, a stuck loop, the notifications, Settings › Loops, and the
+keyboard and screen-reader text of each. With `TWR_LOOPS_SHOTS=<dir>` it also saves each
+step in both themes, at the default size and the minimum width, with its accessibility tree.
+It runs against the debug build only. Debug
 fixtures use the existing debug-only user token inside their own private `TWR_HOME`; release
 builds ignore that token. No real account or existing workspace is used.
 

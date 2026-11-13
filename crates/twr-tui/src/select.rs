@@ -110,6 +110,9 @@ pub enum Target {
     /// A row of the settings, by what it sets: selects it, and a tap on the selected one
     /// changes it (Enter).
     Setting(crate::settings::Key),
+    /// A row of the loop settings editor, by what it sets ([`crate::loops::RowKey`]): selects
+    /// it, and a tap on the selected one changes it (Enter).
+    LoopRow(crate::loops::RowKey),
     /// On a phone, the row under a text cut to the rows it has, saying how much of it is
     /// below (`↓ 12 more lines`), or, once its end is in view, above: a tap scrolls it a page
     /// down, or back to its top ([`crate::app::AppState`]'s `page_text`). Which text: the

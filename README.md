@@ -50,6 +50,8 @@ twr respond api allow                  # show api's top item, answer it after yo
 twr park api                           # stop it and remove its clean worktree
 twr trim api                           # delete its build output (target/, node_modules/, ...)
 twr job run --thread api -- cargo test # a job: queued on the machine's job slots, its end told to api
+twr loop review api                    # a review loop: another model reviews api's work until it finds nothing new
+twr loop show api                      # its rounds, findings and ledger; `twr loop report api` when it ended
 twr resume api                         # recreate the worktree, same session
 twr stop api                           # stop the runtime, drop queued prompts
 twr delete api                         # after a y/N: move its worktree and branch to the trash

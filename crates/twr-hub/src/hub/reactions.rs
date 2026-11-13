@@ -112,6 +112,8 @@ impl Core {
         final_text: Option<String>,
     ) -> anyhow::Result<()> {
         if result == TurnResult::Interrupted {
+            // A loop's turn interrupted: the loop is stuck (`hub::loops::driver`).
+            self.loop_turn_interrupted(hub, thread, turn);
             return Ok(());
         }
         // A turn its runtime opened for a background task's notification that saw no run
@@ -166,17 +168,30 @@ impl Core {
             return self.react_to_orchestrator_turn_end(hub, thread, turn, result, &done);
         }
         // The thread's own work only: a `!` command of the user's is no task its turn waits
-        // for, and its end starts no turn that would report again.
+        // for, and its end starts no turn that would report again; nor is its loop's review run
+        // (the loop's next prompt follows its end).
         let background_starts: serde_json::Map<String, Value> = view
             .background_tasks
             .iter()
-            .filter(|(_, t)| !t.shell)
+            .filter(|(_, t)| !t.shell && !t.review)
             .map(|(id, t)| (id.clone(), json!(t.started_seq)))
             .collect();
         let background_count = background_starts.len();
         let name = view.name.clone();
         let session_id = view.session_id.clone();
         let mut batch = Batch::default();
+        // What the turn brings the thread's loop, if it is the loop's (`hub::loops::driver`):
+        // taken in this batch, with the report it marks.
+        let answer = match result {
+            TurnResult::Completed => self.loop_answer(
+                hub,
+                thread,
+                turn,
+                final_text.as_deref(),
+                background_count > 0,
+            ),
+            _ => None,
+        };
         let report = match self.logged_report(thread, turn)? {
             Some(r) => r,
             None => {
@@ -217,6 +232,9 @@ impl Core {
                             detail["reply_excerpt"] = json!(super::orch::cut(&clean, 3072));
                             detail["reply_truncated"] = json!(clean.len() > 3072);
                         }
+                        if let Some(a) = &answer {
+                            detail[LOOP_REPORT_KEY] = a.mark.clone();
+                        }
                         if detail.as_object().is_some_and(|o| o.is_empty()) {
                             None
                         } else {
@@ -224,6 +242,11 @@ impl Core {
                         }
                     },
                     ..Default::default()
+                };
+                // The loop's last report is the thread's report of the loop.
+                let report = match answer.as_ref().and_then(|a| a.summary.clone()) {
+                    Some(summary) => ReportReady { summary, ..report },
+                    None => report,
                 };
                 batch.push(
                     thread,
@@ -234,7 +257,14 @@ impl Core {
                 report
             }
         };
+        // A loop's turn is the loop's to judge: no review item.
+        let owned = answer.is_some();
+        let staged = match answer {
+            Some(a) => self.loop_take(hub, &mut batch, thread, turn, a),
+            None => Default::default(),
+        };
         if background_count == 0
+            && !owned
             && !is_interim(&report)
             && !done.reviewed
             && review_due(Some(result), report.grade, &done)
@@ -248,6 +278,11 @@ impl Core {
         }
         if !batch.is_empty() {
             self.append_batch(hub, batch)?;
+        }
+        // A review due, or a prompt queued: the loop's watch starts the one, the caller's
+        // dispatch (or the watch) the other.
+        if staged.review || staged.prompted {
+            hub.loop_kick.notify_one();
         }
         Ok(())
     }
@@ -633,7 +668,7 @@ pub(super) fn interim_tasks_running(
         .and_then(Value::as_object);
     running
         .iter()
-        .filter(|(_, t)| !t.shell)
+        .filter(|(_, t)| !t.shell && !t.review)
         .filter(|(id, t)| match starts {
             Some(starts) => starts
                 .get(id.as_str())

@@ -143,10 +143,16 @@ mod idle_compact;
 mod jobs;
 mod lifecycle;
 mod limits;
+mod loops;
+pub use loops::{
+    LoopControlParams, LoopGet, LoopRequest, SettingsFor as LoopSettingsFor,
+    SettingsSet as LoopSettingsSet, SetupGet as LoopSetupGet, SetupUpdate as LoopSetupUpdate,
+};
 pub mod memory;
 pub use memory::DIR as MEMORY_DIR;
 mod mode;
 mod model;
+mod one_shot;
 mod orch;
 mod project_read;
 mod proposal;
@@ -347,6 +353,10 @@ pub struct HubOptions {
     /// (`hub::suggest`): `None` uses the native Codex account's directory
     /// ([`HubOptions::native_dir`]: `$CODEX_HOME`, else `~/.codex`). Tests give a folder.
     pub suggest_codex_home: Option<PathBuf>,
+    /// The reviewer CLIs of review loops (`hub::loops::review`), by runtime (`codex`,
+    /// `claude-code`, `grok-build`): a runtime not named uses its `TWR_*_BIN`, else its command
+    /// on the hub's `PATH`. Tests give scripts.
+    pub reviewer_bins: std::collections::BTreeMap<String, PathBuf>,
     /// Where Claude Code's managed policy is read, to tell whether a Claude Code orchestrator's
     /// memory guard would run (`orch::restrict`); defaults to this system's locations (tests
     /// give their own).
@@ -554,6 +564,7 @@ impl HubOptions {
             suggest_bin: None,
             suggest_codex_bin: None,
             suggest_codex_home: None,
+            reviewer_bins: Default::default(),
             claude_policy: twr_adapters::claude_code::guard::PolicySources::system(),
             stall_after: None,
             wake_after: None,
@@ -757,8 +768,8 @@ pub struct SendOutcome {
 }
 
 /// `ext.twr.reason` of the `thread.stopped` the hub records for a runtime its own shutdown
-/// stopped (not the user).
-pub const HUB_SHUTDOWN: &str = "hub_shutdown";
+/// stopped (not the user): the reducer's, which keeps such a thread's loop going.
+pub const HUB_SHUTDOWN: &str = twr_core::reduce::HUB_SHUTDOWN_REASON;
 
 /// Shutdown progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -871,6 +882,10 @@ struct Inner {
     suggest_codex_bin: PathBuf,
     /// [`HubOptions::suggest_codex_home`] (`None`: read from the environment when needed).
     suggest_codex_home: Option<PathBuf>,
+    /// [`HubOptions::reviewer_bins`].
+    reviewer_bins: std::collections::BTreeMap<String, PathBuf>,
+    /// Wakes the loops' watch (`hub::loops::driver`): a step that leaves a review to run.
+    loop_kick: Arc<tokio::sync::Notify>,
     /// Next-message suggestions asked and answered (`hub::suggest`).
     suggestions: Mutex<suggest::Suggestions>,
     /// Thread summaries asked and answered (`hub::summary`).
@@ -1675,11 +1690,16 @@ struct Core {
     /// Delete cards (`attention.raised` on [`HUB_THREAD`] with `ext.twr.delete`) still open,
     /// with the threads each one deletes once confirmed (`hub::delete`).
     delete_cards: HashMap<String, delete::DeleteCard>,
+    /// The saved loop settings and the open loop setup cards (`hub::loops`).
+    loops: loops::LoopsState,
     /// What the hub knows of its boxes' disks: free space, worktree measurements, the open
     /// disk cards (`hub::disk`).
     disk: disk::DiskState,
     /// The hub's queued and running jobs (`hub::jobs`).
     jobs: jobs::JobState,
+    /// The review runs of loops this hub runs now, by thread (`hub::loops`). Memory only: a
+    /// run never outlives its hub.
+    loop_runs: loops::LoopRuns,
     /// What feeds the notification hook (`hub::hook`); `None` without `[notify] command`.
     hook: Option<hook::HookFeed>,
     /// Prompts waiting for other threads to finish (`hub::after`).
@@ -2365,6 +2385,27 @@ impl Core {
         let Some(p) = next else {
             return Ok(None);
         };
+        // A loop's prompt whose loop is over never starts a turn: it goes, recorded as a
+        // withdrawn message (`hub::loops::driver`), and the queue goes on.
+        if let Some(loop_id) = self.stale_loop_prompt(thread, &p.source, &p.prompt) {
+            let mut batch = Batch {
+                dequeue: Some(p.id),
+                ..Batch::default()
+            };
+            batch.push(
+                thread,
+                None,
+                Source::Hub,
+                EventBody::PromptWithdrawn(PromptWithdrawn {
+                    msg_ref: p.id,
+                    prompt: p.prompt,
+                    ext: twr_ext_map(json!({ "loop_ended": loop_id })),
+                    ..Default::default()
+                }),
+            );
+            self.append_batch(hub, batch)?;
+            return self.dispatch_next(hub, thread);
+        }
         // A new orchestrator's handoff is its first turn, before the first queued prompt
         // (`hub::handoff`); the prompt follows once it ended.
         if let Some(turn) = self.deliver_pending_handoff(hub, thread)? {

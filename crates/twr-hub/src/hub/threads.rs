@@ -112,17 +112,30 @@ impl Core {
             // dropped, and nothing is dropped unless the thread is stopped.
             let plan = if view.current_turn.is_some() {
                 self.closing_plan(&id, Exit::Stopped).map_err(append_err)?
-            } else if !view.stopped {
-                VecDeque::from([Planned {
-                    turn: None,
-                    source: caller.source(),
-                    body: EventBody::ThreadStopped(SessionPayload {
-                        session_id: view.session_id.clone(),
-                        ..Default::default()
-                    }),
-                }])
             } else {
-                VecDeque::new()
+                // Its loop ends, and its setup card goes, with the stop (`hub::loops`; the
+                // closing sequence above records them itself), also when the thread counts as
+                // stopped already (by the hub's shutdown): the user stopped it now.
+                let mut plan: VecDeque<Planned> = self
+                    .loop_closing(&id, "stopped")
+                    .into_iter()
+                    .map(|body| Planned {
+                        turn: None,
+                        source: Source::Hub,
+                        body,
+                    })
+                    .collect();
+                if !view.stopped {
+                    plan.push_back(Planned {
+                        turn: None,
+                        source: caller.source(),
+                        body: EventBody::ThreadStopped(SessionPayload {
+                            session_id: view.session_id.clone(),
+                            ..Default::default()
+                        }),
+                    });
+                }
+                plan
             };
             let mut batch = Batch {
                 drop_queues: vec![id.clone()],

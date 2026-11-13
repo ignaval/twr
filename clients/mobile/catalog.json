@@ -1802,6 +1802,595 @@
     ]
   },
   {
+    "id": "cli:loop list",
+    "title": "twr loop list",
+    "description": "List the running loops: thread, kind, profile, phase, round, ledger, what each waits on",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `loop.list` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop pause",
+    "title": "twr loop pause",
+    "description": "Pause a thread's loop: what runs now finishes, the next step waits for resume",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `loop.control` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "pause"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop report",
+    "title": "twr loop report",
+    "description": "Print the report of a thread's last loop (its `report.md`). It reads the file where the hub wrote it, so it works on the hub's machine",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print `{thread, id, path, text}` as JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "report"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop resume",
+    "title": "twr loop resume",
+    "description": "Resume a paused or stuck loop (a stuck step is asked for again)",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `loop.control` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "resume"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop review",
+    "title": "twr loop review",
+    "description": "Start a review loop on a thread's work: an adversarial reviewer (another model, run read-only) reviews it round after round, and the thread verifies and fixes or dismisses each finding, until the reviewer has nothing left. It starts at once on your saved loop settings and prints them. The first time, or with --setup, or when a saved setting no longer holds, the thread's settings card comes first: on a terminal you answer it here (1 start and save, 2 change… in your editor, 3 cancel); without one it stays open, this prints the `twr respond` line that starts it, and exits 2. No flag starts a first loop without that card",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "setup",
+        "label": "setup",
+        "type": "boolean",
+        "description": "Show the settings card first, even when saved settings hold; starting from it saves what it shows",
+        "advanced": false
+      },
+      {
+        "key": "scope",
+        "label": "scope",
+        "type": "text",
+        "description": "What to review: branch (the default when the thread has commits of its own), uncommitted (else), since:<ref> or last:<n> (also written \"since <ref>\" in quotes, or since=<ref>)",
+        "advanced": false
+      },
+      {
+        "key": "profile",
+        "label": "profile",
+        "type": "text",
+        "description": "This run's profile: low, medium, high, or one of your [loops.profiles]",
+        "advanced": false
+      },
+      {
+        "key": "reviewer",
+        "label": "reviewer",
+        "type": "text",
+        "description": "This run's reviewer: runtime[:account]/model (codex/gpt-6.1-sol)",
+        "advanced": false
+      },
+      {
+        "key": "implementer",
+        "label": "implementer",
+        "type": "text",
+        "description": "This run's implementer: thread (its own model), or runtime[:account]/model[:effort] on the thread's own runtime",
+        "advanced": false
+      },
+      {
+        "key": "workers",
+        "label": "workers",
+        "type": "text",
+        "description": "This run's workers, the implementer's subagents: model[:effort]",
+        "advanced": false
+      },
+      {
+        "key": "commit",
+        "label": "commit",
+        "type": "text",
+        "description": "This run's commit: match (commit the fixes if the thread commits its work) or none",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print `loop.request`'s answer as JSON (with the card, `loop.setup.get`'s, when it needs one); never asks",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "review"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "setup",
+        "flag": "--setup",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "scope",
+        "flag": "--scope",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "profile",
+        "flag": "--profile",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "reviewer",
+        "flag": "--reviewer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "implementer",
+        "flag": "--implementer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "workers",
+        "flag": "--workers",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "commit",
+        "flag": "--commit",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop settings",
+    "title": "twr loop settings",
+    "description": "Show the saved loop settings that apply (a project's own, else the workspace's), where they come from, what the first settings card shows when nothing is saved, and the warnings and problems; --edit changes them in your editor ($VISUAL, $EDITOR, else vi) as a small TOML document; --reset forgets them (the next loop shows its card again). `twr loop settings set` changes named settings without an editor",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "project",
+        "label": "project",
+        "type": "text",
+        "description": "One project's settings (it uses the workspace's until it has its own)",
+        "advanced": false
+      },
+      {
+        "key": "edit",
+        "label": "edit",
+        "type": "boolean",
+        "description": "Change them in your editor and save them (for --project: as that project's own)",
+        "advanced": false
+      },
+      {
+        "key": "reset",
+        "label": "reset",
+        "type": "boolean",
+        "description": "Forget them: a project's own (it uses the workspace's again), or, without --project, every saved set. Asks y/N on a terminal; without one, only with --yes",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `loop.settings.get` JSON (with --edit or --reset: the answer of the change)",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "settings"
+    ],
+    "cliFields": [
+      {
+        "key": "project",
+        "flag": "--project",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "edit",
+        "flag": "--edit",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "reset",
+        "flag": "--reset",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop settings set",
+    "title": "twr loop settings set",
+    "description": "Change named settings and save them (`loop.settings.set`), the others as they apply now (or, before anything is saved, as the first card shows them). Saving them counts as your answer: later loops start on them without a card",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "project",
+        "label": "project",
+        "type": "text",
+        "description": "Save them as this project's own",
+        "advanced": false
+      },
+      {
+        "key": "preset",
+        "label": "preset",
+        "type": "select",
+        "description": "A preset's implementer, workers and reviewer first: claude-codex (Claude Code implements, Codex reviews), claude, codex or grok [possible values: claude-codex, claude, codex, grok]",
+        "advanced": false,
+        "options": [
+          "claude-codex",
+          "claude",
+          "codex",
+          "grok"
+        ]
+      },
+      {
+        "key": "profile",
+        "label": "profile",
+        "type": "text",
+        "description": "The profile: low, medium, high, or one of your [loops.profiles]",
+        "advanced": false
+      },
+      {
+        "key": "implementer",
+        "label": "implementer",
+        "type": "text",
+        "description": "The implementer: thread, or runtime[:account]/model[:effort]",
+        "advanced": false
+      },
+      {
+        "key": "workers",
+        "label": "workers",
+        "type": "text",
+        "description": "The workers: model[:effort]",
+        "advanced": false
+      },
+      {
+        "key": "reviewer",
+        "label": "reviewer",
+        "type": "text",
+        "description": "The reviewer: runtime[:account]/model",
+        "advanced": false
+      },
+      {
+        "key": "commit",
+        "label": "commit",
+        "type": "text",
+        "description": "What a review loop commits: match or none",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print `loop.settings.set`'s answer as JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "settings",
+      "set"
+    ],
+    "cliFields": [
+      {
+        "key": "project",
+        "flag": "--project",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "preset",
+        "flag": "--preset",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "profile",
+        "flag": "--profile",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "implementer",
+        "flag": "--implementer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "workers",
+        "flag": "--workers",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "reviewer",
+        "flag": "--reviewer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "commit",
+        "flag": "--commit",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop show",
+    "title": "twr loop show",
+    "description": "Show a thread's loop (its running one, else its last): its line, the settings it runs on and where they came from, each phase, each round with its findings and their triage, the ledger, the transition, how it ended, its folder and report",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `loop.get` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "show"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop skip",
+    "title": "twr loop skip",
+    "description": "Skip to verification: the ladder ends after the round under way, and the sweep is skipped",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `loop.control` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "skip"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:loop stop",
+    "title": "twr loop stop",
+    "description": "Stop a thread's loop: it ends `stopped`, and the thread and its work stay as they are. Asks y/N on a terminal; without one, only with --yes",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `loop.control` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "stop"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
     "id": "cli:memory edit",
     "title": "twr memory edit",
     "description": "Edit a note (or write a new one) in `$VISUAL` / `$EDITOR` (else `vi`): its `description:` and `type:` lines, then its text. Saved when the editor exits successfully and the text changed; a note changed meanwhile is a conflict, never overwritten",

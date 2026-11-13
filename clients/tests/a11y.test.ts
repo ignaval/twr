@@ -163,6 +163,24 @@ describe("announcement text", () => {
     ).toBeLessThan(200);
   });
 
+  it("says what a loop's setup card and a stuck loop ask, not their reason", () => {
+    // A setup card's reason is `review` (it blocks nothing), a stuck loop's is `error`.
+    expect(
+      attentionAnnouncement({
+        reason: "review",
+        loop_setup: true,
+        threadName: "api",
+      }),
+    ).toBe("Needs you: api asks you to choose a loop's settings");
+    expect(
+      attentionAnnouncement({
+        reason: "error",
+        loop_stuck: true,
+        threadName: "api",
+      }),
+    ).toBe("Needs you: api has a loop that is stuck");
+  });
+
   it("reports how a turn ended", () => {
     expect(turnAnnouncement("Orchestrator", "ok")).toBe(
       "Orchestrator finished responding",

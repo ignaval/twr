@@ -365,6 +365,10 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "desktop.retry_attention",
             "desktop.parse_slash",
             "desktop.slash_commands",
+            "loop.get",
+            "loop.list",
+            "loop.setup.get",
+            "loop.settings.get",
         ],
     ),
     (
@@ -447,6 +451,13 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "log.compact",
             "speech.request",
             "speech.control",
+            // Starting and controlling loops, answering their setup cards, and saving their
+            // settings (the same choice the card saves).
+            "loop.request",
+            "loop.setup.update",
+            "loop.settings.set",
+            "loop.settings.reset",
+            "loop.control",
         ],
     ),
 ];

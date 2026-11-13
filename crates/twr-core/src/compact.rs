@@ -159,7 +159,8 @@ pub struct TaskRow {
     pub running: bool,
     /// Its description is not empty.
     pub described: bool,
-    /// A job's update, as the hub records one ([`crate::event::is_job_task`]).
+    /// A job's or a review run's update, as the hub records one
+    /// ([`crate::event::is_hub_task`]).
     pub job: bool,
     /// It names a job's process group (`ext.twr.job.pgid`).
     pub group: bool,
@@ -183,7 +184,7 @@ impl Row {
                     task_id: p.task_id.clone(),
                     running: p.running,
                     described: !p.description.is_empty(),
-                    job: crate::event::is_job_task(&ev.source, &ev.body),
+                    job: crate::event::is_hub_task(&ev.source, &ev.body),
                     group: job("pgid"),
                     members: job("members"),
                 })
@@ -239,7 +240,9 @@ impl Row {
                 Ok(t) => {
                     let job = t.ext.and_then(|e| e.twr).and_then(|t| t.job);
                     Item::Task(TaskRow {
-                        job: source == "hub" && t.task_id.starts_with(JOB_TASK_PREFIX),
+                        job: source == "hub"
+                            && (t.task_id.starts_with(JOB_TASK_PREFIX)
+                                || t.task_id.starts_with(crate::event::LOOP_TASK_PREFIX)),
                         task_id: t.task_id.into_owned(),
                         running: t.running,
                         described: !t.description.is_empty(),

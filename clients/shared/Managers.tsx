@@ -4,6 +4,7 @@ import { AppOptions } from "./AppOptions";
 import { LayoutOptions } from "./LayoutOptions";
 import { errorMessage } from "./errors";
 import { AppearanceOptions } from "./AppearanceOptions";
+import { LoopSettingsPanel } from "./LoopViews";
 import { useHostAPI } from "./host";
 import { useCallback, useEffect, useState, useRef } from "react";
 import {
@@ -59,6 +60,8 @@ export interface ManagerProps {
   cliAction: (path: string, initial?: Json) => void;
   fail: (error: unknown) => void;
   canAdmin?: boolean;
+  /** A live hub connection (Settings › Loops reads the hub). */
+  connected?: boolean;
 }
 const meta: Record<
   string,
@@ -142,6 +145,7 @@ export function Manager(props: ManagerProps) {
         rpc={rpc}
         action={action}
         canAdmin={props.canAdmin !== false}
+        connected={props.connected !== false}
       />
     );
   if (!info) return null;
@@ -792,8 +796,10 @@ function Settings({
   rpc,
   action,
   canAdmin,
+  connected,
 }: {
   canAdmin: boolean;
+  connected: boolean;
   fail: ManagerProps["fail"];
   rpc: ManagerProps["rpc"];
   action: ManagerProps["action"];
@@ -845,6 +851,7 @@ function Settings({
           </div>
         </header>
         <ClientPreferences />
+        <LoopSettingsPanel connected={connected} />
       </div>
     );
   return (
@@ -868,6 +875,7 @@ function Settings({
           <button onClick={() => action("clear")}>Fresh conversation…</button>
         </div>
       </section>
+      <LoopSettingsPanel connected={connected} />
       <section className="settings-section">
         <h2>Session defaults</h2>
         <p>

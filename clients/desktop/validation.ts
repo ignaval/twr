@@ -36,6 +36,7 @@ const roots = new Set([
   "trash",
   "log",
   "job",
+  "loop",
   "speech",
   "speak",
   "remote",
@@ -133,7 +134,9 @@ export const attentionSummarySchema = z
             id: z.string().min(1).max(200),
             revision: z.number().int().min(0),
             reason: z.string().max(40),
-            card: z.enum(["confirm", "delete"]).optional(),
+            card: z
+              .enum(["confirm", "delete", "loop_setup", "loop_stuck"])
+              .optional(),
             incomplete: z.boolean().optional(),
           })
           .strict(),

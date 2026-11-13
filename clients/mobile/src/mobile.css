@@ -42,6 +42,11 @@ select {
   font-size: 1.230769rem;
   min-height: 44px;
 }
+/* iOS's theme replaces a menu select's min-height with its own (about 1.8em, 29 px), so
+ * the 44-point target comes from its height, which it keeps. */
+[data-mobile="true"] select:not([multiple]):not([size]) {
+  height: max(44px, calc(1.5em + 14px));
+}
 [data-mobile="true"] button,
 [data-mobile="true"] .check-field,
 [data-mobile="true"] .manage-nav > summary {
@@ -861,4 +866,16 @@ select {
 }
 :root[data-mobile="true"].tiny-content .composer > textarea {
   max-height: min(40dvh, calc(3lh + 20px));
+}
+
+/* Disclosure rows (a loop round's findings, the loop folder, Latest thread reports, Full
+ * thread state) are tap targets too: 44 points tall at any text size. */
+[data-mobile="true"] details > summary {
+  min-height: 44px;
+  padding-block: max(0px, calc((44px - 1.5em) / 2));
+  line-height: 1.5;
+}
+/* A model picker's switch back to its list. */
+[data-mobile="true"] .input-with-button > button {
+  min-width: 44px;
 }

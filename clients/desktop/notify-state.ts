@@ -117,13 +117,17 @@ const plain = (text: string, max = 120) => {
 export const kind = (item: Pick<AttentionSummaryItem, "reason" | "card">) =>
   item.card === "delete"
     ? "Asks you to confirm a deletion"
-    : item.card === "confirm"
-      ? "Asks you to confirm what the orchestrator proposed"
-      : item.reason === "permission"
-        ? "Asks for permission"
-        : item.reason === "question"
-          ? "Has a question for you"
-          : "Needs you";
+    : item.card === "loop_setup"
+      ? "Asks you to choose a loop's settings"
+      : item.card === "loop_stuck"
+        ? "Has a loop that is stuck"
+        : item.card === "confirm"
+          ? "Asks you to confirm what the orchestrator proposed"
+          : item.reason === "permission"
+            ? "Asks for permission"
+            : item.reason === "question"
+              ? "Has a question for you"
+              : "Needs you";
 
 const list = (words: string[]) =>
   words.length <= 1

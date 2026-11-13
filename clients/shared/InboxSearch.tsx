@@ -9,6 +9,8 @@ import "./inbox-search.css";
 export type InboxFilter =
   "all" | "permission" | "question" | "completion" | "other";
 export function inboxCategory(item: Attention): Exclude<InboxFilter, "all"> {
+  // A loop's setup card and a stuck loop's item ask the user to choose, as questions do.
+  if (item.loop_setup || item.loop_stuck) return "question";
   if (item.reason === "permission" || item.reason === "question")
     return item.reason;
   return item.reason === "review" ? "completion" : "other";

@@ -29,6 +29,8 @@
   --danger-soft: rgb(240 138 132 / 12%);
   --danger-fg: #1f0907;
   --success: #7cc79a;
+  --loop: #b9a3f0;
+  --loop-soft: rgb(185 163 240 / 13%);
   --focus: var(--accent);
   --scrim: rgb(0 0 0 / 60%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 50%);
@@ -1338,22 +1340,31 @@ kbd {
 .reports > summary > span {
   color: var(--faint);
 }
-.reports > button {
+.report-row {
   display: flex;
-  width: 100%;
+  align-items: center;
+  gap: 8px;
+}
+.report-row > button:first-child {
+  display: flex;
+  flex: 1;
+  min-width: 0;
   background: none;
   border: 0;
   justify-content: flex-start;
   padding: 6px 0;
   font-size: 0.923077rem;
 }
-.reports > button > span:first-child {
+.report-row > button:first-child > span:first-child {
   min-width: 70px;
   max-width: 110px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.reports > button > span:nth-child(2) {
+/* The summary (after the name and its visually hidden separator) ends in an ellipsis. */
+.report-row
+  > button:first-child
+  > span:not(:first-child):not(.visually-hidden) {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -1969,6 +1980,16 @@ meter::-webkit-meter-optimum-value {
   font-size: 1rem;
   padding: 6px 12px;
 }
+/* A primary option (a loop setup card's Start and save) keeps its fill: the rule above
+ * would put its accent-fg label on the raised background, where it cannot be read. */
+.attention-options > button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.attention-options > button.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 90%, var(--text));
+}
 .attention-options kbd {
   color: var(--faint);
   font-size: 0.846154rem;
@@ -2005,6 +2026,361 @@ meter::-webkit-meter-optimum-value {
 .inspector .attention-options > button {
   font-size: 0.923077rem;
   padding: 8px;
+}
+/* Loops (shared/LoopViews.tsx): the chip on a thread's sidebar card, the Review loop offer,
+ * the inspector's Loops section, the setup card and the settings editor. */
+.loop-chip {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  order: 1;
+  font-size: 0.846154rem;
+  line-height: 1.5;
+}
+.loop-badge {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: var(--loop);
+  background: var(--loop-soft);
+  border: 1px solid color-mix(in srgb, var(--loop) 40%, transparent);
+  font-size: 0.769231rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* The line wraps rather than losing its tail (the ledger, the round) to an ellipsis. */
+.loop-line {
+  min-width: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.loop-chip:hover .loop-line {
+  color: var(--loop);
+}
+.loop-offer {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  min-height: 24px;
+  font-size: 0.846154rem;
+  background: none;
+  color: var(--loop);
+  border: 1px solid color-mix(in srgb, var(--loop) 35%, var(--border));
+  border-radius: 6px;
+}
+.loop-offer:hover:not(:disabled) {
+  background: var(--loop-soft);
+}
+.loop-offer:disabled {
+  opacity: 0.55;
+}
+.thread-card-offer {
+  align-self: flex-start;
+  margin: -2px 12px 6px;
+}
+/* In the grid (a narrow window's thread list) the offer sits in its tile's bottom padding,
+ * over the card rather than in it: a button can't hold a button. */
+.thread-grid > .thread-item.has-offer {
+  position: relative;
+}
+.thread-grid > .thread-item.has-offer > .thread-card {
+  padding-bottom: calc(max(44px, 1.7rem) + 28px);
+}
+.thread-grid > .thread-item > .thread-card-offer {
+  position: absolute;
+  left: 20px;
+  bottom: 16px;
+  margin: 0;
+}
+.loop-offer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  max-width: var(--content-width);
+  margin: 4px auto 16px;
+  padding: 8px 12px;
+  border: 1px dashed color-mix(in srgb, var(--loop) 35%, var(--border));
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.inspector-loops {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+  margin: 16px 0;
+}
+.inspector-loops:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.inspector-loops h3 {
+  font-size: 0.923077rem;
+  margin-bottom: 8px;
+}
+.loop-settings-line,
+.loop-last {
+  font-size: 0.923077rem;
+  color: var(--muted);
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+.loop-settings-line .text-button {
+  display: inline;
+  font-size: inherit;
+}
+.loop-status {
+  font-size: 0.923077rem;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+.loop-phases {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 0.846154rem;
+}
+.loop-phases > li {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--faint);
+}
+.loop-phases > li.done {
+  color: var(--muted);
+}
+.loop-phases > li.skipped {
+  border-style: dashed;
+}
+.loop-phases > li.current {
+  color: var(--loop);
+  border-color: color-mix(in srgb, var(--loop) 45%, var(--border));
+  background: var(--loop-soft);
+  font-weight: 600;
+}
+.loop-facts {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 4px 8px;
+  margin: 0 0 12px;
+  font-size: 0.923077rem;
+}
+.loop-facts dt {
+  color: var(--faint);
+}
+.loop-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.loop-rounds {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  font-size: 0.923077rem;
+}
+.loop-rounds > li {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+.loop-rounds b {
+  color: var(--text);
+  font-weight: 600;
+}
+.loop-finding {
+  margin: 8px 0 8px 12px;
+  overflow-wrap: anywhere;
+}
+.loop-finding p {
+  margin: 2px 0;
+}
+.loop-severity {
+  font-size: 0.846154rem;
+  color: var(--muted);
+}
+.loop-severity.blocker {
+  color: var(--danger);
+}
+.loop-severity.major {
+  color: var(--warning);
+}
+.loop-verdict {
+  color: var(--loop);
+}
+.loop-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0;
+}
+.loop-controls > button {
+  font-size: 0.923077rem;
+  padding: 4px 10px;
+}
+.loop-report {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  font-size: 0.923077rem;
+}
+.loop-path {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+}
+.loop-path code {
+  font-family: var(--font-mono);
+  font-size: 0.846154rem;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+.attention-card.attention-loop-setup {
+  border-color: color-mix(in srgb, var(--loop) 40%, var(--border));
+}
+.attention-loop-setup > header {
+  background: var(--loop-soft);
+}
+.attention-loop-setup .attention-kind {
+  color: var(--loop);
+}
+.loop-setup-title {
+  color: var(--text);
+  margin: 0 0 10px;
+}
+.loop-setup-rows {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  font-size: 0.961538rem;
+}
+.loop-setup-rows > div {
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 8px;
+}
+.loop-setup-rows dt {
+  color: var(--faint);
+}
+.loop-setup-rows dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.loop-notes {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+  display: grid;
+  gap: 6px;
+  font-size: 0.923077rem;
+}
+.loop-notes > li {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.loop-notes > li > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.loop-warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+.loop-problem {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.loop-readonly {
+  padding: 0 14px;
+}
+.loop-setup-row .attention-body > p {
+  color: var(--text);
+  margin: 0 0 10px;
+}
+.loop-editor {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.loop-editor-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.loop-editor-heading {
+  font-weight: 600;
+  font-size: 0.923077rem;
+}
+.loop-editor-row {
+  display: grid;
+  /* In rem, so a phone, or a larger text size, gets one column before a select cuts its
+   * value ("Like the thread (commit if it was)"). */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 8px 12px;
+}
+.loop-presets {
+  flex-wrap: wrap;
+  width: auto;
+}
+.loop-editor-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 640px;
+}
+.loop-projects {
+  max-width: 640px;
+}
+/* Settings › Loops: whose settings the editor under it shows. */
+.loop-settings-for {
+  font-size: 1rem;
+  margin: 8px 0 4px;
+}
+.loop-projects ul {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 14px;
+}
+.loop-projects li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.loop-projects li > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.loop-projects h3 {
+  font-size: 0.923077rem;
+}
+.toast.notice-toast {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+.toast.notice-toast > svg {
+  color: var(--success);
+  flex-shrink: 0;
 }
 .connection-banner {
   display: flex;
@@ -2118,7 +2494,8 @@ meter::-webkit-meter-optimum-value {
 }
 .dialog > header p {
   color: var(--muted);
-  max-height: 100px;
+  /* Three lines at any text size before it scrolls. */
+  max-height: max(100px, 4.5em);
   overflow: auto;
   font-size: 1rem;
   line-height: 1.5;
@@ -2322,6 +2699,8 @@ meter::-webkit-meter-optimum-value {
   --danger-soft: rgb(184 58 52 / 9%);
   --danger-fg: #ffffff;
   --success: #2b7449;
+  --loop: #6a46b8;
+  --loop-soft: rgb(106 70 184 / 10%);
   --scrim: rgb(20 22 25 / 35%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
   --destination-strength: 45%;
@@ -2350,6 +2729,8 @@ meter::-webkit-meter-optimum-value {
     --danger-soft: rgb(184 58 52 / 9%);
     --danger-fg: #ffffff;
     --success: #2b7449;
+    --loop: #6a46b8;
+    --loop-soft: rgb(106 70 184 / 10%);
     --scrim: rgb(20 22 25 / 35%);
     --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
     --destination-strength: 45%;
@@ -2382,6 +2763,8 @@ meter::-webkit-meter-optimum-value {
   --danger-soft: color-mix(in srgb, var(--bg) 90%, var(--danger));
   --danger-fg: var(--bg);
   --success: color-mix(in srgb, var(--text) 70%, #3b9c6e);
+  --loop: color-mix(in srgb, var(--text) 70%, #8f6fe0);
+  --loop-soft: color-mix(in srgb, var(--bg) 88%, var(--loop));
   --scrim: color-mix(in srgb, var(--bg) 75%, transparent);
   --shadow-color: color-mix(in srgb, var(--bg) 25%, #000);
   --shadow-pop: 0 12px 40px
@@ -2978,9 +3361,13 @@ meter::-webkit-meter-optimum-value {
   .dialog-footer {
     padding: 16px 20px;
   }
+  /* The hint takes what the buttons leave, on one line: wrapped into a narrow column it
+   * pushed the footer up over the dialog's fields at large text sizes. */
   .dialog-footer > span {
-    max-width: 100px;
+    flex: 1 1 0;
+    min-width: 0;
     overflow: hidden;
+    white-space: nowrap;
     text-overflow: ellipsis;
   }
   .palette-list small {

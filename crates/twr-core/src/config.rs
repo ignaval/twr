@@ -136,6 +136,31 @@
 //! [runtimes.gemini]
 //! acp = "gemini --experimental-acp"
 //! attach = "gemini --resume {session}"
+//!
+//! # Review and implementation loops: what the first setup card shows (never saved settings:
+//! # the card saves those), the profiles and the limits (docs/design/loops.md).
+//! [loops]
+//! profile = "high"                 # low | medium | high | a [loops.profiles.*] name
+//! implementer = "thread"           # "thread", or runtime[:account]/model[:effort]
+//! reviewer = "codex/gpt-6.1-sol"   # runtime[:account]/model
+//! workers = "claude-opus-5-5:high" # the implementer's subagents, where its runtime has them
+//! commit = "end"                   # implementation loops: end | per-round | none
+//! sweep = "thread"                 # thread | runs
+//! max_audit_runs = 4
+//! round_timeout = "1h"             # a review run that takes longer failed
+//! max_rounds_per_tier = 25         # the backstop
+//! offer_review = true              # the apps' Review loop button on a finished turn
+//!
+//! [loops.profiles.high]            # the built-in low, medium and high, overridable
+//! plan_check = "contracts"         # never | contracts | always
+//! tiers = ["medium", "xhigh"]
+//! sweep = true
+//! verify = { rounds = 5, effort = "xhigh" }
+//!
+//! [loops.profiles.quick]           # one of your own gives tiers and verify
+//! tiers = [{ effort = "medium", max_rounds = 2 }]
+//! sweep = false
+//! verify = { rounds = 1, effort = "medium" }
 //! ```
 
 use std::collections::BTreeMap;
@@ -233,6 +258,9 @@ pub struct Config {
     pub accounts: BTreeMap<String, BTreeMap<String, AccountConfig>>,
     /// Per-runtime account policy (`[account_policy.<runtime>]`).
     pub account_policy: BTreeMap<String, AccountPolicy>,
+    /// Review and implementation loops (`[loops]`, [`crate::loops::config`]): what the first
+    /// setup card shows, the profiles and the limits. Never the saved settings.
+    pub loops: crate::loops::config::LoopsConfig,
 }
 
 /// Default `project_roots`: common code folders (the ones that do not exist are skipped).
@@ -281,6 +309,7 @@ impl Default for Config {
             project_roots: None,
             accounts: BTreeMap::new(),
             account_policy: BTreeMap::new(),
+            loops: crate::loops::config::LoopsConfig::default(),
         }
     }
 }
@@ -1871,6 +1900,7 @@ impl Config {
         }
         self.speech.validate()?;
         self.voice.validate()?;
+        self.loops.validate()?;
         match parse_span(&self.tui.summary_every_span) {
             Some(d) if d >= MIN_SUMMARY_EVERY => {}
             _ => anyhow::bail!(
@@ -3380,6 +3410,12 @@ mod tests {
             Some("personal")
         );
         assert_eq!(c.orchestrator_account(), Some(&Pin::parse("work")));
+        assert_eq!(c.loops.reviewer, "codex/gpt-6.1-sol");
+        assert_eq!(
+            c.loops.profile("quick").unwrap().tiers[0].max_rounds,
+            Some(2)
+        );
+        assert!(c.loops.profile("high").unwrap().sweep);
     }
 
     #[test]

@@ -2252,6 +2252,14 @@ impl Core {
                 if view.own_background() || report::interim_tasks(p) > 0 {
                     return;
                 }
+                // A loop's step: the loop goes on, and its end says how it went
+                // (`hub::loops`).
+                if twr_ext(&p.ext)
+                    .and_then(|t| t.get(LOOP_REPORT_KEY))
+                    .is_some_and(|l| l["step"] != "report")
+                {
+                    return;
+                }
                 if p.written_by == "orchestrator" {
                     return;
                 }
@@ -4208,6 +4216,26 @@ impl Hub {
             return Err(rpc(
                 codes::RELAY_FORBIDDEN,
                 format!("{attn_id} is a confirm card: the orchestrator cannot annotate it"),
+            ));
+        }
+        // A loop's setup card is the user's alone, on whatever thread it is (`hub::loops`).
+        if (item.loop_setup || core.loop_card(attn_id)) && caller.is_orchestrator() {
+            return Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                format!(
+                    "{attn_id} is a loop's setup card: the orchestrator cannot annotate it; the \
+                     user chooses its settings"
+                ),
+            ));
+        }
+        // And a stuck loop's item.
+        if (item.loop_stuck || core.loop_stuck(attn_id)) && caller.is_orchestrator() {
+            return Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                format!(
+                    "{attn_id} is a stuck loop's item: the orchestrator cannot annotate it; the \
+                     user resumes or stops the loop"
+                ),
             ));
         }
         let turn = core.registry.get(&item.thread).and_then(|v| v.current_turn);

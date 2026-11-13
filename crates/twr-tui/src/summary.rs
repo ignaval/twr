@@ -255,8 +255,55 @@ fn short(e: &Entry, k: Routine) -> String {
             Some((_, why)) => format!("was stalled ({why}), went on"),
             None => "was stalled, went on".into(),
         },
+        Routine::Loop => loop_short(&rest),
         Routine::Other => rest,
     }
+}
+
+/// A loop's routine update (`twr_hub::hub::updates`), its words after the thread's name, short
+/// for a folded run: `review loop: round m3, 2 findings`, `review loop: sweep`, `review loop:
+/// ladder ended after m3`, `review loop: paused by you`, `review loop: triage m3 answered`.
+/// Words it does not know are kept, after `review loop: `.
+fn loop_short(rest: &str) -> String {
+    let rest = rest.trim().trim_start_matches(':').trim_start();
+    let said = if let Some(r) = rest.strip_prefix("review round ") {
+        // `m3 · gpt-6.1-sol medium · 2 findings`
+        let mut parts = r.split(" · ");
+        let round = parts.next().unwrap_or_default();
+        match parts.last() {
+            Some(n) => format!("round {round}, {n}"),
+            None => format!("round {round}"),
+        }
+    } else if let Some(r) = rest.strip_prefix("its review loop is in its ") {
+        r.trim_end_matches(" now").to_string()
+    } else if let Some(r) = rest.strip_prefix("its review loop's ladder ended after ") {
+        let (round, why) = r.split_once(": ").unwrap_or((r, ""));
+        if why.is_empty() {
+            format!("ladder ended after {round}")
+        } else {
+            format!("ladder ended after {round} ({why})")
+        }
+    } else if rest.starts_with("its review loop skipped to verification") {
+        "skipped to verification".to_string()
+    } else if let Some(r) = rest.strip_prefix("review loop: ") {
+        // `pause by the user`
+        match r.trim_end_matches(" by the user") {
+            "pause" => "paused by you".into(),
+            "resume" => "resumed by you".into(),
+            "stop" => "stopped by you".into(),
+            "skip_to_verify" => "skipped to verification by you".into(),
+            other => other.to_string(),
+        }
+    } else if let Some(r) = rest.strip_prefix("answered its review loop's ") {
+        // `triage m3 step (success): …`
+        match r.split_once(" step") {
+            Some((step, _)) => format!("{step} answered"),
+            None => r.to_string(),
+        }
+    } else {
+        rest.to_string()
+    };
+    format!("review loop: {said}")
 }
 
 /// A live run's folded row as a frame drew it ([`crate::select::Panes::routine`]): what a
@@ -941,6 +988,11 @@ mod tests {
         v.as_object().cloned()
     }
 
+    /// The mark of a loop's routine update.
+    fn marked_loop() -> Option<JsonMap> {
+        ext(json!({"twr": {"routine": "loop"}}))
+    }
+
     /// The hub's mark says the kind; an update of an older hub is told by its words; any other
     /// update is not routine, whatever its text says further on.
     #[test]
@@ -1049,6 +1101,45 @@ mod tests {
         assert_eq!(
             short(&stall, Routine::Stall),
             "was stalled (No activity for 10 min), went on"
+        );
+        // A loop's routine updates, as the hub writes them: a kind of their own, short.
+        assert_eq!(Routine::of(&marked_loop(), "x"), Some(Routine::Loop));
+        for (text, said) in [
+            (
+                "api: review round m3 · gpt-6.1-sol medium · 2 findings",
+                "review loop: round m3, 2 findings",
+            ),
+            (
+                "api: its review loop is in its sweep now",
+                "review loop: sweep",
+            ),
+            (
+                "api: its review loop's ladder ended after m3: two rounds with no new class",
+                "review loop: ladder ended after m3 (two rounds with no new class)",
+            ),
+            (
+                "api's review loop: pause by the user",
+                "review loop: paused by you",
+            ),
+            (
+                "api answered its review loop's triage m3 step (success): fixed m3.1",
+                "review loop: triage m3 answered",
+            ),
+            ("api: something newer", "review loop: something newer"),
+        ] {
+            assert_eq!(short(&update(text, Routine::Loop), Routine::Loop), said);
+        }
+        let entries = vec![
+            update("api: its review loop is in its ladder now", Routine::Loop),
+            update(
+                "api: review round m3 · gpt-6.1-sol medium · 2 findings",
+                Routine::Loop,
+            ),
+        ];
+        let r = runs(&entries, None, "t-orch");
+        assert_eq!(
+            r.runs[0].plain(&entries, None),
+            "review loop: round m3, 2 findings · 2 updates"
         );
         assert_eq!(every_words(Duration::from_secs(300)), "5 min");
         assert_eq!(every_words(Duration::from_secs(3600)), "1 h");

@@ -58,6 +58,9 @@ When the hub's streams end under an open TUI (`twr hub stop`, a hub restarted or
 | Colors | `[tui] colors` | `auto`, `256`, `16`, `none` |
 | Codex auto | `[codex] auto`, the hub's | no: edit the file, then restart the hub |
 | Wake after | `wake_after_secs`, the hub's | no: edit the file, then restart the hub |
+| Loops | the hub's saved loop settings, per workspace or project | `Enter` opens the [loop settings editor](#the-loop-settings-editor) over the settings; `Esc` there comes back here |
+
+The Loops row shows the saved settings' profile and reviewer runtime (`high · reviewer codex`), or that nothing is saved yet, once the hub has said.
 
 `↑`/`↓` select a row, `Enter`, `Space` or `→` change it to the next value and `←` back, `Esc` closes. A tap selects a row and a tap on the selected one changes it; the top border's `✕` closes. A change applies at once, for every workspace this TUI shows, and is written to the [config file](configuration.md) (`~/.config/twr/config.toml`) where the table says. The TUI changes that one line, or adds it under its table, or adds the table at the end, and nothing else: comments, blank lines, the order of the keys and every other table, secrets included, stay byte for byte as they were. It checks the result before writing it: read back, the file must hold exactly what it held before with that one value changed, and still be a config twr loads. It writes into the file itself, so the file keeps its owner, group, permissions, ACLs and links (a symlink's target is what changes), under a lock that makes another TUI's change wait for this one; it leaves the file alone when an editor changed it meanwhile. While it writes, a copy of the old text, readable only by you, waits beside the file as `.config.toml.twr-edit-…`, removed once the new text is on disk. When it can't be sure (the table written inline, `tui = { ... }`, or with dotted keys, a value spread over several lines, a file twr doesn't load), it leaves the file alone: the status bar says why, and the change holds for this session only. A row shows `the file says …` when the value in effect differs from the file's, after `/suggest`, `/summaries` or `/compact` for example.
 
@@ -202,6 +205,66 @@ Select the conversation with `Shift-←`; then `Shift-↑` and `Shift-↓` step 
 
 Streaming uses the same collapsed preview of the beginning of the block as finished text. The preview stays at its maximum height as more text arrives; its hidden-line count grows. Expand it to read the full content while it streams. Expansion opens at the block's beginning, and `PgUp`/`PgDn` or the wheel scroll the conversation normally. Long blocks use their expansion footer while streaming; the header's working icon indicates progress. Finished events fetch their full text from the blob store, so a final event's short stored preview never replaces the full streamed report. If that fetch fails, available streamed text is retained and a notice reports the failure.
 
+### Loops
+
+A [review loop](design/loops.md) runs in a thread: `/review` starts one on the thread you dived into or the selected card's (or the one you name), and so does `review loop` in a thread's [action popup](#the-action-popup). The hub decides whether it starts at once, on settings you saved, or needs its setup card first. When it starts, the status bar says what it runs on: `api: review loop started (high · scope); reviewer codex · gpt-6.1-sol`. When it needs its card, the TUI leaves a dive if you are in one, selects the thread's card and says so; it never answers the card for you.
+
+**The loop line.** While a thread runs a loop, the first row of its card is the loop line: the ` REVIEW LOOP ` badge, then the profile, where the loop is and how many entries its ledger has. The thread's state follows on the next row as usual:
+
+```
+┌ api ──────────── claude-code · opus-5-5 ─ auto ┐
+│ REVIEW LOOP  high · ladder m3 · ledger 2       │
+│▃ running · fixing m3.1 · running tests         │
+└────────────────────────────────────────────────┘
+```
+
+`paused` or `stuck` ends the line when the loop is. On a card too narrow for it, the line gives up the profile first (`ladder m3 · ledger 2`), then shortens what is left (`m3 · ldg 2`, `v1/5` in the verification), and only then is cut with `…`, from the end, so where the loop is goes last. The loop line is on the cards of the stack view, the sidebar and the compact Threads screen, not on the grid's tiles. It is the last row a card gives up: on a card one row tall it is all that is left, short (`REVIEW LOOP m3 · running…`). A permission or a question of the thread's sits under it, as it always does. While a review run goes, the thread is in the `background` state and its activity names the reviewer, its effort and how long it has run (`background · reviewer gpt-6.1-sol xhigh · 6m`); the run is not counted in the card's `(1 bg)`.
+
+The badge has a color of its own (light magenta), which stays itself with 16 colors; with no colors it is drawn in reverse video, and the text says what it is.
+
+**The setup card.** The first loop, and any loop the hub can't start on saved settings, raises a setup card on the thread's card, ordered with the questions. The card shows it short, with its options:
+
+```
+│ REVIEW LOOP  first run: choose its models      │
+│1 start and save these settings  2 cancel       │
+```
+
+Its [action popup](#the-action-popup) shows it in full, as the hub wrote it: a line on why it is raised, then its settings (profile, scope, implementer, workers, reviewer, where it saves) on rows with their values aligned, then its warnings and what has to change first (in red). Warnings are marked black on yellow (`Warning:` here, `· 1 warning` on the card, `warning:` in the [editor](#the-loop-settings-editor)), so they read on a light terminal as on a dark one; the loop line's text is in the terminal's own color for the same reason. Too long for the popup, it opens in the main pane's detail view, as other long items do, and is answered once read there. `1` starts the loop and saves the settings it shows, `2` cancels: answered as any item is, only once on screen in full for 600 ms, at the revision you read. The popup has a `change…` row between the options and the thread's rows, which opens the [editor](#the-loop-settings-editor) on what the card shows; it has no `dismiss` row.
+
+**The stuck card.** A loop whose step failed twice (a review run, a reply it can't read) waits for you on a ` LOOP STUCK ` card (white on magenta) with `1 resume` (ask for the step again) and `2 stop`; it has no `dismiss` row either.
+
+A TUI that a thread's agent runs shows both cards and the editor read-only: no options or `change…` in the popup, and nothing saved.
+
+**Controls.** `/loop [thread] pause`, `resume`, `stop` (asks `y`) and `skip` (end the ladder after this round and go to verification) control a thread's loop; the action popup of a thread in a loop with nothing waiting has `pause loop` (or `resume loop`), `stop loop` (asks `y`), `skip to verify` and `loop settings…`, and shows the loop's progress above them: the loop line, its phases with the current one marked (`scope · ▸ladder · sweep · verify · report`; a phase the loop passed over reads `sweep skipped` or `verify skipped`), its rounds with how many findings each had and how many were fixed as a new class (`rounds m1 5(3) · m2 2(1) · m3 ▸`; `▸` marks the round going on, `✗` a failed run), what it waits on, and why it is stuck when it is. `/loop` alone (or `/loop status`) says the same in the status bar.
+
+#### The loop settings editor
+
+`/loop settings` (`--project p` for the settings one project uses), `loop settings…` in a thread's popup (the thread's project), the Settings overlay's Loops row and a setup card's `change…` open the editor, drawn like the settings:
+
+| Row | Values |
+|---|---|
+| Preset | Claude Code + Codex, all Claude Code, all Codex, all Grok; `custom` when the settings match none |
+| Profile | the hub's profiles, with what each runs (`high · medium tier, then xhigh tier · sweep · 5 verify`) |
+| Implementer | `the thread's own`, or `named`, with its runtime, model and effort on three rows under it |
+| Workers | the implementer's subagents' model and effort, when its runtime runs subagents |
+| Reviewer | its runtime and model; its account when the runtime has several |
+| Review commits | `match` (commit the fixes if the thread commits its work), `none` |
+| Save for | `all projects`, or `this project` when there is one |
+| Save | saves (also `s`) |
+| Reset | the saved settings only: forgets them (asks `y`); for a project, it uses the workspace's again |
+
+Values cycle through what the hub found: the presets, profiles, runtimes and the models, efforts and accounts each runtime reports. A runtime that is not installed or not logged in is skipped, and the runtime rows say so under them (`skipped: grok-build (not installed)`); a preset that needs one is skipped too. A hub that does not check its agent CLIs (`TWR_AGENT_PROBE=off`) can't say, so it skips none, and each runtime reads `codex (not checked)`. Changing a runtime keeps the model only if the new runtime reports it, else takes twr's default for it. The hub's warnings and what has to change first are under the rows, as it last returned them.
+
+| Key (editor open) | Action |
+|---|---|
+| ↑, ↓, Home, End | pick a row |
+| →, Enter, Space | the next value; on Save, save; on Reset, ask `y` |
+| ← | the previous value |
+| s | save |
+| Esc, q | close it, saving nothing (back to the settings when they opened it) |
+
+A tap picks a row and a tap on the picked row changes it; the wheel picks; the top border's `✕` closes it. Moving around saves nothing: only Save (or `s`) does. For a setup card, Save sends the draft to the card at the revision the editor loaded (`loop.setup.update`); the hub raises the card again with it, and the editor closes back to the card, where `1` then starts the loop and saves the settings. When the hub says something must change first, the editor stays open and says what. When the card was raised again since it loaded, the editor loads it again and says the card changed. For the saved settings, Save saves them for all projects or for the project (`loop.settings.set`), and the editor closes.
+
 ### Routine updates and summaries
 
 Some of the hub's updates only say that a worker's work goes on: an interim report (its turn yielded with background tasks still running), `api background work finished.`, and the hub waking the worker after its background work. The hub marks these ([orchestrator.md](orchestrator.md)), and the TUI tells an older hub's by their words. A stall that resolved by itself counts too: the hub closed its item because the thread went on working (its runtime said, did or finished something), and says so on the item's resolution (`ext.twr.went_on`). Everything else shows as it is: requests and their boxes, reviews, errors, hung turns, open stalls, stalls closed any other way (answered, or closed because their thread stopped, crashed or was interrupted, their turn failed, a hung-turn card took their place, or the hub found their work gone when it started; an older hub never says, so its stalls all stay), confirm and delete outcomes, reports, failures (a failed turn's report too, though its background tasks run on), the hub saying it did not wake a worker (that one asks you to send it a message) and the acknowledgment of your messages.
@@ -211,6 +274,8 @@ A thread's routine updates since its last update that isn't routine form a run, 
 ```text
 ◦ api · Built the workspace; the integration tests are running (ctrl+o to expand)
 ```
+
+A loop's rounds, phase changes and controls are routine updates too, of a kind of their own, shortened as `◦ api · review loop: round m3, 2 findings`, `review loop: sweep`, `review loop: paused by you`. A failed round, a stuck loop and the loop's end are not routine.
 
 The thread's name is in its color. The text is the run's summary when it has one, else what its newest update says, shortened, and how many updates there are: `◦ api · background work finished · 3 updates`. `Ctrl-O`, or a click on the row, shows every update of the run as it is, each in its own place. An update about the thread that isn't routine ends its run: the run keeps its row and the text it had, and the thread's next routine update starts a new row below. Runs fold whether summaries are on or not, in the orchestrator's conversation only. A dive shows a thread's own updates as they are, and the folded rows are no steps of `Shift-↑`/`Shift-↓`.
 
@@ -253,6 +318,8 @@ The orchestrator conversation is where you work. When you want to talk to one ag
 A thread on a remote box has its box token after the runtime (`codex@gpu offline · gpt-5-codex · …`); when the details get shorter, the token of a box that isn't simply online stays (`@gpu offline · Esc: back`, then `@gpu offline`, then `@gp… offline`), the label giving way to the thread's name, cut as needed. The header says what the next `Esc` does: back to the orchestrator, or, while a card is selected or a popup is open, `Esc: release` or `Esc: close`, since that `Esc` doesn't leave yet. The input box's title says the same. On a narrow terminal the details get shorter, down to `Esc: back`; on a very narrow one the header is the thread's name and `Esc: back`. A click or tap anywhere on the header band returns to the orchestrator at once, as `/back` does, whatever is selected; `‹ back` at its start says so (left out below 20 columns). Below 100 columns, where the cards are a row above the conversation, a dive hides that row and gives the transcript the whole height. Its card stays the selected one meanwhile, so `Enter` opens the action popup of the thread the header names; neither `Tab` nor the Shift-arrows select a hidden card (the status bar says so).
 
 A dive selects nothing: the thread's card is drawn with a double border in its color, as where your lines go, and a card you select is drawn with the thick yellow border as always. With nothing selected, `Enter` on an empty line opens the action popup of the thread you dived into, so you can answer its request without selecting its card first. The input box's title says `→ orbit-webapp-1` on the thread's color, its border and hint are in that color, and its placeholder says `message orbit-webapp-1 directly…`. In a dive, a line you type goes straight to that thread (`thread.send`), and the transcript shows the agent's prompts (one the orchestrator sent with a dim `from the orchestrator` row above it), its replies, tool calls and turn ends the same way. The tool calls fold the way the orchestrator's do, one dim line per run of calls (`Ran 2 shell commands, read 1 file, 1 failed (ctrl+o to expand)`): `Ctrl-O` shows them all and a click shows one run. Every turn end keeps its line in a dive (`✻ Worked for 12.4s`).
+
+A [loop](#loops)'s own traffic folds the same way. A turn the loop's prompt started is one dim row naming its step, `review loop · triage m3 (ctrl+o to expand)`, which opens to the prompt the hub sent (it carries the findings, as data). Each review round is one row, `↻ review round m3 · gpt-6.1-sol medium · 2 findings · 1 fixed, 1 dismissed (ctrl+o to expand)` (a failed run's says `failed:` and why), which opens to each finding (its id, severity, location and the first line of its problem) with the thread's verdict under it. `Ctrl-O` opens them all, a click on a row that one. The thread's other turns read as usual.
 
 With nothing selected, `Esc` returns to the orchestrator conversation; with a card selected, the first `Esc` releases it and the next one returns (`Shift-←` then `Esc` returns too). Right after you send the thread a message, `Esc` still returns at once, and a second `Esc` within 2 seconds [takes the message back](#taking-back-a-message) and returns to the dive. `/back` returns too. Back in the conversation, the card you had selected before the dive is selected again (unless you selected another one during it), and the row of cards is back on a narrow terminal. Leaving the stack view with `Ctrl-G` ends the dive too; the decisions overlay leaves it as it is. A line only ever goes to a thread you dived into, never to the selected card or the only thread there is.
 
@@ -481,7 +548,7 @@ Each row shows the start of its message, `…` when there is more, and who sent 
 ╰───────────────────────────── Enter runs · Esc closes ╯
 ```
 
-It shows the item waiting on the card in full, its badge, its summary (a request's context, a confirm card's actions on rows of their own) and every option, numbered, and then what else you can do: `talk to <thread>` (dive in), `dismiss` (an item the hub raised: a routing question, review, error or stall; never an agent's permission or question, which waits for its answer), `pin` or `unpin`, `stop`, `park` or `resume` (both ask `y`), and, for a thread with nothing waiting, `attach` (the `twr attach` command to run in another terminal). A thread with nothing waiting shows its last report in full above the rows, under a line naming its turn and grade (`last report · turn 3 · success`); a short screen cuts it with `…` to leave the rows their room. The `twr asks` card and the orchestrator's box have their options and `dismiss` where it applies; a request selected in the conversation has its options and `talk to` its thread. In a dive, the popup of the thread you dived into has no `talk to` row.
+It shows the item waiting on the card in full, its badge, its summary (a request's context, a confirm card's actions on rows of their own) and every option, numbered, and then what else you can do: `talk to <thread>` (dive in), `dismiss` (an item the hub raised: a routing question, review, error or stall; never an agent's permission or question, which waits for its answer), `pin` or `unpin`, `stop`, `park` or `resume` (both ask `y`), and, for a thread with nothing waiting, `review loop` (start one, as `/review`) and `loop settings…`, or, while it runs a loop, `pause loop` or `resume loop`, `stop loop` (asks `y`) and `skip to verify` ([Loops](#loops)), then `attach` (the `twr attach` command to run in another terminal). A loop's setup card adds `change…` after its options, and neither it nor the stuck card has `dismiss`. A thread with nothing waiting shows its last report in full above the rows (in a loop, the loop's progress instead), under a line naming its turn and grade (`last report · turn 3 · success`); a short screen cuts it with `…` to leave the rows their room. The `twr asks` card and the orchestrator's box have their options and `dismiss` where it applies; a request selected in the conversation has its options and `talk to` its thread. In a dive, the popup of the thread you dived into has no `talk to` row.
 
 | Key (action popup open) | Action |
 |---|---|
@@ -561,10 +628,11 @@ These controls are drawn to be clicked, each at least a row tall (most a whole r
 | `↑ more`, `↓ more` | the sidebar's workspaces, where some were cut (the whole row) | brings the next one into view |
 | `THREADS ‹`, `≡` | the sidebar's header (the whole row); the tab strip's left end | hides the sidebar; shows it, as `Ctrl-B` |
 | a setting | the settings (every row of it) | selects it; on the selected one, changes it |
+| a row of the loop settings editor | the [editor](#the-loop-settings-editor) (every row of it) | picks it; on the picked one, changes it (on Save, saves) |
 | `‹ back` | a dive's header band (the whole band) | back to the orchestrator conversation, as `/back` |
 | `‹ stack` | the grid's header | back to the stack view, as `Ctrl-G` |
 | `↓ 12 lines below` | the main pane's last row while scrolled up (the whole row) | to the bottom, following it, as `End` |
-| `✕` | the top border of the help, the trash, the action popup, the `/` or `@` popup and the picker (the whole border row) | closes it, as `Esc` |
+| `✕` | the top border of the help, the trash, the action popup, the `/` or `@` popup, the picker, the settings and the loop settings editor (the whole border row) | closes it, as `Esc` |
 | `✕ close` | the decision table's summary line (the whole row) | closes the table, as `Esc` |
 | `✕` | a detail view's top border (a long request, an item too long for its popup) | back to the conversation, as `Esc` |
 | `↶ take back` | the input box's top border, right after you sent a message (the whole border row) | the first tap arms, the second within 2 s takes the message back, as `Esc Esc` |
@@ -681,6 +749,9 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/clear` | fresh orchestrator session with no handoff; asks `y`; keeps history and workers |
 | `/orch [<runtime> [model]]` | switch the orchestrator; alias `/orchestrator`; asks `y` with the summary, `s` without. Alone, it lists the runtimes to choose from first |
 | `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]]` | start a thread in a configured project, a path, or a repository folder name found under your code folders ([usage](usage.md)) |
+| `/review [thread] [--setup] [--scope s] [--profile p] [--reviewer r] [--implementer m] [--workers w] [--commit c]` | start a [review loop](#loops) on a thread's work, the one you dived into or the selected one by default: at once on your saved settings, or after its setup card (the first time, or with `--setup`). `--scope` is `branch`, `uncommitted`, `since <ref>` or `last <n>`; the other flags change this run only |
+| `/loop [thread] [status\|pause\|resume\|stop\|skip]` | where a thread's loop is (`status`, the default, in the status bar), or pause, resume, stop (asks `y`) or skip it to verification |
+| `/loop settings [--project p]` | the [loop settings editor](#the-loop-settings-editor): the settings all projects use, or one project's |
 | `/park [thread]`, `/stop [thread]` | park or stop a thread, the one you dived into or the selected one by default; asks `y` |
 | `/resume [thread]` | resume a parked thread |
 | `/compact-context [thread]` | compact a thread's context, as its agent's own `/compact` does: a turn of its own, after the turn that runs and the messages queued before; the one you dived into or the selected one by default ([runtimes.md](runtimes.md#context-compaction)). Automatic compaction before a message is turned off for a thread with `twr compact <thread> --offers off`, and on again with `--offers on`. `/compact` is the phone layout |

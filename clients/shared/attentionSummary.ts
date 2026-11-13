@@ -26,11 +26,18 @@ const HUB_THREAD = "hub";
 /**
  * Which of the hub's cards an item is: a question on the hub's thread that the hub marks
  * `proposal` (twr-core `is_confirm_card`), a delete card when it offers Delete (its options
- * are `Delete`/`Cancel`; a confirm card's are `Confirm`/`Cancel`).
+ * are `Delete`/`Cancel`; a confirm card's are `Confirm`/`Cancel`); a loop's setup card or a
+ * stuck loop's item, which the hub marks on the loop's thread (`AttentionItem::loop_setup`,
+ * `loop_stuck`). Every one of them needs the user, whatever its reason.
  */
 export function cardOf(
-  item: Pick<Attention, "thread" | "proposal" | "options">,
+  item: Pick<
+    Attention,
+    "thread" | "proposal" | "options" | "loop_setup" | "loop_stuck"
+  >,
 ): AttentionSummaryItem["card"] {
+  if (item.loop_setup === true) return "loop_setup";
+  if (item.loop_stuck === true) return "loop_stuck";
   if (item.thread !== HUB_THREAD || item.proposal !== true) return undefined;
   return Array.isArray(item.options) && item.options.includes("Delete")
     ? "delete"

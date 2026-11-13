@@ -206,6 +206,8 @@ impl Hub {
                     .map_or_else(|| PathBuf::from("claude"), PathBuf::from)
             }),
             suggest_codex_home: opts.suggest_codex_home,
+            reviewer_bins: opts.reviewer_bins,
+            loop_kick: Default::default(),
             suggest_codex_bin: opts.suggest_codex_bin.unwrap_or_else(|| {
                 std::env::var_os(twr_adapters::codex::BIN_ENV)
                     .filter(|b| !b.is_empty())
@@ -312,6 +314,12 @@ impl Hub {
         // Jobs a stopped hub ran and did not see end (what is left of them is gone already):
         // recorded lost.
         hub.inner.core().close_lost_jobs(&hub.inner);
+        // Review loops: what is left of the review runs a stopped hub ran goes, then every
+        // running loop is looked at as after a restart, and driven from now on
+        // (`hub::loops::driver`).
+        let groups = hub.inner.core().lost_review_groups();
+        super::loops::reap_reviews(&hub.inner, groups).await;
+        hub.inner.core().start_loops(&hub.inner);
         // Prompts waiting for other threads: each checked now, then as those threads move.
         after::start(&hub.inner);
         // The remote boxes' own tasks (an SSH box's supervisor dials it from now on).
@@ -402,6 +410,9 @@ impl Hub {
         // Every job first: each records its end (its process group gone) before the runtimes
         // stop.
         self.end_jobs(Duration::from_secs(15)).await;
+        // Every review run too (their process groups killed); nothing is recorded of them: the
+        // next hub runs their rounds again (`hub::loops::driver`).
+        self.end_reviews(Duration::from_secs(10)).await;
         // The notification command too, if one runs: it ends it, its group with it.
         let _ = self.inner.hook_stop.send(true);
         let hook = self
@@ -720,6 +731,7 @@ impl Core {
             delete_cards: HashMap::new(),
             disk: Default::default(),
             jobs: Default::default(),
+            loop_runs: Default::default(),
             hook,
             after: Default::default(),
             idle_offers: HashMap::new(),
@@ -739,6 +751,7 @@ impl Core {
             stalled: HashMap::new(),
             wake: Default::default(),
             hung: Default::default(),
+            loops: Default::default(),
             went_on: Default::default(),
             activity: HashMap::new(),
             reserved_names: HashSet::new(),
@@ -843,6 +856,10 @@ fn local_host(opts: &HubOptions) -> Arc<dyn ThreadHost> {
 fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
     tokio::spawn(orch::notifier(Arc::downgrade(inner), notify_rx));
     tokio::spawn(super::background::ticker(Arc::downgrade(inner)));
+    tokio::spawn(super::loops::watch(
+        Arc::downgrade(inner),
+        Arc::clone(&inner.loop_kick),
+    ));
     if !inner.stall_after.is_zero() {
         tokio::spawn(stall::stall_ticker(
             Arc::downgrade(inner),

@@ -120,6 +120,24 @@ repo = "/home/me/code/api"        # the repository
 # accounts = { codex = "team" }   # per runtime; replaces `account` there
 # exclude_accounts = ["personal"] # never these accounts
 
+[loops]                           # review loops (usage.md#loops): what the first settings card shows, profiles, limits
+profile = "high"                  # low | medium | high | a [loops.profiles.<name>]
+implementer = "thread"            # "thread" (the thread's own model), or runtime[:account]/model[:effort]
+reviewer = "codex/gpt-6.1-sol"    # runtime[:account]/model: claude-code, codex or grok-build
+workers = "claude-opus-5-5:high"  # the implementer's subagents, model[:effort], where its runtime has them
+commit = "end"                    # implementation loops (a later version): end | per-round | none
+sweep = "thread"                  # who audits the sweep's rules; "runs" comes in a later version
+max_audit_runs = 4                # with sweep = "runs": audit runs at once (1 to 32)
+round_timeout = "1h"              # a review run that takes longer fails (a minute at least)
+max_rounds_per_tier = 25          # the backstop: a tier this many rounds long ends the ladder (1 to 100)
+offer_review = true               # the apps' Review loop button on a finished turn with changes
+
+[loops.profiles.high]             # the built-in low, medium and high can be overridden key by key
+plan_check = "contracts"          # implementation loops: never | contracts | always
+tiers = ["medium", "xhigh"]       # the reviewer's effort per tier, in order; or { effort = "medium", max_rounds = 1 }
+sweep = true                      # audit this loop's findings as named rules after the ladder
+verify = { rounds = 5, effort = "xhigh" }  # capped verification rounds
+
 [codex]
 auto = "auto_review"              # a Codex thread in `auto` whose sandbox says no: Codex's "auto_review" agent decides (the default), "ask" you, or "never" run it
 
@@ -221,6 +239,8 @@ ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 
 `project_roots` lists the folders where `twr thread new <name>`, the TUI's `/new <name>` and the orchestrator look for a project given by its folder name, when that name isn't a `[projects]` entry. Like `default_runtime`, it's a top-level key, so it goes above the first `[section]`. A leading `~` is your home directory, and every other entry must be an absolute path. twr looks for a git repository, a folder with `.git` at its top, at `<root>/<name>` and one level deeper, at `<root>/<group>/<name>`, as in `~/code/acme/api`. The middle folder can't be a git repository itself, so nothing inside a repository is found, and hidden folders are skipped. An exact name match wins. Only when there's none does a match that ignores case count. Exactly one match is used as if you had given its absolute path. Several matches, or none, are an error that lists the candidates or the folders searched. Folders that aren't git repositories are never used. The search reads at most 2048 folders. Unset, it uses the folders in the reference above that exist. `~/Documents/GitHub` isn't among them, because reading `~/Documents` makes macOS ask for permission, and neither is `~/work`, which often holds documents rather than code; add them if you keep repositories there. `project_roots = []` turns the lookup off. The lookup only searches the hub's own machine: a thread on a remote box (`--box`) needs a configured project or an absolute path on that box.
 
+`[loops]` sets what the first settings card of a [review loop](usage.md#loops) shows, and the profiles and limits every loop uses. It is not the saved settings and never starts a loop: the first loop still shows its card, and what you answer there (or save with `twr loop settings`) is kept in the hub's log and used from then on, whatever `[loops]` says later. A key that doesn't parse is refused when the hub starts. A profile is a ladder of tiers, each a reviewer effort (`"medium"`), or `{ effort, max_rounds }` to cap that tier's rounds; the ladder ends when its last tier converges (a round with no findings, or only findings already in the ledger), after two rounds in a row with nothing of a new class, or at `max_rounds_per_tier`. Then the sweep, when `sweep = true` and the ladder found something the thread fixed, and up to `verify.rounds` verification rounds at `verify.effort`. The built-in profiles are `high` (tiers `medium` then `xhigh`, sweep, 5 verification rounds at `xhigh`), `medium` (`medium`, sweep, 2 at `xhigh`) and `low` (one `medium` round, no sweep, 1 at `medium`). A table named after one of them, `[loops.profiles.high]`, replaces only the keys it gives; a profile of your own (a name of 1 to 32 lowercase letters, digits, `-` and `_`, starting with a letter) gives `tiers` and `verify`, and its `plan_check` defaults to `contracts` and its `sweep` to `true`. A loop keeps the profile it started with. The efforts a profile names must be ones its reviewer's runtime takes, or the settings card says what to change. The reviewer's effort is always the round's, from the profile. Loop prompts' templates can be replaced by files in `loops/templates/` beside this file (`goal.md`, `triage.md`, `correction.md`, `sweep.md`, `report.md`, `review.md`).
+
 `[orchestrator] effort` sets the first orchestrator’s reasoning effort, validated against its runtime. Unset uses the runtime default.
 
 `[orchestrator]` only picks the first orchestrator. After `twr orchestrator use`, the choice is kept in the event log and survives hub restarts. See [orchestrator.md](orchestrator.md).
@@ -289,7 +309,7 @@ A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can'
 | `TWR_WORKSPACE` | the [workspace](workspaces.md) commands run in when `-w` doesn't say (default: `default`); a workspace's hub sets it for what it starts |
 | `TWR_RUNNER_TOKEN` | the runner's token when `twr runner` has no `--token-file` |
 | `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` (on a remote box, the login shell's `PATH` and then the runner's: [runners.md](runners.md#the-login-shells-path)) |
-| `TWR_AGENT_PROBE` | `off` keeps the hub from checking its own box's agent CLIs: no `claude`, `codex` or `grok` runs for it, and `hub.info` reports the local box's agents as not reported (an empty list). Any other value, or none, leaves the check on. For tests and troubleshooting |
+| `TWR_AGENT_PROBE` | `off` keeps the hub from checking its own box's agent CLIs: no `claude`, `codex` or `grok` runs for it, and `hub.info` reports the local box's agents as not reported (an empty list). Review loops then count every reviewer runtime as installed and logged in, not knowing (`loop.settings.get` says `probed: false`): no setting is refused or replaced for it, and a round whose CLI is missing fails as a failed run. Any other value, or none, leaves the check on. For tests and troubleshooting |
 | `TWR_BOX_PROBE` | in a runner's environment (`twr runner`, an SSH box's daemon): `off` keeps it from asking your login shell for its `PATH` (the runtimes keep the runner's own) and from checking its agent CLIs (it reports none to the hub); a remote attach (`twr runner --exec`), `twr box login` and `twr box doctor`'s look at the box's agents then skip the login shell too, so they find the agent the runner does. Any other value, or none, leaves both on. For tests and troubleshooting |
 | `TWR_SSH` | the ssh program the hub and `twr box` run for SSH boxes, instead of `ssh` on `PATH` (it gets the same arguments); not used for command boxes |
 | `TWR_BOX_LAUNCHER` | on an SSH box, in the environment ssh commands get there: `setsid` makes the relay start the box daemon in a new session, never as a systemd user service or a launchd job; `launchd` makes it start the daemon as a launchd job in your GUI session and fail rather than start it any other way (an error off macOS; see [Mac boxes](runners.md#mac-boxes)). For tests and troubleshooting |
