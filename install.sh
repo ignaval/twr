@@ -10,6 +10,13 @@
 # current user (no sudo). With a `gh` signed in to github.com it downloads through
 # `gh release download`.
 #
+# With --desktop (`curl -fsSL https://twr.tools/install.sh | sh -s -- --desktop`) it installs
+# the desktop app instead, checked against the release's desktop-sha256sums.txt, which is
+# signed and checked like sha256sums.txt: on macOS (Apple silicon) the app from the disk image
+# into /Applications (~/Applications when /Applications isn't writable); on Arch Linux the
+# Arch package, and on Debian or Ubuntu the .deb, both with sudo; on other x86_64 Linux the
+# AppImage into ~/.local/bin/twr-desktop, with a launcher entry.
+#
 # sha256sums.txt is signed (sha256sums.txt.sig, Ed25519, the key in the block below). When
 # openssl here can check Ed25519 signatures (OpenSSL 3.0 or newer; macOS's LibreSSL can't),
 # the signature must verify. Otherwise, when the P-256 block below holds a key, the ECDSA P-256
@@ -35,6 +42,14 @@
 #                          is not checked here, even with TWR_REQUIRE_SIGNATURE=1: the caller
 #                          (`twr update`) passes the one it verified
 #   TWR_UPDATE             1 when `twr update` runs this: no first-install advice
+#
+# With --desktop, TWR_VERSION, TWR_DOWNLOAD_URL (which then holds desktop-sha256sums.txt and
+# its signatures) and TWR_REQUIRE_SIGNATURE apply as above, and also:
+#   TWR_DESKTOP_DIR        where the app goes: the folder for twr.app on macOS, for the
+#                          AppImage (twr-desktop) on Linux; not used for the Arch and Debian
+#                          packages
+#   TWR_DESKTOP_PACKAGE    dmg, pacman, deb or appimage: install that instead of the one this
+#                          machine would get (appimage: on Arch or Debian, no sudo)
 
 set -eu
 
@@ -69,10 +84,20 @@ PROBE_SIGNATURE_P256='MEYCIQDMpn6V4PfMq2wJa21noPZ+cKKbg5ahWlPoM+vBaJfcnwIhAIuei/
 # The staged binary next to the target, removed on every way out until it is renamed into place.
 staged=""
 tmp=""
+# With --desktop: the directory staging twr.app (or holding the one it replaces), and the disk
+# image's mount point, removed and detached on every way out.
+staged_dir=""
+mounted=""
 
 cleanup() {
+    if [ -n "$mounted" ]; then
+        hdiutil detach "$mounted" -force > /dev/null 2>&1 || true
+    fi
     if [ -n "$staged" ]; then
         rm -f "$staged"
+    fi
+    if [ -n "$staged_dir" ]; then
+        rm -rf "$staged_dir"
     fi
     if [ -n "$tmp" ]; then
         rm -rf "$tmp"
@@ -294,29 +319,35 @@ p256_signature() {
     [ "$bytes" -ge 8 ] && [ "$bytes" -le 72 ]
 }
 
-# check_p256_signature DIR: checks DIR/sha256sums.txt against sha256sums.txt.p256.sig, after
-# has_p256_verifier. A missing or bad signature stops the install, as for Ed25519.
+# check_p256_signature DIR [LIST]: checks DIR/LIST (default sha256sums.txt) against
+# LIST.p256.sig, after has_p256_verifier. A missing or bad signature stops the install, as for
+# Ed25519.
 check_p256_signature() {
-    if ! fetch_signature "$1" sha256sums.txt.p256.sig; then
-        err "could not download sha256sums.txt.p256.sig; nothing was installed (every twr release since the P-256 key was added is signed with it; to install an older one, use OpenSSL 3.0 or newer, see docs/install.md)"
+    slist=${2:-sha256sums.txt}
+    if ! fetch_signature "$1" "$slist.p256.sig"; then
+        if [ "$slist" = sha256sums.txt ]; then
+            err "could not download sha256sums.txt.p256.sig; nothing was installed (every twr release since the P-256 key was added is signed with it; to install an older one, use OpenSSL 3.0 or newer, see docs/install.md)"
+        fi
+        err "could not download $slist.p256.sig; nothing was installed (the desktop checksums of releases after v0.4.0 are signed with it; to install an older one, use OpenSSL 3.0 or newer, see docs/install.md)"
     fi
-    if ! p256_signature "$(cat "$1/sha256sums.txt.p256.sig")" "$1/sha256sums.p256.sig.bin"; then
-        err "sha256sums.txt.p256.sig is not an ECDSA P-256 signature; nothing was installed"
+    if ! p256_signature "$(cat "$1/$slist.p256.sig")" "$1/$slist.p256.sig.bin"; then
+        err "$slist.p256.sig is not an ECDSA P-256 signature; nothing was installed"
     fi
     if ! openssl dgst -sha256 -verify "$tmp/release-key-p256.pem" \
-        -signature "$1/sha256sums.p256.sig.bin" "$1/sha256sums.txt" > /dev/null 2>&1; then
-        err "the P-256 signature of sha256sums.txt does not verify with the release key; nothing was installed"
+        -signature "$1/$slist.p256.sig.bin" "$1/$slist" > /dev/null 2>&1; then
+        err "the P-256 signature of $slist does not verify with the release key; nothing was installed"
     fi
 }
 
-# check_signature DIR: checks DIR/sha256sums.txt against the release's signature of it, when
-# openssl here can: the Ed25519 one, else the P-256 one when this script holds that key. A
-# missing or bad signature always stops the install: every release is signed, so its files
-# were changed or are incomplete.
+# check_signature DIR [LIST]: checks DIR/LIST (default sha256sums.txt; desktop-sha256sums.txt
+# for --desktop) against the release's signature of it, when openssl here can: the Ed25519
+# one, else the P-256 one when this script holds that key. A missing or bad signature always
+# stops the install: every release is signed, so its files were changed or are incomplete.
 check_signature() {
+    slist=${2:-sha256sums.txt}
     if ! has_verifier; then
         if has_p256_verifier; then
-            check_p256_signature "$1"
+            check_p256_signature "$1" "$slist"
             return 0
         fi
         if [ -n "$RELEASE_KEY_P256" ]; then
@@ -332,36 +363,39 @@ check_signature() {
         warn "the checksums were not signature-checked (no openssl with Ed25519 support)"
         return 0
     fi
-    if ! fetch_signature "$1"; then
-        err "could not download sha256sums.txt.sig; nothing was installed (every twr release is signed)"
+    if ! fetch_signature "$1" "$slist.sig"; then
+        err "could not download $slist.sig; nothing was installed (every twr release is signed)"
     fi
-    if ! signature "$(cat "$1/sha256sums.txt.sig")" "$1/sha256sums.sig.bin"; then
-        err "sha256sums.txt.sig is not an Ed25519 signature; nothing was installed"
+    if ! signature "$(cat "$1/$slist.sig")" "$1/$slist.sig.bin"; then
+        err "$slist.sig is not an Ed25519 signature; nothing was installed"
     fi
     if ! openssl pkeyutl -verify -rawin -pubin -inkey "$tmp/release-key.pem" \
-        -sigfile "$1/sha256sums.sig.bin" -in "$1/sha256sums.txt" > /dev/null 2>&1; then
-        err "the signature of sha256sums.txt does not verify with the release key; nothing was installed"
+        -sigfile "$1/$slist.sig.bin" -in "$1/$slist" > /dev/null 2>&1; then
+        err "the signature of $slist does not verify with the release key; nothing was installed"
     fi
 }
 
-# check_release DIR: DIR/sha256sums.txt must name one release (`# twr release <tag>`, signed
-# with the rest), and that must be the TWR_VERSION asked for, so the signed checksums of
-# another release are refused.
+# check_release DIR [LIST [PREFIX]]: DIR/LIST (default sha256sums.txt) must name one release
+# (`PREFIX<tag>`, default `# twr release <tag>`, signed with the rest), and that must be the
+# TWR_VERSION asked for, so the signed checksums of another release are refused. Sets release.
 check_release() {
-    release=$(awk 'index($0, "# twr release ") == 1 { n++; t = substr($0, 15) } END { if (n == 1) print t }' "$1/sha256sums.txt")
+    slist=${2:-sha256sums.txt}
+    prefix=${3:-# twr release }
+    release=$(awk -v p="$prefix" 'index($0, p) == 1 { n++; t = substr($0, length(p) + 1) } END { if (n == 1) print t }' "$1/$slist")
     case "$release" in
         v[0-9]*) ;;
-        *) err "sha256sums.txt does not name one release (a '# twr release <tag>' line); nothing was installed" ;;
+        *) err "$slist does not name one release (a '$prefix<tag>' line); nothing was installed" ;;
     esac
     if [ -n "$version" ] && [ "$release" != "$version" ]; then
-        err "sha256sums.txt is the checksums of $release, not of $version; nothing was installed"
+        err "$slist is the checksums of $release, not of $version; nothing was installed"
     fi
 }
 
-# verify DIR ASSET: checks DIR/ASSET against DIR/sha256sums.txt.
+# verify DIR ASSET [LIST]: checks DIR/ASSET against DIR/LIST (default sha256sums.txt).
 verify() {
-    expected=$(awk -v f="$2" '$2 == f || $2 == "*" f { print $1; exit }' "$1/sha256sums.txt")
-    [ -n "$expected" ] || err "$2 is not listed in sha256sums.txt"
+    slist=${3:-sha256sums.txt}
+    expected=$(awk -v f="$2" '$2 == f || $2 == "*" f { print $1; exit }' "$1/$slist")
+    [ -n "$expected" ] || err "$2 is not listed in $slist"
     if has sha256sum; then
         actual=$(sha256sum "$1/$2" | awk '{ print $1 }')
     elif has shasum; then
@@ -407,15 +441,349 @@ path_advice() {
     esac
 }
 
+# --- desktop app (--desktop) ---
+
+# desktop_kind: what --desktop installs here: dmg (macOS), pacman (Arch), deb (Debian, Ubuntu)
+# or appimage (other Linux), or TWR_DESKTOP_PACKAGE.
+desktop_kind() {
+    case "${TWR_DESKTOP_PACKAGE:-}" in
+        dmg | pacman | deb | appimage)
+            printf '%s\n' "$TWR_DESKTOP_PACKAGE"
+            return
+            ;;
+        "") ;;
+        *) err "TWR_DESKTOP_PACKAGE=$TWR_DESKTOP_PACKAGE is not dmg, pacman, deb or appimage" ;;
+    esac
+    case "$target" in
+        aarch64-apple-darwin) echo dmg ;;
+        x86_64-apple-darwin) err "the desktop app is built for Apple silicon Macs only; on an Intel Mac, run this script without --desktop for the twr CLI" ;;
+        x86_64-unknown-linux-musl)
+            if has pacman && is_arch; then
+                echo pacman
+            elif has dpkg && has apt-get; then
+                echo deb
+            else
+                echo appimage
+            fi
+            ;;
+        *) err "the desktop app is built for x86_64 Linux and Apple silicon Macs, not $target; run this script without --desktop for the twr CLI" ;;
+    esac
+}
+
+# is_arch: whether this is Arch Linux or a distribution built on it (Omarchy, EndeavourOS...).
+is_arch() {
+    [ -f /etc/arch-release ] && return 0
+    [ -r /etc/os-release ] || return 1
+    grep -Eq '^(ID|ID_LIKE)="?([^"]* )?arch( [^"]*)?"?$' /etc/os-release
+}
+
+# fetch_desktop_sums DIR: puts the release's desktop-sha256sums.txt into DIR, from where fetch
+# would get the CLI's files: TWR_DOWNLOAD_URL, else gh when it is signed in, else GitHub.
+fetch_desktop_sums() {
+    if [ -n "${TWR_DOWNLOAD_URL:-}" ]; then
+        origin=${TWR_DOWNLOAD_URL%/}
+        strict=""
+        download "$origin/desktop-sha256sums.txt" "$1/desktop-sha256sums.txt" ||
+            err "could not download desktop-sha256sums.txt from $origin"
+        return 0
+    fi
+    if has gh && gh auth status --hostname github.com > /dev/null 2>&1; then
+        if gh release download ${version:+"$version"} -R "$GH_REPO_REF" -p desktop-sha256sums.txt \
+            -D "$1" --clobber > /dev/null 2>&1; then
+            origin=gh
+            return 0
+        fi
+        say "gh could not download desktop-sha256sums.txt; trying without it"
+    fi
+    if [ -n "$version" ]; then
+        origin="https://github.com/$REPO/releases/download/$version"
+    else
+        origin="https://github.com/$REPO/releases/latest/download"
+    fi
+    download "$origin/desktop-sha256sums.txt" "$1/desktop-sha256sums.txt" 2> /dev/null ||
+        err "could not download desktop-sha256sums.txt from $origin: that release has no desktop app (prereleases don't), or its installers are still being attached (try again in a few minutes)"
+}
+
+# fetch_desktop ASSET DIR: puts ASSET of the release that desktop-sha256sums.txt named (version)
+# into DIR, from where that list came from.
+fetch_desktop() {
+    case "$origin" in
+        gh)
+            if ! gh_with_bar "$1" "$2" && ! gh release download "$version" -R "$GH_REPO_REF" -p "$1" \
+                -D "$2" --clobber > /dev/null 2>&1; then
+                err "could not download $1 with gh"
+            fi
+            ;;
+        *) download "$origin/$1" "$2/$1" bar || err "could not download $1 from $origin" ;;
+    esac
+}
+
+# with_terminal: whether a command can put its questions (and sudo its password prompt) to the
+# terminal. This script may be reading itself from stdin (curl | sh), which they must not read.
+with_terminal() {
+    (: < /dev/tty) 2> /dev/null
+}
+
+# as_root CMD...: runs CMD as root (through sudo unless this is root), reading the terminal, or
+# nothing when there is none.
+as_root() {
+    if [ "$(id -u)" != 0 ]; then
+        has sudo || err "installing the package needs root, and sudo is not installed; run this as root, or set TWR_DESKTOP_PACKAGE=appimage for the AppImage"
+        set -- sudo "$@"
+    fi
+    if with_terminal; then
+        "$@" < /dev/tty
+    else
+        "$@" < /dev/null
+    fi
+}
+
+# desktop_dir DEFAULT: TWR_DESKTOP_DIR or DEFAULT, as an absolute path.
+desktop_dir() {
+    d=${TWR_DESKTOP_DIR:-$1}
+    case "$d" in
+        /*) ;;
+        "~"*) err "TWR_DESKTOP_DIR=$d starts with ~, which the shell did not expand; use \$HOME instead" ;;
+        *)
+            here=$(pwd) || err "could not read the current directory for TWR_DESKTOP_DIR=$d"
+            d="${here%/}/$d"
+            ;;
+    esac
+    printf '%s\n' "${d%/}"
+}
+
+# install_dmg DMG VERSION: copies twr.app from the disk image into the Applications folder,
+# replacing the one there once the new one is in place beside it. curl, wget and gh set no
+# quarantine flag, so Gatekeeper doesn't stop the app's first launch.
+install_dmg() {
+    has hdiutil || err "the disk image needs hdiutil (macOS)"
+    if [ -n "${TWR_DESKTOP_DIR:-}" ]; then
+        apps=$(desktop_dir "")
+    elif [ -w /Applications ]; then
+        apps=/Applications
+    else
+        [ -n "${HOME:-}" ] || err "HOME is not set; set TWR_DESKTOP_DIR to where twr.app should go"
+        apps="$HOME/Applications"
+    fi
+    app="$apps/twr.app"
+    # A command line that starts with the app's executable: a fixed-string match, which pgrep
+    # (a regular expression) can't do, and not this check's own command line.
+    if ps -axo command= 2> /dev/null |
+        awk -v p="$app/Contents/MacOS/" 'index($0, p) == 1 { found = 1 } END { exit !found }'; then
+        err "twr is running from $app; quit it (twr › Quit twr), then run this again. Nothing was installed"
+    fi
+    mkdir -p "$apps" || err "could not create $apps"
+    mounted="$tmp/mnt"
+    mkdir "$mounted"
+    # Its messages only when it fails: macOS 27 warns on every attach that the flags are deprecated.
+    if ! hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mounted" "$1" \
+        > /dev/null 2> "$tmp/hdiutil.log" < /dev/null; then
+        mounted=""
+        cat "$tmp/hdiutil.log" >&2
+        err "could not open $(basename "$1")"
+    fi
+    [ -d "$mounted/twr.app" ] || err "$(basename "$1") holds no twr.app"
+    staged_dir=$(mktemp -d "$apps/.twr.app.XXXXXX") || err "could not write to $apps"
+    ditto "$mounted/twr.app" "$staged_dir/twr.app" || err "could not copy twr.app to $apps"
+    hdiutil detach "$mounted" > /dev/null 2>&1 || true
+    mounted=""
+    if has codesign && ! codesign --verify --deep --strict "$staged_dir/twr.app" 2> /dev/null; then
+        err "the code signature of twr.app in $(basename "$1") does not verify; nothing was installed"
+    fi
+    if [ -e "$app" ]; then
+        mv "$app" "$staged_dir/twr.app.old" || err "could not replace $app"
+    fi
+    if ! mv "$staged_dir/twr.app" "$app"; then
+        if [ -e "$staged_dir/twr.app.old" ]; then
+            mv "$staged_dir/twr.app.old" "$app" || true
+        fi
+        err "could not install $app"
+    fi
+    rm -rf "$staged_dir"
+    staged_dir=""
+    say "Installed twr $2 to $app"
+    say ""
+    say "Open it from Launchpad or Spotlight, or with: open '$app'"
+    if has codesign && codesign --display --verbose=2 "$app" 2>&1 | grep -q '^Authority=Developer ID Application: '; then
+        say "It updates itself."
+    else
+        say "This build is not signed with a Developer ID, so it can't update itself: it tells you"
+        say "when a new release is out, and running this command again installs it."
+    fi
+}
+
+# install_pacman PACKAGE: installs the Arch package with pacman, as root.
+install_pacman() {
+    if pacman -Qq twr-desktop-bin > /dev/null 2>&1; then
+        err "twr-desktop-bin, the AUR package, is installed: update it with your AUR helper (yay -Syu twr-desktop-bin) instead. Nothing was installed"
+    fi
+    say "Installing the Arch package needs root: running sudo pacman -U $(basename "$1")"
+    if with_terminal; then
+        as_root pacman -U --needed "$1" || err "pacman did not install $(basename "$1")"
+    else
+        as_root pacman -U --needed --noconfirm "$1" || err "pacman did not install $(basename "$1")"
+    fi
+    say ""
+    say "Installed twr $2. Open twr from your app launcher, or run twr-desktop."
+    say "It tells you when a new release is out; run this command again to install it."
+}
+
+# install_deb PACKAGE: installs the Debian package with apt-get, as root, which installs what it
+# depends on too.
+install_deb() {
+    # apt-get reads the package as its own unprivileged user (_apt): give it a way in.
+    mkdir "$tmp/deb"
+    cp "$1" "$tmp/deb/" || err "could not stage $(basename "$1")"
+    chmod 711 "$tmp"
+    chmod 755 "$tmp/deb"
+    chmod 644 "$tmp/deb/$(basename "$1")"
+    say "Installing the Debian package needs root: running sudo apt-get install $(basename "$1")"
+    if with_terminal; then
+        as_root apt-get install "$tmp/deb/$(basename "$1")" || err "apt-get did not install $(basename "$1")"
+    else
+        as_root apt-get install -y "$tmp/deb/$(basename "$1")" || err "apt-get did not install $(basename "$1")"
+    fi
+    say ""
+    say "Installed twr $2. Open twr from your app launcher, or run twr-desktop."
+    say "It tells you when a new release is out; run this command again to install it."
+}
+
+# desktop_exec PATH: PATH as one Exec argument of a desktop entry: double-quoted with `"`, `` ` ``,
+# `$` and `\` escaped, then `\` doubled (Exec is a string value) and `%` doubled (field codes),
+# as clients/desktop/autostart.ts writes it.
+desktop_exec() {
+    q=$(printf '%s' "$1" | sed 's/[\\"`$]/\\&/g')
+    printf '"%s"\n' "$q" | sed -e 's/\\/\\\\/g' -e 's/%/%%/g'
+}
+
+# install_appimage APPIMAGE VERSION: puts the AppImage at TWR_DESKTOP_DIR/twr-desktop (default
+# ~/.local/bin), where it replaces itself on updates, with a launcher entry and its icon.
+install_appimage() {
+    [ -n "${TWR_DESKTOP_DIR:-}" ] || [ -n "${HOME:-}" ] ||
+        err "HOME is not set; set TWR_DESKTOP_DIR to where the AppImage should go"
+    bin=$(desktop_dir "${HOME:-}/.local/bin")
+    case "$bin" in
+        *"
+"*) err "TWR_DESKTOP_DIR=$bin has a line break, which a launcher entry can't hold" ;;
+    esac
+    mkdir -p "$bin" || err "could not create $bin"
+    if [ -d "$bin/twr-desktop" ]; then
+        err "$bin/twr-desktop is a directory; move it away or set TWR_DESKTOP_DIR to another place"
+    fi
+    staged=$(mktemp "$bin/.twr-desktop.new.XXXXXX") || err "could not write to $bin"
+    cp "$1" "$staged" || err "could not write to $bin"
+    chmod 755 "$staged" || err "could not make $staged executable"
+    mv -f "$staged" "$bin/twr-desktop" || err "could not install $bin/twr-desktop"
+    staged=""
+    say "Installed twr $2 to $bin/twr-desktop"
+
+    data=${XDG_DATA_HOME:-${HOME:-}/.local/share}
+    case "$data" in
+        /*) ;;
+        *) return 0 ;;
+    esac
+    # The AppImage's own icon, extracted by its runtime (no FUSE needed). Best effort: without
+    # it the launcher shows a generic icon.
+    mkdir "$tmp/icon"
+    if (cd "$tmp/icon" && "$bin/twr-desktop" --appimage-extract 'usr/share/icons/hicolor/*' > /dev/null 2>&1); then
+        icon=$(find "$tmp/icon/squashfs-root/usr/share/icons/hicolor" -type f -name 'twr-desktop.png' 2> /dev/null | sort | tail -n 1)
+        if [ -n "$icon" ] && mkdir -p "$data/icons/hicolor/512x512/apps" &&
+            cp "$icon" "$data/icons/hicolor/512x512/apps/tools.twr.desktop.png"; then
+            :
+        else
+            warn "could not install the app's icon; the launcher shows a generic one"
+        fi
+    fi
+    entry="$data/applications/tools.twr.desktop.desktop"
+    if [ -e "$entry" ] && ! grep -qx 'X-twr-Installer=install.sh' "$entry" 2> /dev/null; then
+        warn "$entry was not written by this script: left as it is"
+    elif mkdir -p "$data/applications" && {
+        printf '%s\n' "[Desktop Entry]" "Name=twr" "Comment=One conversation for all your coding agents"
+        printf 'Exec=%s %%U\n' "$(desktop_exec "$bin/twr-desktop")"
+        printf '%s\n' "Icon=tools.twr.desktop" "Terminal=false" "Type=Application" "Categories=Development;" \
+            "Keywords=agents;coding;terminal;" "StartupWMClass=tools.twr.desktop" "X-twr-Installer=install.sh"
+    } > "$entry.new" && mv -f "$entry.new" "$entry"; then
+        if has update-desktop-database; then
+            update-desktop-database "$data/applications" > /dev/null 2>&1 || true
+        fi
+        say "Added twr to your app launcher ($entry)"
+    else
+        rm -f "$entry.new"
+        warn "could not write $entry; start twr with $bin/twr-desktop"
+    fi
+    if ! { ldconfig -p 2> /dev/null || /sbin/ldconfig -p 2> /dev/null; } | grep -q 'libfuse\.so\.2'; then
+        say ""
+        say "AppImages need FUSE 2 (libfuse.so.2), which this machine doesn't seem to have. Install"
+        say "it with your package manager: fuse2 (Arch), libfuse2t64 or libfuse2 (Debian, Ubuntu),"
+        say "fuse-libs (Fedora)."
+    fi
+    say ""
+    say "It updates itself."
+}
+
+# install_desktop: --desktop.
+install_desktop() {
+    kind=$(desktop_kind)
+    trap cleanup EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 141' PIPE
+    trap 'exit 143' TERM
+    tmp=$(mktemp -d 2> /dev/null || mktemp -d -t twr) || err "could not create a temporary directory"
+
+    say "Installing the twr desktop app ${version:-(latest release)} ($kind)..."
+    fetch_desktop_sums "$tmp"
+    check_signature "$tmp" desktop-sha256sums.txt
+    check_release "$tmp" desktop-sha256sums.txt "# twr desktop release "
+    # Every other file comes from the release the signed list names, even when a newer one is
+    # published meanwhile.
+    version=$release
+    case "$origin" in
+        */releases/latest/download) origin="https://github.com/$REPO/releases/download/$release" ;;
+    esac
+    v=${release#v}
+    case "$kind" in
+        dmg) asset="twr-$v-arm64.dmg" ;;
+        pacman) asset="twr-desktop-$v-1-x86_64.pkg.tar.zst" ;;
+        deb) asset="twr-desktop_${v}_amd64.deb" ;;
+        appimage) asset="twr-$v.AppImage" ;;
+    esac
+    awk -v f="$asset" '$2 == f || $2 == "*" f { found = 1 } END { exit !found }' "$tmp/desktop-sha256sums.txt" ||
+        err "$release has no $asset (desktop-sha256sums.txt doesn't list it); nothing was installed"
+    fetch_desktop "$asset" "$tmp"
+    verify "$tmp" "$asset" desktop-sha256sums.txt
+    case "$kind" in
+        dmg) install_dmg "$tmp/$asset" "$v" ;;
+        pacman) install_pacman "$tmp/$asset" "$v" ;;
+        deb) install_deb "$tmp/$asset" "$v" ;;
+        appimage) install_appimage "$tmp/$asset" "$v" ;;
+    esac
+    say ""
+    say "The app runs its own twr engine. For the twr command in your terminal too, run this"
+    say "script again without --desktop."
+}
+
 main() {
     pair_after_install=0
+    desktop=0
     case "${1:-}" in
         --pair) pair_after_install=1; shift ;;
+        --desktop) desktop=1; shift ;;
         "") ;;
-        *) err "usage: install.sh [--pair]" ;;
+        *) err "usage: install.sh [--pair | --desktop]" ;;
     esac
-    [ "$#" -eq 0 ] || err "usage: install.sh [--pair]"
+    [ "$#" -eq 0 ] || err "usage: install.sh [--pair | --desktop]"
     target=$(detect_target)
+    if [ "$desktop" = 1 ]; then
+        version=${TWR_VERSION:-}
+        case "$version" in
+            "" | latest) version="" ;;
+            v*) ;;
+            *) version="v$version" ;;
+        esac
+        install_desktop
+        return
+    fi
     version=${TWR_VERSION:-}
     case "$version" in
         "" | latest) version="" ;;

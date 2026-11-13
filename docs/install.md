@@ -10,6 +10,8 @@ curl -fsSL https://twr.tools/install.sh | sh
 
 `twr.tools` serves the `install.sh` of this repository's `main` branch (`twr.codes` redirects there).
 
+For the desktop app, add `--desktop`: `curl -fsSL https://twr.tools/install.sh | sh -s -- --desktop` ([Desktop app](#desktop-app)). The rest of this section is about the CLI.
+
 The script is also in the repository, and you can fetch it from GitHub instead:
 
 ```sh
@@ -76,7 +78,59 @@ xattr -d com.apple.quarantine twr
 
 ### Desktop app
 
-Stable releases also carry the desktop app, built from the same commit:
+Stable releases also carry the desktop app, built from the same commit. The install script
+installs it with `--desktop`:
+
+```sh
+curl -fsSL https://twr.tools/install.sh | sh -s -- --desktop
+```
+
+That installs the app, not the `twr` command: the app runs its own copy of the engine. To use
+twr in a terminal too, run the script without `--desktop` as well. What it installs depends on
+the machine:
+
+| Machine | What the script installs | Updates |
+|---|---|---|
+| Mac with Apple silicon, macOS 13 or newer | `twr.app` from the disk image, into `/Applications`, or `~/Applications` when you can't write to `/Applications` | [see below](#the-mac-app) |
+| Arch Linux, Omarchy and other Arch-based systems | the Arch package, with `sudo pacman -U` | the app tells you; run the script again |
+| Debian, Ubuntu 22.04 or newer | the `.deb`, with `sudo apt-get install`, which installs what it depends on too | the app tells you; run the script again |
+| Other x86_64 Linux (glibc 2.35 or newer) | the AppImage, as `~/.local/bin/twr-desktop`, with its icon and a launcher entry | itself |
+
+On Arch and Debian it says that it needs root before it runs the package manager with `sudo`,
+which asks for your password; the package manager asks its questions in your terminal. It
+doesn't replace `twr-desktop-bin`, the AUR package, which your AUR helper updates. On macOS
+it stops while `twr.app` is running, and it copies the new app beside the old one before it
+replaces it. The AppImage needs FUSE 2 (`libfuse.so.2`), and the script says so when it's
+missing. Intel Macs and arm64 Linux have no desktop app.
+
+The script checks the desktop files the way it checks the CLI. `desktop-sha256sums.txt` must
+carry a valid signature (`desktop-sha256sums.txt.sig`, or, where `openssl` can't check
+Ed25519, `desktop-sha256sums.txt.p256.sig`), must name the release you asked for on its
+`# twr desktop release <tag>` line, and must list the file the script downloaded with the
+checksum it has. Otherwise nothing is installed. Releases after v0.4.0 carry the P-256
+signature, so on a Mac without OpenSSL 3 the script refuses v0.4.0: put OpenSSL 3 on your
+`PATH` (`brew install openssl@3`), or install that release by hand. It reads `TWR_VERSION`,
+`TWR_DOWNLOAD_URL` (a base with `desktop-sha256sums.txt`, its signatures and the installer)
+and `TWR_REQUIRE_SIGNATURE` as for the CLI, and two more:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TWR_DESKTOP_DIR` | `/Applications` or `~/Applications` (macOS), `~/.local/bin` (AppImage) | where `twr.app` or the AppImage goes; not used for the Arch and Debian packages |
+| `TWR_DESKTOP_PACKAGE` | this machine's | `dmg`, `pacman`, `deb` or `appimage`: install that instead, for example `appimage` on Arch or Debian to install without `sudo` |
+
+#### With a package manager
+
+- **Arch and Omarchy, from the AUR:** `yay -S twr-desktop-bin`, or in Omarchy's menu
+  **Install › AUR**, then search for `twr-desktop-bin`. It updates with the rest of the
+  system (`yay -Syu`, or Omarchy's **Update**). It installs the same files as the Arch
+  package below and replaces it. The AUR package is not published yet; until it is, use the
+  install script or the Arch package.
+- **macOS, from Homebrew:** `brew install --cask ignaval/twr/twr` installs the app, which
+  then updates itself, and `brew install ignaval/twr/twr` the `twr` command, which
+  `brew upgrade` updates (`twr update` leaves a Homebrew install alone). The tap,
+  `ignaval/homebrew-twr`, is not published yet.
+
+#### By hand
 
 | File | Platform |
 |---|---|
@@ -85,23 +139,27 @@ Stable releases also carry the desktop app, built from the same commit:
 | `twr-desktop_<version>_amd64.deb` | Debian, Ubuntu 22.04 or newer |
 | `twr-desktop-<version>-1-x86_64.pkg.tar.zst` | Arch Linux, Omarchy |
 
-On Linux, the AppImage runs on any distribution and updates itself; the `.deb` and the Arch
-package install with your package manager (`sudo apt install ./twr-desktop_<version>_amd64.deb`,
-`sudo pacman -U twr-desktop-<version>-1-x86_64.pkg.tar.zst`). An AUR package,
-`twr-desktop-bin`, is built and checked with each release and will be published to the AUR
-with them once the maintainer registers it; until then, use the AppImage or the Arch package.
-`desktop-sha256sums.txt` lists the desktop files' checksums. The app updates itself or tells
-you how to, depending on how it was installed. See [desktop updates](desktop.md#updates).
+The `.deb` and the Arch package install with your package manager
+(`sudo apt install ./twr-desktop_<version>_amd64.deb`,
+`sudo pacman -U twr-desktop-<version>-1-x86_64.pkg.tar.zst`). `desktop-sha256sums.txt` lists the
+desktop files' checksums ([Checking the signature](#checking-the-signature)). The app updates
+itself or tells you how to, depending on how it was installed. See
+[desktop updates](desktop.md#updates).
+
+#### The Mac app
 
 The Mac disk image is signed ad hoc, not with an Apple Developer ID, and not notarized
-(releases are, once the maintainer has the Apple credentials: [desktop.md](desktop.md#releases)).
-So:
+(releases will be, once the maintainer has the Apple credentials:
+[desktop.md](desktop.md#releases)). So:
 
-- Gatekeeper blocks the app the first time you open it. Open it once, then choose
-  **Open Anyway** in System Settings › Privacy & Security, or remove the quarantine flag
-  after copying the app to Applications: `xattr -dr com.apple.quarantine /Applications/twr.app`.
+- Gatekeeper blocks the app the first time you open it, if you downloaded the disk image with
+  a browser. Open it once, then choose **Open Anyway** in System Settings › Privacy &
+  Security, or remove the quarantine flag after copying the app to Applications:
+  `xattr -dr com.apple.quarantine /Applications/twr.app`. The install script needs neither:
+  curl, wget and gh set no quarantine flag.
 - It doesn't update itself: macOS only swaps in updates signed by the same Developer ID. It
-  tells you when a new release is out and links its disk image; install that the same way.
+  tells you when a new release is out and links its disk image; install that the same way, or
+  run the install script again.
 - Each such build has a signature of its own, so after a manual update macOS may ask again
   for the microphone (voice mode) and the other permissions you gave it.
 
@@ -132,7 +190,7 @@ gh attestation verify twr-x86_64-unknown-linux-musl.tar.gz --repo ignaval/twr \
   --signer-workflow ignaval/twr/.github/workflows/release.yml
 ```
 
-The desktop files are covered the same way from the first release after v0.3.0. `desktop-sha256sums.txt` starts with `# twr desktop release <tag>` and is signed with the same key, in `desktop-sha256sums.txt.sig`; each installer it lists has a build provenance attestation:
+The desktop files are covered the same way from the first release after v0.3.0. `desktop-sha256sums.txt` starts with `# twr desktop release <tag>` and is signed with the same key, in `desktop-sha256sums.txt.sig` (and, after v0.4.0, with the P-256 key in `desktop-sha256sums.txt.p256.sig`, which LibreSSL checks as above); each installer it lists has a build provenance attestation:
 
 ```sh
 openssl base64 -d -A -in desktop-sha256sums.txt.sig -out desktop-sha256sums.txt.sig.bin

@@ -4600,8 +4600,9 @@ impl Drop for PrivateDir {
 
 /// The directory `twr update` installs into: the one holding this executable `exe` (resolved,
 /// so the real file is replaced, not a symlink to it). Refused when it is one of cargo's bin
-/// directories `cargo_bins` (installing over a binary cargo manages confuses cargo), or when
-/// the executable is not named `twr` (the installer writes `<dir>/twr`, which would not replace
+/// directories `cargo_bins` (installing over a binary cargo manages confuses cargo), when it is
+/// in Homebrew's `Cellar/twr` (Homebrew's formula, which `brew upgrade` updates), or when the
+/// executable is not named `twr` (the installer writes `<dir>/twr`, which would not replace
 /// it).
 fn install_dir(exe: &Path, cargo_bins: &[PathBuf]) -> anyhow::Result<PathBuf> {
     let dir = exe
@@ -4614,6 +4615,14 @@ fn install_dir(exe: &Path, cargo_bins: &[PathBuf]) -> anyhow::Result<PathBuf> {
              with `curl -fsSL https://twr.tools/install.sh | sh`",
             exe.display(),
             dir.join("twr").display()
+        );
+    }
+    let parts: Vec<&std::ffi::OsStr> = dir.components().map(|c| c.as_os_str()).collect();
+    if parts.windows(2).any(|w| w[0] == "Cellar" && w[1] == "twr") {
+        bail!(
+            "{} was installed by Homebrew, and `twr update` does not replace a binary Homebrew \
+             manages. Update it with `brew upgrade twr`",
+            exe.display()
         );
     }
     if cargo_bins.iter().any(|c| c == dir) {
@@ -12175,7 +12184,7 @@ mod tests {
     }
 
     /// `twr update` installs into the executable's own directory, and refuses cargo's bin
-    /// directories and an executable the installer would not replace.
+    /// directories, Homebrew's formula and an executable the installer would not replace.
     #[test]
     fn update_installs_next_to_the_executable_but_not_over_cargo() {
         let cargo = vec![
@@ -12192,6 +12201,19 @@ mod tests {
             assert!(e.contains("cargo install --path crates/twr-cli"), "{e}");
             assert!(e.contains("cargo uninstall twr-cli"), "{e}");
         }
+        for exe in [
+            "/opt/homebrew/Cellar/twr/0.4.0/bin/twr",
+            "/home/linuxbrew/.linuxbrew/Cellar/twr/0.4.0/bin/twr",
+        ] {
+            let e = install_dir(Path::new(exe), &cargo).unwrap_err().to_string();
+            assert!(e.contains("installed by Homebrew"), "{e}");
+            assert!(e.contains("brew upgrade twr"), "{e}");
+        }
+        // Another formula's Cellar, or a directory merely named Cellar, is not twr's.
+        assert_eq!(
+            install_dir(Path::new("/home/u/Cellar/bin/twr"), &cargo).unwrap(),
+            PathBuf::from("/home/u/Cellar/bin")
+        );
         let e = install_dir(Path::new("/usr/local/bin/twr-dev"), &cargo)
             .unwrap_err()
             .to_string();
@@ -12560,9 +12582,12 @@ mod tests {
         assert!(workflow.contains(
             r#"echo "$(sha256sum dist/install.sh | awk '{ print $1 }')  install.sh" >> sha256sums.txt"#
         ));
+        // install.sh's check_release reads the same line by default (the desktop checksums
+        // pass their own), at the start of a line, and takes the tag after it.
         let script = include_str!("../../../install.sh");
-        assert!(script.contains(&format!(r#"index($0, "{RELEASE_LINE}") == 1"#)));
-        assert!(script.contains(&format!("substr($0, {})", RELEASE_LINE.len() + 1)));
+        assert!(script.contains(&format!("prefix=${{3:-{RELEASE_LINE}}}")));
+        assert!(script.contains("index($0, p) == 1"));
+        assert!(script.contains("substr($0, length(p) + 1)"));
     }
 
     /// The release is resolved once: an explicit version names the GitHub release directly

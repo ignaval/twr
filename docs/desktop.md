@@ -344,11 +344,12 @@ Settings › Application has four switches:
 
 | Install | How it updates |
 |---|---|
-| macOS, Developer ID signed | Downloads in the background; **Restart to update**, or it installs when you quit |
-| macOS, ad hoc review build | Notifies and links the new disk image (macOS only swaps in signed updates) |
+| macOS, Developer ID signed (also from Homebrew's cask) | Downloads in the background; **Restart to update**, or it installs when you quit |
+| macOS, ad hoc review build | Notifies and links the new disk image (macOS only swaps in signed updates); or run `install.sh --desktop` again |
 | AppImage | Downloads in the background and replaces the AppImage file |
-| Debian/Ubuntu package | Notifies with the `sudo apt install ./…deb` command and a download link |
-| Arch package, or AUR (`twr-desktop-bin`) once published | Notifies; update with `pacman -U` and the new package, or your AUR helper (`yay -Syu twr-desktop-bin`) |
+| Debian/Ubuntu package | Notifies with the `sudo apt install ./…deb` command and a download link; or run `install.sh --desktop` again |
+| Arch package | Notifies; update with `pacman -U` and the new package, or run `install.sh --desktop` again |
+| AUR (`twr-desktop-bin`) | Your AUR helper updates it with the system (`yay -Syu`, Omarchy's **Update**); the app also notifies |
 
 The app checks the latest GitHub release 45 seconds after launch and then every six
 hours. Turn this off, or check by hand, in Settings › Updates or Help › Check for Updates.
@@ -528,12 +529,26 @@ so a system Electron upgrade cannot change the app's ABI. The Arch package reuse
 the portable producer's native terminal module without recompiling it. Its launcher uses the stable
 `tools.twr.desktop` class for Hyprland rules. Chromium's sandbox stays enabled.
 
-The AUR package `twr-desktop-bin` is not on the AUR yet: each release builds and checks it,
-and pushes it once the repository has the AUR key (`AUR_SSH_PRIVATE_KEY`, below). It installs
-the same files from the release's
+The AUR package `twr-desktop-bin` installs the same files from the release's
 `twr-desktop-<version>-linux-x64.tar.gz`. `node scripts/aur.mjs <archive>` writes its
 `PKGBUILD` and `.SRCINFO`. CI builds that package from the identical archive, checks
-`.SRCINFO` against `makepkg --printsrcinfo`, and installs it over the release package.
+`.SRCINFO` against `makepkg --printsrcinfo`, and installs it over the release package; each
+release pushes it to the AUR when the release environment has the AUR key
+(`AUR_SSH_PRIVATE_KEY`, below). It is not on the AUR yet. Its dependencies are what namcap
+finds the bundle's ELF files link (with `libgcc` and `libstdc++`, not the `gcc-libs` group),
+plus `git`, which twr runs, `libsecret`, which Chromium loads for the keyring, and
+`hicolor-icon-theme`, whose folder holds the icon. namcap's remaining reports are expected:
+ELF files under `/opt` (the self-contained bundle), the setuid `chrome-sandbox`, and `git`
+and `libsecret` as possibly unneeded. The packaged app leaves out node-pty's Windows-only
+sources (`deps/`, `src/` and the `win32` prebuilds), which namcap would otherwise read as a
+dependency on Python.
+
+`install.sh --desktop` installs the release's Arch package, `.deb`, AppImage or Mac app, checked
+against the signed `desktop-sha256sums.txt` ([install.md](install.md#desktop-app)). The Homebrew
+tap `ignaval/homebrew-twr` has a formula for the CLI (`twr`, the release archives) and a cask for
+the app (`twr`, the disk image), written for each release by `release/homebrew/render.py` from
+the release's checksums; the cask needs a Developer ID signed, notarized app, because Homebrew
+quarantines what a cask installs.
 
 ### Releases
 
@@ -551,6 +566,14 @@ secrets, which pull-request runs can read):
 - `AUR_SSH_PRIVATE_KEY`: the key registered on the
   `twr-desktop-bin` AUR account. With it, the release pushes the new PKGBUILD to the AUR.
   Otherwise, push the `twr-desktop-aur` workflow artifact by hand.
+- `HOMEBREW_TAP_DEPLOY_KEY`: a deploy key with write access to `ignaval/homebrew-twr`. With
+  it, the release pushes `Formula/twr.rb` and, when the Mac app is Developer ID signed (the
+  release has `latest-mac.yml`), `Casks/twr.rb`, after checking the signatures of the
+  checksums they come from. Otherwise they are in the `twr-homebrew` workflow artifact.
+
+`TWR_RELEASE_SIGNING_KEY_P256`, which signs `sha256sums.txt.p256.sig`
+([development.md](development.md)), also signs `desktop-sha256sums.txt.p256.sig`, the signature
+`install.sh --desktop` checks on a Mac.
 
 macOS packaging supports normal electron-builder signing/notarization credentials when
 provided by the release environment. After packaging on macOS, `npm run test:packaged:mac` launches the actual app through
@@ -563,6 +586,18 @@ Review builds select the ad hoc identity in pull-request CI. Before uploading th
 installer, CI verifies the complete app signature and checks that it is ad hoc,
 with no signing team. These signatures require no Apple account; Developer ID
 signing and notarization remain the distribution path for public releases.
+
+With the hardened runtime, electron-builder signs every Mach-O file in the bundle: the app with
+`packaging/entitlements.mac.plist` (JIT and the microphone), and the Electron helpers, the
+three engines in `Resources/bin` (`twr`, `twr-desktop-bridge`, `twr-mobile-gateway`) and
+node-pty's `pty.node` and `spawn-helper` with electron-builder's inherited entitlements (JIT,
+unsigned executable memory, no library validation), each with a secure timestamp. electron-builder
+notarizes and staples the app before it makes the disk image and the update zip, so both hold
+the stapled app. The packaged QA drives a copy of the app with the QA marker added: for a
+Developer ID build that copy is signed again ad hoc, without the hardened runtime, because
+macOS checks a notarized app's seal on its first launch even when it isn't quarantined. The
+copy's update policy is therefore the ad hoc one; the release app's own signature is checked
+by `codesign`, `spctl` and `stapler` in `desktop.yml`.
 
 
 ### Needs you across workspaces
