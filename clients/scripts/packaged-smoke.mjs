@@ -227,14 +227,38 @@ async function freePort() {
     stopFixture(twr, hubEnv);
   }
 }
-// The copy under test, with the marker. It is not re-signed: the added file breaks the
-// bundle's seal, which macOS checks only for a quarantined (downloaded) app.
+// The copy under test, with the marker. The added file breaks the bundle's seal. macOS checks
+// the seal of an ad hoc app only when it is quarantined (downloaded), so an ad hoc copy runs as
+// it is. A notarized app is checked on its first launch whether or not it is quarantined
+// (macOS 13 and later), and its broken seal could keep it from opening, so a Developer ID
+// copy is signed again, ad hoc and without the hardened runtime (whose library validation
+// would refuse the Developer ID frameworks): it is then no notarized app, and runs as an ad hoc
+// one. The release app itself, notarized and unchanged, was launched above.
 const application = join(fixture, "twr.app");
 execFileSync("/usr/bin/ditto", [release, application]);
 writeFileSync(
   join(application, "Contents/Resources", QA_MARKER),
   "This copy of twr is a QA build: it honours TWR_DESKTOP_TEST_AUTOMATION. Never ship it.\n",
 );
+if (signing === "developer-id") {
+  const entitlements = join(fixture, "entitlements.plist");
+  writeFileSync(
+    entitlements,
+    execFileSync(
+      "/usr/bin/codesign",
+      ["--display", "--entitlements", "-", "--xml", release],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    ),
+  );
+  execFileSync(
+    "/usr/bin/codesign",
+    ["--force", "--sign", "-", "--entitlements", entitlements, application],
+    { stdio: "ignore" },
+  );
+  console.log(
+    "The QA copy of the Developer ID app is signed again ad hoc, so its update policy is checked as an ad hoc build's",
+  );
+}
 const repository = join(fixture, "repo");
 const speechScript = join(fixture, "speech-sink.sh");
 const spoken = join(fixture, "spoken.txt");
@@ -492,36 +516,17 @@ try {
   // update policy of the build's signature. Launch at login is not toggled
   // here because macOS login items belong to the real user session.
   {
-    let settings = await page.evaluate(() => window.twrApp.settings());
+    const settings = await page.evaluate(() => window.twrApp.settings());
     assert.equal(settings.update.kind, "mac");
-    if (signing === "adhoc") {
-      assert.equal(
-        settings.update.automatic,
-        false,
-        "Ad hoc builds must not self-update",
-      );
-      assert.match(settings.update.manualReason, /Developer ID/);
-    } else {
-      // The app finds its signature with codesign after the window shows.
-      for (
-        let i = 0;
-        i < 100 && !settings.update.automatic && !settings.update.manualReason;
-        i++
-      ) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        settings = await page.evaluate(() => window.twrApp.settings());
-      }
-      assert.equal(
-        settings.update.automatic,
-        true,
-        "A Developer ID build updates itself",
-      );
-      assert.equal(
-        settings.update.manualReason,
-        undefined,
-        "A Developer ID build has no reason to update by hand",
-      );
-    }
+    // The copy under test is ad hoc whatever the release's signature (see where it is made),
+    // so it must not replace itself. A Developer ID release's own policy follows from its
+    // codesign output, which matched the pattern the app uses (developerIdSigned) at the top.
+    assert.equal(
+      settings.update.automatic,
+      false,
+      "Ad hoc builds must not self-update",
+    );
+    assert.match(settings.update.manualReason, /Developer ID/);
     assert.equal(settings.login.supported, true);
     assert.equal(settings.tray.available, true);
     assert.equal(settings.tray.enabled, true);
@@ -615,7 +620,7 @@ try {
     await page.getByRole("switch", { name: "Launch at login" }).waitFor();
     await page.getByRole("heading", { name: "Diagnostics" }).waitFor();
     console.log(
-      `PASS: packaged tray settings, background close/reopen, redacted diagnostics and ${signing === "adhoc" ? "ad hoc" : "Developer ID"} update policy`,
+      `PASS: packaged tray settings, background close/reopen, redacted diagnostics and ad hoc update policy${signing === "adhoc" ? "" : " (QA copy of a Developer ID build)"}`,
     );
   }
   if (process.env.TWR_DESKTOP_EXTENDED_QA === "1") {
