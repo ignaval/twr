@@ -97,7 +97,10 @@
     "files": [
       "dist/**",
       "dist-host/**",
-      "package.json"
+      "package.json",
+      "!node_modules/node-pty/deps/**",
+      "!node_modules/node-pty/src/**",
+      "!node_modules/node-pty/prebuilds/win32-*/**"
     ],
     "asarUnpack": [
       "node_modules/node-pty/**"
