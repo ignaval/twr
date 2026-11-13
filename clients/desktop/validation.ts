@@ -152,5 +152,19 @@ export const attentionSummarySchema = z
           .strict(),
       )
       .max(256),
+    loops: z
+      .array(
+        z
+          .object({
+            workspace: z.string().min(1).max(64),
+            thread: z.string().max(200),
+            title: label(200),
+            id: z.string().min(1).max(200),
+            words: label(200),
+          })
+          .strict(),
+      )
+      .max(SUMMARY_MAX_ITEMS)
+      .optional(),
   })
   .strict();

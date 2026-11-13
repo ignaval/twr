@@ -30,7 +30,10 @@ use crate::app::tests::*;
 use crate::app::{ActionKind, AppState};
 use crate::color::{contrast, degrade, rgb, Depth};
 use crate::loops::RowKey;
-use crate::loops_tests::{change, hub, looping, raise_stuck, settings_got, started};
+use crate::loops_tests::{
+    change, hub, impl_started, implementing, looping, raise_stuck, settings_got, started, ImplRun,
+    Upto,
+};
 
 // ---------------------------------------------------------------------------------------------
 // The terminals: how deep their colors go, and their background
@@ -246,7 +249,12 @@ fn full(st: &mut AppState, w: u16, h: u16) -> Buffer {
 
 /// A card's loop line: its row inside the card.
 fn card_line(name: &'static str, title: &'static str, buf: Buffer) -> Surface {
-    let a = at(&buf, " REVIEW LOOP ", 0);
+    badge_line(name, title, buf, " REVIEW LOOP ")
+}
+
+/// A card's line that starts with `badge`: its row inside the card.
+fn badge_line(name: &'static str, title: &'static str, buf: Buffer, badge: &str) -> Surface {
+    let a = at(&buf, badge, 0);
     let card = boxed(&buf, a);
     Surface {
         name,
@@ -738,7 +746,162 @@ fn surfaces() -> Vec<Surface> {
         crop: b,
         buf,
     });
+    out.extend(impl_surfaces());
     out
+}
+
+/// The implementation loop's own surfaces: its loop line in its first phases (the plan
+/// check's run in flight too), how it ended, its setup card with a task and three options on
+/// its card and in its popup, the editor's plan check and commit rows, and a dive's folded
+/// and opened step rows (a commit that failed its check in red).
+fn impl_surfaces() -> Vec<Surface> {
+    let mut out = Vec::new();
+    let mut st = three_threads();
+    implementing(&mut st, "t-gamma", Upto::Plan);
+    out.push(badge_line(
+        "impl-line-plan",
+        "Implementation loop line: the plan",
+        full(&mut st, 160, 40),
+        " IMPLEMENT LOOP ",
+    ));
+    let mut st = three_threads();
+    let mut run = implementing(&mut st, "t-gamma", Upto::PlanCheck);
+    let ev = hub(
+        &mut run.s,
+        EventBody::TaskUpdated(TaskUpdated {
+            task_id: "loop:l2".into(),
+            running: true,
+            description: "reviewer gpt-6.1-sol medium".into(),
+            ..Default::default()
+        }),
+    );
+    control(&mut st, &[ev]);
+    out.push(badge_line(
+        "impl-line-plan-check",
+        "Implementation loop line: the plan check's run in flight",
+        full(&mut st, 160, 40),
+        " IMPLEMENT LOOP ",
+    ));
+    let mut st = three_threads();
+    implementing(&mut st, "t-gamma", Upto::Ended);
+    out.push(badge_line(
+        "impl-line-ended",
+        "Implementation loop: how it ended, on its card",
+        full(&mut st, 160, 40),
+        " IMPLEMENT LOOP ",
+    ));
+    // The setup card with a task.
+    let mut st = three_threads();
+    crate::ui::loops_impl_tests::raise_impl_setup(
+        &mut st,
+        crate::ui::loops_impl_tests::IMPL_SUMMARY,
+    );
+    st.set_focus(Some("t-gamma".into()));
+    let buf = full(&mut st, 160, 40);
+    let a = at(&buf, " IMPLEMENT LOOP ", 0);
+    let card = boxed(&buf, a);
+    let options = at(&buf, "3 cancel", 0);
+    out.push(Surface {
+        name: "impl-setup-card",
+        title: "Implementation loop's setup card on its card: three options",
+        cells: vec![rows_of(card, a.1, options.1)],
+        crop: card,
+        buf,
+    });
+    popup_open(&mut st);
+    let buf = full(&mut st, 160, 40);
+    let a = at(&buf, "gamma: implementation loop setup", 0);
+    let popup = boxed(&buf, a);
+    let last = at(&buf, " change…", 0);
+    out.push(Surface {
+        name: "impl-setup-popup",
+        title: "Implementation loop's setup card's popup: the task, three options",
+        cells: vec![rows_of(popup, a.1, last.1)],
+        crop: popup,
+        buf,
+    });
+    // The editor on it, the plan check's row selected.
+    st.handle_key(key(KeyCode::Esc));
+    run_row(&mut st, ActionKind::LoopChange);
+    let card = json!({"attn_id": "ls2", "revision": 4, "thread": "t-gamma",
+        "setup": {"kind": "implement", "first_run": true, "why": "first_run",
+                  "settings": {"profile": "medium",
+                               "reviewer": {"runtime": "codex", "model": "gpt-6.1-sol"},
+                               "workers": {"model": "claude-opus-5-5", "effort": "high"}},
+                  "save_for": "all", "project": "proj",
+                  "warnings": [], "problems": []}});
+    st.apply_result(
+        "loop.setup.get",
+        &json!({"asked": {"attn_id": "ls2"}, "result": card}),
+    );
+    st.apply_result(
+        "loop.settings.get",
+        &json!({"asked": {}, "result": settings_got()}),
+    );
+    change(&mut st, RowKey::PlanCheck, KeyCode::Right);
+    out.push(editor(
+        "impl-editor",
+        "Settings editor on an implementation loop's card: plan check selected",
+        &mut st,
+    ));
+    // A dive: the whole loop folded, then opened, its commit's check failed.
+    let mut st = three_threads();
+    st.dive("t-gamma");
+    st.transcript.as_mut().unwrap().settle();
+    let mut run = ImplRun::new("t-gamma", 900, impl_started());
+    run.to(Upto::Ended, false);
+    let tr = st.transcript.as_mut().unwrap();
+    // (The thread's replies are its own text, drawn as any reply: not the loop's.)
+    for ev in run
+        .evs
+        .iter()
+        .filter(|e| !matches!(e.body, EventBody::AgentText(_)))
+    {
+        tr.apply(ev);
+    }
+    let buf = full(&mut st, 160, 60);
+    out.push(impl_dive_surface(
+        "impl-dive-folded",
+        "A dive: an implementation loop's steps folded",
+        buf,
+    ));
+    st.view.expand_all = true;
+    let buf = full(&mut st, 160, 200);
+    out.push(impl_dive_surface(
+        "impl-dive-open",
+        "A dive: an implementation loop's steps open (ctrl+o)",
+        buf,
+    ));
+    out
+}
+
+/// The dive's implementation loop rows: from the plan's row to the last commit row.
+fn impl_dive_surface(name: &'static str, title: &'static str, buf: Buffer) -> Surface {
+    let first = at(&buf, "↻ plan · revision 1", 0);
+    let end = *find(&buf, "not committed")
+        .last()
+        .unwrap_or_else(|| panic!("no commit row:\n{}", screen(&buf)));
+    let side = (0..first.0)
+        .rev()
+        .find(|&i| SIDES.contains(sym(&buf, i, first.1)))
+        .map_or(0, |i| i + 1);
+    let right = (first.0..buf.area.width)
+        .find(|&i| SIDES.contains(sym(&buf, i, first.1)))
+        .unwrap_or(buf.area.width);
+    let cells = Rect::new(side, first.1, right - side, end.1 - first.1 + 1);
+    let crop = Rect::new(
+        side,
+        first.1.saturating_sub(1),
+        right - side,
+        (end.1 + 2).min(buf.area.height) - first.1.saturating_sub(1),
+    );
+    Surface {
+        name,
+        title,
+        buf,
+        cells: vec![cells],
+        crop,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -852,7 +1015,8 @@ fn badge_cells(s: &Surface, badge: &str, v: Variant) -> Vec<(Color, Modifier)> {
         .collect()
 }
 
-/// ` REVIEW LOOP ` keeps its own fill with 16 colors (light magenta, as docs/tui.md says) and
+/// ` REVIEW LOOP ` and ` IMPLEMENT LOOP ` (the same fill, the text saying which) keep their
+/// own fill with 16 colors (light magenta, as docs/tui.md says) and
 /// ` LOOP STUCK ` its own (magenta): not each other's, nor any attention badge's (`PERMISSION`,
 /// `QUESTION`, `ERROR`, `REVIEW`, `STALLED`). With no colors both are drawn in reverse video
 /// and say what they are.
@@ -880,6 +1044,9 @@ fn the_loop_badges_keep_fills_of_their_own_and_say_what_they_are() {
         for (surface, badge, fill) in [
             ("loop-line-running", " REVIEW LOOP ", Color::LightMagenta),
             ("setup-card-first-run", " REVIEW LOOP ", Color::LightMagenta),
+            ("impl-line-plan", " IMPLEMENT LOOP ", Color::LightMagenta),
+            ("impl-line-ended", " IMPLEMENT LOOP ", Color::LightMagenta),
+            ("impl-setup-card", " IMPLEMENT LOOP ", Color::LightMagenta),
             ("stuck-card", " LOOP STUCK ", Color::Magenta),
         ] {
             for (bg, m) in badge_cells(by(surface), badge, v) {

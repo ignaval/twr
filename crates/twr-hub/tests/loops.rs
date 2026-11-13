@@ -1106,7 +1106,7 @@ async fn only_the_user_starts_loops_and_answers_their_cards() {
         let scope = twr_core::devices::method_scope(m);
         let read = matches!(
             *m,
-            "loop.get" | "loop.list" | "loop.setup.get" | "loop.settings.get"
+            "loop.get" | "loop.report" | "loop.list" | "loop.setup.get" | "loop.settings.get"
         );
         assert_eq!(scope, Some(if read { "read" } else { "operate" }), "{m}");
     }
@@ -1115,7 +1115,7 @@ async fn only_the_user_starts_loops_and_answers_their_cards() {
             .iter()
             .filter(|m| m.starts_with("loop."))
             .count(),
-        9
+        10
     );
     for m in [
         "attention.respond",
@@ -1204,9 +1204,13 @@ async fn threads_a_loop_cannot_run_in_are_refused() {
     let e = code(request(&hub, "nope", json!({})).await);
     assert_eq!(e.code, codes::NOT_FOUND);
     let t = thread(&hub, &repo, "api").await;
-    let e = code(request(&hub, &t, json!({"kind": "implement"})).await);
-    assert_eq!(e.code, codes::UNSUPPORTED);
-    assert!(e.message.starts_with("not supported"), "{e:?}");
+    // An implementation loop takes no scope; a review loop no task.
+    let e = code(request(&hub, &t, json!({"kind": "implement", "scope": "branch"})).await);
+    assert_eq!(e.code, codes::BAD_REQUEST);
+    assert!(e.message.contains("has no scope"), "{e:?}");
+    let e = code(request(&hub, &t, json!({"task": "x"})).await);
+    assert_eq!(e.code, codes::BAD_REQUEST);
+    assert!(e.message.contains("takes no task"), "{e:?}");
     let e = code(request(&hub, &t, json!({"scope": "all"})).await);
     assert_eq!(e.code, codes::BAD_REQUEST);
     // A mode that can't edit: the hub never widens it.
@@ -1223,6 +1227,8 @@ async fn threads_a_loop_cannot_run_in_are_refused() {
     // Stopped, parked.
     let s = thread(&hub, &repo, "stopped").await;
     hub.stop_thread(&s, "test").unwrap();
+    let v = hub.thread_view(&s).unwrap();
+    assert!(v.stopped && !v.stopped_by_hub, "someone stopped it");
     let e = code(request(&hub, &s, json!({})).await);
     assert_eq!(e.code, codes::CONFLICT);
     assert!(e.message.contains("is stopped"), "{e:?}");
@@ -1808,7 +1814,12 @@ async fn findings_are_triaged_until_the_ladder_converges() {
         "{triage}"
     );
     assert!(triage.contains("(m1.1, m1.2)"));
-    assert!(triage.contains("commit these fixes"));
+    // The thread had not been committing its work (no commits of its own, changes in its
+    // worktree): `match` commits nothing, and the prompt says so.
+    assert!(
+        triage.contains("Commits: do not commit; leave your fixes uncommitted."),
+        "{triage}"
+    );
     let report = std::fs::read_to_string(g["files"]["report"].as_str().unwrap()).unwrap();
     assert!(
         report.contains("- bounds: fixed\n- locks: accepted residual (bounded by the queue)"),
@@ -2761,6 +2772,197 @@ async fn the_card_is_read_and_accounts_are_checked() {
         e.message.contains("codex has no account nosuch"),
         "{}",
         e.message
+    );
+    hub.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Threads a loop can't run in, and threads whose runtime is gone
+// ---------------------------------------------------------------------------------------------
+
+/// A thread on a remote box is refused `not_supported` (loops run on the hub's own machine in
+/// this version), its card or loop never started, whatever the settings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_thread_on_a_remote_box_is_refused() {
+    use twr_core::config::BoxConfig;
+    use twr_core::runner::Secret;
+    use twr_runner::{LocalBox, LocalBoxOptions, RunnerOptions};
+    const TOKEN: &str = "loop-token-77-0123456789abcdef";
+    let env = Env::new();
+    let mut config = env.config.clone();
+    config.hub.listen = Some("127.0.0.1:0".into());
+    config.boxes.insert(
+        "gpu".into(),
+        BoxConfig {
+            token: Some(TOKEN.into()),
+            ..Default::default()
+        },
+    );
+    let mut o = env.opts_with(config);
+    o.stop_timeout = Duration::from_secs(5);
+    let listener = twr_hub::listener::RunnerListener::bind(&o.config.hub)
+        .await
+        .unwrap()
+        .unwrap();
+    let url = listener.url();
+    let hub = Hub::open(o).await.unwrap();
+    let _server = listener.serve(hub.clone());
+    let rdir = env.path().join("runner");
+    let mut ro = RunnerOptions::new(&url, Secret::new(TOKEN), "gpu", &rdir);
+    ro.backoff_min = Duration::from_millis(20);
+    ro.backoff_max = Duration::from_millis(200);
+    ro.refused_retry = Duration::from_millis(200);
+    let mut box_opts = LocalBoxOptions::new(&rdir, "gpu");
+    box_opts.adapters = Arc::new(|name: &str| -> Option<Arc<dyn Adapter>> {
+        (name == "fake").then(|| Arc::new(FakeAdapter::new()) as Arc<dyn Adapter>)
+    });
+    if !box_opts.runtimes.iter().any(|r| r == "fake") {
+        box_opts.runtimes.push("fake".into());
+    }
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let runner = tokio::spawn(twr_runner::run_with(
+        ro,
+        LocalBox::open(box_opts).unwrap(),
+        async move {
+            let _ = stop_rx.await;
+        },
+    ));
+    until(&hub, "the box online", |h| {
+        h.boxes().iter().any(|(n, online, _)| n == "gpu" && *online)
+    })
+    .await;
+    let repo = env.repo("api");
+    let t = hub
+        .new_thread(
+            NewThread {
+                project: repo.to_string_lossy().into_owned(),
+                runtime: Some("fake".into()),
+                name: Some("remote".into()),
+                box_name: Some("gpu".into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // With no settings saved (the card would come), with saved ones (it would start), and
+    // with `setup` (the card asked for).
+    for (saved, extra) in [
+        (false, json!({})),
+        (true, json!({})),
+        (true, json!({"setup": true})),
+    ] {
+        if saved {
+            save(&hub, None, first_card()).await;
+        }
+        let e = request(&hub, &t, extra).await.unwrap_err();
+        assert_eq!(e.code, codes::UNSUPPORTED, "{e:?}");
+        assert!(
+            e.message
+                .starts_with("not supported: remote runs on box gpu"),
+            "{e:?}"
+        );
+    }
+    assert!(!events(&hub, &t)
+        .iter()
+        .any(|e| e.kind().starts_with("loop.") || e.kind() == "attention.raised"));
+    assert!(hub.loop_list().as_array().unwrap().is_empty());
+    hub.shutdown().await;
+    let _ = stop_tx.send(());
+    let _ = runner.await;
+}
+
+/// A thread being deleted (its delete card confirmed, the deletion under way) is refused, and
+/// gets no card or loop; the deletion goes on.
+#[tokio::test]
+async fn a_thread_being_deleted_is_refused() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let repo = env.repo("api");
+    let t = thread(&hub, &repo, "api").await;
+    let card = hub
+        .delete_threads(std::slice::from_ref(&t), &user())
+        .await
+        .unwrap();
+    // Before the confirmation, a loop could start: the card only asks.
+    answer(&hub, &card, "Delete", &user()).unwrap();
+    // (The deletion runs in a task of its own, which this test's one thread has not run yet.)
+    for extra in [json!({}), json!({"setup": true})] {
+        let e = request(&hub, &t, extra).await.unwrap_err();
+        assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+        assert_eq!(e.message, "api is being deleted");
+    }
+    save(&hub, None, first_card()).await;
+    let e = request(&hub, &t, json!({})).await.unwrap_err();
+    assert_eq!(e.message, "api is being deleted");
+    timeout(WAIT, async {
+        while hub.thread_view(&t).is_ok() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("deleted");
+    assert!(!events(&hub, &t)
+        .iter()
+        .any(|e| e.kind().starts_with("loop.") || e.kind() == "attention.raised"));
+    // And once it is gone, it is no thread.
+    let e = request(&hub, &t, json!({})).await.unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND);
+    hub.shutdown().await;
+}
+
+/// A thread whose runtime is gone without anyone stopping it runs a loop: one whose runtime
+/// crashed (the crash holds its queue until the user acts, and starting a loop is the user
+/// acting), and one the hub's own shutdown stopped. The loop's prompts start the runtime again
+/// and the loop runs to its end. (A thread someone stopped, or parked, is refused:
+/// [`threads_a_loop_cannot_run_in_are_refused`].)
+#[tokio::test]
+async fn a_thread_whose_runtime_is_gone_runs_a_loop() {
+    let env = Env::drive();
+    let hub = env.hub().await;
+    save(&hub, None, settings("low", "codex/gpt-6.1-sol")).await;
+    let changed = |hub: &Hub, t: &str| {
+        let wt = hub.thread_view(t).unwrap().worktree.unwrap();
+        std::fs::write(Path::new(&wt).join("lib.rs"), "fn changed() {}\n").unwrap();
+    };
+    // Crashed.
+    let repo = env.repo("api");
+    let a = thread(&hub, &repo, "a").await;
+    changed(&hub, &a);
+    hub.send(&a, "!crash", TurnFrom::User, Source::User("test".into()))
+        .unwrap();
+    until(&hub, "the crash", |h| {
+        h.thread_view(&a).is_ok_and(|v| v.crashed)
+    })
+    .await;
+    let r = request(&hub, &a, json!({})).await.unwrap();
+    assert_eq!(r["status"], "started", "{r}");
+    assert_eq!(
+        ended(&hub, &a).await.outcome,
+        twr_core::loops::Outcome::Clean
+    );
+    // Stopped by the hub's shutdown.
+    let b = thread(&hub, &repo, "b").await;
+    changed(&hub, &b);
+    hub.send(&b, "hello", TurnFrom::User, Source::User("test".into()))
+        .unwrap();
+    has_kind(&hub, &b, "report.ready").await;
+    hub.shutdown().await;
+    drop(hub);
+    let hub = env.hub().await;
+    // The thread's view says who stopped it (clients offer a loop by it).
+    let v = hub.thread_view(&b).unwrap();
+    assert!(v.stopped && v.stopped_by_hub);
+    let shown = serde_json::to_value(&v).unwrap();
+    assert_eq!(shown["stopped_by_hub"], true);
+    let r = request(&hub, &b, json!({})).await.unwrap();
+    assert_eq!(r["status"], "started", "{r}");
+    assert_eq!(
+        ended(&hub, &b).await.outcome,
+        twr_core::loops::Outcome::Clean
     );
     hub.shutdown().await;
 }

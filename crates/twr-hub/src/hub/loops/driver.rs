@@ -64,10 +64,13 @@
 //! ticker): a loop that waits for a review no run of this hub's serves gets one (or, when its
 //! round had started, a failed run); one that waits for a thread step whose prompt is neither
 //! queued nor delivered gets it again (a queue that refused it, a turn the hub's shutdown
-//! interrupted); and, once after the hub started, a step whose turn ended while no hub ran is
-//! reacted to as at its end. Nothing runs before the hub's start-up recovery is done.
+//! interrupted, a turn whose runtime died with a hub that crashed); and, once after the hub
+//! started, a step whose turn ended before a hub took it is taken as at its end: a completed
+//! one with the turn's other reactions, in the start-up recovery that completes them (its
+//! report marked, no review item), a failed one, or one whose runtime crashed on its own, as
+//! `TurnFailed` (stuck). Nothing else runs before the hub's start-up recovery is done.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,7 +79,8 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use twr_core::event::*;
 use twr_core::loops::contract::{render_ledger, FINDINGS_SCHEMA};
-use twr_core::loops::{Action, Input, LoopState, StepError, Wait};
+use twr_core::loops::{Action, Input, LoopKind, LoopState, ReviewTemplate, Step, StepError, Wait};
+use twr_core::reduce::ThreadView;
 
 use super::super::{twr_ext, twr_ext_map, Batch, Core, Inner, LOCAL_BOX};
 use super::prompts;
@@ -106,7 +110,12 @@ pub(in crate::hub) struct LoopRun {
 #[derive(Default)]
 pub(in crate::hub) struct LoopRuns {
     runs: HashMap<String, LoopRun>,
+    /// The commit checks running, by thread: the loop and the turn each checks.
+    checks: HashMap<String, (String, u64)>,
     ready: bool,
+    /// The threads whose runtime died with the previous hub (closed as crashed at this hub's
+    /// start, `close_stale_runtimes`): their step is asked again, not taken as failed.
+    pub(in crate::hub) died_with_hub: std::collections::HashSet<String>,
 }
 
 impl LoopRuns {
@@ -140,14 +149,18 @@ enum Owner {
 }
 
 /// The step a loop waits for in a thread turn, as its prompts' marker names it (`scope`,
-/// `triage m3`, `sweep`, `report`); `None` while it waits for a review or nothing.
+/// `plan`, `triage p1`, `implement`, `triage m3`, `sweep`, `report`, `commit`); `None` while
+/// it waits for a review, for the hub's own `report.md`, or nothing.
 pub(in crate::hub) fn step_tag(s: &LoopState) -> Option<String> {
     match &s.wait {
         Wait::Goal => Some("scope".into()),
         Wait::Triage { round } => Some(format!("triage {round}")),
         Wait::Sweep => Some("sweep".into()),
         Wait::Report => Some("report".into()),
-        Wait::Review { .. } | Wait::Ended => None,
+        Wait::Plan => Some("plan".into()),
+        Wait::Implement => Some("implement".into()),
+        Wait::Commit => Some("commit".into()),
+        Wait::Review { .. } | Wait::WriteReport | Wait::Ended => None,
     }
 }
 
@@ -158,6 +171,10 @@ pub(in crate::hub) struct Staged {
     pub(in crate::hub) prompted: bool,
     /// A review is to run.
     pub(in crate::hub) review: bool,
+    /// A commit is to be checked (the watch runs the check).
+    pub(in crate::hub) check: bool,
+    /// The commit is settled: `report.md` is to be written.
+    pub(in crate::hub) write_report: bool,
 }
 
 impl Staged {
@@ -165,7 +182,14 @@ impl Staged {
         Staged {
             prompted: self.prompted || other.prompted,
             review: self.review || other.review,
+            check: self.check || other.check,
+            write_report: self.write_report || other.write_report,
         }
+    }
+
+    /// Whether the loops' watch is to look at once (a review or a check due, a prompt queued).
+    pub(in crate::hub) fn kicks(&self) -> bool {
+        self.review || self.prompted || self.check || self.write_report
     }
 }
 
@@ -175,8 +199,33 @@ pub(in crate::hub) struct LoopAnswer {
     pub(in crate::hub) mark: Value,
     /// The report's summary instead of the turn's own (the loop's last report).
     pub(in crate::hub) summary: Option<String>,
-    /// What to step; `None`: an interim end, the step still waits.
+    /// What to step; `None`: an interim end, the step still waits, or a commit to check.
     input: Option<Input>,
+    /// The turn answered a commit step: its check is due ([`Core::check_loops`] runs it).
+    check: bool,
+}
+
+/// What loop `state` committed, for its report and end.
+fn committed_of(state: &LoopState) -> loop_report::Committed {
+    loop_report::Committed {
+        mode: state.commit,
+        commits: state.commits.clone(),
+        problem: state.commit_problem.clone(),
+    }
+}
+
+impl LoopAnswer {
+    /// What [`Inner::loop_record_point`] calls this answer's record, if it steps the loop or
+    /// makes a commit's check due: `answer <step>`.
+    pub(in crate::hub) fn point(&self) -> Option<String> {
+        if self.input.is_none() && !self.check {
+            return None;
+        }
+        Some(format!(
+            "answer {}",
+            self.mark["step"].as_str().unwrap_or_default()
+        ))
+    }
 }
 
 /// The folder of loop `id` as `log` records it (else where the hub puts loop folders).
@@ -203,20 +252,93 @@ fn make_folder(hub: &Inner, folder: &Path) -> anyhow::Result<()> {
 }
 
 /// The files of the loop folder every prompt refers to, as `log` has them now: the findings
-/// schema, `ledger.md` and `goal.md`.
+/// schema, `ledger.md`, and a review loop's `goal.md` or an implementation loop's `task.md`
+/// (when it has a task text). (`plan.md` is written when the plan is taken, and the baseline's
+/// files when the loop starts.)
 fn write_common(hub: &Inner, folder: &Path, log: &LoopLog) -> anyhow::Result<()> {
     make_folder(hub, folder)?;
     std::fs::write(folder.join("findings.schema.json"), FINDINGS_SCHEMA)?;
     std::fs::write(folder.join("ledger.md"), render_ledger(&log.ledger))?;
-    let goal = log
-        .goal
-        .as_deref()
-        .unwrap_or("(not written yet: the scope turn writes it)");
-    std::fs::write(
-        folder.join("goal.md"),
-        format!("# Goal\n\n{}\n", goal.trim()),
-    )?;
+    match log.kind() {
+        LoopKind::Review => {
+            let goal = log
+                .goal
+                .as_deref()
+                .unwrap_or("(not written yet: the scope turn writes it)");
+            std::fs::write(
+                folder.join("goal.md"),
+                format!("# Goal\n\n{}\n", goal.trim()),
+            )?;
+        }
+        LoopKind::Implement => {
+            if let Some(task) = task_of(log) {
+                std::fs::write(folder.join("task.md"), format!("# Task\n\n{task}\n"))?;
+            }
+        }
+    }
     Ok(())
+}
+
+/// An implementation loop's task text, if it has one (none: what the conversation settled).
+fn task_of(log: &LoopLog) -> Option<String> {
+    log.started
+        .as_ref()
+        .and_then(|s| s.task.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
+/// The most bytes of a task a prompt quotes whole; a longer one is read from `task.md`.
+const TASK_INLINE_MAX: usize = 2000;
+
+/// The task as a prompt names it: the thread's plan prompt (`thread`: what to do without
+/// one), or a reviewer's (`GOAL / TASK:`).
+fn task_words(log: &LoopLog, folder: &Path, thread: bool) -> String {
+    match task_of(log) {
+        Some(t) if t.len() <= TASK_INLINE_MAX => t,
+        Some(_) => format!(
+            "the task is in {} (read it whole)",
+            folder.join("task.md").display()
+        ),
+        None if thread => "(No task text was given: the task is what this conversation has \
+                           already settled. State it in the plan's first section, in your own \
+                           words: the reviewer and every later step read only the plan.)"
+            .into(),
+        None => "as the plan states it (its goal and interpretation): read the plan".into(),
+    }
+}
+
+/// The baseline of `log`'s loop as a prompt names it: `out of scope` lines per repository
+/// whose worktree had changes when the loop began (empty when none had). `reviewer`: the
+/// impl-review template's wording.
+fn baseline_words(log: &LoopLog, folder: &Path, reviewer: bool) -> String {
+    let Some(started) = log.started.as_ref() else {
+        return String::new();
+    };
+    let notes = loop_report::baseline_notes(started);
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (slug, summary) in notes {
+        let path = folder.join(format!("baseline-{slug}.patch"));
+        if reviewer {
+            out.push_str(&format!(
+                "\nOUT OF SCOPE — already modified before this task started (see {}); review \
+                 only changes beyond them:\n{summary}\n",
+                path.display()
+            ));
+        } else {
+            out.push_str(&format!(
+                "\nOut of scope: the worktree already held changes when the loop began ({summary}; \
+                 see {}). They are not this task's: leave them as they are, and out of any \
+                 commit.\n",
+                path.display()
+            ));
+        }
+    }
+    out
 }
 
 /// `- <repo> (from <base>)` per repository of `log`'s start.
@@ -311,6 +433,10 @@ impl Core {
                     first = None;
                     staged.review = true;
                 }
+                Action::WriteReport => {
+                    first = None;
+                    staged.write_report = true;
+                }
                 Action::Stuck { why } => {
                     first = None;
                     self.close_stuck(batch, thread, None);
@@ -323,8 +449,9 @@ impl Core {
                             attn_id: new_id(),
                             reason: AttentionReason::Error,
                             summary: format!(
-                                "{name}: its review loop is stuck: {}. Resume asks for that step \
-                                 again; stop ends the loop.",
+                                "{name}: its {} is stuck: {}. Resume asks for that step again; \
+                                 stop ends the loop.",
+                                loop_report::kind_words(state.kind),
                                 prompts::one_line(&why)
                             ),
                             options: vec![LOOP_STUCK_RESUME.into(), LOOP_STUCK_STOP.into()],
@@ -491,9 +618,36 @@ impl Core {
         let dir = prompts::templates_dir(hub.config_file.as_deref());
         let dir = dir.as_deref();
         let started = log.started.clone().unwrap_or_default();
-        let commit = prompts::commit_rule(started.settings.review_commit).to_string();
+        let kind = started.kind;
+        let commit = prompts::commit_rule(kind, state.commit).to_string();
         let ledger_path = folder.join("ledger.md").display().to_string();
+        let plan_path = folder.join("plan.md").display().to_string();
         let tag = step_tag(state).unwrap_or_else(|| "scope".into());
+        let context = match kind {
+            LoopKind::Review => format!(
+                "The work under review is for the GOAL in {}.",
+                folder.join("goal.md").display()
+            ),
+            LoopKind::Implement => format!(
+                "The work implements the plan in {plan_path} (the task: {}).",
+                match task_of(log) {
+                    Some(t) if t.len() <= 300 && !t.contains('\n') => t,
+                    Some(_) => format!("{}", folder.join("task.md").display()),
+                    None => "as the plan states it".into(),
+                }
+            ),
+        };
+        let count = |n: usize| match n {
+            1 => "1 finding".to_string(),
+            n => format!("{n} findings"),
+        };
+        let ids = |findings: &[twr_core::loops::contract::Finding]| {
+            findings
+                .iter()
+                .map(|f| f.id.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let (name, correction, mut values) = match ask {
             Action::AskGoal => (
                 "goal",
@@ -509,35 +663,66 @@ impl Core {
                     ("repos", repos_list(log)),
                 ],
             ),
+            Action::AskPlan => (
+                "plan",
+                false,
+                vec![
+                    ("task", task_words(log, &folder, true)),
+                    ("repos", repos_list(log)),
+                    ("baseline", baseline_words(log, &folder, false)),
+                    ("plan_path", plan_path.clone()),
+                    ("workers", self.workers_words(hub, thread, &started, "plan")),
+                ],
+            ),
+            Action::AskPlanTriage { round, findings } => (
+                "plan-triage",
+                false,
+                vec![
+                    ("round", round.clone()),
+                    ("count", count(findings.len())),
+                    ("findings", prompts::wrap_findings(round, findings)),
+                    ("finding_ids", ids(findings)),
+                    ("ledger_path", ledger_path.clone()),
+                    ("plan_path", plan_path.clone()),
+                ],
+            ),
+            Action::AskImplement => (
+                "implement",
+                false,
+                vec![
+                    ("plan_path", plan_path.clone()),
+                    (
+                        "plan_note",
+                        if state.plan_revision >= 2 {
+                            " (revised after the plan check; the first one is plan-1.md beside it)"
+                                .to_string()
+                        } else {
+                            String::new()
+                        },
+                    ),
+                    (
+                        "workers",
+                        self.workers_words(hub, thread, &started, "implement"),
+                    ),
+                    ("baseline", baseline_words(log, &folder, false)),
+                    ("commit_rule", commit.clone()),
+                ],
+            ),
             Action::AskTriage { round, findings } => (
                 "triage",
                 false,
                 vec![
                     ("round", round.clone()),
-                    (
-                        "count",
-                        match findings.len() {
-                            1 => "1 finding".to_string(),
-                            n => format!("{n} findings"),
-                        },
-                    ),
+                    ("count", count(findings.len())),
                     ("findings", prompts::wrap_findings(round, findings)),
-                    (
-                        "finding_ids",
-                        findings
-                            .iter()
-                            .map(|f| f.id.clone())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    ),
+                    ("finding_ids", ids(findings)),
                     ("ledger_path", ledger_path.clone()),
+                    ("context", context.clone()),
                     ("commit_rule", commit.clone()),
                 ],
             ),
-            Action::AskCorrection { step, problems } => (
-                "correction",
-                true,
-                vec![
+            Action::AskCorrection { step, problems } => {
+                let mut values = vec![
                     ("step", tag.clone()),
                     (
                         "problems",
@@ -547,17 +732,13 @@ impl Core {
                             .collect::<Vec<_>>()
                             .join("\n"),
                     ),
-                    (
-                        "block",
-                        match step {
-                            twr_core::loops::Step::Goal => "twr-goal",
-                            twr_core::loops::Step::Triage => "twr-triage",
-                            twr_core::loops::Step::Sweep => "twr-sweep",
-                        }
-                        .to_string(),
-                    ),
-                ],
-            ),
+                    ("block", step.block().to_string()),
+                ];
+                if *step == Step::Commit {
+                    values.push(("commit", self.commit_words(hub, state, log, &folder)));
+                }
+                ("correction", true, values)
+            }
             Action::AskSweep => {
                 let rules = log.rules();
                 (
@@ -585,17 +766,26 @@ impl Core {
                         ),
                         ("fixed", prompts::wrap_fixed(&log.fixed())),
                         ("ledger_path", ledger_path.clone()),
+                        ("context", context.clone()),
+                        (
+                            "workers",
+                            self.workers_words(hub, thread, &started, "sweep"),
+                        ),
                         ("commit_rule", commit.clone()),
                     ],
                 )
             }
             Action::AskReport => (
-                "report",
+                match kind {
+                    LoopKind::Review => "report",
+                    LoopKind::Implement => "impl-report",
+                },
                 false,
                 vec![
                     (
                         "outcome",
                         loop_report::outcome_words(
+                            kind,
                             state.outcome.unwrap_or_default(),
                             log.answered_rounds(),
                         ),
@@ -603,6 +793,14 @@ impl Core {
                     (
                         "report_path",
                         folder.join("report.md").display().to_string(),
+                    ),
+                    (
+                        "commit",
+                        if state.asks_commit() {
+                            self.commit_words(hub, state, log, &folder)
+                        } else {
+                            String::new()
+                        },
                     ),
                 ],
             ),
@@ -614,7 +812,18 @@ impl Core {
         let template = prompts::template(dir, name);
         let mut body = prompts::render(&template, &values);
         // What a template must carry, whatever it says.
-        for (key, needed) in [("triage", "findings"), ("correction", "problems")] {
+        let commit_correction = matches!(
+            ask,
+            Action::AskCorrection {
+                step: Step::Commit,
+                ..
+            }
+        );
+        for (key, needed) in [
+            ("triage", "findings"),
+            ("plan-triage", "findings"),
+            ("correction", "problems"),
+        ] {
             if name == key && !template.contains(&format!("{{{{{needed}}}}}")) {
                 if let Some((_, v)) = values.iter().find(|(k, _)| *k == needed) {
                     body.push_str("\n\n");
@@ -622,11 +831,113 @@ impl Core {
                 }
             }
         }
+        if commit_correction {
+            body.push_str("\n\n");
+            body.push_str(prompts::COMMIT_AGAIN);
+        }
+        if (matches!(ask, Action::AskReport) && state.asks_commit() || commit_correction)
+            && !template.contains("{{commit}}")
+        {
+            if let Some((_, v)) = values.iter().find(|(k, _)| *k == "commit") {
+                body.push_str("\n\n");
+                body.push_str(v);
+            }
+        }
         Ok(format!(
             "{}\n\n{}",
             prompts::marker(&state.id, &tag, correction),
             body.trim_end()
         ))
+    }
+
+    /// The commit's wording (the `commit` template) for loop `state`: what to commit, the
+    /// baseline left out, the repositories the hub checks.
+    fn commit_words(&self, hub: &Inner, state: &LoopState, log: &LoopLog, folder: &Path) -> String {
+        let dir = prompts::templates_dir(hub.config_file.as_deref());
+        let started = log.started.clone().unwrap_or_default();
+        let notes = loop_report::baseline_notes(&started);
+        let baseline = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Leave the changes that were already in the worktree when the loop began out of \
+                 the commit ({}; see {}). ",
+                notes
+                    .iter()
+                    .map(|(_, s)| s.clone())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                notes
+                    .iter()
+                    .map(|(slug, _)| folder
+                        .join(format!("baseline-{slug}.patch"))
+                        .display()
+                        .to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let repos = started
+            .bases
+            .iter()
+            .map(|b| b.repo.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        prompts::render(
+            &prompts::template(dir.as_deref(), "commit"),
+            &[
+                (
+                    "what",
+                    prompts::commit_what(state.kind, state.commit).to_string(),
+                ),
+                ("baseline", baseline),
+                ("repos", repos),
+            ],
+        )
+        .trim_end()
+        .to_string()
+    }
+
+    /// What prompt `which` (`plan`, `implement`, `sweep`) says of the workers: their model
+    /// where the implementer's runtime runs subagents (`settings::workers_apply`), else that
+    /// the thread works alone.
+    fn workers_words(
+        &self,
+        hub: &Inner,
+        thread: &str,
+        started: &twr_core::event::LoopStarted,
+        which: &str,
+    ) -> String {
+        let view = self.registry.get(thread);
+        let avail = super::availability(hub, &self.accounts, view);
+        let w = &started.settings.workers;
+        let model = match &w.effort {
+            Some(e) => format!("{} at {e} effort", w.model),
+            None => w.model.clone(),
+        };
+        let applies = twr_core::loops::settings::workers_apply(&started.settings, &avail);
+        match (which, applies) {
+            ("plan", true) => format!(
+                "\nThe implement step delegates well-scoped work items to your own subagents on \
+                 {model} (the loop's workers model): plan work items they can take.\n"
+            ),
+            ("implement", true) => format!(
+                "- Delegate well-scoped work items to your own subagents (your Agent tool), each \
+                 with a precise prompt (the plan's slice, the exact files, the constraints), and \
+                 wait for each. Run them on {model}: the loop's workers model (pass it as the \
+                 subagent's model). Keep architectural and cross-cutting items yourself."
+            ),
+            ("sweep", true) => format!(
+                "Run the audit subagents on {model}, the loop's workers model (pass it as the \
+                 subagent's model).\n"
+            ),
+            ("implement", false) => {
+                "- Your runtime runs no subagents of its own: work through the items yourself, \
+                 one after another."
+                    .into()
+            }
+            _ => String::new(),
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -687,7 +998,10 @@ impl Core {
         final_text: Option<&str>,
         interim: bool,
     ) -> Option<LoopAnswer> {
-        if self.shutting_down || !self.loop_runs.ready {
+        // (Also before the loops are driven: start-up recovery completes the reactions to a
+        // turn that ended before the previous hub reacted to it, and the turn's answer is
+        // taken with them, as at its end.)
+        if self.shutting_down {
             return None;
         }
         let state = self.loop_state(thread)?;
@@ -695,22 +1009,27 @@ impl Core {
         let started = self.turn_start(thread, turn)?;
         let owner = self.turn_owner(thread, turn, &started, &state, &tag)?;
         let mut mark = json!({"id": state.id, "step": tag});
-        let accepted = |i: &Input| {
-            matches!(
-                i,
-                Input::GoalWritten { .. } | Input::TriageAccepted { .. } | Input::SweepDone { .. }
-            )
+        let accepted = |i: &Input| match i {
+            Input::GoalWritten { .. }
+            | Input::TriageAccepted { .. }
+            | Input::SweepDone { .. }
+            | Input::PlanWritten { .. }
+            | Input::PlanTriaged { .. } => true,
+            Input::Implemented { implemented } => implemented.problems().is_empty(),
+            _ => false,
         };
+        let commit_step = matches!(state.wait, Wait::Report | Wait::Commit);
         match owner {
             Owner::IfBlock => {
-                if state.wait == Wait::Report {
+                if commit_step {
                     return None;
                 }
                 let input = state.reply_input(final_text?)?;
-                accepted(&input).then_some(LoopAnswer {
+                accepted(&input).then(|| LoopAnswer {
                     mark,
                     summary: None,
-                    input: Some(input),
+                    input: Some(self.with_plan_file(hub, thread, &state, input)),
+                    check: false,
                 })
             }
             Owner::Loop if interim => {
@@ -719,6 +1038,29 @@ impl Core {
                     mark,
                     summary: None,
                     input: None,
+                    check: false,
+                })
+            }
+            // The commit's check reads git: the watch runs it ([`Core::check_loops`]), and its
+            // result is the step's.
+            Owner::Loop if commit_step && state.asks_commit() => {
+                mark["commit"] = json!("checking");
+                let summary = (state.wait == Wait::Report).then(|| {
+                    let log = self.loop_log(thread, &state.id);
+                    format!(
+                        "{}; checking its commit",
+                        loop_report::outcome_words(
+                            state.kind,
+                            state.outcome.unwrap_or_default(),
+                            log.answered_rounds()
+                        )
+                    )
+                });
+                Some(LoopAnswer {
+                    mark,
+                    summary,
+                    input: None,
+                    check: true,
                 })
             }
             Owner::Loop if state.wait == Wait::Report => {
@@ -732,6 +1074,7 @@ impl Core {
                     outcome,
                     &folder.display().to_string(),
                     final_text,
+                    &committed_of(&state),
                 );
                 let written = write_common(hub, &folder, &log)
                     .and_then(|()| std::fs::write(&path, text).map_err(anyhow::Error::from));
@@ -740,10 +1083,7 @@ impl Core {
                         let shown = path.display().to_string();
                         mark["outcome"] = json!(outcome);
                         mark["report_path"] = json!(shown);
-                        Input::ReportWritten {
-                            report_path: shown,
-                            commit: None,
-                        }
+                        Input::ReportWritten { report_path: shown }
                     }
                     Err(e) => Input::Fail {
                         why: format!("cannot write {}: {e:#}", path.display()),
@@ -751,20 +1091,67 @@ impl Core {
                 };
                 let summary = format!(
                     "{}; report: {}",
-                    loop_report::outcome_words(outcome, log.answered_rounds()),
+                    loop_report::outcome_words(state.kind, outcome, log.answered_rounds()),
                     path.display()
                 );
                 Some(LoopAnswer {
                     mark,
                     summary: Some(summary),
                     input: Some(input),
+                    check: false,
                 })
             }
-            Owner::Loop => Some(LoopAnswer {
-                mark,
-                summary: None,
-                input: Some(state.reply_input(final_text.unwrap_or(""))?),
-            }),
+            Owner::Loop => {
+                let input = state.reply_input(final_text.unwrap_or(""))?;
+                Some(LoopAnswer {
+                    mark,
+                    summary: None,
+                    input: Some(self.with_plan_file(hub, thread, &state, input)),
+                    check: false,
+                })
+            }
+        }
+    }
+
+    /// `input` with the plan it brings written to the loop folder (module docs): the plan
+    /// turn's to `plan.md`, the plan check's revision to `plan.md` with the first one kept as
+    /// `plan-1.md`; its path filled in. A plan that can't be written fails the loop. Any
+    /// other input as it is.
+    fn with_plan_file(&self, hub: &Inner, thread: &str, state: &LoopState, input: Input) -> Input {
+        let (text, revised) = match &input {
+            Input::PlanWritten { plan, path: None } => (plan.text.clone(), false),
+            Input::PlanTriaged {
+                triage, path: None, ..
+            } => match &triage.plan {
+                Some(p) => (p.text.clone(), true),
+                None => return input,
+            },
+            _ => return input,
+        };
+        let log = self.loop_log(thread, &state.id);
+        let folder = folder_of(hub, &log, &state.id);
+        let path = folder.join("plan.md");
+        let written = (|| -> anyhow::Result<()> {
+            make_folder(hub, &folder)?;
+            let first = folder.join("plan-1.md");
+            if revised && !first.exists() && path.exists() {
+                std::fs::rename(&path, &first)?;
+            }
+            std::fs::write(&path, format!("{}\n", text.trim_end()))?;
+            Ok(())
+        })();
+        let shown = Some(path.display().to_string());
+        match (written, input) {
+            (Err(e), _) => Input::Fail {
+                why: format!("cannot write {}: {e:#}", path.display()),
+            },
+            (Ok(()), Input::PlanWritten { plan, .. }) => Input::PlanWritten { plan, path: shown },
+            (Ok(()), Input::PlanTriaged { round, triage, .. }) => Input::PlanTriaged {
+                round,
+                triage,
+                path: shown,
+            },
+            (Ok(()), other) => other,
         }
     }
 
@@ -779,7 +1166,10 @@ impl Core {
         answer: LoopAnswer,
     ) -> Staged {
         let Some(input) = answer.input else {
-            return Staged::default();
+            return Staged {
+                check: answer.check,
+                ..Default::default()
+            };
         };
         match self.loop_step(hub, batch, thread, input, Some(turn)) {
             Ok(s) => s,
@@ -803,6 +1193,12 @@ impl Core {
         let Some(failed) = view.failed_turn() else {
             return;
         };
+        self.loop_failed_turn(hub, thread, &view, failed);
+    }
+
+    /// Failed turn `failed` of thread `thread` (`view`), if it is its loop's step's: taken as
+    /// `TurnFailed` (stuck), unless the hub retries it automatically.
+    fn loop_failed_turn(&mut self, hub: &Inner, thread: &str, view: &ThreadView, failed: u64) {
         // A compaction is maintenance, no step's answer.
         if self.is_compaction(thread, failed).unwrap_or(false) {
             return;
@@ -826,18 +1222,27 @@ impl Core {
         if transient && view.retry_eligible() {
             return;
         }
-        let detail = match self.stored_event(thread, Some(failed), "turn.ended") {
+        let ended = match self.stored_event(thread, Some(failed), "turn.ended") {
             Ok(Some(Event {
                 body: EventBody::TurnEnded(p),
                 ..
-            })) => twr_ext(&p.ext)
-                .and_then(|t| t.get("error"))
-                .and_then(Value::as_str)
-                .map(|e| format!(": {}", prompts::one_line(e)))
-                .unwrap_or_default(),
-            _ => String::new(),
+            })) => Some(p),
+            _ => None,
         };
-        let what = if view.crashed { "crashed" } else { "failed" };
+        let detail = ended
+            .as_ref()
+            .and_then(|p| twr_ext(&p.ext))
+            .and_then(|t| t.get("error"))
+            .and_then(Value::as_str)
+            .map(|e| format!(": {}", prompts::one_line(e)))
+            .unwrap_or_default();
+        // (A turn that ended `error` failed, whatever crashed after it; a crash cuts its turn.)
+        let errored = ended.is_some_and(|p| p.result == TurnResult::Error);
+        let what = if view.crashed && !errored {
+            "crashed"
+        } else {
+            "failed"
+        };
         self.loop_turn_failed(hub, thread, failed, format!("turn {failed} {what}{detail}"));
     }
 
@@ -865,6 +1270,7 @@ impl Core {
     /// Records turn `turn` of thread `thread` failed for its loop (`why`), one batch.
     fn loop_turn_failed(&mut self, hub: &Inner, thread: &str, turn: u64, why: String) {
         let mut batch = Batch::default();
+        let tag = self.loop_state(thread).as_ref().and_then(step_tag);
         match self.loop_step(
             hub,
             &mut batch,
@@ -873,6 +1279,7 @@ impl Core {
             Some(turn),
         ) {
             Ok(_) => {
+                hub.loop_record_point(&format!("failed {}", tag.unwrap_or_default()));
                 if let Err(e) = self.append_batch(hub, batch) {
                     tracing::warn!(%thread, turn, error = %format!("{e:#}"), "cannot record a loop turn's failure");
                 }
@@ -916,11 +1323,17 @@ impl Core {
             return true;
         }
         // Delivered: answered by the turn's end, unless that end was an interruption the hub
-        // took no step from (its own shutdown's).
-        !view
+        // took no step from (its own shutdown's). A turn of the user's that the shutdown
+        // interrupted after the step's own turn answered it (a message sent as the report turn
+        // ended, its commit's check still to run) does not ask for the step again.
+        let interrupted = view
             .last_turn
             .as_ref()
-            .is_some_and(|t| t.turn >= ask.turn && t.result == TurnResult::Interrupted)
+            .is_some_and(|t| t.turn >= ask.turn && t.result == TurnResult::Interrupted);
+        !interrupted
+            || self
+                .step_answer(thread, state, tag)
+                .is_some_and(|t| t >= ask.turn)
     }
 
     /// The review tasks thread `thread` shows that no run of this hub's is (a previous hub's).
@@ -1025,6 +1438,7 @@ impl Core {
                 }
             }
             Wait::Ended => {}
+            Wait::WriteReport => staged.write_report = true,
             _ => {
                 let tag = step_tag(&state).unwrap_or_default();
                 if !state.held {
@@ -1036,7 +1450,7 @@ impl Core {
                     // (A step taken just now asks for its next one itself.)
                     let still = self
                         .loop_state(thread)
-                        .is_some_and(|s| s.wait == state.wait)
+                        .is_some_and(|s| s.wait == state.wait && !s.held)
                         && batch
                             .events
                             .iter()
@@ -1055,6 +1469,12 @@ impl Core {
                             ));
                         }
                     }
+                    // A commit step's answer: its check.
+                    if still && state.asks_commit() && !self.loop_runs.checks.contains_key(thread) {
+                        if let Some(turn) = self.step_answer(thread, &state, &tag) {
+                            self.start_commit_check(hub, thread, &state.id, turn);
+                        }
+                    }
                 }
             }
         }
@@ -1067,9 +1487,11 @@ impl Core {
         self.after_loop_batch(hub, thread, staged);
     }
 
-    /// At startup: the turn of thread `thread`'s step that ended while no hub ran, taken as at
-    /// its end; one the hub's stop interrupted, or that failed then, is asked again
-    /// ([`Core::check_loop`] does, finding no ask).
+    /// At startup: the turn of thread `thread`'s step that ended while no hub reacted to it,
+    /// taken as at its end: a completed one as the step's answer, a failed one (it ended
+    /// `error`, or its runtime crashed on its own) as `TurnFailed` (stuck, unless the hub
+    /// retries it). One the hub's stop interrupted, or whose runtime died with the previous
+    /// hub, is asked again ([`Core::check_loop`] does, finding no ask).
     fn recover_turn(
         &mut self,
         hub: &Inner,
@@ -1083,8 +1505,21 @@ impl Core {
             return None;
         }
         let last = view.last_turn.clone()?;
-        if last.result != TurnResult::Completed {
-            return None;
+        match last.result {
+            TurnResult::Completed => {}
+            TurnResult::Error => {
+                self.loop_failed_turn(hub, thread, &view, last.turn);
+                return None;
+            }
+            TurnResult::Interrupted => {
+                if view.crashed
+                    && view.crashed_turn == Some(last.turn)
+                    && !self.loop_runs.died_with_hub.contains(thread)
+                {
+                    self.loop_failed_turn(hub, thread, &view, last.turn);
+                }
+                return None;
+            }
         }
         let started = self.turn_start(thread, last.turn)?;
         self.turn_owner(thread, last.turn, &started, state, tag)?;
@@ -1113,6 +1548,256 @@ impl Core {
         if staged.review {
             self.start_review(hub, thread);
         }
+        if staged.check {
+            hub.loop_kick.notify_one();
+        }
+        if staged.write_report {
+            self.write_report(hub, thread);
+        }
+    }
+
+    /// The turn that answered thread `thread`'s loop's step `tag` and was not taken yet (a
+    /// commit step's, `report` or the correction's `commit`, waits for its check): the latest
+    /// completed turn since the loop last took one that is the step's own
+    /// ([`Core::turn_owner`]) and did not end with background work of its own still running (an
+    /// interim end; its follow-up answers).
+    fn step_answer(&self, thread: &str, state: &LoopState, tag: &str) -> Option<u64> {
+        let view = self.registry.get(thread)?;
+        let last = view.last_turn.as_ref()?.turn;
+        let consumed = self.loops.consumed.get(thread).copied().unwrap_or(0);
+        let mut turn = last;
+        while turn > consumed && last - turn < 32 {
+            let ended = matches!(
+                self.stored_event(thread, Some(turn), "turn.ended"),
+                Ok(Some(Event {
+                    body: EventBody::TurnEnded(TurnEnded {
+                        result: TurnResult::Completed,
+                        ..
+                    }),
+                    ..
+                }))
+            );
+            if ended {
+                if let Some(started) = self.turn_start(thread, turn) {
+                    if self.turn_owner(thread, turn, &started, state, tag) == Some(Owner::Loop) {
+                        let interim = self
+                            .logged_report(thread, turn)
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            .is_some_and(super::super::reactions::is_interim);
+                        return (!interim).then_some(turn);
+                    }
+                }
+            }
+            turn -= 1;
+        }
+        None
+    }
+
+    /// Starts the check of the commit turn `turn` of thread `thread`'s loop `loop_id` answered.
+    fn start_commit_check(&mut self, hub: &Arc<Inner>, thread: &str, loop_id: &str, turn: u64) {
+        if self.shutting_down || !self.loop_runs.ready {
+            return;
+        }
+        self.loop_runs
+            .checks
+            .insert(thread.to_string(), (loop_id.to_string(), turn));
+        tokio::spawn(run_commit_check(
+            Arc::clone(hub),
+            thread.to_string(),
+            loop_id.to_string(),
+            turn,
+        ));
+    }
+
+    /// What the commit check of turn `turn` of thread `thread`'s loop `loop_id` reads: per
+    /// repository, its path, `HEAD` when the loop began, the baseline's paths and whether the
+    /// loop left work there; and the turn's reply. `None`: the loop moved on.
+    fn commit_prep(
+        &self,
+        hub: &Inner,
+        thread: &str,
+        loop_id: &str,
+        turn: u64,
+    ) -> Option<(Vec<RepoCheck>, String)> {
+        let state = self
+            .loop_state(thread)
+            .filter(|s| s.id == loop_id && s.asks_commit())
+            .filter(|s| matches!(s.wait, Wait::Report | Wait::Commit))?;
+        let log = self.loop_log(thread, loop_id);
+        let folder = folder_of(hub, &log, loop_id);
+        let started = log.started.clone()?;
+        let heads = loop_start(&started, "heads");
+        let fixed = !log.fixed().is_empty()
+            || log.sweep.as_ref().is_some_and(|rules| {
+                rules
+                    .iter()
+                    .any(|r| r.result == twr_core::loops::contract::SweepResult::Fixed)
+            });
+        let repos = started
+            .bases
+            .iter()
+            .map(|b| RepoCheck {
+                repo: PathBuf::from(&b.repo),
+                from: match state.kind {
+                    LoopKind::Implement => Some(b.base.clone()),
+                    LoopKind::Review => heads
+                        .get(&b.slug)
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                },
+                baseline: baseline_paths(&folder, &b.slug),
+                work: match state.kind {
+                    LoopKind::Review => fixed,
+                    LoopKind::Implement => latest_diff_has_changes(&folder, &log, &b.slug),
+                },
+            })
+            .collect();
+        let text = self
+            .logged_final_text(thread, turn)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        Some((repos, text))
+    }
+
+    /// Steps the commit check of turn `turn` of thread `thread`'s loop `loop_id` (`input`), if
+    /// the loop still waits for it, with what follows: one batch.
+    fn commit_checked(
+        &mut self,
+        hub: &Arc<Inner>,
+        thread: &str,
+        loop_id: &str,
+        turn: u64,
+        input: Option<Input>,
+    ) {
+        if self
+            .loop_runs
+            .checks
+            .get(thread)
+            .is_some_and(|(l, t)| l == loop_id && *t == turn)
+        {
+            self.loop_runs.checks.remove(thread);
+        }
+        let Some(input) = input else {
+            return;
+        };
+        if self.shutting_down || self.loop_state(thread).is_none_or(|s| s.id != loop_id) {
+            return;
+        }
+        let tag = self.loop_state(thread).as_ref().and_then(step_tag);
+        let mut batch = Batch::default();
+        match self.loop_step(hub, &mut batch, thread, input, Some(turn)) {
+            Ok(staged) => {
+                hub.loop_record_point(&format!("checked {}", tag.unwrap_or_default()));
+                if let Err(e) = self.append_batch(hub, batch) {
+                    tracing::warn!(%thread, error = %format!("{e:#}"), "cannot record a commit's check; the next start checks it again");
+                    return;
+                }
+                self.after_loop_batch(hub, thread, staged);
+            }
+            Err(e) => {
+                tracing::debug!(%thread, turn, error = %e, "a loop did not take a commit's check")
+            }
+        }
+    }
+
+    /// Writes thread `thread`'s loop's `report.md` once its commit is settled
+    /// ([`Action::WriteReport`]): its report turn's reply without the `twr-commit` block,
+    /// joined with what the hub counted and the commits; then `loop.ended` and the loop's
+    /// last report (`report.ready` of the report turn, marked `ext.twr.loop` with the outcome,
+    /// the path and the commits), one batch.
+    fn write_report(&mut self, hub: &Arc<Inner>, thread: &str) {
+        let Some(state) = self
+            .loop_state(thread)
+            .filter(|s| s.wait == Wait::WriteReport)
+        else {
+            return;
+        };
+        let log = self.loop_log(thread, &state.id);
+        let folder = folder_of(hub, &log, &state.id);
+        let turn = log.report_turn();
+        let reply = turn
+            .and_then(|t| self.logged_final_text(thread, t).ok().flatten())
+            .map(|t| {
+                twr_core::loops::contract::without_blocks(
+                    &t,
+                    &[twr_core::loops::contract::COMMIT_BLOCK],
+                )
+            });
+        let committed = committed_of(&state);
+        let outcome = state.outcome.unwrap_or_default();
+        let path = folder.join("report.md");
+        let text = loop_report::report(
+            &self.thread_name(thread),
+            &log,
+            outcome,
+            &folder.display().to_string(),
+            reply.as_deref(),
+            &committed,
+        );
+        let written = write_common(hub, &folder, &log)
+            .and_then(|()| std::fs::write(&path, text).map_err(anyhow::Error::from));
+        let shown = path.display().to_string();
+        let input = match written {
+            Ok(()) => Input::ReportWritten {
+                report_path: shown.clone(),
+            },
+            Err(e) => Input::Fail {
+                why: format!("cannot write {}: {e:#}", path.display()),
+            },
+        };
+        let wrote = matches!(input, Input::ReportWritten { .. });
+        let mut batch = Batch::default();
+        let staged = match self.loop_step(hub, &mut batch, thread, input, turn) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(%thread, error = %e, "a loop did not take its report");
+                return;
+            }
+        };
+        if let (true, Some(turn)) = (wrote, turn) {
+            let grade = self
+                .logged_report(thread, turn)
+                .ok()
+                .flatten()
+                .map(|r| r.grade)
+                .unwrap_or(Grade::Success);
+            let mut summary =
+                loop_report::outcome_words(state.kind, outcome, log.answered_rounds());
+            if let Some(c) = committed.words() {
+                summary.push_str("; ");
+                summary.push_str(&c);
+            }
+            summary.push_str(&format!("; report: {shown}"));
+            batch.push(
+                thread,
+                Some(turn),
+                Source::Hub,
+                EventBody::ReportReady(ReportReady {
+                    summary,
+                    grade,
+                    turn: Some(turn),
+                    written_by: "hub".into(),
+                    ext: twr_ext_map(json!({ LOOP_REPORT_KEY: {
+                        "id": state.id,
+                        "step": "report",
+                        "outcome": outcome,
+                        "report_path": shown,
+                        "commits": committed.commits,
+                        "commit_problem": committed.problem,
+                    }})),
+                    ..Default::default()
+                }),
+            );
+        }
+        hub.loop_record_point("report written");
+        if let Err(e) = self.append_batch(hub, batch) {
+            tracing::warn!(%thread, error = %format!("{e:#}"), "cannot record a loop's report");
+            return;
+        }
+        self.after_loop_batch(hub, thread, staged);
     }
 
     /// Starts thread `thread`'s loop's review run, unless one runs.
@@ -1199,6 +1884,7 @@ fn task_end(task: &str, what: &str) -> EventBody {
 /// What a review run needs, read under the hub's lock.
 struct Prep {
     name: String,
+    template: ReviewTemplate,
     log: LoopLog,
     folder: PathBuf,
     call: review::Call,
@@ -1285,6 +1971,7 @@ impl Core {
         let file = |name: String| folder.join(name);
         Ok(Prep {
             name: view.name.clone(),
+            template: state.review_template(),
             folder: folder.clone(),
             task: format!("{LOOP_TASK_PREFIX}{id}"),
             description: format!("reviewer {} {effort}", reviewer.model),
@@ -1442,6 +2129,7 @@ impl Core {
             );
         }
         let mut staged = Staged::default();
+        let stepped = input.is_some();
         if let Some(input) = input {
             let reviewer = prep.map(|p| p.call.runtime.clone());
             let mut state = self.loop_state(thread);
@@ -1463,6 +2151,9 @@ impl Core {
             }
         }
         if !batch.events.is_empty() || !batch.prompts.is_empty() {
+            if stepped {
+                hub.loop_record_point(&format!("findings {round}"));
+            }
             if let Err(e) = self.append_batch(hub, batch) {
                 tracing::warn!(%thread, error = %format!("{e:#}"), "cannot record a review run's end; the next start retries it");
                 return;
@@ -1648,7 +2339,8 @@ async fn still_as_read(hub: &Arc<Inner>, prep: &Prep, read: Option<&[Vec<u8>]>) 
         return false;
     }
     for (b, was) in started.bases.iter().zip(read) {
-        match super::git::round_diff(&git, Path::new(&b.repo), &b.base).await {
+        let skip = skipped(&git, &prep.folder, &b.slug, Path::new(&b.repo)).await;
+        match super::git::round_diff(&git, Path::new(&b.repo), &b.base, &skip).await {
             Ok(d) if d.truncated.is_none() && d.patch == *was => {}
             _ => return false,
         }
@@ -1664,6 +2356,14 @@ type Built = (Vec<String>, Vec<String>, Option<Vec<Vec<u8>>>);
 /// (`diff-<slug>-<round>.patch`), built fresh from the loop's recorded base.
 async fn build_round(hub: &Arc<Inner>, prep: &Prep, round: &str) -> Result<Built, String> {
     write_common(hub, &prep.folder, &prep.log).map_err(|e| format!("{e:#}"))?;
+    // The plan check reads the plan, not a diff.
+    if prep.template == ReviewTemplate::PlanReview {
+        let plan = prep.folder.join("plan.md");
+        if !plan.is_file() {
+            return Err(format!("the plan is not in {}", plan.display()));
+        }
+        return Ok((vec![plan.display().to_string()], Vec::new(), None));
+    }
     let git = hub
         .host(LOCAL_BOX)
         .and_then(|h| h.local_git())
@@ -1673,7 +2373,8 @@ async fn build_round(hub: &Arc<Inner>, prep: &Prep, round: &str) -> Result<Built
     let mut notes = Vec::new();
     let mut read = Some(Vec::new());
     for b in &started.bases {
-        let d = super::git::round_diff(&git, Path::new(&b.repo), &b.base).await?;
+        let skip = skipped(&git, &prep.folder, &b.slug, Path::new(&b.repo)).await;
+        let d = super::git::round_diff(&git, Path::new(&b.repo), &b.base, &skip).await?;
         let path = prep.folder.join(format!("diff-{}-{round}.patch", b.slug));
         std::fs::write(&path, &d.patch)
             .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -1696,14 +2397,11 @@ async fn build_round(hub: &Arc<Inner>, prep: &Prep, round: &str) -> Result<Built
     Ok((diffs, notes, read))
 }
 
-/// The reviewer's prompt for `prep`'s round: the `review` template filled in.
+/// The reviewer's prompt for `prep`'s round: its template (review, impl-review or
+/// plan-review, as the machine named it) filled in.
 fn review_prompt(hub: &Inner, prep: &Prep, diffs: &[String], notes: &[String]) -> String {
     let dir = prompts::templates_dir(hub.config_file.as_deref());
-    let values = vec![
-        (
-            "goal_path",
-            prep.folder.join("goal.md").display().to_string(),
-        ),
+    let mut values = vec![
         (
             "diffs",
             diffs
@@ -1729,7 +2427,160 @@ fn review_prompt(hub: &Inner, prep: &Prep, diffs: &[String], notes: &[String]) -
         ("folder", prep.folder.display().to_string()),
         ("thread", prep.name.clone()),
     ];
-    prompts::render(&prompts::template(dir.as_deref(), "review"), &values)
+    match prep.template {
+        ReviewTemplate::Review => values.push((
+            "goal_path",
+            prep.folder.join("goal.md").display().to_string(),
+        )),
+        ReviewTemplate::ImplReview | ReviewTemplate::PlanReview => {
+            values.push(("task", task_words(&prep.log, &prep.folder, false)));
+            values.push((
+                "plan_path",
+                prep.folder.join("plan.md").display().to_string(),
+            ));
+            values.push(("baseline", baseline_words(&prep.log, &prep.folder, true)));
+        }
+    }
+    prompts::render(
+        &prompts::template(dir.as_deref(), prep.template.as_str()),
+        &values,
+    )
+}
+
+/// Per repository slug, the commit check of a turn reads one of these ([`run_commit_check`]).
+struct RepoCheck {
+    repo: PathBuf,
+    from: Option<String>,
+    baseline: BTreeMap<String, Option<String>>,
+    work: bool,
+}
+
+/// `ext.twr.`[`super::LOOP_START_KEY`]`.<key>` of loop `started`, as an object (empty when
+/// absent).
+fn loop_start(started: &LoopStarted, key: &str) -> serde_json::Map<String, Value> {
+    started
+        .ext
+        .as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(super::LOOP_START_KEY))
+        .and_then(|s| s.get(key))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The baseline's changed paths of repository `slug` (`baseline-<slug>.paths.json` in the loop
+/// folder; none for a review loop or a clean worktree).
+fn baseline_paths(folder: &Path, slug: &str) -> BTreeMap<String, Option<String>> {
+    std::fs::read(folder.join(format!("baseline-{slug}.paths.json")))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// The baseline paths of repository `slug` the loop has not touched since: what its round
+/// diffs leave out.
+async fn skipped(
+    git: &twr_runner::local::LocalGit,
+    folder: &Path,
+    slug: &str,
+    repo: &Path,
+) -> Vec<String> {
+    let baseline = baseline_paths(folder, slug);
+    if baseline.is_empty() {
+        return Vec::new();
+    }
+    match super::git::worktree_paths(git, repo).await {
+        Ok(now) => super::git::unchanged_since(&baseline, &now),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Whether the latest round diff of repository `slug` shows a change (tracked or untracked):
+/// whether the loop left work there. Without one, it did.
+fn latest_diff_has_changes(folder: &Path, log: &LoopLog, slug: &str) -> bool {
+    let Some(round) = log
+        .rounds
+        .iter()
+        .rev()
+        .find(|r| r.id != twr_core::loops::PLAN_CHECK_ROUND && r.answered)
+    else {
+        return true;
+    };
+    let Ok(patch) = std::fs::read(folder.join(format!("diff-{slug}-{}.patch", round.id))) else {
+        return true;
+    };
+    let text = String::from_utf8_lossy(&patch);
+    let section = |start: &str, end: &str| -> String {
+        let Some(a) = text.find(start) else {
+            return String::new();
+        };
+        let rest = &text[a..];
+        let rest = rest.split_once('\n').map_or("", |(_, r)| r);
+        match rest.find(end) {
+            Some(b) => rest[..b].trim().to_string(),
+            None => rest.trim().to_string(),
+        }
+    };
+    let tracked = section("===== changes from the base", "\n===== new untracked files");
+    let untracked = section(
+        "===== new untracked files",
+        "\n[twr: THIS DIFF IS TRUNCATED",
+    );
+    !tracked.is_empty() || (!untracked.is_empty() && untracked != "(none)")
+}
+
+/// Runs the commit check of turn `turn` of thread `thread`'s loop `loop_id`: each repository
+/// read ([`super::git::repo_after`]) and checked ([`twr_core::loops::contract::check_commit`]),
+/// which follows git; the turn's `twr-commit` block is the thread's note, and one missing or
+/// invalid is noted, never a problem. The result is stepped as `CommitChecked`, stamped with
+/// the turn.
+async fn run_commit_check(hub: Arc<Inner>, thread: String, loop_id: String, turn: u64) {
+    let prep = { hub.core().commit_prep(&hub, &thread, &loop_id, turn) };
+    let Some((repos, text)) = prep else {
+        hub.core()
+            .commit_checked(&hub, &thread, &loop_id, turn, None);
+        return;
+    };
+    let Some(git) = hub.host(LOCAL_BOX).and_then(|h| h.local_git()) else {
+        hub.core()
+            .commit_checked(&hub, &thread, &loop_id, turn, None);
+        return;
+    };
+    let notes: Vec<String> = match twr_core::loops::contract::parse_commit(&text) {
+        Ok(_) => Vec::new(),
+        Err(p)
+            if p.iter()
+                .any(|p| matches!(p, twr_core::loops::contract::BlockProblem::Missing(_))) =>
+        {
+            vec!["the thread wrote no twr-commit block (the check reads git, not the block)".into()]
+        }
+        Err(p) => vec![format!(
+            "the thread's twr-commit block does not read: {} (the check reads git, not the block)",
+            p.iter()
+                .map(|p| prompts::one_line(&p.to_string()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )],
+    };
+    let mut after = Vec::new();
+    for r in &repos {
+        after.push(
+            super::git::repo_after(&git, &r.repo, r.from.as_deref(), &r.baseline, r.work).await,
+        );
+    }
+    let (commits, problems) = twr_core::loops::contract::check_commit(&after);
+    hub.core().commit_checked(
+        &hub,
+        &thread,
+        &loop_id,
+        turn,
+        Some(Input::CommitChecked {
+            commits,
+            problems,
+            notes,
+        }),
+    );
 }
 
 /// The loops' watch: [`Core::check_loops`] on every kick (a step that leaves a review to run,
@@ -1794,6 +2645,13 @@ pub(in crate::hub) async fn reap_reviews(hub: &Arc<Inner>, groups: Vec<(String, 
 }
 
 impl Inner {
+    /// [`super::super::HubOptions::loop_record_hook`], when set, with `point`.
+    pub(in crate::hub) fn loop_record_point(&self, point: &str) {
+        if let Some(hook) = &self.loop_record_hook {
+            hook(point);
+        }
+    }
+
     /// The CLI of reviewer runtime `runtime` ([`super::super::HubOptions::reviewer_bins`]).
     pub(in crate::hub) fn reviewer_bin(&self, runtime: &str) -> PathBuf {
         self.reviewer_bins

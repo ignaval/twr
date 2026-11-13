@@ -259,6 +259,7 @@ impl Core {
         };
         // A loop's turn is the loop's to judge: no review item.
         let owned = answer.is_some();
+        let point = answer.as_ref().and_then(|a| a.point());
         let staged = match answer {
             Some(a) => self.loop_take(hub, &mut batch, thread, turn, a),
             None => Default::default(),
@@ -277,11 +278,14 @@ impl Core {
             );
         }
         if !batch.is_empty() {
+            if let Some(point) = &point {
+                hub.loop_record_point(point);
+            }
             self.append_batch(hub, batch)?;
         }
         // A review due, or a prompt queued: the loop's watch starts the one, the caller's
         // dispatch (or the watch) the other.
-        if staged.review || staged.prompted {
+        if staged.kicks() {
             hub.loop_kick.notify_one();
         }
         Ok(())

@@ -1,6 +1,8 @@
 //! What a loop reads from models: the reviewer's findings, and the fenced blocks the thread
-//! ends its loop turns with (`twr-goal`, `twr-triage`, `twr-sweep`); plus the ledger the hub
-//! builds from them (docs/design/loops.md, "Contracts").
+//! ends its loop turns with (`twr-goal`, `twr-triage`, `twr-sweep`; an implementation loop's
+//! `twr-plan`, `twr-implement` and `twr-commit`); plus the ledger the hub builds from them and
+//! the check of a loop's commit (docs/design/loops.md, "Contracts" and "Milestone 2:
+//! implementation notes").
 //!
 //! Everything here is parsed from another model's output, so every parser is strict about
 //! shape and bounded in size, and none panics: a reviewer's answer that does not parse is a
@@ -18,8 +20,8 @@
 //! - a tier whose effort is none of those, or whose letter an earlier tier of the profile
 //!   already took (two `medium` tiers), is tagged `t` and its place in the ladder as a letter:
 //!   `ta` for the first tier, `tb` for the second (`tb2.1`);
-//! - `v` is the verification's rounds (`v2.1`), and `p` is reserved for the plan check of an
-//!   implementation loop; no tier takes either.
+//! - `v` is the verification's rounds (`v2.1`), and `p` is the plan check of an implementation
+//!   loop (its one round is `p1`, its findings `p1.1`…); no tier takes either.
 //!
 //! A tag is lowercase letters only and a round number digits only, so an id parses back
 //! ([`FindingId::parse`]).
@@ -83,6 +85,22 @@ pub const GOAL_BLOCK: &str = "twr-goal";
 pub const TRIAGE_BLOCK: &str = "twr-triage";
 /// Fence info string of the sweep turn's block.
 pub const SWEEP_BLOCK: &str = "twr-sweep";
+/// Fence info string of an implementation loop's plan turn's block (and of a plan-check
+/// triage that revised the plan).
+pub const PLAN_BLOCK: &str = "twr-plan";
+/// Fence info string of an implementation loop's implement turn's block.
+pub const IMPLEMENT_BLOCK: &str = "twr-implement";
+/// Fence info string of the block a loop's commit ends with.
+pub const COMMIT_BLOCK: &str = "twr-commit";
+
+/// Longest plan (the plan turn's message without its blocks), in bytes.
+pub const MAX_PLAN_BYTES: usize = 128 * 1024;
+/// Most commits a `twr-commit` block may list.
+pub const MAX_COMMITS: usize = 64;
+/// Longest repository path a `twr-commit` block may name, in bytes.
+pub const MAX_REPO_BYTES: usize = 4096;
+/// Most paths a failed commit check names, per repository (the rest are counted).
+pub const MAX_LEFT_SHOWN: usize = 5;
 
 // ---------------------------------------------------------------------------------------------
 // Findings
@@ -599,6 +617,18 @@ pub fn parse_triage(
     round: &[String],
     ledger: &[String],
 ) -> Result<Triage, Vec<BlockProblem>> {
+    triage_with(text, round, ledger, true)
+}
+
+/// [`parse_triage`]'s checks; `review`: a review round's triage (every `fixed` item has a class,
+/// and `gates` are required), else the plan check's (a class is optional, and `gates`, when
+/// given, passed).
+fn triage_with(
+    text: &str,
+    round: &[String],
+    ledger: &[String],
+    review: bool,
+) -> Result<Triage, Vec<BlockProblem>> {
     let m = block_object(text, TRIAGE_BLOCK).map_err(|p| vec![p])?;
     let mut problems = Vec::new();
     let items = match m.get("items") {
@@ -654,9 +684,10 @@ pub fn parse_triage(
                         Some("new-class") => Some(FindingClass::NewClass),
                         Some("known-site") => Some(FindingClass::KnownSite),
                         Some("follow-on") => Some(FindingClass::FollowOn),
-                        None if o.get("class").is_none_or(Value::is_null) => {
+                        None if o.get("class").is_none_or(Value::is_null) && review => {
                             return Err(BlockProblem::NoClass(id.clone()))
                         }
+                        None if o.get("class").is_none_or(Value::is_null) => None,
                         _ => {
                             return Err(BlockProblem::Field(format!(
                                 "{id}: `class` is not new-class, known-site or follow-on"
@@ -706,13 +737,14 @@ pub fn parse_triage(
             }
             g
         }
-        Ok(None) => {
+        Ok(None) if review => {
             problems.push(BlockProblem::Field(
                 "no `gates`: run the gates and report them, {\"ran\": [...], \"result\": \"pass\"}"
                     .into(),
             ));
             Gates::default()
         }
+        Ok(None) => Gates::default(),
         Err(p) => {
             problems.push(p);
             Gates::default()
@@ -871,6 +903,454 @@ pub fn parse_sweep(text: &str) -> Result<Sweep, Vec<BlockProblem>> {
         return Err(problems);
     }
     Ok(Sweep { rules, gates })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan
+// ---------------------------------------------------------------------------------------------
+
+/// `text` without its closed fenced blocks whose info string is one of `infos` (fence lines
+/// included, as [`last_block`] reads a fence), trimmed: what a plan turn's message is without
+/// its `twr-plan` block. A fence never closed stays, as text.
+pub fn without_blocks(text: &str, infos: &[&str]) -> String {
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<(usize, usize)> = None; // (fence length, block start)
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        let start = pos;
+        pos += line.len();
+        let bare = line.trim_end_matches(['\n', '\r']);
+        let indent = bare.len() - bare.trim_start_matches(' ').len();
+        if indent > 3 {
+            continue;
+        }
+        let rest = &bare[indent..];
+        let ticks = rest.len() - rest.trim_start_matches('`').len();
+        if ticks < 3 {
+            continue;
+        }
+        let after = rest[ticks..].trim();
+        match open {
+            Some((len, from)) => {
+                if ticks >= len && after.is_empty() {
+                    cut.push((from, pos));
+                    open = None;
+                }
+            }
+            None if infos.contains(&after) => open = Some((ticks, start)),
+            None => {}
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (from, to) in cut {
+        out.push_str(&text[at..from]);
+        at = to;
+    }
+    out.push_str(&text[at..]);
+    out.trim().to_string()
+}
+
+/// A plan an implementation loop's thread wrote: its `twr-plan` block and the message without
+/// its blocks, which is the plan the hub writes to `plan.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Plan {
+    /// The plan touches money paths, schemas or migrations, or cross-repo contracts.
+    pub contract_risk: bool,
+    /// Why, in a line.
+    pub reason: String,
+    /// The plan itself.
+    pub text: String,
+}
+
+/// The `twr-plan` block's fields of `text`, and its plan: the message without the blocks
+/// `infos` names.
+fn plan_of(text: &str, infos: &[&str]) -> Result<Plan, Vec<BlockProblem>> {
+    let m = block_object(text, PLAN_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let contract_risk = match m.get("contract_risk") {
+        Some(Value::Bool(b)) => *b,
+        _ => {
+            problems.push(BlockProblem::Field(
+                "`contract_risk` is not true or false: does the plan touch money paths, \
+                 schemas or migrations, or cross-repo contracts?"
+                    .into(),
+            ));
+            false
+        }
+    };
+    let reason = match opt_str(&m, "reason", "the plan", MAX_REASON_BYTES) {
+        Ok(Some(r)) if !r.is_empty() => r,
+        Ok(_) => {
+            problems.push(BlockProblem::Field(
+                "the plan: no `reason`: say in a line why contract_risk is what it is".into(),
+            ));
+            String::new()
+        }
+        Err(p) => {
+            problems.push(p);
+            String::new()
+        }
+    };
+    let plan = without_blocks(text, infos);
+    if plan.is_empty() {
+        problems.push(BlockProblem::Field(
+            "the plan is empty: write it in the message, above the ```twr-plan block".into(),
+        ));
+    } else if plan.len() > MAX_PLAN_BYTES {
+        problems.push(BlockProblem::Field(format!(
+            "the plan is longer than {MAX_PLAN_BYTES} bytes"
+        )));
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(Plan {
+        contract_risk,
+        reason,
+        text: plan,
+    })
+}
+
+/// Reads the plan turn's reply `text`: the ```` ```twr-plan ```` block it ends with,
+/// `{"contract_risk": true | false, "reason": "…"}` (a reason is required), and the plan, which
+/// is the message without its `twr-plan` blocks (not empty, at most [`MAX_PLAN_BYTES`]).
+pub fn parse_plan(text: &str) -> Result<Plan, Vec<BlockProblem>> {
+    plan_of(text, &[PLAN_BLOCK])
+}
+
+/// The plan check's triage, validated: one item per finding, and the revised plan when it
+/// changed the plan.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanTriage {
+    /// One item per finding of `p1`, in its order.
+    pub items: Vec<TriageItem>,
+    /// The revised plan: the message without its `twr-triage` and `twr-plan` blocks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Plan>,
+}
+
+/// Reads and checks the plan check's triage reply `text`, for findings `round` (`p1.1`…) and
+/// a ledger whose entries have ids `ledger`: its ```` ```twr-triage ```` block as
+/// [`parse_triage`] reads a round's, but a `fixed` item's class is optional and `gates` are not
+/// required (when given, they passed); and, when it changed the plan, a ```` ```twr-plan ````
+/// block, the message without its blocks being the revised plan ([`parse_plan`]'s checks). A
+/// `fixed` item means the plan changed, so it needs the revised plan.
+pub fn parse_plan_triage(
+    text: &str,
+    round: &[String],
+    ledger: &[String],
+) -> Result<PlanTriage, Vec<BlockProblem>> {
+    let triage = triage_with(text, round, ledger, false);
+    let plan = last_block(text, PLAN_BLOCK)
+        .map(|_| plan_of(text, &[PLAN_BLOCK, TRIAGE_BLOCK]))
+        .transpose();
+    match (triage, plan) {
+        (Ok(t), Ok(plan)) => {
+            let fixed: Vec<&str> = t
+                .items
+                .iter()
+                .filter(|i| i.verdict == Verdict::Fixed)
+                .map(|i| i.id.as_str())
+                .collect();
+            if plan.is_none() && !fixed.is_empty() {
+                return Err(vec![BlockProblem::Field(format!(
+                    "{} fixed, but no ```twr-plan block: write the revised plan in the message \
+                     and end it with the block too",
+                    fixed.join(", ")
+                ))]);
+            }
+            Ok(PlanTriage {
+                items: t.items,
+                plan,
+            })
+        }
+        (t, p) => {
+            let mut problems = t.err().unwrap_or_default();
+            problems.extend(p.err().unwrap_or_default());
+            Err(problems)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Implement
+// ---------------------------------------------------------------------------------------------
+
+/// How far the implement turn got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementStatus {
+    /// The plan is implemented.
+    #[default]
+    Done,
+    /// Some of it.
+    Partial,
+}
+
+impl ImplementStatus {
+    /// As the block writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImplementStatus::Done => "done",
+            ImplementStatus::Partial => "partial",
+        }
+    }
+}
+
+/// The implement turn's `twr-implement` block, read.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Implemented {
+    /// How far it got.
+    pub status: ImplementStatus,
+    /// The gates it ran.
+    pub gates: Gates,
+}
+
+impl Implemented {
+    /// Why the loop can't go on to its review with it: anything but `done` with gates that
+    /// passed ("gates must be green before review"). Empty: it can.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.status != ImplementStatus::Done {
+            out.push(format!(
+                "status is {}: finish the plan; gates must be green before review",
+                self.status.as_str()
+            ));
+        }
+        if self.gates.result != GateResult::Pass {
+            out.push("gates.result is fail: gates must be green before review".into());
+        }
+        out
+    }
+}
+
+/// Reads the ```` ```twr-implement ```` block the implement turn's reply `text` ends with:
+/// `{"status": "done" | "partial", "gates": {"ran": […], "result": "pass" | "fail"}}`, both keys
+/// required. A partial status or red gates read fine: whether the loop goes on is the machine's
+/// call ([`Implemented::problems`]).
+pub fn parse_implement(text: &str) -> Result<Implemented, Vec<BlockProblem>> {
+    let m = block_object(text, IMPLEMENT_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let status = match m.get("status").and_then(Value::as_str).map(str::trim) {
+        Some("done") => ImplementStatus::Done,
+        Some("partial") => ImplementStatus::Partial,
+        _ => {
+            problems.push(BlockProblem::Field(
+                "`status` is not \"done\" or \"partial\"".into(),
+            ));
+            ImplementStatus::Partial
+        }
+    };
+    let gates = match parse_gates(&m) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            problems.push(BlockProblem::Field(
+                "no `gates`: run the gates and report them, {\"ran\": [...], \"result\": \"pass\"}"
+                    .into(),
+            ));
+            Gates::default()
+        }
+        Err(p) => {
+            problems.push(p);
+            Gates::default()
+        }
+    };
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(Implemented { status, gates })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Commit
+// ---------------------------------------------------------------------------------------------
+
+/// A commit a loop made: a repository and the commit's sha.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Commit {
+    /// The repository (its path).
+    pub repo: String,
+    /// The commit.
+    pub sha: String,
+}
+
+/// Whether `sha` reads as a commit id: 7 to 64 hexadecimal digits.
+fn is_sha(sha: &str) -> bool {
+    (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Reads the ```` ```twr-commit ```` block `text` ends with: `{"commits": [{"repo": "<path>",
+/// "sha": "<sha>"}]}`, at most [`MAX_COMMITS`], each named once. The list may be empty (a loop
+/// that committed as it went, or had nothing to commit): what was committed is the hub's check
+/// to say ([`check_commit`]), not the block's.
+pub fn parse_commit(text: &str) -> Result<Vec<Commit>, Vec<BlockProblem>> {
+    let m = block_object(text, COMMIT_BLOCK).map_err(|p| vec![p])?;
+    let Some(Value::Array(list)) = m.get("commits") else {
+        return Err(vec![BlockProblem::Field(
+            "`commits` is not a list of {\"repo\", \"sha\"}".into(),
+        )]);
+    };
+    if list.len() > MAX_COMMITS {
+        return Err(vec![BlockProblem::Field(format!(
+            "`commits` lists more than {MAX_COMMITS} commits"
+        ))]);
+    }
+    let mut problems = Vec::new();
+    let mut out: Vec<Commit> = Vec::new();
+    for (i, c) in list.iter().enumerate() {
+        let what = format!("commit {}", i + 1);
+        let Some(o) = c.as_object() else {
+            problems.push(BlockProblem::Field(format!("{what} is not an object")));
+            continue;
+        };
+        let commit = (|| -> Result<Commit, BlockProblem> {
+            let repo = opt_str(o, "repo", &what, MAX_REPO_BYTES)?
+                .filter(|r| !r.is_empty())
+                .ok_or_else(|| BlockProblem::Field(format!("{what} has no `repo`")))?;
+            let sha = opt_str(o, "sha", &what, 64)?
+                .filter(|s| is_sha(s))
+                .ok_or_else(|| {
+                    BlockProblem::Field(format!(
+                        "{what}: `sha` is not a commit id (7 to 64 hex digits)"
+                    ))
+                })?;
+            Ok(Commit { repo, sha })
+        })();
+        match commit {
+            Ok(c) if out.contains(&c) => problems.push(BlockProblem::Field(format!(
+                "{} {} is listed twice",
+                clip(&c.repo),
+                c.sha
+            ))),
+            Ok(c) => out.push(c),
+            Err(p) => problems.push(p),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(out)
+}
+
+/// What the hub found of one repository when it checked a loop's commit.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoAfter {
+    /// The repository (its path).
+    pub repo: String,
+    /// `HEAD` the commit is measured from (the loop's baseline `HEAD` for an implementation
+    /// loop; `None`: the repository had no commit).
+    pub from: Option<String>,
+    /// `HEAD` now.
+    pub head: Option<String>,
+    /// The loop left work there to commit (its last round's diff showed changes, or, for a
+    /// review loop, it fixed something).
+    pub work: bool,
+    /// The paths still changed in the worktree beyond what the baseline had.
+    pub left: Vec<String>,
+    /// `HEAD`'s tree is `from`'s: whatever moved `HEAD` committed no change (an empty commit,
+    /// or one undone by another).
+    pub same_tree: bool,
+    /// The baseline's paths that are no longer changed in the worktree as the baseline had
+    /// them because `HEAD` now holds the baseline's change (committed by mistake).
+    pub baseline_committed: Vec<String>,
+    /// The baseline's paths whose change is gone: the worktree and `HEAD` are back to what
+    /// `from` had.
+    pub baseline_undone: Vec<String>,
+}
+
+/// The paths `paths` as a problem names them: the first [`MAX_LEFT_SHOWN`], then how many more.
+fn shown_paths(paths: &[String]) -> String {
+    let mut shown: Vec<String> = paths.iter().take(MAX_LEFT_SHOWN).map(|p| clip(p)).collect();
+    if paths.len() > MAX_LEFT_SHOWN {
+        shown.push(format!("and {} more", paths.len() - MAX_LEFT_SHOWN));
+    }
+    shown.join(", ")
+}
+
+/// `1 path is` / `3 paths are`.
+fn paths_are(n: usize) -> String {
+    match n {
+        1 => "1 path is".to_string(),
+        n => format!("{n} paths are"),
+    }
+}
+
+/// The hub's check of a loop's commit, given what it found of each repository. It follows
+/// git, not the thread's `twr-commit` block: a repository passes when nothing is left in its
+/// worktree beyond what the baseline had, the baseline's own changes are still uncommitted as
+/// the baseline had them, and, where the loop left work, `HEAD` moved to a commit that changed
+/// something. Each repository is either committed or has a problem, never both: the commits
+/// are those of the repositories that passed and whose `HEAD` moved (its new `HEAD`); the
+/// problems, one line per problem (none holds `; `, which joins them), name the others, for the
+/// one correction prompt and, after a
+/// second failure, `loop.ended.commit_problem`. The check passed when there is no problem.
+pub fn check_commit(repos: &[RepoAfter]) -> (Vec<Commit>, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut commits = Vec::new();
+    for r in repos {
+        let moved = r.head.is_some() && r.head != r.from;
+        let mut mine = Vec::new();
+        if !r.left.is_empty() {
+            mine.push(format!(
+                "{}: {} uncommitted beyond the baseline: {}",
+                r.repo,
+                paths_are(r.left.len()),
+                shown_paths(&r.left)
+            ));
+        } else if r.work && (!moved || r.same_tree) {
+            mine.push(format!(
+                "{}: the loop's changes are neither in the worktree nor committed ({})",
+                r.repo,
+                if moved {
+                    "HEAD moved, but to a commit that changed nothing"
+                } else {
+                    "HEAD did not move"
+                }
+            ));
+        }
+        if !r.baseline_committed.is_empty() {
+            mine.push(format!(
+                "{}: the baseline's changes were committed, which were not the loop's to commit \
+                 ({} no longer uncommitted as the loop found it): {}",
+                r.repo,
+                paths_are(r.baseline_committed.len()),
+                shown_paths(&r.baseline_committed)
+            ));
+        }
+        if !r.baseline_undone.is_empty() {
+            mine.push(format!(
+                "{}: the baseline's changes are gone ({} back to what HEAD had when the loop \
+                 began): {}",
+                r.repo,
+                paths_are(r.baseline_undone.len()),
+                shown_paths(&r.baseline_undone)
+            ));
+        }
+        if !mine.is_empty() {
+            // (A repository with a problem is not counted committed, whatever HEAD did: say
+            // where it is, so the problem is whole.)
+            if let Some(head) = r.head.as_ref().filter(|_| moved) {
+                if let Some(last) = mine.last_mut() {
+                    last.push_str(&format!(" (HEAD is at {})", head.get(..12).unwrap_or(head)));
+                }
+            }
+            problems.extend(mine);
+            continue;
+        }
+        if let Some(head) = r.head.as_ref().filter(|_| moved) {
+            commits.push(Commit {
+                repo: r.repo.clone(),
+                sha: head.clone(),
+            });
+        }
+    }
+    (commits, problems)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1262,6 +1742,275 @@ mod tests {
                 "{body}: {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_plan_reads_without_its_block() {
+        let text = "## Goal\nCSV export.\n\n```rust\nfn x() {}\n```\n\n```twr-plan\n\
+                    {\"contract_risk\": true, \"reason\": \" a migration \"}\n```\n";
+        let p = parse_plan(text).unwrap();
+        assert!(p.contract_risk);
+        assert_eq!(p.reason, "a migration");
+        // Other fences stay; only the plan block goes.
+        assert_eq!(p.text, "## Goal\nCSV export.\n\n```rust\nfn x() {}\n```");
+        for (text, want) in [
+            ("a plan, no block", "no ```twr-plan block"),
+            (
+                "plan\n```twr-plan\n{\"contract_risk\": \"yes\", \"reason\": \"r\"}\n```",
+                "`contract_risk` is not true or false",
+            ),
+            (
+                "plan\n```twr-plan\n{\"contract_risk\": false}\n```",
+                "no `reason`",
+            ),
+            (
+                "```twr-plan\n{\"contract_risk\": false, \"reason\": \"r\"}\n```",
+                "the plan is empty",
+            ),
+            ("plan\n```twr-plan\n[1]\n```", "not a JSON object"),
+        ] {
+            let e = parse_plan(text).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{text}: {e:?}"
+            );
+        }
+        let long = format!(
+            "{}\n```twr-plan\n{{\"contract_risk\": false, \"reason\": \"r\"}}\n```",
+            "x".repeat(MAX_PLAN_BYTES + 1)
+        );
+        assert!(parse_plan(&long).unwrap_err()[0]
+            .to_string()
+            .contains("longer than"));
+        // An unclosed block is no block, and stays as text.
+        assert_eq!(
+            without_blocks("a\n```twr-plan\nb", &[PLAN_BLOCK]),
+            "a\n```twr-plan\nb"
+        );
+        assert_eq!(
+            without_blocks(
+                "a\n```twr-plan\n{}\n```\nb\n````twr-triage\n{}\n````\n",
+                &[PLAN_BLOCK, TRIAGE_BLOCK]
+            ),
+            "a\nb"
+        );
+    }
+
+    #[test]
+    fn a_plan_check_triage_reads_and_refuses() {
+        let round = ids(&["p1.1", "p1.2"]);
+        let items = r#"{"items": [{"id": "p1.1", "verdict": "fixed"},
+            {"id": "p1.2", "verdict": "dismissed", "reason": "versioned API"}]}"#;
+        let plan = "```twr-plan\n{\"contract_risk\": true, \"reason\": \"api\"}\n```";
+        // No gates and no class needed; the revised plan is the message without both blocks.
+        let t = parse_plan_triage(
+            &format!("Revised plan.\n\n{}\n{plan}\n", triage(items)),
+            &round,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(t.items.len(), 2);
+        assert_eq!(t.items[0].class, None);
+        let p = t.plan.unwrap();
+        // (`triage` writes "I fixed things." before its block.)
+        assert_eq!(p.text, "Revised plan.\n\nI fixed things.");
+        assert!(p.contract_risk);
+        // A fix needs the revised plan.
+        let e = parse_plan_triage(&triage(items), &round, &[]).unwrap_err();
+        assert_eq!(
+            e,
+            vec![BlockProblem::Field(
+                "p1.1 fixed, but no ```twr-plan block: write the revised plan in the message and \
+                 end it with the block too"
+                    .into()
+            )]
+        );
+        // Dismissals only: no plan needed.
+        let dismissed = r#"{"items": [{"id": "p1.1", "verdict": "dismissed", "reason": "a"},
+            {"id": "p1.2", "verdict": "dismissed", "reason": "b"}]}"#;
+        assert_eq!(
+            parse_plan_triage(&triage(dismissed), &round, &[])
+                .unwrap()
+                .plan,
+            None
+        );
+        // Gates, when given, passed; a triage and a plan both wrong say both.
+        let red = r#"{"items": [{"id": "p1.1", "verdict": "dismissed", "reason": "a"},
+            {"id": "p1.2", "verdict": "dismissed", "reason": "b"}],
+            "gates": {"ran": [], "result": "fail"}}"#;
+        assert_eq!(
+            parse_plan_triage(&triage(red), &round, &[]).unwrap_err(),
+            vec![BlockProblem::GatesFailed]
+        );
+        let bad_plan = "```twr-plan\n{\"reason\": \"api\"}\n```";
+        let e = parse_plan_triage(
+            &format!("{}{bad_plan}", triage(r#"{"items": []}"#)),
+            &round,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert_eq!(e[0], BlockProblem::NoItem("p1.1".into()));
+        assert!(e[2].to_string().contains("contract_risk"));
+        // A review round's triage still needs both.
+        let e = parse_triage(&triage(items), &round, &[]).unwrap_err();
+        assert!(e.contains(&BlockProblem::NoClass("p1.1".into())));
+    }
+
+    #[test]
+    fn an_implement_block_reads_and_says_what_holds_the_loop() {
+        let block = |body: &str| format!("Done.\n```twr-implement\n{body}\n```\n");
+        let i = parse_implement(&block(
+            r#"{"status": "done", "gates": {"ran": ["cargo test"], "result": "pass"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(i.status, ImplementStatus::Done);
+        assert_eq!(i.problems(), Vec::<String>::new());
+        let i = parse_implement(&block(
+            r#"{"status": "partial", "gates": {"ran": [], "result": "fail"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            i.problems(),
+            [
+                "status is partial: finish the plan; gates must be green before review",
+                "gates.result is fail: gates must be green before review"
+            ]
+        );
+        for (body, want) in [
+            (r#"{"gates": {"ran": [], "result": "pass"}}"#, "`status`"),
+            (r#"{"status": "done"}"#, "no `gates`"),
+            (
+                r#"{"status": "done", "gates": {"result": "green"}}"#,
+                "`gates.result`",
+            ),
+        ] {
+            let e = parse_implement(&block(body)).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{body}: {e:?}"
+            );
+        }
+        assert_eq!(
+            parse_implement("done").unwrap_err(),
+            vec![BlockProblem::Missing(IMPLEMENT_BLOCK)]
+        );
+    }
+
+    #[test]
+    fn a_commit_block_reads_and_the_check_says_what_is_left() {
+        let block = |body: &str| format!("Report.\n```twr-commit\n{body}\n```\n");
+        let c = parse_commit(&block(
+            r#"{"commits": [{"repo": "/w", "sha": "abc1234def"}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            c,
+            [Commit {
+                repo: "/w".into(),
+                sha: "abc1234def".into()
+            }]
+        );
+        assert_eq!(parse_commit(&block(r#"{"commits": []}"#)).unwrap(), []);
+        for (body, want) in [
+            (r#"{}"#, "`commits` is not a list"),
+            (r#"{"commits": [{"sha": "abc1234"}]}"#, "has no `repo`"),
+            (
+                r#"{"commits": [{"repo": "/w", "sha": "xyz"}]}"#,
+                "not a commit id",
+            ),
+            (
+                r#"{"commits": [{"repo": "/w", "sha": "abc1234"}, {"repo": "/w", "sha": "abc1234"}]}"#,
+                "listed twice",
+            ),
+            (r#"{"commits": [1]}"#, "not an object"),
+        ] {
+            let e = parse_commit(&block(body)).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{body}: {e:?}"
+            );
+        }
+        assert_eq!(
+            parse_commit("no block").unwrap_err(),
+            vec![BlockProblem::Missing(COMMIT_BLOCK)]
+        );
+
+        let repo = |head: &str, work: bool, left: &[&str]| RepoAfter {
+            repo: "/w".into(),
+            from: Some("aaaaaaa".into()),
+            head: Some(head.into()),
+            work,
+            left: left.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let commit = Commit {
+            repo: "/w".into(),
+            sha: "bbbbbbb".into(),
+        };
+        // Committed, nothing left.
+        assert_eq!(
+            check_commit(&[repo("bbbbbbb", true, &[])]),
+            (vec![commit.clone()], vec![])
+        );
+        // Nothing to commit: nothing moved, nothing is wrong.
+        assert_eq!(
+            check_commit(&[repo("aaaaaaa", false, &[])]),
+            (vec![], vec![])
+        );
+        // Work vanished without a commit (stashed, say).
+        assert_eq!(
+            check_commit(&[repo("aaaaaaa", true, &[])]).1,
+            ["/w: the loop's changes are neither in the worktree nor committed (HEAD did not move)"]
+        );
+        // ... or with an empty commit.
+        let mut empty = repo("bbbbbbb", true, &[]);
+        empty.same_tree = true;
+        let (commits, problems) = check_commit(&[empty]);
+        assert!(commits.is_empty());
+        assert_eq!(
+            problems,
+            ["/w: the loop's changes are neither in the worktree nor committed (HEAD moved, but \
+              to a commit that changed nothing) (HEAD is at bbbbbbb)"]
+        );
+        // Left behind, the list cut at five: not counted committed though HEAD moved.
+        let many = ["a", "b", "c", "d", "e", "f", "g"];
+        assert_eq!(
+            check_commit(&[repo("bbbbbbb", true, &many)]),
+            (
+                vec![],
+                vec![
+                    "/w: 7 paths are uncommitted beyond the baseline: a, b, c, d, e, and 2 more \
+                     (HEAD is at bbbbbbb)"
+                        .to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            check_commit(&[repo("aaaaaaa", true, &["a.rs"])]).1,
+            ["/w: 1 path is uncommitted beyond the baseline: a.rs"]
+        );
+        // The baseline committed by mistake, or undone.
+        let mut b = repo("bbbbbbb", true, &[]);
+        b.baseline_committed = vec!["old.rs".into()];
+        b.baseline_undone = vec!["gone.rs".into(), "too.rs".into()];
+        let (commits, problems) = check_commit(&[b]);
+        assert!(commits.is_empty());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].contains("1 path is no longer uncommitted"),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains("old.rs"));
+        assert!(problems[1].contains("2 paths are back"), "{problems:?}");
+        assert!(problems[1].ends_with("gone.rs, too.rs (HEAD is at bbbbbbb)"));
+        // Two repositories: each committed or with a problem, never both.
+        let mut other = repo("ccccccc", true, &["x.rs"]);
+        other.repo = "/v".into();
+        let (commits, problems) = check_commit(&[repo("bbbbbbb", true, &[]), other]);
+        assert_eq!(commits, [commit]);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].starts_with("/v: "));
     }
 
     #[test]

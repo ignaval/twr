@@ -2256,7 +2256,7 @@ impl Core {
                 // (`hub::loops`).
                 if twr_ext(&p.ext)
                     .and_then(|t| t.get(LOOP_REPORT_KEY))
-                    .is_some_and(|l| l["step"] != "report")
+                    .is_some_and(|l| l["step"] != "report" || l["commit"] == "checking")
                 {
                     return;
                 }

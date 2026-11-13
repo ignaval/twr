@@ -1,5 +1,6 @@
-//! Loops in the hub (docs/design/loops.md, "Milestone 1: implementation notes"): who may
-//! start a review loop, on which settings, and the socket methods around it. The loop itself
+//! Loops in the hub (docs/design/loops.md, "Milestone 1: implementation notes" and "Milestone 2:
+//! implementation notes"): who may start a review or an implementation loop, on which
+//! settings, and the socket methods around it. The loop itself
 //! is the pure state machine of `twr_core::loops`; this module records the facts that start
 //! and control it, and [`driver`] carries out what the machine asks for (prompts to the
 //! thread, review runs, the stuck item, the report) and steps what happens back into it.
@@ -10,10 +11,24 @@
 //! - [`report`]: a loop as its log tells it, and `report.md`.
 //! - [`git`]: scopes and round diffs.
 //!
-//! **The loop folder** is `<data>/loops/<id>/`, private: `findings.schema.json`, `goal.md`,
-//! `ledger.md`, per round `diff-<slug>-<round>.patch`, `round-<round>.prompt.md`,
-//! `round-<round>.log` (the reviewer's output, for people) and `round-<round>.answer.json`
-//! (its answer), and at the end `report.md`.
+//! **The loop folder** is `<data>/loops/<id>/`, private: `findings.schema.json`, `ledger.md`,
+//! a review loop's `goal.md`, an implementation loop's `task.md` (with a task text), `plan.md`
+//! (and `plan-1.md` once the plan check revised it), `baseline-<slug>.patch` and
+//! `baseline-<slug>.paths.json` (the digests of the paths the worktree had changed), per round
+//! `diff-<slug>-<round>.patch`, `round-<round>.prompt.md`, `round-<round>.log` (the reviewer's
+//! output, for people) and `round-<round>.answer.json` (its answer), and at the end
+//! `report.md`.
+//!
+//! **An implementation loop's baseline** is read with what the request reads before it starts
+//! or raises its card (`git::baseline`): `HEAD` (the base of its round diffs), the patch of
+//! what the worktree held and its paths' digests. Its two files are kept in
+//! `<data>/loops/baselines/<digest>.*` until the loop starts, which copies them into its folder;
+//! a card's baseline is the one read when its revision was raised, read again by
+//! `loop.setup.update`. `loop.started` records the patch's digest (`baseline_digests`) and, in
+//! `ext.twr.loop_start` ([`LOOP_START_KEY`]), per repository `HEAD` when it began (`heads`)
+//! and the baseline in a line (`baseline`). A review loop records the same `heads`, and its
+//! `match` decision (`commit_fixes`: the scope has commits of the thread's own and the
+//! worktree was clean, `ReviewCommit::commits_fixes`).
 //!
 //! **The stuck item** (`Action::Stuck`) is an `attention.raised` with reason `error` on the
 //! loop's thread, source `hub`, marked `ext.twr.loop_stuck = {loop, why}`, with the options
@@ -81,7 +96,7 @@ mod report;
 mod review;
 
 pub(super) use driver::{reap_reviews, watch, LoopRuns};
-pub(super) use report::{outcome_words, transition_words};
+pub(super) use report::{kind_words, outcome_words, transition_words};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -113,10 +128,17 @@ use super::{
 };
 
 /// The setup card's option that starts the loop and saves the settings it shows.
-pub const START: &str = "start and save these settings";
+pub const START: &str = twr_core::event::LOOP_SETUP_START;
 
 /// The setup card's option that starts nothing and saves nothing.
-pub const CANCEL: &str = "cancel";
+pub const CANCEL: &str = twr_core::event::LOOP_SETUP_CANCEL;
+
+/// A setup card's option, on a card that holds a task: send it as an ordinary prompt.
+pub const RUN_WITHOUT: &str = twr_core::event::LOOP_SETUP_RUN_WITHOUT;
+
+/// `ext.twr` key of what a loop starts from that the hub keeps beside a setup card's
+/// `loop_setup`, and in `loop.started` ([`StartFacts`]).
+pub(super) const LOOP_START_KEY: &str = "loop_start";
 
 /// What the hub folds of loops beyond each thread's own state (`ThreadView::loop`): the saved
 /// settings and the open setup cards. Part of the hub's checkpoints.
@@ -154,6 +176,37 @@ pub(super) struct SetupCard {
     pub(super) thread: String,
     /// The card's payload, as last raised.
     pub(super) setup: LoopSetup,
+    /// What git said when it was raised, beyond the card's payload.
+    #[serde(default)]
+    pub(super) start: StartFacts,
+}
+
+/// What a loop starts from that git said, beyond its bases and digests: per repository
+/// slug, `HEAD` (`heads`) and an implementation loop's baseline in a line (`baseline`);
+/// whether the scope had commits of the thread's own and the worktree was clean (a review
+/// loop's `match`). Kept in a card's `ext.twr.loop_start` and in `loop.started`'s.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct StartFacts {
+    /// `HEAD` per repository slug.
+    pub(super) heads: BTreeMap<String, String>,
+    /// An implementation loop's baseline per repository slug.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) baseline: BTreeMap<String, BaselineNote>,
+    /// The scope has commits of the thread's own.
+    pub(super) own_commits: bool,
+    /// The worktree had no uncommitted change.
+    pub(super) clean: bool,
+}
+
+/// An implementation loop's baseline of one repository, in a line.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct BaselineNote {
+    /// How many paths the worktree had changed.
+    pub(super) changed: u64,
+    /// `clean`, or `3 paths already changed: …`.
+    pub(super) summary: String,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -166,13 +219,32 @@ pub(super) struct SetupCard {
 pub struct LoopRequest {
     /// The thread (a name, alias or id).
     pub thread: String,
-    /// `review` (`implement` is `unsupported` in this version).
+    /// `review` or `implement`.
     pub kind: String,
+    /// An implementation loop's task (none: what the conversation already settled); refused
+    /// for a review loop.
+    pub task: Option<String>,
     /// Raise the setup card even when saved settings hold.
     pub setup: bool,
-    /// `branch`, `uncommitted`, `since <ref>`, `last <n>`; default: `branch` when the thread
-    /// has commits beyond its base, else `uncommitted`.
+    /// A review loop's `branch`, `uncommitted`, `since <ref>`, `last <n>`; default: `branch`
+    /// when the thread has commits beyond its base, else `uncommitted`. Refused for an
+    /// implementation loop.
     pub scope: Option<String>,
+    /// What this run changes, as the user typed it.
+    pub overrides: Overrides,
+}
+
+/// `thread.new`'s `loop`: run the new thread as an implementation loop whose task is its first
+/// prompt.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct NewThreadLoop {
+    /// `implement` (a new thread has nothing to review yet).
+    pub kind: String,
+    /// The task: the thread's first prompt. Required.
+    pub task: String,
+    /// Raise the setup card even when saved settings hold.
+    pub setup: bool,
     /// What this run changes, as the user typed it.
     pub overrides: Overrides,
 }
@@ -254,15 +326,11 @@ fn users_only(caller: &Caller, what: &str) -> Result<(), RpcError> {
     Ok(())
 }
 
-/// The loop kind `kind` names: `review`; `implement` is `unsupported` in this version.
+/// The loop kind `kind` names: `review` (the default) or `implement`.
 fn parse_kind(kind: &str) -> Result<LoopKind, RpcError> {
     match kind.trim() {
         "review" | "" => Ok(LoopKind::Review),
-        "implement" => Err(rpc(
-            codes::UNSUPPORTED,
-            "not supported: implementation loops come in a later version; only review loops \
-             run in this one",
-        )),
+        "implement" => Ok(LoopKind::Implement),
         other => Err(rpc(
             codes::BAD_REQUEST,
             format!("{other:?} is no kind of loop (review, implement)"),
@@ -317,13 +385,16 @@ fn account_names(accounts: &twr_core::account::AccountsView, runtime: &str) -> V
 /// round that would run on it. A hub that does not probe its agent CLIs
 /// (`TWR_AGENT_PROBE=off`) does not know: every runtime counts as installed and logged in
 /// (`probed: false`), so no setting is refused or replaced for a runtime it never looked
-/// for; a run whose CLI is truly missing fails, as any failed run does.
+/// for; a run whose CLI is truly missing fails, as any failed run does. Nor does a hub whose
+/// first probe has not ended yet: the async methods wait for it ([`Hub::loop_agents`]), but an
+/// answer to a setup card just after a start can't, and must not read every runtime as
+/// missing.
 fn availability(
     hub: &Inner,
     accounts: &twr_core::account::AccountsView,
     view: Option<&ThreadView>,
 ) -> Availability {
-    let probed = hub.local_agents.probes();
+    let probed = hub.local_agents.probes() && hub.local_agents.probed_at().is_some();
     let agents = hub.local_agents.known();
     let runtimes = REVIEWER_RUNTIMES
         .iter()
@@ -359,6 +430,29 @@ fn availability(
             effort: v.effort.clone(),
         }),
     }
+}
+
+/// Why thread `name` on `runtime` in `mode` can't run a loop, if it can't: a mode that
+/// can't edit (`plan`, `read-only`), or one twr can't classify. The hub never widens a mode
+/// for a loop.
+pub(super) fn mode_refusal(name: &str, runtime: &str, mode: &str) -> Option<RpcError> {
+    use twr_adapters::acp::translate::ModeLevel;
+    let mode = mode.trim();
+    let why = match twr_adapters::mode_level_for(runtime, mode) {
+        Some(ModeLevel::Restricted) => Some(format!("{name} is in {mode} mode, which can't edit")),
+        Some(_) => None,
+        None if mode.is_empty() => Some(format!("{name}'s mode is its agent's own default")),
+        None => Some(format!(
+            "{name}'s mode {mode:?} is its agent's own, and twr does not know what it allows"
+        )),
+    }?;
+    Some(rpc(
+        codes::CONFLICT,
+        format!(
+            "{why}: a loop has to edit; change the mode first (`twr mode {name} <mode>`): the \
+             hub never widens it for a loop"
+        ),
+    ))
 }
 
 /// The problems `problems` as one message.
@@ -417,6 +511,22 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
                 .unwrap_or_else(|| scope.to_string())
         ));
     }
+    if setup.kind == LoopKind::Implement {
+        let task = task_rows(setup.task.as_deref());
+        for (i, line) in task.iter().enumerate() {
+            rows.push(format!(
+                "{}{line}",
+                if i == 0 {
+                    "Task         "
+                } else {
+                    "             "
+                }
+            ));
+        }
+        if let Some(b) = &setup.scope_summary {
+            rows.push(format!("Baseline     {b}"));
+        }
+    }
     rows.push(format!(
         "Implementer  {}",
         match &s.implementer {
@@ -427,11 +537,14 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
             ),
         }
     ));
-    let workers = match &s.workers.effort {
-        Some(e) => format!("{} · {e}", s.workers.model),
-        None => s.workers.model.clone(),
-    };
-    rows.push(format!("Workers      {workers}"));
+    // Only where the implementer's runtime runs subagents (`settings::workers_apply`).
+    if !setup.no_workers {
+        let workers = match &s.workers.effort {
+            Some(e) => format!("{} · {e}", s.workers.model),
+            None => s.workers.model.clone(),
+        };
+        rows.push(format!("Workers      {workers}"));
+    }
     let mut efforts: Vec<String> = Vec::new();
     if let Some(p) = &setup.profile {
         for e in p.tiers.iter().map(|t| &t.effort).chain([&p.verify.effort]) {
@@ -445,6 +558,19 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
         reviewer.push_str(&format!(" · {}", efforts.join(" → ")));
     }
     rows.push(format!("Reviewer     {reviewer}"));
+    if setup.kind == LoopKind::Implement {
+        rows.push(format!(
+            "Plan check   {}",
+            match s.plan_check {
+                Some(v) => v.as_str().to_string(),
+                None => setup.profile.as_ref().map_or_else(
+                    || "the profile's".to_string(),
+                    |p| format!("{} (the profile's)", p.plan_check.as_str()),
+                ),
+            }
+        ));
+        rows.push(format!("Commit       {}", s.commit.as_str()));
+    }
     let o = &setup.overrides;
     let mut run = Vec::new();
     for (what, v) in [
@@ -453,6 +579,7 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
         ("workers", &o.workers),
         ("reviewer", &o.reviewer),
         ("commit", &o.commit),
+        ("plan check", &o.plan_check),
     ] {
         if let Some(v) = v {
             run.push(format!("{what} {v}"));
@@ -473,16 +600,66 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
     rows.join("\n")
 }
 
+/// The most lines of a held task the card shows, and the most characters of each.
+const TASK_ROWS: usize = 3;
+const TASK_ROW_CHARS: usize = 100;
+
+/// A held task as the card's rows: its first lines, each cut, and a count of what is not
+/// shown; `what the conversation already settled` without one.
+fn task_rows(task: Option<&str>) -> Vec<String> {
+    let Some(task) = task.map(str::trim).filter(|t| !t.is_empty()) else {
+        return vec!["what the conversation already settled".into()];
+    };
+    let lines: Vec<&str> = task.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(TASK_ROWS)
+        .map(|l| {
+            let l = prompts::one_line(l);
+            if l.chars().count() > TASK_ROW_CHARS {
+                format!("{}…", l.chars().take(TASK_ROW_CHARS).collect::<String>())
+            } else {
+                l
+            }
+        })
+        .collect();
+    if lines.len() > TASK_ROWS {
+        let more = lines.len() - TASK_ROWS;
+        out.push(format!(
+            "(+{more} more line{})",
+            if more == 1 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
 /// The `loop.setup` marker of a card's `ext`.
 fn setup_of(ext: &Option<JsonMap>) -> Option<LoopSetup> {
     let v = twr_ext(ext)?.get(LOOP_SETUP_KEY)?;
     serde_json::from_value(v.clone()).ok()
 }
 
+/// A setup card's options: [`START`], [`RUN_WITHOUT`] when it holds a task, [`CANCEL`].
+fn card_options(setup: &LoopSetup) -> Vec<String> {
+    let mut out = vec![START.to_string()];
+    if setup.kind == LoopKind::Implement && setup.task.is_some() {
+        out.push(RUN_WITHOUT.into());
+    }
+    out.push(CANCEL.into());
+    out
+}
+
+/// What the hub keeps beside a card's `loop_setup` (`ext.twr.loop_start`).
+fn start_of(ext: &Option<JsonMap>) -> StartFacts {
+    twr_ext(ext)
+        .and_then(|t| t.get(LOOP_START_KEY))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
 /// A start the machine refused.
 fn start_err(e: StartError) -> RpcError {
     match e {
-        StartError::NotSupported => rpc(codes::UNSUPPORTED, format!("not supported: {e}")),
         StartError::EmptyProfile(_) => rpc(codes::BAD_REQUEST, e.to_string()),
     }
 }
@@ -497,16 +674,20 @@ fn resolved(attn_id: &str, by: ResolvedBy, answer: Option<&str>) -> EventBody {
     })
 }
 
-/// What a loop starts from, besides its settings: the scope and the bases it found.
+/// What a loop starts from, besides its settings: a review loop's scope, the bases, the
+/// baseline digests and the facts git gave ([`StartFacts`]), and what the card says of them.
 #[derive(Debug, Clone, Default)]
 struct StartFrom {
     scope: Option<Scope>,
     bases: Vec<LoopBase>,
     baseline_digests: BTreeMap<String, String>,
+    facts: StartFacts,
+    /// The card's scope row (a review loop's) or baseline row (an implementation loop's).
+    summary: Option<String>,
 }
 
 impl StartFrom {
-    /// From what git found of `target`.
+    /// A review loop's, from what git found of `target`.
     fn of(target: &git::Target, found: &git::ScopeInfo) -> StartFrom {
         StartFrom {
             scope: Some(found.scope.clone()),
@@ -516,15 +697,132 @@ impl StartFrom {
                 base: found.base.clone(),
             }],
             baseline_digests: [(target.slug.clone(), found.dirty_digest.clone())].into(),
+            facts: StartFacts {
+                heads: [(target.slug.clone(), found.head.clone())].into(),
+                baseline: BTreeMap::new(),
+                own_commits: found.commits > 0,
+                clean: found.clean,
+            },
+            summary: Some(found.summary()),
+        }
+    }
+
+    /// An implementation loop's, from `target`'s baseline (its files kept in the hub's
+    /// baselines folder until the loop starts, [`stage_baseline`]).
+    fn baseline(target: &git::Target, b: &git::Baseline) -> StartFrom {
+        StartFrom {
+            scope: None,
+            bases: vec![LoopBase {
+                slug: target.slug.clone(),
+                repo: target.dir.to_string_lossy().into_owned(),
+                base: b.head.clone(),
+            }],
+            baseline_digests: [(target.slug.clone(), b.digest())].into(),
+            facts: StartFacts {
+                heads: [(target.slug.clone(), b.head.clone())].into(),
+                baseline: [(
+                    target.slug.clone(),
+                    BaselineNote {
+                        changed: b.paths.len() as u64,
+                        summary: b.summary(),
+                    },
+                )]
+                .into(),
+                own_commits: false,
+                clean: b.paths.is_empty(),
+            },
+            summary: Some(b.summary()),
         }
     }
 
     /// From a setup card.
-    fn card(setup: &LoopSetup) -> StartFrom {
+    fn card(card: &SetupCard) -> StartFrom {
         StartFrom {
-            scope: setup.scope.clone(),
-            bases: setup.bases.clone(),
-            baseline_digests: setup.baseline_digests.clone(),
+            scope: card.setup.scope.clone(),
+            bases: card.setup.bases.clone(),
+            baseline_digests: card.setup.baseline_digests.clone(),
+            facts: card.start.clone(),
+            summary: card.setup.scope_summary.clone(),
+        }
+    }
+}
+
+/// `<data>/loops/baselines`: an implementation loop's baseline files until it starts.
+fn baselines_dir(hub: &Inner) -> std::path::PathBuf {
+    hub.db_path
+        .parent()
+        .map(|d| d.join("loops").join("baselines"))
+        .unwrap_or_else(|| std::path::PathBuf::from("baselines"))
+}
+
+/// The name a baseline of digest `digest` is kept under (its hex digits).
+fn baseline_name(digest: &str) -> String {
+    digest
+        .strip_prefix(twr_core::blob::REF_PREFIX)
+        .unwrap_or(digest)
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .collect()
+}
+
+/// Keeps baseline `b`'s files (`<digest>.patch`, `<digest>.paths.json`) in the hub's
+/// baselines folder, private, until a loop starts from it.
+fn stage_baseline(hub: &Inner, b: &git::Baseline) -> Result<(), RpcError> {
+    let dir = baselines_dir(hub);
+    let name = baseline_name(&b.digest());
+    let write = || -> anyhow::Result<()> {
+        twr_core::paths::ensure_private_dir(dir.parent().unwrap_or(&dir))?;
+        twr_core::paths::ensure_private_dir(&dir)?;
+        std::fs::write(dir.join(format!("{name}.patch")), &b.patch)?;
+        std::fs::write(
+            dir.join(format!("{name}.paths.json")),
+            serde_json::to_vec(&b.paths)?,
+        )?;
+        Ok(())
+    };
+    write().map_err(|e| internal(format!("cannot keep the loop's baseline: {e:#}")))
+}
+
+/// Moves the kept baseline files of `from` into a starting loop's `folder`, as
+/// `baseline-<slug>.patch` and `baseline-<slug>.paths.json` (best effort: a file that is gone
+/// is said in the log).
+fn place_baseline(hub: &Inner, from: &StartFrom, folder: Option<&str>) {
+    let Some(folder) = folder.map(std::path::Path::new) else {
+        return;
+    };
+    let dir = baselines_dir(hub);
+    if let Err(e) = twr_core::paths::ensure_private_dir(folder.parent().unwrap_or(folder))
+        .and_then(|()| twr_core::paths::ensure_private_dir(folder))
+    {
+        tracing::warn!(folder = %folder.display(), error = %format!("{e:#}"), "cannot make a loop's folder");
+        return;
+    }
+    for (slug, digest) in &from.baseline_digests {
+        if !from.facts.baseline.contains_key(slug) {
+            continue;
+        }
+        let name = baseline_name(digest);
+        for ext in ["patch", "paths.json"] {
+            let src = dir.join(format!("{name}.{ext}"));
+            let dst = folder.join(format!("baseline-{slug}.{ext}"));
+            if let Err(e) = std::fs::copy(&src, &dst) {
+                tracing::warn!(src = %src.display(), error = %e, "a loop's baseline file is missing");
+            }
+            let _ = std::fs::remove_file(&src);
+        }
+    }
+}
+
+/// Drops the kept baseline files of a card that started nothing.
+fn drop_baseline(hub: &Inner, card: &SetupCard) {
+    let dir = baselines_dir(hub);
+    for (slug, digest) in &card.setup.baseline_digests {
+        if !card.start.baseline.contains_key(slug) {
+            continue;
+        }
+        let name = baseline_name(digest);
+        for ext in ["patch", "paths.json"] {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.{ext}")));
         }
     }
 }
@@ -535,6 +833,8 @@ struct Origin {
     id: String,
     of: Option<SettingsOf>,
     overrides: Overrides,
+    /// An implementation loop's task.
+    task: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -542,6 +842,103 @@ struct Origin {
 // ---------------------------------------------------------------------------------------------
 
 impl Hub {
+    /// `thread.new`'s `loop`, checked before anything is made: the user's only (with `operate`
+    /// for a device), an implementation loop with a task, overrides that apply, on the hub's
+    /// own box, in a mode that can edit (`mode`, as the thread will get it, on `runtime`).
+    pub(super) fn check_new_thread_loop(
+        &self,
+        l: &NewThreadLoop,
+        caller: &Caller,
+        name: &str,
+        box_name: &str,
+        runtime: &str,
+        mode: &str,
+    ) -> Result<(), RpcError> {
+        users_only(caller, "start a loop")?;
+        self.inner
+            .require_scope(caller, "start a loop", "operate")?;
+        if parse_kind(&l.kind)? != LoopKind::Implement {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "a new thread has nothing to review yet: its loop is an implementation loop \
+                 (kind \"implement\")",
+            ));
+        }
+        if l.task.trim().is_empty() {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "a new thread's loop needs its task: the thread's first prompt",
+            ));
+        }
+        twr_core::loops::settings::check_run(LoopKind::Implement, None, Some(&l.task))
+            .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        l.overrides
+            .apply(
+                &LoopSettings::first_card(&self.inner.config.loops),
+                LoopKind::Implement,
+            )
+            .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        if box_name != LOCAL_BOX {
+            return Err(rpc(
+                codes::UNSUPPORTED,
+                format!(
+                    "not supported: {name} would run on box {box_name}, and loops run only on \
+                     the hub's own machine in this version"
+                ),
+            ));
+        }
+        if let Some(e) = mode_refusal(name, runtime, mode) {
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// The implementer a new thread asked for with `loop` and no runtime or model of its own
+    /// is created on (`project`'s saved settings, else the first card's, with the request's
+    /// overrides, a missing runtime replaced as the card would): a named one's runtime (and
+    /// account), model and effort; `None` for `the thread's own`, which is the project's.
+    pub(super) async fn new_thread_implementer(
+        &self,
+        l: &NewThreadLoop,
+        project: &str,
+    ) -> Option<twr_core::loops::config::ModelChoice> {
+        self.loop_agents().await;
+        let core = self.inner.core();
+        let config = &self.inner.config.loops;
+        let base = core
+            .loops
+            .saved
+            .for_project(Some(project))
+            .map(|(s, _)| s.settings.clone())
+            .unwrap_or_else(|| LoopSettings::first_card(config));
+        let run = l.overrides.apply(&base, LoopKind::Implement).ok()?;
+        let avail = availability(&self.inner, &core.accounts, None);
+        propose(&run, &avail, config).settings.implementer
+    }
+
+    /// The loop of a thread `thread.new` just made with `loop` (`l`): `loop.request` with its
+    /// task, as `loop.request`'s result; an error after the thread was made is said in the
+    /// result (`{status: "error", code, message}`) and the task is not sent.
+    pub(super) async fn new_thread_loop(
+        &self,
+        thread: &str,
+        l: NewThreadLoop,
+        caller: &Caller,
+    ) -> Value {
+        let req = LoopRequest {
+            thread: thread.to_string(),
+            kind: "implement".into(),
+            task: Some(l.task),
+            setup: l.setup,
+            scope: None,
+            overrides: l.overrides,
+        };
+        match self.loop_request(req, caller).await {
+            Ok(v) => v,
+            Err(e) => json!({"status": "error", "code": e.code, "message": e.message}),
+        }
+    }
+
     /// The hub's own box's agent CLIs, probed once before the first answer that needs them (a
     /// hub just started has not finished its first probe yet).
     async fn loop_agents(&self) {
@@ -577,11 +974,14 @@ impl Hub {
             .ok_or_else(|| rpc(codes::UNSUPPORTED, "the hub's own box has no git"))
     }
 
-    /// `loop.request {thread, kind, setup?, scope?, overrides?}` (see the module docs):
-    /// `{status: "started", loop}` or `{status: "needs_setup", attn_id, revision, why}`.
+    /// `loop.request {thread, kind, task?, setup?, scope?, overrides?}` (see the module docs):
+    /// `{status: "started", loop}` or `{status: "needs_setup", attn_id, revision, why}`. An
+    /// implementation loop takes a task and no scope, a review loop a scope and no task.
     pub async fn loop_request(&self, p: LoopRequest, caller: &Caller) -> Result<Value, RpcError> {
         users_only(caller, "start a loop")?;
         let kind = parse_kind(&p.kind)?;
+        twr_core::loops::settings::check_run(kind, p.scope.as_deref(), p.task.as_deref())
+            .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
         let scope = parse_scope(p.scope.as_deref())?;
         let id = {
             let core = self.inner.core();
@@ -591,11 +991,33 @@ impl Hub {
         };
         let target = self.loop_target(&id)?;
         self.loop_agents().await;
-        let found = git::scope(&*self.loop_git()?, &target, scope).await?;
+        let from = self.loop_start_from(kind, &target, scope).await?;
         let mut core = self.inner.core();
         // Checked again: the thread may have changed while git ran.
         core.loop_eligible(&id)?;
-        core.decide_loop(&self.inner, &id, kind, &p, &target, &found, caller)
+        core.decide_loop(&self.inner, &id, kind, &p, from, caller)
+    }
+
+    /// What a loop of `kind` in `target` starts from, as git says now: a review loop's scope,
+    /// an implementation loop's baseline (its files kept until it starts).
+    async fn loop_start_from(
+        &self,
+        kind: LoopKind,
+        target: &git::Target,
+        scope: Option<Scope>,
+    ) -> Result<StartFrom, RpcError> {
+        let git = self.loop_git()?;
+        match kind {
+            LoopKind::Review => {
+                let found = git::scope(&git, target, scope).await?;
+                Ok(StartFrom::of(target, &found))
+            }
+            LoopKind::Implement => {
+                let b = git::baseline(&git, target).await?;
+                stage_baseline(&self.inner, &b)?;
+                Ok(StartFrom::baseline(target, &b))
+            }
+        }
     }
 
     /// `loop.setup.get {attn_id}`: open setup card `attn_id` as last raised, read only (no new
@@ -647,17 +1069,25 @@ impl Hub {
             check_shape(s)?;
         }
         let scope = parse_scope(p.scope.as_deref())?;
-        let thread = {
+        let (thread, kind) = {
             let core = self.inner.core();
-            core.open_setup_card(&p.attn_id, p.revision)?.thread
+            let card = core.open_setup_card(&p.attn_id, p.revision)?;
+            (card.thread, card.setup.kind)
         };
-        let found = match scope {
-            Some(scope) => {
+        if kind == LoopKind::Implement && scope.is_some() {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "an implementation loop has no scope: what the worktree holds when it starts is \
+                 its baseline, out of scope",
+            ));
+        }
+        // A review loop's new scope, read; an implementation loop's baseline, read again.
+        let found = match (kind, scope) {
+            (LoopKind::Review, None) => None,
+            (kind, scope) => {
                 let target = self.loop_target(&thread)?;
-                let found = git::scope(&*self.loop_git()?, &target, Some(scope)).await?;
-                Some((target, found))
+                Some(self.loop_start_from(kind, &target, scope).await?)
             }
-            None => None,
         };
         self.loop_agents().await;
         let mut core = self.inner.core();
@@ -686,14 +1116,24 @@ impl Hub {
             }
             setup.save_for = save_for;
         }
-        if let Some((target, found)) = found {
-            let from = StartFrom::of(&target, &found);
+        let mut facts = card.start.clone();
+        if let Some(from) = found {
+            if kind == LoopKind::Implement && from.baseline_digests != card.setup.baseline_digests {
+                drop_baseline(&self.inner, &card);
+            }
             setup.scope = from.scope;
-            setup.scope_summary = Some(found.summary());
+            setup.scope_summary = from.summary;
             setup.bases = from.bases;
             setup.baseline_digests = from.baseline_digests;
+            facts = from.facts;
         }
-        let (attn_id, revision) = core.raise_setup_card(&self.inner, &view, setup.clone())?;
+        let (attn_id, revision) = core.raise_setup_card(&self.inner, &view, setup, &facts)?;
+        let setup = core
+            .loops
+            .cards
+            .get(&attn_id)
+            .map(|c| c.setup.clone())
+            .ok_or_else(|| internal("the card raised again is gone"))?;
         let item = core.attention.get(&attn_id).cloned();
         Ok(json!({
             "attn_id": attn_id,
@@ -877,6 +1317,76 @@ impl Hub {
         Ok(detail)
     }
 
+    /// `loop.report {thread}` or `{id}`: the report of the thread's running loop (else its
+    /// last one), or of loop `id`, as text, for a client that cannot read the hub's files (a
+    /// phone, a remote desktop): `{thread, thread_name, id, kind, running, outcome, path,
+    /// written, text, bytes, truncated, note}`. `text` is `report.md` whole, or its first
+    /// [`MAX_REPORT_TEXT`] bytes (cut at a line, `truncated`, a marker line at the end naming the
+    /// path); `null` with a `note` when there is none to read: a loop still running (its report
+    /// is written when it ends: `written: false`), one that ended `stopped` or `failed` (none
+    /// is written), a file that can't be read. `path` is where the hub wrote it, on its machine.
+    pub fn loop_report(&self, p: LoopGet) -> Result<Value, RpcError> {
+        let d = self.loop_get(p)?;
+        let name = d["thread_name"].as_str().unwrap_or_default().to_string();
+        let running = d["running"] == true;
+        let path = d["report_path"]
+            .as_str()
+            .or_else(|| d["files"]["report"].as_str())
+            .filter(|_| !running)
+            .map(str::to_string);
+        let mut out = json!({
+            "thread": d["thread"],
+            "thread_name": name,
+            "id": d["id"],
+            "kind": d["kind"],
+            "running": running,
+            "outcome": d["outcome"],
+            "path": path,
+            "written": false,
+            "text": null,
+            "bytes": null,
+            "truncated": false,
+            "note": null,
+        });
+        let Some(path) = path else {
+            out["path"] = d["folder"]
+                .as_str()
+                .filter(|_| running)
+                .map(|f| json!(std::path::Path::new(f).join("report.md")))
+                .unwrap_or(Value::Null);
+            out["note"] = json!(if running {
+                format!(
+                    "{name}'s {} is still running: its report is not written yet (the hub \
+                     writes it when the loop ends)",
+                    report::kind_words(d["kind"].as_str().map_or(LoopKind::Review, |k| {
+                        parse_kind(k).unwrap_or(LoopKind::Review)
+                    }))
+                )
+            } else {
+                format!(
+                    "{name}'s last loop ended {} and wrote no report",
+                    d["outcome"].as_str().unwrap_or("without one")
+                )
+            });
+            return Ok(out);
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let (text, truncated) = report_text(&bytes, &path);
+                out["written"] = json!(true);
+                out["bytes"] = json!(bytes.len());
+                out["truncated"] = json!(truncated);
+                out["text"] = json!(text);
+            }
+            Err(e) => {
+                out["note"] = json!(format!(
+                    "the hub cannot read {name}'s loop report at {path}: {e}"
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// `loop.list`: the running loops, `[{thread, thread_name, id, kind, profile, phase,
     /// round, ledger, paused, stuck, waiting_on, line}]`.
     pub fn loop_list(&self) -> Value {
@@ -899,6 +1409,8 @@ impl Hub {
                     "paused": l.paused,
                     "stuck": l.stuck,
                     "waiting_on": l.waiting_on,
+                    "plan_revision": l.plan_revision,
+                    "commit": l.commit,
                     "line": line(l),
                 }))
             })
@@ -978,6 +1490,33 @@ impl Hub {
     }
 }
 
+/// The most bytes of a loop's `report.md` that `loop.report` returns whole.
+pub const MAX_REPORT_TEXT: usize = 256 * 1024;
+
+/// `report.md`'s `bytes` as `loop.report` returns them: whole, or cut at the last line that
+/// fits in [`MAX_REPORT_TEXT`] with a marker naming `path`; and whether it was cut.
+fn report_text(bytes: &[u8], path: &str) -> (String, bool) {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= MAX_REPORT_TEXT {
+        return (text.into_owned(), false);
+    }
+    let mut cut = MAX_REPORT_TEXT;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let kept = &text[..cut];
+    let kept = kept.rfind('\n').map_or(kept, |i| &kept[..=i]);
+    (
+        format!(
+            "{kept}\n[twr: the report is cut here: it is {} bytes, and this shows the first {}. \
+             The whole of it is {path} on the hub's machine.]\n",
+            bytes.len(),
+            kept.len()
+        ),
+        true,
+    )
+}
+
 /// The loop folder's files that exist, into `loop.get`'s `detail`: `files` (`goal`, `ledger`,
 /// `schema`, `report`) and each round's `files` (`diffs`, `prompt`, `answer`, `log`), as
 /// absolute paths.
@@ -997,6 +1536,9 @@ fn add_files(detail: &mut Value) {
     let mut files = serde_json::Map::new();
     for (key, name) in [
         ("goal", "goal.md"),
+        ("task", "task.md"),
+        ("plan", "plan.md"),
+        ("plan_1", "plan-1.md"),
         ("ledger", "ledger.md"),
         ("schema", "findings.schema.json"),
         ("report", "report.md"),
@@ -1004,6 +1546,17 @@ fn add_files(detail: &mut Value) {
         if has(name) {
             files.insert(key.into(), path(name));
         }
+    }
+    let mut baselines: Vec<&String> = names
+        .iter()
+        .filter(|n| n.starts_with("baseline-") && n.ends_with(".patch"))
+        .collect();
+    baselines.sort();
+    if !baselines.is_empty() {
+        files.insert(
+            "baselines".into(),
+            json!(baselines.iter().map(|n| path(n)).collect::<Vec<_>>()),
+        );
     }
     detail["files"] = Value::Object(files);
     if let Some(rounds) = detail["rounds"].as_array_mut() {
@@ -1045,9 +1598,18 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
             EventBody::LoopTransition(p) => p.id == id,
             EventBody::LoopControl(p) => p.id == id,
             EventBody::LoopEnded(p) => p.id == id,
+            EventBody::LoopPlan(p) => p.id == id,
+            EventBody::LoopImplemented(p) => p.id == id,
+            EventBody::LoopCommit(p) => p.id == id,
             _ => false,
         })
         .collect();
+    let revised = mine
+        .iter()
+        .any(|e| matches!(&e.body, EventBody::LoopPlan(p) if p.revision >= 2));
+    let mut plans = Vec::new();
+    let mut implemented = Vec::new();
+    let mut commit_checks = Vec::new();
     let mut started = Value::Null;
     let mut folder = Value::Null;
     let mut phases = Vec::new();
@@ -1082,8 +1644,51 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
                     "bases": p.bases,
                     "baseline_digests": p.baseline_digests,
                     "task": p.task,
+                    "commit_fixes": p.commit_fixes,
+                    "baseline": twr_ext(&p.ext)
+                        .and_then(|t| t.get(LOOP_START_KEY))
+                        .and_then(|s| s.get("baseline"))
+                        .cloned(),
                 });
             }
+            EventBody::LoopPlan(p) => {
+                // (The first plan's file is `plan-1.md` once the plan check revised it.)
+                let path = match (&p.path, p.revision) {
+                    (Some(path), 1) if revised => Some(
+                        std::path::Path::new(path)
+                            .with_file_name("plan-1.md")
+                            .display()
+                            .to_string(),
+                    ),
+                    (path, _) => path.clone(),
+                };
+                plans.push(json!({
+                    "at": e.ts,
+                    "revision": p.revision,
+                    "contract_risk": p.contract_risk,
+                    "reason": p.reason,
+                    "path": path,
+                }));
+            }
+            EventBody::LoopImplemented(p) => implemented.push(json!({
+                "at": e.ts,
+                "status": p.status,
+                "gates": p.gates,
+                "accepted": twr_core::loops::contract::Implemented {
+                    status: p.status,
+                    gates: p.gates.clone(),
+                }
+                .problems()
+                .is_empty(),
+            })),
+            EventBody::LoopCommit(p) => commit_checks.push(json!({
+                "at": e.ts,
+                "turn": e.turn,
+                "commits": p.commits,
+                "problems": p.problems,
+                "notes": p.notes,
+                "passed": p.problems.is_empty(),
+            })),
             EventBody::LoopPhase(p) => phases.push(json!({
                 "at": e.ts,
                 "phase": p.phase,
@@ -1144,7 +1749,8 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
                     "at": e.ts,
                     "outcome": p.outcome,
                     "report_path": p.report_path,
-                    "commit": p.commit,
+                    "commits": p.commits,
+                    "commit_problem": p.commit_problem,
                     "reason": p.reason,
                 });
             }
@@ -1168,6 +1774,14 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
         "ledger": ledger,
         "transition": transition,
         "controls": controls,
+        "plans": plans,
+        "plan_path": plans
+            .last()
+            .and_then(|p| p.get("path"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "implemented": implemented,
+        "commit_checks": commit_checks,
         "ended": ended,
         "folder": folder,
         "report_path": ended.get("report_path").cloned().unwrap_or(Value::Null),
@@ -1202,6 +1816,7 @@ impl Core {
                         SetupCard {
                             thread: ev.thread.clone(),
                             setup,
+                            start: start_of(&p.ext),
                         },
                     );
                 }
@@ -1352,26 +1967,8 @@ impl Core {
                 format!("{name} has no git workspace to diff"),
             ));
         }
-        use twr_adapters::acp::translate::ModeLevel;
-        let mode = v.mode.trim();
-        let why = match twr_adapters::mode_level_for(&v.runtime, mode) {
-            Some(ModeLevel::Restricted) => {
-                Some(format!("{name} is in {mode} mode, which can't edit"))
-            }
-            Some(_) => None,
-            None if mode.is_empty() => Some(format!("{name}'s mode is its agent's own default")),
-            None => Some(format!(
-                "{name}'s mode {mode:?} is its agent's own, and twr does not know what it allows"
-            )),
-        };
-        if let Some(why) = why {
-            return Err(rpc(
-                codes::CONFLICT,
-                format!(
-                    "{why}: a loop has to edit; change the mode first (`twr mode {name} \
-                     <mode>`): the hub never widens it for a loop"
-                ),
-            ));
+        if let Some(e) = mode_refusal(name, &v.runtime, &v.mode) {
+            return Err(e);
         }
         if let Some(l) = &v.r#loop {
             return Err(rpc(
@@ -1388,25 +1985,14 @@ impl Core {
     }
 
     /// Whether thread `id`, which counts as stopped, was stopped by someone: not only by the
-    /// hub's own shutdown (`thread.stopped` `ext.twr.reason`), after which a thread counts as
-    /// stopped too, yet goes on (and so does its loop) as soon as it is sent something. A log
-    /// that cannot be read says it was.
+    /// hub's own shutdown (`ThreadView::stopped_by_hub`, from `thread.stopped`
+    /// `ext.twr.reason`), after which a thread counts as stopped too, yet goes on (and so does
+    /// its loop) as soon as it is sent something. Clients read the same field to offer a loop
+    /// only where this does not refuse it.
     fn stopped_by_someone(&self, id: &str) -> bool {
-        match crate::store::latest_of_kind(self.store.conn(), id, "thread.stopped", 1) {
-            Ok(evs) => !evs.first().is_some_and(|e| match &e.body {
-                EventBody::ThreadStopped(p) => {
-                    twr_ext(&p.ext)
-                        .and_then(|t| t.get("reason"))
-                        .and_then(Value::as_str)
-                        == Some(super::HUB_SHUTDOWN)
-                }
-                _ => false,
-            }),
-            Err(e) => {
-                tracing::warn!(thread = %id, error = %format!("{e:#}"), "cannot read how a thread stopped");
-                true
-            }
-        }
+        self.registry
+            .get(id)
+            .is_none_or(|v| v.stopped && !v.stopped_by_hub)
     }
 
     /// `loop.request`'s decision for eligible thread `id` (module docs): start on saved
@@ -1418,8 +2004,7 @@ impl Core {
         id: &str,
         kind: LoopKind,
         req: &LoopRequest,
-        target: &git::Target,
-        found: &git::ScopeInfo,
+        from: StartFrom,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
         let view = self.view(id)?.clone();
@@ -1456,7 +2041,12 @@ impl Core {
                 }
             }
         };
-        let from = StartFrom::of(target, found);
+        let task = req
+            .task
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
         let Some(why) = why else {
             // Saved settings that hold: the run's own overrides must hold too.
             let problems = validate(&run, &avail, config);
@@ -1472,14 +2062,21 @@ impl Core {
             let (saved, of) = saved.ok_or_else(|| internal("no saved settings"))?;
             let mut batch = Batch::default();
             // A card the thread still has (asked for before, never answered) goes: this
-            // start supersedes it.
-            if let Some((attn, _)) = self.setup_card_of(id) {
+            // start supersedes it (and its kept baseline, unless it is this start's).
+            let superseded = self.setup_card_of(id).map(|(attn, card)| {
                 batch.push(
                     id,
                     None,
                     caller.source(),
                     resolved(&attn, ResolvedBy::User, Some(CANCEL)),
                 );
+                card
+            });
+            if let Some(card) = superseded
+                .as_ref()
+                .filter(|c| c.setup.baseline_digests != from.baseline_digests)
+            {
+                drop_baseline(hub, card);
             }
             let (rest, model) = self.stage_start(
                 hub,
@@ -1492,6 +2089,7 @@ impl Core {
                     id: saved.id.clone(),
                     of: Some(of),
                     overrides,
+                    task,
                 },
                 from,
                 caller,
@@ -1526,10 +2124,10 @@ impl Core {
             },
             project: view.project.clone(),
             scope: from.scope.clone(),
-            scope_summary: Some(found.summary()),
+            scope_summary: from.summary.clone(),
             bases: from.bases,
             baseline_digests: from.baseline_digests,
-            task: None,
+            task,
             overrides: card_overrides,
             requested_by: if user {
                 ControlBy::User
@@ -1543,8 +2141,18 @@ impl Core {
                 .map(|p| p.message.clone())
                 .collect(),
             held_prompt: None,
+            // (Set where the card is raised.)
+            no_workers: false,
         };
-        let (attn_id, revision) = self.raise_setup_card(hub, &view, setup)?;
+        // (A card raised again over another baseline: the one it kept goes.)
+        let replaced = self
+            .setup_card_of(id)
+            .map(|(_, c)| c)
+            .filter(|c| c.setup.baseline_digests != setup.baseline_digests);
+        let (attn_id, revision) = self.raise_setup_card(hub, &view, setup, &from.facts)?;
+        if let Some(c) = replaced {
+            drop_baseline(hub, &c);
+        }
         Ok(json!({
             "status": "needs_setup",
             "attn_id": attn_id,
@@ -1553,17 +2161,24 @@ impl Core {
         }))
     }
 
-    /// Raises `setup` as the setup card of thread `view`: again, under the same id and as a
-    /// new revision, when the thread has one open. Returns its id and revision.
+    /// Raises `setup` as the setup card of thread `view` (`facts`: what git said beyond it):
+    /// again, under the same id and as a new revision, when the thread has one open. A card
+    /// that holds a task has the option [`RUN_WITHOUT`] between [`START`] and [`CANCEL`].
+    /// Returns its id and revision.
     fn raise_setup_card(
         &mut self,
         hub: &Inner,
         view: &ThreadView,
         setup: LoopSetup,
+        facts: &StartFacts,
     ) -> Result<(String, u64), RpcError> {
         let attn_id = self.setup_card_of(&view.id).map_or_else(new_id, |(a, _)| a);
+        let mut setup = setup;
+        let avail = availability(hub, &self.accounts, Some(view));
+        setup.no_workers = !twr_core::loops::settings::workers_apply(&setup.settings, &avail);
         let summary = card_text(&view.name, &setup, view);
-        let ext = twr_ext_map(json!({ LOOP_SETUP_KEY: setup }));
+        let options = card_options(&setup);
+        let ext = twr_ext_map(json!({ LOOP_SETUP_KEY: setup, LOOP_START_KEY: facts }));
         self.append(
             hub,
             &view.id,
@@ -1573,7 +2188,7 @@ impl Core {
                 attn_id: attn_id.clone(),
                 reason: AttentionReason::Review,
                 summary,
-                options: vec![START.into(), CANCEL.into()],
+                options,
                 ext,
                 ..Default::default()
             }),
@@ -1637,6 +2252,15 @@ impl Core {
             .db_path
             .parent()
             .map(|d| d.join("loops").join(&id).to_string_lossy().into_owned());
+        // A review loop under `match` commits its fixes when the thread had been committing
+        // its work: decided now, and recorded.
+        let commit_fixes = kind == LoopKind::Review
+            && settings
+                .review_commit
+                .commits_fixes(from.facts.own_commits, from.facts.clean);
+        if kind == LoopKind::Implement {
+            place_baseline(hub, &from, folder.as_deref());
+        }
         let started = LoopStarted {
             id,
             kind,
@@ -1650,8 +2274,10 @@ impl Core {
             scope: from.scope,
             bases: from.bases,
             baseline_digests: from.baseline_digests,
-            task: None,
+            task: origin.task,
+            commit_fixes,
             folder,
+            ext: twr_ext_map(json!({ LOOP_START_KEY: from.facts })),
             ..Default::default()
         };
         let (state, actions) = LoopState::start(&started).map_err(start_err)?;
@@ -1670,8 +2296,11 @@ impl Core {
     }
 
     /// What follows a committed start: the thread's new model applied (a restart of its
-    /// runtime once it is free, `hub::restart`), then the scope turn's prompt dispatched.
+    /// runtime once it is free, `hub::restart`), then the scope turn's prompt dispatched. A
+    /// start is the user's (their request, or their answer to the card), so it lets the
+    /// prompt go though a crash held the thread's queue, as the user's own message would.
     fn after_start(&mut self, hub: &Arc<Inner>, thread: &str, staged: driver::Staged, model: bool) {
+        self.release_queue(thread);
         if model {
             let mut dispatch_error = None;
             self.apply_settings(hub, thread, &mut dispatch_error);
@@ -1696,7 +2325,10 @@ impl Core {
     }
 
     /// Answers setup card `item` (`card`) with `response` (see the module docs): only the
-    /// user; [`START`] starts and saves, in one batch; [`CANCEL`], or a dismissal, closes it.
+    /// user; [`START`] starts and saves, in one batch; [`RUN_WITHOUT`] (a card that holds a
+    /// task) sends the task to the thread as an ordinary prompt of the user's, saving nothing,
+    /// in the batch of the card's resolution; [`CANCEL`], or a dismissal, closes it (a task it
+    /// held is dropped).
     pub(super) fn answer_loop_card(
         &mut self,
         hub: &Arc<Inner>,
@@ -1720,20 +2352,31 @@ impl Core {
             r => super::attention::answer_of(r, item, attn_id)?.decision,
         };
         let decision = decision.trim().to_ascii_lowercase();
+        let held = card
+            .setup
+            .task
+            .clone()
+            .filter(|_| card.setup.kind == LoopKind::Implement);
         let start = match decision.as_str() {
             START | "start" => true,
+            RUN_WITHOUT | "without" if held.is_some() => {
+                return self.run_without_loop(hub, attn_id, card, held.unwrap_or_default(), caller)
+            }
             CANCEL | "dismiss" => false,
             other => {
                 return Err(rpc(
                     codes::BAD_REQUEST,
-                    format!("{other:?} is no option of {attn_id}: {START} or {CANCEL}"),
+                    format!(
+                        "{other:?} is no option of {attn_id}: {}",
+                        card_options(&card.setup).join(", ")
+                    ),
                 ))
             }
         };
         let thread = card.thread.clone();
         if !start {
             let turn = self.registry.get(&thread).and_then(|v| v.current_turn);
-            return self
+            let ev = self
                 .append(
                     hub,
                     &thread,
@@ -1741,7 +2384,9 @@ impl Core {
                     caller.source(),
                     resolved(attn_id, ResolvedBy::User, Some(CANCEL)),
                 )
-                .map_err(append_err);
+                .map_err(append_err)?;
+            drop_baseline(hub, card);
+            return Ok(ev);
         }
         // A paired device starts loops and saves their settings with `operate`.
         hub.require_scope(caller, "start a loop and save its settings", "operate")?;
@@ -1824,12 +2469,57 @@ impl Core {
                 id: attn_id.to_string(),
                 of: None,
                 overrides: setup.overrides.clone(),
+                task: setup.task.clone(),
             },
-            StartFrom::card(setup),
+            StartFrom::card(card),
             caller,
         )?;
         let done = self.append_batch(hub, batch).map_err(append_err)?;
         self.after_start(hub, &thread, rest, model);
+        done.events
+            .get(answered)
+            .cloned()
+            .ok_or_else(|| internal("the answer was not recorded"))
+    }
+
+    /// [`RUN_WITHOUT`] on setup card `attn_id` (`card`), which holds `task`: the card's
+    /// resolution and the task, queued as the user's own prompt to the thread (as `send`
+    /// queues one), in one batch; then the thread's queue is dispatched. Nothing is saved and
+    /// no loop starts.
+    fn run_without_loop(
+        &mut self,
+        hub: &Arc<Inner>,
+        attn_id: &str,
+        card: &SetupCard,
+        task: String,
+        caller: &Caller,
+    ) -> Result<Event, RpcError> {
+        hub.require_scope(caller, "send a thread a prompt", "operate")?;
+        let thread = card.thread.clone();
+        let turn = self.registry.get(&thread).and_then(|v| v.current_turn);
+        let mut batch = Batch::default();
+        let answered = batch.push(
+            &thread,
+            turn,
+            caller.source(),
+            resolved(attn_id, ResolvedBy::User, Some(RUN_WITHOUT)),
+        );
+        self.push_prompt(
+            &mut batch,
+            &thread,
+            &task,
+            caller.from(),
+            caller.source(),
+            None,
+        )?;
+        if let Some(p) = batch.prompts.last_mut() {
+            p.user_send = true;
+        }
+        let done = self.append_batch(hub, batch).map_err(append_err)?;
+        drop_baseline(hub, card);
+        if let Err(e) = self.try_dispatch(hub, &thread) {
+            tracing::warn!(%thread, error = %format!("{e:#}"), "dispatching a held task failed");
+        }
         done.events
             .get(answered)
             .cloned()
@@ -1981,6 +2671,27 @@ mod tests {
 
     /// The card's text reads as rows a generic client shows whole.
     #[test]
+    fn a_long_report_is_cut_at_a_line() {
+        let short = "# Report\n\nshort\n";
+        assert_eq!(
+            report_text(short.as_bytes(), "/r.md"),
+            (short.to_string(), false)
+        );
+        let line = "x".repeat(99) + "\n";
+        let long = line.repeat(MAX_REPORT_TEXT / 100 + 10);
+        let (text, cut) = report_text(long.as_bytes(), "/r.md");
+        assert!(cut);
+        assert!(text.len() < MAX_REPORT_TEXT + 300, "{}", text.len());
+        let (body, marker) = text.split_once("\n[twr: the report is cut here").unwrap();
+        assert!(body.ends_with('\n') && body.lines().all(|l| l.len() == 99));
+        assert!(
+            marker.contains(&format!("it is {} bytes", long.len())),
+            "{marker}"
+        );
+        assert!(marker.contains("/r.md on the hub's machine"), "{marker}");
+    }
+
+    #[test]
     fn a_card_reads_well() {
         let config = twr_core::loops::config::LoopsConfig::default();
         let settings = LoopSettings::first_card(&config);
@@ -2023,10 +2734,7 @@ mod tests {
     #[test]
     fn kinds_and_shapes() {
         assert_eq!(parse_kind("review").unwrap(), LoopKind::Review);
-        assert_eq!(
-            parse_kind("implement").unwrap_err().code,
-            codes::UNSUPPORTED
-        );
+        assert_eq!(parse_kind("implement").unwrap(), LoopKind::Implement);
         assert_eq!(parse_kind("x").unwrap_err().code, codes::BAD_REQUEST);
         let ok = LoopSettings::first_card(&Default::default());
         check_shape(&ok).unwrap();

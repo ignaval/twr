@@ -26,7 +26,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use serde_json::{json, Value};
-use twr_core::loops::config::{ModelChoice, ReviewCommit, ReviewerChoice, REVIEWER_RUNTIMES};
+use twr_core::loops::config::{
+    ImplCommit, ModelChoice, PlanCheck, ReviewCommit, ReviewerChoice, REVIEWER_RUNTIMES,
+};
 use twr_core::loops::contract::{Finding, TriageItem, Verdict};
 use twr_core::loops::settings::{
     default_model, LoopSettings, Preset, RuntimeAvailability, SaveFor,
@@ -95,13 +97,18 @@ pub fn item_badge(item: &AttentionItem) -> Option<Span<'static>> {
     }
 }
 
+/// A loop of `kind` in words: `review loop`, `implementation loop`.
+pub fn kind_words(kind: LoopKind) -> &'static str {
+    match kind {
+        LoopKind::Review => "review loop",
+        LoopKind::Implement => "implementation loop",
+    }
+}
+
 /// What a detail view's title calls a loop's item (`review loop`, `loop stuck`).
 pub fn item_label(item: &AttentionItem) -> Option<&'static str> {
     if item.loop_setup {
-        Some(match setup_kind(&item.summary) {
-            LoopKind::Review => "review loop",
-            LoopKind::Implement => "implementation loop",
-        })
+        Some(kind_words(setup_kind(&item.summary)))
     } else if item.loop_stuck {
         Some("loop stuck")
     } else {
@@ -187,6 +194,15 @@ pub fn setup_rows(item: &AttentionItem, width: usize) -> Vec<Line<'static>> {
             ));
             continue;
         }
+        // A value's next line (a task of several lines), as the hub indents it: under the
+        // value.
+        if let Some(rest) = line
+            .strip_prefix(&" ".repeat(LABEL_W))
+            .filter(|r| !r.trim().is_empty())
+        {
+            rows.extend(aligned("", rest.trim_end(), width, dim));
+            continue;
+        }
         let (style, text) = if line.starts_with("Change first: ") {
             (
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -234,10 +250,12 @@ fn aligned(label: &str, value: &str, width: usize, dim: Style) -> Vec<Line<'stat
             out.push(row);
         }
     } else {
-        out.extend(crate::ui::wrap_line(
-            Line::from(Span::styled(label.to_string(), dim)),
-            width,
-        ));
+        if !label.is_empty() {
+            out.extend(crate::ui::wrap_line(
+                Line::from(Span::styled(label.to_string(), dim)),
+                width,
+            ));
+        }
         out.extend(crate::ui::wrap_line(
             Line::from(Span::raw(format!("  {value}"))),
             width,
@@ -271,10 +289,11 @@ pub fn card_line(l: &LoopView, width: usize) -> Line<'static> {
 }
 
 /// Where a loop is, in a word: its round in the ladder and the verification (`m3`, `v1`),
-/// else its phase (`scope`, `sweep`).
+/// else its phase, short (`scope`, `sweep`; an implementation loop's `plan`, `p1`, `impl`).
 pub fn where_word(l: &LoopView) -> String {
     match (l.phase, &l.round) {
-        (Phase::Ladder | Phase::Verify, Some(r)) => r.clone(),
+        (Phase::Ladder | Phase::Verify | Phase::PlanCheck, Some(r)) => r.clone(),
+        (Phase::Implement, _) => "impl".into(),
         (p, _) => p.as_str().to_string(),
     }
 }
@@ -288,16 +307,50 @@ pub fn short_line(l: &LoopView, state: &str, width: usize) -> Line<'static> {
     Line::from(crate::ui::cut_spans(spans, width.max(1)))
 }
 
-/// The phases of a review loop, as its progress lists them (the sweep only when its profile
-/// sweeps), each with whether the loop passed it over without running it: the sweep once the
-/// ladder ended without one (it fixed nothing, or skipped to verify), the verification when
-/// the ladder's end skipped it (`verify_skipped`: v1 could only repeat the last round).
+/// Where phase `p` comes in a loop, to tell the phases a loop is past.
+fn phase_order(p: Phase) -> u8 {
+    match p {
+        Phase::Setup => 0,
+        Phase::Plan | Phase::Scope => 1,
+        Phase::PlanCheck => 2,
+        Phase::Implement => 3,
+        Phase::Ladder => 4,
+        Phase::Sweep => 5,
+        Phase::Verify => 6,
+        Phase::Report => 7,
+    }
+}
+
+/// Whether an implementation loop passed its plan check over: it is past it and ran no
+/// round `p1` (the plan said no contract risk under `contracts`, or the setting is `never`).
+fn plan_check_skipped(l: &LoopView) -> bool {
+    phase_order(l.phase) > phase_order(Phase::PlanCheck)
+        && !l
+            .rounds
+            .iter()
+            .any(|r| r.id == twr_core::loops::PLAN_CHECK_ROUND)
+}
+
+/// The phases of a loop, as its progress lists them (the sweep only when its profile sweeps),
+/// each with whether the loop passed it over without running it: an implementation loop's
+/// plan check when it did not run, the sweep once the ladder ended without one (it fixed
+/// nothing, or skipped to verify), the verification when the ladder's end skipped it
+/// (`verify_skipped`: v1 could only repeat the last round). A review loop starts with its
+/// scope; an implementation loop with its plan, plan check and implement phases.
 fn phases(l: &LoopView) -> Vec<(Phase, bool)> {
     let t = l.transition.as_ref();
     let swept = l.plan.sweep
         && l.fixed > 0
         && t.is_some_and(|t| t.reason != twr_core::loops::TransitionReason::Skipped);
-    let mut out = vec![(Phase::Scope, false), (Phase::Ladder, false)];
+    let mut out = match l.kind {
+        LoopKind::Review => vec![(Phase::Scope, false)],
+        LoopKind::Implement => vec![
+            (Phase::Plan, false),
+            (Phase::PlanCheck, plan_check_skipped(l)),
+            (Phase::Implement, false),
+        ],
+    };
+    out.push((Phase::Ladder, false));
     if l.plan.sweep || l.phase == Phase::Sweep {
         out.push((
             Phase::Sweep,
@@ -307,6 +360,19 @@ fn phases(l: &LoopView) -> Vec<(Phase, bool)> {
     out.push((Phase::Verify, t.is_some_and(|t| t.verify_skipped)));
     out.push((Phase::Report, false));
     out
+}
+
+/// Why `skip to verify` does nothing now, or `None` when it does: before an implementation
+/// loop has implemented its plan, and once a loop is past its ladder (as the hub refuses it).
+pub fn skip_refused(l: &LoopView) -> Option<&'static str> {
+    match l.phase {
+        Phase::Plan | Phase::PlanCheck | Phase::Implement => {
+            Some("the loop has not implemented its plan yet: skip to verify comes after it")
+        }
+        Phase::Scope | Phase::Ladder if l.skip => Some("the loop already skips to verify"),
+        Phase::Scope | Phase::Ladder => None,
+        _ => Some("the loop is past its ladder"),
+    }
 }
 
 /// Phase `p` as a progress lists it: `verify skipped` when the loop passed it over.
@@ -397,7 +463,7 @@ pub fn progress_rows(l: &LoopView, width: usize) -> Vec<Line<'static>> {
 }
 
 /// `/loop status` in the status bar: where thread `name`'s loop is (its line and rounds),
-/// or how its last one ended.
+/// or how its last one ended (with what it committed, [`commit_words`]).
 pub fn status_text(t: &twr_core::reduce::ThreadView) -> String {
     if let Some(l) = &t.r#loop {
         let mut out = format!(
@@ -417,13 +483,146 @@ pub fn status_text(t: &twr_core::reduce::ThreadView) -> String {
         return out;
     }
     match &t.last_loop {
-        Some(last) => format!(
-            "{} runs no loop; its last {} loop ended {}",
-            t.name,
-            last.kind.as_str(),
-            outcome_words(last.outcome)
-        ),
-        None => format!("{} runs no loop (/review starts one)", t.name),
+        Some(last) => {
+            let mut out = format!(
+                "{} runs no loop; its last {} ended {}",
+                t.name,
+                kind_words(last.kind),
+                outcome_words(last.outcome)
+            );
+            if let Some(c) = commit_words(last, true) {
+                out.push_str(&format!("; {c}"));
+            }
+            out
+        }
+        None => format!("{} runs no loop (/implement or /review starts one)", t.name),
+    }
+}
+
+/// A commit's short sha (its first 7 digits).
+pub fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// What an ended loop committed, in words: `committed abc1234` (with each repository's name
+/// when there are several: `committed abc1234 in api, def5678 in web`), then, when its
+/// commit's check failed twice for the other repositories, what was not (`not committed:
+/// why` with `why`; without, `not committed`, or `not committed in web` after commits): a
+/// loop that committed something never reads `not committed` alone. `None` when it
+/// committed nothing and was asked for no commit.
+pub fn commit_words(last: &twr_core::reduce::LastLoop, why: bool) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(c) = commits_words(&last.commits) {
+        parts.push(c);
+    }
+    if let Some(problem) = &last.commit_problem {
+        parts.push(if why {
+            format!("not committed: {}", first_line(problem))
+        } else {
+            not_committed_short(problem, !last.commits.is_empty())
+        });
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// The commits a check found, in words (`committed abc1234`, `committed abc1234 in api,
+/// def5678 in web`); `None` for none.
+fn commits_words(commits: &[twr_core::loops::contract::Commit]) -> Option<String> {
+    match commits {
+        [] => None,
+        [c] => Some(format!("committed {}", short_sha(&c.sha))),
+        all => Some(format!(
+            "committed {}",
+            all.iter()
+                .map(|c| format!("{} in {}", short_sha(&c.sha), repo_name(&c.repo)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// A commit problem without its why: `not committed`; after commits, which repositories
+/// were not (`not committed in web`, from the paths each problem starts with), so it never
+/// reads as if nothing was.
+fn not_committed_short(problem: &str, after_commits: bool) -> String {
+    if !after_commits {
+        return "not committed".into();
+    }
+    let repos: Vec<&str> = problem
+        .split("; ")
+        .filter_map(|p| p.split_once(": ").map(|(repo, _)| repo))
+        .filter(|repo| repo.contains('/') || repo.contains('\\'))
+        .map(repo_name)
+        .collect();
+    if repos.is_empty() {
+        "not all committed".into()
+    } else {
+        format!("not committed in {}", repos.join(", "))
+    }
+}
+
+/// A repository's name: the last part of its path.
+fn repo_name(repo: &str) -> &str {
+    repo.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(repo)
+}
+
+/// Whether thread `t`'s card says how its last loop ended ([`ended_line`]): it runs no loop
+/// now, and no turn of the thread's started since that one ended.
+pub fn ended_due(t: &twr_core::reduce::ThreadView) -> Option<&twr_core::reduce::LastLoop> {
+    let last = t.last_loop.as_ref()?;
+    (t.r#loop.is_none()
+        && t.current_turn.is_none()
+        && last.ended_turn.is_some()
+        && last.ended_turn == t.last_turn.as_ref().map(|l| l.turn))
+    .then_some(last)
+}
+
+/// The line a card shows in its loop line's place once the loop ended, until the thread's
+/// next turn: the badge, how it ended and what it committed (`IMPLEMENT LOOP  ended clean ·
+/// committed abc1234`, `ended clean · not committed`, `ended clean · committed abc1234 · not
+/// committed in web`). Too narrow, it drops `ended`, then shortens the commit to its sha
+/// (`clean · abc1234`, `clean · abc1234 · not all committed`), then is cut with `…`.
+pub fn ended_line(last: &twr_core::reduce::LastLoop, width: usize) -> Line<'static> {
+    let width = width.max(1);
+    let badge = kind_badge(last.kind);
+    let room = width.saturating_sub(crate::edit::width(&badge.content) + 1);
+    let outcome = outcome_short(last.outcome);
+    let commit = commit_words(last, false);
+    let short_commit = match (&last.commit_problem, last.commits.as_slice()) {
+        (Some(_), []) => Some("not committed".to_string()),
+        (Some(_), [c, ..]) => Some(format!("{} · not all committed", short_sha(&c.sha))),
+        (None, []) => None,
+        (None, [c, ..]) => Some(short_sha(&c.sha).to_string()),
+    };
+    let join =
+        |parts: [Option<String>; 2]| parts.into_iter().flatten().collect::<Vec<_>>().join(" · ");
+    let forms = [
+        join([Some(format!("ended {outcome}")), commit.clone()]),
+        join([Some(outcome.to_string()), commit]),
+        join([Some(outcome.to_string()), short_commit]),
+    ];
+    let text = forms
+        .iter()
+        .find(|f| crate::edit::width(f) <= room)
+        .unwrap_or(&forms[2])
+        .clone();
+    let spans = vec![badge, Span::raw(" "), Span::raw(text)];
+    Line::from(crate::ui::cut_spans(spans, width))
+}
+
+/// How a loop ended, in a word or two, as a card says it (`clean`, `cap expired`).
+fn outcome_short(o: twr_core::loops::Outcome) -> &'static str {
+    use twr_core::loops::Outcome;
+    match o {
+        Outcome::Clean => "clean",
+        Outcome::LedgerFixedPoint => "at a ledger fixed point",
+        Outcome::CapExpired => "cap expired",
+        Outcome::Stopped => "stopped",
+        Outcome::Failed => "failed",
     }
 }
 
@@ -470,23 +669,47 @@ pub fn prompt_step(prompt: &str) -> Option<(String, String)> {
     (!id.is_empty() && !step.is_empty()).then(|| (id.to_string(), step.to_string()))
 }
 
-/// The folded row's text of a turn a loop's prompt started: `review loop · triage m3`.
-pub fn prompt_marker(step: &str) -> String {
-    format!("review loop · {step}")
+/// Whether a loop prompt's step is one only an implementation loop has: its plan, the plan
+/// check's triage (`triage p1`), its implement turn and its commit's correction.
+pub fn implementation_step(step: &str) -> bool {
+    let step = step.strip_suffix(" correction").unwrap_or(step);
+    matches!(step, "plan" | "implement" | "commit")
+        || step == format!("triage {}", twr_core::loops::PLAN_CHECK_ROUND)
 }
 
-/// A round's folded row's text (`review round m3 · gpt-6.1-sol medium · 2 findings`; a failed
-/// run's `review round m3 · failed: <why>`), with how the thread triaged it once it did.
+/// The folded row's text of a turn a loop's prompt started: `review loop · triage m3`,
+/// `implementation loop · plan`.
+pub fn prompt_marker(step: &str, kind: LoopKind) -> String {
+    format!("{} · {step}", kind_words(kind))
+}
+
+/// How long a review run took, as a round's row says it (`14m`, `40s`).
+pub fn took_words(ms: i64) -> String {
+    twr_core::work::ago(ms.max(0) / 1000)
+}
+
+/// A round's folded row's text (`review round m3 · gpt-6.1-sol medium · 14m · 2 findings`; the
+/// plan check's `plan check p1 · …`; a failed run's `review round m3 · failed: <why>`), with
+/// how the thread triaged it once it did. `took`: how long its run took, when known.
 pub fn round_head(
     round: &str,
     reviewer: Option<&str>,
+    took: Option<&str>,
     findings: &[Finding],
     failed: Option<&str>,
     triage: &[TriageItem],
 ) -> String {
-    let mut parts = vec![format!("review round {round}")];
+    let what = if round == twr_core::loops::PLAN_CHECK_ROUND {
+        "plan check"
+    } else {
+        "review round"
+    };
+    let mut parts = vec![format!("{what} {round}")];
     if let Some(r) = reviewer.filter(|r| !r.is_empty()) {
         parts.push(r.to_string());
+    }
+    if let Some(t) = took.filter(|t| !t.is_empty()) {
+        parts.push(t.to_string());
     }
     if let Some(why) = failed {
         parts.push(format!("failed: {}", first_line(why)));
@@ -514,6 +737,95 @@ pub fn round_head(
         parts.push(said.join(", "));
     }
     parts.join(" · ")
+}
+
+/// An implementation loop's step the transcript folds to one row ([`step_head`]) that opens
+/// to its details ([`step_rows`]): its plan, its implement turn, the hub's check of its
+/// commit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepNote {
+    /// `loop.plan`: the plan the thread wrote (revision 1) or the plan check's revision (2).
+    Plan(twr_core::event::LoopPlanned),
+    /// `loop.implemented`: the implement turn's `twr-implement` block.
+    Implemented(twr_core::event::LoopImplemented),
+    /// `loop.commit`: the hub's check of the loop's commit.
+    Commit(twr_core::event::LoopCommitChecked),
+}
+
+/// A step's folded row's text: `plan · revision 1 · contract risk: no`, `implement · gates
+/// pass` (`implement · partial · gates fail`), `committed abc1234` (one per repository,
+/// `committed abc1234 in api, def5678 in web`) or `not committed: <why>`, both when some
+/// repositories were committed and others not (`committed abc1234 · not committed: <why>`).
+pub fn step_head(n: &StepNote) -> String {
+    match n {
+        StepNote::Plan(p) => format!(
+            "plan · revision {} · contract risk: {}",
+            p.revision,
+            if p.contract_risk { "yes" } else { "no" }
+        ),
+        StepNote::Implemented(i) => {
+            let gates = match i.gates.result {
+                twr_core::loops::contract::GateResult::Pass => "gates pass",
+                twr_core::loops::contract::GateResult::Fail => "gates fail",
+            };
+            match i.status {
+                twr_core::loops::contract::ImplementStatus::Done => format!("implement · {gates}"),
+                s => format!("implement · {} · {gates}", s.as_str()),
+            }
+        }
+        StepNote::Commit(c) => {
+            let problem = c
+                .problems
+                .first()
+                .map(|p| format!("not committed: {}", first_line(p)));
+            match (commits_words(&c.commits), problem) {
+                (Some(done), Some(not)) => format!("{done} · {not}"),
+                (Some(done), None) => done,
+                (None, Some(not)) => not,
+                (None, None) => "committed nothing: there was nothing to commit".into(),
+            }
+        }
+    }
+}
+
+/// A step's row opened: the plan's file and why it named its contract risk; the gates the
+/// implement turn ran; each repository's commit, then every problem of the check, then what
+/// it noted that is no problem (`note: …`).
+pub fn step_rows(n: &StepNote) -> Vec<String> {
+    match n {
+        StepNote::Plan(p) => {
+            let mut out = Vec::new();
+            if let Some(path) = p.path.as_deref().filter(|p| !p.is_empty()) {
+                out.push(format!("plan.md: {path}"));
+            }
+            if !p.reason.trim().is_empty() {
+                out.push(format!("contract risk: {}", first_line(&p.reason)));
+            }
+            out
+        }
+        StepNote::Implemented(i) if i.gates.ran.is_empty() => vec!["no gates named".into()],
+        StepNote::Implemented(i) => i.gates.ran.iter().map(|g| format!("ran {g}")).collect(),
+        StepNote::Commit(c) => c
+            .commits
+            .iter()
+            .map(|c| format!("{} {}", c.repo, short_sha(&c.sha)))
+            .chain(c.problems.iter().cloned())
+            .chain(c.notes.iter().map(|n| format!("note: {}", first_line(n))))
+            .collect(),
+    }
+}
+
+/// A step's row is in red: an implement turn that is not done with green gates, a commit
+/// whose check failed.
+pub fn step_failed(n: &StepNote) -> bool {
+    match n {
+        StepNote::Plan(_) => false,
+        StepNote::Implemented(i) => {
+            i.status != twr_core::loops::contract::ImplementStatus::Done
+                || i.gates.result != twr_core::loops::contract::GateResult::Pass
+        }
+        StepNote::Commit(c) => !c.problems.is_empty(),
+    }
 }
 
 /// A round opened: each finding (`m3.1 major src/a.rs:4 — the problem's first line`), each
@@ -607,6 +919,10 @@ pub enum RowKey {
     ReviewerModel,
     /// The reviewer's account, when its runtime lists several.
     ReviewerAccount,
+    /// An implementation loop's plan check (`None`: the profile's).
+    PlanCheck,
+    /// What an implementation loop commits.
+    ImplCommit,
     /// What a review loop commits.
     ReviewCommit,
     /// Where the settings are saved.
@@ -653,6 +969,8 @@ pub struct LoopEditor {
     pub thread: Option<String>,
     /// The card's profile, resolved (`setup.profile`): its summary.
     pub profile: Option<twr_core::loops::config::Profile>,
+    /// The kind of loop the card is for (`setup.kind`); the saved settings serve both.
+    pub kind: Option<LoopKind>,
 }
 
 impl LoopEditor {
@@ -860,20 +1178,69 @@ pub fn rows(e: &LoopEditor, thread_rt: Option<&str>) -> Vec<Row> {
                 .unwrap_or_else(|| "the runtime's default".into()),
         ));
     }
-    out.push(Row {
-        detail: Some(
-            match s.review_commit {
-                ReviewCommit::Match => "commit the fixes if the thread commits its work",
-                ReviewCommit::None => "leave the fixes uncommitted",
-            }
-            .into(),
-        ),
-        ..row(
-            RowKey::ReviewCommit,
-            "Review commits",
-            s.review_commit.as_str().into(),
-        )
-    });
+    // The implementation loop's rows: on its card and on the saved settings, which serve
+    // both kinds of loop; a review loop's card leaves them out.
+    if e.kind != Some(LoopKind::Review) {
+        let profile_check = e
+            .profile
+            .as_ref()
+            .filter(|p| p.name == s.profile)
+            .cloned()
+            .or_else(|| twr_core::loops::config::Profile::builtin(&s.profile))
+            .map(|p| p.plan_check);
+        out.push(Row {
+            detail: Some(
+                match s.plan_check.or(profile_check) {
+                    Some(PlanCheck::Contracts) => {
+                        "a review of the plan when it touches money, schemas or cross-repo contracts"
+                    }
+                    Some(PlanCheck::Always) => "a review of the plan, always",
+                    Some(PlanCheck::Never) => "no review of the plan",
+                    None => "as the profile says",
+                }
+                .into(),
+            ),
+            ..row(
+                RowKey::PlanCheck,
+                "Plan check",
+                match (s.plan_check, profile_check) {
+                    (Some(v), _) => v.as_str().to_string(),
+                    (None, Some(v)) => format!("the profile's ({})", v.as_str()),
+                    (None, None) => "the profile's".into(),
+                },
+            )
+        });
+        out.push(Row {
+            detail: Some(
+                match s.commit {
+                    ImplCommit::End => "an implementation loop commits its work once, at the end",
+                    ImplCommit::PerRound => {
+                        "commit after implementing and after every round that fixed something"
+                    }
+                    ImplCommit::None => "an implementation loop leaves its work uncommitted",
+                }
+                .into(),
+            ),
+            ..row(RowKey::ImplCommit, "Commit", s.commit.as_str().into())
+        });
+    }
+    // A review loop's commit: on its card and on the saved settings.
+    if e.kind != Some(LoopKind::Implement) {
+        out.push(Row {
+            detail: Some(
+                match s.review_commit {
+                    ReviewCommit::Match => "commit the fixes if the thread commits its work",
+                    ReviewCommit::None => "leave the fixes uncommitted",
+                }
+                .into(),
+            ),
+            ..row(
+                RowKey::ReviewCommit,
+                "Review commits",
+                s.review_commit.as_str().into(),
+            )
+        });
+    }
     out.push(row(
         RowKey::SaveFor,
         "Save for",
@@ -1121,6 +1488,20 @@ pub fn step(
             s.reviewer.account =
                 cycle(&all, &s.reviewer.account, forward).ok_or("no accounts to pick")?;
         }
+        RowKey::PlanCheck => {
+            // The profile's, then each value.
+            let all = [
+                None,
+                Some(PlanCheck::Contracts),
+                Some(PlanCheck::Always),
+                Some(PlanCheck::Never),
+            ];
+            s.plan_check = cycle(&all, &s.plan_check, forward).flatten();
+        }
+        RowKey::ImplCommit => {
+            let all = [ImplCommit::End, ImplCommit::PerRound, ImplCommit::None];
+            s.commit = cycle(&all, &s.commit, forward).unwrap_or_default();
+        }
         RowKey::ReviewCommit => {
             s.review_commit = match s.review_commit {
                 ReviewCommit::Match => ReviewCommit::None,
@@ -1169,6 +1550,22 @@ pub fn save_request(e: &LoopEditor) -> Option<(&'static str, Value)> {
 const MAX_WIDTH: u16 = 84;
 /// Columns of a row's label.
 const ROW_LABEL: usize = 16;
+
+/// A row's dim line under it, `width` cells wide: under the value column, each wrapped line
+/// too; with no room for that, from the row's start.
+fn detail_rows(d: &str, width: usize, dim: Style) -> Vec<Line<'static>> {
+    let indent = ROW_LABEL + 2;
+    if width < indent + 12 {
+        return crate::ui::wrap_line(Line::from(Span::styled(d.to_string(), dim)), width);
+    }
+    crate::ui::wrap_line(Line::from(Span::styled(d.to_string(), dim)), width - indent)
+        .into_iter()
+        .map(|mut row| {
+            row.spans.insert(0, Span::raw(" ".repeat(indent)));
+            row
+        })
+        .collect()
+}
 
 /// The editor, centered over `area`, as the settings overlay is drawn: what it edits at the
 /// top, a row per setting (`label  value`, a dim line under some), the selected row
@@ -1246,15 +1643,16 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
             Span::styled(label, base),
             Span::styled(row.value, value_style),
         ]);
+        // Cut with `…` only when it is too wide; else padded to the width (a selected row is
+        // reversed across it).
+        if head.width() > inner_w {
+            head = Line::from(crate::ui::cut_spans(head.spans, inner_w));
+        }
         let pad = inner_w.saturating_sub(head.width());
         head.spans.push(Span::styled(" ".repeat(pad), base));
-        lines.push(crate::ui::ellipsized(head, inner_w));
+        lines.push(head);
         if let Some(d) = row.detail {
-            let text = format!("{:w$}{d}", "", w = ROW_LABEL + 2);
-            lines.extend(crate::ui::wrap_line(
-                Line::from(Span::styled(text, dim)),
-                inner_w,
-            ));
+            lines.extend(detail_rows(&d, inner_w, dim));
         }
         spans.push((row.key, start..lines.len()));
     }
@@ -1312,10 +1710,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
             scroll = (span.end - fit).min(span.start);
         }
     }
-    let title = if e.is_card() {
-        " review loop setup "
-    } else {
-        " loop settings "
+    let title = match (e.is_card(), e.kind) {
+        (true, Some(LoopKind::Implement)) => " implementation loop setup ".to_string(),
+        (true, _) => " review loop setup ".to_string(),
+        (false, _) => " loop settings ".to_string(),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1424,6 +1822,54 @@ impl AppState {
         scope: Option<String>,
         overrides: Vec<(&'static str, Option<String>)>,
     ) -> (Vec<Action>, bool) {
+        self.request_loop(LoopKind::Review, thread, setup, scope, None, overrides)
+    }
+
+    /// `/implement [thread] [flags] [task…]`: `loop.request {thread, kind: implement, task?,
+    /// setup?, overrides?}`. In a dive the thread is that one and every word is the task;
+    /// elsewhere a first word that names a live thread is the thread, else the selected
+    /// card's ([`twr_core::slash::implement_target`]).
+    pub(crate) fn request_implement(
+        &mut self,
+        words: &[String],
+        setup: bool,
+        overrides: Vec<(&'static str, Option<String>)>,
+    ) -> (Vec<Action>, bool) {
+        let dive = self.view.dive.is_some();
+        let (thread, task) = twr_core::slash::implement_target(words, dive, |w| {
+            self.registry
+                .resolve(w)
+                .ok()
+                .is_some_and(|t| t.id == w || t.name == w || t.aliases.iter().any(|a| a == w))
+        });
+        if thread.is_none() && self.thread_arg(None).is_err() {
+            self.view.status = Some(
+                "no thread to run it in: select a card, dive into a thread, or name one first (/implement <thread> <task>)"
+                    .into(),
+            );
+            return (Vec::new(), false);
+        }
+        self.request_loop(
+            LoopKind::Implement,
+            thread.as_deref(),
+            setup,
+            None,
+            task,
+            overrides,
+        )
+    }
+
+    /// `loop.request {thread, kind, setup?, scope?, task?, overrides?}` on the named thread,
+    /// else the one dived into, else the selected card's.
+    fn request_loop(
+        &mut self,
+        kind: LoopKind,
+        thread: Option<&str>,
+        setup: bool,
+        scope: Option<String>,
+        task: Option<String>,
+        overrides: Vec<(&'static str, Option<String>)>,
+    ) -> (Vec<Action>, bool) {
         let t = match self.thread_arg(thread) {
             Ok(t) => t,
             Err(e) => {
@@ -1436,7 +1882,10 @@ impl AppState {
             return (Vec::new(), false);
         }
         let (id, name) = (t.id.clone(), t.name.clone());
-        let mut p = json!({ "thread": id, "kind": "review" });
+        let mut p = json!({ "thread": id, "kind": kind.as_str() });
+        if let Some(task) = task {
+            p["task"] = json!(task);
+        }
         if setup {
             p["setup"] = json!(true);
         }
@@ -1450,8 +1899,51 @@ impl AppState {
         if !o.is_empty() {
             p["overrides"] = Value::Object(o);
         }
-        self.view.status = Some(format!("review loop on {name}: asking the hub"));
+        self.view.status = Some(format!("{} on {name}: asking the hub", kind_words(kind)));
         (vec![call("loop.request", p)], true)
+    }
+
+    /// The popup's `implementation loop…`: `/implement ` in the input box (with the thread's
+    /// name when it is not the one dived into), ready for the task. A line already in the box
+    /// goes to the history (↑).
+    pub(crate) fn prefill_implement(&mut self, thread: &str) {
+        let Some(t) = self.registry.get(thread) else {
+            return;
+        };
+        let name = t.name.clone();
+        // In a dive every word of `/implement` is the task, for the thread dived into: to
+        // name another one, the dive is left first, its card selected.
+        let left = match self.view.dive.as_deref() {
+            Some(d) if d != thread => {
+                self.back();
+                self.set_focus(Some(thread.to_string()));
+                true
+            }
+            _ => false,
+        };
+        let line = if self.view.dive.as_deref() == Some(thread) {
+            "/implement ".to_string()
+        } else {
+            format!("/implement {name} ")
+        };
+        let old = self.view.input.as_str().to_string();
+        let kept = !old.trim().is_empty() && old != line;
+        if kept {
+            self.keep_taken_back(&old);
+        }
+        let (cols, rows) = (self.input_cols(), self.input_rows());
+        self.view.input.set(&line);
+        self.view.input.keep_visible(cols, rows);
+        let mut said = "type the task and Enter starts the implementation loop".to_string();
+        if left {
+            said.push_str(&format!(" on {name} (out of the dive)"));
+        }
+        said.push_str(if kept {
+            " (your line is in the history, ↑)"
+        } else {
+            " (no task: what the conversation settled)"
+        });
+        self.view.status = Some(said);
     }
 
     /// `/loop [thread] pause|resume|stop|skip|status` and the popup's loop rows: `stop` asks
@@ -1473,9 +1965,18 @@ impl AppState {
             return (Vec::new(), true);
         }
         let (id, name) = (t.id.clone(), t.name.clone());
-        if t.r#loop.is_none() {
-            self.view.status = Some(format!("{name} runs no loop (/review starts one)"));
+        let Some(l) = &t.r#loop else {
+            self.view.status = Some(format!(
+                "{name} runs no loop (/implement or /review starts one)"
+            ));
             return (Vec::new(), false);
+        };
+        let kind = kind_words(l.kind);
+        if action == "skip_to_verify" {
+            if let Some(why) = skip_refused(l) {
+                self.view.status = Some(format!("{name}: {why}"));
+                return (Vec::new(), false);
+            }
         }
         let act = call("loop.control", json!({ "thread": id, "action": action }));
         let pending = format!(
@@ -1487,7 +1988,7 @@ impl AppState {
             self.view.confirm = Some(crate::app::Confirm {
                 action: act,
                 prompt: format!(
-                    "stop {name}'s review loop? The thread and its work stay as they are. y to \
+                    "stop {name}'s {kind}? The thread and its work stay as they are. y to \
                      confirm, any other key cancels"
                 ),
                 pending,
@@ -1706,9 +2207,11 @@ impl AppState {
         };
         match method {
             "loop.request" if failed => {
-                self.view.status = Some(format!("review loop: {error}"));
+                let kind = kind_of(asked);
+                self.view.status = Some(format!("{}: {error}", kind_words(kind)));
             }
             "loop.request" => {
+                let kind = kind_words(kind_of(asked));
                 let thread = asked["thread"].as_str().unwrap_or_default().to_string();
                 let name = name_of(self, &thread);
                 if r["status"] == "needs_setup" {
@@ -1721,8 +2224,8 @@ impl AppState {
                     }
                     self.set_focus(Some(thread));
                     self.view.status = Some(format!(
-                        "{name}'s review loop waits for its setup card: read it on {name}'s \
-                         card (Enter opens it); 1 starts the loop and saves the settings"
+                        "{name}'s {kind} waits for its setup card: read it on {name}'s card \
+                         (Enter opens it); 1 starts the loop and saves the settings"
                     ));
                 } else {
                     let l = &r["loop"];
@@ -1734,8 +2237,7 @@ impl AppState {
                         (Some(rt), Some(m)) => format!("; reviewer {rt} · {m}"),
                         _ => String::new(),
                     };
-                    self.view.status =
-                        Some(format!("{name}: review loop started ({line}){reviewer}"));
+                    self.view.status = Some(format!("{name}: {kind} started ({line}){reviewer}"));
                 }
             }
             "loop.control" if failed => {
@@ -1743,6 +2245,18 @@ impl AppState {
             }
             "loop.control" => {
                 let name = r["thread_name"].as_str().unwrap_or("the thread");
+                // The kind the hub names, else the one the thread's loop has.
+                let kind = kind_words(
+                    serde_json::from_value(r["kind"].clone())
+                        .ok()
+                        .or_else(|| {
+                            asked["thread"]
+                                .as_str()
+                                .and_then(|t| self.registry.get(t))
+                                .and_then(|t| t.r#loop.as_ref().map(|l| l.kind))
+                        })
+                        .unwrap_or_default(),
+                );
                 let what = match asked["action"].as_str().unwrap_or_default() {
                     "pause" => "paused",
                     "resume" => "resumed",
@@ -1751,9 +2265,9 @@ impl AppState {
                 };
                 self.view.status = Some(match r["line"].as_str() {
                     Some(line) if r["running"] == true => {
-                        format!("{name}'s review loop {what}: {line}")
+                        format!("{name}'s {kind} {what}: {line}")
                     }
-                    _ => format!("{name}'s review loop {what}"),
+                    _ => format!("{name}'s {kind} {what}"),
                 });
             }
             "loop.settings.get" => {
@@ -1909,6 +2423,7 @@ impl LoopEditor {
         self.save_for = serde_json::from_value(setup["save_for"].clone()).unwrap_or_default();
         self.project = setup["project"].as_str().map(str::to_string);
         self.profile = serde_json::from_value(setup["profile"].clone()).ok();
+        self.kind = serde_json::from_value(setup["kind"].clone()).ok();
         self.warnings = strings(&setup["warnings"]);
         self.problems = strings(&setup["problems"]);
         if let Some(t) = r["thread"].as_str() {
@@ -1916,6 +2431,11 @@ impl LoopEditor {
         }
         self.busy = None;
     }
+}
+
+/// The kind of loop a `loop.request` asked for (`kind`), a review loop when it says none.
+fn kind_of(asked: &Value) -> LoopKind {
+    serde_json::from_value(asked["kind"].clone()).unwrap_or_default()
 }
 
 /// A list of strings in `v`.

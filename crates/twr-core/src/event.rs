@@ -2156,11 +2156,22 @@ pub struct TrashPurged {
 // Loops (`crate::loops`, docs/design/loops.md)
 // ---------------------------------------------------------------------------------------------
 
-/// `ext.twr` key of a loop's setup card: an `attention.raised` (reason `question`, source
-/// `hub`) on the loop's thread, with the options `start and save these settings` and `cancel`.
-/// Its value is a [`LoopSetup`]. Only the user answers it: not the orchestrator, and not a
-/// thread's agent even where `attention.respond` is one of its methods.
+/// `ext.twr` key of a loop's setup card: an `attention.raised` (reason `review`, source
+/// `hub`) on the loop's thread, with the options [`LOOP_SETUP_START`], then
+/// [`LOOP_SETUP_RUN_WITHOUT`] when the card holds a task ([`LoopSetup::task`]), then
+/// [`LOOP_SETUP_CANCEL`]. Its value is a [`LoopSetup`]. Only the user answers it: not the
+/// orchestrator, and not a thread's agent even where `attention.respond` is one of its methods.
 pub const LOOP_SETUP_KEY: &str = "loop_setup";
+
+/// A setup card's option that starts the loop on the settings it shows and saves them.
+pub const LOOP_SETUP_START: &str = "start and save these settings";
+
+/// A setup card's option, on a card that holds a task ([`LoopSetup::task`]): send the task to
+/// the thread as an ordinary prompt of the user's, saving nothing and starting no loop.
+pub const LOOP_SETUP_RUN_WITHOUT: &str = "run without a loop";
+
+/// A setup card's option that starts nothing and saves nothing (a task it held is dropped).
+pub const LOOP_SETUP_CANCEL: &str = "cancel";
 
 /// [`ROUTINE_KEY`]: a loop's round or phase change, mirrored into the orchestrator's
 /// conversation as a routine update (folded into the thread's row, no orchestrator turn). A
@@ -2266,7 +2277,9 @@ pub struct LoopSetup {
     /// raised ([`LoopStarted::baseline_digests`]).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub baseline_digests: BTreeMap<String, String>,
-    /// An implementation loop's task.
+    /// An implementation loop's task, held until the card is answered: the card shows it and
+    /// has the option [`LOOP_SETUP_RUN_WITHOUT`]. `None`: the task is what the conversation
+    /// already settled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     /// The request's overrides, as typed.
@@ -2283,6 +2296,11 @@ pub struct LoopSetup {
     /// A new thread's first prompt, held until the card is answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held_prompt: Option<String>,
+    /// The implementer's runtime runs no subagents of its own, so the workers setting does not
+    /// apply to this loop (`loops::settings::workers_apply`): the card leaves out its Workers
+    /// row. (False on a card raised before the hub said so: the row is shown.)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_workers: bool,
 }
 
 /// `loop.settings_saved` (control stream, on [`HUB_THREAD`], source `hub`): the user saved loop
@@ -2369,8 +2387,15 @@ pub struct LoopStarted {
     /// (out of scope of an implementation loop).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub baseline_digests: BTreeMap<String, String>,
-    /// An implementation loop's task.
+    /// An implementation loop's task, as the request gave it; `None`: what the conversation
+    /// already settled.
     pub task: Option<String>,
+    /// A review loop under the commit setting `match` commits its fixes: the hub found the
+    /// thread had been committing its work when the loop started
+    /// ([`crate::loops::config::ReviewCommit::commits_fixes`]). Recorded so a fold decides as
+    /// the start did. (Absent in milestone 1's logs: no commit.)
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub commit_fixes: bool,
     /// The loop folder.
     pub folder: Option<String>,
     /// Runtime-specific extras.
@@ -2559,6 +2584,80 @@ pub struct LoopControl {
     pub extra: JsonMap,
 }
 
+/// `loop.plan` (on the loop's thread, source `hub`): an implementation loop's thread wrote its
+/// plan (`revision` 1) or the plan check's triage revised it (`revision` 2); the hub wrote it
+/// to `path` (`plan.md`; the first is kept as `plan-1.md` when the plan check revises it).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopPlanned {
+    /// The loop.
+    pub id: String,
+    /// 1: the plan turn's; 2: the plan check's revision.
+    pub revision: u32,
+    /// The plan touches money paths, schemas or migrations, or cross-repo contracts.
+    pub contract_risk: bool,
+    /// Why, as the plan's `twr-plan` block says.
+    pub reason: String,
+    /// The file the hub wrote it to.
+    pub path: Option<String>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `loop.implemented` (on the loop's thread, source `hub`): an implementation loop's implement
+/// turn ended with its `twr-implement` block. Anything but `done` with gates that passed is
+/// refused (a correction prompt follows, or, the second time, the loop is stuck).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopImplemented {
+    /// The loop.
+    pub id: String,
+    /// How far it got.
+    pub status: crate::loops::contract::ImplementStatus,
+    /// The gates it ran.
+    pub gates: crate::loops::contract::Gates,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `loop.commit` (on the loop's thread, source `hub`): the hub's check of the commit a loop's
+/// report turn (or its correction) was asked for: what it committed, and, when the check
+/// failed, what is wrong (`problems`: a `twr-commit` block missing or invalid, work left
+/// uncommitted beyond the baseline, a `HEAD` that did not move). A first failure gets one
+/// correction prompt; a second one ends the loop with its outcome all the same, its
+/// `loop.ended.commit_problem` saying what is left.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopCommitChecked {
+    /// The loop.
+    pub id: String,
+    /// The commits the hub found, one per repository that passed and whose `HEAD` moved (a
+    /// repository with a problem is never listed here).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<crate::loops::contract::Commit>,
+    /// Why the check failed; empty: it passed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub problems: Vec<String>,
+    /// What the check noted that is no problem: the thread's `twr-commit` block missing or
+    /// invalid (the check follows git, not the block).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
 /// `loop.ended` (on the loop's thread, source `hub`): the loop is over.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -2569,8 +2668,14 @@ pub struct LoopEnded {
     pub outcome: crate::loops::Outcome,
     /// `report.md`, when one was written.
     pub report_path: Option<String>,
-    /// An implementation loop's commit.
-    pub commit: Option<String>,
+    /// What the loop committed (an implementation loop's, a review loop's fixes under
+    /// `match`), as the hub's check found it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<crate::loops::contract::Commit>,
+    /// A commit was asked for and its check failed twice: what is left (the report and the
+    /// end notification say `not committed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_problem: Option<String>,
     /// Why it failed (`failed`).
     pub reason: Option<String>,
     /// Runtime-specific extras.
@@ -2793,6 +2898,12 @@ event_body! {
     LoopControl(LoopControl) => "loop.control",
     /// `loop.ended`
     LoopEnded(LoopEnded) => "loop.ended",
+    /// `loop.plan`
+    LoopPlan(LoopPlanned) => "loop.plan",
+    /// `loop.implemented`
+    LoopImplemented(LoopImplemented) => "loop.implemented",
+    /// `loop.commit`
+    LoopCommit(LoopCommitChecked) => "loop.commit",
 }
 
 impl EventBody {
@@ -3220,6 +3331,7 @@ mod tests {
                 }],
                 baseline_digests: [("api".to_string(), "sha256:00".to_string())].into(),
                 task: Some("add a CSV export".into()),
+                commit_fixes: true,
                 folder: Some("/data/loops/l1".into()),
                 ext: ext("twr"),
                 ..Default::default()
@@ -3315,8 +3427,38 @@ mod tests {
                 id: "l1".into(),
                 outcome: crate::loops::Outcome::LedgerFixedPoint,
                 report_path: Some("/data/loops/l1/report.md".into()),
-                commit: Some("abc".into()),
+                commits: vec![crate::loops::contract::Commit {
+                    repo: "/w".into(),
+                    sha: "abc1234".into(),
+                }],
+                commit_problem: Some("1 path is uncommitted".into()),
                 reason: Some("why".into()),
+                ..Default::default()
+            }),
+            EventBody::LoopPlan(LoopPlanned {
+                id: "l1".into(),
+                revision: 2,
+                contract_risk: true,
+                reason: "a migration".into(),
+                path: Some("/data/loops/l1/plan.md".into()),
+                ..Default::default()
+            }),
+            EventBody::LoopImplemented(LoopImplemented {
+                id: "l1".into(),
+                status: crate::loops::contract::ImplementStatus::Partial,
+                gates: crate::loops::contract::Gates {
+                    ran: vec!["cargo test".into()],
+                    result: crate::loops::contract::GateResult::Fail,
+                },
+                ..Default::default()
+            }),
+            EventBody::LoopCommit(LoopCommitChecked {
+                id: "l1".into(),
+                commits: vec![crate::loops::contract::Commit {
+                    repo: "/w".into(),
+                    sha: "abc1234".into(),
+                }],
+                problems: vec!["/w: 1 path is uncommitted beyond the baseline: a.rs".into()],
                 ..Default::default()
             }),
         ]

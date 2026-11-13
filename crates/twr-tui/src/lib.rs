@@ -599,6 +599,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             name,
             account,
             outside_pin,
+            implement,
         } => {
             let mut p = json!({ "project": project_param(project) });
             if let Some(r) = runtime {
@@ -612,6 +613,14 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             if *outside_pin {
                 p["outside_pin"] = json!(true);
+            }
+            // `/new … --implement [--setup] <task>`: the task is the thread's first prompt, run
+            // as an implementation loop (`loop {kind, task, setup?}`).
+            if let Some(l) = implement {
+                p["loop"] = json!({ "kind": "implement", "task": l.task });
+                if l.setup {
+                    p["loop"]["setup"] = json!(true);
+                }
             }
             Some(("thread.new", p))
         }
@@ -6062,6 +6071,7 @@ mod tests {
             name: Some("api2".into()),
             account: None,
             outside_pin: false,
+            implement: None,
         })
         .unwrap();
         assert_eq!(

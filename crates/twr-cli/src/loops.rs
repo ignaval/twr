@@ -1,11 +1,12 @@
-//! `twr loop`: review loops from the command line (docs/design/loops.md, docs/usage.md
-//! "Loops"). `review` asks the hub for a loop (`loop.request`); the hub alone decides whether
-//! it starts on the saved settings or raises the thread's setup card, which this command then
-//! shows and, on a terminal, answers as the user says (`attention.respond`, at the revision
-//! shown) or changes in the editor (`loop.setup.update`). `list`, `show` and `report` read
-//! (`loop.list`, `loop.get`, the report file); `pause`, `resume`, `stop` and `skip` control
-//! (`loop.control`); `settings` shows, edits, sets and resets the saved settings
-//! (`loop.settings.*`).
+//! `twr loop`: review and implementation loops from the command line (docs/design/loops.md,
+//! docs/usage.md "Loops"). `review` and `implement` ask the hub for a loop (`loop.request`);
+//! the hub alone decides whether it starts on the saved settings or raises the thread's setup
+//! card, which this command then shows and, on a terminal, answers as the user says
+//! (`attention.respond`, at the revision shown) or changes in the editor (`loop.setup.update`).
+//! `twr thread new … --loop implement` does the same for a new thread (`thread.new {loop}`,
+//! [`after_new_thread`]). `list`, `show` and `report` read (`loop.list`, `loop.get`,
+//! `loop.report`); `pause`, `resume`, `stop` and `skip` control (`loop.control`); `settings`
+//! shows, edits, sets and resets the saved settings (`loop.settings.*`).
 //!
 //! There is no flag that starts a first loop without its card: the card is how the user
 //! chooses the models a loop runs on, and only an answer to it, or settings the user saved,
@@ -39,6 +40,9 @@ const START: &str = "start and save these settings";
 
 /// The setup card's option that starts nothing and saves nothing.
 const CANCEL: &str = "cancel";
+
+/// The option of a setup card that holds a task: send the task as your own message, no loop.
+const RUN_WITHOUT: &str = twr_core::event::LOOP_SETUP_RUN_WITHOUT;
 
 /// `twr loop review`'s exit code when it leaves the setup card open: the loop waits on you
 /// (as `twr wait`'s 2).
@@ -82,6 +86,54 @@ pub(super) enum LoopCmd {
         /// This run's commit: match (commit the fixes if the thread commits its work) or none.
         #[arg(long, value_parser = commit_arg)]
         commit: Option<String>,
+        /// Print `loop.request`'s answer as JSON (with the card, `loop.setup.get`'s, when it
+        /// needs one); never asks.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start an implementation loop in a thread: it plans the task, has the plan reviewed when
+    /// it touches a contract, implements it with the gates green, then runs the review loop on
+    /// the result, and commits at the end. The task is the words after the thread (`-` alone
+    /// reads it from stdin; --task-file from a file); without one, it is what the thread's
+    /// conversation already settled. Changes already in the worktree are the loop's baseline:
+    /// out of its scope and out of its commit. It starts at once on your saved loop settings;
+    /// the first time, with --setup, or when a saved setting no longer holds, the thread's
+    /// settings card comes first, as for `twr loop review`, with one more answer when it holds a
+    /// task: run without a loop (the task goes to the thread as your own message). Without a
+    /// terminal the card stays open, this prints the `twr respond` lines for it, and exits 2.
+    Implement {
+        /// Thread id, name, alias or unique prefix.
+        thread: String,
+        /// The task, as words (`-` alone: read it from stdin). Put `--` before a task whose
+        /// words start with `-`.
+        #[arg(value_name = "TASK", conflicts_with = "task_file")]
+        task: Vec<String>,
+        /// Read the task from this file (for a long one).
+        #[arg(long, value_name = "PATH")]
+        task_file: Option<std::path::PathBuf>,
+        /// Show the settings card first, even when saved settings hold; starting from it saves
+        /// what it shows.
+        #[arg(long)]
+        setup: bool,
+        /// This run's profile: low, medium, high, or one of your [loops.profiles].
+        #[arg(long, value_parser = profile_arg)]
+        profile: Option<String>,
+        /// This run's reviewer: runtime[:account]/model (codex/gpt-6.1-sol).
+        #[arg(long, value_parser = reviewer_arg)]
+        reviewer: Option<String>,
+        /// This run's implementer: thread (its own model), or runtime[:account]/model[:effort]
+        /// on the thread's own runtime.
+        #[arg(long, value_parser = implementer_arg)]
+        implementer: Option<String>,
+        /// This run's workers, the implementer's subagents: model[:effort].
+        #[arg(long, value_parser = workers_arg)]
+        workers: Option<String>,
+        /// This run's commit: end (one commit at the end), per-round, or none.
+        #[arg(long, value_parser = impl_commit_arg)]
+        commit: Option<String>,
+        /// This run's plan check: contracts (when the plan touches a contract), always or never.
+        #[arg(long, value_parser = plan_check_arg)]
+        plan_check: Option<String>,
         /// Print `loop.request`'s answer as JSON (with the card, `loop.setup.get`'s, when it
         /// needs one); never asks.
         #[arg(long)]
@@ -141,12 +193,13 @@ pub(super) enum LoopCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Print the report of a thread's last loop (its `report.md`). It reads the file where
-    /// the hub wrote it, so it works on the hub's machine.
+    /// Print the report of a thread's loop (its running one's, else its last one's: its
+    /// `report.md`), as the hub reads it (`loop.report`), so it works from any machine that
+    /// reaches the hub. A long report is cut, with a line saying where the whole of it is.
     Report {
         /// Thread id, name, alias or unique prefix.
         thread: String,
-        /// Print `{thread, id, path, text}` as JSON.
+        /// Print `loop.report`'s answer as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -207,6 +260,13 @@ pub(super) enum LoopSettingsCmd {
         /// What a review loop commits: match or none.
         #[arg(long, value_parser = commit_arg)]
         commit: Option<String>,
+        /// What an implementation loop commits: end, per-round or none.
+        #[arg(long, value_parser = impl_commit_arg)]
+        implementation_commit: Option<String>,
+        /// When an implementation loop checks its plan: profile (the profile's), contracts,
+        /// always or never.
+        #[arg(long, value_parser = ["profile", "contracts", "always", "never"])]
+        plan_check: Option<String>,
         /// Print `loop.settings.set`'s answer as JSON.
         #[arg(long)]
         json: bool,
@@ -239,6 +299,130 @@ fn workers_arg(s: &str) -> Result<String, String> {
 
 fn commit_arg(s: &str) -> Result<String, String> {
     ReviewCommit::parse(s).map(|c| c.as_str().to_string())
+}
+
+fn impl_commit_arg(s: &str) -> Result<String, String> {
+    ImplCommit::parse(s).map(|c| c.as_str().to_string())
+}
+
+fn plan_check_arg(s: &str) -> Result<String, String> {
+    PlanCheck::parse(s).map(|c| c.as_str().to_string())
+}
+
+/// The flags of `twr thread new … --loop implement`: the new thread runs its first prompt, the
+/// task, as an implementation loop (`thread.new {loop}`).
+#[derive(Debug, Default, clap::Args)]
+pub(super) struct NewLoopArgs {
+    /// Run the new thread as a loop: `implement` (an implementation loop whose task is the
+    /// words after the project, or --task-file, or `-` for stdin).
+    #[arg(long = "loop", value_name = "KIND", value_parser = ["implement"])]
+    pub(super) kind: Option<String>,
+    /// The task (with --loop implement): the thread's first prompt. `-` alone reads it from
+    /// stdin. Put `--` before a task whose words start with `-`.
+    #[arg(value_name = "TASK", requires = "kind", conflicts_with = "task_file")]
+    pub(super) task: Vec<String>,
+    /// Read the task from this file (with --loop implement).
+    #[arg(long, value_name = "PATH", requires = "kind")]
+    pub(super) task_file: Option<std::path::PathBuf>,
+    /// Show the loop's settings card first, even when saved settings hold.
+    #[arg(long, requires = "kind")]
+    pub(super) setup: bool,
+    /// The loop's profile for this run: low, medium, high, or one of your [loops.profiles].
+    #[arg(long, value_parser = profile_arg, requires = "kind")]
+    pub(super) profile: Option<String>,
+    /// The loop's reviewer for this run: runtime[:account]/model.
+    #[arg(long, value_parser = reviewer_arg, requires = "kind")]
+    pub(super) reviewer: Option<String>,
+    /// The loop's implementer for this run: thread, or runtime[:account]/model[:effort]. A
+    /// named one is the runtime and model the thread is made on, unless --runtime or --model
+    /// says otherwise.
+    #[arg(long, value_parser = implementer_arg, requires = "kind")]
+    pub(super) implementer: Option<String>,
+    /// The loop's workers for this run: model[:effort].
+    #[arg(long, value_parser = workers_arg, requires = "kind")]
+    pub(super) workers: Option<String>,
+    /// The loop's commit for this run: end, per-round or none.
+    #[arg(long, value_parser = impl_commit_arg, requires = "kind")]
+    pub(super) commit: Option<String>,
+    /// The loop's plan check for this run: contracts, always or never.
+    #[arg(long, value_parser = plan_check_arg, requires = "kind")]
+    pub(super) plan_check: Option<String>,
+    /// Print `thread.new`'s answer as JSON (with the loop's card when it needs one); never
+    /// asks.
+    #[arg(long)]
+    pub(super) json: bool,
+}
+
+/// `thread.new`'s `loop` of `twr thread new … --loop implement`: `{kind, task, setup?,
+/// overrides?}`, and whether the task was read from stdin. A new thread's loop needs a task.
+pub(super) fn new_thread_loop_param(a: NewLoopArgs) -> anyhow::Result<(Value, bool)> {
+    let kind = a.kind.unwrap_or_else(|| "implement".into());
+    let (task, stdin) = read_task(&a.task, a.task_file.as_deref())?;
+    let Some(task) = task else {
+        bail!(
+            "--loop {kind} needs the task: the words after the project (or --task-file, or `-` \
+             to read it from stdin), the new thread's first prompt"
+        );
+    };
+    let mut l = json!({ "kind": kind, "task": task });
+    if a.setup {
+        l["setup"] = json!(true);
+    }
+    if let Some(o) = overrides_of([
+        ("profile", a.profile),
+        ("reviewer", a.reviewer),
+        ("implementer", a.implementer),
+        ("workers", a.workers),
+        ("commit", a.commit),
+        ("plan_check", a.plan_check),
+    ]) {
+        l["overrides"] = o;
+    }
+    Ok((l, stdin))
+}
+
+/// This run's overrides from the flags given, as `loop.request` takes them.
+fn overrides_of(pairs: [(&str, Option<String>); 6]) -> Option<Value> {
+    let mut overrides = serde_json::Map::new();
+    for (k, v) in pairs {
+        if let Some(v) = v {
+            overrides.insert(k.into(), json!(v));
+        }
+    }
+    (!overrides.is_empty()).then_some(Value::Object(overrides))
+}
+
+/// The task of an implementation loop from its words (joined by single spaces; `-` alone:
+/// stdin) or `file`; `None` when there is none. The second value: whether stdin was read
+/// (no terminal is left to answer a card on).
+fn read_task(
+    words: &[String],
+    file: Option<&std::path::Path>,
+) -> anyhow::Result<(Option<String>, bool)> {
+    let (text, stdin) = match (words, file) {
+        (_, Some(f)) => (
+            std::fs::read_to_string(f)
+                .with_context(|| format!("cannot read the task from {}", f.display()))?,
+            false,
+        ),
+        ([one], None) if one == "-" => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                .context("cannot read the task from stdin")?;
+            (text, true)
+        }
+        (words, None) => (
+            words
+                .iter()
+                .map(|w| w.trim())
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
+            false,
+        ),
+    };
+    let text = text.trim();
+    Ok(((!text.is_empty()).then(|| text.to_string()), stdin))
 }
 
 /// The hub's preset id of `--preset`'s word.
@@ -298,7 +482,47 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
             } else {
                 consent(false, &mut ask)
             };
-            review(socket, params, json, consent).await
+            request(socket, params, json, consent).await
+        }
+        LoopCmd::Implement {
+            thread,
+            task,
+            task_file,
+            setup,
+            profile,
+            reviewer,
+            implementer,
+            workers,
+            commit,
+            plan_check,
+            json,
+        } => {
+            refuse_agent_action("start a loop")?;
+            let (task, stdin) = read_task(&task, task_file.as_deref())?;
+            let mut params = json!({ "thread": thread, "kind": "implement" });
+            if let Some(t) = task {
+                params["task"] = json!(t);
+            }
+            if setup {
+                params["setup"] = json!(true);
+            }
+            if let Some(o) = overrides_of([
+                ("profile", profile),
+                ("reviewer", reviewer),
+                ("implementer", implementer),
+                ("workers", workers),
+                ("commit", commit),
+                ("plan_check", plan_check),
+            ]) {
+                params["overrides"] = o;
+            }
+            let mut ask = ask_on_stderr;
+            let consent = if json || stdin {
+                Consent::NoTerminal
+            } else {
+                consent(false, &mut ask)
+            };
+            request(socket, params, json, consent).await
         }
         LoopCmd::List { json } => {
             let list = connect(socket)
@@ -357,6 +581,8 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
                     workers,
                     reviewer,
                     commit,
+                    implementation_commit,
+                    plan_check,
                     json,
                 }),
             ..
@@ -369,6 +595,8 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
                 workers,
                 reviewer,
                 commit,
+                implementation_commit,
+                plan_check,
             };
             settings_set(socket, project, changes, json).await?;
             Ok(ExitCode::SUCCESS)
@@ -411,8 +639,9 @@ fn project_params(project: &Option<String>) -> Value {
     }
 }
 
-/// `twr loop review`: `loop.request`, then the loop it started, or its setup card.
-async fn review(
+/// `twr loop review` and `twr loop implement`: `loop.request`, then the loop it started, or
+/// its setup card ([`answer_card`]).
+async fn request(
     socket: &Path,
     params: Value,
     json: bool,
@@ -433,31 +662,74 @@ async fn review(
         return Ok(ExitCode::SUCCESS);
     }
     let attn_id = str_of(&r["attn_id"]).to_string();
-    let mut card = c
+    let card = c
         .call("loop.setup.get", json!({ "attn_id": attn_id }))
         .await?;
     if json {
         let mut r = r;
-        r["card"] = card.clone();
-        r["respond"] = json!(respond_line(&card));
+        add_card(&mut r, card);
         outln!("{}", serde_json::to_string_pretty(&r)?);
         return Ok(ExitCode::from(LEFT_OPEN));
     }
+    answer_card(&mut c, socket, &thread, card, consent).await
+}
+
+/// `card` (`loop.setup.get`'s) into `r` (`--json`'s answer): `card`, the `respond` line that
+/// starts the loop, and, on a card that holds a task, the `run_without` line.
+fn add_card(r: &mut Value, card: Value) {
+    r["respond"] = json!(respond_line(&card, START));
+    if offers_run_without(&card) {
+        r["run_without"] = json!(respond_line(&card, RUN_WITHOUT));
+    }
+    r["card"] = card;
+}
+
+/// Whether `card` has the option [`RUN_WITHOUT`] (it holds a task).
+fn offers_run_without(card: &Value) -> bool {
+    card["options"]
+        .as_array()
+        .is_some_and(|o| o.iter().any(|x| x == RUN_WITHOUT))
+}
+
+/// The setup card `card` of thread `thread`'s loop, shown and, on a terminal (`consent`),
+/// answered: start and save (then the loop it started), change… (the editor, then the card
+/// again), cancel, or, on a card that holds a task, run without a loop. Without a terminal
+/// the card stays open and the `twr respond` lines that answer it are printed: exit 2.
+async fn answer_card(
+    c: &mut twr_core::client::Client,
+    socket: &Path,
+    thread: &str,
+    mut card: Value,
+    consent: Consent<'_>,
+) -> anyhow::Result<ExitCode> {
     let Consent::Ask(ask) = consent else {
         outln!("{}", card_text(&card));
         std::io::stdout().flush()?;
         errln!(
             "twr: no terminal to answer it on: the card stays open; start the loop and save \
-             these settings with `{}`, or answer it in the TUI or the apps",
-            respond_line(&card)
+             these settings with `{}`{}, or answer it in the TUI or the apps",
+            respond_line(&card, START),
+            if offers_run_without(&card) {
+                format!(
+                    ", send the task as your own message with no loop with `{}`",
+                    respond_line(&card, RUN_WITHOUT)
+                )
+            } else {
+                String::new()
+            }
         );
         return Ok(ExitCode::from(LEFT_OPEN));
     };
     loop {
         outln!("{}", card_text(&card));
         std::io::stdout().flush()?;
-        let reply = ask("1 start and save  2 change…  3 cancel: ")?;
-        match card_reply(&reply) {
+        let without = offers_run_without(&card);
+        let reply = ask(if without {
+            "1 start and save  2 change…  3 cancel  4 run without a loop: "
+        } else {
+            "1 start and save  2 change…  3 cancel: "
+        })?;
+        match card_reply(&reply, without) {
             CardReply::Start => {
                 c.call("attention.respond", answer_params(&card, START))
                     .await?;
@@ -471,7 +743,16 @@ async fn review(
                 outln!("cancelled: no loop started, nothing saved");
                 return Ok(ExitCode::SUCCESS);
             }
-            CardReply::Change => match change_card(&mut c, socket, &card).await {
+            CardReply::RunWithout => {
+                c.call("attention.respond", answer_params(&card, RUN_WITHOUT))
+                    .await?;
+                outln!(
+                    "sent the task to {} as your own message: no loop, nothing saved",
+                    str_of(&card["thread_name"])
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+            CardReply::Change => match change_card(c, socket, &card).await {
                 Ok(Some(again)) => card = again,
                 Ok(None) => outln!("no changes"),
                 Err(e) => errln!("twr: {}", localize(&format!("{e:#}"))),
@@ -480,10 +761,65 @@ async fn review(
                 outln!(
                     "the card stays open: start the loop and save these settings with `{}`, or \
                      answer it in the TUI or the apps",
-                    respond_line(&card)
+                    respond_line(&card, START)
                 );
                 return Ok(ExitCode::from(LEFT_OPEN));
             }
+        }
+    }
+}
+
+/// `twr thread new … --loop implement`: what `thread.new`'s answer `t` says of the loop it
+/// asked for (`t["loop"]`, `loop.request`'s answer, or an error the thread was made despite):
+/// the loop it started, or its card, answered on a terminal (`consent`) as `twr loop implement`
+/// does. `json`: the whole answer, with the card. Exit 2 while the card stays open; 1 when the
+/// loop could not be asked for (the thread stays, idle).
+pub(super) async fn after_new_thread(
+    socket: &Path,
+    t: Value,
+    json: bool,
+    consent: Consent<'_>,
+) -> anyhow::Result<ExitCode> {
+    let thread = str_of(&t["id"]).to_string();
+    let name = str_of(&t["name"]).to_string();
+    let l = t["loop"].clone();
+    let mut c = connect(socket).await?;
+    match l["status"].as_str() {
+        Some("started") => {
+            let detail = c.call("loop.get", json!({ "thread": thread })).await?;
+            if json {
+                let mut t = t;
+                t["loop"]["detail"] = detail;
+                outln!("{}", serde_json::to_string_pretty(&t)?);
+            } else {
+                outln!("{}", started_text(&detail));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some("needs_setup") => {
+            let card = c
+                .call("loop.setup.get", json!({ "attn_id": l["attn_id"] }))
+                .await?;
+            if json {
+                let mut t = t;
+                add_card(&mut t["loop"], card);
+                outln!("{}", serde_json::to_string_pretty(&t)?);
+                return Ok(ExitCode::from(LEFT_OPEN));
+            }
+            answer_card(&mut c, socket, &thread, card, consent).await
+        }
+        _ => {
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&t)?);
+            } else {
+                errln!(
+                    "twr: {name} was made, but its loop did not start: {} ({}); the thread is \
+                     idle and the task was not sent",
+                    localize(l["message"].as_str().unwrap_or("no answer from the hub")),
+                    l["code"].as_str().unwrap_or("error")
+                );
+            }
+            Ok(ExitCode::FAILURE)
         }
     }
 }
@@ -494,15 +830,19 @@ enum CardReply {
     Start,
     Change,
     Cancel,
+    /// Run the held task without a loop (only on a card that holds one).
+    RunWithout,
     /// Anything else: the card stays open.
     Open,
 }
 
-fn card_reply(reply: &str) -> CardReply {
+/// The answer `reply` gives a card (`without`: one that offers [`RUN_WITHOUT`]).
+fn card_reply(reply: &str, without: bool) -> CardReply {
     match reply.trim().to_ascii_lowercase().as_str() {
         "1" | "start" | START => CardReply::Start,
         "2" | "change" | "change…" | "change..." => CardReply::Change,
         "3" | CANCEL => CardReply::Cancel,
+        "4" | "run" | "without" | RUN_WITHOUT if without => CardReply::RunWithout,
         _ => CardReply::Open,
     }
 }
@@ -513,10 +853,10 @@ fn answer_params(card: &Value, answer: &str) -> Value {
     json!({ "attn_id": card["attn_id"], "revision": card["revision"], "answer": answer })
 }
 
-/// The `twr respond` line that starts the loop from `card` later.
-fn respond_line(card: &Value) -> String {
+/// The `twr respond` line that answers `card` with `answer` later (`START`: starts the loop).
+fn respond_line(card: &Value, answer: &str) -> String {
     format!(
-        "twr{} respond {} \"{START}\"",
+        "twr{} respond {} \"{answer}\"",
         workspace_hint(),
         revisioned_id(card)
     )
@@ -543,10 +883,12 @@ async fn change_card(
         .context("the card's settings do not read")?;
     let avail = c.call("loop.settings.get", json!({})).await?;
     let thread = str_of(&card["thread_name"]).to_string();
+    let implement = setup["kind"] == "implement";
     let doc = render_doc(
         &settings,
         &DocFor::Card {
             thread: &thread,
+            implement,
             project: setup["project"].as_str(),
             save_for: setup["save_for"].as_str().unwrap_or("all"),
             scope: setup["scope"].as_str(),
@@ -556,7 +898,13 @@ async fn change_card(
     let Some((text, tmp)) = edit_in_editor(&doc, "twr-loop-card")? else {
         return Ok(None);
     };
-    let edited = match parse_doc(&text, &settings, true) {
+    let edited = match parse_doc(&text, &settings, true).and_then(|e| match e {
+        Some(e) if implement && e.scope.is_some() => bail!(
+            "scope: an implementation loop has no scope (what the worktree holds when it \
+                 starts is its baseline)"
+        ),
+        e => Ok(e),
+    }) {
         Ok(Some(e)) => e,
         Ok(None) => return Ok(None),
         Err(e) => bail!(
@@ -629,50 +977,31 @@ fn control_text(action: &str, r: &Value) -> String {
     format!("{name}'s loop {done} ({})", str_of(&r["line"]))
 }
 
-/// `twr loop report`: the last loop's `report.md`, read where the hub wrote it.
+/// `twr loop report`: the report of the thread's loop as the hub reads it (`loop.report`).
 async fn report(socket: &Path, thread: &str, json: bool) -> anyhow::Result<ExitCode> {
-    let detail = connect(socket)
+    let r = connect(socket)
         .await?
-        .call("loop.get", json!({ "thread": thread }))
+        .call("loop.report", json!({ "thread": thread }))
         .await?;
-    let name = str_of(&detail["thread_name"]).to_string();
-    let Some(path) = detail["report_path"]
-        .as_str()
-        .or_else(|| detail["files"]["report"].as_str())
-    else {
-        if detail["running"] == true {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Some(text) = r["text"].as_str() else {
+        let name = str_of(&r["thread_name"]);
+        let note = r["note"].as_str().unwrap_or("there is no report to read");
+        if r["running"] == true {
             bail!(
-                "{name}'s loop is still running: its report is written when it ends (`twr{w} \
-                 loop show {name}` shows where it is)",
+                "{}; `twr{w} loop show {name}` shows where it is",
+                localize(note),
                 w = workspace_hint()
             );
         }
-        bail!("{name}'s last loop wrote no report");
+        bail!("{}", localize(note));
     };
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        anyhow!(
-            "cannot read {name}'s loop report at {path} ({e}): the hub wrote it on its own \
-             machine, and `twr loop report` reads it there (on another machine, `twr{w} loop \
-             show {name}` shows the loop)",
-            w = workspace_hint()
-        )
-    })?;
-    if json {
-        outln!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "thread": detail["thread"],
-                "thread_name": name,
-                "id": detail["id"],
-                "path": path,
-                "text": text,
-            }))?
-        );
-    } else {
-        out!("{text}");
-        if !text.ends_with('\n') {
-            outln!();
-        }
+    out!("{text}");
+    if !text.ends_with('\n') {
+        outln!();
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -690,6 +1019,8 @@ struct Changes {
     workers: Option<String>,
     reviewer: Option<String>,
     commit: Option<String>,
+    implementation_commit: Option<String>,
+    plan_check: Option<String>,
 }
 
 /// The settings `twr loop settings set` and `--edit` start from: those that apply to
@@ -742,6 +1073,15 @@ async fn settings_set(
     if let Some(k) = ch.commit {
         s.review_commit = ReviewCommit::parse(&k).map_err(parse)?;
     }
+    if let Some(k) = ch.implementation_commit {
+        s.commit = ImplCommit::parse(&k).map_err(parse)?;
+    }
+    if let Some(p) = ch.plan_check {
+        s.plan_check = match p.as_str() {
+            "profile" => None,
+            p => Some(PlanCheck::parse(p).map_err(parse)?),
+        };
+    }
     let mut params = json!({ "settings": s });
     if let Some(p) = &project {
         params["project"] = json!(p);
@@ -762,7 +1102,7 @@ fn saved_text(s: &LoopSettings, project: Option<&str>) -> String {
     };
     format!(
         "saved as {whose} loop settings:\n{}",
-        settings_rows(s, None)
+        settings_rows(s, None, None)
             .iter()
             .map(|r| format!("  {r}"))
             .collect::<Vec<_>>()
@@ -938,6 +1278,7 @@ enum DocFor<'a> {
     /// (`save_for`) and what the run reviews (`scope`).
     Card {
         thread: &'a str,
+        implement: bool,
         project: Option<&'a str>,
         save_for: &'a str,
         scope: Option<&'a str>,
@@ -960,7 +1301,11 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
             saved,
         } => format!(
             "# twr loop settings: {p}'s own{}. Saving them makes them {p}'s own.",
-            if *saved { "" } else { " (none saved yet: these are what would apply)" }
+            if *saved {
+                ""
+            } else {
+                " (none saved yet: these are what would apply)"
+            }
         ),
         DocFor::Saved {
             project: None,
@@ -973,9 +1318,16 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
                 " (none saved yet: these are what the first settings card shows)"
             }
         ),
-        DocFor::Card { thread, .. } => format!(
-            "# The settings card of {thread}'s review loop. Saving this changes the card; the loop\n\
-             # starts, and they are saved, only when you answer it `1 start and save`."
+        DocFor::Card {
+            thread, implement, ..
+        } => format!(
+            "# The settings card of {thread}'s {} loop. Saving this changes the card; the loop\n\
+             # starts, and they are saved, only when you answer it `1 start and save`.",
+            if *implement {
+                "implementation"
+            } else {
+                "review"
+            }
         ),
     };
     out.push_str(&head);
@@ -1024,10 +1376,12 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
         "# \"none\".".into(),
         format!("commit = {}", toml_str(s.review_commit.as_str())),
         String::new(),
-        "# Implementation loops (a later version): what one commits (\"end\", \"per-round\",".into(),
-        "# \"none\") and when it checks its plan (\"profile\": the profile's; \"never\",".into(),
-        "# \"contracts\", \"always\").".into(),
+        "# What an implementation loop commits: \"end\" (one commit of its work at its end),".into(),
+        "# \"per-round\" (each step that changed something commits it) or \"none\".".into(),
         format!("implementation_commit = {}", toml_str(s.commit.as_str())),
+        String::new(),
+        "# When an implementation loop has its plan reviewed: \"profile\" (the profile's),".into(),
+        "# \"contracts\" (when the plan touches a contract), \"always\" or \"never\".".into(),
         format!(
             "plan_check = {}",
             toml_str(s.plan_check.map_or("profile", PlanCheck::as_str))
@@ -1038,6 +1392,7 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
         out.push('\n');
     }
     if let DocFor::Card {
+        implement,
         project,
         save_for,
         scope,
@@ -1056,13 +1411,16 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
             ),
         }
         out.push_str(&format!("save_for = {}\n", toml_str(save_for)));
-        out.push_str(
-            "\n# What this run reviews: \"branch\", \"uncommitted\", \"since <ref>\" or \"last <n>\".\n",
-        );
-        out.push_str(&format!(
-            "scope = {}\n",
-            toml_str(scope.unwrap_or("branch"))
-        ));
+        // (An implementation loop has no scope: its baseline is what the worktree holds.)
+        if !implement {
+            out.push_str(
+                "\n# What this run reviews: \"branch\", \"uncommitted\", \"since <ref>\" or \"last <n>\".\n",
+            );
+            out.push_str(&format!(
+                "scope = {}\n",
+                toml_str(scope.unwrap_or("branch"))
+            ));
+        }
     }
     let runtimes: Vec<String> = got["runtimes"]
         .as_array()
@@ -1222,8 +1580,9 @@ fn transition_words(reason: &str) -> &str {
     }
 }
 
-/// The rows of settings `s` (`runtime · model · effort`), with this run's `overrides`.
-fn settings_rows(s: &LoopSettings, overrides: Option<&Value>) -> Vec<String> {
+/// The rows of settings `s` (`runtime · model · effort`) for a loop of `kind` (`review`,
+/// `implement`; `None`: saved settings, which both kinds share), with this run's `overrides`.
+fn settings_rows(s: &LoopSettings, overrides: Option<&Value>, kind: Option<&str>) -> Vec<String> {
     let mut rows = vec![
         format!("profile      {}", s.profile),
         format!(
@@ -1234,8 +1593,23 @@ fn settings_rows(s: &LoopSettings, overrides: Option<&Value>) -> Vec<String> {
         ),
         format!("workers      {}", s.workers),
         format!("reviewer     {}", s.reviewer),
-        format!("commit       {}", s.review_commit.as_str()),
     ];
+    let plan_check = s.plan_check.map_or("the profile's", PlanCheck::as_str);
+    match kind {
+        Some("review") => rows.push(format!("commit       {}", s.review_commit.as_str())),
+        Some(_) => {
+            rows.push(format!("plan check   {plan_check}"));
+            rows.push(format!("commit       {}", s.commit.as_str()));
+        }
+        None => {
+            rows.push(format!(
+                "commit       {} (review loops), {} (implementation loops)",
+                s.review_commit.as_str(),
+                s.commit.as_str()
+            ));
+            rows.push(format!("plan check   {plan_check}"));
+        }
+    }
     if let Some(o) = overrides
         .and_then(Value::as_object)
         .filter(|o| !o.is_empty())
@@ -1261,23 +1635,48 @@ fn source_words(started: &Value) -> String {
     }
 }
 
-/// What `twr loop review` prints of a loop it started (`loop.get`'s answer).
-fn started_text(d: &Value) -> String {
-    let name = str_of(&d["thread_name"]);
-    let started = &d["started"];
-    let mut out = vec![format!(
-        "{name}: review loop started ({})",
-        d["line"].as_str().unwrap_or("-")
-    )];
-    out.push(format!(
-        "  on {} (`twr{w} loop settings` shows them; `twr{w} loop review {name} --setup` changes \
-         them first)",
-        source_words(started),
-        w = workspace_hint()
-    ));
+/// A loop's kind in words (`review loop`, `implementation loop`), from `loop.get`'s `kind`.
+fn kind_words(kind: &Value) -> &'static str {
+    match kind.as_str() {
+        Some("implement") => "implementation loop",
+        _ => "review loop",
+    }
+}
+
+/// The command that starts a loop of `kind` (`review`, `implement`).
+fn kind_command(kind: &Value) -> &'static str {
+    match kind.as_str() {
+        Some("implement") => "implement",
+        _ => "review",
+    }
+}
+
+/// An implementation loop's task as a line: its first line, cut at 100 characters, then how
+/// many more lines it has.
+fn task_line(task: &str) -> String {
+    let lines: Vec<&str> = task.lines().filter(|l| !l.trim().is_empty()).collect();
+    let first = lines.first().map_or("", |l| l.trim());
+    let mut out: String = first.chars().take(100).collect();
+    if first.chars().count() > 100 {
+        out.push('…');
+    }
+    if lines.len() > 1 {
+        out.push_str(&format!(
+            " (+{} more line{})",
+            lines.len() - 1,
+            if lines.len() == 2 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
+/// The rows of a loop's start (`loop.get`'s `started`): its settings, where they came from is
+/// said by the caller; then its scope or task and baseline.
+fn start_rows(started: &Value, kind: &Value) -> Vec<String> {
+    let mut out = Vec::new();
     if let Ok(s) = serde_json::from_value::<LoopSettings>(started["settings"].clone()) {
         out.extend(
-            settings_rows(&s, Some(&started["overrides"]))
+            settings_rows(&s, Some(&started["overrides"]), Some(kind_command(kind)))
                 .into_iter()
                 .map(|r| format!("  {r}")),
         );
@@ -1285,6 +1684,56 @@ fn started_text(d: &Value) -> String {
     if let Some(scope) = started["scope"].as_str() {
         out.push(format!("  scope        {scope}"));
     }
+    if kind.as_str() == Some("implement") {
+        out.push(format!(
+            "  task         {}",
+            match started["task"]
+                .as_str()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                Some(t) => task_line(t),
+                None => "what the conversation already settled".into(),
+            }
+        ));
+        for b in started["baseline"]
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.values())
+            .filter(|b| b["changed"].as_u64().unwrap_or(0) > 0)
+        {
+            out.push(format!(
+                "  baseline     {} (out of scope, left out of the commit)",
+                str_of(&b["summary"])
+            ));
+        }
+    }
+    out
+}
+
+/// What `twr loop review` and `twr loop implement` print of a loop they started (`loop.get`'s
+/// answer).
+fn started_text(d: &Value) -> String {
+    let name = str_of(&d["thread_name"]);
+    let started = &d["started"];
+    let kind = if d["kind"].is_null() {
+        &started["kind"]
+    } else {
+        &d["kind"]
+    };
+    let mut out = vec![format!(
+        "{name}: {} started ({})",
+        kind_words(kind),
+        d["line"].as_str().unwrap_or("-")
+    )];
+    out.push(format!(
+        "  on {} (`twr{w} loop settings` shows them; `twr{w} loop {} {name} --setup` changes \
+         them first)",
+        source_words(started),
+        kind_command(kind),
+        w = workspace_hint()
+    ));
+    out.extend(start_rows(started, kind));
     out.join("\n")
 }
 
@@ -1378,7 +1827,8 @@ fn show_text(d: &Value) -> String {
         ));
     } else {
         out.push(format!(
-            "{name}: {kind} loop {} (ended: {})",
+            "{name}: {} {} (ended: {})",
+            kind_words(&d["kind"]),
             str_of(&d["id"]),
             outcome_words(d["outcome"].as_str().unwrap_or("-"))
         ));
@@ -1390,16 +1840,7 @@ fn show_text(d: &Value) -> String {
             source_words(started),
             clock(&started["at"])
         ));
-        if let Ok(s) = serde_json::from_value::<LoopSettings>(started["settings"].clone()) {
-            out.extend(
-                settings_rows(&s, Some(&started["overrides"]))
-                    .into_iter()
-                    .map(|r| format!("  {r}")),
-            );
-        }
-        if let Some(scope) = started["scope"].as_str() {
-            out.push(format!("  scope        {scope}"));
-        }
+        out.extend(start_rows(started, &d["kind"]));
         for b in started["bases"].as_array().into_iter().flatten() {
             out.push(format!(
                 "  repository   {} (from {})",
@@ -1418,6 +1859,7 @@ fn show_text(d: &Value) -> String {
     if let Some(goal) = phases.iter().find_map(|p| p["goal"].as_str()) {
         out.push(format!("goal: {}", first_line(goal)));
     }
+    out.extend(plan_rows(d));
     let rounds = d["rounds"].as_array().cloned().unwrap_or_default();
     if !rounds.is_empty() {
         out.push("rounds:".into());
@@ -1425,6 +1867,12 @@ fn show_text(d: &Value) -> String {
     for r in &rounds {
         let id = str_of(&r["id"]);
         let effort = r["effort"].as_str().unwrap_or("");
+        // (The plan check's round reviews the plan, not the work.)
+        let effort = if id == "p1" {
+            format!("{effort} (plan check)")
+        } else {
+            effort.to_string()
+        };
         if r["failed"] == true {
             out.push(format!(
                 "  {id} {effort}: failed: {}",
@@ -1512,6 +1960,7 @@ fn show_text(d: &Value) -> String {
                 .unwrap_or_default()
         ));
     }
+    out.extend(commit_rows(d));
     if d["ended"].is_object() {
         let e = &d["ended"];
         out.push(format!(
@@ -1531,6 +1980,88 @@ fn show_text(d: &Value) -> String {
         out.push(format!("report: {r}"));
     }
     out.join("\n")
+}
+
+/// An implementation loop's plan and implement rows of `loop.get`'s answer `d`: each plan
+/// (revision, contract risk, path) and each implement turn's result.
+fn plan_rows(d: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in d["plans"].as_array().into_iter().flatten() {
+        let risk = match p["contract_risk"].as_bool() {
+            Some(true) => "contract risk: yes",
+            Some(false) => "contract risk: no",
+            None => "contract risk: -",
+        };
+        out.push(format!(
+            "plan {}: {risk}{} ({})",
+            p["revision"].as_u64().unwrap_or(1),
+            p["reason"]
+                .as_str()
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" — {}", first_line(r)))
+                .unwrap_or_default(),
+            p["path"].as_str().unwrap_or("-")
+        ));
+    }
+    for i in d["implemented"].as_array().into_iter().flatten() {
+        let ran: Vec<&str> = i["gates"]["ran"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        out.push(format!(
+            "implement: {}, gates {}{}{}",
+            str_of(&i["status"]),
+            i["gates"]["result"].as_str().unwrap_or("-"),
+            if ran.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", ran.join(", "))
+            },
+            if i["accepted"] == false {
+                " — sent back: gates must be green before review"
+            } else {
+                ""
+            }
+        ));
+    }
+    out
+}
+
+/// The commit rows of `loop.get`'s answer `d`: each check of the hub's (passed or what was
+/// wrong, and its notes), then, once the loop ended, what it committed and what it did not.
+/// A repository is committed or has a problem, never both.
+fn commit_rows(d: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in d["commit_checks"].as_array().into_iter().flatten() {
+        let problems: Vec<&str> = c["problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        out.push(if problems.is_empty() {
+            "commit check: passed".to_string()
+        } else {
+            format!("commit check: failed: {}", problems.join("; "))
+        });
+        for n in c["notes"].as_array().into_iter().flatten() {
+            out.push(format!("  note: {}", str_of(n)));
+        }
+    }
+    let e = &d["ended"];
+    for c in e["commits"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "committed: {} ({})",
+            str_of(&c["sha"]),
+            str_of(&c["repo"])
+        ));
+    }
+    if let Some(p) = e["commit_problem"].as_str() {
+        out.push(format!("not committed: {p}"));
+    }
+    out
 }
 
 /// ` — fixed (new-class, bounds)`, ` — dismissed: <reason>`, ` — duplicate of L1`.
@@ -1579,7 +2110,7 @@ fn settings_text(got: &Value, project: Option<&str>) -> String {
     });
     if let Ok(s) = serde_json::from_value::<LoopSettings>(shown.clone()) {
         out.extend(
-            settings_rows(&s, None)
+            settings_rows(&s, None, None)
                 .into_iter()
                 .map(|r| format!("  {r}")),
         );
@@ -1705,6 +2236,131 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("is not runtime[:account]/model"), "{e}");
+    }
+
+    /// `twr loop implement` takes `/implement`'s flags and the task as words (`--` before words
+    /// that start with `-`), or from a file; `twr thread new … --loop implement` the same, its
+    /// loop flags only with `--loop`.
+    #[test]
+    fn implement_parses() {
+        match loop_cmd(&[
+            "loop",
+            "implement",
+            "api",
+            "--setup",
+            "--plan-check",
+            "always",
+            "--commit",
+            "per-round",
+            "--profile",
+            "low",
+            "add",
+            "a",
+            "CSV export",
+            "--json",
+        ]) {
+            LoopCmd::Implement {
+                thread,
+                task,
+                task_file,
+                setup,
+                commit,
+                plan_check,
+                profile,
+                json,
+                ..
+            } => {
+                assert_eq!(thread, "api");
+                assert_eq!(task, ["add", "a", "CSV export"]);
+                assert!(task_file.is_none() && setup && json);
+                assert_eq!(commit.as_deref(), Some("per-round"));
+                assert_eq!(plan_check.as_deref(), Some("always"));
+                assert_eq!(profile.as_deref(), Some("low"));
+                assert_eq!(
+                    read_task(&task, None).unwrap(),
+                    (Some("add a CSV export".into()), false)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        match loop_cmd(&["loop", "implement", "api", "--", "--flags", "stay"]) {
+            LoopCmd::Implement { task, .. } => assert_eq!(task, ["--flags", "stay"]),
+            other => panic!("{other:?}"),
+        }
+        match loop_cmd(&["loop", "implement", "api"]) {
+            LoopCmd::Implement { task, .. } => {
+                assert_eq!(read_task(&task, None).unwrap(), (None, false))
+            }
+            other => panic!("{other:?}"),
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("task.md");
+        std::fs::write(&file, "\n  a long task\nover lines \n").unwrap();
+        assert_eq!(
+            read_task(&[], Some(&file)).unwrap(),
+            (Some("a long task\nover lines".into()), false)
+        );
+        for bad in [
+            &["loop", "implement", "api", "--commit", "match"][..],
+            &["loop", "implement", "api", "--plan-check", "sometimes"],
+            &["loop", "implement", "api", "--scope", "branch"],
+            &[
+                "loop",
+                "implement",
+                "api",
+                "--task-file",
+                "/t",
+                "and",
+                "words",
+            ],
+            &["loop", "implement"],
+            &["thread", "new", ".", "--setup"],
+            &["thread", "new", ".", "a", "task"],
+            &["thread", "new", ".", "--loop", "review", "x"],
+            &["thread", "new", ".", "--plan-check", "always"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        let c = parse(&[
+            "thread",
+            "new",
+            "api",
+            "--runtime",
+            "fake",
+            "--loop",
+            "implement",
+            "--setup",
+            "--commit",
+            "none",
+            "add",
+            "rate limiting",
+        ])
+        .unwrap();
+        let Some(super::super::Cmd::Thread {
+            cmd: super::super::ThreadCmd::New {
+                project, new_loop, ..
+            },
+        }) = c.cmd
+        else {
+            panic!("{:?}", c.cmd)
+        };
+        assert_eq!(project, "api");
+        let (l, stdin) = new_thread_loop_param(new_loop).unwrap();
+        assert!(!stdin);
+        assert_eq!(
+            l,
+            json!({"kind": "implement", "task": "add rate limiting", "setup": true,
+                   "overrides": {"commit": "none"}})
+        );
+        let c = parse(&["thread", "new", "api", "--loop", "implement"]).unwrap();
+        let Some(super::super::Cmd::Thread {
+            cmd: super::super::ThreadCmd::New { new_loop, .. },
+        }) = c.cmd
+        else {
+            panic!()
+        };
+        let e = new_thread_loop_param(new_loop).unwrap_err().to_string();
+        assert!(e.contains("needs the task"), "{e}");
     }
 
     #[test]
@@ -1872,6 +2528,7 @@ mod tests {
             &base,
             &DocFor::Card {
                 thread: "api",
+                implement: false,
                 project: Some("api"),
                 save_for: "all",
                 scope: Some("since main"),
@@ -1893,24 +2550,76 @@ mod tests {
         assert_eq!(e.scope.as_deref(), Some("last 2"));
         assert!(parse_doc(&card, &base, false).is_err());
         assert!(parse_doc(&card.replace("\"all\"", "\"some\""), &base, true).is_err());
+        // An implementation loop's card: no scope, and its plan check and commit rows.
+        let card = render_doc(
+            &base,
+            &DocFor::Card {
+                thread: "api",
+                implement: true,
+                project: None,
+                save_for: "all",
+                scope: None,
+            },
+            &got,
+        );
+        assert!(card.contains("implementation loop"), "{card}");
+        assert!(!card.contains("scope ="), "{card}");
+        assert!(!card.contains("later version"), "{card}");
+        let e = parse_doc(
+            &card
+                .replace("plan_check = \"profile\"", "plan_check = \"always\"")
+                .replace(
+                    "implementation_commit = \"end\"",
+                    "implementation_commit = \"none\"",
+                ),
+            &base,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(e.settings.plan_check, Some(PlanCheck::Always));
+        assert_eq!(e.settings.commit, ImplCommit::None);
     }
 
     #[test]
     fn card_replies_and_lines() {
-        assert_eq!(card_reply("1\n"), CardReply::Start);
-        assert_eq!(card_reply(" 2 "), CardReply::Change);
-        assert_eq!(card_reply("3"), CardReply::Cancel);
-        assert_eq!(card_reply("cancel"), CardReply::Cancel);
-        assert_eq!(card_reply(""), CardReply::Open);
-        assert_eq!(card_reply("y"), CardReply::Open);
+        for without in [false, true] {
+            assert_eq!(card_reply("1\n", without), CardReply::Start);
+            assert_eq!(card_reply(" 2 ", without), CardReply::Change);
+            assert_eq!(card_reply("3", without), CardReply::Cancel);
+            assert_eq!(card_reply("cancel", without), CardReply::Cancel);
+            assert_eq!(card_reply("", without), CardReply::Open);
+            assert_eq!(card_reply("y", without), CardReply::Open);
+        }
+        // Only a card that holds a task runs it without a loop.
+        assert_eq!(card_reply("4", false), CardReply::Open);
+        assert_eq!(card_reply("4", true), CardReply::RunWithout);
+        assert_eq!(
+            card_reply("run without a loop", true),
+            CardReply::RunWithout
+        );
         let card = json!({"attn_id": "01A", "revision": 3, "summary": "api: review loop setup"});
         assert_eq!(
-            respond_line(&card),
+            respond_line(&card, START),
             format!(
                 "twr{} respond 01A@3 \"start and save these settings\"",
                 workspace_hint()
             )
         );
+        assert!(!offers_run_without(&card));
+        let held = json!({"attn_id": "01B", "revision": 1,
+            "options": [START, RUN_WITHOUT, CANCEL]});
+        assert!(offers_run_without(&held));
+        let mut r = json!({"status": "needs_setup"});
+        add_card(&mut r, held);
+        assert!(r["run_without"]
+            .as_str()
+            .unwrap()
+            .ends_with("respond 01B@1 \"run without a loop\""));
+        assert!(r["respond"]
+            .as_str()
+            .unwrap()
+            .ends_with("01B@1 \"start and save these settings\""));
         assert_eq!(card_text(&card), "api: review loop setup\n  card: 01A@3");
         assert_eq!(
             answer_params(&card, START),
@@ -1979,6 +2688,66 @@ mod tests {
             "transition: after x1: the last tier converged; verification skipped (it could only \
              repeat that round)"
         ));
+        // An implementation loop: its task, baseline, plans, implement turns, plan check round,
+        // commit checks with their notes, and what it committed and did not.
+        let mut s = LoopSettings::first_card(&Default::default());
+        s.plan_check = Some(PlanCheck::Always);
+        let detail = json!({
+            "thread_name": "api", "id": "L2", "kind": "implement", "running": false,
+            "outcome": "clean",
+            "started": {"settings_from": "setup_item", "settings": s,
+                "task": "add a CSV export\nwith a header row", "bases": [{"repo": "/r", "base": "abc"}],
+                "baseline": {"r": {"changed": 2, "summary": "2 paths already changed: a, b"}}},
+            "plans": [
+                {"revision": 1, "contract_risk": true, "reason": "a new endpoint",
+                 "path": "/data/loops/L2/plan-1.md"},
+                {"revision": 2, "contract_risk": false, "reason": "revised",
+                 "path": "/data/loops/L2/plan.md"}],
+            "implemented": [
+                {"status": "partial", "gates": {"ran": ["cargo test"], "result": "fail"},
+                 "accepted": false},
+                {"status": "done", "gates": {"ran": ["cargo test"], "result": "pass"},
+                 "accepted": true}],
+            "rounds": [{"id": "p1", "effort": "medium", "failed": false, "findings": []}],
+            "commit_checks": [
+                {"problems": ["/r: 1 path is uncommitted beyond the baseline: x.rs"]},
+                {"problems": [], "notes": ["the thread wrote no twr-commit block"]}],
+            "ended": {"outcome": "clean", "commits": [{"repo": "/r", "sha": "abc1234def"}],
+                "commit_problem": "/s: 1 path is uncommitted beyond the baseline: y.rs"},
+        });
+        let text = show_text(&detail);
+        for want in [
+            "api: implementation loop L2 (ended: clean)",
+            "settings (the settings card you answered",
+            "  plan check   always",
+            "  commit       end",
+            "  task         add a CSV export (+1 more line)",
+            "  baseline     2 paths already changed: a, b (out of scope, left out of the commit)",
+            "plan 1: contract risk: yes — a new endpoint (/data/loops/L2/plan-1.md)",
+            "plan 2: contract risk: no — revised (/data/loops/L2/plan.md)",
+            "implement: partial, gates fail (cargo test) — sent back: gates must be green",
+            "implement: done, gates pass (cargo test)\n",
+            "  p1 medium (plan check): clean",
+            "commit check: failed: /r: 1 path is uncommitted beyond the baseline: x.rs",
+            "commit check: passed\n  note: the thread wrote no twr-commit block",
+            "committed: abc1234def (/r)",
+            "not committed: /s: 1 path is uncommitted beyond the baseline: y.rs",
+        ] {
+            assert!(text.contains(want), "{want:?} missing:\n{text}");
+        }
+        assert!(!text.contains("scope "), "{text}");
+        let started = started_text(&json!({"thread_name": "api", "kind": "implement",
+            "line": "low · plan", "started": detail["started"]}));
+        assert!(
+            started.starts_with("api: implementation loop started (low · plan)"),
+            "{started}"
+        );
+        assert!(started.contains("loop implement api --setup"), "{started}");
+        assert!(
+            started.contains("  task         add a CSV export"),
+            "{started}"
+        );
+        assert_eq!(task_line(&"x".repeat(150)), format!("{}…", "x".repeat(100)));
         assert_eq!(
             control_text(
                 "pause",

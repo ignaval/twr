@@ -1,8 +1,8 @@
-/* Review loops in the apps (docs/design/loops.md › Desktop and mobile): the pure logic
- * behind the inspector's Loops section, the loop chip, the Review loop offer, the setup card
- * and the settings editor. Nothing here decides what the hub decides: who may start a loop,
+/* Loops in the apps (docs/design/loops.md › Desktop and mobile): the pure logic behind the
+ * inspector's Loops section, the loop chip, the Review loop offer, Send as implementation
+ * loop, the New thread form's switch, the setup card and the settings editor. Nothing here decides what the hub decides: who may start a loop,
  * on which settings, whether settings hold, the loop line. The hub says; this reads it. */
-import type { Json, Thread } from "./types";
+import type { Attention, Json, Thread } from "./types";
 
 /** `runtime[:account]/model[:effort]`: a named implementer (twr-core `ModelChoice`). */
 export interface ModelChoice {
@@ -88,6 +88,17 @@ export interface LoopSetup {
   warnings?: string[];
   problems?: string[];
   profile?: Json;
+  /** An implementation loop's task, held until the card is answered; none: what the
+   * conversation already settled. */
+  task?: string | null;
+  /** The implementer's runtime runs no subagents: the card has no Workers row (only when
+   * true; a card raised before the hub said so shows the row). */
+  no_workers?: boolean;
+}
+/** A commit a loop made, as the hub's check found it (twr-core `Commit`). */
+export interface Commit {
+  repo: string;
+  sha: string;
 }
 /** A thread's running loop (`thread.loop`, twr-core `LoopState`). */
 export interface LoopState {
@@ -112,6 +123,15 @@ export interface LoopState {
   review_started_at?: string | null;
   outcome?: string | null;
   plan?: { sweep?: boolean; [key: string]: Json };
+  /** An implementation loop: 0 before the plan turn answered, 1 once it did, 2 once the
+   * plan check revised it. */
+  plan_revision?: number;
+  /** What the latest plan said of contracts. */
+  contract_risk?: boolean | null;
+  /** What it commits (`end`, `per-round`, `none`). */
+  commit?: string;
+  commits?: Commit[];
+  commit_problem?: string | null;
   [key: string]: Json;
 }
 /** The last loop that ended on a thread (`thread.last_loop`). */
@@ -120,6 +140,21 @@ export interface LastLoop {
   kind: string;
   outcome: string;
   ended_turn?: number | null;
+  /** What it committed, as the hub's check found it: the repositories that were committed. */
+  commits?: Commit[];
+  /** Its commit's check failed twice: the other repositories' problems (`not committed`),
+   * each starting with the repository's path, joined by `; `. A loop can have both: some
+   * repositories committed, the others not. */
+  commit_problem?: string | null;
+}
+/** One check of a loop's commit (`loop.get`'s `commit_checks`, twr-core `LoopCommitChecked`). */
+export interface CommitCheck {
+  commits?: Commit[];
+  problems?: string[];
+  /** What the check noted that is no problem (the thread wrote no `twr-commit` block). */
+  notes?: string[];
+  passed?: boolean;
+  [key: string]: Json;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -133,19 +168,23 @@ export interface LastLoop {
  * flight; it has finished a turn; its git state shows changes (files not committed, or
  * commits ahead of its base); and no loop ended since its last turn.
  *
- * A stopped thread is offered one too: the hub's shutdown stops every thread, which then
- * goes on (and a loop with it) as soon as it is sent something, and the thread's view does
- * not tell that stop from one of the user's. The hub refuses a thread someone stopped, with
- * the reason (`send it a message to start it again first`).
+ * A thread someone stopped (`stopped` and not `stopped_by_hub`) is not: the hub refuses a
+ * loop there (`send it a message to start it again first`). A thread stopped only by the
+ * hub's own shutdown is: it goes on (and a loop with it) as soon as it is sent something.
  */
 export function offersReview(
   thread: Thread | undefined,
   offerReview: boolean | undefined,
+  attention?: Pick<Attention, "thread" | "loop_setup">[],
 ): boolean {
   if (!thread || offerReview === false) return false;
+  // Its setup card is open: that is where the loop starts, not here.
+  if (attention?.some((a) => a.thread === thread.id && a.loop_setup === true))
+    return false;
   if (thread.is_orchestrator || thread.parked) return false;
   if (["parked", "attached"].includes(thread.status)) return false;
   if (thread.loop) return false;
+  if (stoppedBySomeone(thread)) return false;
   if (thread.current_turn != null) return false;
   const lastTurn = Number(thread.last_turn?.turn);
   if (!Number.isFinite(lastTurn) || lastTurn <= 0) return false;
@@ -158,6 +197,12 @@ export function offersReview(
   return true;
 }
 
+/** Whether a thread counts as stopped because someone stopped it, not only the hub's own
+ * shutdown: the hub refuses to start a loop on it (`loop.request`) until it is sent
+ * something. */
+export const stoppedBySomeone = (thread: Thread | undefined) =>
+  !!thread?.stopped && !thread.stopped_by_hub;
+
 /** `config.show`'s `loops.offer_review`: true unless the hub says false. */
 export function offerReviewSetting(config: Json): boolean {
   return config?.loops?.offer_review !== false;
@@ -167,14 +212,18 @@ export function offerReviewSetting(config: Json): boolean {
 // The setup card
 // ---------------------------------------------------------------------------------------
 
-/** The setup card's options, as the hub raises them. */
+/** The setup card's options, as the hub raises them (twr-core `LOOP_SETUP_START`,
+ * `LOOP_SETUP_RUN_WITHOUT`, `LOOP_SETUP_CANCEL`): `run without a loop` only on a card that
+ * holds a task, between the other two. */
 export const SETUP_START = "start and save these settings";
+export const SETUP_RUN_WITHOUT = "run without a loop";
 export const SETUP_CANCEL = "cancel";
 
 export interface SetupSummary {
   /** The first line: what the card asks. */
   title: string;
-  /** `Label   value` rows, in order. */
+  /** `Label   value` rows, in order. A value the hub wrote on several lines (a held task)
+   * keeps them, joined by newlines. */
   rows: [string, string][];
   warnings: string[];
   /** What has to change before the loop can start (`Change first: …`). */
@@ -185,8 +234,9 @@ export interface SetupSummary {
 
 /**
  * Reads a setup card's summary: a sentence, then `Label   value` rows (a label, then two or
- * more spaces), then `Warning: …` and `Change first: …` lines. A line it can't place stays in
- * `other`, so nothing the hub wrote is lost.
+ * more spaces), then `Warning: …` and `Change first: …` lines. An indented line right after
+ * a row goes on with that row's value (the task's further lines and `(+N more lines)`). A
+ * line it can't place stays in `other`, so nothing the hub wrote is lost.
  */
 export function parseSetupSummary(summary: string): SetupSummary {
   const lines = String(summary || "")
@@ -200,8 +250,13 @@ export function parseSetupSummary(summary: string): SetupSummary {
     other: [],
   };
   let first = true;
+  // Whether the line before was a row (or its continuation), which an indented line goes on.
+  let inRow = false;
   for (const line of lines) {
-    if (!line.trim()) continue;
+    if (!line.trim()) {
+      inRow = false;
+      continue;
+    }
     if (first) {
       out.title = line.trim();
       first = false;
@@ -209,16 +264,70 @@ export function parseSetupSummary(summary: string): SetupSummary {
     }
     const warning = /^\s*Warning:\s*(.*)$/i.exec(line);
     const problem = /^\s*Change first:\s*(.*)$/i.exec(line);
+    const continued = inRow && /^\s{2,}\S/.test(line);
     const row = /^\s*([A-Za-z][A-Za-z ]{0,30}?)\s{2,}(\S.*)$/.exec(line);
+    inRow = false;
     if (warning) out.warnings.push(warning[1].trim());
     else if (problem) out.problems.push(problem[1].trim());
-    else if (row) out.rows.push([row[1].trim(), row[2].trim()]);
-    else out.other.push(line.trim());
+    else if (continued) {
+      const last = out.rows[out.rows.length - 1];
+      last[1] = `${last[1]}\n${line.trim()}`;
+      inRow = true;
+    } else if (row) {
+      out.rows.push([row[1].trim(), row[2].trim()]);
+      inRow = true;
+    } else out.other.push(line.trim());
   }
   return out;
 }
 
-/** Whether `item` is a loop's setup card, and whether Start and save may be pressed. */
+/** The kind of loop a setup card is for, from what the hub wrote: an implementation loop's
+ * card says so in its first line and has a Task row. */
+export function setupKind(parsed: SetupSummary): "implement" | "review" {
+  return /implementation loop/i.test(parsed.title) ||
+    parsed.rows.some(([label]) => label === "Task")
+    ? "implement"
+    : "review";
+}
+
+/** One answer of a setup card, as its button says it. */
+export interface SetupOption {
+  /** What the hub takes (`attention.respond` `answer`). */
+  answer: string;
+  label: string;
+  /** Start and save, while the card lists something to change first, can't be pressed. */
+  disabled: boolean;
+  /** Why not, when not. */
+  why?: string;
+}
+
+/** A setup card's answers, in the order the hub raised them, as buttons say them; one the
+ * apps don't know shows as the hub wrote it. */
+export function setupOptions(
+  options: string[],
+  problems: string[] = [],
+): SetupOption[] {
+  return options.map((answer) => {
+    if (answer === SETUP_START)
+      return {
+        answer,
+        label: "Start and save",
+        disabled: problems.length > 0,
+        ...(problems.length ? { why: "Change what the card lists first" } : {}),
+      };
+    if (answer === SETUP_RUN_WITHOUT)
+      return { answer, label: "Run without a loop", disabled: false };
+    if (answer === SETUP_CANCEL)
+      return { answer, label: "Cancel", disabled: false };
+    return {
+      answer,
+      label: answer.charAt(0).toUpperCase() + answer.slice(1),
+      disabled: false,
+    };
+  });
+}
+
+/** Whether `item` is a loop's setup card, what it is for, and what may be pressed. */
 export function setupCardState(item: {
   loop_setup?: boolean;
   summary: string;
@@ -226,12 +335,32 @@ export function setupCardState(item: {
 }) {
   const parsed = parseSetupSummary(item.summary);
   const options = item.options || [];
+  const kind = setupKind(parsed);
+  const task = parsed.rows.find(([label]) => label === "Task")?.[1];
   return {
     parsed,
+    kind,
+    /** The task as the summary shows it (its first lines); `loop.setup.get` has it whole. */
+    task,
+    options: setupOptions(options, parsed.problems),
     canStart: options.includes(SETUP_START) && parsed.problems.length === 0,
+    canRunWithout: options.includes(SETUP_RUN_WITHOUT),
     canCancel: options.includes(SETUP_CANCEL),
   };
 }
+
+/** A request in one line, where a card or list names it: a setup card's first line says
+ * which loop it is for; its other lines are rows (a held task among them). */
+export function requestLine(item: { summary?: string; loop_setup?: boolean }) {
+  const summary = item.summary || "";
+  return item.loop_setup
+    ? summary.split("\n").find((line) => line.trim()) || summary
+    : summary;
+}
+
+/** The setup card's heading: the kind of loop it is for. */
+export const setupHeading = (kind: string) =>
+  kind === "implement" ? "Implementation loop setup" : "Review loop setup";
 
 // ---------------------------------------------------------------------------------------
 // Words
@@ -303,18 +432,31 @@ export function phasesOf(kind: string): string[] {
 }
 export const phaseWords = (phase: string) => phase.replace(/_/g, " ");
 
+/** The plan check's round (twr-core `contract::PLAN_CHECK_ROUND`). */
+export const PLAN_CHECK_ROUND = "p1";
+
 /**
- * The phases running loop `state` passed over without running them: the verification when
+ * The phases running loop `state` passed over without running them: an implementation
+ * loop's plan check when it did not run, the verification when
  * the ladder's end skipped it (`transition.verify_skipped`: the last tier's round found
  * nothing at the verification's effort, so v1 could only repeat it), and the sweep once the
  * ladder ended without one (the profile has none, the ladder fixed nothing, or the loop
  * skipped to verify).
  */
 export function skippedPhases(state: LoopState): string[] {
+  const out: string[] = [];
+  // An implementation loop's plan check runs only when its setting says so (`always`, or
+  // `contracts` and a plan with contract risk): past it with no round `p1`, it did not run.
+  if (
+    state.kind === "implement" &&
+    phasesOf("implement").indexOf(state.phase) >
+      phasesOf("implement").indexOf("plan_check") &&
+    !state.rounds.some((r) => r.id === PLAN_CHECK_ROUND)
+  )
+    out.push("plan_check");
   const transition = state.transition as
     { reason?: string; verify_skipped?: boolean } | null | undefined;
-  if (!transition) return [];
-  const out: string[] = [];
+  if (!transition) return out;
   const swept =
     !!state.plan?.sweep &&
     Number(state.fixed || 0) > 0 &&
@@ -370,9 +512,139 @@ export function outcomeWords(outcome: string | null | undefined) {
   }
 }
 
+/** The short form of a commit's sha. */
+export const shortSha = (sha: string) => String(sha || "").slice(0, 7);
+
+/** What a loop committed, in words: `committed abc1234` (with the repository's name when
+ * there are several), then, when other repositories were not committed, `not committed:
+ * <why>` (`committed abc1234 · not committed: /w/web: …`); nothing when it asked no commit.
+ * Never `not committed` alone for a loop that committed something. */
+export function commitWords(
+  l: Pick<LastLoop, "commits" | "commit_problem">,
+): string {
+  const commits = l.commits || [];
+  const repo = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1);
+  const parts: string[] = [];
+  if (commits.length)
+    parts.push(
+      `committed ${commits
+        .map((c) =>
+          commits.length > 1 && repo(c.repo)
+            ? `${shortSha(c.sha)} (${repo(c.repo)})`
+            : shortSha(c.sha),
+        )
+        .join(", ")}`,
+    );
+  if (l.commit_problem) parts.push(`not committed: ${l.commit_problem}`);
+  return parts.join(" · ");
+}
+
+/** The notes of a loop's last commit check (`loop.get`'s `commit_checks`): what it noted that
+ * is no problem. */
+export function commitNotes(detail: Json): string[] {
+  const checks: CommitCheck[] = Array.isArray(detail?.commit_checks)
+    ? detail.commit_checks
+    : [];
+  const notes = checks.at(-1)?.notes;
+  return Array.isArray(notes)
+    ? notes.filter((n): n is string => typeof n === "string" && !!n.trim())
+    : [];
+}
+
+/** `loop.report {thread}` or `{id}`: a loop's `report.md` as text, for a device that cannot
+ * read the hub's files (a phone, a remote desktop). */
+export interface LoopReport {
+  thread: string;
+  thread_name: string;
+  id: string;
+  kind?: string | null;
+  running: boolean;
+  outcome?: string | null;
+  /** Where the hub wrote it, on the hub's machine. */
+  path?: string | null;
+  written: boolean;
+  /** The report, or its first 256 KiB with a marker line at the end (`truncated`). */
+  text?: string | null;
+  bytes?: number | null;
+  truncated: boolean;
+  /** Why there is no text: a loop still running, one that ended stopped or failed, a file
+   * the hub can't read. */
+  note?: string | null;
+}
+
+/** The report's dialog: its title, the line under it, its text or why there is none. */
+export function reportView(r: LoopReport, name?: string) {
+  const kind = kindWords(r.kind ?? undefined);
+  const how = r.running ? "running" : outcomeWords(r.outcome);
+  const size =
+    typeof r.bytes === "number" && r.bytes >= 0 ? sizeWords(r.bytes) : "";
+  const text = typeof r.text === "string" ? r.text : undefined;
+  return {
+    title: `${kind.charAt(0).toUpperCase()}${kind.slice(1)} report · ${
+      r.thread_name || name || "twr"
+    }`,
+    subtitle: [how, size].filter(Boolean).join(" · "),
+    text,
+    note:
+      text === undefined
+        ? r.note ||
+          (r.running
+            ? "The loop is still running: its report is written when it ends."
+            : "This loop wrote no report.")
+        : undefined,
+    path: typeof r.path === "string" && r.path ? r.path : undefined,
+  };
+}
+
+/** A size in bytes, in words, as attachments say it: `812 bytes`, `12.3 KiB`, `1.2 MiB`. */
+export function sizeWords(bytes: number): string {
+  if (bytes < 1024) return `${bytes} byte${bytes === 1 ? "" : "s"}`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+/** `review loop` or `implementation loop`. */
+export const kindWords = (kind: string | undefined) =>
+  kind === "implement" ? "implementation loop" : "review loop";
+
+/** Rounds a loop ran, as a notification counts them: the plan check's `p1` is not one. */
+export const countedRounds = (rounds: { id: string }[] | undefined) =>
+  (rounds || []).filter((r) => r.id !== PLAN_CHECK_ROUND).length;
+
+/**
+ * How a loop ended, in a line: `review loop clean after 6 rounds`; an implementation loop's
+ * adds its commit, or that it was not committed: `implementation loop clean after 3 rounds ·
+ * committed abc1234`. `rounds` when it is known.
+ */
+export function endedWords(last: LastLoop, rounds?: number): string {
+  const how = outcomeWords(last.outcome);
+  const commit = commitWords(last);
+  return [
+    `${kindWords(last.kind)}${how ? ` ${how}` : " ended"}${
+      rounds && rounds > 0
+        ? ` after ${rounds} round${rounds === 1 ? "" : "s"}`
+        : ""
+    }`,
+    ...(commit ? [commit] : []),
+  ].join(" · ");
+}
+
+/** Whether a thread's last loop ended at its latest turn: its ended line still describes
+ * what the card's last report says. */
+export function endedLately(thread: Thread | undefined): LastLoop | undefined {
+  if (!thread || thread.loop) return undefined;
+  const last = thread.last_loop as LastLoop | undefined | null;
+  if (!last?.id) return undefined;
+  const lastTurn = Number(thread.last_turn?.turn ?? 0);
+  if (Number(last.ended_turn ?? 0) < lastTurn) return undefined;
+  return last;
+}
+
 /**
  * The loops that ended since `known` (thread id → the id of its last loop, as last seen), as
- * the words a screen reader hears (`api's review loop ended: clean`), and the new `known`.
+ * the words a screen reader hears (`api's review loop ended: clean`; an implementation loop
+ * adds its commit: `…: clean; committed abc1234`, `not committed: …`, or both), and the new
+ * `known`.
  * A thread seen for the first time is known, not news.
  */
 export function endedLoops(
@@ -388,9 +660,71 @@ export function endedLoops(
     if (!known || !known.has(t.id) || !id || known.get(t.id) === id) continue;
     const kind = last!.kind === "implement" ? "implementation" : "review";
     const how = outcomeWords(last!.outcome);
-    said.push(`${t.name}'s ${kind} loop ended${how ? `: ${how}` : ""}`);
+    const commit = commitWords(last!);
+    said.push(
+      `${t.name}'s ${kind} loop ended${how ? `: ${how}` : ""}${commit ? `; ${commit}` : ""}`,
+    );
   }
   return { said, known: next };
+}
+
+/** A loop that started, as a screen reader hears it and the notice says it. */
+export function startedNotice(name: string, kind: string, line?: string) {
+  return `${name} started ${kind === "implement" ? "an implementation loop" : "a review loop"}${
+    line ? `: ${line}` : ""
+  }.`;
+}
+
+/**
+ * Whether **Skip to verify** can be pressed, and why not: an implementation loop has built
+ * nothing to verify before its ladder (the hub refuses it in `plan`, `plan_check` and
+ * `implement`); a skip already asked for waits for the round's end. `show: false`: the
+ * phase is past the ladder, where it means nothing.
+ */
+export function skipToVerify(state: { phase: string; skip?: boolean }): {
+  show: boolean;
+  enabled: boolean;
+  why?: string;
+} {
+  if (["plan", "plan_check", "implement"].includes(state.phase))
+    return {
+      show: true,
+      enabled: false,
+      why: "Nothing has been built to verify yet: Skip to verify is available from the ladder on.",
+    };
+  if (!["scope", "ladder"].includes(state.phase) || state.skip)
+    return { show: false, enabled: false };
+  return { show: true, enabled: true };
+}
+
+/** An implementation loop's plan, as `loop.get`'s `plans` lists each revision. */
+export interface PlanInfo {
+  revision: number;
+  contract_risk: boolean;
+  reason: string;
+  path?: string | null;
+}
+
+/** The plan in words: `revision 2 · contract risk yes: a migration`. */
+export function planWords(plan: PlanInfo): string {
+  return `revision ${plan.revision} · contract risk ${plan.contract_risk ? "yes" : "no"}${
+    plan.reason ? `: ${plan.reason}` : ""
+  }`;
+}
+
+/** The implement turn's result, as `loop.get`'s `implemented` lists each block read:
+ * `done · gates pass: cargo test`, and whether the hub took it. */
+export function implementedWords(i: {
+  status?: string;
+  gates?: { ran?: string[]; result?: string };
+  accepted?: boolean;
+}): string {
+  const ran = i.gates?.ran?.length ? `: ${i.gates.ran.join(", ")}` : "";
+  return `${i.status || "?"} · gates ${i.gates?.result || "not run"}${ran}${
+    i.accepted === false
+      ? " (sent back: gates must be green before review)"
+      : ""
+  }`;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -490,6 +824,228 @@ export function reviewRequest(
     ...(a.scope?.trim() ? { scope: a.scope.trim() } : {}),
     ...(Object.keys(overrides).length ? { overrides } : {}),
   };
+}
+
+/** `/implement`'s parsed arguments (`desktop.parse_slash` kind `Implement`): the words that
+ * are no flag, in order (perhaps a thread first, then the task), and the run's flags. */
+export interface ImplementArgs {
+  words: string[];
+  setup?: boolean;
+  profile?: string | null;
+  reviewer?: string | null;
+  implementer?: string | null;
+  workers?: string | null;
+  commit?: string | null;
+  plan_check?: string | null;
+}
+
+/** `loop.request`'s parameters for an implementation loop. */
+export interface ImplementRequest {
+  thread: string;
+  kind: "implement";
+  /** None: the task is what the conversation already settled. */
+  task?: string;
+  setup?: boolean;
+  overrides?: {
+    profile?: string;
+    implementer?: string;
+    workers?: string;
+    reviewer?: string;
+    commit?: string;
+    plan_check?: string;
+  };
+}
+
+/**
+ * Where `/implement`'s words go, as twr-core's `slash::implement_target` splits them for
+ * every client: in a thread's conversation (`dive`) the thread is that one and every word is
+ * the task's; elsewhere a first word that names a live thread (`namesThread`) is the thread,
+ * else the thread is the selected card's, and the other words are the task. The task's words
+ * are joined by single spaces; none means the task is what the conversation already settled.
+ */
+export function implementTarget(
+  words: string[],
+  dive: boolean,
+  namesThread: (word: string) => boolean,
+): { thread?: string; task?: string } {
+  const [first, ...rest] = words;
+  const named = !dive && first !== undefined && namesThread(first);
+  const task = (named ? rest : words)
+    .map((w) => w.trim())
+    .filter(Boolean)
+    .join(" ");
+  return {
+    ...(named ? { thread: first } : {}),
+    ...(task ? { task } : {}),
+  };
+}
+
+/** A name, alias or id of a thread in `threads` (the view lists no deleted thread), as the
+ * TUI resolves `/implement`'s first word. */
+export const namesThread = (
+  threads: { id: string; name: string; aliases?: string[] }[],
+  word: string,
+) =>
+  threads.some(
+    (t) => t.id === word || t.name === word || (t.aliases || []).includes(word),
+  );
+
+/**
+ * The `loop.request` an `/implement` asks for: on the thread it names, else the one whose
+ * conversation is shown (`dive`), else the selected card's (`chosen`).
+ */
+export function implementRequest(
+  args: ImplementArgs | undefined,
+  {
+    dive,
+    chosen,
+    threads,
+  }: {
+    /** The thread whose conversation is shown, when it is a thread's. */
+    dive?: string;
+    /** The selected card's thread, else the one shown. */
+    chosen?: string;
+    threads: { id: string; name: string; aliases?: string[] }[];
+  },
+): ImplementRequest {
+  const a = args || { words: [] };
+  const target = implementTarget(a.words || [], !!dive, (w) =>
+    namesThread(threads, w),
+  );
+  const thread = target.thread || dive || chosen;
+  if (!thread)
+    throw new Error(
+      "No thread to run it in: select a thread, open its conversation, or name it first (/implement <thread> <task>).",
+    );
+  const overrides: NonNullable<ImplementRequest["overrides"]> = {};
+  for (const key of [
+    "profile",
+    "implementer",
+    "workers",
+    "reviewer",
+    "commit",
+    "plan_check",
+  ] as const) {
+    const value = a[key];
+    if (typeof value === "string" && value.trim())
+      overrides[key] = value.trim();
+  }
+  return {
+    thread,
+    kind: "implement",
+    ...(target.task ? { task: target.task } : {}),
+    ...(a.setup ? { setup: true } : {}),
+    ...(Object.keys(overrides).length ? { overrides } : {}),
+  };
+}
+
+/** The most bytes a loop's task may have (twr-core `settings::MAX_TASK_BYTES`). */
+export const MAX_TASK_BYTES = 16 * 1024;
+
+/**
+ * What **Send as implementation loop** sends for a composer's `draft`: the message is the
+ * task, as typed (`//` escapes a leading `/`, as Send does). A command or a shell line is no
+ * task. An empty draft asks for what the conversation already settled, and `confirm` says so
+ * first: nothing was typed.
+ */
+export function sendAsLoop(draft: string): {
+  task?: string;
+  confirm: boolean;
+} {
+  const text = draft.startsWith("//") ? draft.slice(1) : draft;
+  if (draft.startsWith("/") && !draft.startsWith("//"))
+    throw new Error(
+      "A command is no task: send it with Send, or write what to build (start it with // to send a leading /).",
+    );
+  if (draft.startsWith("!") && !draft.startsWith("!!!"))
+    throw new Error(
+      "A shell command is no task: send it with Send, or write what to build.",
+    );
+  const task = text.trim();
+  if (new TextEncoder().encode(task).length > MAX_TASK_BYTES)
+    throw new Error(
+      "The task is longer than 16 KiB: put the details in a file and name it in the task.",
+    );
+  return task ? { task, confirm: false } : { confirm: true };
+}
+
+/**
+ * The New thread form's request: `thread.new`'s parameters, with `loop: {kind: "implement",
+ * task}` when **Run as an implementation loop** is on (the first prompt is the task, and is
+ * required), and otherwise the first prompt to send once the thread exists (`firstPrompt`).
+ * `prompt`, `implement` and `loop_setup` are the form's own keys, never sent as they are.
+ */
+export function newThreadRequest(params: Record<string, Json>): {
+  params: Record<string, Json>;
+  firstPrompt?: string;
+} {
+  const {
+    prompt,
+    implement,
+    loop_setup: setup,
+    ...rest
+  } = params as Record<string, Json>;
+  const text = typeof prompt === "string" ? prompt.trim() : "";
+  if (implement) {
+    if (!text)
+      throw new Error(
+        "The first prompt is the implementation loop's task: write it, or turn off Run as an implementation loop.",
+      );
+    if (new TextEncoder().encode(text).length > MAX_TASK_BYTES)
+      throw new Error(
+        "The task is longer than 16 KiB: put the details in a file and name it in the task.",
+      );
+    return {
+      params: {
+        ...rest,
+        loop: {
+          kind: "implement",
+          task: text,
+          ...(setup ? { setup: true } : {}),
+        },
+      },
+    };
+  }
+  return { params: rest, ...(text ? { firstPrompt: text } : {}) };
+}
+
+/** `/new … --implement`'s parsed arguments, as the New thread form's values. */
+export function newThreadValues(args: Json): Record<string, Json> {
+  const { implement, setup, task, ...rest } = args || {};
+  return {
+    ...Object.fromEntries(
+      Object.entries(rest).filter(([, v]) => v !== null && v !== undefined),
+    ),
+    ...(implement
+      ? {
+          implement: true,
+          prompt: task || "",
+          ...(setup ? { loop_setup: true } : {}),
+        }
+      : {}),
+  };
+}
+
+/** What `thread.new`'s answer says of the loop it asked for: started, its setup card, or
+ * refused after the thread was made (`{status: "error", code, message}`). */
+export function newThreadLoop(
+  result: Json,
+):
+  | { status: "started" | "needs_setup"; attn_id?: string }
+  | { status: "error"; message: string }
+  | undefined {
+  const l = result?.loop;
+  if (!l || typeof l !== "object" || typeof l.status !== "string") return;
+  if (l.status === "error")
+    return {
+      status: "error",
+      message: String(l.message || l.code || "the loop could not start"),
+    };
+  if (l.status === "started" || l.status === "needs_setup")
+    return {
+      status: l.status,
+      ...(typeof l.attn_id === "string" ? { attn_id: l.attn_id } : {}),
+    };
 }
 
 /** What a `/loop` does: a control of a thread's loop, the editor, or its progress. */

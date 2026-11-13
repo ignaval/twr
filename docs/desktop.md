@@ -88,7 +88,7 @@ as code with a copy button instead of a link that does nothing.
 | New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
 | Stop, park/resume, compact, trim, delete | Inspector actions; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
-| Review loops (`twr loop`, `/review`, `/loop`) | The inspector's Loops section, the Review loop button on a finished turn with changes, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
+| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Send as implementation loop, the Review loop button on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |
 | Attach, PTY fallback, arbitrary shell | Embedded xterm.js terminals using the matching real CLI or login shell |
 | Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
@@ -142,42 +142,86 @@ the client preference, which is restored on the next launch.
 ### Loops
 
 A review loop has a reviewer model check a thread's changes round by round while the thread
-fixes what holds up ([the design](design/loops.md)). The app starts and follows review loops
-in threads on the hub's own machine.
+fixes what holds up. An implementation loop gives a thread a task: it plans it, implements it,
+the same review runs on its work, and the loop commits it at the end ([the
+design](design/loops.md)). The app starts and follows both kinds in threads on the hub's own
+machine.
 
-- **Start one.** Select a thread: its inspector has a **Loops** section with a **Review
-  loop** button and, under it, the settings a loop would run on (profile, implementer,
-  reviewer, and whether they are this project's) or `first run: you will be asked to choose
-  models`. When a thread's turn ends with changes in its worktree (files not committed, or
+- **Send as implementation loop.** When you talk to a thread, Send has a caret (a `↻`
+  button beside Send on a phone) with **Send as implementation loop**: what you wrote is the
+  loop's task. Sent with nothing written, it asks first, since the task is then what your
+  conversation with the thread already settled. It needs a live connection, like every loop
+  action: without one, or on a read-only device, the choice says why and nothing is saved
+  for later.
+- **Start one.** Select a thread: its inspector has a **Loops** section with **Review
+  loop** and **Implementation loop…** (which asks for the task, empty meaning what the
+  conversation settled) and, under them, the settings a loop would run on (profile,
+  implementer, reviewer, and whether they are this project's) or `first run: you will be
+  asked to choose models`, with **Change…**. When a thread's turn ends with changes in its worktree (files not committed, or
   commits ahead of its base) and no loop has reviewed them, its sidebar card, its
   conversation and the orchestrator's **Latest thread reports** also show a **Review loop**
   button (the grid's tiles do too in a narrow window such as a phone's, where the grid is
   the thread list).
-  `[loops] offer_review = false` turns that button off. `/review` in the composer does the
-  same for the thread you talk to or have selected, and takes the CLI's options (`--setup`,
-  `--scope`, `--profile`, `--reviewer`, `--implementer`, `--workers`, `--commit`).
-- **The setup card.** The first loop, a loop you ask to check (`/review --setup`), or one
-  whose saved settings no longer hold, raises a setup card instead of starting. It shows in
-  Needs you, in the thread's conversation and in its inspector, ordered with questions. It
-  lists what the loop would run on, the hub's warnings, and anything to change first.
-  **Start and save** starts the loop and saves its settings; it waits while the card lists
-  something to change first. **Change…** opens the settings editor on the card; saving
-  there raises the card again with the new values. **Cancel** starts and saves nothing.
-  Start and Cancel answer the revision shown, under the same 600 ms rule as other requests.
-  The card has no Dismiss. On a phone it opens as a sheet.
+  `[loops] offer_review = false` turns that button off, and it hides while the thread's setup
+  card is open and on a thread someone stopped (send it a message first; a thread stopped
+  only because the hub shut down keeps the button). `/review` in the composer does the same for the thread you talk to or have
+  selected, and takes the CLI's options (`--setup`, `--scope`, `--profile`, `--reviewer`,
+  `--implementer`, `--workers`, `--commit`). `/implement` starts an implementation loop with
+  the same rule as the terminal UI: in a thread's conversation every word is the task;
+  elsewhere a first word that names a thread is the thread, else the selected one, and the
+  rest is the task (`--setup`, `--profile`, `--reviewer`, `--implementer`, `--workers`,
+  `--commit`, `--plan-check`; after `--` every word is the task's). `/loop` only controls a
+  running loop and opens the settings; `/loop implement` says to use `/implement` or
+  `/review`.
+- **A new thread with a loop.** The New thread form has a **First prompt** and, under it, a
+  **Run as an implementation loop** switch with the settings line and **Change…**. On, the
+  first prompt is the loop's task, and required (**Show the loop's setup card first** asks
+  for the card even with saved settings); off, the first prompt is sent to the thread once
+  it exists. `/new <project> --implement <task>` opens the form with the switch on.
+- **The setup card.** The first loop of either kind, a loop you ask to check
+  (`/review --setup`, `/implement --setup`), or one whose saved settings no longer hold,
+  raises a setup card instead of starting. It shows in Needs you, in the thread's
+  conversation and in its inspector, ordered with questions, titled for its kind
+  (**Implementation loop setup**). It lists what the loop would run on (an implementation
+  loop's card adds its plan check and commit rows; there is no Workers row when the
+  implementer's runtime runs no subagents), the hub's warnings, and anything to change
+  first. An implementation loop's card holds its task, whole, in a box that scrolls
+  inside the card. **Start and save** starts the loop and saves its settings; it waits while
+  the card lists something to change first. **Change…** opens the settings editor on the
+  card; saving there raises the card again with the new values. A card that holds a task has
+  **Run without a loop**, which sends the task to the thread as an ordinary message and
+  saves nothing. **Cancel** starts and saves nothing (a held task is dropped). Every answer
+  applies to the revision shown, under the same 600 ms rule as other requests. The card has
+  no Dismiss. On a phone it opens as a sheet.
 - **While it runs.** The thread's sidebar card (and in a narrow window its grid tile) shows the hub's loop badge and line
-  (`REVIEW LOOP high · ladder m3 · ledger 2`, wrapping on a narrow card rather than cut);
+  (`REVIEW LOOP high · ladder m3 · ledger 2`, `IMPLEMENT LOOP high · plan`, wrapping on a
+  narrow card rather than cut);
   a click on it opens the inspector at its Loops section. There you see every phase with
-  the current one marked (and a sweep or verification the loop passed over as skipped), what
-  it runs on and whose settings they are, each round's findings and new-class count (the
-  round whose review still runs reads `under review`; open a round for its findings and the
-  thread's verdicts), the ledger, and whether it waits on the thread, the review or you. **Pause** or
-  **Resume**, **Skip to verify** and **Stop** (after a confirmation) control it, as do
-  `/loop pause|resume|skip|stop`. A stuck loop raises a card with **Resume** and **Stop**.
-  A loop started from the app says what it runs on (`api started a review loop: low ·
-  implementer … · reviewer … (saved settings)`), and a screen reader hears a setup card,
-  a stuck loop and a loop that ends (`api's review loop ended: clean`), in any thread.
-  Once it ended, **Open report** shows the report's path with a copy button.
+  the current one marked (and a plan check, sweep or verification the loop passed over as
+  skipped), what it runs on and whose settings they are, each round's findings and
+  new-class count (the round whose review still runs reads `under review`; open a round for
+  its findings and the thread's verdicts; an implementation loop's plan check is round
+  `p1`), the ledger, and whether it waits on the thread, the review or you. An
+  implementation loop also shows its plan (revision, contract risk yes or no with the reason,
+  and where `plan.md` is), its implement turn's result and gates, and what it commits.
+  **Pause** or **Resume**, **Skip to verify** and **Stop** (after a confirmation) control
+  it, as do `/loop pause|resume|skip|stop`; Skip to verify waits for the ladder in an
+  implementation loop, which has built nothing to verify before it, and says so. A stuck
+  loop raises a card with **Resume** and **Stop**. A loop started from the app says what it
+  runs on (`api started a review loop: low · implementer … · reviewer … (saved
+  settings)`), and a screen reader hears a setup card, a stuck loop and a loop that ends
+  (`api's review loop ended: clean`; `api's implementation loop ended: clean; committed
+  abc1234`, `not committed: …`, or both when some repositories were committed and others
+  not), in any thread.
+  Once it ended, the inspector shows how, an implementation loop's commits (a short sha per
+  repository), then why any other repository was not committed, and what the last commit
+  check noted that is no problem (the thread wrote no `twr-commit` block, say) in quiet
+  text. **Open report** reads the loop's `report.md` through the hub and shows it in a
+  dialog (a sheet on a phone), with where the hub wrote it, small, and a copy button; a
+  report over 256 KiB ends with the hub's marker line, and a running loop's says it is not
+  written yet. A `read` device can open it. While the loop's turn is the thread's last, its
+  sidebar card and **Latest thread reports** show the same in a line (`IMPLEMENT LOOP
+  clean · committed abc1234`, `clean · committed abc1234 · not committed: …`).
 - **Settings.** **Change…** in the Loops section and `/loop settings` open the editor:
   the four presets, the implementer (the thread's own, or a runtime, model and effort), its
   workers where its runtime has subagents, the reviewer (runtime, model, and account where
@@ -214,9 +258,9 @@ Settings › Application has four switches:
   GNOME and KDE start at login. AppImages are started through the image itself. twr
   only removes an autostart entry that it created.
 - **Show in menu bar / Show tray icon.**
-- **Notify me of new requests** (on by default). A new permission or question, or a
-  confirm or delete card, in any workspace posts a system notification while twr's window
-  isn't in front: hidden in background mode, minimized, or behind another app. It names the
+- **Notify me of new requests** (on by default). A new permission or question, a confirm
+  or delete card, or a loop's setup card or stuck loop, in any workspace posts a system
+  notification while twr's window isn't in front: hidden in background mode, minimized, or behind another app. It names the
   thread and the workspace (`api · client-x`, *Asks for permission*) and, for the hub's
   cards, what kind of card it is (`twr · client-x`, *Asks you to confirm what the
   orchestrator proposed*, or *Asks you to confirm a deletion*), never what is asked or which
@@ -230,8 +274,13 @@ Settings › Application has four switches:
   macOS asks whether twr may notify the first time it does (System Settings ›
   Notifications changes the answer later); a build macOS won't let notify, such as some
   ad hoc signed ones, shows nothing. The diagnostics log records the first notification
-  posted, a system without notification support and notifications that failed. How this relates to the hub's `[notify]`
-  command and the TUI's notifications: [notifications.md](notifications.md#the-desktop-app).
+  posted, a system without notification support and notifications that failed. A loop that
+  ends notifies once too, with how it ended (`api · client-x`, *Review loop clean after 6
+  rounds*; an implementation loop adds *committed abc1234*, *not committed: …*, or both), under the
+  same rules: not when it ended while you looked or before twr connected, and more than three
+  at once as one (*4 loops ended*); it goes when clicked or when the window comes to the
+  front. How this relates to the hub's `[notify]` command and the TUI's notifications:
+  [notifications.md](notifications.md#the-desktop-app).
 - **Keep running when the window is closed.** Closing the window hides it instead,
   so terminals, the hub connection and the badge stay live. A login launch then starts
   hidden on Linux. macOS 13 and later do not always tell an app it was opened at login, so
@@ -350,7 +399,11 @@ script, `scripts/loops-integration.mjs`, drives a review loop through the app wi
 reviewer: the Review loop offer and `[loops] offer_review`, the setup card and its 600 ms
 rule, the editor, the chip, the inspector's progress and controls, the loop's end, a second
 run from `/review`, `/loop`, a stuck loop, the notifications, Settings › Loops, and the
-keyboard and screen-reader text of each. With `TWR_LOOPS_SHOTS=<dir>` it also saves each
+keyboard and screen-reader text of each. Then an implementation loop: Send as
+implementation loop with no saved settings raises the card holding the task, **Run without
+a loop** sends it as a message, **Start and save** runs the plan, the implement turn, the
+review rounds, the report and the commit (the script commits for the fake thread), its end
+notifies, and the New thread form's switch starts one that ends `not committed`. With `TWR_LOOPS_SHOTS=<dir>` it also saves each
 step in both themes, at the default size and the minimum width, with its accessibility tree.
 It runs against the debug build only. Debug
 fixtures use the existing debug-only user token inside their own private `TWR_HOME`; release

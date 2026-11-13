@@ -2374,6 +2374,180 @@ meter::-webkit-meter-optimum-value {
 .loop-projects h3 {
   font-size: 0.923077rem;
 }
+/* Implementation loops: the inspector's two starts, the held task on a setup card, a
+ * loop's commits and its ended line, and Send as implementation loop. */
+.loop-starts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.loop-starts > button {
+  flex: 1 1 auto;
+}
+/* A long task scrolls inside the card: the card never cuts it without a word. */
+.loop-setup-task {
+  white-space: pre-wrap;
+  max-height: 9.5em;
+  overflow: auto;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+.loop-setup-task:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.loop-commits {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 8px;
+  font-size: 0.923077rem;
+  color: var(--text);
+}
+.loop-commits > li {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+.loop-commits code {
+  font-family: var(--font-mono);
+}
+.loop-commit.loop-problem {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 0.923077rem;
+}
+.loop-commit.loop-problem > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.loop-commit-notes {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 8px;
+  font-size: 0.846154rem;
+  overflow-wrap: anywhere;
+}
+/* Open report: the loop's report.md, scrolling inside the dialog (a sheet on a phone). */
+.loop-report-body {
+  overflow: auto;
+  min-height: 0;
+  padding: 16px 24px 24px;
+}
+.loop-report-body:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.loop-report-footer .loop-path {
+  min-width: 0;
+}
+.loop-report-footer .loop-path small {
+  min-width: 0;
+}
+.loop-implement {
+  margin-top: -4px;
+}
+.loop-implement .loop-path {
+  margin-top: 2px;
+}
+.loop-ended {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  order: 1;
+  font-size: 0.846154rem;
+  line-height: 1.5;
+}
+.loop-ended.not-committed .loop-line,
+.loop-ended.not-committed > svg {
+  color: var(--warning);
+}
+.report-row > .loop-ended {
+  padding: 0 8px 6px;
+}
+.loop-controls > small {
+  flex-basis: 100%;
+  font-size: 0.846154rem;
+}
+.new-thread-loop {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: -6px 0 4px;
+}
+.new-thread-loop .loop-settings-line {
+  margin: 0;
+}
+.send-as-loop {
+  position: relative;
+  display: flex;
+}
+.send-caret {
+  width: 20px;
+  min-width: 20px;
+  height: 32px;
+  padding: 0;
+  margin-left: -5px;
+  border-radius: 0 6px 6px 0;
+  color: var(--muted);
+}
+.send-loop-button {
+  color: var(--loop);
+}
+.send-loop-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 5;
+  width: min(320px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-pop);
+}
+.send-loop-panel > button {
+  justify-content: flex-start;
+  color: var(--loop);
+}
+.send-loop-panel > small {
+  color: var(--muted);
+  font-size: 0.846154rem;
+  line-height: 1.4;
+}
+/* A phone's inspector shows a notice in its flow, where no toast covers its controls. */
+.inspector-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 4px 4px 12px;
+  margin-bottom: 8px;
+  border: 1px solid color-mix(in srgb, var(--success) 45%, var(--border));
+  border-radius: 8px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.inspector-notice > svg {
+  color: var(--success);
+  flex-shrink: 0;
+  margin-top: 12px;
+}
+.inspector-notice > span {
+  flex: 1;
+  padding-block: 8px;
+}
 .toast.notice-toast {
   color: var(--text);
   border-color: color-mix(in srgb, var(--success) 45%, var(--border));
@@ -3356,6 +3530,9 @@ meter::-webkit-meter-optimum-value {
     padding: 20px 20px 8px;
   }
   .operation-fields {
+    padding: 16px 20px 20px;
+  }
+  .loop-report-body {
     padding: 16px 20px 20px;
   }
   .dialog-footer {

@@ -228,6 +228,7 @@ pub fn allowed_method(method: &str) -> bool {
             | "loop.settings.set"
             | "loop.settings.reset"
             | "loop.get"
+            | "loop.report"
             | "loop.list"
             | "loop.control"
     )

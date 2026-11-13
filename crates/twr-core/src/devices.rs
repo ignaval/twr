@@ -366,6 +366,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "desktop.parse_slash",
             "desktop.slash_commands",
             "loop.get",
+            "loop.report",
             "loop.list",
             "loop.setup.get",
             "loop.settings.get",

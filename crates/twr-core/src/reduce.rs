@@ -444,6 +444,12 @@ pub struct ThreadView {
     /// Stopped (`thread.stopped`, except the one closing a runtime restarted for a mode,
     /// model or effort change, [`is_settings_restart`]).
     pub stopped: bool,
+    /// Stopped by the hub's own shutdown (`thread.stopped` `ext.twr.reason`
+    /// [`HUB_SHUTDOWN_REASON`]), not by anyone: the thread goes on, and so does its loop, as
+    /// soon as it is sent something, and a loop may start on it (`loop.request` refuses a
+    /// thread someone stopped). Only while `stopped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_by_hub: bool,
     /// Crashed since the last turn started.
     pub crashed: bool,
     /// The turn the latest crash took down: the turn open at `thread.crashed`, or, when the hub
@@ -501,6 +507,12 @@ pub struct LastLoop {
     pub outcome: crate::loops::Outcome,
     /// The thread's turn when it ended (its report turn, for a loop that reported).
     pub ended_turn: Option<u64>,
+    /// What it committed, as the hub's check found it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<crate::loops::contract::Commit>,
+    /// Its commit's check failed twice: what is left (`not committed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_problem: Option<String>,
 }
 
 /// `ext.twr.reason` of the `thread.stopped` the hub records for a runtime its own shutdown
@@ -509,7 +521,7 @@ pub const HUB_SHUTDOWN_REASON: &str = "hub_shutdown";
 
 impl ThreadView {
     /// Folds a `loop.*` event of its loop into [`ThreadView::r#loop`]: a `loop.started`
-    /// starts one (an implementation loop, which this build does not run, starts none), the
+    /// starts one (of either kind; one with a profile that has nothing to run starts none), the
     /// others apply to it, and a loop that ended moves to [`ThreadView::last_loop`].
     fn apply_loop(&mut self, ev: &Event) {
         if let EventBody::LoopStarted(p) = &ev.body {
@@ -537,6 +549,8 @@ impl ThreadView {
                 .unwrap_or(crate::loops::Outcome::Stopped),
             id: l.id,
             kind: l.kind,
+            commits: l.commits,
+            commit_problem: l.commit_problem,
             ended_turn: self
                 .current_turn
                 .or(self.last_turn.as_ref().map(|t| t.turn)),
@@ -685,6 +699,7 @@ impl ThreadView {
                 self.compacting = None;
                 self.set_session(&p.session_id);
                 self.stopped = false;
+                self.stopped_by_hub = false;
                 self.actual_model = reported_model(p.ext.as_ref()).map(str::to_string);
             }
             EventBody::ThreadResumed(p) => {
@@ -693,6 +708,7 @@ impl ThreadView {
                 self.task_tracking_closed = false;
                 self.parked = false;
                 self.stopped = false;
+                self.stopped_by_hub = false;
             }
             EventBody::ThreadParked(p) => {
                 self.set_session(&p.session_id);
@@ -706,7 +722,9 @@ impl ThreadView {
                 // stopped by anyone: the thread keeps its status while its runtime starts again.
                 if !is_settings_restart(p) {
                     self.stopped = true;
-                    if twr_str(p.ext.as_ref(), "reason") != Some(HUB_SHUTDOWN_REASON) {
+                    self.stopped_by_hub =
+                        twr_str(p.ext.as_ref(), "reason") == Some(HUB_SHUTDOWN_REASON);
+                    if !self.stopped_by_hub {
                         self.end_loop(Some(crate::loops::Outcome::Stopped));
                     }
                 }
@@ -813,6 +831,7 @@ impl ThreadView {
                 self.current_turn_compact = true;
                 // (A crash before it stays the thread's failure: `crashed`, `crashed_turn`.)
                 self.stopped = false;
+                self.stopped_by_hub = false;
                 self.parked = false;
             }
             EventBody::TurnStarted(p) => {
@@ -856,6 +875,7 @@ impl ThreadView {
                 self.crashed = false;
                 self.crashed_turn = None;
                 self.stopped = false;
+                self.stopped_by_hub = false;
                 self.parked = false;
                 self.reported = false;
             }
@@ -1050,6 +1070,9 @@ impl ThreadView {
             | EventBody::LoopLedger(_)
             | EventBody::LoopTransition(_)
             | EventBody::LoopControl(_)
+            | EventBody::LoopPlan(_)
+            | EventBody::LoopImplemented(_)
+            | EventBody::LoopCommit(_)
             | EventBody::LoopEnded(_) => self.apply_loop(ev),
             EventBody::ConversationUpdate(p) => {
                 match twr_str(p.ext.as_ref(), IDLE_COMPACTION_KEY) {
@@ -5286,7 +5309,6 @@ mod tests {
             &mut m,
             Input::ReportWritten {
                 report_path: "/r.md".into(),
-                commit: None,
             },
         );
         assert_eq!(v.r#loop, None);
@@ -5297,6 +5319,7 @@ mod tests {
                 kind: crate::loops::LoopKind::Review,
                 outcome: Outcome::Clean,
                 ended_turn: None,
+                ..Default::default()
             })
         );
         // Serialized as `loop`, and gone when there is none.
@@ -5338,8 +5361,17 @@ mod tests {
             v.apply(&started(&mut t));
             assert!(v.r#loop.is_some());
             let kind = body.kind().to_string();
+            let by_hub = matches!(&body, EventBody::ThreadStopped(p)
+                if twr_str(p.ext.as_ref(), "reason") == Some(HUB_SHUTDOWN_REASON));
             v.apply(&t.event(body));
             assert_eq!(v.r#loop.is_some(), keeps, "{kind}");
+            // Who stopped it: the hub's shutdown only for its own reason; started again, no one.
+            assert_eq!(v.stopped_by_hub, by_hub, "{kind}");
+            if by_hub {
+                assert!(v.stopped);
+                v.apply(&t.event(EventBody::ThreadStarted(SessionPayload::default())));
+                assert!(!v.stopped && !v.stopped_by_hub);
+            }
             if !keeps {
                 assert_eq!(
                     v.last_loop.as_ref().map(|l| l.outcome),
@@ -5362,12 +5394,52 @@ mod tests {
             ..Default::default()
         })));
         assert!(r.deleted["a"].r#loop.is_none());
-        // An implementation loop (milestone 2) starts none here.
+        // An implementation loop starts one too, in its plan phase, and its new steps fold
+        // into it; one with a profile that has nothing to run starts none.
         let mut v = ThreadView::new("t1");
         v.apply(&t.event(EventBody::LoopStarted(Box::new(LoopStarted {
             id: "l2".into(),
             kind: crate::loops::LoopKind::Implement,
             profile: Profile::builtin("low").unwrap(),
+            ..Default::default()
+        }))));
+        assert_eq!(
+            v.r#loop.as_ref().map(|l| l.phase),
+            Some(crate::loops::Phase::Plan)
+        );
+        v.apply(&t.event(EventBody::LoopPlan(crate::event::LoopPlanned {
+            id: "l2".into(),
+            revision: 1,
+            ..Default::default()
+        })));
+        assert_eq!(
+            v.r#loop.as_ref().map(|l| l.phase),
+            Some(crate::loops::Phase::Implement)
+        );
+        assert_eq!(
+            crate::loops::line(v.r#loop.as_ref().unwrap()),
+            "low · implementing"
+        );
+        v.apply(&t.event(EventBody::LoopEnded(LoopEnded {
+            id: "l2".into(),
+            outcome: crate::loops::Outcome::Clean,
+            commits: vec![crate::loops::contract::Commit {
+                repo: "/w".into(),
+                sha: "abc1234".into(),
+            }],
+            ..Default::default()
+        })));
+        let last = v.last_loop.as_ref().unwrap();
+        assert_eq!(last.kind, crate::loops::LoopKind::Implement);
+        assert_eq!(last.commits.len(), 1);
+        assert_eq!(last.commit_problem, None);
+        let mut empty = Profile::builtin("low").unwrap();
+        empty.tiers.clear();
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.event(EventBody::LoopStarted(Box::new(LoopStarted {
+            id: "l3".into(),
+            kind: crate::loops::LoopKind::Implement,
+            profile: empty,
             ..Default::default()
         }))));
         assert!(v.r#loop.is_none());

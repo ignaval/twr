@@ -19,6 +19,7 @@ import {
   setupCardState,
   skippedPhases,
   startedWords,
+  stoppedBySomeone,
   endedLoops,
   roundWords,
   waitingWords,
@@ -87,10 +88,21 @@ describe("the Review loop offer", () => {
     expect(offersReview(undefined, true)).toBe(false);
   });
 
-  it("offers on a stopped thread: after a hub restart every thread counts as stopped", () => {
+  it("offers on a thread stopped only by the hub's shutdown, not on one someone stopped", () => {
     // The hub's shutdown stops every thread, and a loop on one goes on once it is sent
-    // something; the view does not tell that stop from the user's (the hub refuses that one).
-    expect(offersReview(worker({ stopped: true }), true)).toBe(true);
+    // something; a thread someone stopped, the hub refuses until it is sent something.
+    expect(
+      offersReview(worker({ stopped: true, stopped_by_hub: true }), true),
+    ).toBe(true);
+    expect(offersReview(worker({ stopped: true }), true)).toBe(false);
+    expect(
+      offersReview(worker({ stopped: true, stopped_by_hub: false }), true),
+    ).toBe(false);
+    expect(stoppedBySomeone(worker({ stopped: true }))).toBe(true);
+    expect(
+      stoppedBySomeone(worker({ stopped: true, stopped_by_hub: true })),
+    ).toBe(false);
+    expect(stoppedBySomeone(worker())).toBe(false);
   });
 
   it("needs a finished turn and changes in its git state", () => {

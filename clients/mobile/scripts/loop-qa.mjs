@@ -870,11 +870,20 @@ export async function loopQA(driver, fixture, options) {
     { what: "Open report", timeout: 30000 },
   );
   await run.tap(".inspector-loops button", "Open report");
+  // The report's text in a sheet (`loop.report`), the path under it.
+  await run.until(
+    "async (a, lq) => !!lq.find('.loop-report-body .markdown, .loop-report-body p')",
+    {},
+    { what: "the report's text", timeout: 30000 },
+  );
   const ended = await run.ev(
-    "async (a, lq) => ({ last: lq.text(document.querySelector('.loop-last')), report: lq.text(document.querySelector('.inspector-report')), path: lq.text(document.querySelector('.loop-report .loop-path code')) })",
+    "async (a, lq) => ({ last: lq.text(document.querySelector('.loop-last')), report: lq.text(document.querySelector('.inspector-report')), text: lq.text(document.querySelector('.loop-report-body')), path: lq.text(document.querySelector('.loop-report-footer .loop-path code')) })",
   );
   assert.match(ended.path, /report\.md$/);
   assert.match(ended.report, /review loop \w+/);
+  assert.match(ended.text, /review loop/i);
+  await run.shots("report-sheet");
+  await run.tap("button[aria-label='Close dialog']");
   await run.shots("inspector-ended", { root: ".inspector" });
   await run.tab("Threads");
   const after = await run.ev(
@@ -920,8 +929,8 @@ export async function loopQA(driver, fixture, options) {
     {},
     { what: "the second loop's controls" },
   );
-  // The "started a review loop" notice covers the inspector's close button until it goes
-  // (6 s) or is dismissed: noted for the reviewer, not failed.
+  // The "started a review loop" notice shows at the top of the inspector, in its flow (on
+  // a phone a toast would cover the inspector's close button); it goes after 6 s.
   await run.shots("second-run", {
     root: ".inspector",
     transient: ["Dismiss notice"],

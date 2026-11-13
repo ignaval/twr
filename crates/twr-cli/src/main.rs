@@ -424,11 +424,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: JobCmd,
     },
-    /// Review loops: an adversarial reviewer (another model, read-only) reviews a thread's
-    /// work round after round while the thread verifies and fixes or dismisses each finding,
-    /// until the reviewer has nothing left. `twr loop review <thread>` starts one (the first
-    /// time, on a settings card you answer); `list`, `show`, `report` read them; `pause`,
-    /// `resume`, `stop`, `skip` control one; `settings` shows and changes the saved settings.
+    /// Review and implementation loops: an adversarial reviewer (another model, read-only)
+    /// reviews a thread's work round after round while the thread verifies and fixes or
+    /// dismisses each finding, until the reviewer has nothing left. `twr loop review <thread>`
+    /// starts a review loop; `twr loop implement <thread> <task>` plans, implements, reviews
+    /// and commits a task (the first time, on a settings card you answer); `list`, `show`,
+    /// `report` read them; `pause`, `resume`, `stop`, `skip` control one; `settings` shows and
+    /// changes the saved settings.
     Loop {
         #[command(subcommand)]
         cmd: loops::LoopCmd,
@@ -1294,7 +1296,10 @@ enum MemoryCmd {
 enum ThreadCmd {
     /// Pull committed runner results into a separate ref, preserving your checkout.
     Pull { thread: String },
-    /// Create a thread on a project (a configured project name or a directory).
+    /// Create a thread on a project (a configured project name or a directory). With --loop
+    /// implement, the words after the project are a task the new thread runs as an
+    /// implementation loop (its first prompt): it starts on your saved loop settings, or its
+    /// settings card comes first, as for `twr loop implement`.
     New {
         /// Project name from the config, or a path.
         project: String,
@@ -1345,6 +1350,8 @@ enum ThreadCmd {
         /// HEAD).
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+        #[command(flatten)]
+        new_loop: loops::NewLoopArgs,
     },
     /// List threads. Parked threads are left out (a footer names them) unless --all.
     List {
@@ -2142,6 +2149,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Cmd::Boxes { cmd } => boxes::run(cmd, &config, &paths, &socket).await,
         Cmd::Loop { cmd } => loops::run(cmd, &socket).await,
+        Cmd::Thread {
+            cmd: cmd @ ThreadCmd::New { .. },
+        } => thread_new(cmd, &config, &socket).await,
         Cmd::Account { cmd } => accounts::run(cmd, &paths, &socket)
             .await
             .map(|()| ExitCode::SUCCESS),
@@ -2162,18 +2172,111 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        cmd => run_simple(cmd, &config, paths, socket)
+        cmd => run_simple(cmd, paths, socket)
             .await
             .map(|()| ExitCode::SUCCESS),
     }
 }
 
-async fn run_simple(
-    cmd: Cmd,
-    config: &Config,
-    paths: Paths,
-    socket: PathBuf,
-) -> anyhow::Result<()> {
+/// `twr thread new`: `thread.new`, then what it made; with `--loop implement`, the loop it
+/// asked for, or its card ([`loops::after_new_thread`]).
+async fn thread_new(cmd: ThreadCmd, config: &Config, socket: &Path) -> anyhow::Result<ExitCode> {
+    let ThreadCmd::New {
+        project,
+        runtime,
+        account,
+        outside_pin,
+        box_name,
+        name,
+        mode,
+        model,
+        effort,
+        aliases,
+        no_worktree,
+        worktree,
+        base,
+        new_loop,
+    } = cmd
+    else {
+        unreachable!("thread_new takes `thread new`")
+    };
+    check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
+    let project = project_param(config, &project, box_name.as_deref())?;
+    let mut params = json!({ "project": project, "aliases": aliases });
+    if no_worktree {
+        params["no_worktree"] = json!(true);
+    }
+    if worktree {
+        params["worktree"] = json!(true);
+    }
+    if outside_pin {
+        params["outside_pin"] = json!(true);
+    }
+    for (k, v) in [
+        ("runtime", runtime),
+        ("account", account),
+        ("box", box_name),
+        ("name", name),
+        ("mode", mode),
+        ("model", model),
+        ("effort", effort),
+        ("base", base),
+    ] {
+        if let Some(v) = v {
+            params[k] = json!(v);
+        }
+    }
+    let json = new_loop.json;
+    let mut stdin = false;
+    if new_loop.kind.is_some() {
+        refuse_agent_action("start a loop")?;
+        let (l, read_stdin) = loops::new_thread_loop_param(new_loop)?;
+        params["loop"] = l;
+        stdin = read_stdin;
+    }
+    let t = connect(socket).await?.call("thread.new", params).await?;
+    if !json {
+        let mut model = format!(
+            " model={}",
+            t["model"].as_str().unwrap_or("(runtime default)")
+        );
+        if let Some(e) = t["effort"].as_str() {
+            model.push_str(&format!(" effort={e}"));
+        }
+        let command = match t["pty_command"].as_array().or(t["acp_command"].as_array()) {
+            Some(argv) => format!(" command={}", Value::Array(argv.clone())),
+            None => String::new(),
+        };
+        outln!(
+            "created {} ({}) runtime={}{command}{model} worktree={}",
+            str_of(&t["name"]),
+            str_of(&t["id"]),
+            accounts::runtime_label(&t),
+            str_of(&t["worktree"])
+        );
+        if let Some(repo) = t["project_found"]["repo"].as_str() {
+            outln!("found {} at {repo}", str_of(&t["project_found"]["name"]));
+        }
+        if let Some(w) = result_warning(&t) {
+            errln!("{w}");
+        }
+    }
+    if t["loop"].is_null() {
+        if json {
+            outln!("{}", serde_json::to_string_pretty(&t)?);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut ask = ask_on_stderr;
+    let consent = if json || stdin {
+        Consent::NoTerminal
+    } else {
+        consent(false, &mut ask)
+    };
+    loops::after_new_thread(socket, t, json, consent).await
+}
+
+async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     match cmd {
         Cmd::Attach { .. }
         | Cmd::Wait { .. }
@@ -2190,6 +2293,9 @@ async fn run_simple(
         | Cmd::TerminalSetup { .. }
         | Cmd::Completions { .. }
         | Cmd::Account { .. }
+        | Cmd::Thread {
+            cmd: ThreadCmd::New { .. },
+        }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
         }
@@ -2289,78 +2395,6 @@ async fn run_simple(
         Cmd::Thread {
             cmd: ThreadCmd::Show { thread, json },
         } => thread_show(&socket, &thread, json).await,
-        Cmd::Thread {
-            cmd:
-                ThreadCmd::New {
-                    project,
-                    runtime,
-                    account,
-                    outside_pin,
-                    box_name,
-                    name,
-                    mode,
-                    model,
-                    effort,
-                    aliases,
-                    no_worktree,
-                    worktree,
-                    base,
-                },
-        } => {
-            check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
-            let project = project_param(config, &project, box_name.as_deref())?;
-            let mut c = connect(&socket).await?;
-            let mut params = json!({ "project": project, "aliases": aliases });
-            if no_worktree {
-                params["no_worktree"] = json!(true);
-            }
-            if worktree {
-                params["worktree"] = json!(true);
-            }
-            if outside_pin {
-                params["outside_pin"] = json!(true);
-            }
-            for (k, v) in [
-                ("runtime", runtime),
-                ("account", account),
-                ("box", box_name),
-                ("name", name),
-                ("mode", mode),
-                ("model", model),
-                ("effort", effort),
-                ("base", base),
-            ] {
-                if let Some(v) = v {
-                    params[k] = json!(v);
-                }
-            }
-            let t = c.call("thread.new", params).await?;
-            let mut model = format!(
-                " model={}",
-                t["model"].as_str().unwrap_or("(runtime default)")
-            );
-            if let Some(e) = t["effort"].as_str() {
-                model.push_str(&format!(" effort={e}"));
-            }
-            let command = match t["pty_command"].as_array().or(t["acp_command"].as_array()) {
-                Some(argv) => format!(" command={}", Value::Array(argv.clone())),
-                None => String::new(),
-            };
-            outln!(
-                "created {} ({}) runtime={}{command}{model} worktree={}",
-                str_of(&t["name"]),
-                str_of(&t["id"]),
-                accounts::runtime_label(&t),
-                str_of(&t["worktree"])
-            );
-            if let Some(repo) = t["project_found"]["repo"].as_str() {
-                outln!("found {} at {repo}", str_of(&t["project_found"]["name"]));
-            }
-            if let Some(w) = result_warning(&t) {
-                errln!("{w}");
-            }
-            Ok(())
-        }
         Cmd::Send {
             cancel: Some(id), ..
         } => {
@@ -3396,6 +3430,14 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     // Named accounts without a `dir` of their own: the home's root's, every workspace's.
     opts.accounts_root = Some(paths.accounts_dir());
     opts.worktree_namespace = paths.worktree_namespace();
+    // A loop's record held at a gate, for a test that kills the hub there.
+    if let Some((at, gate)) = loop_gate(trusted) {
+        opts.loop_record_hook = Some(std::sync::Arc::new(move |point: &str| {
+            if point.starts_with(&at) {
+                test_gate(&gate, LOOP_GATE_ENV);
+            }
+        }));
+    }
     if trusted && std::env::var_os(HUB_STOP_GATE_ENV).is_some() {
         opts.socket_removed_hook = Some(std::sync::Arc::new(|| {
             Box::pin(async {
@@ -3459,7 +3501,28 @@ fn hub_test_gate(env: &str) {
     let Some(gate) = std::env::var_os(env).filter(|_| test_token_trusted()) else {
         return;
     };
-    let gate = PathBuf::from(gate);
+    test_gate(Path::new(&gate), env);
+}
+
+/// `TWR_TEST_LOOP_GATE=<point>=<file>`, for tests of a hub killed in the middle of a loop:
+/// right before the hub commits what a loop records at a point whose name starts with
+/// `<point>` (`findings m1`, `answer triage m1`, `failed scope`, `checked report`, `report
+/// written`:
+/// [`twr_hub::HubOptions::loop_record_hook`]), it waits at the gate `<file>` ([`test_gate`]),
+/// under its lock. Only in a test's throwaway hub ([`test_token_trusted`]).
+const LOOP_GATE_ENV: &str = "TWR_TEST_LOOP_GATE";
+
+/// The point and the gate [`LOOP_GATE_ENV`] names, in a test's throwaway hub (`trusted`).
+fn loop_gate(trusted: bool) -> Option<(String, PathBuf)> {
+    let raw = std::env::var(LOOP_GATE_ENV).ok().filter(|_| trusted)?;
+    let (at, file) = raw.split_once('=')?;
+    Some((at.to_string(), PathBuf::from(file)))
+}
+
+/// The test gate `gate` (of `env`): creates `<gate>.reached` and waits while `gate` exists
+/// (at most a minute).
+fn test_gate(gate: &Path, env: &str) {
+    let gate = gate.to_path_buf();
     let mut reached = gate.clone().into_os_string();
     reached.push(".reached");
     if let Err(e) = std::fs::write(&reached, b"") {
@@ -7311,8 +7374,8 @@ fn wait_line(t: &Value, state: WaitState) -> String {
                     .is_some_and(|i| i.iter().any(|i| i["loop_setup"] == true)) =>
         {
             format!(
-                "{name}'s loop waits for its settings card: `twr{w} attention --all` shows it, \
-                 `twr{w} loop review {name}` answers it",
+                "{name}'s loop waits for its settings card: `twr{w} attention --all` shows it \
+                 and the `twr{w} respond` line that answers it",
                 w = workspace_hint()
             )
         }

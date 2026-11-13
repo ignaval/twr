@@ -384,7 +384,12 @@ export function attentionAnnouncement(item: {
           : item.reason === "review"
             ? "finished work to review"
             : "needs you";
-  const summary = (item.summary || "").replace(/\s+/g, " ").trim();
+  // A setup card's first line says which loop it is for; its rows (models, a held task)
+  // are for the card, not for a sentence read aloud.
+  const text = item.loop_setup
+    ? (item.summary || "").split("\n").find((line) => line.trim()) || ""
+    : item.summary || "";
+  const summary = text.replace(/\s+/g, " ").trim();
   return `Needs you: ${who} ${kind}${summary ? ": " + summary.slice(0, 160) : ""}`;
 }
 

@@ -758,6 +758,10 @@ pub struct Overrides {
     /// (review).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// An implementation loop's plan check: `contracts`, `always` or `never` (it overrides the
+    /// profile's). A review loop refuses it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_check: Option<String>,
 }
 
 impl Overrides {
@@ -789,7 +793,58 @@ impl Overrides {
                 LoopKind::Review => out.review_commit = ReviewCommit::parse(c)?,
             }
         }
+        if let Some(v) = &self.plan_check {
+            match kind {
+                LoopKind::Implement => {
+                    out.plan_check =
+                        Some(PlanCheck::parse(v).map_err(|e| format!("plan_check: {e}"))?)
+                }
+                LoopKind::Review => {
+                    return Err(
+                        "plan_check is an implementation loop's: a review loop has no plan".into(),
+                    )
+                }
+            }
+        }
         Ok(out)
+    }
+}
+
+/// Longest task an implementation loop takes, in bytes.
+pub const MAX_TASK_BYTES: usize = 16 * 1024;
+
+/// Checks what one run of a loop of `kind` names besides its settings: an implementation loop
+/// takes a task (none: the task is what the conversation already settled) and no scope (its
+/// baseline is the worktree as it is when it starts); a review loop takes a scope and no task.
+/// `scope` and `task` are as the request gives them (`None` or blank: none).
+pub fn check_run(kind: LoopKind, scope: Option<&str>, task: Option<&str>) -> Result<(), String> {
+    let given = |v: Option<&str>| v.is_some_and(|v| !v.trim().is_empty());
+    match kind {
+        LoopKind::Implement if given(scope) => Err(
+            "an implementation loop has no scope: what the worktree holds when it starts is its \
+             baseline, out of scope"
+                .into(),
+        ),
+        LoopKind::Review if given(task) => Err(
+            "a review loop takes no task: it reviews the thread's work (/implement takes one)"
+                .into(),
+        ),
+        _ if task.is_some_and(|t| t.len() > MAX_TASK_BYTES) => Err(format!(
+            "the task is longer than {MAX_TASK_BYTES} bytes: put the details in a file and \
+             name it"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Whether the workers of `s` apply: the implementer's runtime (the named one's, else the
+/// thread's) runs subagents of its own. Where it does not, the setup card leaves out its
+/// workers row, [`validate`] does not check them, and the loop's prompts do not name them.
+/// Outside a thread (the settings editor) with the thread's own implementer, they may apply.
+pub fn workers_apply(s: &LoopSettings, avail: &Availability) -> bool {
+    match implementer_runtime(s, avail) {
+        Some(rt) => avail.runtime(rt).is_some_and(|r| r.subagents),
+        None => true,
     }
 }
 
@@ -1219,6 +1274,7 @@ mod tests {
             implementer: Some("thread".into()),
             workers: Some("claude-sonnet-5-5".into()),
             commit: Some("none".into()),
+            plan_check: None,
         };
         let r = o.apply(&s, LoopKind::Review).unwrap();
         assert_eq!(r.profile, "low");
@@ -1244,6 +1300,77 @@ mod tests {
             .apply(&s, LoopKind::Review)
             .unwrap_err()
             .starts_with("reviewer: "));
+    }
+
+    #[test]
+    fn a_plan_check_override_is_an_implementation_loops() {
+        let o = Overrides {
+            plan_check: Some("always".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            o.apply(&first(), LoopKind::Implement).unwrap().plan_check,
+            Some(PlanCheck::Always)
+        );
+        assert!(o
+            .apply(&first(), LoopKind::Review)
+            .unwrap_err()
+            .contains("a review loop has no plan"));
+        let bad = Overrides {
+            plan_check: Some("sometimes".into()),
+            ..Default::default()
+        };
+        assert!(bad
+            .apply(&first(), LoopKind::Implement)
+            .unwrap_err()
+            .starts_with("plan_check: "));
+        // As the request carries it.
+        let j: Overrides =
+            serde_json::from_value(serde_json::json!({"plan_check": "never"})).unwrap();
+        assert_eq!(j.plan_check.as_deref(), Some("never"));
+        assert!(!j.is_empty());
+    }
+
+    #[test]
+    fn a_run_takes_a_task_or_a_scope_by_its_kind() {
+        assert_eq!(
+            check_run(LoopKind::Implement, None, Some("add a CSV export")),
+            Ok(())
+        );
+        assert_eq!(check_run(LoopKind::Implement, Some("  "), None), Ok(()));
+        assert!(check_run(LoopKind::Implement, Some("branch"), None)
+            .unwrap_err()
+            .starts_with("an implementation loop has no scope"));
+        assert_eq!(check_run(LoopKind::Review, Some("branch"), None), Ok(()));
+        assert!(check_run(LoopKind::Review, None, Some("x"))
+            .unwrap_err()
+            .starts_with("a review loop takes no task"));
+        let long = "x".repeat(MAX_TASK_BYTES + 1);
+        assert!(check_run(LoopKind::Implement, None, Some(&long))
+            .unwrap_err()
+            .contains("longer than"));
+    }
+
+    #[test]
+    fn workers_apply_where_the_implementer_runs_subagents() {
+        let s = first();
+        // The thread's own model on Claude Code: yes; on Codex: no.
+        assert!(workers_apply(&s, &all_found()));
+        let mut a = all_found();
+        a.thread.as_mut().unwrap().runtime = "codex".into();
+        assert!(!workers_apply(&s, &a));
+        // A named implementer's runtime decides, not the thread's.
+        let mut named = first();
+        named.implementer = Some(ModelChoice::parse("codex/gpt-6.1-sol:high").unwrap());
+        assert!(!workers_apply(&named, &all_found()));
+        // Outside a thread, with the thread's own: they may.
+        let mut editor = all_found();
+        editor.thread = None;
+        assert!(workers_apply(&s, &editor));
+        // A runtime not found: no.
+        let mut gone = all_found();
+        gone.runtimes.clear();
+        assert!(!workers_apply(&s, &gone));
     }
 
     #[test]

@@ -533,6 +533,28 @@ impl PlanCheck {
             PlanCheck::Always => "always",
         }
     }
+
+    /// Parses `never`, `contracts` or `always`.
+    pub fn parse(s: &str) -> Result<PlanCheck, String> {
+        match s.trim() {
+            "never" => Ok(PlanCheck::Never),
+            "contracts" => Ok(PlanCheck::Contracts),
+            "always" => Ok(PlanCheck::Always),
+            other => Err(format!(
+                "{other:?} is not a plan check (contracts, always or never)"
+            )),
+        }
+    }
+
+    /// Whether the plan check runs on a plan that said `contract_risk`: always with `always`,
+    /// never with `never`, and with `contracts` when the plan touches a contract.
+    pub fn runs(self, contract_risk: bool) -> bool {
+        match self {
+            PlanCheck::Never => false,
+            PlanCheck::Contracts => contract_risk,
+            PlanCheck::Always => true,
+        }
+    }
 }
 
 /// What an implementation loop commits.
@@ -599,6 +621,18 @@ impl ReviewCommit {
             other => Err(format!(
                 "{other:?} is not a review loop's commit (match or none)"
             )),
+        }
+    }
+
+    /// Whether a review loop commits its fixes, as the hub decides it when the loop starts
+    /// (`loop.started.commit_fixes`): under `match`, when the thread had been committing its
+    /// work, which is when the scope has commits of the thread's own and the worktree had no
+    /// uncommitted changes; under `none`, never. The report turn then asks for one commit of
+    /// the fixes.
+    pub fn commits_fixes(self, own_commits: bool, clean: bool) -> bool {
+        match self {
+            ReviewCommit::Match => own_commits && clean,
+            ReviewCommit::None => false,
         }
     }
 }
@@ -924,6 +958,25 @@ verify = { rounds = 1, effort = "medium" }
             Profile::builtin("low").unwrap().summary(),
             "low · one medium round · 1 verify"
         );
+    }
+
+    #[test]
+    fn plan_checks_parse_and_run_by_the_plans_risk() {
+        for (text, v) in [
+            ("never", PlanCheck::Never),
+            ("contracts", PlanCheck::Contracts),
+            (" always ", PlanCheck::Always),
+        ] {
+            assert_eq!(PlanCheck::parse(text).unwrap(), v);
+            assert_eq!(PlanCheck::parse(v.as_str()).unwrap(), v);
+        }
+        assert!(PlanCheck::parse("yes")
+            .unwrap_err()
+            .contains("contracts, always or never"));
+        assert!(!PlanCheck::Never.runs(true));
+        assert!(PlanCheck::Contracts.runs(true));
+        assert!(!PlanCheck::Contracts.runs(false));
+        assert!(PlanCheck::Always.runs(false));
     }
 
     #[test]

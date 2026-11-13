@@ -10,8 +10,10 @@
 //! - **facts**, what happened that the machine could not know: `loop.started`, a review run
 //!   started (`loop.review_started`) or answered (`loop.findings`), the thread's triage
 //!   (`loop.triage`), its GOAL paragraph or sweep results or a refused reply (`loop.phase`
-//!   with `goal`, `sweep` or `problems`), a control (`loop.control`), the end
-//!   (`loop.ended`, also written by the hub for a stopped thread or a report written);
+//!   with `goal`, `sweep` or `problems`), an implementation loop's plan (`loop.plan`) and
+//!   implement turn (`loop.implemented`), the hub's check of a commit (`loop.commit`), a
+//!   control (`loop.control`), the end (`loop.ended`, also written by the hub for a stopped
+//!   thread or a report written);
 //! - **records**, what the machine decided from them: a phase change (a plain `loop.phase`),
 //!   the ledger's new entries (`loop.ledger`), the ladder's end (`loop.transition`) and the
 //!   end it reached itself (`loop.ended`).
@@ -23,7 +25,9 @@
 //! returned, and a fold of the log gives back the state it stepped to.
 //!
 //! [`LoopState::step`] is the driver's entry: it turns an [`Input`] into its fact, checks
-//! that the loop waits for it, applies it and returns the fact's [`Action::Record`] first.
+//! that the loop waits for it, applies it and returns the fact's [`Action::Record`] first. (One
+//! input is two facts: a plan-check triage that revised the plan is its `loop.plan`, then its
+//! `loop.triage`, each recorded and applied in turn.)
 //!
 //! # The rules (review loops)
 //!
@@ -73,20 +77,65 @@
 //!   the loop `stopped`; `skip_to_verify` (scope or ladder only) ends the ladder at the end of
 //!   the current round (after the GOAL paragraph in scope), skipping the sweep, and at once
 //!   when the loop is paused before a round has run.
+//!
+//! # The rules (implementation loops)
+//!
+//! An implementation loop has no scope phase and no GOAL paragraph: the task and the plan
+//! take their place. It goes `plan → plan_check → implement`, then the ladder, sweep,
+//! verification and report exactly as a review loop, its review runs on the impl-review
+//! template ([`ReviewTemplate`]).
+//!
+//! - **plan**: one thread turn; its `twr-plan` block (and the message without it, the plan the
+//!   hub writes to `plan.md`) is `loop.plan` revision 1. A missing or invalid block gets the
+//!   one correction prompt, then the loop is stuck.
+//! - **plan check**: it runs when the plan check setting (the settings' `plan_check`, else the
+//!   profile's) is `always`, or `contracts` and the plan said `contract_risk: true`. It is one
+//!   review run, round `p1`, at `medium`, on the plan-review template, retried once when it
+//!   fails as any round is. No findings: on to implement. Findings: one triage turn
+//!   ([`contract::parse_plan_triage`]: no gates, class optional) whose dismissals go into the
+//!   ledger and whose revised plan, if any, is `loop.plan` revision 2. There is no second plan
+//!   round, and the plan check's findings neither count toward the sweep nor the transition.
+//! - **implement**: one thread turn; its `twr-implement` block is `loop.implemented`. Anything
+//!   but `done` with gates that passed (or a missing block) gets the one correction prompt,
+//!   "gates must be green before review", then the loop is stuck. `done` and green start the
+//!   ladder.
+//! - **skip to verify** is refused until the implement phase is done: there is nothing to
+//!   verify before it. In the ladder it is a review loop's.
+//!
+//! # The commit
+//!
+//! Whether a loop commits is fixed when it starts ([`CommitMode`]): an implementation loop by
+//! its Commit setting (`end`, `per-round`, `none`), a review loop under `match` by the hub's
+//! decision `loop.started.commit_fixes` (`end` when it holds, else none). A loop that ends
+//! `stopped` or `failed` never reaches its report and never commits. When it commits
+//! ([`LoopState::asks_commit`]), the report turn asks for the commit and a `twr-commit` block;
+//! the hub checks it ([`contract::check_commit`], which follows git: the block is the thread's
+//! note, never the check) and gives the result ([`Input::CommitChecked`], `loop.commit`). A passed check, or a second failed one, has the hub write `report.md`
+//! ([`Action::WriteReport`]), and then the loop ends with its outcome, its `loop.ended` naming
+//! the commits and, after two failures, `commit_problem`. A first failure gets one correction
+//! prompt ([`Step::Commit`]); a loop that commits never gets stuck over it.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::config::{Tier, Verify};
+use super::config::{ImplCommit, PlanCheck, ReviewCommit, Tier, Verify};
 use super::contract::{
-    self, ledger_id, number_findings, parse_goal, parse_sweep, parse_triage, tier_tags, Finding,
-    FindingClass, LedgerEntry, LedgerKind, Sweep, SweepResult, Triage, Verdict, VERIFY_TAG,
+    self, ledger_id, number_findings, parse_goal, parse_implement, parse_plan, parse_plan_triage,
+    parse_sweep, parse_triage, tier_tags, Commit, Finding, FindingClass, Implemented, LedgerEntry,
+    LedgerKind, Plan, PlanTriage, Sweep, SweepResult, Triage, Verdict, PLAN_CHECK_TAG, VERIFY_TAG,
 };
 use super::{ControlAction, ControlBy, LoopKind, Outcome, Phase, TransitionReason, WaitingOn};
 use crate::event::{
-    Event, EventBody, LoopControl, LoopEnded, LoopFindings, LoopLedger, LoopPhaseChanged,
-    LoopReviewStarted, LoopStarted, LoopTransition, LoopTriage, Usage,
+    Event, EventBody, LoopCommitChecked, LoopControl, LoopEnded, LoopFindings, LoopImplemented,
+    LoopLedger, LoopPhaseChanged, LoopPlanned, LoopReviewStarted, LoopStarted, LoopTransition,
+    LoopTriage, Usage,
 };
+
+/// The round of an implementation loop's plan check (its findings are `p1.1`…).
+pub const PLAN_CHECK_ROUND: &str = "p1";
+
+/// The reviewer's effort in the plan check.
+pub const PLAN_CHECK_EFFORT: &str = "medium";
 
 /// The loop as clients see it: the machine's state itself, so a client's fold and the hub's
 /// driver never disagree ([`crate::reduce::ThreadView::r#loop`]).
@@ -153,20 +202,29 @@ pub enum Wait {
     /// The scope turn's GOAL paragraph.
     #[default]
     Goal,
-    /// Round `round`'s review run.
+    /// An implementation loop's plan turn (`twr-plan`).
+    Plan,
+    /// Round `round`'s review run (`p1`: the plan check's).
     Review {
         /// The round.
         round: String,
     },
-    /// The thread's triage of round `round`.
+    /// The thread's triage of round `round` (`p1`: the plan check's).
     Triage {
         /// The round.
         round: String,
     },
+    /// An implementation loop's implement turn (`twr-implement`).
+    Implement,
     /// The sweep turn.
     Sweep,
-    /// The report turn, then the hub's `report.md`.
+    /// The report turn, then (with no commit asked) the hub's `report.md`, or (with one) the
+    /// hub's check of the commit.
     Report,
+    /// The commit's correction turn, then the hub's check of it.
+    Commit,
+    /// The commit is settled: the hub writes `report.md` ([`Action::WriteReport`]).
+    WriteReport,
     /// Nothing: the loop is over.
     Ended,
 }
@@ -177,10 +235,16 @@ pub enum Wait {
 pub enum Step {
     /// The scope turn (`twr-goal`).
     Goal,
-    /// A triage turn (`twr-triage`).
+    /// A triage turn (`twr-triage`; the plan check's may add `twr-plan`).
     Triage,
     /// The sweep turn (`twr-sweep`).
     Sweep,
+    /// The plan turn (`twr-plan`).
+    Plan,
+    /// The implement turn (`twr-implement`).
+    Implement,
+    /// The report turn's commit (`twr-commit`): its check failed once.
+    Commit,
 }
 
 impl Step {
@@ -190,6 +254,79 @@ impl Step {
             Step::Goal => "scope",
             Step::Triage => "triage",
             Step::Sweep => "sweep",
+            Step::Plan => "plan",
+            Step::Implement => "implement",
+            Step::Commit => "commit",
+        }
+    }
+
+    /// The fenced block its reply ends with.
+    pub fn block(self) -> &'static str {
+        match self {
+            Step::Goal => contract::GOAL_BLOCK,
+            Step::Triage => contract::TRIAGE_BLOCK,
+            Step::Sweep => contract::SWEEP_BLOCK,
+            Step::Plan => contract::PLAN_BLOCK,
+            Step::Implement => contract::IMPLEMENT_BLOCK,
+            Step::Commit => contract::COMMIT_BLOCK,
+        }
+    }
+}
+
+/// The template a review run's prompt is built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewTemplate {
+    /// A review loop's rounds: the thread's work in its scope.
+    Review,
+    /// An implementation loop's rounds: the diff against the plan, the baseline out of scope.
+    ImplReview,
+    /// An implementation loop's plan check: the plan, before any code.
+    PlanReview,
+}
+
+impl ReviewTemplate {
+    /// The template's name (`templates/<name>.md`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewTemplate::Review => "review",
+            ReviewTemplate::ImplReview => "impl-review",
+            ReviewTemplate::PlanReview => "plan-review",
+        }
+    }
+}
+
+/// What a loop commits, fixed when it starts (module docs, "The commit").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommitMode {
+    /// Nothing: no commit is asked for and nothing is checked.
+    #[default]
+    None,
+    /// The report turn commits the loop's work.
+    End,
+    /// The implement turn and every triage turn that fixed something commit their work; the
+    /// report turn commits what is left. The same check runs at the end.
+    PerRound,
+}
+
+impl CommitMode {
+    /// What loop `p` commits: an implementation loop by its Commit setting; a review loop
+    /// under `match` at the end when the hub decided so at the start
+    /// (`loop.started.commit_fixes`), else nothing.
+    pub fn of(p: &LoopStarted) -> CommitMode {
+        match p.kind {
+            LoopKind::Implement => match p.settings.commit {
+                ImplCommit::End => CommitMode::End,
+                ImplCommit::PerRound => CommitMode::PerRound,
+                ImplCommit::None => CommitMode::None,
+            },
+            LoopKind::Review
+                if p.commit_fixes && p.settings.review_commit == ReviewCommit::Match =>
+            {
+                CommitMode::End
+            }
+            LoopKind::Review => CommitMode::None,
         }
     }
 }
@@ -228,17 +365,34 @@ pub enum Action {
     /// Send the scope prompt: run the gates once, write the GOAL paragraph in a `twr-goal`
     /// block.
     AskGoal,
+    /// Send an implementation loop's plan prompt: the task, the skill's plan sections, "state
+    /// an interpretation instead of asking", and a `twr-plan` block.
+    AskPlan,
     /// Run the review of round `round` at `effort` (and record `loop.review_started`).
     RunReview {
-        /// The round (`m3`, `v1`).
+        /// The round (`m3`, `v1`; `p1`: the plan check).
         round: String,
-        /// The phase it is of (ladder or verify).
+        /// The phase it is of (ladder, verify or plan check).
         phase: Phase,
         /// The reviewer's effort.
         effort: String,
         /// It retries a failed run.
         retry: bool,
+        /// The template its prompt is built from.
+        template: ReviewTemplate,
     },
+    /// Send the plan check's findings for triage, wrapped as data: a `twr-triage` block (no
+    /// gates, class optional) and, when the plan changes, the revised plan and a `twr-plan`
+    /// block.
+    AskPlanTriage {
+        /// The round (`p1`).
+        round: String,
+        /// Its findings, numbered.
+        findings: Vec<Finding>,
+    },
+    /// Send an implementation loop's implement prompt: execute `plan.md`, delegate as the
+    /// skill says, run the gates, and a `twr-implement` block.
+    AskImplement,
     /// Send round `round`'s findings for triage, wrapped as data.
     AskTriage {
         /// The round.
@@ -255,8 +409,11 @@ pub enum Action {
     },
     /// Send the sweep prompt (this loop's findings, distilled into rules).
     AskSweep,
-    /// Send the report prompt.
+    /// Send the report prompt (with a commit to make when [`LoopState::asks_commit`]).
     AskReport,
+    /// Write `report.md` from the report turn's reply: the commit is settled (made, or its
+    /// check failed twice); then [`Input::ReportWritten`].
+    WriteReport,
     /// Raise a stuck item on the thread's card: the loop is paused until the user resumes it.
     Stuck {
         /// What went wrong.
@@ -279,6 +436,41 @@ pub enum Input {
     },
     /// The scope turn's reply had no valid `twr-goal` block.
     GoalRejected {
+        /// Why.
+        problems: Vec<String>,
+    },
+    /// The plan turn's plan ([`contract::parse_plan`]), which the hub wrote to `path`.
+    PlanWritten {
+        /// The plan.
+        plan: Plan,
+        /// Where the hub wrote it (`plan.md`); `None` from [`LoopState::reply_input`], which
+        /// the hub fills in once it wrote the file.
+        path: Option<String>,
+    },
+    /// The plan turn's reply had no valid `twr-plan` block, or no plan.
+    PlanRejected {
+        /// Why.
+        problems: Vec<String>,
+    },
+    /// The plan check's triage ([`contract::parse_plan_triage`]); a revised plan the hub wrote
+    /// to `path`. (Its refusal is [`Input::TriageRejected`].)
+    PlanTriaged {
+        /// The round (`p1`).
+        round: String,
+        /// The triage.
+        triage: PlanTriage,
+        /// Where the hub wrote the revised plan (`plan.md`, the first kept as `plan-1.md`);
+        /// `None` from [`LoopState::reply_input`], or when the plan did not change.
+        path: Option<String>,
+    },
+    /// The implement turn's `twr-implement` block ([`contract::parse_implement`]), whatever
+    /// it says: the machine refuses anything but `done` and green.
+    Implemented {
+        /// The block.
+        implemented: Implemented,
+    },
+    /// The implement turn's reply had no valid `twr-implement` block.
+    ImplementRejected {
         /// Why.
         problems: Vec<String>,
     },
@@ -338,12 +530,20 @@ pub enum Input {
         /// Why.
         problems: Vec<String>,
     },
+    /// The hub checked the commit the report turn (or its correction) made
+    /// ([`contract::parse_commit`], [`contract::check_commit`]).
+    CommitChecked {
+        /// The commits it found (of the repositories that passed).
+        commits: Vec<Commit>,
+        /// What is wrong; empty: the check passed.
+        problems: Vec<String>,
+        /// What it noted that is no problem (the `twr-commit` block missing or invalid).
+        notes: Vec<String>,
+    },
     /// The hub wrote `report.md` from the report turn's reply.
     ReportWritten {
         /// Its path.
         report_path: String,
-        /// An implementation loop's commit.
-        commit: Option<String>,
     },
     /// The loop's thread turn failed (an error, a crash, an interrupt): the loop is stuck.
     TurnFailed {
@@ -368,9 +568,6 @@ pub enum Input {
 /// Why a loop does not start.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StartError {
-    /// Implementation loops come in milestone 2.
-    #[error("implementation loops are not supported yet: only review loops run in this version")]
-    NotSupported,
     /// The profile has no tier, no verification round, or a tier capped at zero rounds.
     #[error("profile {0} has no ladder or no verification round to run")]
     EmptyProfile(String),
@@ -426,7 +623,27 @@ pub struct LoopState {
     pub review_started_at: Option<DateTime<Utc>>,
     /// How it ended, once it did; while the report is being written, how it will.
     pub outcome: Option<Outcome>,
+    /// What it commits ([`CommitMode`]).
+    pub commit: CommitMode,
+    /// The commits the hub's check found.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<Commit>,
+    /// The commit's check failed twice: what is left (`not committed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_problem: Option<String>,
+    /// An implementation loop's plan: 0 before the plan turn answered, 1 once it did, 2 once
+    /// the plan check revised it.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub plan_revision: u32,
 
+    /// An implementation loop's plan check setting: the settings' `plan_check`, else the
+    /// profile's.
+    pub plan_check: PlanCheck,
+    /// What the latest plan said of contracts.
+    pub contract_risk: Option<bool>,
+    /// The last failed commit check's problems (what a resumed correction names again).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commit_problems: Vec<String>,
     /// What the ladder runs.
     pub plan: LoopPlan,
     /// The current tier's place in [`LoopPlan::tiers`].
@@ -461,13 +678,10 @@ pub struct LoopState {
 }
 
 impl LoopState {
-    /// The state `loop.started` `p` starts, and what to do first: record the scope phase and
-    /// ask for the GOAL paragraph. (The hub writes `p` itself.) An implementation loop is
-    /// refused in this milestone, and so is a profile with nothing to run.
+    /// The state `loop.started` `p` starts, and what to do first: record the first phase and
+    /// ask for its turn (a review loop's scope turn, an implementation loop's plan turn). (The
+    /// hub writes `p` itself.) A profile with nothing to run is refused.
     pub fn start(p: &LoopStarted) -> Result<(LoopState, Vec<Action>), StartError> {
-        if p.kind == LoopKind::Implement {
-            return Err(StartError::NotSupported);
-        }
         let profile = &p.profile;
         if profile.tiers.is_empty()
             || profile.verify.rounds == 0
@@ -476,11 +690,15 @@ impl LoopState {
             return Err(StartError::EmptyProfile(profile.name.clone()));
         }
         let efforts: Vec<&str> = profile.tiers.iter().map(|t| t.effort.as_str()).collect();
+        let (phase, wait) = match p.kind {
+            LoopKind::Review => (Phase::Scope, Wait::Goal),
+            LoopKind::Implement => (Phase::Plan, Wait::Plan),
+        };
         let mut s = LoopState {
             id: p.id.clone(),
             kind: p.kind,
             profile: profile.name.clone(),
-            phase: Phase::Scope,
+            phase,
             verify: VerifyProgress {
                 done: 0,
                 cap: profile.verify.rounds,
@@ -490,6 +708,8 @@ impl LoopState {
                 model: p.settings.reviewer.model.clone(),
                 effort: None,
             },
+            commit: CommitMode::of(p),
+            plan_check: p.settings.plan_check.unwrap_or(profile.plan_check),
             plan: LoopPlan {
                 tiers: profile.tiers.clone(),
                 tags: tier_tags(&efforts),
@@ -501,7 +721,7 @@ impl LoopState {
                     n => n,
                 },
             },
-            wait: Wait::Goal,
+            wait,
             ..Default::default()
         };
         let mut out = vec![s.record_phase()];
@@ -537,17 +757,23 @@ impl LoopState {
 
     /// Takes `input` at `at` (the time the hub records it): its fact, if the loop waits for
     /// it, applied. The actions start with [`Action::Record`] of the fact, then what applying
-    /// it returned; the hub writes every record in one batch, with `at` as their time.
+    /// it returned (an input of two facts: each, in turn); the hub writes every record in one
+    /// batch, with `at` as their time.
     pub fn step(&mut self, input: Input, at: DateTime<Utc>) -> Result<Vec<Action>, StepError> {
-        let fact = self.fact(input)?;
-        let mut out = vec![Action::Record(fact.clone())];
-        out.extend(self.evolve(&fact, at));
+        let facts = self.facts(input)?;
+        let mut out = Vec::new();
+        for fact in facts {
+            out.push(Action::Record(fact.clone()));
+            out.extend(self.evolve(&fact, at));
+        }
         Ok(out)
     }
 
     /// What the thread's final message `text` brings to the step the loop waits for: a GOAL
-    /// paragraph, a triage or sweep results, or why the block was refused. `None` when the loop
-    /// waits for no reply of the thread's it parses (a review run, the report, the end).
+    /// paragraph, a plan, a triage, the implement turn's block or sweep results, or why the
+    /// block was refused. `None` when the loop waits for no reply of the thread's it parses (a
+    /// review run, the report and its commit, which the hub reads itself, the end). A plan
+    /// comes back without its path: the hub writes the plan, then steps the input with it.
     pub fn reply_input(&self, text: &str) -> Option<Input> {
         let problems = |v: Vec<contract::BlockProblem>| v.iter().map(ToString::to_string).collect();
         match &self.wait {
@@ -557,6 +783,25 @@ impl LoopState {
                     problems: problems(p),
                 },
             }),
+            Wait::Plan => Some(match parse_plan(text) {
+                Ok(plan) => Input::PlanWritten { plan, path: None },
+                Err(p) => Input::PlanRejected {
+                    problems: problems(p),
+                },
+            }),
+            Wait::Triage { round } if self.phase == Phase::PlanCheck => Some(
+                match parse_plan_triage(text, &self.round_finding_ids(), &self.ledger_ids()) {
+                    Ok(triage) => Input::PlanTriaged {
+                        round: round.clone(),
+                        triage,
+                        path: None,
+                    },
+                    Err(p) => Input::TriageRejected {
+                        round: round.clone(),
+                        problems: problems(p),
+                    },
+                },
+            ),
             Wait::Triage { round } => Some(
                 match parse_triage(text, &self.round_finding_ids(), &self.ledger_ids()) {
                     Ok(triage) => Input::TriageAccepted {
@@ -569,6 +814,12 @@ impl LoopState {
                     },
                 },
             ),
+            Wait::Implement => Some(match parse_implement(text) {
+                Ok(implemented) => Input::Implemented { implemented },
+                Err(p) => Input::ImplementRejected {
+                    problems: problems(p),
+                },
+            }),
             Wait::Sweep => Some(match parse_sweep(text) {
                 Ok(sweep) => Input::SweepDone { sweep },
                 Err(p) => Input::SweepRejected {
@@ -584,20 +835,51 @@ impl LoopState {
     pub fn ask(&self) -> Option<Action> {
         Some(match &self.wait {
             Wait::Goal => Action::AskGoal,
+            Wait::Plan => Action::AskPlan,
             Wait::Review { round } => Action::RunReview {
                 round: round.clone(),
                 phase: self.phase,
                 effort: self.reviewer.effort.clone().unwrap_or_default(),
                 retry: self.retried,
+                template: self.review_template(),
+            },
+            Wait::Triage { round } if self.phase == Phase::PlanCheck => Action::AskPlanTriage {
+                round: round.clone(),
+                findings: self.findings.clone(),
             },
             Wait::Triage { round } => Action::AskTriage {
                 round: round.clone(),
                 findings: self.findings.clone(),
             },
+            Wait::Implement => Action::AskImplement,
             Wait::Sweep => Action::AskSweep,
             Wait::Report => Action::AskReport,
+            Wait::Commit => Action::AskCorrection {
+                step: Step::Commit,
+                problems: self.commit_problems.clone(),
+            },
+            Wait::WriteReport => Action::WriteReport,
             Wait::Ended => return None,
         })
+    }
+
+    /// The template the current review run's prompt is built from: the plan check's, an
+    /// implementation loop's rounds' or a review loop's.
+    pub fn review_template(&self) -> ReviewTemplate {
+        match (self.kind, self.phase) {
+            (_, Phase::PlanCheck) => ReviewTemplate::PlanReview,
+            (LoopKind::Implement, _) => ReviewTemplate::ImplReview,
+            (LoopKind::Review, _) => ReviewTemplate::Review,
+        }
+    }
+
+    /// Whether the report turn asks for a commit (and the hub checks it): the loop commits
+    /// ([`CommitMode`]) and it is reporting, which a loop that ends `stopped` or `failed` never
+    /// does.
+    pub fn asks_commit(&self) -> bool {
+        !self.ended
+            && self.commit != CommitMode::None
+            && matches!(self.wait, Wait::Report | Wait::Commit | Wait::WriteReport)
     }
 
     /// The ids of the findings being triaged.
@@ -614,11 +896,108 @@ impl LoopState {
     // Inputs into facts
     // -----------------------------------------------------------------------------------------
 
-    /// The fact `input` is, if the loop waits for it.
-    fn fact(&self, input: Input) -> Result<EventBody, StepError> {
+    /// The facts `input` is, if the loop waits for it: one, but for a plan-check triage that
+    /// revised the plan (its `loop.plan`, then its `loop.triage`).
+    fn facts(&self, input: Input) -> Result<Vec<EventBody>, StepError> {
         if self.ended {
             return Err(StepError::Ended);
         }
+        let id = self.id.clone();
+        let plan_check = self.phase == Phase::PlanCheck;
+        let waits_triage =
+            |round: &str| matches!(&self.wait, Wait::Triage { round: r } if r == round);
+        Ok(match input {
+            Input::PlanWritten { plan, path } if self.wait == Wait::Plan => {
+                vec![self.plan_fact(&plan, path)]
+            }
+            Input::PlanRejected { problems } if self.wait == Wait::Plan => {
+                vec![self.refusal_fact(problems)]
+            }
+            Input::PlanTriaged {
+                round,
+                triage,
+                path,
+            } if plan_check && waits_triage(&round) => {
+                let mut out = Vec::new();
+                if let Some(plan) = &triage.plan {
+                    out.push(self.plan_fact(plan, path));
+                }
+                out.push(EventBody::LoopTriage(LoopTriage {
+                    id,
+                    round,
+                    items: triage.items,
+                    ..Default::default()
+                }));
+                out
+            }
+            Input::Implemented { implemented } if self.wait == Wait::Implement => {
+                vec![EventBody::LoopImplemented(LoopImplemented {
+                    id,
+                    status: implemented.status,
+                    gates: implemented.gates,
+                    ..Default::default()
+                })]
+            }
+            Input::ImplementRejected { problems } if self.wait == Wait::Implement => {
+                vec![self.refusal_fact(problems)]
+            }
+            Input::CommitChecked {
+                commits,
+                problems,
+                notes,
+            } if self.asks_commit() && matches!(self.wait, Wait::Report | Wait::Commit) => {
+                vec![EventBody::LoopCommit(LoopCommitChecked {
+                    id,
+                    commits,
+                    problems,
+                    notes,
+                    ..Default::default()
+                })]
+            }
+            Input::ReportWritten { report_path }
+                if self.wait == Wait::WriteReport
+                    || (self.wait == Wait::Report && !self.asks_commit()) =>
+            {
+                vec![EventBody::LoopEnded(LoopEnded {
+                    id,
+                    outcome: self.outcome.unwrap_or_default(),
+                    report_path: Some(report_path),
+                    commits: self.commits.clone(),
+                    commit_problem: self.commit_problem.clone(),
+                    ..Default::default()
+                })]
+            }
+            Input::TriageAccepted { round, .. } if plan_check && waits_triage(&round) => {
+                return Err(StepError::NotWaiting(self.wait_words()))
+            }
+            other => vec![self.fact(other)?],
+        })
+    }
+
+    /// The `loop.plan` of `plan`, written to `path`: the next revision.
+    fn plan_fact(&self, plan: &Plan, path: Option<String>) -> EventBody {
+        EventBody::LoopPlan(LoopPlanned {
+            id: self.id.clone(),
+            revision: self.plan_revision + 1,
+            contract_risk: plan.contract_risk,
+            reason: plan.reason.clone(),
+            path,
+            ..Default::default()
+        })
+    }
+
+    /// The `loop.phase` of a reply refused for `problems`, on the phase the loop stays in.
+    fn refusal_fact(&self, problems: Vec<String>) -> EventBody {
+        EventBody::LoopPhase(LoopPhaseChanged {
+            id: self.id.clone(),
+            phase: self.phase,
+            problems: nonempty(problems),
+            ..Default::default()
+        })
+    }
+
+    /// The fact of an input a review loop has too, if the loop waits for it.
+    fn fact(&self, input: Input) -> Result<EventBody, StepError> {
         let id = self.id.clone();
         let not_waiting = || StepError::NotWaiting(self.wait_words());
         let waits_review =
@@ -639,12 +1018,7 @@ impl LoopState {
                 })
             }
             Input::GoalRejected { problems } if self.wait == Wait::Goal => {
-                EventBody::LoopPhase(LoopPhaseChanged {
-                    id,
-                    phase: self.phase,
-                    problems: nonempty(problems),
-                    ..Default::default()
-                })
+                self.refusal_fact(problems)
             }
             Input::ReviewStarted {
                 round,
@@ -710,23 +1084,8 @@ impl LoopState {
                 })
             }
             Input::SweepRejected { problems } if self.wait == Wait::Sweep => {
-                EventBody::LoopPhase(LoopPhaseChanged {
-                    id,
-                    phase: self.phase,
-                    problems: nonempty(problems),
-                    ..Default::default()
-                })
+                self.refusal_fact(problems)
             }
-            Input::ReportWritten {
-                report_path,
-                commit,
-            } if self.wait == Wait::Report => EventBody::LoopEnded(LoopEnded {
-                id,
-                outcome: self.outcome.unwrap_or_default(),
-                report_path: Some(report_path),
-                commit,
-                ..Default::default()
-            }),
             Input::TurnFailed { why } if self.waits_on_thread() && !self.held => {
                 EventBody::LoopControl(LoopControl {
                     id,
@@ -761,6 +1120,14 @@ impl LoopState {
         match action {
             ControlAction::Pause if self.paused => no("the loop is already paused"),
             ControlAction::Resume if !self.paused => no("the loop is not paused"),
+            ControlAction::SkipToVerify
+                if matches!(
+                    self.phase,
+                    Phase::Plan | Phase::PlanCheck | Phase::Implement
+                ) =>
+            {
+                no("the loop has not implemented its plan yet: skip to verify comes after it")
+            }
             ControlAction::SkipToVerify if !matches!(self.phase, Phase::Scope | Phase::Ladder) => {
                 no("the loop is past its ladder")
             }
@@ -773,10 +1140,14 @@ impl LoopState {
     fn wait_words(&self) -> String {
         match &self.wait {
             Wait::Goal => "the scope turn".into(),
+            Wait::Plan => "the plan turn".into(),
             Wait::Review { round } => format!("review round {round}"),
             Wait::Triage { round } => format!("the triage of {round}"),
+            Wait::Implement => "the implement turn".into(),
             Wait::Sweep => "the sweep turn".into(),
             Wait::Report => "the report".into(),
+            Wait::Commit => "the commit's correction".into(),
+            Wait::WriteReport => "the report file".into(),
             Wait::Ended => "nothing".into(),
         }
     }
@@ -785,7 +1156,13 @@ impl LoopState {
     fn waits_on_thread(&self) -> bool {
         matches!(
             self.wait,
-            Wait::Goal | Wait::Triage { .. } | Wait::Sweep | Wait::Report
+            Wait::Goal
+                | Wait::Plan
+                | Wait::Triage { .. }
+                | Wait::Implement
+                | Wait::Sweep
+                | Wait::Report
+                | Wait::Commit
         )
     }
 
@@ -804,6 +1181,8 @@ impl LoopState {
                 if !p.problems.is_empty() {
                     match self.wait {
                         Wait::Goal => self.refused(Step::Goal, &p.problems),
+                        Wait::Plan => self.refused(Step::Plan, &p.problems),
+                        Wait::Implement => self.refused(Step::Implement, &p.problems),
                         Wait::Sweep => self.refused(Step::Sweep, &p.problems),
                         _ => vec![],
                     }
@@ -814,7 +1193,7 @@ impl LoopState {
                         self.skip = false;
                         self.enter_verify(false)
                     } else {
-                        self.enter_ladder()
+                        self.enter_ladder(false)
                     }
                 } else if p.sweep.is_some() && self.wait == Wait::Sweep {
                     self.corrected = false;
@@ -823,6 +1202,20 @@ impl LoopState {
                     out
                 } else {
                     vec![]
+                }
+            }
+            EventBody::LoopPlan(p) if mine(&p.id) => self.planned(p),
+            EventBody::LoopImplemented(p) if mine(&p.id) && self.wait == Wait::Implement => {
+                let problems = Implemented {
+                    status: p.status,
+                    gates: p.gates.clone(),
+                }
+                .problems();
+                if problems.is_empty() {
+                    self.corrected = false;
+                    self.enter_ladder(true)
+                } else {
+                    self.refused(Step::Implement, &problems)
                 }
             }
             EventBody::LoopReviewStarted(p)
@@ -848,14 +1241,29 @@ impl LoopState {
                 if mine(&p.id)
                     && matches!(&self.wait, Wait::Triage { round } if *round == p.round) =>
             {
-                if p.problems.is_empty() {
-                    self.triaged(&p.items)
-                } else {
+                if !p.problems.is_empty() {
                     self.refused(Step::Triage, &p.problems)
+                } else if self.phase == Phase::PlanCheck {
+                    self.plan_triaged(&p.items)
+                } else {
+                    self.triaged(&p.items)
                 }
             }
+            EventBody::LoopCommit(p)
+                if mine(&p.id) && matches!(self.wait, Wait::Report | Wait::Commit) =>
+            {
+                self.commit_checked(p)
+            }
             EventBody::LoopControl(p) if mine(&p.id) => self.control(p),
-            EventBody::LoopEnded(p) if mine(&p.id) => self.end(p.outcome, None),
+            EventBody::LoopEnded(p) if mine(&p.id) => {
+                if !p.commits.is_empty() {
+                    self.commits.clone_from(&p.commits);
+                }
+                if p.commit_problem.is_some() {
+                    self.commit_problem.clone_from(&p.commit_problem);
+                }
+                self.end(p.outcome, None)
+            }
             // Records (plain phases, ledger entries, transitions) and other loops' events.
             _ => vec![],
         };
@@ -922,13 +1330,87 @@ impl LoopState {
         }]
     }
 
-    /// Starts the ladder at its first tier.
-    fn enter_ladder(&mut self) -> Vec<Action> {
+    /// An implementation loop's plan (`loop.plan`): the plan turn's starts the plan check or
+    /// the implement turn; the plan check's revision only replaces the plan.
+    fn planned(&mut self, p: &LoopPlanned) -> Vec<Action> {
+        let revision = p.revision.max(self.plan_revision + 1);
+        match &self.wait {
+            Wait::Plan => {
+                self.plan_revision = revision;
+                self.contract_risk = Some(p.contract_risk);
+                self.corrected = false;
+                if self.plan_check.runs(p.contract_risk) {
+                    self.enter_plan_check()
+                } else {
+                    self.enter_implement()
+                }
+            }
+            Wait::Triage { .. } if self.phase == Phase::PlanCheck => {
+                self.plan_revision = revision;
+                self.contract_risk = Some(p.contract_risk);
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Starts the plan check: its one review run, round `p1` at `medium`.
+    fn enter_plan_check(&mut self) -> Vec<Action> {
+        self.phase = Phase::PlanCheck;
+        let round = PLAN_CHECK_ROUND.to_string();
+        self.tier = Some(PLAN_CHECK_TAG.to_string());
+        self.round = Some(round.clone());
+        self.rounds.push(RoundView {
+            id: round.clone(),
+            ..Default::default()
+        });
+        self.reviewer.effort = Some(PLAN_CHECK_EFFORT.to_string());
+        self.review_started_at = None;
+        self.retried = false;
+        self.corrected = false;
+        self.wait = Wait::Review { round };
+        let mut out = vec![self.record_phase()];
+        out.extend(self.issue());
+        out
+    }
+
+    /// The plan check's triage, accepted: its dismissals into the ledger, then the implement
+    /// turn (a revised plan was its own `loop.plan`, before this).
+    fn plan_triaged(&mut self, items: &[contract::TriageItem]) -> Vec<Action> {
+        self.corrected = false;
+        let mut out = self.ledger_dismissals(items);
+        self.findings.clear();
+        out.extend(self.enter_implement());
+        out
+    }
+
+    /// Starts the implement turn.
+    fn enter_implement(&mut self) -> Vec<Action> {
+        self.phase = Phase::Implement;
+        self.tier = None;
+        self.round = None;
+        self.review_started_at = None;
+        self.findings.clear();
+        self.corrected = false;
+        self.wait = Wait::Implement;
+        let mut out = vec![self.record_phase()];
+        out.extend(self.issue());
+        out
+    }
+
+    /// Starts the ladder at its first tier (`record`: with a record of the phase; a fact that
+    /// already says `ladder` needs none).
+    fn enter_ladder(&mut self, record: bool) -> Vec<Action> {
         self.phase = Phase::Ladder;
         self.tier_index = 0;
         self.tier_rounds = 0;
         self.no_new_class = 0;
-        self.begin_round()
+        let mut out = Vec::new();
+        if record {
+            out.push(self.record_phase());
+        }
+        out.extend(self.begin_round());
+        out
     }
 
     /// Starts the verification (`record`: with a record of the phase; a fact that already
@@ -1006,6 +1488,9 @@ impl LoopState {
             self.verify.done += 1;
         }
         if findings.is_empty() {
+            if self.phase == Phase::PlanCheck {
+                return self.enter_implement();
+            }
             return self.converged(Convergence::Empty, unchanged);
         }
         self.findings = findings.to_vec();
@@ -1016,10 +1501,8 @@ impl LoopState {
         self.issue()
     }
 
-    /// A triage the hub accepted.
-    fn triaged(&mut self, items: &[contract::TriageItem]) -> Vec<Action> {
-        self.corrected = false;
-        let mut out = Vec::new();
+    /// The ledger entries of the `dismissed` items of a triage of the round being triaged.
+    fn ledger_dismissals(&mut self, items: &[contract::TriageItem]) -> Vec<Action> {
         let entries: Vec<LedgerEntry> = items
             .iter()
             .filter(|i| i.verdict == Verdict::Dismissed)
@@ -1036,7 +1519,13 @@ impl LoopState {
                 }
             })
             .collect();
-        out.extend(self.append_ledger(entries));
+        self.append_ledger(entries)
+    }
+
+    /// A triage the hub accepted.
+    fn triaged(&mut self, items: &[contract::TriageItem]) -> Vec<Action> {
+        self.corrected = false;
+        let mut out = self.ledger_dismissals(items);
         let fixed = items.iter().filter(|i| i.verdict == Verdict::Fixed).count();
         let new_class = items
             .iter()
@@ -1210,10 +1699,32 @@ impl LoopState {
         self.phase = Phase::Report;
         self.tier = None;
         self.round = None;
+        self.corrected = false;
         self.wait = Wait::Report;
         let mut out = vec![self.record_phase()];
         out.extend(self.issue());
         out
+    }
+
+    /// The hub's check of the commit (`loop.commit`): passed, the report is written; failed
+    /// the first time, the one correction; failed again, the report is written all the same,
+    /// with what is left (module docs, "The commit").
+    fn commit_checked(&mut self, p: &LoopCommitChecked) -> Vec<Action> {
+        self.commits.clone_from(&p.commits);
+        if p.problems.is_empty() || self.corrected {
+            if !p.problems.is_empty() {
+                self.commit_problem = Some(p.problems.join("; "));
+            }
+            self.commit_problems.clear();
+            self.wait = Wait::WriteReport;
+            // (Not held by a pause: it is the hub's own last step, no turn of the thread's.)
+            self.held = false;
+            return vec![Action::WriteReport];
+        }
+        self.corrected = true;
+        self.commit_problems.clone_from(&p.problems);
+        self.wait = Wait::Commit;
+        self.issue()
     }
 
     /// The loop ends `outcome`; `record`: with its `loop.ended` record (an end the machine
@@ -1227,6 +1738,7 @@ impl LoopState {
         self.stuck = None;
         self.review_started_at = None;
         self.findings.clear();
+        self.commit_problems.clear();
         let mut out: Vec<Action> = record
             .map(|r| Action::Record(EventBody::LoopEnded(r)))
             .into_iter()
@@ -1262,6 +1774,7 @@ impl LoopState {
                 Some(LoopEnded {
                     id: self.id.clone(),
                     outcome: Outcome::Stopped,
+                    commits: self.commits.clone(),
                     ..Default::default()
                 }),
             ),
@@ -1281,7 +1794,12 @@ impl LoopState {
                 if self.phase == Phase::Ladder && self.held && unrun {
                     self.rounds.pop();
                     self.tier_rounds = self.tier_rounds.saturating_sub(1);
-                    self.round = self.rounds.last().map(|r| r.id.clone());
+                    // (The ladder's rounds only: not the plan check's `p1`.)
+                    self.round = self
+                        .rounds
+                        .last()
+                        .filter(|r| r.id != PLAN_CHECK_ROUND)
+                        .map(|r| r.id.clone());
                     return self.end_ladder(TransitionReason::Skipped);
                 }
                 vec![]
@@ -1298,6 +1816,11 @@ fn nonempty(problems: Vec<String>) -> Vec<String> {
     } else {
         problems
     }
+}
+
+/// Whether `n` is 0 (serde's `skip_serializing_if`).
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[cfg(test)]

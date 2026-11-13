@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowDown, ArrowUp, Search } from "lucide-react";
 import type { Attention, HubEvent, InboxSource, Json, Thread } from "./types";
 import { Dialog, Empty, Markdown, Spinner } from "./ui";
+import { requestLine } from "./loops";
 import { errorMessage } from "./errors";
 import { announce, scrollBehavior } from "./a11y";
 import "./inbox-search.css";
@@ -258,7 +259,7 @@ export function NeedsYouInbox({
                         </b>
                         <span className="visually-hidden">, </span>
                         <span>
-                          {inboxCategory(item)} · {item.summary}
+                          {inboxCategory(item)} · {requestLine(item)}
                         </span>
                         <span className="visually-hidden">. </span>
                         <small>Open {group.workspace}</small>

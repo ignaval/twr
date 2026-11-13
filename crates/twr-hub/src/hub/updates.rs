@@ -54,6 +54,9 @@ fn may_update(body: &EventBody) -> bool {
             | EventBody::LoopPhase(_)
             | EventBody::LoopControl(_)
             | EventBody::LoopEnded(_)
+            | EventBody::LoopPlan(_)
+            | EventBody::LoopImplemented(_)
+            | EventBody::LoopCommit(_)
             | EventBody::ReportReady(_)
             | EventBody::TaskUpdated(_)
             | EventBody::ConversationUpdate(_)
@@ -95,6 +98,10 @@ fn hung_closed_text(name: &str, p: &AttentionResolved, turn_ended: bool) -> Stri
 fn loop_started_text(v: &twr_core::reduce::ThreadView, p: &LoopStarted) -> String {
     use twr_core::loops::settings::{SettingsOf, SettingsSource};
     let s = &p.settings;
+    let setup = match p.kind {
+        twr_core::loops::LoopKind::Review => "/review --setup",
+        twr_core::loops::LoopKind::Implement => "/implement --setup",
+    };
     let implementer = match &s.implementer {
         Some(m) => [Some(m.model.as_str()), m.effort.as_deref()]
             .into_iter()
@@ -119,10 +126,10 @@ fn loop_started_text(v: &twr_core::reduce::ThreadView, p: &LoopStarted) -> Strin
             "settings chosen on its setup card, now saved".to_string()
         }
         (SettingsSource::Saved, Some(SettingsOf::Project)) => format!(
-            "{}'s settings; /review --setup changes them",
+            "{}'s settings; {setup} changes them",
             v.project.as_deref().unwrap_or(&v.name)
         ),
-        (SettingsSource::Saved, _) => "saved settings; /review --setup changes them".to_string(),
+        (SettingsSource::Saved, _) => format!("saved settings; {setup} changes them"),
     };
     let mut run = Vec::new();
     for (what, val) in [
@@ -131,6 +138,7 @@ fn loop_started_text(v: &twr_core::reduce::ThreadView, p: &LoopStarted) -> Strin
         ("workers", &p.overrides.workers),
         ("reviewer", &p.overrides.reviewer),
         ("commit", &p.overrides.commit),
+        ("plan check", &p.overrides.plan_check),
     ] {
         if let Some(val) = val {
             run.push(format!("{what} {val}"));
@@ -233,6 +241,13 @@ impl Core {
                 ));
             }
             let worker = view.as_ref().filter(|v| !v.is_orchestrator());
+            // `review loop` or `implementation loop`, as the loop was (or, for its start, is).
+            let kind = prev_loop
+                .as_ref()
+                .map(|l| l.kind)
+                .or_else(|| worker.and_then(|v| v.r#loop.as_ref().map(|l| l.kind)))
+                .unwrap_or_default();
+            let loop_words = super::loops::kind_words(kind);
             let (text, about, ext) = match (&e.body, worker) {
                 // A loop's setup card (`hub::loops`): the user's to answer, like a question.
                 (EventBody::AttentionRaised(p), Some(v))
@@ -333,12 +348,12 @@ impl Core {
                 (EventBody::LoopTransition(p), Some(v)) => (
                     if p.round.is_empty() {
                         format!(
-                            "{}: its review loop skipped to verification before any ladder round",
+                            "{}: its {loop_words} skipped to verification before any ladder round",
                             v.name
                         )
                     } else {
                         format!(
-                            "{}: its review loop's ladder ended after {}: {}{}",
+                            "{}: its {loop_words}'s ladder ended after {}: {}{}",
                             v.name,
                             p.round,
                             super::loops::transition_words(p.reason),
@@ -357,10 +372,13 @@ impl Core {
                 (EventBody::LoopPhase(p), Some(v))
                     if prev_loop.is_some()
                         && p.problems.is_empty()
-                        && p.phase != twr_core::loops::Phase::Scope =>
+                        && !matches!(
+                            p.phase,
+                            twr_core::loops::Phase::Scope | twr_core::loops::Phase::Plan
+                        ) =>
                 {
                     (
-                        format!("{}: its review loop is in its {} now", v.name, p.phase),
+                        format!("{}: its {loop_words} is in its {} now", v.name, p.phase),
                         Some(e.thread.clone()),
                         routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
                     )
@@ -369,7 +387,7 @@ impl Core {
                     if p.by != twr_core::loops::ControlBy::Hub =>
                 {
                     (
-                        format!("{}'s review loop: {} by the user", v.name, p.action.as_str()),
+                        format!("{}'s {loop_words}: {} by the user", v.name, p.action.as_str()),
                         Some(e.thread.clone()),
                         routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
                     )
@@ -377,8 +395,15 @@ impl Core {
                 // How a loop ended, once: its last report says it when it wrote one.
                 (EventBody::LoopEnded(p), Some(v)) if p.report_path.is_none() => {
                     let rounds = prev_loop.as_ref().map_or(0, |l| {
-                        l.rounds.len()
-                            - usize::from(matches!(l.wait, twr_core::loops::Wait::Review { .. }))
+                        l.rounds
+                            .iter()
+                            .filter(|r| r.id != twr_core::loops::PLAN_CHECK_ROUND)
+                            .count()
+                            - usize::from(matches!(
+                                &l.wait,
+                                twr_core::loops::Wait::Review { round }
+                                    if round != twr_core::loops::PLAN_CHECK_ROUND
+                            ))
                     });
                     let why = p
                         .reason
@@ -389,7 +414,7 @@ impl Core {
                         format!(
                             "{}: {}{why}",
                             v.name,
-                            super::loops::outcome_words(p.outcome, rounds)
+                            super::loops::outcome_words(kind, p.outcome, rounds)
                         ),
                         Some(e.thread.clone()),
                         not_routine(twr_ext_map(json!({"loop": p.id, "outcome": p.outcome}))),
@@ -405,7 +430,9 @@ impl Core {
                         .cloned()
                         .unwrap_or_default();
                     let step = mark["step"].as_str().unwrap_or_default().to_string();
-                    if step == "report" {
+                    // (A report turn whose commit is still being checked: the loop's last
+                    // report comes once it is.)
+                    if step == "report" && mark["commit"] != "checking" {
                         (
                             format!("{}: {}", v.name, p.summary),
                             Some(e.thread.clone()),
@@ -414,7 +441,7 @@ impl Core {
                     } else {
                         (
                             format!(
-                                "{} answered its review loop's {step} step ({}): {}",
+                                "{} answered its {loop_words}'s {step} step ({}): {}",
                                 v.name,
                                 twr_decisions::grade_str(p.grade),
                                 p.summary
@@ -424,10 +451,74 @@ impl Core {
                         )
                     }
                 }
+                // An implementation loop's plan, implement turn and commit check: routine.
+                (EventBody::LoopPlan(p), Some(v)) => (
+                    format!(
+                        "{}: its {loop_words}'s plan{} (contract risk: {}: {}){}",
+                        v.name,
+                        if p.revision >= 2 {
+                            ", revised after the plan check"
+                        } else {
+                            ""
+                        },
+                        if p.contract_risk { "yes" } else { "no" },
+                        cut(&p.reason, 200),
+                        p.path
+                            .as_deref()
+                            .map(|path| format!("; {path}"))
+                            .unwrap_or_default()
+                    ),
+                    Some(e.thread.clone()),
+                    routine(
+                        twr_ext_map(json!({"loop": p.id, "plan": p.revision})),
+                        ROUTINE_LOOP,
+                    ),
+                ),
+                (EventBody::LoopImplemented(p), Some(v)) => (
+                    format!(
+                        "{}: its {loop_words}'s implement turn: {}, gates {}",
+                        v.name,
+                        p.status.as_str(),
+                        match p.gates.result {
+                            twr_core::loops::contract::GateResult::Pass => "pass",
+                            twr_core::loops::contract::GateResult::Fail => "fail",
+                        }
+                    ),
+                    Some(e.thread.clone()),
+                    routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
+                ),
+                (EventBody::LoopCommit(p), Some(v)) => (
+                    if p.problems.is_empty() {
+                        format!(
+                            "{}: its {loop_words}'s commit checked: {}",
+                            v.name,
+                            if p.commits.is_empty() {
+                                "nothing to commit".to_string()
+                            } else {
+                                p.commits
+                                    .iter()
+                                    .map(|c| format!("{} in {}", cut(&c.sha, 12), c.repo))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            }
+                        )
+                    } else {
+                        format!(
+                            "{}: its {loop_words}'s commit check failed: {}",
+                            v.name,
+                            cut(&p.problems.join("; "), 300)
+                        )
+                    },
+                    Some(e.thread.clone()),
+                    routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
+                ),
                 (EventBody::LoopFindings(_)
                 | EventBody::LoopTransition(_)
                 | EventBody::LoopPhase(_)
                 | EventBody::LoopControl(_)
+                | EventBody::LoopPlan(_)
+                | EventBody::LoopImplemented(_)
+                | EventBody::LoopCommit(_)
                 | EventBody::LoopEnded(_), _) => continue,
                 (EventBody::AttentionRaised(p), Some(v)) => (
                     format!(

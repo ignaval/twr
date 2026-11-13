@@ -19,6 +19,11 @@ export interface Thread {
   repo?: string;
   report?: Json;
   git?: Json;
+  /** Stopped (`thread.stopped`): by someone, or only by the hub's own shutdown. */
+  stopped?: boolean;
+  /** Stopped only by the hub's own shutdown (only while `stopped`): the thread goes on, and
+   * a loop may start on it, as soon as it is sent something. */
+  stopped_by_hub?: boolean;
   [key: string]: Json;
 }
 export interface Attention {
@@ -229,6 +234,23 @@ export interface AttentionSummary {
    * what the new source lists first is never taken for news.
    */
   workspaces: { name: string; stream?: string }[];
+  /**
+   * The last loop that ended on each thread, with how it ended: the desktop notifies a loop
+   * that ends once, as it does a new request (desktop/notify-state.ts `LoopWatch`).
+   */
+  loops?: LoopEndSummary[];
+}
+/** A thread's last loop that ended, for the host app's notification of it. */
+export interface LoopEndSummary {
+  workspace: string;
+  thread: string;
+  /** The thread's name. */
+  title: string;
+  /** The loop's id: a new id is a new end. */
+  id: string;
+  /** How it ended: `review loop clean after 6 rounds`, an implementation loop's commit or
+   * `not committed`. */
+  words: string;
 }
 export type InstallKind =
   "development" | "mac" | "appimage" | "deb" | "pacman" | "portable";

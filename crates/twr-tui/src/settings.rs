@@ -507,14 +507,31 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
             Span::styled(label, base),
             Span::styled(row.value, value_style),
         ]);
+        // Cut with `…` only when it is too wide; else padded to the width (a selected row is
+        // reversed across it).
+        if head.width() > inner_w {
+            head = Line::from(crate::ui::cut_spans(head.spans, inner_w));
+        }
         let pad = inner_w.saturating_sub(head.width());
         head.spans.push(Span::styled(" ".repeat(pad), base));
-        lines.push(crate::ui::ellipsized(head, inner_w));
-        let kept = format!("{:w$}{}", "", row.kept, w = LABEL + 2);
-        lines.extend(crate::ui::wrap_line(
-            Line::from(Span::styled(kept, dim)),
-            inner_w,
-        ));
+        lines.push(head);
+        // Where it is kept, under the value column, each wrapped row too.
+        let indent = LABEL + 2;
+        let kept = if inner_w >= indent + 12 {
+            crate::ui::wrap_line(
+                Line::from(Span::styled(row.kept.clone(), dim)),
+                inner_w - indent,
+            )
+            .into_iter()
+            .map(|mut l| {
+                l.spans.insert(0, Span::raw(" ".repeat(indent)));
+                l
+            })
+            .collect()
+        } else {
+            crate::ui::wrap_line(Line::from(Span::styled(row.kept.clone(), dim)), inner_w)
+        };
+        lines.extend(kept);
         spans.push((row.key, start..lines.len()));
     }
     lines.push(Line::default());

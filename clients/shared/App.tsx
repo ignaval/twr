@@ -18,6 +18,7 @@ import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
+  Fragment,
   useCallback,
   useEffect,
   useId,
@@ -121,21 +122,36 @@ import {
   LoopChip,
   LoopContext,
   LoopEditorDialog,
+  LoopEndedLine,
   LoopSetupCard,
   LoopsSection,
+  NewThreadLoopLine,
   ReviewLoopOffer,
+  isPhone,
   type LoopActions,
 } from "./LoopViews";
 import {
+  countedRounds,
+  endedLately,
   endedLoops,
+  endedWords,
+  implementRequest,
   loopAccess,
   loopSlash,
+  newThreadLoop,
+  newThreadRequest,
+  newThreadValues,
+  sendAsLoop,
+  startedNotice,
   startedWords,
   offerReviewSetting,
   offersReview,
+  requestLine,
   reviewRequest,
   type EditorSource,
+  type ImplementRequest,
   type LoopControlAction,
+  type LoopState,
   type ReviewRequest,
 } from "./loops";
 import {
@@ -514,12 +530,26 @@ export default function App({
   // the box is cleared, never on each key.
   const hasDraft = useHasDraft(drafts, draftKey);
   const selectedThread = view.threads.find((t) => t.id === selected);
+  // A phone shows the inspector over the conversation: a notice goes inside it, in the
+  // flow, never over its controls.
+  const noticeInInspector = !!selectedThread && isPhone();
   // The desktop tray/menu bar, Dock badge and notifications mirror what needs the user in
   // every workspace: this one's live view and the others' latest reads. The live view's
   // stream starts over on each (re)connection and resync, so what it lists first is not
   // taken for news (desktop/notify-state.ts).
   const [resyncs, setResyncs] = useState(0);
   const liveStream = useRef({ epoch: 0, connected: false, resyncs: 0 });
+  // Rounds each running loop has run, by loop id: its end's notification counts them (the
+  // view of an ended loop keeps none). The plan check's `p1` is no round of the ladder.
+  const loopRounds = useRef(new Map<string, number>());
+  for (const thread of view.threads) {
+    const running = thread.loop as LoopState | undefined;
+    if (running?.id) {
+      loopRounds.current.set(running.id, countedRounds(running.rounds));
+      if (loopRounds.current.size > 500)
+        loopRounds.current.delete(loopRounds.current.keys().next().value!);
+    }
+  }
   useEffect(() => {
     if (!window.twrApp) return;
     const stream = liveStream.current;
@@ -538,6 +568,7 @@ export default function App({
           ? `live:${hostId}:${workspace}:${stream.epoch}`
           : undefined,
         sources: inboxSources,
+        loopRounds: loopRounds.current,
       }),
     );
   }, [
@@ -1481,12 +1512,17 @@ export default function App({
             );
           setOperation(undefined);
         } else {
-          const params = parameters(operation, values);
+          let params = parameters(operation, values);
+          // The New thread form's first prompt: the loop's task with Run as an
+          // implementation loop on (`thread.new {loop}`), else sent once the thread exists.
+          let firstPrompt: string | undefined;
           if (operation.method === "thread.new") {
             if (!values._cwd)
               throw new Error(
                 "Choose a working directory to resolve project paths.",
               );
+            ({ params, firstPrompt } = newThreadRequest(params));
+            if (params.loop) liveAnswerCheck();
             params.desktop_cwd = values._cwd;
           }
           const value = await rpc(operation.method!, params);
@@ -1497,6 +1533,31 @@ export default function App({
             setDestination(value.id);
             setSelected(undefined);
             setSection("chat");
+            const name = value.name || value.id;
+            const loop = newThreadLoop(value);
+            if (loop?.status === "error")
+              fail(
+                `${name} was made, but its implementation loop did not start: ${loop.message}`,
+              );
+            else if (loop?.status === "started")
+              setNotice(startedNotice(name, "implement"));
+            else if (loop?.status === "needs_setup")
+              setNotice(
+                `Choose ${name}'s loop settings on its setup card: it holds the task until you answer.`,
+              );
+            if (firstPrompt)
+              await rpc("thread.send", {
+                thread: value.id,
+                prompt: firstPrompt,
+              }).catch((error) => {
+                // Kept in its box, to send again.
+                drafts.set(workspace + ":" + value.id, (old) =>
+                  appendDraft(old, firstPrompt!),
+                );
+                fail(
+                  `${name} was made, but its first prompt was not sent: ${errorMessage(error)}`,
+                );
+              });
           } else if (operation.id === "delete") {
             setOperation(undefined);
             setSection("attention");
@@ -1642,6 +1703,44 @@ export default function App({
       setSending(false);
       input.current?.focus();
     }
+  };
+  /** Send as implementation loop: the draft is the task of a loop on the thread whose
+   * conversation is shown. Live only, never to the outbox; an empty draft asks first, since
+   * the task is then what the conversation already settled. */
+  const sendAsImplementation = () => {
+    const thread = destination
+      ? view.threads.find((t) => t.id === destination)
+      : undefined;
+    if (!thread || thread.is_orchestrator || sending) return;
+    const key = draftKey;
+    const draft = drafts.get(key);
+    let plan: ReturnType<typeof sendAsLoop>;
+    try {
+      plan = sendAsLoop(draft);
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    const run = async () => {
+      setSending(true);
+      try {
+        if (
+          await startImplement(thread.id, plan.task ? { task: plan.task } : {})
+        )
+          drafts.set(key, (old) => (old === draft ? "" : old));
+      } finally {
+        setSending(false);
+        input.current?.focus();
+      }
+    };
+    if (plan.confirm)
+      setConfirmation({
+        title: `Start an implementation loop on ${thread.name} with no task?`,
+        detail: `Nothing was typed, so the loop's task is what your conversation with ${thread.name} already settled. Its plan says how the thread reads it.`,
+        action: "Start loop",
+        run: () => void run(),
+      });
+    else void run();
   };
   // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
   // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
@@ -1819,7 +1918,9 @@ export default function App({
           action("rename", { ...args, thread: thread(args.thread) });
           break;
         case "New":
-          action("new", args);
+          // `/new <project> --implement <task>`: the form, with its switch on and the task
+          // as its first prompt.
+          action("new", newThreadValues(args));
           break;
         case "Delete":
           action("delete", { threads: args });
@@ -1964,6 +2065,24 @@ export default function App({
         case "Review": {
           const { thread: reviewed, ...request } = reviewRequest(args, chosen);
           if (await startReview(reviewed, request)) drafts.set(draftKey, "");
+          return;
+        }
+        case "Implement": {
+          // In a thread's conversation every word is the task; elsewhere a first word that
+          // names a thread is the thread (twr-core `slash::implement_target`).
+          const { thread: implemented, ...request } = implementRequest(args, {
+            dive: destination,
+            chosen: selected || destination,
+            threads: view.threads,
+          });
+          const target = named(implemented);
+          if (!target) throw new Error(`No thread named ${implemented}.`);
+          if (target.is_orchestrator)
+            throw new Error(
+              "The orchestrator runs no loop: name a worker thread.",
+            );
+          if (await startImplement(target.id, request))
+            drafts.set(draftKey, "");
           return;
         }
         case "Loop": {
@@ -2279,15 +2398,14 @@ export default function App({
     setSelected(id);
     setLoopFocus(id);
   }, []);
-  const startReview = useCallback(
-    async (
-      thread: string,
-      options: Omit<ReviewRequest, "thread" | "kind"> = {},
-    ): Promise<boolean> => {
+  /** `loop.request` for a loop of either kind; says what came of it: the loop started (with
+   * what it runs on), or its setup card is up and brought into view. */
+  const requestLoop = useCallback(
+    async (request: ReviewRequest | ImplementRequest): Promise<boolean> => {
       try {
         liveAnswerCheck();
-        const request: ReviewRequest = { thread, kind: "review", ...options };
         const result = await rpc("loop.request", request);
+        const thread = request.thread;
         const nav = loopNavigation.current;
         const found = nav.threads.find((t) =>
           [t.id, t.name, ...(t.aliases || [])].includes(thread),
@@ -2300,7 +2418,7 @@ export default function App({
           );
           const words = startedWords(detail?.started, found);
           const line = words || result.loop?.line;
-          setNotice(`${name} started a review loop${line ? `: ${line}` : ""}.`);
+          setNotice(startedNotice(name, request.kind, line));
         } else if (result?.status === "needs_setup") {
           // The card is the user's to answer: bring it into view, never answer it here.
           if (!found) setSection("attention");
@@ -2311,7 +2429,11 @@ export default function App({
             setSelected(found.id);
             setRevealSetup(found.id);
           }
-          setNotice(`Choose ${name}'s loop settings on its setup card.`);
+          setNotice(
+            request.kind === "implement" && request.task
+              ? `Choose ${name}'s loop settings on its setup card: it holds your task until you answer.`
+              : `Choose ${name}'s loop settings on its setup card.`,
+          );
         }
         return true;
       } catch (error) {
@@ -2320,6 +2442,16 @@ export default function App({
       }
     },
     [liveAnswerCheck, rpc, fail],
+  );
+  const startReview = useCallback(
+    (thread: string, options: Omit<ReviewRequest, "thread" | "kind"> = {}) =>
+      requestLoop({ thread, kind: "review", ...options }),
+    [requestLoop],
+  );
+  const startImplement = useCallback(
+    (thread: string, options: Omit<ImplementRequest, "thread" | "kind"> = {}) =>
+      requestLoop({ thread, kind: "implement", ...options }),
+    [requestLoop],
   );
   const controlLoop = useCallback(
     async (thread: string, action: LoopControlAction): Promise<boolean> => {
@@ -2347,6 +2479,7 @@ export default function App({
       offerReview,
       catalog: modelCatalog,
       startReview,
+      startImplement,
       control: controlLoop,
       openEditor: setLoopEditor,
       confirm: setConfirmation,
@@ -2361,6 +2494,7 @@ export default function App({
       offerReview,
       modelCatalog,
       startReview,
+      startImplement,
       controlLoop,
       loopSettingsVersion,
     ],
@@ -2635,7 +2769,11 @@ export default function App({
                               onSelect={selectThread}
                               onOpen={openThread}
                               onLoop={showLoop}
-                              offer={offersReview(thread, offerReview)}
+                              offer={offersReview(
+                                thread,
+                                offerReview,
+                                view.attention,
+                              )}
                             />
                           ))}
                           {!visible.length && (
@@ -3193,7 +3331,9 @@ export default function App({
                   onError={fail}
                   onVisibleRoutines={setVisibleRoutines}
                   offer={
-                    destination && target && offersReview(target, offerReview)
+                    destination &&
+                    target &&
+                    offersReview(target, offerReview, view.attention)
                       ? target
                       : undefined
                   }
@@ -3217,7 +3357,8 @@ export default function App({
                             <span>{t.last_report.summary}</span>
                             <ArrowUpRight size={14} />
                           </button>
-                          {offersReview(t, offerReview) && (
+                          <LoopEndedLine thread={t} />
+                          {offersReview(t, offerReview, view.attention) && (
                             <ReviewLoopOffer thread={t} />
                           )}
                         </div>
@@ -3382,6 +3523,11 @@ export default function App({
                   onEdit={forgetAcceptedSuggestion}
                   send={send}
                   submitSlash={submitSlash}
+                  sendAsLoop={
+                    target && !target.is_orchestrator && destination
+                      ? sendAsImplementation
+                      : undefined
+                  }
                   uploads={uploads}
                   submitVoice={submitVoice}
                   voiceHint={voiceHintWords}
@@ -3445,7 +3591,9 @@ export default function App({
                       // A narrow window (a phone) has no sidebar list beside the grid: the
                       // grid is where its cards are, so they carry the loop chip and offer.
                       onLoop={narrow ? showLoop : undefined}
-                      offer={narrow && offersReview(t, offerReview)}
+                      offer={
+                        narrow && offersReview(t, offerReview, view.attention)
+                      }
                       large
                     />
                   ))}
@@ -3579,6 +3727,22 @@ export default function App({
                 </button>
               </header>
               <div className="inspector-body">
+                {notice && !error && noticeInInspector && (
+                  // On a phone the inspector fills the screen under the header, where a
+                  // toast would cover its close button: the notice takes its place in it.
+                  <div role="status" className="inspector-notice">
+                    <Check size={15} aria-hidden="true" />
+                    <span>{notice}</span>
+                    <button
+                      className="icon-button"
+                      aria-label="Dismiss notice"
+                      title="Dismiss"
+                      onClick={() => setNotice("")}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                )}
                 <span className="thread-runtime">
                   {selectedThread.runtime} · {selectedThread.box_name}
                 </span>
@@ -3870,7 +4034,7 @@ export default function App({
           </button>
         </div>
       )}
-      {notice && !error && (
+      {notice && !error && !noticeInInspector && (
         <div role="status" className="toast notice-toast" data-modal-keep="">
           <Check size={17} aria-hidden="true" />
           <span>{notice}</span>
@@ -4010,60 +4174,79 @@ export default function App({
             }}
           >
             <div className="operation-fields">
-              {operation.fields.map((field) => (
-                <FieldInput
-                  key={field.key}
-                  field={
-                    field.key === "runtime"
-                      ? {
-                          ...field,
-                          options: [
-                            ...new Set([
-                              "claude-code",
-                              "codex",
-                              "grok-build",
-                              ...(info?.agents || []).map(
-                                (a: Json) => a.runtime,
-                              ),
-                            ]),
-                          ],
-                        }
-                      : field.type === "model" || field.type === "effort"
-                        ? {
-                            ...field,
-                            choices: (field.type === "model"
-                              ? modelChoices
-                              : effortChoices)(
-                              modelCatalog,
-                              formRuntime(
-                                operation,
-                                values,
-                                view.threads,
-                                info?.orchestrator?.configured?.explicit ===
-                                  false
-                                  ? info.orchestrator.configured.runtime
-                                  : undefined,
-                              ),
-                            ),
-                          }
-                        : field.key === "mode" && !permitted("admin")
+              {operation.fields
+                .filter(
+                  (field) =>
+                    // The setup card choice goes with the New thread form's loop only.
+                    !(
+                      operation.id === "new" &&
+                      field.key === "loop_setup" &&
+                      !values.implement
+                    ),
+                )
+                .map((field) => (
+                  <Fragment key={field.key}>
+                    <FieldInput
+                      field={
+                        field.key === "runtime"
                           ? {
                               ...field,
                               options: [
-                                "manual",
-                                "plan",
-                                "read-only",
-                                "dontAsk",
+                                ...new Set([
+                                  "claude-code",
+                                  "codex",
+                                  "grok-build",
+                                  ...(info?.agents || []).map(
+                                    (a: Json) => a.runtime,
+                                  ),
+                                ]),
                               ],
                             }
-                          : field
-                  }
-                  value={values[field.key]}
-                  onChange={(value) =>
-                    setValues((old) => ({ ...old, [field.key]: value }))
-                  }
-                />
-              ))}
+                          : field.type === "model" || field.type === "effort"
+                            ? {
+                                ...field,
+                                choices: (field.type === "model"
+                                  ? modelChoices
+                                  : effortChoices)(
+                                  modelCatalog,
+                                  formRuntime(
+                                    operation,
+                                    values,
+                                    view.threads,
+                                    info?.orchestrator?.configured?.explicit ===
+                                      false
+                                      ? info.orchestrator.configured.runtime
+                                      : undefined,
+                                  ),
+                                ),
+                              }
+                            : field.key === "mode" && !permitted("admin")
+                              ? {
+                                  ...field,
+                                  options: [
+                                    "manual",
+                                    "plan",
+                                    "read-only",
+                                    "dontAsk",
+                                  ],
+                                }
+                              : field
+                      }
+                      value={values[field.key]}
+                      onChange={(value) =>
+                        setValues((old) => ({ ...old, [field.key]: value }))
+                      }
+                    />
+                    {operation.id === "new" &&
+                      field.key === "implement" &&
+                      values.implement && (
+                        <NewThreadLoopLine
+                          project={values.project}
+                          connected={connected}
+                        />
+                      )}
+                  </Fragment>
+                ))}
               {(operation.cli || operation.method === "thread.new") && (
                 <FieldInput
                   field={{
@@ -4461,12 +4644,18 @@ function ThreadCardButton({
           <LoopChip thread={thread} />
         </>
       )}
+      {onLoop && !thread.loop_line && endedLately(thread) && (
+        <>
+          <span className="visually-hidden">. </span>
+          <LoopEndedLine thread={thread} />
+        </>
+      )}
       <span className="visually-hidden">. </span>
       {items[0] ? (
         <span className="thread-card-request">
           <AlertCircle size={12} />
           <span className="visually-hidden">Request: </span>
-          {items[0].summary}
+          {requestLine(items[0])}
         </span>
       ) : report && ["done", "idle", "parked"].includes(thread.status) ? (
         <span className="thread-card-summary">{report.summary}</span>

@@ -180,7 +180,6 @@ impl Run {
     fn report(&mut self) -> Vec<Action> {
         self.step(Input::ReportWritten {
             report_path: "/data/loops/l1/report.md".into(),
-            commit: None,
         })
     }
 }
@@ -244,6 +243,7 @@ fn review(round: &str, effort: &str, retry: bool) -> Action {
         },
         effort: effort.into(),
         retry,
+        template: ReviewTemplate::Review,
     }
 }
 
@@ -253,10 +253,14 @@ fn ended(run: &Run) -> Outcome {
 }
 
 #[test]
-fn an_implementation_loop_is_refused() {
-    let mut p = started(Profile::builtin("high").unwrap(), 25);
-    p.kind = LoopKind::Implement;
-    assert_eq!(LoopState::start(&p).unwrap_err(), StartError::NotSupported);
+fn a_profile_with_nothing_to_run_is_refused() {
+    let mut empty = Profile::builtin("high").unwrap();
+    empty.tiers.clear();
+    let p = started(empty, 25);
+    assert_eq!(
+        LoopState::start(&p).unwrap_err(),
+        StartError::EmptyProfile("high".into())
+    );
     let mut events = vec![Event::new(
         "t1",
         1,
@@ -999,3 +1003,6 @@ fn the_ask_after_a_restart_and_reply_inputs() {
     assert!(other.apply(&ev).is_empty());
     assert_eq!(other, run.state);
 }
+
+#[path = "impl_tests.rs"]
+mod implementation;

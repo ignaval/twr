@@ -145,7 +145,7 @@ mod lifecycle;
 mod limits;
 mod loops;
 pub use loops::{
-    LoopControlParams, LoopGet, LoopRequest, SettingsFor as LoopSettingsFor,
+    LoopControlParams, LoopGet, LoopRequest, NewThreadLoop, SettingsFor as LoopSettingsFor,
     SettingsSet as LoopSettingsSet, SetupGet as LoopSetupGet, SetupUpdate as LoopSetupUpdate,
 };
 pub mod memory;
@@ -481,6 +481,16 @@ pub struct HubOptions {
     /// its members are read (`hub::jobs`, every 5 s while it runs). Never set outside tests.
     #[doc(hidden)]
     pub job_members_hook: Option<MarkerReadHook>,
+    /// Test hook: called under the hub's lock with what a loop is about to record, before the
+    /// batch that records it commits (`hub::loops::driver`): `findings <round>` (a review
+    /// run's end, `p1` the plan check's), `answer <step>` (a turn's answer to the step:
+    /// `scope`, `plan`, `triage p1`, `implement`, `triage m1`, `sweep`, `report`, `commit`; a
+    /// commit step's is its report marked `checking`), `failed <step>` (the step's turn
+    /// failed), `checked <step>` (a commit's check, `report` or `commit`) or `report written`
+    /// (the hub's `report.md` after a commit, with `loop.ended`). A test that kills the hub
+    /// there leaves the log as a crash at that point would. Never set outside tests.
+    #[doc(hidden)]
+    pub loop_record_hook: Option<LoopRecordHook>,
     /// Test hook: an SSH box's supervisor dials the box through it instead of ssh (no probe,
     /// no upload, no relay; [`crate::ssh_box::BoxDialer`]). Never set outside tests.
     #[doc(hidden)]
@@ -538,6 +548,10 @@ pub type BoxFilesReadHook =
 /// [`HubOptions::socket_removed_hook`].
 #[doc(hidden)]
 pub type SocketRemovedHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// [`HubOptions::loop_record_hook`].
+#[doc(hidden)]
+pub type LoopRecordHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// [`HubOptions::reap_job_group_hook`]: given the group's id and its leader's start time.
 #[doc(hidden)]
@@ -597,6 +611,7 @@ impl HubOptions {
             job_gate_hook: None,
             reap_job_group_hook: None,
             job_members_hook: None,
+            loop_record_hook: None,
             box_dialer: None,
             link_program: None,
             box_files_read_hook: None,
@@ -696,6 +711,11 @@ pub struct NewThread {
     /// Start point of the thread's branch (default: the repository's `HEAD`); only for a new
     /// worktree.
     pub base: Option<String>,
+    /// Run the new thread as a loop (`hub::loops`, milestone 2: an implementation loop): its
+    /// task is the thread's first prompt, never sent as an ordinary prompt unless the user
+    /// answers the setup card `run without a loop`. The user's only.
+    #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_req: Option<NewThreadLoop>,
     /// Internal atomic creation bookkeeping, never accepted by `thread.new`.
     #[serde(skip)]
     pub spawn_operation: Option<String>,
@@ -961,6 +981,8 @@ struct Inner {
     reap_job_group_hook: Option<ReapJobGroupHook>,
     /// [`HubOptions::job_members_hook`].
     job_members_hook: Option<MarkerReadHook>,
+    /// [`HubOptions::loop_record_hook`].
+    loop_record_hook: Option<LoopRecordHook>,
     /// Exclusive lock on `<data_dir>/twr.lock`, released when the hub is dropped.
     _lock: File,
 }

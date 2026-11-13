@@ -879,3 +879,23 @@ select {
 [data-mobile="true"] .input-with-button > button {
   min-width: 44px;
 }
+
+/* Send as implementation loop: the ↻ button beside Send, and the choice it opens. */
+[data-mobile="true"] .send-loop-button {
+  min-width: 44px;
+  min-height: 44px;
+  width: 44px;
+  height: 44px;
+}
+[data-mobile="true"] .send-loop-panel {
+  width: min(
+    320px,
+    calc(100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right))
+  );
+}
+[data-mobile="true"] .send-loop-panel > button,
+[data-mobile="true"] .inspector-notice > button,
+[data-mobile="true"] .loop-starts > button {
+  min-height: 44px;
+  min-width: 44px;
+}

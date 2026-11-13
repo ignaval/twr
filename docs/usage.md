@@ -211,16 +211,18 @@ With Claude Code, the end of a command the agent ran in the background opens the
 
 ## Loops
 
-A review loop has another model review a thread's work, round after round, until it finds nothing new. Each round, a reviewer (Codex, Claude Code or Grok Build) reads the thread's changes read-only and lists findings; the thread checks each one against the code, fixes it or dismisses it with a reason, runs its gates and says what it did; dismissed findings go into a ledger that every later round reads, so they are not raised again. The hub runs the rounds, counts and sequences them, and writes a report at the end ([the design](design/loops.md)). The thread is the implementer and the arbiter: it is the session that wrote the code. In this version loops are review loops, in a thread on the hub's own machine with a git workspace, in a mode that can edit (not `plan` or `read-only`: a loop never widens a mode).
+A review loop has another model review a thread's work, round after round, until it finds nothing new. Each round, a reviewer (Codex, Claude Code or Grok Build) reads the thread's changes read-only and lists findings; the thread checks each one against the code, fixes it or dismisses it with a reason, runs its gates and says what it did; dismissed findings go into a ledger that every later round reads, so they are not raised again. The hub runs the rounds, counts and sequences them, and writes a report at the end ([the design](design/loops.md)). The thread is the implementer and the arbiter: it is the session that wrote the code. An implementation loop does the same after the thread has planned the task and built it ([below](#implementation-loops)). Loops run in a thread on the hub's own machine with a git workspace, in a mode that can edit (not `plan` or `read-only`: a loop never widens a mode).
 
 ```sh
 twr loop review api                          # start a review loop on api's work
 twr loop review api --scope since:main       # what it reviews; also --profile, --reviewer, ... for this run
 twr loop review api --setup                  # show the settings card first
+twr loop implement api add a CSV export      # plan, implement, review and commit a task
+twr thread new api --loop implement add rate limiting   # the same in a new thread
 twr loop list                                # the running loops
 twr loop show api                            # phases, rounds, findings and verdicts, ledger
 twr loop pause api                           # also resume, skip (to verification), stop
-twr loop report api                          # the last loop's report
+twr loop report api                          # the loop's report, from any machine
 twr loop settings                            # the saved settings; --edit, --reset, `set`
 ```
 
@@ -243,29 +245,59 @@ What a loop reviews is its scope, `--scope`:
 
 How much review a loop runs is its profile: `high` runs a medium-effort tier until it converges, then an `xhigh` tier, then a sweep and up to 5 verification rounds; `medium` one medium tier, a sweep and up to 2 verification rounds; `low` one medium round and one verification round, no sweep. A tier converges on a round with no findings, or one whose every finding repeats the ledger; two rounds in a row with nothing of a new class end the ladder early. When the last tier ends on a round with no findings, at the verification's effort, with no sweep to run and nothing changed in the worktree while that round ran, a verification round could only repeat it, so the loop skips the verification and goes to its report, clean: `low` after a clean first round, `high` after a clean `xhigh` round that followed a ladder that fixed nothing. You can change the built-in profiles and add your own in `[loops.profiles.<name>]` ([configuration.md](configuration.md#notes-on-some-keys)).
 
-`--profile`, `--reviewer` (`runtime[:account]/model`), `--implementer` (`thread`, or `runtime[:account]/model[:effort]` on the thread's own runtime), `--workers` (the implementer's subagents, `model[:effort]`) and `--commit` (`match` or `none`) change this run only and leave the saved settings alone. Before the first save they fill in the settings card instead. Each value is checked before anything is sent: a typo is an error that says what the value takes.
+`--profile`, `--reviewer` (`runtime[:account]/model`), `--implementer` (`thread`, or `runtime[:account]/model[:effort]` on the thread's own runtime), `--workers` (the implementer's subagents, `model[:effort]`) and `--commit` (`match` or `none`; [below](#commits)) change this run only and leave the saved settings alone. Before the first save they fill in the settings card instead. Each value is checked before anything is sent: a typo is an error that says what the value takes.
 
 While a loop runs, the hub sends the thread one prompt per step, each starting with `[twr loop <id> <step>]`: the scope step (run the gates, write a GOAL paragraph for the reviewer), each round's triage, the sweep, the report. A message you send the thread goes ahead of the loop's next prompt, and the loop goes on after that turn. While a round's review runs, the thread shows as `background`. Each step's turn has a report like any other turn; the loop's last one is its report ([below](#the-report)).
+
+### Implementation loops
+
+An implementation loop builds a task end to end in a thread: the thread plans it, another model checks the plan when it touches a contract, the thread implements it with its gates green, and then the review loop above runs on the result, with the plan and the task in place of the GOAL. The hub runs it in a thread on its own machine, asked for with `loop.request {kind: "implement", task}` on an existing thread, or with `thread.new {…, loop: {kind: "implement", task}}` for a new thread whose first prompt is the task. With no task text, the task is what the conversation in the thread already settled, and the plan has to state it.
+
+```sh
+twr loop implement api add a CSV export to the reports page
+twr loop implement api --plan-check always --commit per-round -- --flags in the task stay
+twr loop implement api --task-file task.md        # a long task; `-` reads it from stdin
+twr loop implement api                            # the task is what the conversation settled
+twr thread new api --loop implement --setup add rate limiting to the webhooks
+```
+
+`twr loop implement <thread> [task…]` takes `twr loop review`'s flags but `--scope` (an implementation loop has none: its baseline is what the worktree holds), and two of its own for this run, `--commit` (`end`, `per-round`, `none`) and `--plan-check` (`contracts`, `always`, `never`). The task is the words after the thread, joined by single spaces (put `--` before words that start with `-`), or `-` alone to read it from stdin, or `--task-file <path>`; at most 16 KiB. It starts at once on your saved settings and prints them, with the task and the baseline, or shows the settings card as `twr loop review` does ([below](#the-first-run-the-settings-card)), with one more answer: the card holds the task. `twr thread new <project> … --loop implement [--setup] [--profile … --plan-check …] <task>` makes the thread and asks for the loop with its task as the first prompt, then prints the thread and the loop it started or its card, the same way (`--json`: `thread.new`'s answer, with the card). A new thread asked for with a loop and no `--runtime` or `--model` of its own runs on the settings' implementer when it names one. When the thread is made but its loop can't be asked for, the command says why and exits 1; the thread stays, idle, and the task is not sent.
+
+Its steps, each a turn of the thread's with a prompt that starts `[twr loop <id> <step>]`:
+
+1. **Plan.** The task, the plan's sections (the goal and your interpretation, the files, ordered steps, data and migrations, edge cases, verification, cross-repository contracts) and the rule to state an interpretation instead of asking. The thread's reply is the plan, ending with a `twr-plan` block that says whether it has contract risk (money paths, schemas or migrations, cross-repository contracts). The hub writes it to `plan.md` in the loop's folder.
+2. **Plan check.** One review of the plan by the reviewer, at `medium`, when the plan check setting is `always`, or `contracts` (the default of `high` and `medium`; `low`'s is `never`) and the plan said it has contract risk. The thread verifies each finding, revises the plan or dismisses the finding into the ledger; a revised plan replaces `plan.md`, the first kept as `plan-1.md`. There is no second plan review.
+3. **Implement.** The thread executes `plan.md`, delegating work items to its own subagents on the workers model where its runtime has them (Claude Code), and runs the gates. Anything but `done` with green gates gets one correction ("gates must be green before review"), then the loop is stuck until you resume it.
+4. **Review**: the ladder, the sweep and the verification of a review loop, the reviewer reading the plan, the diffs and the ledger.
+5. **Report**, and the commit ([below](#commits)).
+
+What the worktree already held when the loop started is its baseline: the loop folder keeps it (`baseline-<slug>.patch`), every reviewer prompt names it as out of scope, the round diffs leave out the files the loop has not touched since, and it stays out of the commit and of what the report says was built. A first implementation loop shows the settings card, which then holds the task: besides **start and save these settings** and **cancel** it offers **run without a loop**, which sends the task to the thread as an ordinary message of yours and saves nothing. **cancel** drops the task. A new thread made with a loop stays, idle, after either. A new thread asked for with a loop and no runtime or model of its own runs on the settings' implementer when it names one, else on its project's.
+
+### Commits
+
+An implementation loop commits by its Commit setting: `end` (the default) has its report turn make one commit per repository of the loop's work, in the repository's own message style, leaving the baseline out; `per-round` has the implement turn and each triage turn commit as they go, and the report turn what is left; `none` commits nothing. A review loop under `match` commits its fixes, once at its end, when the thread had been committing its work: the scope has commits of the thread's own and its worktree was clean when the loop started; otherwise, and under `none`, it commits nothing, and its prompts say so.
+
+After the commit the hub checks each repository with git: where the loop left work, `HEAD` moved to a commit that changed something (work stashed away, or an empty commit, is "neither in the worktree nor committed"); nothing is left in the worktree beyond the baseline; and the baseline's own changes are still uncommitted as they were (committed by mistake, or undone, the check names the paths). The thread's `twr-commit` block is its note of what it committed, not the check: a commit with no block, or with one that does not read, passes, and the report notes it. Each repository is either committed or has a problem, never both. A failed check gets one correction asking only for the commit; a second failure doesn't hold the loop: it ends as it would have, and its report, its last line in the conversation and its end name the repositories committed and say `not committed` with what is wrong of the others. A loop that ends `stopped` or `failed` commits nothing. One whose verification ran out with findings still arriving (`cap_expired`) commits, and its report names the findings the commit still carries.
 
 ### The first run: the settings card
 
 A loop runs only on settings you chose. The first loop, of either kind, shows a settings card that names the models: the profile, the scope, the implementer (the thread's own model by default), its workers, the reviewer, and where an answer saves them (all projects, or this thread's project). It also says when a runtime is missing and what it shows instead (`codex isn't installed: reviewing with claude-code · claude-opus-5-5 instead`), and when the reviewer and the implementer are the same model family.
 
-On a terminal, `twr loop review` shows the card and asks:
+On a terminal, `twr loop review` and `twr loop implement` show the card and ask:
 
 ```
 1 start and save  2 change…  3 cancel:
 ```
 
-`1` starts the loop and saves what the card shows; later loops start on it without a card. `2` opens the settings in your editor (`$VISUAL`, else `$EDITOR`, else `vi`) as a short TOML document, with what the hub found installed in its comments; saving it raises the card again with the new values, and it asks again. `3` starts and saves nothing. Any other reply leaves the card open. Each answer applies to the revision of the card you saw: a card that changed meanwhile is refused, and you look again.
+`1` starts the loop and saves what the card shows; later loops start on it without a card. `2` opens the settings in your editor (`$VISUAL`, else `$EDITOR`, else `vi`) as a short TOML document, with what the hub found installed in its comments (an implementation loop's has no scope; its plan check and commit rows are there); saving it raises the card again with the new values, and it asks again. `3` starts and saves nothing. A card that holds a task (`twr loop implement` with one, `twr thread new --loop implement`) adds `4 run without a loop`, which sends the task to the thread as your own message and saves nothing. Any other reply leaves the card open. Each answer applies to the revision of the card you saw: a card that changed meanwhile is refused, and you look again. The card shows the Workers row only where the implementer's runtime runs subagents (Claude Code).
 
-Without a terminal (a script, `--json`), the card stays open: `twr loop review` prints it and the line that starts the loop from it, and exits 2.
+Without a terminal (a script, `--json`, a task read from stdin), the card stays open: the command prints it and the lines that answer it (start the loop, and run the task without one when it holds a task), and exits 2.
 
 ```sh
 twr respond 01JA...@3 "start and save these settings"
 ```
 
-You can answer it there, in the apps, or with `twr loop review` again on a terminal. No flag skips the card. The card comes back, filled with the saved settings, when you ask for it (`--setup`), when a saved setting no longer holds (a runtime not installed or not logged in, a model or account it no longer has, a profile that was removed), and when the thread runs on another runtime than the saved implementer: a loop never moves a thread to another runtime.
+You can answer it there, in the apps, or with `twr loop review` (or `implement`) again on a terminal. No flag skips the card. The card comes back, filled with the saved settings, when you ask for it (`--setup`), when a saved setting no longer holds (a runtime not installed or not logged in, a model or account it no longer has, a profile that was removed), and when the thread runs on another runtime than the saved implementer: a loop never moves a thread to another runtime.
 
 ### Saved and per-project settings
 
@@ -280,7 +312,7 @@ twr loop settings --reset --project api      # api uses the workspace's again
 twr loop settings --reset                    # forget every saved set: the next loop shows the card
 ```
 
-`--edit` opens the TOML document of the card's `2 change…` (without the card's own `save_for` and `scope`), on a private temporary copy: if saving fails, the copy is kept and its path printed. `set` takes `--profile`, `--implementer`, `--workers`, `--reviewer`, `--commit` and `--preset` (`claude-codex`: Claude Code implements and Codex reviews, the default; `claude`, `codex`, `grok`: all on one runtime), and saves the others as they apply now. `--reset` asks y/N on a terminal; without one, pass `--yes`. Only you save settings, from a client of yours: the orchestrator and the threads' agents cannot, and `[loops]` in the config file only sets what the first card shows ([configuration.md](configuration.md#notes-on-some-keys)).
+`--edit` opens the TOML document of the card's `2 change…` (without the card's own `save_for` and `scope`), on a private temporary copy: if saving fails, the copy is kept and its path printed. `set` takes `--profile`, `--implementer`, `--workers`, `--reviewer`, `--commit` (a review loop's), `--implementation-commit`, `--plan-check` (`profile` for the profile's) and `--preset` (`claude-codex`: Claude Code implements and Codex reviews, the default; `claude`, `codex`, `grok`: all on one runtime), and saves the others as they apply now. `--reset` asks y/N on a terminal; without one, pass `--yes`. Only you save settings, from a client of yours: the orchestrator and the threads' agents cannot, and `[loops]` in the config file only sets what the first card shows ([configuration.md](configuration.md#notes-on-some-keys)).
 
 ### Pause, stop, skip
 
@@ -288,11 +320,11 @@ twr loop settings --reset                    # forget every saved set: the next 
 
 A step that fails (a review run that fails twice, a turn that fails, a triage block refused twice) makes the loop stuck: it raises an item on the thread's card with **resume**, which asks for that step again, and **stop**. Only you answer it. A loop survives a hub restart and goes on where it was.
 
-`twr loop list` lists the running loops, `twr loop show <thread>` the thread's running loop, else its last: its settings and where they came from, each phase, each round with its findings and the thread's verdicts, the ledger, the transition, and how it ended.
+`twr loop list` lists the running loops, `twr loop show <thread>` the thread's running loop, else its last: its settings and where they came from, each phase, each round with its findings and the thread's verdicts, the ledger, the transition, and how it ended. An implementation loop's adds its task and baseline, each plan (its revision, contract risk and path), each implement turn (its status and gates), the plan check's round `p1`, each commit check with its notes, and the commits and `not committed: …`. Pause, resume, stop and skip work on either kind; skip is refused before an implementation loop's ladder (nothing is built to verify yet).
 
 ### The report
 
-When the loop ends, the hub writes `report.md` in the loop's folder (`<data dir>/loops/<id>/`, with the round diffs, prompts, the reviewer's output and answers, the GOAL and the ledger): rounds per tier, the class breakdown, why the ladder ended, the sweep, how the loop ended, the ledger and the gates, then the thread's own summary of what was reviewed and what is left. That is the thread's report for its last turn, so the card, the conversation and `twr wait` show it. `twr loop report <thread>` prints the file; it reads it on the hub's machine, so from another machine use `twr loop show`.
+When the loop ends, the hub writes `report.md` in the loop's folder (`<data dir>/loops/<id>/`, with the round diffs, prompts, the reviewer's output and answers, the GOAL or the task and plan, the baseline and the ledger): rounds per tier, the class breakdown, why the ladder ended, the sweep, how the loop ended, the ledger and the gates, then the thread's own summary of what was reviewed and what is left. An implementation loop's adds the plan check (whether it ran and why, its findings, whether the plan changed, what it ledgered), the implement turn and the commits; one that commits writes it once the commit is checked. That is the thread's report for its last turn, so the card, the conversation and `twr wait` show it. `twr loop report <thread>` prints it as the hub reads it (`loop.report`), so it works from any machine that reaches the hub, a paired device with the `read` scope included; a report over 256 KiB is cut, with a line naming where the whole of it is. While the loop runs, it says the report is not written yet.
 
 `twr wait <thread>` waits through a running loop and returns when its report is written (exit 0), when the loop is stuck or paused waiting on you, or the thread waits on you, its settings card included (exit 2), or when the thread failed or was stopped (exit 3).
 

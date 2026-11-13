@@ -1,4 +1,5 @@
-// Review loops in the real Electron app against a real Rust hub (docs/desktop.md › Loops,
+// Review and implementation loops in the real Electron app against a real Rust hub
+// (docs/desktop.md › Loops,
 // docs/design/loops.md › Desktop and mobile): a fake thread in a git repository, and a fake
 // Codex reviewer (`TWR_CODEX_BIN`) that holds a run while `reviewers/hold.<n>` exists and
 // fails it while `reviewers/fail.<n>` does. The hub is told Codex is installed and logged in
@@ -111,6 +112,23 @@ writeFileSync(
 writeFileSync(
   join(templates, "report.md"),
   "The loop reviewed the change; nothing is left open.\n",
+);
+// An implementation loop's steps (step 8): the plan, the implement turn that writes a file,
+// and the report turn, which sleeps while the script commits the work for it (the fake
+// runtime runs no git), then names a commit (the hub checks the repository, not the sha).
+// `{{commit}}` comes before the block: the fake echoes the wording's indented example as a
+// fence, and the hub reads the last one.
+writeFileSync(
+  join(templates, "plan.md"),
+  'Plan: a CSV export on the reports page.\n```twr-plan\n{"contract_risk": false, "reason": "UI only: a new button"}\n```\n',
+);
+writeFileSync(
+  join(templates, "implement.md"),
+  '!write feature.rs pub fn export_csv() {}\nImplemented.\n```twr-implement\n{"status": "done", "gates": {"ran": ["true"], "result": "pass"}}\n```\n',
+);
+writeFileSync(
+  join(templates, "impl-report.md"),
+  '!sleep 4000\nBuilt the CSV export.\n{{commit}}\n```twr-commit\n{"commits": [{"repo": "demo", "sha": "abc1234"}]}\n```\n',
 );
 const tokenFile = join(home, "test-user.token");
 writeFileSync(tokenFile, randomUUID(), { mode: 0o600 });
@@ -853,13 +871,21 @@ try {
   await loopsSection.getByText("Last review loop: clean").waitFor();
   const openReport = loopsSection.getByRole("button", { name: "Open report" });
   await openReport.click();
-  assert.equal(await openReport.getAttribute("aria-expanded"), "true");
-  const path = await loopsSection
-    .locator(".loop-report .loop-path code")
+  // The report's text in a dialog (`loop.report`), the path under it.
+  const reportDialog = page.getByRole("dialog");
+  await reportDialog
+    .locator(".loop-report-body")
+    .getByText(/review loop/i)
+    .first()
+    .waitFor({ timeout: 15000 });
+  const path = await reportDialog
+    .locator(".loop-report-footer .loop-path code")
     .first()
     .innerText();
   assert.match(path, /report\.md$/);
   assert(existsSync(path), "The report's path exists");
+  await reportDialog.getByRole("button", { name: "Close dialog" }).click();
+  await reportDialog.waitFor({ state: "hidden", timeout: 15000 });
   await page.waitForTimeout(1500);
   assert.equal(
     await page.locator(".loop-offer").count(),
@@ -872,7 +898,7 @@ try {
     restore: back,
   });
   console.log(
-    "PASS: the loop ends clean: the thread's report says so, the chip goes, Open report gives report.md, no offer comes back",
+    "PASS: the loop ends clean: the thread's report says so, the chip goes, Open report shows report.md, no offer comes back",
   );
 
   // ---------------------------------------------------------------------------------
@@ -1055,8 +1081,302 @@ try {
   console.log(
     "PASS: Settings › Loops shows the editor and the projects with their own settings; saving for one project works",
   );
+
+  // ---------------------------------------------------------------------------------
+  // 8. Implementation loops. With no saved settings, Send as implementation loop raises
+  //    the setup card holding the task; Run without a loop sends it as an ordinary
+  //    message. Again with Start and save: plan, implement, a round, the report and the
+  //    commit. The New thread form's switch starts one on saved settings.
+  // ---------------------------------------------------------------------------------
+  await page.evaluate(async () => {
+    await window.twr.rpc("loop.settings.reset", {});
+    await window.twr.rpc("thread.new", {
+      project: "demo",
+      name: "web",
+      runtime: "fake",
+      mode: "auto",
+    });
+  });
+  assert.equal(twrJson("loop", "settings").settings ?? null, null);
+  const webCard = () =>
+    page.locator(".thread-list .thread-item").filter({ hasText: "web" });
+  await sidebar();
+  await webCard().waitFor();
+  await webCard().locator(".thread-card").click();
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  const webBox = page.getByRole("textbox", { name: "Message web directly" });
+  await webBox.waitFor();
+  const task = "add a CSV export to the reports page";
+  /** Types the task and picks Send as implementation loop from Send's caret. */
+  const sendAsLoop = async () => {
+    await webBox.fill(task);
+    const caret = page.getByRole("button", { name: "More ways to send" });
+    assert.equal(await caret.getAttribute("aria-expanded"), "false");
+    await caret.click();
+    assert.equal(await caret.getAttribute("aria-expanded"), "true");
+    const choice = page.getByRole("button", {
+      name: "Send as implementation loop",
+      exact: true,
+    });
+    await choice.waitFor();
+    return choice;
+  };
+  // The choice is keyboard-reachable and Escape closes it, giving focus back to the caret.
+  await sendAsLoop();
+  await ariaOf("20-send-as-loop", page.locator(".composer"));
+  await capture("20-send-as-loop", null, { narrow: false });
+  assert.equal((await focused()).text, "Send as implementation loop");
+  await page.keyboard.press("Escape");
+  assert.equal((await focused()).text, "More ways to send");
+  (await sendAsLoop()).click();
+  const webSetup = setupIn(page.locator(".conversation-attention"));
+  await webSetup.waitFor({ timeout: 15000 });
+  assert.equal(await webBox.inputValue(), "", "The task left the composer");
+  assert.match(
+    await webSetup.locator(".loop-setup-title").innerText(),
+    /^web: implementation loop setup/,
+  );
+  assert.match(
+    await webSetup.locator(".attention-kind").innerText(),
+    /Implementation loop setup/,
+  );
+  const webRows = await webSetup.locator(".loop-setup-rows dt").allInnerTexts();
+  for (const row of ["Task", "Plan check", "Commit"])
+    assert(webRows.includes(row), `The card has a ${row} row: ${webRows}`);
+  assert.equal(
+    await webSetup.getByRole("region", { name: "Task" }).innerText(),
+    task,
+  );
+  // The conversation's requests take at most a third of it: the card's answers arm once
+  // scrolled into view, as for a person.
+  await webSetup.locator(".attention-options").scrollIntoViewIfNeeded();
+  await webSetup.locator('.attention-options[data-armed="true"]').waitFor();
+  assert.deepEqual(
+    await webSetup.locator(".attention-options button").allInnerTexts(),
+    ["Start and save", "Change…", "Run without a loop", "Cancel"],
+  );
+  await ariaOf("21-setup-task", webSetup);
+  await capture("21-setup-task", null, { narrow: false });
+  // In Needs you too, with the same three answers.
+  await nav(/Needs you/);
+  const needsTask = setupIn(page.locator(".manager"));
+  await needsTask.waitFor();
+  await needsTask.getByRole("button", { name: "Run without a loop" }).waitFor();
+  await sidebar();
+  await webCard().locator(".thread-card").dblclick();
+  await webSetup.waitFor();
+  // The conversation's requests take at most a third of it: the card's answers arm once
+  // scrolled into view, as for a person.
+  await webSetup.locator(".attention-options").scrollIntoViewIfNeeded();
+  await webSetup.locator('.attention-options[data-armed="true"]').waitFor();
+  await webSetup.getByRole("button", { name: "Run without a loop" }).click();
+  await webSetup.waitFor({ state: "hidden", timeout: 15000 });
+  await until(async () => {
+    const events = await page.evaluate(() =>
+      window.twr.rpc("thread.transcript", { thread: "web" }),
+    );
+    return (events.events || events).some(
+      (e) =>
+        e.kind === "agent.text" && e.data?.final && e.data.text?.includes(task),
+    );
+  }, "Run without a loop did not send the task as an ordinary message");
+  assert.equal(thread("web").loop, undefined, "Run without a loop starts none");
+  assert.equal(
+    twrJson("loop", "settings").settings ?? null,
+    null,
+    "Run without a loop saves nothing",
+  );
+  console.log(
+    "PASS: Send as implementation loop raises the card holding the task; Run without a loop sends it as a message",
+  );
+
+  // Again, with Start and save: the loop runs. Its first review run is held to look.
+  const firstRun = runs() + 1;
+  hold(firstRun);
+  await until(() => thread("web").status !== "running", "web is still busy");
+  (await sendAsLoop()).click();
+  await webSetup.waitFor({ timeout: 15000 });
+  // The conversation's requests take at most a third of it: the card's answers arm once
+  // scrolled into view, as for a person.
+  await webSetup.locator(".attention-options").scrollIntoViewIfNeeded();
+  await webSetup.locator('.attention-options[data-armed="true"]').waitFor();
+  await webSetup.getByRole("button", { name: "Start and save" }).click();
+  await until(() => runs() >= firstRun, "The ladder's first run never started");
+  await select();
+  await webCard().locator(".thread-card").click();
+  const webLoops = inspector.locator(".inspector-loops");
+  await webLoops
+    .locator(".loop-status")
+    .filter({ hasText: "IMPLEMENT LOOP" })
+    .waitFor();
+  const phaseWords = await webLoops.locator(".loop-phases li").allInnerTexts();
+  assert.deepEqual(
+    phaseWords.map((w) =>
+      w
+        .replace(/\s*\(done\)/, "")
+        .replace(/\s+/g, " ")
+        .trim(),
+    ),
+    [
+      "plan",
+      "plan check skipped",
+      "implement",
+      "ladder",
+      "sweep",
+      "verify",
+      "report",
+    ],
+    "The phases, the plan check skipped",
+  );
+  await webLoops
+    .locator(".loop-implement dd")
+    .filter({ hasText: "revision 1 · contract risk no: UI only: a new button" })
+    .waitFor();
+  await webLoops
+    .locator(".loop-implement dd")
+    .filter({ hasText: "done · gates pass: true" })
+    .waitFor();
+  await webLoops
+    .locator(".loop-implement code")
+    .filter({ hasText: /plan\.md$/ })
+    .waitFor();
+  await sidebar();
+  const webChip = webCard().locator(".loop-chip");
+  await webChip.waitFor();
+  assert.equal(
+    await webChip.locator(".loop-badge").innerText(),
+    "IMPLEMENT LOOP",
+  );
+  await ariaOf("22-implement-running", webLoops);
+  await capture("22-implement-running", null, { narrow: false });
+  console.log(
+    "PASS: Start and save starts the implementation loop: its chip, phases, plan and implement result",
+  );
+  // The rest runs with the window hidden: the end notifies once, with the commit.
+  await hidden(async () => {
+    await page.waitForTimeout(1500);
+    release(firstRun);
+    await until(
+      () => thread("web").loop?.phase === "report",
+      "The loop never reached its report",
+      60000,
+    );
+    const wt = thread("web").worktree;
+    execFileSync("git", ["-C", wt, "add", "-A"], { stdio: "ignore" });
+    execFileSync(
+      "git",
+      [
+        "-C",
+        wt,
+        "-c",
+        "user.name=Desktop Test",
+        "-c",
+        "user.email=desktop@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "Add the CSV export",
+      ],
+      { stdio: "ignore" },
+    );
+    await until(
+      () => !thread("web").loop && thread("web").last_loop,
+      "The implementation loop never ended",
+      60000,
+    );
+    const last = thread("web").last_loop;
+    assert.equal(last.kind, "implement");
+    assert.equal(last.outcome, "clean");
+    assert.equal(last.commits?.length, 1, JSON.stringify(last));
+    const sha = last.commits[0].sha.slice(0, 7);
+    const notice = await until(async () => {
+      await send({ type: "inbox-poll" });
+      return (await notifications()).find((n) =>
+        /^Implementation loop clean/.test(n.body),
+      );
+    }, "No notification of the loop's end");
+    assert.equal(notice.title, "web · default");
+    assert.match(
+      notice.body,
+      new RegExp(
+        `^Implementation loop clean after \\d+ rounds? · committed ${sha}$`,
+      ),
+    );
+  });
+  const sha = thread("web").last_loop.commits[0].sha.slice(0, 7);
+  await announced(`web's implementation loop ended: clean; committed ${sha}`);
+  await select();
+  await webCard().locator(".thread-card").click();
+  await webLoops.getByText("Last implementation loop: clean").waitFor();
+  await webLoops
+    .locator(".loop-commits code")
+    .filter({ hasText: sha })
+    .waitFor();
+  await sidebar();
+  await webCard()
+    .locator(".loop-ended")
+    .filter({ hasText: `committed ${sha}` })
+    .waitFor();
+  await ariaOf("23-implement-ended", webLoops);
+  await capture("23-implement-ended", null, { narrow: false });
+  console.log(
+    "PASS: the loop plans, implements, reviews, reports and commits; the commit shows and notifies once",
+  );
+
+  // The New thread form's switch: on saved settings the loop starts at once. Its report
+  // commits nothing (the script does not commit this time): it ends `not committed`.
+  await sidebar();
+  await page
+    .getByRole("button", { name: "New thread", exact: true })
+    .first()
+    .click();
+  const form = page.getByRole("dialog", { name: "New thread" });
+  await form.waitFor();
+  await form
+    .getByRole("textbox", { name: /Project or repository/ })
+    .fill("demo");
+  await form.getByRole("textbox", { name: "Name" }).fill("csv");
+  await form.getByRole("textbox", { name: "First prompt" }).fill(task);
+  const loopSwitch = form.getByRole("switch", {
+    name: "Run as an implementation loop",
+  });
+  await loopSwitch.check();
+  await form
+    .locator(".new-thread-loop .loop-settings-line")
+    .filter({ hasText: "saved settings" })
+    .waitFor();
+  await form
+    .getByRole("button", { name: "Change the loop settings…" })
+    .waitFor();
+  await ariaOf("24-new-thread-loop", form);
+  await capture("24-new-thread-loop", null, { narrow: false });
+  await form.getByRole("button", { name: "Create thread" }).click();
+  await until(() => thread("csv"), "The New thread form made no thread");
+  await until(
+    () => thread("csv").loop || thread("csv").last_loop,
+    "The New thread form's switch started no loop",
+    30000,
+  );
+  await until(() => thread("csv").last_loop, "csv's loop never ended", 90000);
+  assert(
+    thread("csv").last_loop.commit_problem,
+    "Nothing committed: the loop says why",
+  );
+  await sidebar();
+  await page
+    .locator(".thread-list .thread-item")
+    .filter({ hasText: "csv" })
+    .locator(".loop-ended")
+    .filter({ hasText: "not committed" })
+    .waitFor({ timeout: 15000 });
+  console.log(
+    "PASS: the New thread form's switch starts an implementation loop with the first prompt as its task; an uncommitted end says so",
+  );
+
   if (errors.length) throw new Error(errors.join("\n"));
-  console.log("PASS: review loops in the desktop app against a real hub");
+  console.log(
+    "PASS: review and implementation loops in the desktop app against a real hub",
+  );
 } catch (error) {
   console.error("Failed:", error);
   if (application) {

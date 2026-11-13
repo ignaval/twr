@@ -1,15 +1,16 @@
 //! A loop as its log tells it ([`LoopLog`], read from its thread's `loop.*` events): what the
-//! driver needs beyond the folded state (the bases and folder of `loop.started`, the GOAL, the
-//! ledger's entries, each round's findings and triage, the sweep) and what `report.md` says
-//! ([`report`]).
+//! driver needs beyond the folded state (the bases and folder of `loop.started`, the GOAL, an
+//! implementation loop's plans and implement turns, the ledger's entries, each round's findings
+//! and triage, the sweep, the commit's checks) and what `report.md` says ([`report`]).
 
 use std::fmt::Write as _;
 
 use twr_core::event::*;
 use twr_core::loops::contract::{
-    render_ledger_entries, Finding, FindingClass, LedgerEntry, SweepItem, TriageItem, Verdict,
+    render_ledger_entries, Commit, Finding, FindingClass, Gates, ImplementStatus, LedgerEntry,
+    SweepItem, TriageItem, Verdict, PLAN_CHECK_TAG,
 };
-use twr_core::loops::{Outcome, TransitionReason};
+use twr_core::loops::{CommitMode, LoopKind, Outcome, TransitionReason, PLAN_CHECK_ROUND};
 
 /// One round as the log tells it.
 #[derive(Debug, Clone, Default)]
@@ -49,6 +50,12 @@ pub(in crate::hub) struct LoopLog {
     pub(in crate::hub) sweep: Option<Vec<SweepItem>>,
     /// Controls, as `(action, by, why)`.
     pub(in crate::hub) controls: Vec<(String, String, Option<String>)>,
+    /// An implementation loop's plans (`loop.plan`), in order.
+    pub(in crate::hub) plans: Vec<LoopPlanned>,
+    /// An implementation loop's implement turns' blocks (`loop.implemented`), in order.
+    pub(in crate::hub) implemented: Vec<(ImplementStatus, Gates)>,
+    /// The commit's checks (`loop.commit`), in order, with the turn each took.
+    pub(in crate::hub) commit_checks: Vec<(Option<u64>, LoopCommitChecked)>,
 }
 
 impl LoopLog {
@@ -105,6 +112,13 @@ impl LoopLog {
                     log.transition = Some((p.reason, p.round.clone()));
                     log.verify_skipped = p.verify_skipped;
                 }
+                EventBody::LoopPlan(p) if p.id == id => log.plans.push(p.clone()),
+                EventBody::LoopImplemented(p) if p.id == id => {
+                    log.implemented.push((p.status, p.gates.clone()))
+                }
+                EventBody::LoopCommit(p) if p.id == id => {
+                    log.commit_checks.push((e.turn, p.clone()))
+                }
                 EventBody::LoopControl(p) if p.id == id => log.controls.push((
                     p.action.as_str().to_string(),
                     serde_json::to_value(p.by)
@@ -150,10 +164,74 @@ impl LoopLog {
         out
     }
 
-    /// Rounds answered.
+    /// Review rounds answered (the plan check's not counted).
     pub(in crate::hub) fn answered_rounds(&self) -> usize {
-        self.rounds.iter().filter(|r| r.answered).count()
+        self.rounds
+            .iter()
+            .filter(|r| r.answered && r.id != PLAN_CHECK_ROUND)
+            .count()
     }
+
+    /// The loop's kind.
+    pub(in crate::hub) fn kind(&self) -> LoopKind {
+        self.started.as_ref().map(|s| s.kind).unwrap_or_default()
+    }
+
+    /// The turn whose reply is the loop's report text, when a commit was asked: the turn the
+    /// first commit check took (the report turn's; a correction asks only for the commit).
+    pub(in crate::hub) fn report_turn(&self) -> Option<u64> {
+        self.commit_checks.first().and_then(|(t, _)| *t)
+    }
+
+    /// The latest plan's path.
+    pub(in crate::hub) fn plan_path(&self) -> Option<String> {
+        self.plans.iter().rev().find_map(|p| p.path.clone())
+    }
+}
+
+/// What a loop committed, as its report and end say it: the commits, or why it did not.
+#[derive(Debug, Clone, Default)]
+pub(in crate::hub) struct Committed {
+    /// What the loop commits ([`CommitMode`]).
+    pub(in crate::hub) mode: CommitMode,
+    /// The commits its check found.
+    pub(in crate::hub) commits: Vec<Commit>,
+    /// Its check failed twice: what is left.
+    pub(in crate::hub) problem: Option<String>,
+}
+
+impl Committed {
+    /// The commit in a few words, when one was asked: `committed abc1234 (/w)`, `committed
+    /// nothing (there was nothing to commit)`, `not committed: …`.
+    pub(in crate::hub) fn words(&self) -> Option<String> {
+        if self.mode == CommitMode::None {
+            return None;
+        }
+        // (A repository is committed or has a problem, never both: `check_commit`.)
+        let mut parts = Vec::new();
+        if !self.commits.is_empty() {
+            parts.push(format!(
+                "committed {}",
+                self.commits
+                    .iter()
+                    .map(|c| format!("{} ({})", short_sha(&c.sha), c.repo))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(p) = &self.problem {
+            parts.push(format!("not committed: {}", super::prompts::one_line(p)));
+        }
+        if parts.is_empty() {
+            return Some("committed nothing (there was nothing to commit)".into());
+        }
+        Some(parts.join("; "))
+    }
+}
+
+/// `sha`'s first 12 digits.
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
 }
 
 /// `reason` in words.
@@ -167,9 +245,17 @@ pub(in crate::hub) fn transition_words(reason: TransitionReason) -> &'static str
     }
 }
 
-/// How a loop that ended `outcome` after `rounds` answered rounds is said:
+/// `review loop` or `implementation loop`.
+pub(in crate::hub) fn kind_words(kind: LoopKind) -> &'static str {
+    match kind {
+        LoopKind::Review => "review loop",
+        LoopKind::Implement => "implementation loop",
+    }
+}
+
+/// How a loop of `kind` that ended `outcome` after `rounds` answered review rounds is said:
 /// `review loop clean after 6 rounds`.
-pub(in crate::hub) fn outcome_words(outcome: Outcome, rounds: usize) -> String {
+pub(in crate::hub) fn outcome_words(kind: LoopKind, outcome: Outcome, rounds: usize) -> String {
     let after = match rounds {
         0 => "before any round".to_string(),
         1 => "after 1 round".to_string(),
@@ -182,26 +268,40 @@ pub(in crate::hub) fn outcome_words(outcome: Outcome, rounds: usize) -> String {
         Outcome::Stopped => "stopped",
         Outcome::Failed => "failed",
     };
-    format!("review loop {how} {after}")
+    format!("{} {how} {after}", kind_words(kind))
 }
 
 /// The text of `report.md` for loop `log` of thread `name`, that ended `outcome`, the
-/// thread's own part being `reply` (its report turn's final message).
+/// thread's own part being `reply` (its report turn's final message, without its
+/// `twr-commit` block), and its commit `committed`. An implementation loop's adds the skill's
+/// Phase 5 parts: the plan check (ran or not and why, findings, plan changes, ledgered items),
+/// the implement turn, and the commits (after `cap_expired`, which findings they still carry).
+/// A baseline that had changes is named only as out of scope, never reported as work.
 pub(in crate::hub) fn report(
     name: &str,
     log: &LoopLog,
     outcome: Outcome,
     folder: &str,
     reply: Option<&str>,
+    committed: &Committed,
 ) -> String {
     let mut out = String::new();
     let started = log.started.clone().unwrap_or_default();
-    let _ = writeln!(out, "# Review loop report: {name}\n");
-    let _ = writeln!(
+    let kind = started.kind;
+    let title = match kind {
+        LoopKind::Review => "Review loop report",
+        LoopKind::Implement => "Implementation loop report",
+    };
+    let _ = writeln!(out, "# {title}: {name}\n");
+    let _ = write!(
         out,
-        "{}.\n",
-        capitalized(&outcome_words(outcome, log.answered_rounds()))
+        "{}",
+        capitalized(&outcome_words(kind, outcome, log.answered_rounds()))
     );
+    if let Some(c) = committed.words() {
+        let _ = write!(out, "; {c}");
+    }
+    let _ = writeln!(out, ".\n");
     let _ = writeln!(
         out,
         "- Loop: {} (profile {})",
@@ -215,20 +315,75 @@ pub(in crate::hub) fn report(
     if let Some(scope) = &started.scope {
         let _ = writeln!(out, "- Scope: {scope}");
     }
+    if kind == LoopKind::Implement {
+        let _ = writeln!(
+            out,
+            "- Task: {}",
+            match started
+                .task
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+            {
+                Some(t) => super::prompts::one_line(&cut_words(t, 300)),
+                None => "what the conversation had settled (the plan states it)".into(),
+            }
+        );
+        if let Some(p) = log.plan_path() {
+            let _ = writeln!(out, "- Plan: {p}");
+        }
+    }
     for b in &started.bases {
         let _ = writeln!(out, "- Repository {}: {} from {}", b.slug, b.repo, b.base);
+    }
+    for (slug, summary) in baseline_notes(&started) {
+        let _ = writeln!(
+            out,
+            "- Out of scope in {slug}: what the worktree held before the loop began ({summary}; \
+             {folder}/baseline-{slug}.patch)"
+        );
     }
     let _ = writeln!(out, "- Files: {folder}");
     if let Some(goal) = &log.goal {
         let _ = writeln!(out, "\n## Goal\n\n{}", goal.trim());
     }
+    if kind == LoopKind::Implement {
+        plan_check_section(&mut out, log);
+        let _ = writeln!(out, "\n## Implementation\n");
+        match log.implemented.last() {
+            Some((status, gates)) => {
+                let _ = writeln!(
+                    out,
+                    "The implement turn reported {} with gates {}{}.",
+                    status.as_str(),
+                    gate_words(gates),
+                    match log.implemented.len() {
+                        1 => String::new(),
+                        n => format!(
+                            " (after {} refused answer{})",
+                            n - 1,
+                            if n == 2 { "" } else { "s" }
+                        ),
+                    }
+                );
+            }
+            None => {
+                let _ = writeln!(out, "The implement turn did not report.");
+            }
+        }
+    }
     let _ = writeln!(out, "\n## Rounds\n");
-    if log.rounds.is_empty() {
+    let review_rounds: Vec<&RoundLog> = log
+        .rounds
+        .iter()
+        .filter(|r| r.id != PLAN_CHECK_ROUND)
+        .collect();
+    if review_rounds.is_empty() {
         let _ = writeln!(out, "No round ran.");
     }
     // Per tier: its rounds, findings and new classes.
     let mut tiers: Vec<(String, Vec<&RoundLog>)> = Vec::new();
-    for r in &log.rounds {
+    for r in review_rounds.iter().copied() {
         let tag: String =
             r.id.chars()
                 .take_while(|c| c.is_ascii_lowercase())
@@ -408,6 +563,10 @@ pub(in crate::hub) fn report(
     }
     let _ = writeln!(out, "\n## Gates\n");
     let mut any = false;
+    if let Some((_, g)) = log.implemented.last() {
+        any = true;
+        let _ = writeln!(out, "- implement: {}", gate_words(g));
+    }
     for r in &log.rounds {
         if let Some(g) = &r.gates {
             any = true;
@@ -441,7 +600,58 @@ pub(in crate::hub) fn report(
     } else {
         out.push_str(&render_ledger_entries(&log.ledger));
     }
-    let _ = writeln!(out, "\n## The thread's report\n");
+    if committed.mode != CommitMode::None {
+        let _ = writeln!(out, "\n## Commits\n");
+        for c in &committed.commits {
+            let _ = writeln!(out, "- {}: {}", c.repo, c.sha);
+        }
+        match &committed.problem {
+            Some(p) => {
+                if !committed.commits.is_empty() {
+                    out.push('\n');
+                }
+                let _ = writeln!(
+                    out,
+                    "Not committed: {}. The loop's work there is left as it is in the worktree.",
+                    super::prompts::one_line(p)
+                );
+            }
+            None if committed.commits.is_empty() => {
+                let _ = writeln!(out, "Nothing to commit: the loop left no change.");
+            }
+            None => {}
+        }
+        // What the check noted (the thread's `twr-commit` block missing, say): no problem.
+        if let Some((_, last)) = log.commit_checks.last() {
+            for n in &last.notes {
+                let _ = writeln!(out, "\nNote: {}.", super::prompts::one_line(n));
+            }
+        }
+        if outcome == Outcome::CapExpired && !committed.commits.is_empty() {
+            if let Some(last) = verify.last().filter(|r| !r.findings.is_empty()) {
+                let _ = writeln!(
+                    out,
+                    "\nThe commit still carries the last verification round's {} finding{}, \
+                     listed under How it ended: {}.",
+                    last.findings.len(),
+                    if last.findings.len() == 1 { "" } else { "s" },
+                    last.findings
+                        .iter()
+                        .map(|f| f.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\n## {}\n",
+        match kind {
+            LoopKind::Review => "The thread's report",
+            LoopKind::Implement => "What was built (the thread's report)",
+        }
+    );
     match reply.map(str::trim).filter(|r| !r.is_empty()) {
         Some(r) => {
             let _ = writeln!(out, "{r}");
@@ -451,6 +661,170 @@ pub(in crate::hub) fn report(
         }
     }
     out
+}
+
+/// The plan check's part of an implementation loop's report: whether it ran and why, its
+/// findings and their triage, whether the plan changed, and what it ledgered.
+fn plan_check_section(out: &mut String, log: &LoopLog) {
+    let _ = writeln!(out, "\n## Plan check\n");
+    let started = log.started.clone().unwrap_or_default();
+    let setting = started
+        .settings
+        .plan_check
+        .unwrap_or(started.profile.plan_check);
+    let first = log.plans.iter().find(|p| p.revision == 1);
+    let risk = first.map(|p| {
+        format!(
+            "the plan said contract risk: {} ({})",
+            if p.contract_risk { "yes" } else { "no" },
+            super::prompts::one_line(&p.reason)
+        )
+    });
+    let Some(round) = log.rounds.iter().find(|r| r.id == PLAN_CHECK_ROUND) else {
+        let _ = writeln!(
+            out,
+            "Not run: the plan check is `{}`{}.",
+            setting.as_str(),
+            match (&risk, first) {
+                (Some(r), _) => format!(", and {r}"),
+                (None, None) => ", and no plan was written".to_string(),
+                (None, Some(_)) => String::new(),
+            }
+        );
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "Ran (one review at {}, round {}): the plan check is `{}`{}.",
+        if round.effort.is_empty() {
+            twr_core::loops::PLAN_CHECK_EFFORT
+        } else {
+            round.effort.as_str()
+        },
+        PLAN_CHECK_ROUND,
+        setting.as_str(),
+        risk.map(|r| format!(", and {r}")).unwrap_or_default()
+    );
+    if !round.answered {
+        let _ = writeln!(out, "It gave no answer.");
+        return;
+    }
+    if round.findings.is_empty() {
+        let _ = writeln!(out, "It found nothing.");
+    }
+    for f in &round.findings {
+        let verdict = round
+            .triage
+            .iter()
+            .find(|t| t.id == f.id)
+            .map(|t| match t.verdict {
+                Verdict::Fixed => "fixed in the plan".to_string(),
+                Verdict::Dismissed => format!(
+                    "dismissed: {}",
+                    super::prompts::one_line(t.reason.as_deref().unwrap_or(""))
+                ),
+                Verdict::Duplicate => format!(
+                    "duplicate of {}",
+                    t.of.as_deref()
+                        .map(super::prompts::one_line)
+                        .unwrap_or_default()
+                ),
+            })
+            .unwrap_or_else(|| "not triaged".into());
+        let _ = writeln!(
+            out,
+            "- {} ({}) {}: {} — {verdict}",
+            f.id,
+            f.severity.as_str(),
+            super::prompts::one_line(&f.location),
+            super::prompts::one_line(&f.problem)
+        );
+    }
+    match log.plans.iter().find(|p| p.revision >= 2) {
+        Some(p) => {
+            let _ = writeln!(
+                out,
+                "\nThe plan was revised{}; the first one is kept as plan-1.md.",
+                p.path
+                    .as_deref()
+                    .map(|path| format!(" ({path})"))
+                    .unwrap_or_default()
+            );
+        }
+        None => {
+            let _ = writeln!(out, "\nThe plan did not change.");
+        }
+    }
+    let ledgered: Vec<&LedgerEntry> = log
+        .ledger
+        .iter()
+        .filter(|e| e.from.starts_with(PLAN_CHECK_TAG))
+        .collect();
+    if !ledgered.is_empty() {
+        let _ = writeln!(
+            out,
+            "Ledgered: {}.",
+            ledgered
+                .iter()
+                .map(|e| format!("{} ({})", e.id, e.from))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+/// `gates` in words: `` `cargo test` pass ``.
+fn gate_words(gates: &Gates) -> String {
+    format!(
+        "{} {}",
+        if gates.ran.is_empty() {
+            "(no command named)".to_string()
+        } else {
+            gates
+                .ran
+                .iter()
+                .map(|c| format!("`{}`", super::prompts::one_line(c).replace('`', "'")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+        match gates.result {
+            twr_core::loops::contract::GateResult::Pass => "pass",
+            twr_core::loops::contract::GateResult::Fail => "fail",
+        }
+    )
+}
+
+/// The baseline notes `loop.started` of an implementation loop carries
+/// (`ext.twr.loop_start.baseline`): per repository slug that had changes, their summary.
+pub(in crate::hub) fn baseline_notes(started: &LoopStarted) -> Vec<(String, String)> {
+    let Some(b) = started
+        .ext
+        .as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(super::LOOP_START_KEY))
+        .and_then(|s| s.get("baseline"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    b.iter()
+        .filter_map(|(slug, v)| {
+            let summary = v["summary"].as_str()?;
+            (v["changed"].as_u64().unwrap_or(0) > 0).then(|| (slug.clone(), summary.to_string()))
+        })
+        .collect()
+}
+
+/// `s`, at most `max` bytes of it, `…` when cut.
+fn cut_words(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 fn capitalized(s: &str) -> String {

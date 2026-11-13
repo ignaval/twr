@@ -151,7 +151,7 @@
 //! The `loop.*` methods are the user's only (in neither `ORCHESTRATOR_METHODS` nor
 //! `AGENT_METHODS`, and refused by the hub to the orchestrator identity as well): a loop's
 //! setup card (an `attention.raised` with `ext.twr.loop_setup`, reason `review`, options `start
-//! and save these settings` and `cancel`) is answered with `attention.respond` by the user
+//! and save these settings`, `run without a loop` when it holds a task, and `cancel`) is answered with `attention.respond` by the user
 //! alone (`relay_forbidden` for the orchestrator, which may not annotate it either; a
 //! dismissal is a cancel), and its `change…` is `loop.setup.update` (`hub::loops`). A stuck
 //! loop's item (`ext.twr.loop_stuck`, reason `error`, options `resume` and `stop`) is the
@@ -807,6 +807,7 @@ pub const METHODS: &[&str] = &[
     "loop.settings.set",
     "loop.settings.reset",
     "loop.get",
+    "loop.report",
     "loop.list",
     "loop.control",
 ];
@@ -3198,6 +3199,7 @@ fn call(
         }
         "loop.settings.reset" => hub.loop_settings_reset(params(p)?, caller),
         "loop.get" => hub.loop_get(params(p)?),
+        "loop.report" => hub.loop_report(params(p)?),
         "loop.list" => Ok(hub.loop_list()),
         "loop.control" => {
             let p: LoopControlParams = required_params(p)?;

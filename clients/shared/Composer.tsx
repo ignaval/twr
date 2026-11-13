@@ -17,6 +17,7 @@ import type { UploadController } from "./uploads";
 import { takesSuggestion, type useAssistance } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { Spinner } from "./ui";
+import { SendAsLoop } from "./LoopViews";
 import type { DesktopAPI, Json, Thread } from "./types";
 
 /**
@@ -112,6 +113,7 @@ export function Composer({
   onEdit,
   send,
   submitSlash,
+  sendAsLoop,
   uploads,
   submitVoice,
   voiceHint,
@@ -147,6 +149,9 @@ export function Composer({
   onEdit: () => void;
   send: (event?: FormEvent) => Promise<void>;
   submitSlash: (text: string) => Promise<void>;
+  /** Send as implementation loop: the composer's draft is the task. Only while the
+   * destination is a thread. */
+  sendAsLoop?: () => void;
   uploads: UploadController;
   submitVoice: (text: string) => Promise<Json>;
   voiceHint: string[];
@@ -469,6 +474,14 @@ export function Composer({
             >
               {sending ? <Spinner /> : <ArrowUp size={18} />}
             </button>
+            {sendAsLoop && target && !target.is_orchestrator && (
+              <SendAsLoop
+                thread={target}
+                phone={document.documentElement.dataset.mobile === "true"}
+                busy={sending}
+                onSend={sendAsLoop}
+              />
+            )}
           </div>
         </div>
         {mentions.length > 0 && !mentionHidden && (

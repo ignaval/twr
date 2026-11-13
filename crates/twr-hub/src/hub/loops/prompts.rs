@@ -1,6 +1,7 @@
-//! The texts a review loop sends: the thread's prompts (scope, triage, correction, sweep,
-//! report) and the reviewer's (review), from the built-in templates in
-//! `crates/twr-hub/src/loops/*.md` or the user's own.
+//! The texts a loop sends: the thread's prompts (a review loop's scope; an implementation
+//! loop's plan, plan-check triage and implement; then triage, correction, sweep and report,
+//! with the commit's wording) and the reviewer's (review, impl-review, plan-review), from the
+//! built-in templates in `crates/twr-hub/src/loops/*.md` or the user's own.
 //!
 //! **Templates.** One per text, named [`TEMPLATES`]. A file `<config dir>/loops/templates/
 //! <name>.md` (the directory of the hub's config file) replaces the built-in one: read at
@@ -11,8 +12,9 @@
 //!
 //! **What the hub adds itself**, whatever the template says: every prompt to the thread
 //! starts with its marker line, `[twr loop <id> <step>]` ([`marker`]), by which the hub knows
-//! the loop's turns; a triage prompt always carries the round's findings in their wrapper
-//! (appended when the template has no `{{findings}}`), and a correction prompt the problems.
+//! the loop's turns; a triage prompt (and the plan check's) always carries the round's findings
+//! in their wrapper (appended when the template has no `{{findings}}`), a correction prompt the
+//! problems, and a report prompt that asks for a commit the commit's wording (`{{commit}}`).
 //!
 //! **Findings are data** ([`wrap_findings`]): what a reviewer wrote reaches the thread only
 //! between two marker lines carrying a fresh random tag, every line of it prefixed with `│ `
@@ -25,10 +27,24 @@
 use std::path::{Path, PathBuf};
 
 use twr_core::loops::contract::{Finding, LedgerEntry};
+use twr_core::loops::{CommitMode, LoopKind};
 
 /// The template names: what a file in `loops/templates/` may replace.
-pub(in crate::hub) const TEMPLATES: [&str; 6] =
-    ["goal", "review", "triage", "correction", "sweep", "report"];
+pub(in crate::hub) const TEMPLATES: [&str; 13] = [
+    "goal",
+    "review",
+    "triage",
+    "correction",
+    "sweep",
+    "report",
+    "plan",
+    "plan-review",
+    "impl-review",
+    "plan-triage",
+    "implement",
+    "impl-report",
+    "commit",
+];
 
 /// The largest template file the hub reads, in bytes.
 pub(in crate::hub) const MAX_TEMPLATE_BYTES: u64 = 64 * 1024;
@@ -41,6 +57,13 @@ fn builtin(name: &str) -> &'static str {
         "triage" => include_str!("../../loops/triage.md"),
         "correction" => include_str!("../../loops/correction.md"),
         "sweep" => include_str!("../../loops/sweep.md"),
+        "plan" => include_str!("../../loops/plan.md"),
+        "plan-review" => include_str!("../../loops/plan-review.md"),
+        "impl-review" => include_str!("../../loops/impl-review.md"),
+        "plan-triage" => include_str!("../../loops/plan-triage.md"),
+        "implement" => include_str!("../../loops/implement.md"),
+        "impl-report" => include_str!("../../loops/impl-report.md"),
+        "commit" => include_str!("../../loops/commit.md"),
         _ => include_str!("../../loops/report.md"),
     }
 }
@@ -254,20 +277,48 @@ pub(in crate::hub) fn ledger_state(entries: &[LedgerEntry]) -> String {
     }
 }
 
-/// What a triage or sweep prompt says of commits, by the review loop's commit setting:
-/// `match` follows how the thread has been committing its work; `none` never commits.
-pub(in crate::hub) fn commit_rule(commit: twr_core::loops::config::ReviewCommit) -> &'static str {
-    match commit {
-        twr_core::loops::config::ReviewCommit::Match => {
-            "Commits: if this thread has been committing its work as it went, commit these fixes \
-             the same way (the same message style and trailers); otherwise leave them \
-             uncommitted."
+/// What a loop's turns that may change files (implement, triage, sweep) are told of commits,
+/// by the loop's kind and what it commits ([`CommitMode`], fixed when it started): what the
+/// hub will check at the end, never more. `per-round`: each such turn commits what it changed;
+/// `end`: none does, the report turn commits; none: nothing is committed.
+pub(in crate::hub) fn commit_rule(kind: LoopKind, mode: CommitMode) -> &'static str {
+    match (kind, mode) {
+        (_, CommitMode::PerRound) => {
+            "Commits: when the gates are green, commit what this step changed: one commit per \
+             repository, in that repository's own message style, leaving out the changes the \
+             worktree had before the loop began. Do not amend or rewrite earlier commits, and do \
+             not push. A step that changed nothing commits nothing."
         }
-        twr_core::loops::config::ReviewCommit::None => {
+        (LoopKind::Implement, CommitMode::End) => {
+            "Commits: do not commit yet. The loop commits its work once, at its end: its report \
+             step asks for it."
+        }
+        (LoopKind::Review, CommitMode::End) => {
+            "Commits: do not commit yet. The loop commits its fixes once, at its end: its report \
+             step asks for it."
+        }
+        (LoopKind::Implement, CommitMode::None) => {
+            "Commits: do not commit; leave your changes uncommitted."
+        }
+        (LoopKind::Review, CommitMode::None) => {
             "Commits: do not commit; leave your fixes uncommitted."
         }
     }
 }
+
+/// What a loop's report turn commits, in the `commit` template's `{{what}}`.
+pub(in crate::hub) fn commit_what(kind: LoopKind, mode: CommitMode) -> &'static str {
+    match (kind, mode) {
+        (LoopKind::Review, _) => "this loop's fixes",
+        (LoopKind::Implement, CommitMode::PerRound) => "what is left of the loop's work",
+        (LoopKind::Implement, _) => "the loop's work",
+    }
+}
+
+/// The line a commit's correction prompt adds to the correction template, before the commit's
+/// wording: only the commit is asked again.
+pub(in crate::hub) const COMMIT_AGAIN: &str =
+    "Only the commit is asked again: your report stays as you wrote it.";
 
 #[cfg(test)]
 mod tests {
@@ -343,6 +394,12 @@ mod tests {
         std::os::unix::fs::symlink(tpl.join("real.md"), tpl.join("report.md")).unwrap();
         assert_eq!(template(Some(&tpl), "report"), "inside");
         assert!(template(None, "review").contains("OUTPUT: JSON matching the provided schema"));
+        for name in ["plan-review", "impl-review"] {
+            assert!(
+                template(None, name).contains("Report an EMPTY `findings` list if and only if"),
+                "{name}"
+            );
+        }
     }
 
     /// No built-in template holds a block the hub would read, nor a line a fake runtime takes
@@ -351,7 +408,14 @@ mod tests {
     fn built_in_templates_hold_no_block() {
         for name in TEMPLATES {
             let t = builtin(name);
-            for info in ["twr-goal", "twr-triage", "twr-sweep"] {
+            for info in [
+                "twr-goal",
+                "twr-triage",
+                "twr-sweep",
+                "twr-plan",
+                "twr-implement",
+                "twr-commit",
+            ] {
                 assert_eq!(last_block(t, info), None, "{name}");
             }
             assert!(!t.lines().any(|l| l.starts_with('!')), "{name}");

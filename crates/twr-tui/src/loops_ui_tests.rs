@@ -215,7 +215,7 @@ fn a_dive_folds_the_loops_prompts_and_rounds() {
     let folded = view(false);
     assert!(
         folded.iter().any(|r| r
-            == "↻ review round m3 · gpt-6.1-sol medium · 2 findings · 1 fixed, 1 dismissed (ctrl+o to expand)"),
+            == "↻ review round m3 · gpt-6.1-sol medium · 1s · 2 findings · 1 fixed, 1 dismissed (ctrl+o to expand)"),
         "{folded:#?}"
     );
     assert!(

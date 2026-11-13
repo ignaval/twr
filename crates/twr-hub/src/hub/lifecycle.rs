@@ -193,6 +193,7 @@ impl Hub {
             job_gate_hook: opts.job_gate_hook,
             reap_job_group_hook: opts.reap_job_group_hook,
             job_members_hook: opts.job_members_hook,
+            loop_record_hook: opts.loop_record_hook,
             started_at: Utc::now(),
             warnings: Mutex::new(warnings),
             fatal: Mutex::new(None),
@@ -1155,6 +1156,8 @@ impl Core {
                 }
             } else {
                 tracing::info!(%thread, "closing thread whose runtime died with the previous hub");
+                // Its loop's step, if a turn of it was cut, is asked again (`hub::loops`).
+                self.loop_runs.died_with_hub.insert(thread.clone());
                 Exit::Crashed {
                     exit_code: None,
                     stderr_tail: "hub restarted; the runtime process is gone".into(),

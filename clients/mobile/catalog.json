@@ -1802,6 +1802,163 @@
     ]
   },
   {
+    "id": "cli:loop implement",
+    "title": "twr loop implement",
+    "description": "Start an implementation loop in a thread: it plans the task, has the plan reviewed when it touches a contract, implements it with the gates green, then runs the review loop on the result, and commits at the end. The task is the words after the thread (`-` alone reads it from stdin; --task-file from a file); without one, it is what the thread's conversation already settled. Changes already in the worktree are the loop's baseline: out of its scope and out of its commit. It starts at once on your saved loop settings; the first time, with --setup, or when a saved setting no longer holds, the thread's settings card comes first, as for `twr loop review`, with one more answer when it holds a task: run without a loop (the task goes to the thread as your own message). Without a terminal the card stays open, this prints the `twr respond` lines for it, and exits 2",
+    "group": "CLI · loop",
+    "fields": [
+      {
+        "key": "thread",
+        "label": "thread",
+        "type": "text",
+        "required": true,
+        "description": "Thread id, name, alias or unique prefix"
+      },
+      {
+        "key": "task",
+        "label": "task",
+        "type": "words",
+        "required": false,
+        "description": "The task, as words (`-` alone: read it from stdin). Put `--` before a task whose words start with `-`"
+      },
+      {
+        "key": "task-file",
+        "label": "task file",
+        "type": "text",
+        "description": "Read the task from this file (for a long one)",
+        "advanced": false
+      },
+      {
+        "key": "setup",
+        "label": "setup",
+        "type": "boolean",
+        "description": "Show the settings card first, even when saved settings hold; starting from it saves what it shows",
+        "advanced": false
+      },
+      {
+        "key": "profile",
+        "label": "profile",
+        "type": "text",
+        "description": "This run's profile: low, medium, high, or one of your [loops.profiles]",
+        "advanced": false
+      },
+      {
+        "key": "reviewer",
+        "label": "reviewer",
+        "type": "text",
+        "description": "This run's reviewer: runtime[:account]/model (codex/gpt-6.1-sol)",
+        "advanced": false
+      },
+      {
+        "key": "implementer",
+        "label": "implementer",
+        "type": "text",
+        "description": "This run's implementer: thread (its own model), or runtime[:account]/model[:effort] on the thread's own runtime",
+        "advanced": false
+      },
+      {
+        "key": "workers",
+        "label": "workers",
+        "type": "text",
+        "description": "This run's workers, the implementer's subagents: model[:effort]",
+        "advanced": false
+      },
+      {
+        "key": "commit",
+        "label": "commit",
+        "type": "text",
+        "description": "This run's commit: end (one commit at the end), per-round, or none",
+        "advanced": false
+      },
+      {
+        "key": "plan-check",
+        "label": "plan check",
+        "type": "text",
+        "description": "This run's plan check: contracts (when the plan touches a contract), always or never",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print `loop.request`'s answer as JSON (with the card, `loop.setup.get`'s, when it needs one); never asks",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "loop",
+      "implement"
+    ],
+    "cliFields": [
+      {
+        "key": "thread",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "task",
+        "many": true,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "task-file",
+        "flag": "--task-file",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "setup",
+        "flag": "--setup",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "profile",
+        "flag": "--profile",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "reviewer",
+        "flag": "--reviewer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "implementer",
+        "flag": "--implementer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "workers",
+        "flag": "--workers",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "commit",
+        "flag": "--commit",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "plan-check",
+        "flag": "--plan-check",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
     "id": "cli:loop list",
     "title": "twr loop list",
     "description": "List the running loops: thread, kind, profile, phase, round, ledger, what each waits on",
@@ -1871,7 +2028,7 @@
   {
     "id": "cli:loop report",
     "title": "twr loop report",
-    "description": "Print the report of a thread's last loop (its `report.md`). It reads the file where the hub wrote it, so it works on the hub's machine",
+    "description": "Print the report of a thread's loop (its running one's, else its last one's: its `report.md`), as the hub reads it (`loop.report`), so it works from any machine that reaches the hub. A long report is cut, with a line saying where the whole of it is",
     "group": "CLI · loop",
     "fields": [
       {
@@ -1885,7 +2042,7 @@
         "key": "json",
         "label": "json",
         "type": "boolean",
-        "description": "Print `{thread, id, path, text}` as JSON",
+        "description": "Print `loop.report`'s answer as JSON",
         "advanced": true
       }
     ],
@@ -2207,6 +2364,26 @@
         "advanced": false
       },
       {
+        "key": "implementation-commit",
+        "label": "implementation commit",
+        "type": "text",
+        "description": "What an implementation loop commits: end, per-round or none",
+        "advanced": false
+      },
+      {
+        "key": "plan-check",
+        "label": "plan check",
+        "type": "select",
+        "description": "When an implementation loop checks its plan: profile (the profile's), contracts, always or never [possible values: profile, contracts, always, never]",
+        "advanced": false,
+        "options": [
+          "profile",
+          "contracts",
+          "always",
+          "never"
+        ]
+      },
+      {
         "key": "json",
         "label": "json",
         "type": "boolean",
@@ -2259,6 +2436,18 @@
       {
         "key": "commit",
         "flag": "--commit",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "implementation-commit",
+        "flag": "--implementation-commit",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "plan-check",
+        "flag": "--plan-check",
         "many": false,
         "separator": false
       },
@@ -3717,7 +3906,7 @@
   {
     "id": "cli:thread new",
     "title": "twr thread new",
-    "description": "Create a thread on a project (a configured project name or a directory)",
+    "description": "Create a thread on a project (a configured project name or a directory). With --loop implement, the words after the project are a task the new thread runs as an implementation loop (its first prompt): it starts on your saved loop settings, or its settings card comes first, as for `twr loop implement`",
     "group": "CLI · thread",
     "fields": [
       {
@@ -3726,6 +3915,13 @@
         "type": "text",
         "required": true,
         "description": "Project name from the config, or a path"
+      },
+      {
+        "key": "task",
+        "label": "task",
+        "type": "words",
+        "required": false,
+        "description": "The task (with --loop implement): the thread's first prompt. `-` alone reads it from stdin. Put `--` before a task whose words start with `-`"
       },
       {
         "key": "runtime",
@@ -3810,6 +4006,79 @@
         "type": "text",
         "description": "Start the thread's branch `twr/<name>` from this ref (default: the repository's HEAD)",
         "advanced": false
+      },
+      {
+        "key": "loop",
+        "label": "loop",
+        "type": "select",
+        "description": "Run the new thread as a loop: `implement` (an implementation loop whose task is the words after the project, or --task-file, or `-` for stdin) [possible values: implement]",
+        "advanced": false,
+        "options": [
+          "implement"
+        ]
+      },
+      {
+        "key": "task-file",
+        "label": "task file",
+        "type": "text",
+        "description": "Read the task from this file (with --loop implement)",
+        "advanced": false
+      },
+      {
+        "key": "setup",
+        "label": "setup",
+        "type": "boolean",
+        "description": "Show the loop's settings card first, even when saved settings hold",
+        "advanced": false
+      },
+      {
+        "key": "profile",
+        "label": "profile",
+        "type": "text",
+        "description": "The loop's profile for this run: low, medium, high, or one of your [loops.profiles]",
+        "advanced": false
+      },
+      {
+        "key": "reviewer",
+        "label": "reviewer",
+        "type": "text",
+        "description": "The loop's reviewer for this run: runtime[:account]/model",
+        "advanced": false
+      },
+      {
+        "key": "implementer",
+        "label": "implementer",
+        "type": "text",
+        "description": "The loop's implementer for this run: thread, or runtime[:account]/model[:effort]. A named one is the runtime and model the thread is made on, unless --runtime or --model says otherwise",
+        "advanced": false
+      },
+      {
+        "key": "workers",
+        "label": "workers",
+        "type": "text",
+        "description": "The loop's workers for this run: model[:effort]",
+        "advanced": false
+      },
+      {
+        "key": "commit",
+        "label": "commit",
+        "type": "text",
+        "description": "The loop's commit for this run: end, per-round or none",
+        "advanced": false
+      },
+      {
+        "key": "plan-check",
+        "label": "plan check",
+        "type": "text",
+        "description": "The loop's plan check for this run: contracts, always or never",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print `thread.new`'s answer as JSON (with the loop's card when it needs one); never asks",
+        "advanced": true
       }
     ],
     "cli": [
@@ -3820,6 +4089,12 @@
       {
         "key": "project",
         "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "task",
+        "many": true,
         "separator": false,
         "literal": false
       },
@@ -3892,6 +4167,66 @@
       {
         "key": "base",
         "flag": "--base",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "loop",
+        "flag": "--loop",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "task-file",
+        "flag": "--task-file",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "setup",
+        "flag": "--setup",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "profile",
+        "flag": "--profile",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "reviewer",
+        "flag": "--reviewer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "implementer",
+        "flag": "--implementer",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "workers",
+        "flag": "--workers",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "commit",
+        "flag": "--commit",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "plan-check",
+        "flag": "--plan-check",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
         "many": false,
         "separator": false
       }

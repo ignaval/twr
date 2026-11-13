@@ -1,5 +1,6 @@
-/* Review loops in the apps (docs/design/loops.md › Desktop and mobile): the loop chip on a
- * thread's sidebar card, the Review loop offer, the inspector's Loops section, the setup
+/* Loops in the apps (docs/design/loops.md › Desktop and mobile): the loop chip on a
+ * thread's sidebar card, the Review loop offer, Send as implementation loop, the inspector's
+ * Loops section with its Implementation loop… form, the New thread form's switch, the setup
  * card, the settings editor and Settings › Loops. Logic lives in loops.ts; App provides the
  * actions through LoopContext, so cards rendered anywhere reach the same ones. */
 import {
@@ -13,39 +14,60 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { AlertCircle, Check, RefreshCw, Repeat } from "lucide-react";
+import {
+  AlertCircle,
+  Check,
+  ChevronDown,
+  RefreshCw,
+  Repeat,
+  RotateCw,
+} from "lucide-react";
 import type { Attention, Json, Thread } from "./types";
-import { CopyButton, Dialog, ModelSelect, Spinner } from "./ui";
+import { CopyButton, Dialog, Markdown, ModelSelect, Spinner } from "./ui";
 import { errorMessage } from "./errors";
 import { announce, scrollBehavior } from "./a11y";
 import { mayAnswer } from "./arming";
 import { canRespond } from "./attention";
 import { useArming } from "./useArming";
 import {
-  SETUP_CANCEL,
   SETUP_START,
+  commitNotes,
   editSettings,
   editorRequest,
+  endedLately,
+  endedWords,
   hasSubagents,
+  implementedWords,
+  outcomeWords,
+  kindWords,
+  reportView,
   matchingPreset,
   modelWords,
-  outcomeWords,
   phaseWords,
   phasesOf,
+  planWords,
   roundWords,
+  setupHeading,
+  shortSha,
+  skipToVerify,
   skippedPhases,
   startedWords,
   runtimeUsable,
   setupCardState,
   settingsLine,
   waitingWords,
+  type Commit,
   type EditorChange,
   type EditorSource,
   type EditorState,
+  type ImplementRequest,
+  type LastLoop,
   type LoopAccess,
   type LoopControlAction,
+  type LoopReport,
   type LoopSetup,
   type LoopState,
+  type PlanInfo,
   type ReviewRequest,
   type RuntimeInfo,
   type SettingsGet,
@@ -67,6 +89,12 @@ export interface LoopActions {
   startReview: (
     thread: string,
     options?: Omit<ReviewRequest, "thread" | "kind">,
+  ) => Promise<boolean>;
+  /** Starts an implementation loop (`loop.request {kind: "implement", task?}`); App shows
+   * what came of it. */
+  startImplement: (
+    thread: string,
+    options?: Omit<ImplementRequest, "thread" | "kind">,
   ) => Promise<boolean>;
   /** Controls a thread's running loop (`loop.control`). */
   control: (thread: string, action: LoopControlAction) => Promise<boolean>;
@@ -95,6 +123,7 @@ export const LoopContext = createContext<LoopActions>({
   access: { act: false, why: "Not connected" },
   offerReview: false,
   startReview: noop,
+  startImplement: noop,
   control: noop,
   openEditor: () => {},
   confirm: () => {},
@@ -111,6 +140,30 @@ export function LoopChip({ thread }: { thread: Thread }) {
       <span className="loop-badge">{thread.loop_badge || "LOOP"}</span>
       <span className="visually-hidden">: </span>
       <span className="loop-line">{thread.loop_line}</span>
+    </span>
+  );
+}
+
+/**
+ * How a thread's last loop ended, while its last turn is the loop's: `IMPLEMENT LOOP clean
+ * after 3 rounds · committed abc1234`, or `not committed: …`. On the thread's card and in
+ * Latest thread reports.
+ */
+export function LoopEndedLine({ thread }: { thread: Thread }) {
+  const last = endedLately(thread);
+  if (!last) return null;
+  const words = endedWords(last);
+  const problem = !!last.commit_problem;
+  return (
+    <span className={`loop-ended ${problem ? "not-committed" : ""}`}>
+      <span className="loop-badge">
+        {last.kind === "implement" ? "IMPLEMENT LOOP" : "REVIEW LOOP"}
+      </span>
+      <span className="visually-hidden"> ended: </span>
+      {problem && <AlertCircle size={12} aria-hidden="true" />}
+      <span className="loop-line">
+        {words.replace(/^(review|implementation) loop /, "")}
+      </span>
     </span>
   );
 }
@@ -179,6 +232,94 @@ function useLoopSettings(
   return { got, error, reload: () => setTick((n) => n + 1) };
 }
 
+/** The line with the settings a loop would run on, and **Change…**, which opens the
+ * editor for the thread's project. */
+export function LoopSettingsLine({
+  project,
+  connected,
+  refreshKey,
+  id,
+}: {
+  project?: string;
+  connected: boolean;
+  /** Read again when this changes (a loop started or ended: its card may have saved). */
+  refreshKey?: unknown;
+  id?: string;
+}) {
+  const loops = useLoops();
+  const settings = useLoopSettings(project, connected, refreshKey);
+  return (
+    <p className="loop-settings-line" id={id}>
+      {settings.got ? (
+        <span>{settingsLine(settings.got)}</span>
+      ) : settings.error ? (
+        <span className="error-text">{settings.error}</span>
+      ) : connected ? (
+        <Spinner />
+      ) : (
+        <span className="muted">Connect to see the loop settings.</span>
+      )}{" "}
+      <button
+        type="button"
+        className="text-button"
+        disabled={!connected}
+        aria-haspopup="dialog"
+        aria-label="Change the loop settings…"
+        onClick={() => loops.openEditor({ kind: "saved", project })}
+      >
+        Change…
+      </button>
+    </p>
+  );
+}
+
+/** What a loop committed, a short sha per repository; then, when other repositories were
+ * not committed, why; then what the last commit check noted, quietly. */
+function Commits({
+  commits,
+  problem,
+  notes = [],
+}: {
+  commits?: Commit[];
+  problem?: string | null;
+  /** The last commit check's notes (no problems). */
+  notes?: string[];
+}) {
+  if (!commits?.length && !problem && !notes.length) return null;
+  return (
+    <>
+      {!!commits?.length && (
+        <ul className="loop-commits" aria-label="Commits">
+          {commits.map((c) => (
+            <li key={c.repo + c.sha} title={`${c.sha} in ${c.repo}`}>
+              <Check size={12} aria-hidden="true" className="loop-done" />
+              Committed <code>{shortSha(c.sha)}</code>
+              <span className="muted"> in {c.repo}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {problem && (
+        <p className="loop-commit loop-problem">
+          <AlertCircle size={13} aria-hidden="true" />
+          <span>
+            <b>Not committed:</b> {problem}
+          </span>
+        </p>
+      )}
+      {notes.length > 0 && (
+        <ul className="loop-commit-notes" aria-label="Commit check notes">
+          {notes.map((n, i) => (
+            <li key={i} className="muted">
+              {n}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
 export function LoopsSection({
   thread,
   connected,
@@ -195,17 +336,14 @@ export function LoopsSection({
   const root = useRef<HTMLElement>(null);
   const headingId = useId();
   const state = thread.loop as LoopState | undefined;
-  const last = thread.last_loop as Json;
-  // Read again when a loop starts or ends: its setup card may have saved settings.
-  const settings = useLoopSettings(
-    thread.project,
-    connected,
-    `${state?.id || ""}:${last?.id || ""}`,
-  );
+  const last = thread.last_loop as LastLoop | undefined | null;
   const [detail, setDetail] = useState<Json>();
   const [detailError, setDetailError] = useState("");
   const [busy, setBusy] = useState("");
   const [reportOpen, setReportOpen] = useState(false);
+  const reportOpener = useRef<HTMLButtonElement>(null);
+  const [asking, setAsking] = useState(false);
+  const implementOpener = useRef<HTMLButtonElement>(null);
   // `loop.get` again whenever the thread's loop (or its last one) changes.
   const loopKey = JSON.stringify([state ?? null, last ?? null]);
   useEffect(() => {
@@ -239,10 +377,12 @@ export function LoopsSection({
   };
   const control = (action: LoopControlAction) =>
     run(action, () => loops.control(thread.id, action));
-  const reportPath: string | undefined =
-    typeof detail?.report_path === "string" ? detail.report_path : undefined;
+  const loopId: string | undefined =
+    typeof detail?.id === "string" ? detail.id : undefined;
   const folder: string | undefined =
     typeof detail?.folder === "string" ? detail.folder : undefined;
+  const skip = state ? skipToVerify(state) : undefined;
+  const lastDetail = !state && detail?.id === last?.id ? detail : undefined;
   return (
     <section
       className="inspector-loops"
@@ -260,49 +400,75 @@ export function LoopsSection({
         />
       ) : (
         <>
-          <button
-            type="button"
-            className="full-width"
-            disabled={!act || !!busy}
-            title={loops.access.why}
-            onClick={() => run("review", () => loops.startReview(thread.id))}
-          >
-            {busy === "review" ? (
-              <Spinner />
-            ) : (
-              <Repeat size={15} aria-hidden="true" />
-            )}
-            Review loop
-          </button>
-          <p className="loop-settings-line">
-            {settings.got ? (
-              <span>{settingsLine(settings.got)}</span>
-            ) : settings.error ? (
-              <span className="error-text">{settings.error}</span>
-            ) : connected ? (
-              <Spinner />
-            ) : (
-              <span className="muted">Connect to see the loop settings.</span>
-            )}{" "}
+          <div className="loop-starts">
             <button
               type="button"
-              className="text-button"
-              disabled={!connected}
-              aria-haspopup="dialog"
-              onClick={() =>
-                loops.openEditor({ kind: "saved", project: thread.project })
-              }
+              disabled={!act || !!busy}
+              title={loops.access.why}
+              onClick={() => run("review", () => loops.startReview(thread.id))}
             >
-              Change…
+              {busy === "review" ? (
+                <Spinner />
+              ) : (
+                <Repeat size={15} aria-hidden="true" />
+              )}
+              Review loop
             </button>
-          </p>
+            <button
+              type="button"
+              ref={implementOpener}
+              disabled={!act || !!busy}
+              title={
+                loops.access.why ||
+                "Plan, build and review a task: the thread plans and implements it, a reviewer model checks the work round by round, and the loop commits at the end."
+              }
+              aria-haspopup="dialog"
+              onClick={() => setAsking(true)}
+            >
+              {busy === "implement" ? (
+                <Spinner />
+              ) : (
+                <RotateCw size={15} aria-hidden="true" />
+              )}
+              Implementation loop…
+            </button>
+          </div>
+          <LoopSettingsLine
+            project={thread.project}
+            connected={connected}
+            refreshKey={last?.id || ""}
+          />
           {last && (
-            <p className="muted loop-last">
-              Last {last.kind === "implement" ? "implementation" : "review"}{" "}
-              loop: {outcomeWords(last.outcome)}
-            </p>
+            <div className="loop-last">
+              <p className="muted">
+                Last {kindWords(last.kind)}: {outcomeWords(last.outcome)}
+              </p>
+              {last.kind === "implement" || last.commits?.length ? (
+                <Commits
+                  commits={last.commits}
+                  problem={last.commit_problem}
+                  notes={lastDetail ? commitNotes(lastDetail) : []}
+                />
+              ) : null}
+              {lastDetail?.kind === "implement" && (
+                <ImplementFacts detail={lastDetail} />
+              )}
+            </div>
           )}
         </>
+      )}
+      {asking && (
+        <ImplementTaskDialog
+          thread={thread}
+          connected={connected}
+          onClose={() => {
+            setAsking(false);
+            requestAnimationFrame(() => implementOpener.current?.focus());
+          }}
+          onStart={(task) =>
+            loops.startImplement(thread.id, task ? { task } : {})
+          }
+        />
       )}
       {detailError && <p className="error-text">{detailError}</p>}
       {state && (
@@ -328,12 +494,14 @@ export function LoopsSection({
               Pause
             </button>
           )}
-          {["scope", "ladder"].includes(state.phase) && !state.skip && (
+          {skip?.show && (
             <button
               type="button"
-              disabled={!act || !!busy}
+              disabled={!act || !!busy || !skip.enabled}
+              aria-describedby={skip.why ? `${headingId}-skip-why` : undefined}
               title={
                 loops.access.why ||
+                skip.why ||
                 "End the ladder after the current round and go on to the capped verification"
               }
               onClick={() => control("skip_to_verify")}
@@ -349,9 +517,11 @@ export function LoopsSection({
             title={loops.access.why}
             onClick={() =>
               loops.confirm({
-                title: `Stop ${thread.name}'s review loop?`,
+                title: `Stop ${thread.name}'s ${kindWords(state.kind)}?`,
                 detail:
-                  "The loop ends as stopped. The thread and its work stay as they are.",
+                  state.kind === "implement"
+                    ? "The loop ends as stopped and commits nothing. The thread and its work stay as they are."
+                    : "The loop ends as stopped. The thread and its work stay as they are.",
                 action: "Stop loop",
                 destructive: true,
                 run: () => control("stop"),
@@ -361,30 +531,40 @@ export function LoopsSection({
             {busy === "stop" && <Spinner />}
             Stop…
           </button>
+          {skip?.why && (
+            <small className="muted" id={`${headingId}-skip-why`}>
+              {skip.why}
+            </small>
+          )}
         </div>
       )}
-      {(reportPath || folder) && (
+      {(loopId || folder) && (
         <div className="loop-report">
-          {reportPath && (
-            <>
-              <button
-                type="button"
-                aria-expanded={reportOpen}
-                onClick={() => setReportOpen((v) => !v)}
-              >
-                Open report
-              </button>
-              {reportOpen && (
-                <div className="loop-path">
-                  <code>{reportPath}</code>
-                  <CopyButton
-                    label="Copy report path"
-                    text={() => reportPath}
-                    onError={loops.fail}
-                  />
-                </div>
-              )}
-            </>
+          {loopId && (
+            <button
+              type="button"
+              ref={reportOpener}
+              disabled={!connected}
+              aria-haspopup="dialog"
+              title={
+                connected
+                  ? "Read the loop's report, as the hub wrote it"
+                  : "Connect to read the loop's report"
+              }
+              onClick={() => setReportOpen(true)}
+            >
+              Open report
+            </button>
+          )}
+          {reportOpen && loopId && (
+            <LoopReportDialog
+              thread={thread}
+              id={loopId}
+              onClose={() => {
+                setReportOpen(false);
+                requestAnimationFrame(() => reportOpener.current?.focus());
+              }}
+            />
           )}
           {folder && (
             <details>
@@ -402,6 +582,250 @@ export function LoopsSection({
         </div>
       )}
     </section>
+  );
+}
+
+/** **Open report**: the loop's `report.md` as text (`loop.report`), read here so a phone or a
+ * remote desktop, which cannot open the hub's files, reads it too. A sheet on a phone, as
+ * every dialog is; needs only the `read` scope. */
+export function LoopReportDialog({
+  thread,
+  id,
+  onClose,
+}: {
+  thread: Thread;
+  /** The loop's id (`loop.get`'s `id`). */
+  id: string;
+  onClose: () => void;
+}) {
+  const loops = useLoops();
+  const [report, setReport] = useState<LoopReport>();
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let live = true;
+    void loops
+      .rpc("loop.report", { id })
+      .then((value) => {
+        if (!live) return;
+        setReport(value as LoopReport);
+        setError("");
+      })
+      .catch((e) => live && setError(errorMessage(e)));
+    return () => {
+      live = false;
+    };
+  }, [id, loops.rpc]);
+  const view = report ? reportView(report, thread.name) : undefined;
+  return (
+    <Dialog
+      title={view?.title || `Loop report · ${thread.name}`}
+      subtitle={view?.subtitle || undefined}
+      onClose={onClose}
+      wide
+    >
+      <LoopReportBody report={report} error={error} name={thread.name} />
+    </Dialog>
+  );
+}
+
+/** The report dialog's body: the text (cut at 256 KiB, its marker line as the hub wrote it),
+ * or why there is none; then where the hub wrote it, small and copyable. */
+export function LoopReportBody({
+  report,
+  error = "",
+  name,
+}: {
+  report?: LoopReport;
+  error?: string;
+  name?: string;
+}) {
+  const loops = useLoops();
+  const view = report ? reportView(report, name) : undefined;
+  return (
+    <>
+      <div
+        className="loop-report-body"
+        tabIndex={view?.text !== undefined ? 0 : undefined}
+        role={view?.text !== undefined ? "region" : undefined}
+        aria-label={view?.text !== undefined ? "Report" : undefined}
+        aria-busy={!view && !error ? true : undefined}
+      >
+        {error ? (
+          <p className="error-text" role="alert">
+            {error}
+          </p>
+        ) : !view ? (
+          <Spinner />
+        ) : view.text !== undefined ? (
+          <Markdown text={view.text} />
+        ) : (
+          <p className="muted">{view.note}</p>
+        )}
+      </div>
+      {view?.path && (
+        <footer className="dialog-footer loop-report-footer">
+          <div className="loop-path">
+            <small>
+              <span className="visually-hidden">
+                {view.text !== undefined
+                  ? "Written on the hub's machine at "
+                  : "To be written on the hub's machine at "}
+              </span>
+              <code>{view.path}</code>
+            </small>
+            <CopyButton
+              label="Copy report path"
+              text={() => view.path!}
+              onError={loops.fail}
+            />
+          </div>
+        </footer>
+      )}
+    </>
+  );
+}
+
+/** **Implementation loop…**: the task, in a small form, with the settings line a loop would
+ * run on. An empty task is what the conversation already settled. */
+export function ImplementTaskDialog({
+  thread,
+  connected,
+  onClose,
+  onStart,
+}: {
+  thread: Thread;
+  connected: boolean;
+  onClose: () => void;
+  /** Requests the loop; true once the hub took it (started, or its card is up). */
+  onStart: (task: string) => Promise<boolean>;
+}) {
+  const loops = useLoops();
+  const ids = useId();
+  const [task, setTask] = useState("");
+  const [busy, setBusy] = useState(false);
+  const start = async () => {
+    if (busy || !loops.access.act) return;
+    setBusy(true);
+    try {
+      if (await onStart(task.trim())) onClose();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Dialog
+      title={`Implementation loop · ${thread.name}`}
+      subtitle="The thread plans the task, implements it, and a reviewer model checks the work round by round. The loop commits at the end."
+      onClose={() => {
+        if (!busy) onClose();
+      }}
+      wide
+    >
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          void start();
+        }}
+      >
+        <div className="operation-fields">
+          <label className="field" htmlFor={`${ids}-task`}>
+            <span>Task</span>
+            <textarea
+              id={`${ids}-task`}
+              rows={6}
+              value={task}
+              aria-describedby={`${ids}-task-hint ${ids}-settings`}
+              placeholder="What to build, as you would write it to the thread"
+              onChange={(e) => setTask(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  void start();
+                }
+              }}
+            />
+            <small id={`${ids}-task-hint`}>
+              Leave it empty to build what the conversation with {thread.name}{" "}
+              already settled: the plan says how the thread reads it.
+            </small>
+          </label>
+          <LoopSettingsLine
+            id={`${ids}-settings`}
+            project={thread.project}
+            connected={connected}
+          />
+          {!loops.access.act && <p className="muted">{loops.access.why}</p>}
+        </div>
+        <footer className="dialog-footer">
+          <span>{thread.name}</span>
+          <div>
+            <button type="button" onClick={onClose} disabled={busy}>
+              Cancel
+            </button>
+            <button
+              type="submit"
+              className="primary"
+              disabled={busy || !loops.access.act}
+              title={loops.access.why}
+            >
+              {busy ? <Spinner /> : <RotateCw size={15} aria-hidden="true" />}
+              Start implementation loop
+            </button>
+          </div>
+        </footer>
+      </form>
+    </Dialog>
+  );
+}
+
+/** An implementation loop's plan and implement turn, from `loop.get`. */
+function ImplementFacts({
+  detail,
+  state,
+}: {
+  detail?: Json;
+  state?: LoopState;
+}) {
+  const loops = useLoops();
+  const plans: PlanInfo[] = Array.isArray(detail?.plans) ? detail.plans : [];
+  const plan = plans.at(-1);
+  const implemented: Json[] = Array.isArray(detail?.implemented)
+    ? detail.implemented
+    : [];
+  const done = implemented.at(-1);
+  const planPath: string | undefined =
+    typeof detail?.plan_path === "string" ? detail.plan_path : undefined;
+  const revision = plan?.revision ?? state?.plan_revision ?? 0;
+  if (!plan && !revision && !done) return null;
+  return (
+    <dl className="loop-facts loop-implement">
+      <dt>Plan</dt>
+      <dd>
+        {plan
+          ? planWords(plan)
+          : `revision ${revision}${
+              typeof state?.contract_risk === "boolean"
+                ? ` · contract risk ${state.contract_risk ? "yes" : "no"}`
+                : ""
+            }`}
+        {planPath && (
+          <span className="loop-path">
+            <code>{planPath}</code>
+            <CopyButton
+              label="Copy the plan's path"
+              text={() => planPath}
+              onError={loops.fail}
+            />
+          </span>
+        )}
+      </dd>
+      {done && (
+        <>
+          <dt>Implement</dt>
+          <dd>{implementedWords(done)}</dd>
+        </>
+      )}
+    </dl>
   );
 }
 
@@ -429,7 +853,8 @@ function LoopProgress({
     <div className="loop-progress">
       <p className="loop-status" role="status">
         <span className="loop-badge">
-          {state.kind === "implement" ? "IMPLEMENT LOOP" : "REVIEW LOOP"}
+          {thread.loop_badge ||
+            (state.kind === "implement" ? "IMPLEMENT LOOP" : "REVIEW LOOP")}
         </span>{" "}
         {state.profile} · {waitingWords(state)}
       </p>
@@ -488,7 +913,16 @@ function LoopProgress({
             </dd>
           </>
         )}
+        {state.kind === "implement" && (
+          <>
+            <dt>Commit</dt>
+            <dd>{commitModeWords(state.commit)}</dd>
+          </>
+        )}
       </dl>
+      {state.kind === "implement" && (
+        <ImplementFacts detail={detail} state={state} />
+      )}
       {state.rounds.length > 0 && (
         <ul className="loop-rounds" aria-label="Rounds">
           {state.rounds.map((round, index) => {
@@ -557,9 +991,22 @@ function LoopProgress({
           })}
         </ul>
       )}
+      <Commits
+        commits={state.commits}
+        problem={state.commit_problem}
+        notes={commitNotes(detail)}
+      />
     </div>
   );
 }
+
+/** An implementation loop's Commit setting, in words. */
+const commitModeWords = (mode: string | undefined) =>
+  mode === "per-round"
+    ? "a commit per round"
+    : mode === "none"
+      ? "none"
+      : "one commit at the end";
 
 // ---------------------------------------------------------------------------------------
 // The setup card
@@ -568,16 +1015,19 @@ function LoopProgress({
 /** Setup cards whose sheet is open, by attention id. */
 const openSheets = new Set<string>();
 
-const isPhone = () =>
+/** Whether the app is laid out for a phone: the mobile app in a window narrower than 800. */
+export const isPhone = () =>
   typeof document !== "undefined" &&
   document.documentElement.dataset.mobile === "true" &&
   typeof window.matchMedia === "function" &&
   window.matchMedia("(max-width: 799px)").matches;
 
 /**
- * A loop's setup card: what the loop would run on, as the hub wrote it, and Start and save,
- * Change… and Cancel. Start and Cancel answer the revision shown, under the 600 ms rule of
- * every request card; Start waits while the card lists something to change first. On a
+ * A loop's setup card: what the loop would run on, as the hub wrote it, and its answers in
+ * the hub's order (Start and save, then Run without a loop on a card that holds a task, then
+ * Cancel), with Change… after Start. The answers apply to the revision shown, under the
+ * 600 ms rule of every request card; Start waits while the card lists something to change
+ * first. An implementation loop's card shows its task whole, scrolling inside the card. On a
  * phone the card is a row that opens as a sheet.
  */
 export function LoopSetupCard({
@@ -600,7 +1050,8 @@ export function LoopSetupCard({
     else openSheets.delete(item.attn_id);
     setSheetState(open);
   };
-  const { parsed } = setupCardState(item);
+  const { parsed, kind } = setupCardState(item);
+  const heading = setupHeading(kind);
   const phone = isPhone();
   const card = (
     <SetupCardBody
@@ -613,7 +1064,7 @@ export function LoopSetupCard({
   if (!phone && !sheet) return card;
   const dialog = sheet && (
     <Dialog
-      title={`Loop setup · ${thread?.name || "twr"}`}
+      title={`${heading} · ${thread?.name || "twr"}`}
       onClose={() => {
         setSheet(false);
         // The sheet that opened before a new revision remembers no opener of its own.
@@ -630,12 +1081,12 @@ export function LoopSetupCard({
     <>
       <article
         className="attention-card attention-loop-setup loop-setup-row"
-        aria-label={`Loop setup for ${thread?.name || "a thread"}`}
+        aria-label={`${heading} for ${thread?.name || "a thread"}`}
       >
         <header>
           <span className="attention-kind">
             <Repeat size={14} aria-hidden="true" />
-            Loop setup
+            {heading}
           </span>
           <span>{thread?.name || "twr"}</span>
         </header>
@@ -658,6 +1109,29 @@ export function LoopSetupCard({
   );
 }
 
+/** A setup card's held task, whole (`loop.setup.get`): the summary shows its first lines
+ * only. Read again for each revision; `undefined` until it comes, or when it can't. */
+function useHeldTask(item: Attention, wanted: boolean) {
+  const loops = useLoops();
+  const [task, setTask] = useState<{ key: string; text?: string }>();
+  const key = `${item.attn_id}:${item.revision}`;
+  useEffect(() => {
+    if (!wanted) return;
+    let live = true;
+    void loops
+      .rpc("loop.setup.get", { attn_id: item.attn_id })
+      .then((shown) => {
+        const text = (shown?.setup as LoopSetup | undefined)?.task;
+        if (live) setTask({ key, text: typeof text === "string" ? text : "" });
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [key, wanted, loops.rpc]);
+  return task?.key === key ? task.text : undefined;
+}
+
 function SetupCardBody({
   item,
   thread,
@@ -677,7 +1151,13 @@ function SetupCardBody({
   const [sent, setSent] = useState(false);
   const [error, setError] = useState("");
   const pending = useRef(false);
-  const { parsed, canStart, canCancel } = setupCardState(item);
+  const { parsed, kind, options, task } = setupCardState(item);
+  // The summary cuts a long task (its first lines, then `(+N more lines)`): the card shows
+  // it whole, from the card itself.
+  const held = useHeldTask(
+    item,
+    kind === "implement" && task !== undefined && !item.incomplete,
+  );
   const settle = async (answer: string) => {
     if (
       pending.current ||
@@ -708,18 +1188,37 @@ function SetupCardBody({
   const locked = readOnly || busy || sent || !item.revision || item.incomplete;
   const waiting = !locked && !arming.armed;
   const fallback = !parsed.rows.length;
+  const change = (
+    <button
+      key="change"
+      type="button"
+      disabled={readOnly || busy || sent || !loops.access.act}
+      aria-haspopup="dialog"
+      onClick={() =>
+        loops.openEditor({
+          kind: "card",
+          attnId: item.attn_id,
+          thread: item.thread,
+          project: thread?.project,
+        })
+      }
+    >
+      Change…
+    </button>
+  );
   return (
     <article
       className="attention-card attention-loop-setup"
       aria-labelledby={`${ids}-kind ${ids}-thread`}
       aria-describedby={`${ids}-title`}
       data-thread={item.thread}
+      data-kind={kind}
       tabIndex={-1}
     >
       <header>
         <span className="attention-kind" id={`${ids}-kind`}>
           <Repeat size={14} aria-hidden="true" />
-          Loop setup
+          {setupHeading(kind)}
         </span>
         <span id={`${ids}-thread`}>{thread?.name || "twr"}</span>
       </header>
@@ -737,7 +1236,21 @@ function SetupCardBody({
               {parsed.rows.map(([label, value], i) => (
                 <div key={label + i}>
                   <dt>{label}</dt>
-                  <dd>{value}</dd>
+                  <dd>
+                    {label === "Task" ? (
+                      // A long task scrolls inside the card: never cut without a word.
+                      <div
+                        className="loop-setup-task"
+                        tabIndex={0}
+                        role="region"
+                        aria-label="Task"
+                      >
+                        {held || value}
+                      </div>
+                    ) : (
+                      value
+                    )}
+                  </dd>
                 </div>
               ))}
             </dl>
@@ -778,43 +1291,25 @@ function SetupCardBody({
           className={`attention-options ${waiting ? "arming" : ""}`}
           data-armed={arming.armed && !locked ? "true" : "false"}
         >
-          <button
-            type="button"
-            className="primary"
-            disabled={locked || !canStart}
-            aria-disabled={waiting || undefined}
-            title={
-              parsed.problems.length
-                ? "Change what the card lists first"
-                : undefined
-            }
-            onClick={() => void settle(SETUP_START)}
-          >
-            Start and save
-          </button>
-          <button
-            type="button"
-            disabled={readOnly || busy || sent || !loops.access.act}
-            aria-haspopup="dialog"
-            onClick={() =>
-              loops.openEditor({
-                kind: "card",
-                attnId: item.attn_id,
-                thread: item.thread,
-                project: thread?.project,
-              })
-            }
-          >
-            Change…
-          </button>
-          <button
-            type="button"
-            disabled={locked || !canCancel}
-            aria-disabled={waiting || undefined}
-            onClick={() => void settle(SETUP_CANCEL)}
-          >
-            Cancel
-          </button>
+          {options.flatMap((option) => {
+            const button = (
+              <button
+                key={option.answer}
+                type="button"
+                className={
+                  option.answer === SETUP_START ? "primary" : undefined
+                }
+                disabled={locked || option.disabled}
+                aria-disabled={waiting || undefined}
+                title={option.why}
+                onClick={() => void settle(option.answer)}
+              >
+                {option.label}
+              </button>
+            );
+            return option.answer === SETUP_START ? [button, change] : [button];
+          })}
+          {!options.some((o) => o.answer === SETUP_START) && change}
           {busy && <Spinner />}
           {sent && (
             <span className="attention-sent" role="status">
@@ -830,6 +1325,159 @@ function SetupCardBody({
         )}
       </div>
     </article>
+  );
+}
+
+// ---------------------------------------------------------------------------------------
+// Send as implementation loop
+// ---------------------------------------------------------------------------------------
+
+/**
+ * The composer's other way to send, when its destination is a thread: a caret beside Send
+ * (a `↻` button on a phone) that opens **Send as implementation loop**: the message is the
+ * task. It needs a live connection and `operate`, as starting any loop does: otherwise the
+ * choice shows why it can't be made. Nothing goes to the outbox.
+ */
+export function SendAsLoop({
+  thread,
+  phone,
+  busy,
+  onSend,
+}: {
+  thread: Thread;
+  phone: boolean;
+  busy: boolean;
+  onSend: () => void;
+}) {
+  const loops = useLoops();
+  const ids = useId();
+  const [open, setOpen] = useState(false);
+  const opener = useRef<HTMLButtonElement>(null);
+  const panel = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    panel.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const away = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (!panel.current?.contains(target) && !opener.current?.contains(target))
+        setOpen(false);
+    };
+    document.addEventListener("mousedown", away);
+    return () => document.removeEventListener("mousedown", away);
+  }, [open]);
+  const close = () => {
+    setOpen(false);
+    opener.current?.focus();
+  };
+  const why = loops.access.why;
+  return (
+    <div className={`send-as-loop ${phone ? "phone" : ""}`}>
+      <button
+        type="button"
+        ref={opener}
+        className={phone ? "send-loop-button" : "send-caret"}
+        aria-label={
+          phone
+            ? `Send as implementation loop to ${thread.name}…`
+            : "More ways to send"
+        }
+        title={phone ? "Send as implementation loop…" : "More ways to send"}
+        aria-haspopup="true"
+        aria-expanded={open}
+        aria-controls={`${ids}-panel`}
+        disabled={busy}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {phone ? (
+          <RotateCw size={18} aria-hidden="true" />
+        ) : (
+          <ChevronDown size={14} aria-hidden="true" />
+        )}
+      </button>
+      {open && (
+        <div
+          className="send-loop-panel"
+          id={`${ids}-panel`}
+          ref={panel}
+          role="group"
+          aria-label="Send as"
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
+              close();
+            }
+          }}
+        >
+          <button
+            type="button"
+            disabled={!loops.access.act}
+            aria-describedby={`${ids}-what`}
+            onClick={() => {
+              setOpen(false);
+              onSend();
+            }}
+          >
+            <RotateCw size={15} aria-hidden="true" />
+            Send as implementation loop
+          </button>
+          <small id={`${ids}-what`}>
+            {why
+              ? why
+              : `${thread.name} plans your message as a task, implements it, and a reviewer model checks the work round by round. The loop commits at the end.`}
+          </small>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------------------
+// The New thread form
+// ---------------------------------------------------------------------------------------
+
+/**
+ * Under the New thread form's switch **Run as an implementation loop**: the settings a loop
+ * would run on, for the project the form names when it names a configured one (a path
+ * resolves only on the hub), and **Change…**.
+ */
+export function NewThreadLoopLine({
+  project,
+  connected,
+}: {
+  project?: string;
+  connected: boolean;
+}) {
+  const named =
+    typeof project === "string" && /^[A-Za-z0-9._-]+$/.test(project.trim())
+      ? project.trim()
+      : undefined;
+  // A project name the hub does not know reads the workspace's settings.
+  const [fallback, setFallback] = useState(false);
+  const loops = useLoops();
+  useEffect(() => {
+    setFallback(false);
+    if (!named || !connected) return;
+    let live = true;
+    void loops
+      .rpc("loop.settings.get", { project: named })
+      .catch(() => live && setFallback(true));
+    return () => {
+      live = false;
+    };
+  }, [named, connected, loops.rpc]);
+  return (
+    <div className="new-thread-loop">
+      <LoopSettingsLine
+        project={fallback ? undefined : named}
+        connected={connected}
+      />
+      <small className="muted">
+        The first prompt is the loop's task. The thread plans it, implements it,
+        and a reviewer model checks the work round by round; the loop commits at
+        the end.
+      </small>
+    </div>
   );
 }
 

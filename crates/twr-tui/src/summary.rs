@@ -152,7 +152,7 @@ impl Run {
     /// many updates it has when more than one (`background work finished · 3 updates`).
     pub fn plain(&self, entries: &[Entry], state: Option<&AppState>) -> String {
         let e = &entries[self.newest()];
-        let said = kind(e, state).map_or_else(String::new, |k| short(e, k));
+        let said = kind(e, state).map_or_else(String::new, |k| short_of(e, k, state));
         match self.entries.len() {
             1 => said,
             n => format!("{said} · {n} updates"),
@@ -229,7 +229,14 @@ pub fn runs(entries: &[Entry], state: Option<&AppState>, conv: &str) -> Runs {
 /// Routine update `e` (of kind `k`) said short, without its thread's name: `yielded with 2
 /// background tasks still running: <its report>`, `background work finished`, `background work
 /// finished; woken to continue`, `was stalled (No activity for 10 min), went on`.
+#[cfg(test)]
 fn short(e: &Entry, k: Routine) -> String {
+    short_of(e, k, None)
+}
+
+/// [`short`], with `state` to tell the kind of a loop whose update does not name it (a
+/// round's): its thread's running or last loop's.
+fn short_of(e: &Entry, k: Routine, state: Option<&AppState>) -> String {
     let Entry::HubUpdate { text, .. } = e else {
         return String::new();
     };
@@ -255,37 +262,89 @@ fn short(e: &Entry, k: Routine) -> String {
             Some((_, why)) => format!("was stalled ({why}), went on"),
             None => "was stalled, went on".into(),
         },
-        Routine::Loop => loop_short(&rest),
+        Routine::Loop => {
+            let kind = thread_of(e, state)
+                .and_then(|t| state?.registry.get(&t).cloned())
+                .and_then(|t| {
+                    t.r#loop
+                        .as_ref()
+                        .map(|l| l.kind)
+                        .or(t.last_loop.as_ref().map(|l| l.kind))
+                });
+            loop_short(&rest, kind)
+        }
         Routine::Other => rest,
     }
 }
 
 /// A loop's routine update (`twr_hub::hub::updates`), its words after the thread's name, short
-/// for a folded run: `review loop: round m3, 2 findings`, `review loop: sweep`, `review loop:
-/// ladder ended after m3`, `review loop: paused by you`, `review loop: triage m3 answered`.
-/// Words it does not know are kept, after `review loop: `.
-fn loop_short(rest: &str) -> String {
+/// for a folded run, after the loop's kind: `review loop: round m3, 2 findings`, `review loop:
+/// sweep`, `review loop: ladder ended after m3`, `review loop: paused by you`, `review loop:
+/// triage m3 answered`; an implementation loop's `implementation loop: plan check p1, 1
+/// finding`, `implementation loop: plan (contract risk: no)`, `implementation loop:
+/// implemented: done, gates pass`, `implementation loop: commit checked: abc1234 in /w`. The
+/// kind is the one the words name, else (a round's) `kind`, the thread's loop's, else a review
+/// loop's. Words it does not know are kept, after the kind.
+fn loop_short(rest: &str, kind: Option<twr_core::loops::LoopKind>) -> String {
+    use twr_core::loops::LoopKind;
     let rest = rest.trim().trim_start_matches(':').trim_start();
+    let plan_check = format!("review round {} ", twr_core::loops::PLAN_CHECK_ROUND);
+    let kind = if rest.contains("implementation loop") || rest.starts_with(&plan_check) {
+        LoopKind::Implement
+    } else if rest.contains("review loop") {
+        LoopKind::Review
+    } else {
+        kind.unwrap_or_default()
+    };
+    let kw = crate::loops::kind_words(kind);
+    let its = format!("its {kw}");
     let said = if let Some(r) = rest.strip_prefix("review round ") {
         // `m3 · gpt-6.1-sol medium · 2 findings`
         let mut parts = r.split(" · ");
         let round = parts.next().unwrap_or_default();
+        let what = if round == twr_core::loops::PLAN_CHECK_ROUND {
+            "plan check"
+        } else {
+            "round"
+        };
         match parts.last() {
-            Some(n) => format!("round {round}, {n}"),
-            None => format!("round {round}"),
+            Some(n) => format!("{what} {round}, {n}"),
+            None => format!("{what} {round}"),
         }
-    } else if let Some(r) = rest.strip_prefix("its review loop is in its ") {
+    } else if let Some(r) = rest.strip_prefix(&format!("{its} is in its ")) {
         r.trim_end_matches(" now").to_string()
-    } else if let Some(r) = rest.strip_prefix("its review loop's ladder ended after ") {
+    } else if let Some(r) = rest.strip_prefix(&format!("{its}'s ladder ended after ")) {
         let (round, why) = r.split_once(": ").unwrap_or((r, ""));
         if why.is_empty() {
             format!("ladder ended after {round}")
         } else {
             format!("ladder ended after {round} ({why})")
         }
-    } else if rest.starts_with("its review loop skipped to verification") {
+    } else if rest.starts_with(&format!("{its} skipped to verification")) {
         "skipped to verification".to_string()
-    } else if let Some(r) = rest.strip_prefix("review loop: ") {
+    } else if let Some(r) = rest.strip_prefix(&format!("{its}'s plan")) {
+        // `, revised after the plan check (contract risk: no: why); /path`
+        let what = if r.starts_with(", revised") {
+            "plan revised"
+        } else {
+            "plan"
+        };
+        match r.split_once("(contract risk: ") {
+            Some((_, risk)) => {
+                let risk = risk.split([':', ')']).next().unwrap_or_default();
+                format!("{what} (contract risk: {risk})")
+            }
+            None => what.to_string(),
+        }
+    } else if let Some(r) = rest.strip_prefix(&format!("{its}'s implement turn: ")) {
+        format!("implemented: {r}")
+    } else if let Some(r) = rest.strip_prefix(&format!("{its}'s commit checked: ")) {
+        format!("commit checked: {r}")
+    } else if rest.starts_with(&format!("{its}'s commit check failed")) {
+        // Not `not committed`: other repositories may have been committed (the check is
+        // each repository's), and the thread is asked to fix what failed.
+        "commit check failed".to_string()
+    } else if let Some(r) = rest.strip_prefix(&format!("{kw}: ")) {
         // `pause by the user`
         match r.trim_end_matches(" by the user") {
             "pause" => "paused by you".into(),
@@ -294,7 +353,7 @@ fn loop_short(rest: &str) -> String {
             "skip_to_verify" => "skipped to verification by you".into(),
             other => other.to_string(),
         }
-    } else if let Some(r) = rest.strip_prefix("answered its review loop's ") {
+    } else if let Some(r) = rest.strip_prefix(&format!("answered {its}'s ")) {
         // `triage m3 step (success): …`
         match r.split_once(" step") {
             Some((step, _)) => format!("{step} answered"),
@@ -303,7 +362,7 @@ fn loop_short(rest: &str) -> String {
     } else {
         rest.to_string()
     };
-    format!("review loop: {said}")
+    format!("{kw}: {said}")
 }
 
 /// A live run's folded row as a frame drew it ([`crate::select::Panes::routine`]): what a
@@ -1126,9 +1185,62 @@ mod tests {
                 "review loop: triage m3 answered",
             ),
             ("api: something newer", "review loop: something newer"),
+            // An implementation loop's.
+            (
+                "api: review round p1 · gpt-6.1-sol medium · 1 finding",
+                "implementation loop: plan check p1, 1 finding",
+            ),
+            (
+                "api: its implementation loop is in its plan now",
+                "implementation loop: plan",
+            ),
+            (
+                "api: its implementation loop's plan (contract risk: no: a new endpoint); \
+                 /data/loops/l2/plan.md",
+                "implementation loop: plan (contract risk: no)",
+            ),
+            (
+                "api: its implementation loop's plan, revised after the plan check (contract \
+                 risk: yes: a migration)",
+                "implementation loop: plan revised (contract risk: yes)",
+            ),
+            (
+                "api: its implementation loop's implement turn: done, gates pass",
+                "implementation loop: implemented: done, gates pass",
+            ),
+            (
+                "api: its implementation loop's commit checked: abc1234 in /w",
+                "implementation loop: commit checked: abc1234 in /w",
+            ),
+            (
+                "api: its implementation loop's commit check failed: /w: 1 path",
+                "implementation loop: commit check failed",
+            ),
+            (
+                "api's implementation loop: stop by the user",
+                "implementation loop: stopped by you",
+            ),
+            (
+                "api answered its implementation loop's plan step (success): …",
+                "implementation loop: plan answered",
+            ),
         ] {
             assert_eq!(short(&update(text, Routine::Loop), Routine::Loop), said);
         }
+        // A round's update names no kind: the thread's loop's.
+        let mut st = crate::app::tests::three_threads();
+        crate::loops_tests::implementing(&mut st, "t-gamma", crate::loops_tests::Upto::Ladder);
+        let mut round = update(
+            "gamma: review round m1 · gpt-6.1-sol medium · 2 findings",
+            Routine::Loop,
+        );
+        if let Entry::HubUpdate { about, .. } = &mut round {
+            *about = Some("t-gamma".into());
+        }
+        assert_eq!(
+            short_of(&round, Routine::Loop, Some(&st)),
+            "implementation loop: round m1, 2 findings"
+        );
         let entries = vec![
             update("api: its review loop is in its ladder now", Routine::Loop),
             update(

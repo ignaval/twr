@@ -9,11 +9,12 @@
 //! - [`config`]: `[loops]` of the config file, the profiles and the model specs.
 //! - [`settings`]: the saved settings, presets, the checks against what is installed and the
 //!   replacements the setup card shows; overrides and scope.
-//! - [`contract`]: the reviewer's findings, the `twr-goal`, `twr-triage` and `twr-sweep`
-//!   blocks, finding ids and the ledger.
-//! - the state machine ([`LoopState`], [`Input`], [`Action`]) and the loop line ([`line`]).
+//! - [`contract`]: the reviewer's findings, the `twr-goal`, `twr-triage`, `twr-sweep`,
+//!   `twr-plan`, `twr-implement` and `twr-commit` blocks, finding ids, the ledger and the
+//!   check of a loop's commit.
+//! - the state machine ([`LoopState`], [`Input`], [`Action`]) of both kinds of loop, and the
+//!   loop line ([`line`]).
 //!
-//! Milestone 1 runs review loops only: [`LoopState::start`] refuses an implementation loop.
 //! Nothing here does IO, reads the clock or starts a process.
 
 pub mod config;
@@ -36,7 +37,8 @@ pub enum LoopKind {
     /// Review the thread's work: scope, ladder, sweep, verify, report.
     #[default]
     Review,
-    /// Plan, implement and review a task (milestone 2).
+    /// Plan, implement and review a task: plan, plan check, implement, ladder, sweep, verify,
+    /// report.
     Implement,
 }
 
@@ -211,7 +213,8 @@ pub enum WaitingOn {
 /// The loop line a card draws after the [`badge`]: the profile, where the loop is and the
 /// ledger's size: `high · scope`, `high · ladder m3 · ledger 2`, `high · sweep`,
 /// `medium · verify 1/2`, `high · report`, with `· paused` when it is paused (and `· stuck`
-/// when a step failed and waits for the user).
+/// when a step failed and waits for the user). An implementation loop's first phases read
+/// `high · plan`, `high · plan check` and `high · implementing`.
 pub fn line(l: &LoopView) -> String {
     let [full, ..] = line_forms(l);
     full
@@ -219,8 +222,9 @@ pub fn line(l: &LoopView) -> String {
 
 /// The loop line in the forms a card too narrow for it falls back on, longest first: the
 /// [`line`] itself (`high · ladder m3 · ledger 2`); without the profile (`ladder m3 · ledger
-/// 2`); and short (`m3 · ldg 2`, `v1/5`, `sweep · ldg 2 · paused`). Where the loop is comes
-/// first in each, so a cut at the end keeps it longest.
+/// 2`); and short (`m3 · ldg 2`, `v1/5`, `sweep · ldg 2 · paused`; `plan`, `p1`, `impl` for an
+/// implementation loop's first phases). Where the loop is comes first in each, so a cut at the
+/// end keeps it longest.
 pub fn line_forms(l: &LoopView) -> [String; 3] {
     let (place, short_place) = match l.phase {
         Phase::Ladder => match &l.round {
@@ -239,6 +243,13 @@ pub fn line_forms(l: &LoopView) -> [String; 3] {
                 format!("{}{n}/{}", contract::VERIFY_TAG, l.verify.cap),
             )
         }
+        Phase::PlanCheck => (
+            Phase::PlanCheck.as_str().to_string(),
+            l.round
+                .clone()
+                .unwrap_or_else(|| Phase::PlanCheck.as_str().to_string()),
+        ),
+        Phase::Implement => ("implementing".into(), "impl".into()),
         p => (p.as_str().to_string(), p.as_str().to_string()),
     };
     let (ledger, short_ledger) = if l.ledger > 0 {

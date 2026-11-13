@@ -2364,13 +2364,20 @@ fn card_body(
         (None, Some(g)) => Some(git_line(g, width)),
         (None, None) => None,
     };
-    // The loop line: on a card (stack, sidebar), not on a grid tile.
-    let looping = t.r#loop.as_ref().filter(|_| tile.is_none()).map(|l| {
-        (
+    // The loop line: on a card (stack, sidebar), not on a grid tile. Once the loop ended, how
+    // it ended and what it committed, until the thread's next turn.
+    let looping = match (&t.r#loop, crate::loops::ended_due(t)) {
+        _ if tile.is_some() => None,
+        (Some(l), _) => Some((
             crate::loops::card_line(l, width),
             crate::loops::short_line(l, &card_status(t), width),
-        )
-    });
+        )),
+        (None, Some(last)) => {
+            let line = crate::loops::ended_line(last, width);
+            Some((line.clone(), line))
+        }
+        (None, None) => None,
+    };
     CardBody {
         looping,
         section,
@@ -4424,6 +4431,7 @@ fn block_key(entry: &Entry, index: usize, threads: &Threads) -> String {
         Entry::TurnEnd { .. } => ("end", 0),
         Entry::Shell { seq, .. } => ("shell", *seq),
         Entry::LoopRound { seq, .. } => ("loop-round", *seq),
+        Entry::LoopStep { seq, .. } => ("loop-step", *seq),
     };
     // Synthetic entries used by offscreen callers may have no event position.
     let id = if seq == 0 {
@@ -4972,7 +4980,9 @@ pub fn transcript_view_spans(
                 // A loop's prompt (it can be long: it carries the findings) names its step.
                 let marker = crate::loops::prompt_step(prompt).map_or_else(
                     || NOTICE_MARKER.to_string(),
-                    |(_, step)| crate::loops::prompt_marker(&step),
+                    |(id, step)| {
+                        crate::loops::prompt_marker(&step, loop_kind(entries, threads, &id, &step))
+                    },
                 );
                 if collapse.folded(&key) {
                     let about = notice_thread(prompt);
@@ -4998,6 +5008,16 @@ pub fn transcript_view_spans(
                 let key = format!("loop-round:{loop_id}:{round}");
                 v.block(Kind::Compact);
                 let row = loop_round_row(&entries[i], width);
+                v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
+            }
+            // An implementation loop's step: one row, unless expanded
+            // ([`crate::loops::step_head`]).
+            Entry::LoopStep { loop_id, seq, .. }
+                if collapse.folded(&format!("loop-step:{loop_id}:{seq}")) =>
+            {
+                let key = format!("loop-step:{loop_id}:{seq}");
+                v.block(Kind::Compact);
+                let row = loop_step_row(&entries[i], width);
                 v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
             }
             Entry::TurnEnd {
@@ -5309,12 +5329,32 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
             v.block(Kind::Block);
             shell_rows(v, e, threads);
         }
+        Entry::LoopStep { note, .. } => {
+            v.block(Kind::Compact);
+            let dim = Style::default().fg(Color::DarkGray);
+            let color = if crate::loops::step_failed(note) {
+                Color::Red
+            } else {
+                crate::loops::LOOP_COLOR
+            };
+            v.marked(
+                0,
+                ("↻ ", Style::default().fg(color)),
+                Vec::new(),
+                &crate::loops::step_head(note),
+                Style::default().fg(MUTED),
+            );
+            for row in crate::loops::step_rows(note) {
+                v.marked(4, ("⎿ ", dim), Vec::new(), &row, dim);
+            }
+        }
         Entry::LoopRound {
             round,
             reviewer,
             findings,
             failed,
             triage,
+            took,
             ..
         } => {
             v.block(Kind::Compact);
@@ -5322,6 +5362,7 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
             let head = crate::loops::round_head(
                 round,
                 reviewer.as_deref(),
+                took.as_deref(),
                 findings,
                 failed.as_deref(),
                 triage,
@@ -5725,6 +5766,7 @@ fn loop_round_row(e: &Entry, width: usize) -> Line<'static> {
         findings,
         failed,
         triage,
+        took,
         ..
     } = e
     else {
@@ -5734,6 +5776,7 @@ fn loop_round_row(e: &Entry, width: usize) -> Line<'static> {
     let head = crate::loops::round_head(
         round,
         reviewer.as_deref(),
+        took.as_deref(),
         findings,
         failed.as_deref(),
         triage,
@@ -5755,6 +5798,67 @@ fn loop_round_row(e: &Entry, width: usize) -> Line<'static> {
     let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
     line.push(Span::styled(hint, dim));
     Line::from(cut_spans(line, width))
+}
+
+/// The row of a folded implementation loop's step ([`crate::app::Entry::LoopStep`]): `↻ plan ·
+/// revision 1 · contract risk: no (ctrl+o to expand)`, `↻ committed abc1234`, cut to `width`.
+fn loop_step_row(e: &Entry, width: usize) -> Line<'static> {
+    let Entry::LoopStep { note, .. } = e else {
+        return Line::default();
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let color = if crate::loops::step_failed(note) {
+        Color::Red
+    } else {
+        crate::loops::LOOP_COLOR
+    };
+    let hint = if crate::loops::step_rows(note).is_empty() {
+        ""
+    } else {
+        " (ctrl+o to expand)"
+    };
+    let spans = vec![
+        Span::styled("↻ ", Style::default().fg(color)),
+        Span::styled(crate::loops::step_head(note), Style::default().fg(MUTED)),
+    ];
+    let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
+    line.push(Span::styled(hint, dim));
+    Line::from(cut_spans(line, width))
+}
+
+/// The kind of loop `id` whose prompt names `step`: an implementation loop's when the step is
+/// one only it has, or the transcript has a step row of that loop's, or the thread's running
+/// or last loop is one; else a review loop's.
+fn loop_kind(
+    entries: &[Entry],
+    threads: &Threads,
+    id: &str,
+    step: &str,
+) -> twr_core::loops::LoopKind {
+    use twr_core::loops::LoopKind;
+    if crate::loops::implementation_step(step) {
+        return LoopKind::Implement;
+    }
+    // The thread's running or last loop first (a look-up per thread), then the transcript.
+    let known = threads.state.and_then(|s| {
+        s.registry.list().into_iter().find_map(|t| {
+            t.r#loop
+                .as_ref()
+                .filter(|l| l.id == id)
+                .map(|l| l.kind)
+                .or_else(|| t.last_loop.as_ref().filter(|l| l.id == id).map(|l| l.kind))
+        })
+    });
+    known.unwrap_or_else(|| {
+        if entries
+            .iter()
+            .any(|e| matches!(e, Entry::LoopStep { loop_id, .. } if loop_id == id))
+        {
+            LoopKind::Implement
+        } else {
+            LoopKind::Review
+        }
+    })
 }
 
 /// The row of a folded hub notice turn: `· hub update`, after the thread it is about.
@@ -19707,3 +19811,6 @@ mod loops_ui_tests;
 #[cfg(test)]
 #[path = "loops_color_tests.rs"]
 mod loops_color_tests;
+#[cfg(test)]
+#[path = "loops_impl_tests.rs"]
+mod loops_impl_tests;

@@ -980,6 +980,8 @@ pub enum ActionKind {
     LoopChange,
     /// Starts a review loop on the thread, as `/review` (`review loop`).
     LoopStart,
+    /// Puts `/implement ` in the input box, ready for the task (`implementation loop…`).
+    LoopImplement,
     /// Opens the loop settings editor on the settings the thread's project uses
     /// (`loop settings…`).
     LoopSettings,
@@ -991,6 +993,16 @@ pub enum ActionKind {
     LoopStop,
     /// Ends the ladder after this round and goes to verification.
     LoopSkip,
+}
+
+/// A new thread's first prompt run as an implementation loop (`/new … --implement [--setup]
+/// <task>`): `thread.new {loop: {kind: implement, task, setup?}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewLoop {
+    /// The task: the thread's first prompt.
+    pub task: String,
+    /// Show the setup card first (`--setup`).
+    pub setup: bool,
 }
 
 /// One row of the action popup: what it does and what it says.
@@ -1393,6 +1405,8 @@ pub enum Action {
         account: Option<String>,
         /// Open it on `account` although the project's pin leaves it out.
         outside_pin: bool,
+        /// Its first prompt, run as an implementation loop (`/new … --implement`).
+        implement: Option<NewLoop>,
     },
     /// Put selected text on the clipboard (OSC 52, and a local clipboard command when there
     /// is one).
@@ -1585,6 +1599,19 @@ pub enum Entry {
         failed: Option<String>,
         /// The thread's verdicts, once its triage was taken.
         triage: Vec<twr_core::loops::contract::TriageItem>,
+        /// How long its review run took (`14m`), when the transcript has its start.
+        took: Option<String>,
+    },
+    /// An implementation loop's plan, implement turn or commit check (`loop.plan`,
+    /// `loop.implemented`, `loop.commit`): one folded row (`plan · revision 1 · contract risk:
+    /// no`) that opens to its details ([`crate::loops::StepNote`]).
+    LoopStep {
+        /// The event's seq.
+        seq: u64,
+        /// The loop.
+        loop_id: String,
+        /// What it records.
+        note: crate::loops::StepNote,
     },
 }
 
@@ -1650,6 +1677,8 @@ pub struct Transcript {
     pub loop_reviewer: Option<(String, String)>,
     /// The effort of the latest review run started (its round and the effort).
     pub loop_effort: Option<(String, String)>,
+    /// When the latest review run started (its round and the time), for its round's row.
+    pub loop_review_at: Option<(String, chrono::DateTime<chrono::Utc>)>,
 }
 
 impl Transcript {
@@ -1842,8 +1871,25 @@ impl Transcript {
             }
             EventBody::LoopReviewStarted(p) => {
                 self.loop_effort = Some((p.round.clone(), p.effort.clone()));
+                self.loop_review_at = Some((p.round.clone(), ev.ts));
             }
-            EventBody::LoopFindings(p) => self.apply_findings(ev.seq, p),
+            EventBody::LoopFindings(p) => self.apply_findings(ev.seq, ev.ts, p),
+            // An implementation loop's steps: one row each.
+            EventBody::LoopPlan(p) => self.push_step(
+                ev.seq,
+                p.id.clone(),
+                crate::loops::StepNote::Plan(p.clone()),
+            ),
+            EventBody::LoopImplemented(p) => self.push_step(
+                ev.seq,
+                p.id.clone(),
+                crate::loops::StepNote::Implemented(p.clone()),
+            ),
+            EventBody::LoopCommit(p) => self.push_step(
+                ev.seq,
+                p.id.clone(),
+                crate::loops::StepNote::Commit(p.clone()),
+            ),
             EventBody::LoopTriage(p) if p.problems.is_empty() => {
                 let round = self.entries.iter_mut().rev().find_map(|e| match e {
                     Entry::LoopRound {
@@ -2047,7 +2093,17 @@ impl Transcript {
 
     /// A round's `loop.findings` (`p`, at `seq`): the round's row, or, for a round whose run
     /// failed before and was retried, that row again with what the retry found.
-    fn apply_findings(&mut self, seq: u64, p: &twr_core::event::LoopFindings) {
+    fn apply_findings(
+        &mut self,
+        seq: u64,
+        at: chrono::DateTime<chrono::Utc>,
+        p: &twr_core::event::LoopFindings,
+    ) {
+        let took = self
+            .loop_review_at
+            .as_ref()
+            .filter(|(r, _)| *r == p.round)
+            .map(|(_, start)| crate::loops::took_words((at - *start).num_milliseconds()));
         let model = self
             .loop_reviewer
             .as_ref()
@@ -2074,11 +2130,15 @@ impl Transcript {
             reviewer: r,
             findings,
             failed: f,
+            took: t,
             ..
         }) = found
         {
             if reviewer.is_some() {
                 *r = reviewer;
+            }
+            if took.is_some() {
+                *t = took;
             }
             *findings = p.findings.clone();
             *f = failed;
@@ -2093,7 +2153,15 @@ impl Transcript {
             findings: p.findings.clone(),
             failed,
             triage: Vec::new(),
+            took,
         });
+    }
+
+    /// An implementation loop's step (`loop.plan`, `loop.implemented`, `loop.commit`, at
+    /// `seq`): its row.
+    fn push_step(&mut self, seq: u64, loop_id: String, note: crate::loops::StepNote) {
+        self.close_text();
+        self.push(Entry::LoopStep { seq, loop_id, note });
     }
 
     /// A job's `task.updated` (`p`, at `seq`): a `!` command's starts its entry, its end
@@ -5390,14 +5458,47 @@ impl AppState {
                 }
             }
             Slash::Quit => return (vec![Action::Quit], true),
+            Slash::Implement {
+                words,
+                setup,
+                profile,
+                reviewer,
+                implementer,
+                workers,
+                commit,
+                plan_check,
+            } => {
+                let overrides = vec![
+                    ("profile", profile),
+                    ("reviewer", reviewer),
+                    ("implementer", implementer),
+                    ("workers", workers),
+                    ("commit", commit),
+                    ("plan_check", plan_check),
+                ];
+                return self.request_implement(&words, setup, overrides);
+            }
             Slash::New {
                 project,
                 runtime,
                 name,
                 account,
                 outside_pin,
+                implement,
+                setup,
+                task,
             } => {
-                self.view.status = Some(format!("creating a thread in {project}..."));
+                // `--implement <task>`: the task is the first prompt, run as an implementation
+                // loop (the parser requires the task).
+                let implement = task
+                    .filter(|_| implement)
+                    .map(|task| NewLoop { task, setup });
+                self.view.status = Some(match &implement {
+                    Some(_) => {
+                        format!("creating a thread in {project} for an implementation loop...")
+                    }
+                    None => format!("creating a thread in {project}..."),
+                });
                 return (
                     vec![Action::NewThread {
                         project,
@@ -5405,6 +5506,7 @@ impl AppState {
                         name,
                         account,
                         outside_pin,
+                        implement,
                     }],
                     true,
                 );
@@ -7018,7 +7120,10 @@ impl AppState {
                 // With nothing waiting: start a review loop, or control the one it runs.
                 if let Some(t) = worker.filter(|_| item.is_none()) {
                     match &t.r#loop {
-                        None => rows.push(row(ActionKind::LoopStart, "review loop")),
+                        None => {
+                            rows.push(row(ActionKind::LoopStart, "review loop"));
+                            rows.push(row(ActionKind::LoopImplement, "implementation loop…"));
+                        }
                         Some(l) => {
                             rows.push(if l.paused {
                                 row(ActionKind::LoopResume, "resume loop")
@@ -7026,7 +7131,11 @@ impl AppState {
                                 row(ActionKind::LoopPause, "pause loop")
                             });
                             rows.push(row(ActionKind::LoopStop, "stop loop"));
-                            rows.push(row(ActionKind::LoopSkip, "skip to verify"));
+                            // Only where it does something: in the scope or the ladder, not
+                            // before an implementation loop implemented its plan.
+                            if crate::loops::skip_refused(l).is_none() {
+                                rows.push(row(ActionKind::LoopSkip, "skip to verify"));
+                            }
                         }
                     }
                     rows.push(row(ActionKind::LoopSettings, "loop settings…"));
@@ -7297,6 +7406,7 @@ impl AppState {
                     .request_review(Some(&thread), false, None, Vec::new())
                     .0;
             }
+            ActionKind::LoopImplement => self.prefill_implement(&thread),
             ActionKind::LoopSettings => {
                 let project = self.registry.get(&thread).and_then(|t| t.project.clone());
                 return self.open_loop_settings(project, false);
@@ -12062,6 +12172,7 @@ pub(crate) mod tests {
                 name: Some("api2".into()),
                 account: None,
                 outside_pin: false,
+                implement: None,
             }]
         );
         // /park and /stop ask first; the default is the focused thread.
@@ -21571,7 +21682,8 @@ pub(crate) mod tests {
             .any(|d| d.attn_id == "pm1" && d.area == pop));
         assert_eq!(st.seen_gseq(), st.last_gseq);
         st.handle_key(key(KeyCode::Esc));
-        // Nothing waiting: no options, a review loop and its settings, and Attach.
+        // Nothing waiting: no options, a review loop, an implementation loop and their
+        // settings, and Attach.
         st.set_focus(Some("t-gamma".into()));
         popup_open(&mut st);
         assert_eq!(
@@ -21579,6 +21691,7 @@ pub(crate) mod tests {
             [
                 ActionKind::Talk,
                 ActionKind::LoopStart,
+                ActionKind::LoopImplement,
                 ActionKind::LoopSettings,
                 ActionKind::Pin,
                 ActionKind::Stop,

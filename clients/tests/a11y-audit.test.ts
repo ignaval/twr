@@ -248,10 +248,42 @@ describe("styles that keep controls usable", () => {
     expect(
       rule(mobile, '[data-mobile="true"] .input-with-button > button'),
     ).toContain("min-width: 44px");
+    // Send as implementation loop's ↻ button and its choice, the inspector's two loop
+    // starts and the phone's in-flow notice's Dismiss.
+    expect(rule(mobile, '[data-mobile="true"] .send-loop-button')).toContain(
+      "min-width: 44px",
+    );
+    expect(rule(mobile, '[data-mobile="true"] .send-loop-button')).toContain(
+      "min-height: 44px",
+    );
+    const loopTargets = rule(
+      mobile,
+      '[data-mobile="true"] .send-loop-panel > button,\n[data-mobile="true"] .inspector-notice > button,\n[data-mobile="true"] .loop-starts > button',
+    );
+    expect(loopTargets).toContain("min-height: 44px");
+    expect(loopTargets).toContain("min-width: 44px");
     // iOS ignores min-height on a menu select: its height must say 44.
     expect(
       rule(mobile, '[data-mobile="true"] select:not([multiple]):not([size])'),
     ).toContain("height: max(44px");
+  });
+});
+
+describe("loop surfaces", () => {
+  const css = readFileSync(join(root, "shared/style.css"), "utf8");
+  it("lets a long held task scroll inside the setup card, and be scrolled by keyboard", () => {
+    const at = css.indexOf(".loop-setup-task {");
+    const rule = css.slice(at, css.indexOf("}", at));
+    expect(rule).toContain("overflow: auto");
+    expect(rule).toContain("max-height");
+    expect(css).toContain(".loop-setup-task:focus-visible");
+  });
+  it("marks an uncommitted end with an icon and words, not colour alone", () => {
+    const views = readFileSync(join(root, "shared/LoopViews.tsx"), "utf8");
+    const at = views.indexOf("export function LoopEndedLine");
+    const body = views.slice(at, views.indexOf("\n}\n", at));
+    expect(body).toContain("<AlertCircle");
+    expect(body).toContain("ended: ");
   });
 });
 

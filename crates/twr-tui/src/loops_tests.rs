@@ -663,7 +663,7 @@ fn loop_controls_the_loop_and_says_where_it_is() {
     assert!(loop_call(&type_line(&mut st, "/loop gamma pause")).is_empty());
     assert_eq!(
         st.view.status.as_deref(),
-        Some("gamma runs no loop (/review starts one)")
+        Some("gamma runs no loop (/implement or /review starts one)")
     );
     looping(&mut st, "t-gamma");
     assert_eq!(
@@ -771,6 +771,8 @@ fn the_editor_of_the_saved_settings() {
             RowKey::ReviewerRuntime,
             RowKey::ReviewerModel,
             RowKey::ReviewerAccount,
+            RowKey::PlanCheck,
+            RowKey::ImplCommit,
             RowKey::ReviewCommit,
             RowKey::SaveFor,
             RowKey::Save,
@@ -1126,4 +1128,237 @@ fn the_editor_without_an_agent_probe() {
     let screen = text(&draw(&mut st, 120, 50));
     assert!(!screen.contains("skipped:"), "{screen}");
     assert!(!screen.contains("not installed"), "{screen}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Implementation loops: a scripted run, as the hub's driver records it
+// ---------------------------------------------------------------------------------------------
+
+/// What `loop.started` says of a `medium` implementation loop (`l2`) reviewed by codex, its
+/// plan checked always, committed at the end.
+pub(crate) fn impl_started() -> LoopStarted {
+    LoopStarted {
+        id: "l2".into(),
+        kind: LoopKind::Implement,
+        profile: Profile::builtin("medium").unwrap(),
+        max_rounds_per_tier: 25,
+        task: Some("add a CSV export to the reports page".into()),
+        settings: LoopSettings {
+            profile: "medium".into(),
+            reviewer: ReviewerChoice::parse("codex/gpt-6.1-sol").unwrap(),
+            plan_check: Some(twr_core::loops::config::PlanCheck::Always),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// How far [`ImplRun`] takes an implementation loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Upto {
+    /// The plan turn asked.
+    Plan,
+    /// The plan check's review run going.
+    PlanCheck,
+    /// The implement turn asked.
+    Implement,
+    /// The ladder's first review run going.
+    Ladder,
+    /// Ended clean, committed.
+    Ended,
+}
+
+/// An implementation loop on one thread, stepped as the hub's driver steps it: each prompt
+/// it asks for as the turn the thread runs (`[twr loop l2 <step>]`), each fact and record as
+/// the hub writes it.
+pub(crate) struct ImplRun {
+    pub(crate) s: ThreadScript,
+    pub(crate) m: LoopState,
+    pub(crate) evs: Vec<Event>,
+}
+
+impl ImplRun {
+    /// A run of [`impl_started`] on `thread`, at `at` seconds.
+    pub(crate) fn new(thread: &str, at: i64, started: LoopStarted) -> ImplRun {
+        let mut s = ThreadScript::new(thread);
+        s.at(at);
+        let (m, first) = LoopState::start(&started).unwrap();
+        let mut evs = vec![hub(&mut s, EventBody::LoopStarted(Box::new(started)))];
+        let mut run = ImplRun {
+            s,
+            m,
+            evs: Vec::new(),
+        };
+        run.record(first);
+        evs.append(&mut run.evs);
+        run.evs = evs;
+        run
+    }
+
+    fn record(&mut self, actions: Vec<Step>) {
+        for a in actions {
+            if let Step::Record(body) = a {
+                let ev = hub(&mut self.s, body);
+                self.evs.push(ev);
+            }
+        }
+    }
+
+    /// Steps `input`.
+    pub(crate) fn step(&mut self, input: Input) {
+        let actions = self.m.step(input, twr_core::testkit::base_time()).unwrap();
+        self.record(actions);
+    }
+
+    /// The thread's turn on the loop's `step` prompt, replying `reply` (its final message),
+    /// as the machine reads it (a plan written to `plan.md`).
+    pub(crate) fn turn(&mut self, step: &str, reply: &str) {
+        let prompt = format!("[twr loop l2 {step}]\nthe loop's {step} prompt");
+        let mut ev = self.s.turn_started(&prompt);
+        if let EventBody::TurnStarted(p) = &mut ev.body {
+            p.from = twr_core::event::TurnFrom::Runtime;
+        }
+        self.evs.push(ev);
+        let ev = self.s.text(reply);
+        self.evs.push(ev);
+        let ev = self.s.turn_ended(twr_core::event::TurnResult::Completed);
+        self.evs.push(ev);
+        let path = Some("/data/loops/l2/plan.md".to_string());
+        // (A reply the machine does not read itself, the commit's: the hub checks it.)
+        let Some(input) = self.m.reply_input(reply) else {
+            return;
+        };
+        let input = match input {
+            Input::PlanWritten { plan, .. } => Input::PlanWritten { plan, path },
+            Input::PlanTriaged {
+                round,
+                triage,
+                path: _,
+            } => {
+                let path = triage.plan.as_ref().map(|_| path.clone().unwrap());
+                Input::PlanTriaged {
+                    round,
+                    triage,
+                    path,
+                }
+            }
+            other => other,
+        };
+        self.step(input);
+    }
+
+    /// Round `round`'s review run, answering `n` findings.
+    pub(crate) fn review(&mut self, round: &str, n: usize) {
+        self.started(round);
+        let found: Vec<Finding> = findings(n);
+        self.step(Input::ReviewAnswered {
+            round: round.into(),
+            findings: found,
+            answer_path: None,
+            usage: None,
+            unchanged: false,
+        });
+    }
+
+    /// Round `round`'s review run started.
+    pub(crate) fn started(&mut self, round: &str) {
+        self.step(Input::ReviewStarted {
+            round: round.into(),
+            diffs: vec![],
+            prompt_digest: None,
+        });
+    }
+
+    /// Runs the loop to `upto`: a plan with no contract risk, the plan check's one finding
+    /// dismissed, the implement turn done and green, a clean ladder round and verification,
+    /// the report turn's commit checked (`committed`; else its check failed twice).
+    pub(crate) fn to(&mut self, upto: Upto, committed: bool) {
+        if upto == Upto::Plan {
+            return;
+        }
+        self.turn(
+            "plan",
+            "## Goal\nExport reports as CSV.\n\n```twr-plan\n{\"contract_risk\": false, \
+             \"reason\": \"a new endpoint, no schema change\"}\n```\n",
+        );
+        self.started("p1");
+        if upto == Upto::PlanCheck {
+            return;
+        }
+        self.step(Input::ReviewAnswered {
+            round: "p1".into(),
+            findings: findings(1),
+            answer_path: None,
+            usage: None,
+            unchanged: false,
+        });
+        self.turn(
+            "triage p1",
+            "Checked.\n\n```twr-triage\n{\"items\": [{\"id\": \"p1.1\", \"verdict\": \
+             \"dismissed\", \"reason\": \"the plan covers it\"}]}\n```\n",
+        );
+        if upto == Upto::Implement {
+            return;
+        }
+        self.turn(
+            "implement",
+            "Implemented.\n```twr-implement\n{\"status\": \"done\", \"gates\": {\"ran\": \
+             [\"cargo test --workspace\"], \"result\": \"pass\"}}\n```\n",
+        );
+        self.started("m1");
+        if upto == Upto::Ladder {
+            return;
+        }
+        self.step(Input::ReviewAnswered {
+            round: "m1".into(),
+            findings: vec![],
+            answer_path: None,
+            usage: None,
+            unchanged: false,
+        });
+        self.review("v1", 0);
+        let mut report_turn = self
+            .s
+            .turn_started("[twr loop l2 report]\nwrite the report");
+        if let EventBody::TurnStarted(p) = &mut report_turn.body {
+            p.from = twr_core::event::TurnFrom::Runtime;
+        }
+        self.evs.push(report_turn);
+        let ev = self.s.turn_ended(twr_core::event::TurnResult::Completed);
+        self.evs.push(ev);
+        let check = |ok: bool| Input::CommitChecked {
+            commits: if ok {
+                vec![twr_core::loops::contract::Commit {
+                    repo: "/w/api".into(),
+                    sha: "abc1234def".into(),
+                }]
+            } else {
+                vec![]
+            },
+            problems: if ok {
+                vec![]
+            } else {
+                vec!["/w/api: 1 path is uncommitted beyond the baseline: a.rs".into()]
+            },
+            notes: vec![],
+        };
+        if committed {
+            self.step(check(true));
+        } else {
+            self.step(check(false));
+            self.turn("commit", "Tried.\n");
+            self.step(check(false));
+        }
+        self.step(Input::ReportWritten {
+            report_path: "/data/loops/l2/report.md".into(),
+        });
+    }
+}
+
+/// Runs an implementation loop on `thread` to `upto` and applies its events.
+pub(crate) fn implementing(st: &mut AppState, thread: &str, upto: Upto) -> ImplRun {
+    let mut run = ImplRun::new(thread, 500, impl_started());
+    run.to(upto, true);
+    control(st, &run.evs);
+    run
 }

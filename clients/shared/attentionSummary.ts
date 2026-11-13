@@ -3,8 +3,10 @@ import type {
   AttentionSummary,
   AttentionSummaryItem,
   InboxSource,
+  LoopEndSummary,
   Thread,
 } from "./types";
+import { endedWords, requestLine, type LastLoop } from "./loops";
 
 /** The most items a summary lists; `count` still counts every one. */
 export const SUMMARY_MAX_ITEMS = 200;
@@ -61,6 +63,7 @@ export function attentionSummary({
   liveStream,
   sources,
   max = SUMMARY_MAX_ITEMS,
+  loopRounds,
 }: {
   current: string;
   hubId: string;
@@ -69,6 +72,9 @@ export function attentionSummary({
   liveStream?: string;
   sources: InboxSource[];
   max?: number;
+  /** Rounds each loop ran, by loop id, as seen while it ran (an ended loop's view keeps no
+   * rounds): a loop's end says `after N rounds` when it is known. */
+  loopRounds?: ReadonlyMap<string, number>;
 }): AttentionSummary {
   const lists: {
     name: string;
@@ -98,8 +104,21 @@ export function attentionSummary({
     lists.push(read(source));
   }
   const items: AttentionSummaryItem[] = [];
+  const loops: LoopEndSummary[] = [];
   let count = 0;
   for (const list of lists) {
+    for (const thread of list.threads) {
+      const last = thread?.last_loop as LastLoop | undefined | null;
+      if (!last?.id || typeof thread.id !== "string" || loops.length >= max)
+        continue;
+      loops.push({
+        workspace: list.name,
+        thread: thread.id,
+        title: String(thread.name || thread.id).slice(0, 200),
+        id: String(last.id).slice(0, 200),
+        words: endedWords(last, loopRounds?.get(last.id)).slice(0, 200),
+      });
+    }
     const names = new Map(list.threads.map((t) => [t?.id, t?.name]));
     for (const item of list.attention) {
       if (!item || typeof item.attn_id !== "string") continue;
@@ -115,7 +134,9 @@ export function attentionSummary({
           (item.thread === HUB_THREAD ? "twr" : item.thread) ||
           "twr"
         ).slice(0, 200),
-        summary: (item.summary || item.reason || "").slice(0, 300),
+        // A loop's setup card: its first line says what it asks; the rest are its rows
+        // (an implementation loop's held task among them).
+        summary: (requestLine(item) || item.reason || "").slice(0, 300),
         id: item.attn_id,
         revision: Number.isSafeInteger(item.revision) ? item.revision : 0,
         reason: String(item.reason || "").slice(0, 40),
@@ -130,5 +151,6 @@ export function attentionSummary({
     workspaces: lists.map(({ name, stream }) =>
       stream ? { name, stream } : { name },
     ),
+    ...(loops.length ? { loops } : {}),
   };
 }
