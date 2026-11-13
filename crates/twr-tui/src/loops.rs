@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use serde_json::{json, Value};
 use twr_core::loops::config::{
-    ImplCommit, ModelChoice, PlanCheck, ReviewCommit, ReviewerChoice, REVIEWER_RUNTIMES,
+    ImplCommit, ModelChoice, PlanCheck, ReviewCommit, ReviewerChoice, SweepMode, REVIEWER_RUNTIMES,
 };
 use twr_core::loops::contract::{Finding, TriageItem, Verdict};
 use twr_core::loops::settings::{
@@ -289,11 +289,17 @@ pub fn card_line(l: &LoopView, width: usize) -> Line<'static> {
 }
 
 /// Where a loop is, in a word: its round in the ladder and the verification (`m3`, `v1`),
-/// else its phase, short (`scope`, `sweep`; an implementation loop's `plan`, `p1`, `impl`).
+/// else its phase, short (`scope`, `sweep`; an implementation loop's `plan`, `p1`, `impl`; the
+/// sweep's `rules` and `aud 2/5` when the hub audits it).
 pub fn where_word(l: &LoopView) -> String {
     match (l.phase, &l.round) {
         (Phase::Ladder | Phase::Verify | Phase::PlanCheck, Some(r)) => r.clone(),
         (Phase::Implement, _) => "impl".into(),
+        (Phase::Sweep, _) if l.wait == Wait::Rules => "rules".into(),
+        (Phase::Sweep, _) if l.wait == Wait::Audits => {
+            let done = l.audits.iter().filter(|a| a.status.ended()).count();
+            format!("aud {done}/{}", l.audits.len())
+        }
         (p, _) => p.as_str().to_string(),
     }
 }
@@ -405,6 +411,29 @@ pub fn rounds_text(l: &LoopView) -> String {
         .join(" · ")
 }
 
+/// The sweep's audits in a line, when the hub audits it (`sweep = "runs"`): each rule's run with
+/// its findings once it answered (`s1 identity-gating 2`), the ones running marked `▸`, a
+/// failed one about to run again `✗ ▸`, one that did not run `✗`, one waiting for a slot `…`.
+/// Empty when there are none.
+pub fn audits_text(l: &LoopView) -> String {
+    use twr_core::loops::AuditStatus;
+    l.audits
+        .iter()
+        .map(|a| {
+            let what = match a.status {
+                AuditStatus::Answered => a.findings.to_string(),
+                AuditStatus::Running if a.retried => "✗ ▸".into(),
+                AuditStatus::Running => "▸".into(),
+                AuditStatus::NotRun => "✗ not run".into(),
+                AuditStatus::Pending if a.retried => "✗ …".into(),
+                AuditStatus::Pending => "…".into(),
+            };
+            format!("{} {} {what}", a.id(), a.name)
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// A loop's progress `width` cells wide, for its thread's action popup: the loop line, its
 /// phases with the current one marked (`▸`), its rounds ([`rounds_text`]), what it waits
 /// for, and why it is stuck when it is.
@@ -434,8 +463,19 @@ pub fn progress_rows(l: &LoopView, width: usize) -> Vec<Line<'static>> {
             width,
         ));
     }
+    let audits = audits_text(l);
+    if !audits.is_empty() {
+        rows.extend(crate::ui::wrap_line(
+            Line::from(vec![Span::styled("audits ", dim), Span::raw(audits)]),
+            width,
+        ));
+    }
     let waits = match (&l.stuck, l.waiting_on) {
         (Some(_), _) => None,
+        (None, twr_core::loops::WaitingOn::Review) if l.wait == Wait::Audits => Some(format!(
+            "waiting on the audits: {} {}",
+            l.reviewer.model, l.plan.audit_effort
+        )),
         (None, twr_core::loops::WaitingOn::Review) => Some(format!(
             "waiting on the reviewer: {} {}",
             l.reviewer.model,
@@ -476,6 +516,10 @@ pub fn status_text(t: &twr_core::reduce::ThreadView) -> String {
         let rounds = rounds_text(l);
         if !rounds.is_empty() {
             out.push_str(&format!(" · rounds {rounds}"));
+        }
+        let audits = audits_text(l);
+        if !audits.is_empty() {
+            out.push_str(&format!(" · audits {audits}"));
         }
         if let Some(why) = &l.stuck {
             out.push_str(&format!(" · stuck: {why}"));
@@ -750,6 +794,22 @@ pub enum StepNote {
     Implemented(twr_core::event::LoopImplemented),
     /// `loop.commit`: the hub's check of the loop's commit.
     Commit(twr_core::event::LoopCommitChecked),
+    /// `loop.rules`: the rules the sweep's audit runs check (`sweep = "runs"`, either kind
+    /// of loop).
+    Rules(twr_core::event::LoopRules),
+    /// `loop.audit`: a rule's audit run answered, or failed.
+    Audit(twr_core::event::LoopAudit),
+}
+
+impl StepNote {
+    /// Whether only an implementation loop has a step of this kind (its plan, implement turn,
+    /// commit): the sweep's rules and audits are either kind's.
+    pub fn implementation_only(&self) -> bool {
+        matches!(
+            self,
+            StepNote::Plan(_) | StepNote::Implemented(_) | StepNote::Commit(_)
+        )
+    }
 }
 
 /// A step's folded row's text: `plan · revision 1 · contract risk: no`, `implement · gates
@@ -785,6 +845,33 @@ pub fn step_head(n: &StepNote) -> String {
                 (None, None) => "committed nothing: there was nothing to commit".into(),
             }
         }
+        StepNote::Rules(r) if r.rules.is_empty() => "sweep rules · none to audit".into(),
+        StepNote::Rules(r) => format!(
+            "sweep rules · {}",
+            r.rules
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        StepNote::Audit(a) => {
+            let head = format!(
+                "sweep audit {} {}",
+                twr_core::loops::contract::audit_id(a.rule),
+                a.name
+            );
+            if a.failed {
+                return format!(
+                    "{head} · failed: {}",
+                    first_line(a.reason.as_deref().unwrap_or("the run failed"))
+                );
+            }
+            match a.findings.len() {
+                0 => format!("{head} · no findings"),
+                1 => format!("{head} · 1 finding"),
+                n => format!("{head} · {n} findings"),
+            }
+        }
     }
 }
 
@@ -812,11 +899,36 @@ pub fn step_rows(n: &StepNote) -> Vec<String> {
             .chain(c.problems.iter().cloned())
             .chain(c.notes.iter().map(|n| format!("note: {}", first_line(n))))
             .collect(),
+        StepNote::Rules(r) => r
+            .rules
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: {} (where: {})",
+                    r.name,
+                    first_line(&r.rule),
+                    first_line(&r.r#where)
+                )
+            })
+            .collect(),
+        StepNote::Audit(a) => a
+            .findings
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} {} {} — {}",
+                    f.id,
+                    f.severity.as_str(),
+                    f.location,
+                    first_line(&f.problem)
+                )
+            })
+            .collect(),
     }
 }
 
 /// A step's row is in red: an implement turn that is not done with green gates, a commit
-/// whose check failed.
+/// whose check failed, an audit run that failed.
 pub fn step_failed(n: &StepNote) -> bool {
     match n {
         StepNote::Plan(_) => false,
@@ -825,6 +937,8 @@ pub fn step_failed(n: &StepNote) -> bool {
                 || i.gates.result != twr_core::loops::contract::GateResult::Pass
         }
         StepNote::Commit(c) => !c.problems.is_empty(),
+        StepNote::Rules(_) => false,
+        StepNote::Audit(a) => a.failed,
     }
 }
 
@@ -925,6 +1039,8 @@ pub enum RowKey {
     ImplCommit,
     /// What a review loop commits.
     ReviewCommit,
+    /// Who audits the sweep's rules: the thread, or the hub's runs (`sweep = "runs"`).
+    Sweep,
     /// Where the settings are saved.
     SaveFor,
     /// Saves (`s`).
@@ -1078,6 +1194,13 @@ pub fn rows(e: &LoopEditor, thread_rt: Option<&str>) -> Vec<Row> {
     };
     let runtimes = e.runtimes();
     let presets = e.presets();
+    // Runtimes found on a thread's remote box are named for it.
+    let on = e
+        .got
+        .as_ref()
+        .and_then(|g| g["box"].as_str())
+        .map(|b| format!(" on box {b}"))
+        .unwrap_or_default();
     let row = |key, label, value: String| Row {
         key,
         label,
@@ -1094,12 +1217,49 @@ pub fn rows(e: &LoopEditor, thread_rt: Option<&str>) -> Vec<Row> {
                     .map(|why| format!("{rt} ({why})"))
             })
             .collect();
-        (!out.is_empty()).then(|| format!("skipped: {}", out.join(", ")))
+        (!out.is_empty()).then(|| format!("skipped{on}: {}", out.join(", ")))
     };
     let runtime_value = |rt: &str| match usable(&runtimes, rt) {
         Ok(()) if not_checked(&runtimes, rt) => (format!("{rt} (not checked)"), false),
         Ok(()) => (rt.to_string(), false),
         Err(why) => (format!("{rt} ({why})"), true),
+    };
+    // The reviewer's choices also hold the ACP presets: one that reviews names its read-only
+    // mode, one that can't says why.
+    let reviewer_skipped = || {
+        let mut out: Vec<String> = REVIEWER_RUNTIMES
+            .iter()
+            .filter_map(|rt| {
+                usable(&runtimes, rt)
+                    .err()
+                    .map(|why| format!("{rt} ({why})"))
+            })
+            .collect();
+        out.extend(runtimes.iter().filter(|r| r.acp).filter_map(|r| {
+            match (r.reviews(), usable(&runtimes, &r.runtime)) {
+                (Err(why), _) => Some(format!("{} ({why})", r.runtime)),
+                (Ok(()), Err(why)) => Some(format!("{} ({why})", r.runtime)),
+                _ => None,
+            }
+        }));
+        (!out.is_empty()).then(|| format!("skipped{on}: {}", out.join(", ")))
+    };
+    let reviewer_value = |rt: &str| {
+        let acp = runtimes.iter().find(|r| r.runtime == rt && r.acp);
+        match acp {
+            Some(r) => match (r.reviews(), usable(&runtimes, rt)) {
+                (Err(why), _) => (format!("{rt} ({why})"), true),
+                (Ok(()), Err(why)) => (format!("{rt} ({why})"), true),
+                (Ok(()), Ok(())) => (
+                    format!(
+                        "{rt} (acp, {} mode)",
+                        r.review_mode.as_deref().unwrap_or("read-only")
+                    ),
+                    false,
+                ),
+            },
+            None => runtime_value(rt),
+        }
     };
     let mut out = Vec::new();
     out.push(row(
@@ -1153,9 +1313,9 @@ pub fn rows(e: &LoopEditor, thread_rt: Option<&str>) -> Vec<Row> {
             s.workers.effort.clone().unwrap_or_else(|| "default".into()),
         ));
     }
-    let (value, dim) = runtime_value(&s.reviewer.runtime);
+    let (value, dim) = reviewer_value(&s.reviewer.runtime);
     out.push(Row {
-        detail: skipped(),
+        detail: reviewer_skipped(),
         dim,
         ..row(RowKey::ReviewerRuntime, "Reviewer", value)
     });
@@ -1241,6 +1401,28 @@ pub fn rows(e: &LoopEditor, thread_rt: Option<&str>) -> Vec<Row> {
             )
         });
     }
+    out.push(Row {
+        detail: Some(
+            match s.sweep {
+                SweepMode::Thread => {
+                    "the thread audits the sweep's rules, with its subagents where it has them"
+                }
+                SweepMode::Runs => {
+                    "one read-only reviewer run per rule, a few at once: one reviewer call per rule"
+                }
+            }
+            .into(),
+        ),
+        ..row(
+            RowKey::Sweep,
+            "Sweep",
+            match s.sweep {
+                SweepMode::Thread => "thread",
+                SweepMode::Runs => "runs",
+            }
+            .into(),
+        )
+    });
     out.push(row(
         RowKey::SaveFor,
         "Save for",
@@ -1328,6 +1510,19 @@ fn usable_runtimes(runtimes: &[RuntimeAvailability]) -> Vec<String> {
         .filter(|rt| usable(runtimes, rt).is_ok())
         .map(|rt| rt.to_string())
         .collect()
+}
+
+/// The runtimes a reviewer can be on: the usable built-in ones, then the usable ACP presets
+/// that review (they name a read-only mode), in the hub's order.
+fn reviewer_runtimes(runtimes: &[RuntimeAvailability]) -> Vec<String> {
+    let mut out = usable_runtimes(runtimes);
+    out.extend(
+        runtimes
+            .iter()
+            .filter(|r| r.acp && r.reviews().is_ok() && usable(runtimes, &r.runtime).is_ok())
+            .map(|r| r.runtime.clone()),
+    );
+    out
 }
 
 /// Steps row `key` of `e` (`forward`: Enter, Space, →, a tap; else ←): the draft changed, or
@@ -1464,7 +1659,7 @@ pub fn step(
                 .ok_or_else(|| format!("{rt} takes no efforts"))?;
         }
         RowKey::ReviewerRuntime => {
-            let rt = cycle(&usable_rts, &s.reviewer.runtime, forward)
+            let rt = cycle(&reviewer_runtimes(&runtimes), &s.reviewer.runtime, forward)
                 .ok_or("no runtime is installed and logged in")?;
             s.reviewer = ReviewerChoice {
                 model: model_on(&runtimes, &rt, &s.reviewer.model),
@@ -1506,6 +1701,12 @@ pub fn step(
             s.review_commit = match s.review_commit {
                 ReviewCommit::Match => ReviewCommit::None,
                 ReviewCommit::None => ReviewCommit::Match,
+            };
+        }
+        RowKey::Sweep => {
+            s.sweep = match s.sweep {
+                SweepMode::Thread => SweepMode::Runs,
+                SweepMode::Runs => SweepMode::Thread,
             };
         }
         RowKey::SaveFor => {
@@ -2041,9 +2242,10 @@ impl AppState {
             busy: Some("loading…"),
             ..Default::default()
         });
+        // (What the runtimes offer on the thread's box: a remote box's own, named.)
         vec![
             call("loop.setup.get", json!({ "attn_id": attn_id })),
-            call("loop.settings.get", json!({})),
+            call("loop.settings.get", json!({ "thread": thread })),
         ]
     }
 
@@ -2272,7 +2474,8 @@ impl AppState {
             }
             "loop.settings.get" => {
                 let project = asked["project"].as_str().map(str::to_string);
-                if !failed && project.is_none() {
+                // (A thread's are its box's: not the workspace's settings line.)
+                if !failed && project.is_none() && asked["thread"].is_null() {
                     self.loop_settings = Some(r.clone());
                 }
                 let Some(e) = self.view.loop_editor.as_mut() else {

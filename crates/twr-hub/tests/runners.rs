@@ -648,6 +648,7 @@ async fn raw_hello(ws: &mut RawWs, h: Hello) {
         agents: Vec::new(),
         launch: None,
         spool: h.spool,
+        loops: None,
     };
     raw_send(ws, &RunnerMsg::Inventory(inv)).await;
 }
@@ -2152,6 +2153,7 @@ async fn a_remote_acp_preset_attaches_with_its_template() {
         twr_core::config::RuntimePreset {
             acp: format!("python3 {} {}", stub.display(), agent.display()),
             attach: Some("stub-cli --resume {session}".into()),
+            review: None,
         },
     );
     let h = TestHub::start(dir.path(), cfg).await;

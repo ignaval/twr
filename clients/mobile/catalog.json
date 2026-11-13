@@ -2384,6 +2384,17 @@
         ]
       },
       {
+        "key": "sweep",
+        "label": "sweep",
+        "type": "select",
+        "description": "Who audits the sweep's rules: thread (the thread, with its own subagents) or runs (one read-only reviewer run per rule, up to `[loops] max_audit_runs` at once: one reviewer call per rule) [possible values: thread, runs]",
+        "advanced": false,
+        "options": [
+          "thread",
+          "runs"
+        ]
+      },
+      {
         "key": "json",
         "label": "json",
         "type": "boolean",
@@ -2448,6 +2459,12 @@
       {
         "key": "plan-check",
         "flag": "--plan-check",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "sweep",
+        "flag": "--sweep",
         "many": false,
         "separator": false
       },

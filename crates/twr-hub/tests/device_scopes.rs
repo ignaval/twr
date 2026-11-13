@@ -138,6 +138,7 @@ impl Env {
             RuntimePreset {
                 acp: "/bin/true --acp".into(),
                 attach: None,
+                review: None,
             },
         );
         let mut o = HubOptions::new(self.path().join("data").join("twr.db"), config);

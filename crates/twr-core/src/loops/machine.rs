@@ -51,7 +51,9 @@
 //! - **refused reply** (a missing or invalid `twr-goal`, `twr-triage` or `twr-sweep` block,
 //!   red gates): one correction prompt; a second refusal pauses the loop, stuck.
 //! - **sweep**: after the ladder, when the profile has one and the ladder had at least one
-//!   finding triaged `fixed`. Its accepted residuals go into the ledger.
+//!   finding triaged `fixed`. Its accepted residuals go into the ledger. With `sweep = "thread"`
+//!   it is one thread turn (`twr-sweep`). With `sweep = "runs"` it is two thread turns with the
+//!   hub's audit runs between them ("The sweep's audit runs", below).
 //! - **verify**: up to the profile's `verify.rounds` rounds at its effort. A converging round
 //!   ends it: `clean` when it had no findings, `ledger_fixed_point` when all were duplicates.
 //!   Every answered round counts against the cap; a cap spent with findings still arriving
@@ -77,6 +79,23 @@
 //!   the loop `stopped`; `skip_to_verify` (scope or ladder only) ends the ladder at the end of
 //!   the current round (after the GOAL paragraph in scope), skipping the sweep, and at once
 //!   when the loop is paused before a round has run.
+//!
+//! # The sweep's audit runs (`sweep = "runs"`)
+//!
+//! - **rules**: one thread turn; its `twr-rules` block ([`contract::parse_rules`]) is
+//!   `loop.rules`. A refused block gets the one correction, then the loop is stuck. No rules:
+//!   nothing to audit, on to the verification.
+//! - **audits**: one audit run per rule (`s<k>` for rule `k`), at the verification's effort,
+//!   which the hub starts ([`Action::RunAudits`]: every audit still to run; the hub runs up to
+//!   `max_audit_runs` at once) and records (`loop.audit_started`, `loop.audit`). A failed run is
+//!   retried once; a second failure leaves the rule **not run**: the loop goes on, never stuck
+//!   over it, and the rule never counts as clean. A pause lets the runs that started finish and
+//!   starts no other until the resume; a stop ends them all (the hub cancels them). A run the
+//!   log shows started that no hub runs (the hub stopped or died while it ran) is a failed run.
+//! - **verification turn**: once every rule's audit ended (answered or not run), one thread
+//!   turn with the reports as data; its `twr-sweep` block reports every rule once, `not audited`
+//!   (with a reason) only for a rule whose audit did not run ([`contract::check_sweep_rules`]).
+//!   It ends the sweep as a thread's sweep turn does.
 //!
 //! # The rules (implementation loops)
 //!
@@ -126,9 +145,9 @@ use super::contract::{
 };
 use super::{ControlAction, ControlBy, LoopKind, Outcome, Phase, TransitionReason, WaitingOn};
 use crate::event::{
-    Event, EventBody, LoopCommitChecked, LoopControl, LoopEnded, LoopFindings, LoopImplemented,
-    LoopLedger, LoopPhaseChanged, LoopPlanned, LoopReviewStarted, LoopStarted, LoopTransition,
-    LoopTriage, Usage,
+    Event, EventBody, LoopAudit, LoopAuditStarted, LoopCommitChecked, LoopControl, LoopEnded,
+    LoopFindings, LoopImplemented, LoopLedger, LoopPhaseChanged, LoopPlanned, LoopReviewStarted,
+    LoopRules, LoopStarted, LoopTransition, LoopTriage, Usage,
 };
 
 /// The round of an implementation loop's plan check (its findings are `p1.1`…).
@@ -189,10 +208,70 @@ pub struct LoopPlan {
     pub tags: Vec<String>,
     /// Whether the profile sweeps.
     pub sweep: bool,
+    /// The sweep's rules are audited by the hub's audit runs (`sweep = "runs"`), not by the
+    /// thread.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub audit_runs: bool,
+    /// The audit runs' effort: the verification's. An audit is a narrow pass (one rule), and
+    /// the verification's effort is the one the loop trusts to certify the work it audits.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub audit_effort: String,
     /// The capped verification.
     pub verify: Verify,
     /// The backstop.
     pub max_rounds_per_tier: u32,
+}
+
+/// Where a rule's audit run is (`sweep = "runs"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStatus {
+    /// Waiting for a run (its first, or the retry of a failed one).
+    #[default]
+    Pending,
+    /// Its run started (`loop.audit_started`) and has not ended.
+    Running,
+    /// Its run answered.
+    Answered,
+    /// Its run failed twice: not run.
+    NotRun,
+}
+
+impl AuditStatus {
+    /// Whether its audit has ended: answered, or not run.
+    pub fn ended(self) -> bool {
+        matches!(self, AuditStatus::Answered | AuditStatus::NotRun)
+    }
+}
+
+/// A rule's audit run, as `loop.get` and the clients show it (`sweep = "runs"`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditView {
+    /// The rule, 1-based: its run is `s<rule>`.
+    pub rule: u32,
+    /// Its name.
+    pub name: String,
+    /// Where its run is.
+    pub status: AuditStatus,
+    /// How many findings its answer had.
+    pub findings: u32,
+    /// A run of it failed (the next one is the retry).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retried: bool,
+    /// When its running run started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Why its last run failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AuditView {
+    /// Its run's id (`s2`).
+    pub fn id(&self) -> String {
+        contract::audit_id(self.rule)
+    }
 }
 
 /// The step a loop waits for.
@@ -216,8 +295,12 @@ pub enum Wait {
     },
     /// An implementation loop's implement turn (`twr-implement`).
     Implement,
-    /// The sweep turn.
+    /// The sweep turn (with `sweep = "runs"`: its verification turn, after the audit runs).
     Sweep,
+    /// `sweep = "runs"`: the sweep's rules turn (`twr-rules`).
+    Rules,
+    /// `sweep = "runs"`: the audit runs, until every rule's has ended.
+    Audits,
     /// The report turn, then (with no commit asked) the hub's `report.md`, or (with one) the
     /// hub's check of the commit.
     Report,
@@ -245,6 +328,8 @@ pub enum Step {
     Implement,
     /// The report turn's commit (`twr-commit`): its check failed once.
     Commit,
+    /// The sweep's rules turn (`twr-rules`, `sweep = "runs"`).
+    Rules,
 }
 
 impl Step {
@@ -257,6 +342,7 @@ impl Step {
             Step::Plan => "plan",
             Step::Implement => "implement",
             Step::Commit => "commit",
+            Step::Rules => "rules",
         }
     }
 
@@ -269,6 +355,7 @@ impl Step {
             Step::Plan => contract::PLAN_BLOCK,
             Step::Implement => contract::IMPLEMENT_BLOCK,
             Step::Commit => contract::COMMIT_BLOCK,
+            Step::Rules => contract::RULES_BLOCK,
         }
     }
 }
@@ -407,8 +494,16 @@ pub enum Action {
         /// What was wrong.
         problems: Vec<String>,
     },
-    /// Send the sweep prompt (this loop's findings, distilled into rules).
+    /// Send the sweep prompt: this loop's findings, distilled into rules and audited by the
+    /// thread; with `sweep = "runs"`, the verification turn: the audit runs' reports, as data.
     AskSweep,
+    /// `sweep = "runs"`: send the rules prompt (this loop's findings, distilled into named
+    /// rules in a `twr-rules` block).
+    AskRules,
+    /// `sweep = "runs"`: start the audit run of every rule still waiting for one
+    /// ([`AuditStatus::Pending`]), up to `max_audit_runs` at once (and record
+    /// `loop.audit_started` for each).
+    RunAudits,
     /// Send the report prompt (with a commit to make when [`LoopState::asks_commit`]).
     AskReport,
     /// Write `report.md` from the report turn's reply: the commit is settled (made, or its
@@ -530,6 +625,43 @@ pub enum Input {
         /// Why.
         problems: Vec<String>,
     },
+    /// The rules turn's rules ([`contract::parse_rules`]; `sweep = "runs"`).
+    RulesWritten {
+        /// The rules, in order.
+        rules: Vec<contract::AuditRule>,
+    },
+    /// The rules turn's reply had no valid `twr-rules` block.
+    RulesRejected {
+        /// Why.
+        problems: Vec<String>,
+    },
+    /// Rule `rule`'s audit run started.
+    AuditStarted {
+        /// The rule, 1-based.
+        rule: u32,
+        /// Its prompt's digest.
+        prompt_digest: Option<String>,
+    },
+    /// Rule `rule`'s audit run answered ([`contract::parse_findings`]); the machine numbers
+    /// the findings `s<rule>.<n>`.
+    AuditAnswered {
+        /// The rule, 1-based.
+        rule: u32,
+        /// The findings, as read.
+        findings: Vec<Finding>,
+        /// The answer file.
+        answer_path: Option<String>,
+        /// What the run spent.
+        usage: Option<Usage>,
+    },
+    /// Rule `rule`'s audit run failed (as a review run fails), or was in flight when the hub
+    /// stopped.
+    AuditFailed {
+        /// The rule, 1-based.
+        rule: u32,
+        /// Why.
+        reason: String,
+    },
     /// The hub checked the commit the report turn (or its correction) made
     /// ([`contract::parse_commit`], [`contract::check_commit`]).
     CommitChecked {
@@ -615,6 +747,11 @@ pub struct LoopState {
     pub paused: bool,
     /// Why it is stuck (paused by a step that failed), if it is.
     pub stuck: Option<String>,
+    /// The remote box it waits for, while it waits for one (`loop.box`): the thread's box went
+    /// away while the loop needs it for a run of the hub's. The loop line says `waiting on box
+    /// <name>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_away: Option<String>,
     /// What it waits for.
     pub waiting_on: WaitingOn,
     /// The reviewer.
@@ -676,6 +813,9 @@ pub struct LoopState {
     pub converged: Option<Convergence>,
     /// When and why the ladder ended.
     pub transition: Option<Transition>,
+    /// `sweep = "runs"`: the sweep's rules and their audit runs, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audits: Vec<AuditView>,
     /// The loop is over.
     pub ended: bool,
 }
@@ -718,6 +858,12 @@ impl LoopState {
                 tiers: profile.tiers.clone(),
                 tags: tier_tags(&efforts),
                 sweep: profile.sweep,
+                audit_runs: p.settings.sweep == super::config::SweepMode::Runs,
+                audit_effort: if p.settings.sweep == super::config::SweepMode::Runs {
+                    profile.verify.effort.clone()
+                } else {
+                    String::new()
+                },
                 verify: profile.verify.clone(),
                 // (0: a `loop.started` that does not say; the default backstop.)
                 max_rounds_per_tier: match p.max_rounds_per_tier {
@@ -825,8 +971,22 @@ impl LoopState {
                 },
             }),
             Wait::Sweep => Some(match parse_sweep(text) {
-                Ok(sweep) => Input::SweepDone { sweep },
+                Ok(sweep) => {
+                    let (rules, not_run) = self.audited_rules();
+                    match contract::check_sweep_rules(&sweep, &rules, &not_run) {
+                        p if p.is_empty() => Input::SweepDone { sweep },
+                        p => Input::SweepRejected {
+                            problems: problems(p),
+                        },
+                    }
+                }
                 Err(p) => Input::SweepRejected {
+                    problems: problems(p),
+                },
+            }),
+            Wait::Rules => Some(match contract::parse_rules(text) {
+                Ok(rules) => Input::RulesWritten { rules },
+                Err(p) => Input::RulesRejected {
                     problems: problems(p),
                 },
             }),
@@ -857,6 +1017,8 @@ impl LoopState {
             },
             Wait::Implement => Action::AskImplement,
             Wait::Sweep => Action::AskSweep,
+            Wait::Rules => Action::AskRules,
+            Wait::Audits => Action::RunAudits,
             Wait::Report => Action::AskReport,
             Wait::Commit => Action::AskCorrection {
                 step: Step::Commit,
@@ -884,6 +1046,35 @@ impl LoopState {
         !self.ended
             && self.commit != CommitMode::None
             && matches!(self.wait, Wait::Report | Wait::Commit | Wait::WriteReport)
+    }
+
+    /// The names of the sweep's rules (`sweep = "runs"`; empty otherwise), and those whose
+    /// audit did not run.
+    pub fn audited_rules(&self) -> (Vec<String>, Vec<String>) {
+        (
+            self.audits.iter().map(|a| a.name.clone()).collect(),
+            self.audits
+                .iter()
+                .filter(|a| a.status == AuditStatus::NotRun)
+                .map(|a| a.name.clone())
+                .collect(),
+        )
+    }
+
+    /// The audits waiting for a run, which [`Action::RunAudits`] starts (none while paused).
+    pub fn pending_audits(&self) -> Vec<&AuditView> {
+        if self.wait != Wait::Audits {
+            return Vec::new();
+        }
+        self.audits
+            .iter()
+            .filter(|a| a.status == AuditStatus::Pending)
+            .collect()
+    }
+
+    /// Rule `rule`'s audit.
+    fn audit(&self, rule: u32) -> Option<&AuditView> {
+        self.audits.iter().find(|a| a.rule == rule)
     }
 
     /// The ids of the findings being triaged.
@@ -1090,6 +1281,68 @@ impl LoopState {
             Input::SweepRejected { problems } if self.wait == Wait::Sweep => {
                 self.refusal_fact(problems)
             }
+            Input::RulesWritten { rules } if self.wait == Wait::Rules => {
+                EventBody::LoopRules(LoopRules {
+                    id,
+                    rules,
+                    ..Default::default()
+                })
+            }
+            Input::RulesRejected { problems } if self.wait == Wait::Rules => {
+                self.refusal_fact(problems)
+            }
+            Input::AuditStarted {
+                rule,
+                prompt_digest,
+            } if self.wait == Wait::Audits
+                && self
+                    .audit(rule)
+                    .is_some_and(|a| a.status == AuditStatus::Pending) =>
+            {
+                let a = self.audit(rule).cloned().unwrap_or_default();
+                EventBody::LoopAuditStarted(LoopAuditStarted {
+                    id,
+                    rule,
+                    name: a.name,
+                    effort: self.plan.audit_effort.clone(),
+                    prompt_digest,
+                    retry: a.retried,
+                    ..Default::default()
+                })
+            }
+            Input::AuditAnswered {
+                rule,
+                findings,
+                answer_path,
+                usage,
+            } if self.wait == Wait::Audits
+                && self
+                    .audit(rule)
+                    .is_some_and(|a| a.status == AuditStatus::Running) =>
+            {
+                EventBody::LoopAudit(LoopAudit {
+                    id,
+                    rule,
+                    name: self.audit(rule).map(|a| a.name.clone()).unwrap_or_default(),
+                    findings: number_findings(&contract::audit_id(rule), findings),
+                    answer_path,
+                    usage,
+                    ..Default::default()
+                })
+            }
+            Input::AuditFailed { rule, reason }
+                if self.wait == Wait::Audits
+                    && self.audit(rule).is_some_and(|a| !a.status.ended()) =>
+            {
+                EventBody::LoopAudit(LoopAudit {
+                    id,
+                    rule,
+                    name: self.audit(rule).map(|a| a.name.clone()).unwrap_or_default(),
+                    failed: true,
+                    reason: Some(reason),
+                    ..Default::default()
+                })
+            }
             Input::TurnFailed { why } if self.waits_on_thread() && !self.held => {
                 EventBody::LoopControl(LoopControl {
                     id,
@@ -1149,6 +1402,8 @@ impl LoopState {
             Wait::Triage { round } => format!("the triage of {round}"),
             Wait::Implement => "the implement turn".into(),
             Wait::Sweep => "the sweep turn".into(),
+            Wait::Rules => "the sweep's rules turn".into(),
+            Wait::Audits => "the sweep's audit runs".into(),
             Wait::Report => "the report".into(),
             Wait::Commit => "the commit's correction".into(),
             Wait::WriteReport => "the report file".into(),
@@ -1165,6 +1420,7 @@ impl LoopState {
                 | Wait::Triage { .. }
                 | Wait::Implement
                 | Wait::Sweep
+                | Wait::Rules
                 | Wait::Report
                 | Wait::Commit
         )
@@ -1180,7 +1436,17 @@ impl LoopState {
             return vec![];
         }
         let mine = |id: &str| id == self.id;
+        // A run that starts on the box: it is back.
+        match body {
+            EventBody::LoopReviewStarted(p) if mine(&p.id) => self.box_away = None,
+            EventBody::LoopAuditStarted(p) if mine(&p.id) => self.box_away = None,
+            _ => {}
+        }
         let out = match body {
+            EventBody::LoopBox(p) if mine(&p.id) => {
+                self.box_away = p.away.then(|| p.box_name.clone());
+                vec![]
+            }
             EventBody::LoopPhase(p) if mine(&p.id) => {
                 if !p.problems.is_empty() {
                     match self.wait {
@@ -1188,6 +1454,7 @@ impl LoopState {
                         Wait::Plan => self.refused(Step::Plan, &p.problems),
                         Wait::Implement => self.refused(Step::Implement, &p.problems),
                         Wait::Sweep => self.refused(Step::Sweep, &p.problems),
+                        Wait::Rules => self.refused(Step::Rules, &p.problems),
                         _ => vec![],
                     }
                 } else if p.goal.is_some() && self.wait == Wait::Goal {
@@ -1258,6 +1525,29 @@ impl LoopState {
             {
                 self.commit_checked(p)
             }
+            EventBody::LoopRules(p) if mine(&p.id) && self.wait == Wait::Rules => {
+                self.rules_named(&p.rules)
+            }
+            EventBody::LoopAuditStarted(p)
+                if mine(&p.id)
+                    && self.wait == Wait::Audits
+                    && self
+                        .audit(p.rule)
+                        .is_some_and(|a| a.status == AuditStatus::Pending) =>
+            {
+                if let Some(a) = self.audits.iter_mut().find(|a| a.rule == p.rule) {
+                    a.status = AuditStatus::Running;
+                    a.started_at = Some(ts);
+                }
+                vec![]
+            }
+            EventBody::LoopAudit(p)
+                if mine(&p.id)
+                    && self.wait == Wait::Audits
+                    && self.audit(p.rule).is_some_and(|a| !a.status.ended()) =>
+            {
+                self.audit_ended(p)
+            }
             EventBody::LoopControl(p) if mine(&p.id) => self.control(p),
             EventBody::LoopEnded(p) if mine(&p.id) => {
                 if !p.commits.is_empty() {
@@ -1279,7 +1569,7 @@ impl LoopState {
     fn refresh(&mut self) {
         self.waiting_on = if self.paused && self.held {
             WaitingOn::User
-        } else if matches!(self.wait, Wait::Review { .. }) {
+        } else if matches!(self.wait, Wait::Review { .. } | Wait::Audits) {
             WaitingOn::Review
         } else {
             WaitingOn::Thread
@@ -1657,13 +1947,67 @@ impl LoopState {
             self.tier = None;
             self.round = None;
             self.corrected = false;
-            self.wait = Wait::Sweep;
+            self.wait = if self.plan.audit_runs {
+                Wait::Rules
+            } else {
+                Wait::Sweep
+            };
             out.push(self.record_phase());
             out.extend(self.issue());
         } else {
             out.extend(self.enter_verify(true));
         }
         out
+    }
+
+    /// The rules turn's rules (`loop.rules`): an audit per rule, or, with none, the
+    /// verification.
+    fn rules_named(&mut self, rules: &[contract::AuditRule]) -> Vec<Action> {
+        self.corrected = false;
+        if rules.is_empty() {
+            return self.enter_verify(true);
+        }
+        self.audits = rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| AuditView {
+                rule: u32::try_from(i + 1).unwrap_or(u32::MAX),
+                name: r.name.clone(),
+                ..Default::default()
+            })
+            .collect();
+        self.wait = Wait::Audits;
+        self.issue()
+    }
+
+    /// Rule `p.rule`'s audit run ended (`loop.audit`): a first failure is retried, a second
+    /// leaves the rule not run; once every rule's audit ended, the verification turn.
+    fn audit_ended(&mut self, p: &LoopAudit) -> Vec<Action> {
+        let Some(a) = self.audits.iter_mut().find(|a| a.rule == p.rule) else {
+            return vec![];
+        };
+        a.started_at = None;
+        if p.failed {
+            a.reason.clone_from(&p.reason);
+            if a.retried {
+                a.status = AuditStatus::NotRun;
+            } else {
+                a.retried = true;
+                a.status = AuditStatus::Pending;
+            }
+        } else {
+            a.status = AuditStatus::Answered;
+            a.findings = u32::try_from(p.findings.len()).unwrap_or(u32::MAX);
+        }
+        if self.audits.iter().all(|a| a.status.ended()) {
+            self.corrected = false;
+            self.wait = Wait::Sweep;
+            return self.issue();
+        }
+        if self.audits.iter().any(|a| a.status == AuditStatus::Pending) {
+            return self.issue();
+        }
+        vec![]
     }
 
     /// The sweep's accepted residuals, into the ledger.
@@ -1766,7 +2110,8 @@ impl LoopState {
             ControlAction::Resume => {
                 self.paused = false;
                 self.stuck = None;
-                if !self.held {
+                // (Audits that waited for a slot when the pause came start now too.)
+                if !self.held && self.pending_audits().is_empty() {
                     return vec![];
                 }
                 self.retried = false;

@@ -49,7 +49,7 @@
 //! **Review runs** ([`run_review`]) are tasks of the hub's, one per thread at a time
 //! ([`LoopRuns`]): the round's diffs, ledger, goal and prompt go into the loop folder, then
 //! `loop.review_started` with the run's background task (`task.updated` `loop:<loop id>`, its
-//! description `reviewer <model> <effort>`), the run itself (`hub::loops::review`), and its end:
+//! description `reviewer <model> <effort>`), the run itself (`twr_runner::loops::review` through `place`, on the thread's box), and its end:
 //! the task's end, `loop.findings` and what follows, one batch. A run that answers no findings
 //! has its diffs built again first: when every one is byte for byte what the round read (none
 //! cut), `loop.findings` says `unchanged`, which is what lets the machine skip a verification
@@ -80,9 +80,11 @@ use serde_json::{json, Value};
 use twr_core::event::*;
 use twr_core::loops::contract::{render_ledger, FINDINGS_SCHEMA};
 use twr_core::loops::{Action, Input, LoopKind, LoopState, ReviewTemplate, Step, StepError, Wait};
+use twr_core::proto::codes;
 use twr_core::reduce::ThreadView;
 
 use super::super::{twr_ext, twr_ext_map, Batch, Core, Inner, LOCAL_BOX};
+use super::place::{self, Place, Trouble};
 use super::prompts;
 use super::report::{self as loop_report, LoopLog};
 use super::review;
@@ -110,9 +112,16 @@ pub(in crate::hub) struct LoopRun {
 #[derive(Default)]
 pub(in crate::hub) struct LoopRuns {
     runs: HashMap<String, LoopRun>,
+    /// The audit runs (`sweep = "runs"`), by thread: up to `max_audit_runs` each.
+    pub(super) audits: HashMap<String, Vec<super::audit::AuditRun>>,
     /// The commit checks running, by thread: the loop and the turn each checks.
     checks: HashMap<String, (String, u64)>,
-    ready: bool,
+    pub(super) ready: bool,
+    /// Per thread on a remote box, the loop whose folder the hub last wrote to the box's copy
+    /// and the box connection it wrote it on ([`Core::sync_box_folder`]): a new connection
+    /// (the box back, the hub restarted) is written to again, a box that lost the folder gets
+    /// it back.
+    synced: HashMap<String, (String, u64)>,
     /// The threads whose runtime died with the previous hub (closed as crashed at this hub's
     /// start, `close_stale_runtimes`): their step is asked again, not taken as failed.
     pub(in crate::hub) died_with_hub: std::collections::HashSet<String>,
@@ -124,18 +133,24 @@ impl LoopRuns {
         if let Some(r) = self.runs.get(thread) {
             let _ = r.cancel.send(Some(why.to_string()));
         }
+        for a in self.audits.get(thread).into_iter().flatten() {
+            a.cancel(why);
+        }
     }
 
-    /// Ends every review run.
+    /// Ends every review and audit run.
     pub(in crate::hub) fn cancel_all(&self, why: &str) {
         for r in self.runs.values() {
             let _ = r.cancel.send(Some(why.to_string()));
+        }
+        for a in self.audits.values().flatten() {
+            a.cancel(why);
         }
     }
 
     /// Whether any runs.
     pub(in crate::hub) fn any(&self) -> bool {
-        !self.runs.is_empty()
+        !self.runs.is_empty() || self.audits.values().any(|v| !v.is_empty())
     }
 }
 
@@ -149,8 +164,9 @@ enum Owner {
 }
 
 /// The step a loop waits for in a thread turn, as its prompts' marker names it (`scope`,
-/// `plan`, `triage p1`, `implement`, `triage m3`, `sweep`, `report`, `commit`); `None` while
-/// it waits for a review, for the hub's own `report.md`, or nothing.
+/// `plan`, `triage p1`, `implement`, `triage m3`, `rules`, `sweep`, `report`, `commit`);
+/// `None` while it waits for a review, the sweep's audit runs, the hub's own `report.md`, or
+/// nothing.
 pub(in crate::hub) fn step_tag(s: &LoopState) -> Option<String> {
     match &s.wait {
         Wait::Goal => Some("scope".into()),
@@ -160,7 +176,8 @@ pub(in crate::hub) fn step_tag(s: &LoopState) -> Option<String> {
         Wait::Plan => Some("plan".into()),
         Wait::Implement => Some("implement".into()),
         Wait::Commit => Some("commit".into()),
-        Wait::Review { .. } | Wait::WriteReport | Wait::Ended => None,
+        Wait::Rules => Some("rules".into()),
+        Wait::Review { .. } | Wait::Audits | Wait::WriteReport | Wait::Ended => None,
     }
 }
 
@@ -175,21 +192,24 @@ pub(in crate::hub) struct Staged {
     pub(in crate::hub) check: bool,
     /// The commit is settled: `report.md` is to be written.
     pub(in crate::hub) write_report: bool,
+    /// Audit runs are to start (`sweep = "runs"`).
+    pub(in crate::hub) audits: bool,
 }
 
 impl Staged {
-    fn and(self, other: Staged) -> Staged {
+    pub(super) fn and(self, other: Staged) -> Staged {
         Staged {
             prompted: self.prompted || other.prompted,
             review: self.review || other.review,
             check: self.check || other.check,
             write_report: self.write_report || other.write_report,
+            audits: self.audits || other.audits,
         }
     }
 
     /// Whether the loops' watch is to look at once (a review or a check due, a prompt queued).
     pub(in crate::hub) fn kicks(&self) -> bool {
-        self.review || self.prompted || self.check || self.write_report
+        self.review || self.prompted || self.check || self.write_report || self.audits
     }
 }
 
@@ -229,12 +249,57 @@ impl LoopAnswer {
 }
 
 /// The folder of loop `id` as `log` records it (else where the hub puts loop folders).
-fn folder_of(hub: &Inner, log: &LoopLog, id: &str) -> PathBuf {
+pub(super) fn folder_of(hub: &Inner, log: &LoopLog, id: &str) -> PathBuf {
     log.started
         .as_ref()
         .and_then(|s| s.folder.as_deref())
         .map(PathBuf::from)
         .unwrap_or_else(|| loops_root(hub).join(id))
+}
+
+/// Where loop `id`'s thread and reviewer read its folder, as `log` records it: on a remote
+/// box, the box's copy (`loop.started`'s `box_folder`, `hub::loops::place`); else the hub's
+/// own ([`folder_of`]), which is the record either way.
+pub(super) fn shown_folder(hub: &Inner, log: &LoopLog, id: &str) -> PathBuf {
+    log.started
+        .as_ref()
+        .and_then(|s| s.ext.as_ref())
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(super::LOOP_START_KEY))
+        .and_then(|s| s.get("box_folder"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| folder_of(hub, log, id))
+}
+
+/// The files of the loop folder a thread's step or a reviewer may read, as the hub's
+/// `record` has them: what a remote box's copy is given before they read it
+/// ([`Place::sync`]).
+pub(super) fn shared_files(record: &Path) -> Vec<String> {
+    let fixed = [
+        "findings.schema.json",
+        "ledger.md",
+        "goal.md",
+        "task.md",
+        "plan.md",
+        "plan-1.md",
+        "audits.md",
+        "report.md",
+    ];
+    let mut out: Vec<String> = fixed
+        .iter()
+        .filter(|n| record.join(n).is_file())
+        .map(|n| n.to_string())
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(record) {
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with("baseline-") && (n.ends_with(".patch") || n.ends_with(".paths.json")) {
+                out.push(n);
+            }
+        }
+    }
+    out
 }
 
 /// `<data>/loops`.
@@ -255,7 +320,7 @@ fn make_folder(hub: &Inner, folder: &Path) -> anyhow::Result<()> {
 /// schema, `ledger.md`, and a review loop's `goal.md` or an implementation loop's `task.md`
 /// (when it has a task text). (`plan.md` is written when the plan is taken, and the baseline's
 /// files when the loop starts.)
-fn write_common(hub: &Inner, folder: &Path, log: &LoopLog) -> anyhow::Result<()> {
+pub(super) fn write_common(hub: &Inner, folder: &Path, log: &LoopLog) -> anyhow::Result<()> {
     make_folder(hub, folder)?;
     std::fs::write(folder.join("findings.schema.json"), FINDINGS_SCHEMA)?;
     std::fs::write(folder.join("ledger.md"), render_ledger(&log.ledger))?;
@@ -294,7 +359,7 @@ const TASK_INLINE_MAX: usize = 2000;
 
 /// The task as a prompt names it: the thread's plan prompt (`thread`: what to do without
 /// one), or a reviewer's (`GOAL / TASK:`).
-fn task_words(log: &LoopLog, folder: &Path, thread: bool) -> String {
+pub(super) fn task_words(log: &LoopLog, folder: &Path, thread: bool) -> String {
     match task_of(log) {
         Some(t) if t.len() <= TASK_INLINE_MAX => t,
         Some(_) => format!(
@@ -312,7 +377,7 @@ fn task_words(log: &LoopLog, folder: &Path, thread: bool) -> String {
 /// The baseline of `log`'s loop as a prompt names it: `out of scope` lines per repository
 /// whose worktree had changes when the loop began (empty when none had). `reviewer`: the
 /// impl-review template's wording.
-fn baseline_words(log: &LoopLog, folder: &Path, reviewer: bool) -> String {
+pub(super) fn baseline_words(log: &LoopLog, folder: &Path, reviewer: bool) -> String {
     let Some(started) = log.started.as_ref() else {
         return String::new();
     };
@@ -342,7 +407,7 @@ fn baseline_words(log: &LoopLog, folder: &Path, reviewer: bool) -> String {
 }
 
 /// `- <repo> (from <base>)` per repository of `log`'s start.
-fn repos_list(log: &LoopLog) -> String {
+pub(super) fn repos_list(log: &LoopLog) -> String {
     let started = log.started.clone().unwrap_or_default();
     if started.bases.is_empty() {
         return "- (none recorded)".into();
@@ -381,6 +446,41 @@ impl Core {
                 LoopLog::default()
             }
         }
+    }
+
+    /// Loop `id` of thread `thread` as its log tells it with `batch`'s events of it, not
+    /// written yet, after the log's: what a prompt staged in that batch reads (the audit that
+    /// ended the sweep's runs, the triage that ended the ladder).
+    pub(in crate::hub) fn loop_log_with(&self, thread: &str, id: &str, batch: &Batch) -> LoopLog {
+        let conn = self.store.conn();
+        let mut evs: Vec<Event> = match crate::store::loop_events(conn, thread) {
+            Ok(evs) => evs
+                .into_iter()
+                .map(|ev| super::super::append::hydrated_from_store(conn, &ev).unwrap_or(ev))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(%thread, error = %format!("{e:#}"), "cannot read a loop's log");
+                Vec::new()
+            }
+        };
+        let next = evs.last().map_or(0, |e| e.seq) + 1;
+        evs.extend(
+            batch
+                .events
+                .iter()
+                .filter(|e| e.thread == thread && e.body.kind().starts_with("loop."))
+                .enumerate()
+                .map(|(i, e)| {
+                    Event::new(
+                        thread,
+                        next + i as u64,
+                        e.turn,
+                        e.source.clone(),
+                        e.body.clone(),
+                    )
+                }),
+        );
+        LoopLog::of(id, &evs)
     }
 
     /// Steps `input` into thread `thread`'s loop and stages what it decided into `batch`
@@ -437,6 +537,10 @@ impl Core {
                     first = None;
                     staged.write_report = true;
                 }
+                Action::RunAudits => {
+                    first = None;
+                    staged.audits = true;
+                }
                 Action::Stuck { why } => {
                     first = None;
                     self.close_stuck(batch, thread, None);
@@ -468,7 +572,10 @@ impl Core {
                 }
                 ask => {
                     first = None;
-                    let log = log.get_or_insert_with(|| self.loop_log(thread, &state.id));
+                    if log.is_none() {
+                        log = Some(self.loop_log_with(thread, &state.id, batch));
+                    }
+                    let log = log.as_ref().expect("just set");
                     match self.loop_prompt(hub, thread, state, &ask, log) {
                         Ok(text) => match self.push_prompt(
                             batch,
@@ -613,8 +720,11 @@ impl Core {
         ask: &Action,
         log: &LoopLog,
     ) -> Result<String, String> {
-        let folder = folder_of(hub, log, &state.id);
-        write_common(hub, &folder, log).map_err(|e| format!("{e:#}"))?;
+        // Written to the hub's folder (the record); the prompt names where the thread reads
+        // it (a remote box's copy, which the hub writes before the turn reads it).
+        let record = folder_of(hub, log, &state.id);
+        write_common(hub, &record, log).map_err(|e| format!("{e:#}"))?;
+        let folder = shown_folder(hub, log, &state.id);
         let dir = prompts::templates_dir(hub.config_file.as_deref());
         let dir = dir.as_deref();
         let started = log.started.clone().unwrap_or_default();
@@ -739,6 +849,69 @@ impl Core {
                 }
                 ("correction", true, values)
             }
+            Action::AskSweep if !state.audits.is_empty() => (
+                "sweep-verify",
+                false,
+                vec![
+                    ("context", context.clone()),
+                    (
+                        "audits",
+                        super::audit::reports_words(&record, &folder, log)
+                            .map_err(|e| format!("{e:#}"))?,
+                    ),
+                    ("not_run", super::audit::not_run_words(log)),
+                    ("ledger_path", ledger_path.clone()),
+                    ("commit_rule", commit.clone()),
+                    (
+                        "rule_names",
+                        state
+                            .audits
+                            .iter()
+                            .map(|a| a.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                ],
+            ),
+            Action::AskRules => {
+                let rules = log.rules();
+                let r = &started.settings.reviewer;
+                (
+                    "rules",
+                    false,
+                    vec![
+                        (
+                            "transition",
+                            match &state.transition {
+                                Some(t) => format!(
+                                    "after {}: {}",
+                                    t.round,
+                                    loop_report::transition_words(t.reason)
+                                ),
+                                None => "it ended".into(),
+                            },
+                        ),
+                        (
+                            "rules",
+                            if rules.is_empty() {
+                                "none named".to_string()
+                            } else {
+                                rules.join(", ")
+                            },
+                        ),
+                        ("fixed", prompts::wrap_fixed(&log.fixed())),
+                        ("context", context.clone()),
+                        (
+                            "reviewer",
+                            format!("{} · {} at {}", r.runtime, r.model, state.plan.audit_effort),
+                        ),
+                        (
+                            "max_rules",
+                            twr_core::loops::contract::MAX_AUDIT_RULES.to_string(),
+                        ),
+                    ],
+                )
+            }
             Action::AskSweep => {
                 let rules = log.rules();
                 (
@@ -823,6 +996,7 @@ impl Core {
             ("triage", "findings"),
             ("plan-triage", "findings"),
             ("correction", "problems"),
+            ("sweep-verify", "audits"),
         ] {
             if name == key && !template.contains(&format!("{{{{{needed}}}}}")) {
                 if let Some((_, v)) = values.iter().find(|(k, _)| *k == needed) {
@@ -834,6 +1008,15 @@ impl Core {
         if commit_correction {
             body.push_str("\n\n");
             body.push_str(prompts::COMMIT_AGAIN);
+        }
+        // A thread on a remote box runs its gates itself: twr jobs run only on the hub's box.
+        if let Some(b) = self
+            .registry
+            .get(thread)
+            .map(|v| v.box_name.clone())
+            .filter(|b| b != LOCAL_BOX)
+        {
+            body = prompts::without_jobs(&body, &b);
         }
         if (matches!(ask, Action::AskReport) && state.asks_commit() || commit_correction)
             && !template.contains("{{commit}}")
@@ -1013,6 +1196,7 @@ impl Core {
             Input::GoalWritten { .. }
             | Input::TriageAccepted { .. }
             | Input::SweepDone { .. }
+            | Input::RulesWritten { .. }
             | Input::PlanWritten { .. }
             | Input::PlanTriaged { .. } => true,
             Input::Implemented { implemented } => implemented.problems().is_empty(),
@@ -1336,19 +1520,30 @@ impl Core {
                 .is_some_and(|t| t >= ask.turn)
     }
 
-    /// The review tasks thread `thread` shows that no run of this hub's is (a previous hub's).
+    /// The review and audit tasks thread `thread` shows that no run of this hub's is (a
+    /// previous hub's).
     fn orphan_review_tasks(&self, thread: &str) -> Vec<String> {
-        let mine = self.loop_runs.runs.get(thread);
+        let mut mine: Vec<String> = self
+            .loop_runs
+            .runs
+            .get(thread)
+            .map(|r| format!("{LOOP_TASK_PREFIX}{}", r.loop_id))
+            .into_iter()
+            .collect();
+        mine.extend(
+            self.loop_runs
+                .audits
+                .get(thread)
+                .into_iter()
+                .flatten()
+                .map(super::audit::AuditRun::task),
+        );
         self.registry
             .get(thread)
             .map(|v| {
                 v.background_tasks
                     .iter()
-                    .filter(|(id, t)| {
-                        t.review
-                            && !mine
-                                .is_some_and(|r| **id == format!("{LOOP_TASK_PREFIX}{}", r.loop_id))
-                    })
+                    .filter(|(id, t)| t.review && !mine.contains(id))
                     .map(|(id, _)| id.clone())
                     .collect()
             })
@@ -1402,9 +1597,15 @@ impl Core {
         let Some(state) = self.loop_state(thread) else {
             return;
         };
+        // On a remote box: its copy of the folder written again on each new connection of the
+        // box, and a loop that waited on the box marked back once it is.
+        self.sync_box_folder(hub, thread, false);
+        if state.box_away.is_some() {
+            self.box_gate(hub, thread);
+        }
         let mut batch = Batch::default();
         let mut staged = Staged::default();
-        if !self.loop_runs.runs.contains_key(thread) {
+        {
             for task in self.orphan_review_tasks(thread) {
                 batch.push(
                     thread,
@@ -1437,6 +1638,8 @@ impl Core {
                     staged.review = true;
                 }
             }
+            // (After this batch: `check_audits`.)
+            Wait::Audits => {}
             Wait::Ended => {}
             Wait::WriteReport => staged.write_report = true,
             _ => {
@@ -1483,6 +1686,9 @@ impl Core {
                 tracing::warn!(%thread, error = %format!("{e:#}"), "cannot record a loop's step");
                 return;
             }
+        }
+        if state.wait == Wait::Audits {
+            staged = staged.and(self.check_audits(hub, thread));
         }
         self.after_loop_batch(hub, thread, staged);
     }
@@ -1540,6 +1746,8 @@ impl Core {
         thread: &str,
         staged: Staged,
     ) {
+        // A remote box's copy of the loop folder gets what the step reads, ahead of its prompt.
+        self.sync_box_folder(hub, thread, staged.prompted);
         if staged.prompted {
             if let Err(e) = self.try_dispatch(hub, thread) {
                 tracing::warn!(%thread, error = %format!("{e:#}"), "dispatching a loop's prompt failed");
@@ -1547,6 +1755,9 @@ impl Core {
         }
         if staged.review {
             self.start_review(hub, thread);
+        }
+        if staged.audits {
+            self.start_audits(hub, thread);
         }
         if staged.check {
             hub.loop_kick.notify_one();
@@ -1598,6 +1809,10 @@ impl Core {
     /// Starts the check of the commit turn `turn` of thread `thread`'s loop `loop_id` answered.
     fn start_commit_check(&mut self, hub: &Arc<Inner>, thread: &str, loop_id: &str, turn: u64) {
         if self.shutting_down || !self.loop_runs.ready {
+            return;
+        }
+        // The check reads the box's git: it waits while the box is away.
+        if self.box_gate(hub, thread) {
             return;
         }
         self.loop_runs
@@ -1800,6 +2015,165 @@ impl Core {
         self.after_loop_batch(hub, thread, staged);
     }
 
+    /// Whether thread `thread`'s remote box is away now (never for the hub's own box). A loop
+    /// that needs it for a run of the hub's waits for it: `loop.box` marks it waiting the
+    /// first time (its loop line says `waiting on box <name>`), and marks it back when the box
+    /// is.
+    pub(super) fn box_gate(&mut self, hub: &Arc<Inner>, thread: &str) -> bool {
+        let Some(box_name) = self.registry.get(thread).map(|v| v.box_name.clone()) else {
+            return false;
+        };
+        let away = Place::away(hub, &box_name);
+        let Some(state) = self.loop_state(thread) else {
+            return away;
+        };
+        if away != state.box_away.is_some() {
+            let body = EventBody::LoopBox(LoopBoxAway {
+                id: state.id.clone(),
+                box_name: box_name.clone(),
+                away,
+                ..Default::default()
+            });
+            if let Err(e) = self.append(hub, thread, None, Source::Hub, body) {
+                tracing::warn!(%thread, error = %format!("{e:#}"), "cannot record that a loop waits on its box");
+            }
+        }
+        away
+    }
+
+    /// Writes thread `thread`'s loop's shared files ([`shared_files`]) into its remote box's
+    /// copy of the folder, when the thread runs on one that is connected: `now` (a step was
+    /// just asked of the thread), or when the box's connection is another than the one they
+    /// were last written on (the box back, the hub restarted). Issued at once, ahead of the
+    /// step's prompt on the box's connection: each small file with its data; a large one (a
+    /// baseline patch) only when the box lacks it, which a box that lost its folder does,
+    /// right after. The previous loop of the thread has its folder on the box removed when a
+    /// new one first writes there. The thread's later turns may still read its last loop's
+    /// files: they stay until then, or until the thread is deleted.
+    pub(super) fn sync_box_folder(&mut self, hub: &Arc<Inner>, thread: &str, now: bool) {
+        let Some(view) = self.registry.get(thread) else {
+            return;
+        };
+        if view.box_name == LOCAL_BOX {
+            return;
+        }
+        let Some(loop_id) = view
+            .r#loop
+            .as_ref()
+            .map(|l| l.id.clone())
+            .or_else(|| view.last_loop.as_ref().map(|l| l.id.clone()))
+        else {
+            return;
+        };
+        let box_name = view.box_name.clone();
+        let Ok(place) = Place::of(hub, &box_name) else {
+            return;
+        };
+        let Place::Remote(remote) = &place else {
+            return;
+        };
+        let Some(epoch) = remote.rbox.epoch() else {
+            return;
+        };
+        let last = self.loop_runs.synced.get(thread).cloned();
+        if !now && last.as_ref() == Some(&(loop_id.clone(), epoch)) {
+            return;
+        }
+        let log = self.loop_log(thread, &loop_id);
+        let record = folder_of(hub, &log, &loop_id);
+        let digests = log
+            .started
+            .as_ref()
+            .map(|s| s.baseline_digests.clone())
+            .unwrap_or_default();
+        let mut files = Vec::new();
+        let mut big = Vec::new();
+        for name in shared_files(&record) {
+            // A baseline patch's digest is the log's: it is not read here.
+            let known = name
+                .strip_prefix("baseline-")
+                .and_then(|n| n.strip_suffix(".patch"))
+                .and_then(|slug| digests.get(slug));
+            if let Some(digest) = known {
+                files.push(twr_core::runner::LoopFile {
+                    name: name.clone(),
+                    digest: digest.clone(),
+                    data: None,
+                });
+                big.push(name);
+                continue;
+            }
+            let Ok(data) = std::fs::read(record.join(&name)) else {
+                continue;
+            };
+            files.push(twr_core::runner::LoopFile {
+                digest: twr_core::blob::blob_ref(&data),
+                data: Some(twr_core::b64::encode(&data)),
+                name,
+            });
+        }
+        let op = twr_core::runner::Op::LoopFiles {
+            loop_id: loop_id.clone(),
+            files,
+            read: Vec::new(),
+            max: 0,
+        };
+        let Ok(asked) = remote.rbox.issue(op) else {
+            return;
+        };
+        self.loop_runs
+            .synced
+            .insert(thread.to_string(), (loop_id.clone(), epoch));
+        let old = last.map(|(l, _)| l).filter(|l| *l != loop_id);
+        tokio::spawn(async move {
+            match asked.await {
+                Ok(v) => {
+                    let missing: Vec<String> = v["missing"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|n| n.as_str().map(str::to_string))
+                        .filter(|n| big.contains(n))
+                        .collect();
+                    if !missing.is_empty() {
+                        if let Err(t) = place.sync(&loop_id, &record, &missing).await {
+                            tracing::warn!(box_name = %box_name, loop_id = %loop_id, error = %t.message(), "cannot write a loop's folder on its box");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(box_name = %box_name, loop_id = %loop_id, error = %e, "cannot write a loop's folder on its box")
+                }
+            }
+            if let Some(old) = old {
+                place.forget(&old).await;
+            }
+        });
+    }
+
+    /// Removes thread `thread`'s loop's folder (its running loop's, else its last one's) from
+    /// its remote box, when the box is connected (the thread is being deleted). Best effort: a
+    /// box that is away keeps it until its runner prunes it (`twr_runner::loops::folder`).
+    pub(in crate::hub) fn forget_box_loop(&mut self, hub: &Inner, thread: &str) {
+        let Some(view) = self.registry.get(thread) else {
+            return;
+        };
+        let Some(loop_id) = view
+            .r#loop
+            .as_ref()
+            .map(|l| l.id.clone())
+            .or_else(|| view.last_loop.as_ref().map(|l| l.id.clone()))
+        else {
+            return;
+        };
+        if let Ok(Place::Remote(r)) = Place::of(hub, &view.box_name) {
+            if let Ok(asked) = r.rbox.issue(twr_core::runner::Op::LoopForget { loop_id }) {
+                tokio::spawn(asked);
+            }
+        }
+        self.loop_runs.synced.remove(thread);
+    }
+
     /// Starts thread `thread`'s loop's review run, unless one runs.
     fn start_review(&mut self, hub: &Arc<Inner>, thread: &str) {
         if self.shutting_down || !self.loop_runs.ready || self.loop_runs.runs.contains_key(thread) {
@@ -1812,6 +2186,10 @@ impl Core {
             return;
         };
         if state.held {
+            return;
+        }
+        // Not while the thread's box is away: the run (a retry's too) waits for it.
+        if self.box_gate(hub, thread) {
             return;
         }
         let (tx, rx) = tokio::sync::watch::channel(None);
@@ -1840,6 +2218,9 @@ impl Core {
     /// What review task `task` (`loop:<id>`) does now, when this hub runs it: `reviewer
     /// gpt-6.1-sol xhigh · 6m`.
     pub(in crate::hub) fn review_description(&self, task: &str) -> Option<String> {
+        if let Some(d) = self.audit_description(task) {
+            return Some(d);
+        }
         let id = task.strip_prefix(LOOP_TASK_PREFIX)?;
         let r = self.loop_runs.runs.values().find(|r| r.loop_id == id)?;
         let mins = r.began.elapsed().as_secs() / 60;
@@ -1881,19 +2262,26 @@ fn task_end(task: &str, what: &str) -> EventBody {
     })
 }
 
-/// What a review run needs, read under the hub's lock.
-struct Prep {
-    name: String,
-    template: ReviewTemplate,
-    log: LoopLog,
-    folder: PathBuf,
-    call: review::Call,
-    task: String,
-    description: String,
+/// What a review (or audit) run needs, read under the hub's lock.
+pub(super) struct Prep {
+    pub(super) name: String,
+    pub(super) template: ReviewTemplate,
+    pub(super) log: LoopLog,
+    /// The hub's loop folder: the record.
+    pub(super) folder: PathBuf,
+    /// Where the reviewer reads the folder (a remote box's copy, else [`Prep::folder`]).
+    pub(super) shown: PathBuf,
+    /// The loop.
+    pub(super) loop_id: String,
+    /// The thread's box.
+    pub(super) place: Place,
+    pub(super) call: review::Call,
+    pub(super) task: String,
+    pub(super) description: String,
 }
 
-/// Why a review run does not run.
-enum NoRun {
+/// Why a review (or audit) run does not run.
+pub(super) enum NoRun {
     /// The loop moved on (or ended): nothing to record.
     Gone,
     /// A failed run.
@@ -1915,6 +2303,33 @@ impl Core {
                         }
             })
             .ok_or(NoRun::Gone)?;
+        let effort = state.reviewer.effort.clone().unwrap_or_default();
+        self.reviewer_prep(
+            hub,
+            thread,
+            &state,
+            effort,
+            &format!("round-{round}"),
+            format!("{LOOP_TASK_PREFIX}{id}"),
+            format!("{thread}:loop-{id}"),
+        )
+    }
+
+    /// What a reviewer's run (a review run, or an audit run) of thread `thread`'s loop at
+    /// `state` needs: the call at `effort`, its files named `<stem>.answer.json` and
+    /// `<stem>.log`, its task `task` and its `TWR_AGENT` marker `marker`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn reviewer_prep(
+        &self,
+        hub: &Inner,
+        thread: &str,
+        state: &LoopState,
+        effort: String,
+        stem: &str,
+        task: String,
+        marker: String,
+    ) -> Result<Prep, NoRun> {
+        let id = state.id.as_str();
         let view = self.registry.get(thread).ok_or(NoRun::Gone)?;
         let log = self.loop_log(thread, id);
         let started = log
@@ -1922,13 +2337,24 @@ impl Core {
             .clone()
             .ok_or_else(|| NoRun::Fail("the loop's start is not in the log".into()))?;
         let folder = folder_of(hub, &log, id);
+        // The thread's box: away, a failed run (retried once it is back); one whose runner
+        // can't run loops any more, the loop's end.
+        let place = Place::of(hub, &view.box_name).map_err(|e| {
+            if e.code == codes::BOX_OFFLINE {
+                NoRun::Failed(place::disconnected(&view.box_name))
+            } else {
+                NoRun::Fail(e.message)
+            }
+        })?;
+        let shown = place.folder(&folder, id);
         let cwd = view
             .worktree
             .clone()
             .map(PathBuf::from)
             .or_else(|| started.bases.first().map(|b| PathBuf::from(&b.repo)))
             .ok_or_else(|| NoRun::Fail(format!("{} has no working directory", view.name)))?;
-        if !cwd.is_dir() {
+        // (On a remote box, the box says so when the run starts.)
+        if !place.is_remote() && !cwd.is_dir() {
             return Err(NoRun::Fail(format!(
                 "{}'s working directory {} is gone",
                 view.name,
@@ -1936,9 +2362,17 @@ impl Core {
             )));
         }
         let reviewer = &started.settings.reviewer;
-        let effort = state.reviewer.effort.clone().unwrap_or_default();
         let account_env = match &reviewer.account {
             None => None,
+            // A thread on a remote box runs on the box's own login, and so does its reviewer.
+            Some(name) if place.is_remote() => {
+                return Err(NoRun::Failed(format!(
+                    "the reviewer's account {}:{name} can't be used on box {}: a remote box's \
+                     reviewer runs on the box's own login",
+                    reviewer.runtime,
+                    place.name()
+                )))
+            }
             Some(name) => {
                 let who = format!("{}:{name}", reviewer.runtime);
                 let info = self
@@ -1968,12 +2402,16 @@ impl Core {
                 )
             }
         };
-        let file = |name: String| folder.join(name);
+        // The run's files are where it runs: on a remote box, the box's copy.
+        let file = |name: String| shown.join(name);
         Ok(Prep {
             name: view.name.clone(),
             template: state.review_template(),
             folder: folder.clone(),
-            task: format!("{LOOP_TASK_PREFIX}{id}"),
+            shown: shown.clone(),
+            loop_id: id.to_string(),
+            place: place.clone(),
+            task,
             description: format!("reviewer {} {effort}", reviewer.model),
             call: review::Call {
                 runtime: reviewer.runtime.clone(),
@@ -1981,14 +2419,16 @@ impl Core {
                 model: reviewer.model.clone(),
                 effort,
                 cwd,
-                folder: folder.clone(),
+                folder: shown.clone(),
                 prompt: String::new(),
                 schema_file: file("findings.schema.json".into()),
-                answer_file: file(format!("round-{round}.answer.json")),
-                log_file: file(format!("round-{round}.log")),
+                answer_file: file(format!("{stem}.answer.json")),
+                log_file: file(format!("{stem}.log")),
                 account_env,
-                marker: format!("{thread}:loop-{id}"),
+                marker,
                 timeout: hub.config.loops.round_timeout(),
+                acp: hub.acp_reviewer(&reviewer.runtime),
+                path: None,
             },
             log,
         })
@@ -2193,14 +2633,20 @@ async fn run_review(
     let built = build_round(&hub, &prep, &round).await;
     let (diffs, truncated, read) = match built {
         Ok(d) => d,
-        Err(why) => {
+        Err(trouble) => {
+            // A box that went away: a failed run, retried once it is back. Anything else
+            // (the worktree gone, git failing): the loop can't go on.
+            let no = match trouble {
+                Trouble::Away(why) => NoRun::Failed(why),
+                Trouble::Failed(why) => NoRun::Fail(why),
+            };
             hub.core().review_end(
                 &hub,
                 &thread,
                 &run,
                 &round,
                 Some(&prep),
-                Err(NoRun::Fail(why)),
+                Err(no),
                 false,
                 began.elapsed(),
             );
@@ -2208,7 +2654,8 @@ async fn run_review(
         }
     };
     let prompt = review_prompt(&hub, &prep, &diffs, &truncated);
-    let prompt_file = prep.folder.join(format!("round-{round}.prompt.md"));
+    let prompt_name = format!("round-{round}.prompt.md");
+    let prompt_file = prep.folder.join(&prompt_name);
     if let Err(e) = std::fs::write(&prompt_file, &prompt) {
         hub.core().review_end(
             &hub,
@@ -2220,6 +2667,22 @@ async fn run_review(
                 "cannot write {}: {e}",
                 prompt_file.display()
             ))),
+            false,
+            began.elapsed(),
+        );
+        return;
+    }
+    // A remote box's copy of the folder gets what the reviewer reads, its prompt with it.
+    let mut names = shared_files(&prep.folder);
+    names.push(prompt_name);
+    if let Err(t) = prep.place.sync(&prep.loop_id, &prep.folder, &names).await {
+        hub.core().review_end(
+            &hub,
+            &thread,
+            &run,
+            &round,
+            Some(&prep),
+            Err(NoRun::Failed(t.message().to_string())),
             false,
             began.elapsed(),
         );
@@ -2244,10 +2707,51 @@ async fn run_review(
         );
         return;
     }
+    let (renew, renewer) = renewals(&hub, &thread, &prep);
+    let call = prep.call.clone();
+    let ended = prep
+        .place
+        .review(&prep.loop_id, &run, call, &prep.folder, renew, cancel)
+        .await;
+    renewer.abort();
+    // An empty answer: whether the worktree is still the one the round read, which lets the
+    // machine skip a verification round that could only repeat this one.
+    let unchanged = match &ended {
+        review::Ended::Answered { findings, .. } if findings.is_empty() => {
+            still_as_read(&prep, read.as_deref()).await
+        }
+        _ => false,
+    };
+    hub.core().review_end(
+        &hub,
+        &thread,
+        &run,
+        &round,
+        Some(&prep),
+        Ok(ended),
+        unchanged,
+        began.elapsed(),
+    );
+}
+
+/// What keeps run `prep`'s task of thread `thread` told: the callback that records its process
+/// group once it started (`ext.twr.job.pgid`, what a later hub kills), and the renewer that
+/// heartbeats the task every [`RENEW_EVERY`] (abort it when the run ends).
+pub(super) fn renewals(
+    hub: &Arc<Inner>,
+    thread: &str,
+    prep: &Prep,
+) -> (
+    impl FnOnce(u32) + Send + 'static,
+    tokio::task::JoinHandle<()>,
+) {
     let renew = {
-        let hub = Arc::clone(&hub);
-        let (thread, task, description) =
-            (thread.clone(), prep.task.clone(), prep.description.clone());
+        let hub = Arc::clone(hub);
+        let (thread, task, description) = (
+            thread.to_string(),
+            prep.task.clone(),
+            prep.description.clone(),
+        );
         move |pid: u32| {
             tokio::spawn(async move {
                 let start_time = match hub.host(LOCAL_BOX) {
@@ -2275,11 +2779,13 @@ async fn run_review(
             });
         }
     };
-    let call = prep.call.clone();
     let renewer = {
-        let hub = Arc::clone(&hub);
-        let (thread, task, description) =
-            (thread.clone(), prep.task.clone(), prep.description.clone());
+        let hub = Arc::clone(hub);
+        let (thread, task, description) = (
+            thread.to_string(),
+            prep.task.clone(),
+            prep.description.clone(),
+        );
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(RENEW_EVERY).await;
@@ -2302,36 +2808,14 @@ async fn run_review(
             }
         })
     };
-    let ended = review::run(call, renew, cancel).await;
-    renewer.abort();
-    // An empty answer: whether the worktree is still the one the round read, which lets the
-    // machine skip a verification round that could only repeat this one.
-    let unchanged = match &ended {
-        review::Ended::Answered { findings, .. } if findings.is_empty() => {
-            still_as_read(&hub, &prep, read.as_deref()).await
-        }
-        _ => false,
-    };
-    hub.core().review_end(
-        &hub,
-        &thread,
-        &run,
-        &round,
-        Some(&prep),
-        Ok(ended),
-        unchanged,
-        began.elapsed(),
-    );
+    (renew, renewer)
 }
 
-/// Whether every repository's diff, built again now, is byte for byte `read`, the one the
-/// round reviewed (`None`: a diff was cut, so a change past the cut could not be seen; never
-/// the same then). A diff that can't be built is not the same either.
-async fn still_as_read(hub: &Arc<Inner>, prep: &Prep, read: Option<&[Vec<u8>]>) -> bool {
+/// Whether every repository's diff, built again now, is byte for byte the one the round
+/// reviewed (`read`: their digests; `None`: a diff was cut, so a change past the cut could not
+/// be seen; never the same then). A diff that can't be built is not the same either.
+async fn still_as_read(prep: &Prep, read: Option<&[String]>) -> bool {
     let Some(read) = read else {
-        return false;
-    };
-    let Some(git) = hub.host(LOCAL_BOX).and_then(|h| h.local_git()) else {
         return false;
     };
     let started = prep.log.started.clone().unwrap_or_default();
@@ -2339,47 +2823,69 @@ async fn still_as_read(hub: &Arc<Inner>, prep: &Prep, read: Option<&[Vec<u8>]>) 
         return false;
     }
     for (b, was) in started.bases.iter().zip(read) {
-        let skip = skipped(&git, &prep.folder, &b.slug, Path::new(&b.repo)).await;
-        match super::git::round_diff(&git, Path::new(&b.repo), &b.base, &skip).await {
-            Ok(d) if d.truncated.is_none() && d.patch == *was => {}
+        let baseline = baseline_paths(&prep.folder, &b.slug);
+        match prep
+            .place
+            .diff(Path::new(&b.repo), &b.base, &baseline, None, true)
+            .await
+        {
+            Ok(d) if d.truncated.is_none() && d.digest == *was => {}
             _ => return false,
         }
     }
     true
 }
 
-/// The diffs' paths, a note of each one that was cut, and the patches as read (`None` when
-/// one was cut) ([`build_round`]).
-type Built = (Vec<String>, Vec<String>, Option<Vec<Vec<u8>>>);
+/// The diffs' paths (where the reviewer reads them), a note of each one that was cut, and
+/// the patches' digests as read (`None` when one was cut) ([`build_round`]).
+pub(super) type Built = (Vec<String>, Vec<String>, Option<Vec<String>>);
 
 /// The round's files in the loop folder: the common ones, and one diff per repository
-/// (`diff-<slug>-<round>.patch`), built fresh from the loop's recorded base.
-async fn build_round(hub: &Arc<Inner>, prep: &Prep, round: &str) -> Result<Built, String> {
-    write_common(hub, &prep.folder, &prep.log).map_err(|e| format!("{e:#}"))?;
+/// (`diff-<slug>-<round>.patch`), built fresh from the loop's recorded base on the thread's
+/// box (and kept there too, on a remote box) and written to the hub's folder.
+pub(super) async fn build_round(
+    hub: &Arc<Inner>,
+    prep: &Prep,
+    round: &str,
+) -> Result<Built, Trouble> {
+    write_common(hub, &prep.folder, &prep.log).map_err(|e| Trouble::Failed(format!("{e:#}")))?;
     // The plan check reads the plan, not a diff.
     if prep.template == ReviewTemplate::PlanReview {
         let plan = prep.folder.join("plan.md");
         if !plan.is_file() {
-            return Err(format!("the plan is not in {}", plan.display()));
+            return Err(Trouble::Failed(format!(
+                "the plan is not in {}",
+                plan.display()
+            )));
         }
-        return Ok((vec![plan.display().to_string()], Vec::new(), None));
+        return Ok((
+            vec![prep.shown.join("plan.md").display().to_string()],
+            Vec::new(),
+            None,
+        ));
     }
-    let git = hub
-        .host(LOCAL_BOX)
-        .and_then(|h| h.local_git())
-        .ok_or("the hub's own box has no git")?;
     let started = prep.log.started.clone().unwrap_or_default();
     let mut diffs = Vec::new();
     let mut notes = Vec::new();
     let mut read = Some(Vec::new());
     for b in &started.bases {
-        let skip = skipped(&git, &prep.folder, &b.slug, Path::new(&b.repo)).await;
-        let d = super::git::round_diff(&git, Path::new(&b.repo), &b.base, &skip).await?;
-        let path = prep.folder.join(format!("diff-{}-{round}.patch", b.slug));
-        std::fs::write(&path, &d.patch)
-            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        let baseline = baseline_paths(&prep.folder, &b.slug);
+        let name = format!("diff-{}-{round}.patch", b.slug);
+        let d = prep
+            .place
+            .diff(
+                Path::new(&b.repo),
+                &b.base,
+                &baseline,
+                Some((&prep.loop_id, &name)),
+                false,
+            )
+            .await?;
+        let path = prep.folder.join(&name);
+        std::fs::write(&path, d.patch.as_deref().unwrap_or_default())
+            .map_err(|e| Trouble::Failed(format!("cannot write {}: {e}", path.display())))?;
         match (&mut read, d.truncated) {
-            (Some(r), None) => r.push(d.patch.clone()),
+            (Some(r), None) => r.push(d.digest.clone()),
             _ => read = None,
         }
         if let Some((kept, whole)) = d.truncated {
@@ -2389,10 +2895,12 @@ async fn build_round(hub: &Arc<Inner>, prep: &Prep, round: &str) -> Result<Built
                 b.repo, b.base
             ));
         }
-        diffs.push(path.display().to_string());
+        diffs.push(prep.shown.join(&name).display().to_string());
     }
     if diffs.is_empty() {
-        return Err("the loop records no repository to diff".into());
+        return Err(Trouble::Failed(
+            "the loop records no repository to diff".into(),
+        ));
     }
     Ok((diffs, notes, read))
 }
@@ -2421,24 +2929,24 @@ fn review_prompt(hub: &Inner, prep: &Prep, diffs: &[String], notes: &[String]) -
         ),
         (
             "ledger_path",
-            prep.folder.join("ledger.md").display().to_string(),
+            prep.shown.join("ledger.md").display().to_string(),
         ),
         ("ledger_state", prompts::ledger_state(&prep.log.ledger)),
-        ("folder", prep.folder.display().to_string()),
+        ("folder", prep.shown.display().to_string()),
         ("thread", prep.name.clone()),
     ];
     match prep.template {
         ReviewTemplate::Review => values.push((
             "goal_path",
-            prep.folder.join("goal.md").display().to_string(),
+            prep.shown.join("goal.md").display().to_string(),
         )),
         ReviewTemplate::ImplReview | ReviewTemplate::PlanReview => {
-            values.push(("task", task_words(&prep.log, &prep.folder, false)));
+            values.push(("task", task_words(&prep.log, &prep.shown, false)));
             values.push((
                 "plan_path",
-                prep.folder.join("plan.md").display().to_string(),
+                prep.shown.join("plan.md").display().to_string(),
             ));
-            values.push(("baseline", baseline_words(&prep.log, &prep.folder, true)));
+            values.push(("baseline", baseline_words(&prep.log, &prep.shown, true)));
         }
     }
     prompts::render(
@@ -2476,24 +2984,6 @@ fn baseline_paths(folder: &Path, slug: &str) -> BTreeMap<String, Option<String>>
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
-}
-
-/// The baseline paths of repository `slug` the loop has not touched since: what its round
-/// diffs leave out.
-async fn skipped(
-    git: &twr_runner::local::LocalGit,
-    folder: &Path,
-    slug: &str,
-    repo: &Path,
-) -> Vec<String> {
-    let baseline = baseline_paths(folder, slug);
-    if baseline.is_empty() {
-        return Vec::new();
-    }
-    match super::git::worktree_paths(git, repo).await {
-        Ok(now) => super::git::unchanged_since(&baseline, &now),
-        Err(_) => Vec::new(),
-    }
 }
 
 /// Whether the latest round diff of repository `slug` shows a change (tracked or untracked):
@@ -2542,7 +3032,15 @@ async fn run_commit_check(hub: Arc<Inner>, thread: String, loop_id: String, turn
             .commit_checked(&hub, &thread, &loop_id, turn, None);
         return;
     };
-    let Some(git) = hub.host(LOCAL_BOX).and_then(|h| h.local_git()) else {
+    // The thread's box: away, the check waits for it (the watch asks again once it is back).
+    let place = {
+        let core = hub.core();
+        core.registry
+            .get(&thread)
+            .map(|v| v.box_name.clone())
+            .and_then(|b| Place::of(&hub, &b).ok())
+    };
+    let Some(place) = place else {
         hub.core()
             .commit_checked(&hub, &thread, &loop_id, turn, None);
         return;
@@ -2565,9 +3063,25 @@ async fn run_commit_check(hub: Arc<Inner>, thread: String, loop_id: String, turn
     };
     let mut after = Vec::new();
     for r in &repos {
-        after.push(
-            super::git::repo_after(&git, &r.repo, r.from.as_deref(), &r.baseline, r.work).await,
-        );
+        match place
+            .after(&r.repo, r.from.as_deref(), &r.baseline, r.work)
+            .await
+        {
+            Ok(a) => after.push(a),
+            // (Away: checked again once the box is back; never a commit problem.)
+            Err(Trouble::Away(_)) => {
+                hub.core()
+                    .commit_checked(&hub, &thread, &loop_id, turn, None);
+                return;
+            }
+            Err(Trouble::Failed(why)) => after.push(twr_core::loops::contract::RepoAfter {
+                repo: r.repo.display().to_string(),
+                from: r.from.clone(),
+                left: vec![format!("(the box could not read it: {why})")],
+                work: r.work,
+                ..Default::default()
+            }),
+        }
     }
     let (commits, problems) = twr_core::loops::contract::check_commit(&after);
     hub.core().commit_checked(

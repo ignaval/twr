@@ -348,7 +348,7 @@ impl Hub {
             let conn = inner.reader();
             let mut stmt = conn.prepare_cached(
                 "SELECT thread, ts, source, data FROM events \
-                 WHERE kind IN ('turn.ended', 'loop.findings') AND (?1 IS NULL OR ts >= ?1)",
+                 WHERE kind IN ('turn.ended', 'loop.findings', 'loop.audit') AND (?1 IS NULL OR ts >= ?1)",
             )?;
             let mut rows = stmt.query([from])?;
             let mut out = Vec::new();
@@ -369,7 +369,7 @@ impl Hub {
                     .filter(|u| u.is_object())
                     .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
                 {
-                    // A review run's is its reviewer runtime's (`hub::loops`).
+                    // A review or audit run's is its reviewer runtime's (`hub::loops`).
                     let source = match data.pointer("/ext/twr/reviewer").and_then(Value::as_str) {
                         Some(rt) => format!("adapter:{rt}"),
                         None => source,

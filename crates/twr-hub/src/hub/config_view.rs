@@ -273,7 +273,11 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
     let presets: Vec<&String> = runtimes
         .iter()
         .map(|(name, p)| {
-            let RuntimePreset { acp: _, attach: _ } = p;
+            let RuntimePreset {
+                acp: _,
+                attach: _,
+                review: _,
+            } = p;
             name
         })
         .collect();

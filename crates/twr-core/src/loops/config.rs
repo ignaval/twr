@@ -16,8 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::account::{check_name, split_runtime};
 use crate::config::parse_span;
 
-/// The runtimes a review run can use in this build (Codex, Claude Code, Grok Build): those
-/// whose CLI has a one-shot, read-only, schema-constrained mode. An ACP reviewer comes later.
+/// The built-in runtimes a review run can use (Codex, Claude Code, Grok Build): those whose
+/// CLI has a one-shot, read-only, schema-constrained mode. Besides them, an ACP preset whose
+/// `[runtimes.<name>.review]` names its agent's read-only mode can review
+/// ([`crate::config::PresetReview`], [`crate::loops::settings::RuntimeAvailability::reviews`]).
 pub const REVIEWER_RUNTIMES: &[&str] = &["claude-code", "codex", "grok-build"];
 
 /// The built-in profiles, from the skills' table. A `[loops.profiles.<name>]` of the same name
@@ -416,7 +418,7 @@ pub fn parse_implementer(s: &str) -> Result<Option<ModelChoice>, String> {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReviewerChoice {
-    /// The runtime, one of [`REVIEWER_RUNTIMES`].
+    /// The runtime: one of [`REVIEWER_RUNTIMES`], or an ACP preset's name.
     pub runtime: String,
     /// The account of the runtime; `None`: the runtime's default account.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -426,7 +428,10 @@ pub struct ReviewerChoice {
 }
 
 impl ReviewerChoice {
-    /// Parses `runtime[:account]/model`; the runtime must be one of [`REVIEWER_RUNTIMES`].
+    /// Parses `runtime[:account]/model`. The runtime is a plain runtime name: whether it can
+    /// review (one of [`REVIEWER_RUNTIMES`], or an ACP preset that names a read-only mode) is
+    /// what the config ([`crate::config::Config::validate`]) and the settings
+    /// ([`crate::loops::settings::validate`]) check, since only they know the presets.
     pub fn parse(s: &str) -> Result<ReviewerChoice, String> {
         let s = s.trim();
         let Some((left, model)) = s.split_once('/') else {
@@ -435,12 +440,6 @@ impl ReviewerChoice {
             ));
         };
         let (runtime, account) = parse_runtime_account(left)?;
-        if !REVIEWER_RUNTIMES.contains(&runtime.as_str()) {
-            return Err(format!(
-                "{runtime:?} can't review yet ({} can)",
-                REVIEWER_RUNTIMES.join(", ")
-            ));
-        }
         if split_effort(model).1.is_some() {
             return Err(format!(
                 "{s:?} gives an effort: a reviewer's effort is each round's, from the profile"
@@ -644,7 +643,9 @@ pub enum SweepMode {
     /// The thread, with its own read-only subagents where its runtime has them.
     #[default]
     Thread,
-    /// The hub, one read-only audit run per rule on the reviewer's model (a later milestone).
+    /// The hub, one read-only audit run per rule on the reviewer's model, up to
+    /// `max_audit_runs` at once; the thread verifies their reports (`twr_core::loops`, "The
+    /// sweep's audit runs").
     Runs,
 }
 
@@ -886,8 +887,10 @@ mod tests {
         assert!(parse_implementer("nope")
             .unwrap_err()
             .contains("or \"thread\""));
+        // An ACP preset's name parses; whether it can review is the settings' to say.
+        assert_eq!(ReviewerChoice::parse("gemini/x").unwrap().runtime, "gemini");
         for (bad, why) in [
-            ("gemini/x", "can't review yet"),
+            ("acp:gemini/x", "is not a runtime name"),
             ("codex/gpt-6.1-sol:high", "gives an effort"),
             ("codex", "is not runtime[:account]/model"),
         ] {
@@ -984,7 +987,7 @@ verify = { rounds = 1, effort = "medium" }
         for (toml, key) in [
             ("profile = \"nope\"", "loops.profile: "),
             ("implementer = \"x\"", "loops.implementer: "),
-            ("reviewer = \"gemini/x\"", "loops.reviewer: "),
+            ("reviewer = \"acp:x/y\"", "loops.reviewer: "),
             ("workers = \"a/b\"", "loops.workers: "),
             ("max_audit_runs = 0", "loops.max_audit_runs: "),
             ("round_timeout = \"30s\"", "loops.round_timeout: "),

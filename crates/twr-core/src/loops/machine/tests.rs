@@ -1006,3 +1006,6 @@ fn the_ask_after_a_restart_and_reply_inputs() {
 
 #[path = "impl_tests.rs"]
 mod implementation;
+
+#[path = "sweep_runs_tests.rs"]
+mod sweep_runs;

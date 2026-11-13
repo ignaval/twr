@@ -31,8 +31,8 @@ use crate::app::{ActionKind, AppState};
 use crate::color::{contrast, degrade, rgb, Depth};
 use crate::loops::RowKey;
 use crate::loops_tests::{
-    change, hub, impl_started, implementing, looping, raise_stuck, settings_got, started, ImplRun,
-    Upto,
+    auditing, change, hub, impl_started, implementing, looping, raise_stuck, settings_got, started,
+    ImplRun, Upto,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -747,6 +747,117 @@ fn surfaces() -> Vec<Surface> {
         buf,
     });
     out.extend(impl_surfaces());
+    out.extend(sweep_surfaces());
+    out
+}
+
+/// The sweep audited by runs (`sweep = "runs"`): the loop line counting the rules audited with
+/// the card's activity under it, the popup's progress listing each audit, a dive's folded and
+/// opened rules and audit rows (a failed audit in red), and the editor's Sweep row.
+fn sweep_surfaces() -> Vec<Surface> {
+    let mut out = Vec::new();
+    let mut st = three_threads();
+    auditing(&mut st, "t-gamma");
+    let buf = full(&mut st, 160, 40);
+    let a = at(&buf, " REVIEW LOOP ", 0);
+    let card = boxed(&buf, a);
+    out.push(Surface {
+        name: "sweep-line-auditing",
+        // (The activity row under it is the card's own state line, in its own colors.)
+        title: "Loop line while the sweep's audits run",
+        cells: vec![rows_of(card, a.1, a.1)],
+        crop: card,
+        buf,
+    });
+    st.set_focus(Some("t-gamma".into()));
+    popup_open(&mut st);
+    let buf = full(&mut st, 160, 40);
+    let a = at(&buf, "audits s1 a 2", 0);
+    let popup = boxed(&buf, a);
+    let top = at(&buf, " REVIEW LOOP ", 1);
+    let last = at(&buf, " loop settings…", 0);
+    out.push(Surface {
+        name: "sweep-popup",
+        title: "A popup's progress while the sweep's audits run",
+        cells: vec![rows_of(popup, top.1, last.1)],
+        crop: popup,
+        buf,
+    });
+    // A dive: the rules and audit rows, folded and open.
+    let mut st = three_threads();
+    st.dive("t-gamma");
+    let tr = st.transcript.as_mut().unwrap();
+    tr.settle();
+    let (_, mut evs) = crate::loops_tests::auditing_events("t-gamma");
+    let mut g = ThreadScript::new("t-gamma");
+    g.at(950);
+    evs.push(hub(
+        &mut g,
+        EventBody::LoopAudit(twr_core::event::LoopAudit {
+            id: "l1".into(),
+            rule: 3,
+            name: "c".into(),
+            failed: true,
+            reason: Some("timed out".into()),
+            ..Default::default()
+        }),
+    ));
+    for ev in &evs {
+        tr.apply(ev);
+    }
+    let sweep_rows = |buf: Buffer, name: &'static str, title: &'static str| {
+        let first = at(&buf, "↻ sweep rules", 0);
+        let end = *find(&buf, "failed: timed out")
+            .last()
+            .unwrap_or_else(|| panic!("no failed audit row:\n{}", screen(&buf)));
+        let side = (0..first.0)
+            .rev()
+            .find(|&i| SIDES.contains(sym(&buf, i, first.1)))
+            .map_or(0, |i| i + 1);
+        let right = (first.0..buf.area.width)
+            .find(|&i| SIDES.contains(sym(&buf, i, first.1)))
+            .unwrap_or(buf.area.width);
+        let cells = Rect::new(side, first.1, right - side, end.1 - first.1 + 1);
+        let crop = Rect::new(
+            side,
+            first.1.saturating_sub(1),
+            right - side,
+            (end.1 + 2).min(buf.area.height) - first.1.saturating_sub(1),
+        );
+        Surface {
+            name,
+            title,
+            buf,
+            cells: vec![cells],
+            crop,
+        }
+    };
+    let buf = full(&mut st, 160, 60);
+    out.push(sweep_rows(
+        buf,
+        "sweep-dive-folded",
+        "A dive: the sweep's rules and audits folded, a failed one in red",
+    ));
+    st.view.expand_all = true;
+    let buf = full(&mut st, 160, 80);
+    out.push(sweep_rows(
+        buf,
+        "sweep-dive-open",
+        "A dive: the sweep's rules and audits open (ctrl+o)",
+    ));
+    // The editor's Sweep row, switched to runs and selected.
+    let mut st = three_threads();
+    st.open_loop_settings(None, false);
+    st.apply_result(
+        "loop.settings.get",
+        &json!({"asked": {}, "result": settings_got()}),
+    );
+    change(&mut st, RowKey::Sweep, KeyCode::Right);
+    out.push(editor(
+        "editor-sweep",
+        "Settings editor: the Sweep row on runs, selected",
+        &mut st,
+    ));
     out
 }
 

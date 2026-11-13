@@ -211,7 +211,7 @@ With Claude Code, the end of a command the agent ran in the background opens the
 
 ## Loops
 
-A review loop has another model review a thread's work, round after round, until it finds nothing new. Each round, a reviewer (Codex, Claude Code or Grok Build) reads the thread's changes read-only and lists findings; the thread checks each one against the code, fixes it or dismisses it with a reason, runs its gates and says what it did; dismissed findings go into a ledger that every later round reads, so they are not raised again. The hub runs the rounds, counts and sequences them, and writes a report at the end ([the design](design/loops.md)). The thread is the implementer and the arbiter: it is the session that wrote the code. An implementation loop does the same after the thread has planned the task and built it ([below](#implementation-loops)). Loops run in a thread on the hub's own machine with a git workspace, in a mode that can edit (not `plan` or `read-only`: a loop never widens a mode).
+A review loop has another model review a thread's work, round after round, until it finds nothing new. Each round, a reviewer (Codex, Claude Code, Grok Build, or an ACP agent whose preset names its read-only mode, [below](#acp-reviewers)) reads the thread's changes read-only and lists findings; the thread checks each one against the code, fixes it or dismisses it with a reason, runs its gates and says what it did; dismissed findings go into a ledger that every later round reads, so they are not raised again. The hub runs the rounds, counts and sequences them, and writes a report at the end ([the design](design/loops.md)). The thread is the implementer and the arbiter: it is the session that wrote the code. An implementation loop does the same after the thread has planned the task and built it ([below](#implementation-loops)). Loops run in a thread with a git workspace, in a mode that can edit (not `plan` or `read-only`: a loop never widens a mode), on the hub's own machine or on a remote box: there the reviewer runs on the box, with the box's own CLI and login, so it must be installed and logged in there ([runners.md](runners.md#loops-on-a-box)); a box that goes away fails the round it was running, which runs again once when the box is back (the loop line says `waiting on box gpu` meanwhile).
 
 ```sh
 twr loop review api                          # start a review loop on api's work
@@ -247,7 +247,9 @@ How much review a loop runs is its profile: `high` runs a medium-effort tier unt
 
 `--profile`, `--reviewer` (`runtime[:account]/model`), `--implementer` (`thread`, or `runtime[:account]/model[:effort]` on the thread's own runtime), `--workers` (the implementer's subagents, `model[:effort]`) and `--commit` (`match` or `none`; [below](#commits)) change this run only and leave the saved settings alone. Before the first save they fill in the settings card instead. Each value is checked before anything is sent: a typo is an error that says what the value takes.
 
-While a loop runs, the hub sends the thread one prompt per step, each starting with `[twr loop <id> <step>]`: the scope step (run the gates, write a GOAL paragraph for the reviewer), each round's triage, the sweep, the report. A message you send the thread goes ahead of the loop's next prompt, and the loop goes on after that turn. While a round's review runs, the thread shows as `background`. Each step's turn has a report like any other turn; the loop's last one is its report ([below](#the-report)).
+While a loop runs, the hub sends the thread one prompt per step, each starting with `[twr loop <id> <step>]`: the scope step (run the gates, write a GOAL paragraph for the reviewer), each round's triage, the sweep, the report.
+
+**The sweep** distills what the ladder fixed into named rules and audits the whole touched surface for each one. By default (`sweep = "thread"`) the thread does it in one turn, with its own read-only subagents where its runtime has them. With `sweep = "runs"` (the settings editor's **Sweep** row, `twr loop settings set --sweep runs`, or `[loops] sweep` for the first card) it takes two turns with the hub's runs between them: the thread names the rules (`rules` step, at most 12), the hub runs one read-only audit run per rule on the reviewer's model at the verification's effort, up to `[loops] max_audit_runs` at once, and the thread then gets their reports as data (`sweep` step), verifies every citation, fixes what survives and reports each rule. That costs one reviewer call per rule. An audit run that fails is retried once; one that fails again leaves its rule not audited, which the thread is told and either audits itself or reports as not audited with the reason. While the audits run, the loop line reads `sweep · auditing 2/5` (rules audited of all) and the card `background · auditing 3 of 5 rules`. A message you send the thread goes ahead of the loop's next prompt, and the loop goes on after that turn. While a round's review runs, the thread shows as `background`. Each step's turn has a report like any other turn; the loop's last one is its report ([below](#the-report)).
 
 ### Implementation loops
 
@@ -308,6 +310,7 @@ twr loop settings --project api              # the set api uses
 twr loop settings --edit                     # change the workspace's in your editor
 twr loop settings --edit --project api       # give api its own
 twr loop settings set --preset claude --profile medium   # change named settings, no editor
+twr loop settings set --sweep runs                       # the hub audits the sweep: one reviewer run per rule
 twr loop settings --reset --project api      # api uses the workspace's again
 twr loop settings --reset                    # forget every saved set: the next loop shows the card
 ```
@@ -337,6 +340,22 @@ When the loop ends, the hub writes `report.md` in the loop's folder (`<data dir>
 ### What the reviewer can read
 
 The reviewer runs on the hub's machine as a program of yours, one headless call of its CLI per round, in the thread's working directory, on your own login (or the account the settings name), and counts against that login's usage; what it spent is added to the thread's. It runs read-only by flags no setting reaches, and without twr's tokens. Its prompt names the round's diffs, the GOAL and the ledger in the loop folder. Like any read-only program of yours it can read what your user can read, not only the diff, so run loops on repositories whose content you trust not to steer it. What it answers reaches the thread as another model's findings to verify, never as instructions, and only the thread's own final message answers a step ([security-model.md](security-model.md)).
+
+### ACP reviewers
+
+An ACP agent can review too, when its `[runtimes.<name>]` preset has a `review` table naming the agent's read-only mode ([configuration.md](configuration.md#notes-on-some-keys)):
+
+```toml
+[runtimes.example-agent]          # a fictional agent
+acp = "example-agent --acp"
+[runtimes.example-agent.review]
+mode = "read-only"                # the agent's own read-only mode
+models = ["example-large"]
+```
+
+Then `example-agent/example-large` is a reviewer like `codex/gpt-6.1-sol`: in `--reviewer`, the settings card and every settings editor, which list the presets that can review beside Claude Code, Codex and Grok Build, and show the others disabled with the reason (`acp preset bare names no read-only mode`). A card with an ACP reviewer always warns `acp reviewer: read-only rests on the agent's own "read-only" mode` (see [security-model.md](security-model.md#the-relay-rule)). An ACP agent whose program isn't on the hub's `PATH` is `not installed`, and the card moves the reviewer to the next built-in one, as it does for a missing CLI. The same-family warning uses the model's family when twr can tell it from the name, and says nothing otherwise.
+
+Each round starts the agent in the thread's worktree, opens one ACP session in that mode, on the round's model (and effort, when the preset lists `efforts`), and sends the round's prompt with one more paragraph: answer with the findings in one fenced `json` block. The hub reads the last such block of the reply, checked like any reviewer's answer. A reply without a valid block is asked once more in the same session; a second one is a failed run, which the loop retries once like any failed run. A session that doesn't report the read-only mode, or another read-only one twr knows, never gets the prompt: the run fails. Every permission request the agent makes during the run is refused and noted in the round's log (`round-<round>.log` in the loop folder), which also holds what the agent said and the tools it called. What it spent is what its ACP prompt results report, or nothing.
 
 ## Attach
 

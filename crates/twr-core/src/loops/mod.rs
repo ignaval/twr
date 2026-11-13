@@ -230,8 +230,12 @@ pub enum WaitingOn {
 /// The loop line a card draws after the [`badge`]: the profile, where the loop is and the
 /// ledger's size: `high · scope`, `high · ladder m3 · ledger 2`, `high · sweep`,
 /// `medium · verify 1/2`, `high · report`, with `· paused` when it is paused (and `· stuck`
-/// when a step failed and waits for the user). An implementation loop's first phases read
-/// `high · plan`, `high · plan check` and `high · implementing`.
+/// when a step failed and waits for the user, `· waiting on box devbox` while its thread's
+/// remote box is away and the loop needs it for a run). An implementation loop's first phases read
+/// `high · plan`, `high · plan check` and `high · implementing`. With `sweep = "runs"` the
+/// sweep reads `high · sweep · rules` (the rules turn), `high · sweep · auditing 2/5` (the
+/// rules whose audit run ended, of all) and `high · sweep · verifying` (the thread's turn
+/// with the reports).
 pub fn line(l: &LoopView) -> String {
     let [full, ..] = line_forms(l);
     full
@@ -240,7 +244,7 @@ pub fn line(l: &LoopView) -> String {
 /// The loop line in the forms a card too narrow for it falls back on, longest first: the
 /// [`line`] itself (`high · ladder m3 · ledger 2`); without the profile (`ladder m3 · ledger
 /// 2`); and short (`m3 · ldg 2`, `v1/5`, `sweep · ldg 2 · paused`; `plan`, `p1`, `impl` for an
-/// implementation loop's first phases). Where the loop is comes first in each, so a cut at the
+/// implementation loop's first phases; `rules`, `aud 2/5` for the sweep's audit runs). Where the loop is comes first in each, so a cut at the
 /// end keeps it longest.
 pub fn line_forms(l: &LoopView) -> [String; 3] {
     let (place, short_place) = match l.phase {
@@ -267,6 +271,19 @@ pub fn line_forms(l: &LoopView) -> [String; 3] {
                 .unwrap_or_else(|| Phase::PlanCheck.as_str().to_string()),
         ),
         Phase::Implement => ("implementing".into(), "impl".into()),
+        // `sweep = "runs"`: the rules turn, the audit runs (ended of all), the verification.
+        Phase::Sweep if l.wait == Wait::Rules => ("sweep · rules".into(), "rules".into()),
+        Phase::Sweep if l.wait == Wait::Audits => {
+            let done = l.audits.iter().filter(|a| a.status.ended()).count();
+            let all = l.audits.len();
+            (
+                format!("sweep · auditing {done}/{all}"),
+                format!("aud {done}/{all}"),
+            )
+        }
+        Phase::Sweep if !l.audits.is_empty() && l.wait == Wait::Sweep => {
+            ("sweep · verifying".into(), "sweep".into())
+        }
         p => (p.as_str().to_string(), p.as_str().to_string()),
     };
     let (ledger, short_ledger) = if l.ledger > 0 {
@@ -279,6 +296,8 @@ pub fn line_forms(l: &LoopView) -> [String; 3] {
     };
     let state = if l.stuck.is_some() {
         Some("stuck".to_string())
+    } else if let Some(b) = &l.box_away {
+        Some(format!("waiting on box {b}"))
     } else if l.paused {
         Some("paused".to_string())
     } else {

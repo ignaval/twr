@@ -71,6 +71,9 @@ only once its options have been on screen for 600 ms: from when the card appears
 into view or the window is shown again, and from zero for a request raised again. Until then
 they show dimmed and a click or key does nothing, so the second click of a double click, or a
 key pressed as one card replaces another, can't answer the request that slid into place.
+In a conversation, its requests take at most about a third of its height and scroll in their
+own area, so the composer stays in view; while a request goes on below that area's edge
+(its buttons, in a short window), the edge fades out, and Tab brings each button into view.
 After an answer is accepted the card shows **Sent** and its buttons stay disabled until it
 goes away. Answers need a live connection to the hub. Orchestrator messages use `say` with
 the displayed control position, matching the TUI's relay semantics.
@@ -201,7 +204,11 @@ machine.
   skipped), what it runs on and whose settings they are, each round's findings and
   new-class count (the round whose review still runs reads `under review`; open a round for
   its findings and the thread's verdicts; an implementation loop's plan check is round
-  `p1`), the ledger, and whether it waits on the thread, the review or you. An
+  `p1`), the ledger, and whether it waits on the thread, the review or you. A sweep the hub
+  audits (`sweep = "runs"`) lists its rules like rounds, each with what its audit found
+  (`2 findings`, `no place breaks it`, `auditing`, `waiting for a slot`, `not run: …`) and
+  the thread's verdict, open for the audit's findings; while they run the card reads
+  `auditing 3 of 5 rules` and the loop line `sweep · auditing 2/5`. An
   implementation loop also shows its plan (revision, contract risk yes or no with the reason,
   and where `plan.md` is), its implement turn's result and gates, and what it commits.
   **Pause** or **Resume**, **Skip to verify** and **Stop** (after a confirmation) control
@@ -226,9 +233,12 @@ machine.
   the four presets, the implementer (the thread's own, or a runtime, model and effort), its
   workers where its runtime has subagents, the reviewer (runtime, model, and account where
   it has several), the profile, an implementation loop's plan check and commits, what a
-  review loop commits, and **Save for** (all projects
+  review loop commits, **Sweep** (the thread audits the rules, or a reviewer run per rule:
+  one reviewer call per rule, the hint under it says), and **Save for** (all projects
   or this project). Only runtimes that are installed and logged in can be chosen; the
-  others show why not. A hub that does not check its agent CLIs (`TWR_AGENT_PROBE=off`)
+  others show why not. The reviewer's list also has the ACP presets: one that names its
+  read-only mode reads `ex (acp, read-only mode)`, and one that doesn't is disabled with the
+  reason ([usage.md](usage.md#acp-reviewers)); the implementer's list has none. A hub that does not check its agent CLIs (`TWR_AGENT_PROBE=off`)
   can't say, so every runtime can be chosen, marked `not checked`. **Settings › Loops** shows the same editor, the projects with their
   own settings (open or remove them) and **Reset all**.
 
@@ -405,7 +415,9 @@ a loop** sends it as a message, **Start and save** runs the plan, the implement 
 review rounds, the report and the commit (the script commits for the fake thread), its end
 notifies, and the New thread form's switch starts one that ends `not committed`. With `TWR_LOOPS_SHOTS=<dir>` it also saves each
 step in both themes, at the default size and the minimum width, with its accessibility tree.
-It runs against the debug build only. Debug
+`TWR_LOOPS_WINDOW=<width>x<height>` runs it in a window of that size, such as a CI runner's
+`1024x674`, where the requests in the conversation scroll in their own area and the script
+scrolls to their buttons as a person would. It runs against the debug build only. Debug
 fixtures use the existing debug-only user token inside their own private `TWR_HOME`; release
 builds ignore that token. No real account or existing workspace is used.
 

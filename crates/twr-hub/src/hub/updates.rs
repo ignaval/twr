@@ -57,6 +57,8 @@ fn may_update(body: &EventBody) -> bool {
             | EventBody::LoopPlan(_)
             | EventBody::LoopImplemented(_)
             | EventBody::LoopCommit(_)
+            | EventBody::LoopRules(_)
+            | EventBody::LoopAudit(_)
             | EventBody::ReportReady(_)
             | EventBody::TaskUpdated(_)
             | EventBody::ConversationUpdate(_)
@@ -523,7 +525,76 @@ impl Core {
                     Some(e.thread.clone()),
                     routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
                 ),
+                // The sweep's rules and audit runs (`sweep = "runs"`): routine, failures too,
+                // since a failed audit never holds the loop (it is retried once, then reported
+                // to the thread as not run).
+                (EventBody::LoopRules(p), Some(v)) => (
+                    if p.rules.is_empty() {
+                        format!(
+                            "{}: its {loop_words}'s sweep named no rule to audit",
+                            v.name
+                        )
+                    } else {
+                        format!(
+                            "{}: its {loop_words}'s sweep named {} rule{} to audit: {}",
+                            v.name,
+                            p.rules.len(),
+                            if p.rules.len() == 1 { "" } else { "s" },
+                            cut(
+                                &p.rules
+                                    .iter()
+                                    .map(|r| r.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                300
+                            )
+                        )
+                    },
+                    Some(e.thread.clone()),
+                    routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
+                ),
+                (EventBody::LoopAudit(p), Some(v)) => {
+                    let audit = twr_core::loops::contract::audit_id(p.rule);
+                    let (model, effort) = prev_loop
+                        .as_ref()
+                        .map(|l| (l.reviewer.model.clone(), l.plan.audit_effort.clone()))
+                        .unwrap_or_default();
+                    let retried = prev_loop.as_ref().is_some_and(|l| {
+                        l.audits.iter().any(|a| a.rule == p.rule && a.retried)
+                    });
+                    let text = if p.failed {
+                        format!(
+                            "{}: sweep audit {audit} ({}) · {model} {effort} failed{}: {}",
+                            v.name,
+                            p.name,
+                            if retried {
+                                " again: not run"
+                            } else {
+                                "; retrying it"
+                            },
+                            cut(p.reason.as_deref().unwrap_or("the run failed"), 300)
+                        )
+                    } else {
+                        let n = p.findings.len();
+                        format!(
+                            "{}: sweep audit {audit} ({}) · {model} {effort} · {n} finding{}",
+                            v.name,
+                            p.name,
+                            if n == 1 { "" } else { "s" }
+                        )
+                    };
+                    (
+                        text,
+                        Some(e.thread.clone()),
+                        routine(
+                            twr_ext_map(json!({"loop": p.id, "audit": audit})),
+                            ROUTINE_LOOP,
+                        ),
+                    )
+                }
                 (EventBody::LoopFindings(_)
+                | EventBody::LoopRules(_)
+                | EventBody::LoopAudit(_)
                 | EventBody::LoopTransition(_)
                 | EventBody::LoopPhase(_)
                 | EventBody::LoopControl(_)

@@ -323,7 +323,10 @@ impl Hub {
         // named implementer (`the thread's own`: the project's, as without a loop).
         if let Some(l) = req.loop_req.clone() {
             if req.runtime.is_none() && req.model.is_none() {
-                if let Some(m) = self.new_thread_implementer(&l, &target.project).await {
+                if let Some(m) = self
+                    .new_thread_implementer(&l, &target.project, &box_name)
+                    .await
+                {
                     req.runtime = Some(match &m.account {
                         Some(a) => format!("{}:{a}", m.runtime),
                         None => m.runtime.clone(),

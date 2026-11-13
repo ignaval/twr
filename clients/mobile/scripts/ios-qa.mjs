@@ -740,7 +740,7 @@ for (const [
           });
           const readOnly = await loopReadOnlyQA(driver, loops, {
             ...options,
-            step: 40,
+            step: 60,
           });
           writeFileSync(
             join(loopShots, "ios-loop-qa-read.json"),

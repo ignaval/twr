@@ -2509,9 +2509,29 @@ fn section_lines(
 
 /// The activity line of thread `t` while it waits, in the background, on its loop's review
 /// run alone: the run's description and how long it has run (`reviewer gpt-6.1-sol xhigh ·
-/// 6m`). `None` otherwise (it works, or has other background work too).
+/// 6m`); on its sweep's audit runs alone, how many rules they audit of all and how long the
+/// oldest has run (`auditing 2 of 5 rules · 3m`). `None` otherwise (it works, or has other
+/// background work too).
 fn review_activity(t: &ThreadView) -> Option<String> {
     if t.status() != ThreadStatus::Background {
+        return None;
+    }
+    // The sweep's audit runs (`sweep = "runs"`): how many rules are being audited, of all.
+    if let Some(l) = t
+        .r#loop
+        .as_ref()
+        .filter(|l| l.wait == twr_core::loops::Wait::Audits)
+    {
+        let mut tasks = t.background_tasks.values().filter(|b| b.in_background());
+        if tasks.clone().all(|b| b.review) {
+            let running = tasks.clone().count();
+            let mut out = format!("auditing {running} of {} rules", l.audits.len());
+            if let Some(at) = tasks.by_ref().filter_map(|b| b.started_at).min() {
+                let secs = (chrono::Utc::now() - at).num_seconds();
+                out.push_str(&format!(" · {}", twr_core::work::ago(secs)));
+            }
+            return Some(out);
+        }
         return None;
     }
     let mut tasks = t.background_tasks.values().filter(|b| b.in_background());
@@ -5850,10 +5870,10 @@ fn loop_kind(
         })
     });
     known.unwrap_or_else(|| {
-        if entries
-            .iter()
-            .any(|e| matches!(e, Entry::LoopStep { loop_id, .. } if loop_id == id))
-        {
+        if entries.iter().any(|e| {
+            matches!(e, Entry::LoopStep { loop_id, note, .. }
+                if loop_id == id && note.implementation_only())
+        }) {
             LoopKind::Implement
         } else {
             LoopKind::Review

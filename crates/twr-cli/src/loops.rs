@@ -267,6 +267,11 @@ pub(super) enum LoopSettingsCmd {
         /// always or never.
         #[arg(long, value_parser = ["profile", "contracts", "always", "never"])]
         plan_check: Option<String>,
+        /// Who audits the sweep's rules: thread (the thread, with its own subagents) or runs
+        /// (one read-only reviewer run per rule, up to `[loops] max_audit_runs` at once: one
+        /// reviewer call per rule).
+        #[arg(long, value_parser = ["thread", "runs"])]
+        sweep: Option<String>,
         /// Print `loop.settings.set`'s answer as JSON.
         #[arg(long)]
         json: bool,
@@ -583,6 +588,7 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
                     commit,
                     implementation_commit,
                     plan_check,
+                    sweep,
                     json,
                 }),
             ..
@@ -597,6 +603,7 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
                 commit,
                 implementation_commit,
                 plan_check,
+                sweep,
             };
             settings_set(socket, project, changes, json).await?;
             Ok(ExitCode::SUCCESS)
@@ -881,7 +888,10 @@ async fn change_card(
     let setup = &card["setup"];
     let settings: LoopSettings = serde_json::from_value(setup["settings"].clone())
         .context("the card's settings do not read")?;
-    let avail = c.call("loop.settings.get", json!({})).await?;
+    // What the card's thread's box has (a remote box's own CLIs).
+    let avail = c
+        .call("loop.settings.get", json!({"thread": card["thread"]}))
+        .await?;
     let thread = str_of(&card["thread_name"]).to_string();
     let implement = setup["kind"] == "implement";
     let doc = render_doc(
@@ -1021,6 +1031,7 @@ struct Changes {
     commit: Option<String>,
     implementation_commit: Option<String>,
     plan_check: Option<String>,
+    sweep: Option<String>,
 }
 
 /// The settings `twr loop settings set` and `--edit` start from: those that apply to
@@ -1081,6 +1092,9 @@ async fn settings_set(
             "profile" => None,
             p => Some(PlanCheck::parse(p).map_err(parse)?),
         };
+    }
+    if let Some(w) = ch.sweep {
+        s.sweep = sweep_mode(&w).map_err(parse)?;
     }
     let mut params = json!({ "settings": s });
     if let Some(p) = &project {
@@ -1366,9 +1380,10 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
             .into(),
         format!("workers = {}", toml_str(&s.workers.to_string())),
         String::new(),
-        "# The reviewer: runtime[:account]/model (claude-code, codex or grok-build); its effort is"
+        "# The reviewer: runtime[:account]/model (claude-code, codex, grok-build, or an acp preset"
             .into(),
-        "# each round's, from the profile.".into(),
+        "# below that names a read-only mode); its effort is each round's, from the profile."
+            .into(),
         format!("reviewer = {}", toml_str(&s.reviewer.to_string())),
         String::new(),
         "# What a review loop commits: \"match\" (the fixes, when the thread commits its work) or"
@@ -1386,6 +1401,11 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
             "plan_check = {}",
             toml_str(s.plan_check.map_or("profile", PlanCheck::as_str))
         ),
+        String::new(),
+        "# Who audits the sweep's rules: \"thread\" (the thread, with its own subagents) or".into(),
+        "# \"runs\" (one read-only reviewer run per rule, in parallel: one reviewer call per rule)."
+            .into(),
+        format!("sweep = {}", toml_str(sweep_words(s.sweep))),
     ];
     for l in lines {
         out.push_str(&l);
@@ -1429,7 +1449,12 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
         .map(runtime_words)
         .collect();
     if !runtimes.is_empty() {
-        out.push_str("\n# On the hub's machine:\n");
+        match got["box"].as_str() {
+            Some(b) => out.push_str(&format!(
+                "\n# On box {b} (the thread's, where its reviewer runs):\n"
+            )),
+            None => out.push_str("\n# On the hub's machine:\n"),
+        }
         for r in runtimes {
             out.push_str(&format!("#   {r}\n"));
         }
@@ -1437,13 +1462,25 @@ fn render_doc(s: &LoopSettings, what: &DocFor<'_>, got: &Value) -> String {
     out
 }
 
-/// One runtime of `loop.settings.get`'s `runtimes`, in words.
+/// One runtime of `loop.settings.get`'s `runtimes`, in words. An ACP preset says whether it
+/// can review (its read-only mode) or why not.
 fn runtime_words(r: &Value) -> String {
     let name = str_of(&r["runtime"]);
+    let acp = r["acp"] == true;
+    if acp {
+        if let Some(why) = r["cannot_review"].as_str() {
+            return format!("{name}: can't review ({why})");
+        }
+    }
     if r["found"] != true {
         return format!("{name}: not installed");
     }
-    let mut parts = vec![if r["login"] == true {
+    let mut parts = vec![if acp {
+        format!(
+            "acp preset, reviews in its {:?} mode",
+            str_of(&r["review_mode"])
+        )
+    } else if r["login"] == true {
         "logged in".to_string()
     } else {
         "not logged in".to_string()
@@ -1484,6 +1521,8 @@ struct Doc {
     implementation_commit: Option<String>,
     #[serde(default)]
     plan_check: Option<String>,
+    #[serde(default)]
+    sweep: Option<String>,
     #[serde(default)]
     save_for: Option<String>,
     #[serde(default)]
@@ -1530,6 +1569,9 @@ fn parse_doc(text: &str, base: &LoopSettings, card: bool) -> anyhow::Result<Opti
                 "plan_check: {other:?} is not a plan check (profile, never, contracts or always)"
             ),
         };
+    }
+    if let Some(w) = &doc.sweep {
+        s.sweep = sweep_mode(w.trim()).map_err(key("sweep"))?;
     }
     if !card && (doc.save_for.is_some() || doc.scope.is_some()) {
         bail!("save_for and scope belong to a loop's settings card, not to saved settings");
@@ -1580,6 +1622,23 @@ fn transition_words(reason: &str) -> &str {
     }
 }
 
+/// `thread` or `runs`, as the settings write a sweep mode.
+fn sweep_words(m: twr_core::loops::config::SweepMode) -> &'static str {
+    match m {
+        twr_core::loops::config::SweepMode::Thread => "thread",
+        twr_core::loops::config::SweepMode::Runs => "runs",
+    }
+}
+
+/// The sweep mode `w` names.
+fn sweep_mode(w: &str) -> Result<twr_core::loops::config::SweepMode, String> {
+    match w {
+        "thread" => Ok(twr_core::loops::config::SweepMode::Thread),
+        "runs" => Ok(twr_core::loops::config::SweepMode::Runs),
+        other => Err(format!("{other:?} is neither \"thread\" nor \"runs\"")),
+    }
+}
+
 /// The rows of settings `s` (`runtime · model · effort`) for a loop of `kind` (`review`,
 /// `implement`; `None`: saved settings, which both kinds share), with this run's `overrides`.
 fn settings_rows(s: &LoopSettings, overrides: Option<&Value>, kind: Option<&str>) -> Vec<String> {
@@ -1594,6 +1653,9 @@ fn settings_rows(s: &LoopSettings, overrides: Option<&Value>, kind: Option<&str>
         format!("workers      {}", s.workers),
         format!("reviewer     {}", s.reviewer),
     ];
+    if s.sweep == twr_core::loops::config::SweepMode::Runs {
+        rows.push("sweep        runs (one reviewer call per rule)".into());
+    }
     let plan_check = s.plan_check.map_or("the profile's", PlanCheck::as_str);
     match kind {
         Some("review") => rows.push(format!("commit       {}", s.review_commit.as_str())),
@@ -1920,6 +1982,7 @@ fn show_text(d: &Value) -> String {
             ));
         }
     }
+    out.extend(sweep_rows(d));
     let ledger = d["ledger"].as_array().cloned().unwrap_or_default();
     out.push(format!("ledger: {}", ledger.len()));
     for e in &ledger {
@@ -1980,6 +2043,76 @@ fn show_text(d: &Value) -> String {
         out.push(format!("report: {r}"));
     }
     out.join("\n")
+}
+
+/// The sweep's rows of `loop.get`'s answer `d` when the hub audited it (`sweep = "runs"`):
+/// each rule, its audit (findings, failed, not run) and the thread's verdict, with each
+/// finding of the audit; nothing for a sweep the thread audited itself.
+fn sweep_rows(d: &Value) -> Vec<String> {
+    let Some(rules) = d["sweep"]["rules"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = vec![if rules.is_empty() {
+        "sweep (audited by runs): no rule named".to_string()
+    } else {
+        "sweep (audited by runs):".to_string()
+    }];
+    for r in rules {
+        let a = &r["audit"];
+        let failures = a["failures"].as_array().map_or(0, Vec::len);
+        let audit = match str_of(&a["status"]) {
+            "answered" => match a["count"].as_u64().unwrap_or(0) {
+                0 => "clean".to_string(),
+                1 => "1 finding".to_string(),
+                n => format!("{n} findings"),
+            },
+            "not_run" => format!(
+                "not run: {}",
+                first_line(
+                    a["failures"]
+                        .as_array()
+                        .and_then(|f| f.last())
+                        .and_then(Value::as_str)
+                        .unwrap_or("-")
+                )
+            ),
+            "failed" => "failed, retrying".to_string(),
+            "running" if failures > 0 => "running (retry)".to_string(),
+            "running" => "running".to_string(),
+            _ => "waiting".to_string(),
+        };
+        let verdict = match r["verdict"]["result"].as_str() {
+            Some(v) => format!(
+                " → {}{}",
+                v.replace('_', " "),
+                r["verdict"]["reason"]
+                    .as_str()
+                    .map(|w| format!(" ({})", first_line(w)))
+                    .unwrap_or_default()
+            ),
+            None => String::new(),
+        };
+        out.push(format!(
+            "  {} {}: {audit}{verdict}",
+            str_of(&a["id"]),
+            str_of(&r["name"])
+        ));
+        out.push(format!(
+            "    rule: {} (where: {})",
+            first_line(str_of(&r["rule"])),
+            first_line(str_of(&r["where"]))
+        ));
+        for f in a["findings"].as_array().into_iter().flatten() {
+            out.push(format!(
+                "    {} {} {}: {}",
+                str_of(&f["id"]),
+                str_of(&f["severity"]),
+                str_of(&f["location"]),
+                first_line(str_of(&f["problem"]))
+            ));
+        }
+    }
+    out
 }
 
 /// An implementation loop's plan and implement rows of `loop.get`'s answer `d`: each plan
@@ -2486,6 +2619,11 @@ mod tests {
                 {"runtime": "codex", "found": true, "login": true, "models": ["gpt-6.1-sol"],
                  "efforts": ["medium", "xhigh"], "accounts": [], "subagents": false},
                 {"runtime": "grok-build", "found": false},
+                {"runtime": "ex", "found": true, "login": true, "models": ["ex-large"],
+                 "efforts": [], "acp": true, "review_mode": "read-only", "cannot_review": null},
+                {"runtime": "bare", "found": true, "login": true, "models": [], "efforts": [],
+                 "acp": true, "review_mode": null,
+                 "cannot_review": "acp preset bare names no read-only mode"},
             ],
         });
         let doc = render_doc(
@@ -2500,6 +2638,26 @@ mod tests {
         assert!(doc.contains("implementer = \"thread\""), "{doc}");
         assert!(doc.contains("#   codex: logged in; models gpt-6.1-sol; efforts medium, xhigh"));
         assert!(doc.contains("#   grok-build: not installed"));
+        assert!(
+            doc.contains("#   ex: acp preset, reviews in its \"read-only\" mode; models ex-large")
+        );
+        assert!(doc.contains("#   bare: can't review (acp preset bare names no read-only mode)"));
+        assert!(doc.contains("# On the hub's machine:"), "{doc}");
+        // A card's thread on a remote box: what was found there, named.
+        let mut on_box = got.clone();
+        on_box["box"] = json!("gpu");
+        let boxed = render_doc(
+            &base,
+            &DocFor::Saved {
+                project: None,
+                saved: false,
+            },
+            &on_box,
+        );
+        assert!(
+            boxed.contains("# On box gpu (the thread's, where its reviewer runs):"),
+            "{boxed}"
+        );
         let back = parse_doc(&doc, &base, false).unwrap().unwrap();
         assert_eq!(back.settings, base);
         assert_eq!((back.save_for, back.scope), (None, None));
@@ -2518,7 +2676,21 @@ mod tests {
         let bad = doc.replace("commit = \"match\"", "commit = \"end\"");
         let err = parse_doc(&bad, &base, false).unwrap_err().to_string();
         assert!(err.starts_with("commit: "), "{err}");
-        let unknown = format!("{doc}\nsweep = \"runs\"\n");
+        let runs = doc.replace("sweep = \"thread\"", "sweep = \"runs\"");
+        assert_eq!(
+            parse_doc(&runs, &base, false)
+                .unwrap()
+                .unwrap()
+                .settings
+                .sweep,
+            twr_core::loops::config::SweepMode::Runs
+        );
+        let bad_sweep = doc.replace("sweep = \"thread\"", "sweep = \"hub\"");
+        assert!(parse_doc(&bad_sweep, &base, false)
+            .unwrap_err()
+            .to_string()
+            .starts_with("sweep: "));
+        let unknown = format!("{doc}\nmax_audit_runs = 2\n");
         assert!(parse_doc(&unknown, &base, false)
             .unwrap_err()
             .to_string()
@@ -2763,6 +2935,43 @@ mod tests {
                 "last": {"outcome": "stopped"}})
             ),
             "api's loop ended: stopped"
+        );
+    }
+    /// `twr loop show` lists a sweep audited by runs: each rule, its audit and the thread's
+    /// verdict; nothing for a sweep the thread audited itself.
+    #[test]
+    fn show_lists_the_sweeps_audits() {
+        let d = json!({"sweep": {"mode": "runs", "rules": [
+            {"name": "identity-gating", "rule": "Every handler checks the caller.", "where": "src/**",
+             "audit": {"id": "s1", "status": "answered", "count": 1, "failures": [],
+                       "findings": [{"id": "s1.1", "severity": "major", "location": "a.rs:3",
+                                     "problem": "no check"}]},
+             "verdict": {"rule": "identity-gating", "result": "fixed"}},
+            {"name": "retries", "rule": "r", "where": "w",
+             "audit": {"id": "s2", "status": "not_run", "count": 0,
+                       "failures": ["exit 1", "timed out"], "findings": []},
+             "verdict": {"rule": "retries", "result": "not_audited", "reason": "no time"}},
+            {"name": "locks", "rule": "r", "where": "w",
+             "audit": {"id": "s3", "status": "running", "count": 0, "failures": ["exit 1"],
+                       "findings": []}}
+        ]}});
+        assert_eq!(
+            sweep_rows(&d),
+            [
+                "sweep (audited by runs):",
+                "  s1 identity-gating: 1 finding → fixed",
+                "    rule: Every handler checks the caller. (where: src/**)",
+                "    s1.1 major a.rs:3: no check",
+                "  s2 retries: not run: timed out → not audited (no time)",
+                "    rule: r (where: w)",
+                "  s3 locks: running (retry)",
+                "    rule: r (where: w)",
+            ]
+        );
+        assert!(sweep_rows(&json!({"sweep": {"mode": "thread", "rules": null}})).is_empty());
+        assert_eq!(
+            sweep_rows(&json!({"sweep": {"rules": []}})),
+            ["sweep (audited by runs): no rule named"]
         );
     }
 }

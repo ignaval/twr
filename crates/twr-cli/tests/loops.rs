@@ -765,6 +765,10 @@ fn facts(events: &[twr_core::event::Event]) -> Vec<String> {
                 B::LoopImplemented(p) => format!("implemented {:?}", p.status),
                 B::LoopCommit(p) if p.problems.is_empty() => "commit passed".to_string(),
                 B::LoopCommit(_) => "commit failed".to_string(),
+                B::LoopRules(p) => format!("rules {}", p.rules.len()),
+                B::LoopAuditStarted(p) => format!("audit s{}", p.rule),
+                B::LoopAudit(p) if p.failed => format!("audit failed s{}", p.rule),
+                B::LoopAudit(p) => format!("audited s{} {}", p.rule, p.findings.len()),
                 _ => return None,
             })
         })
@@ -1880,4 +1884,172 @@ fn a_users_message_as_the_report_turn_ends_then_a_kill_during_the_check() {
     // Nothing of the loop's was withdrawn either: no report prompt was queued again.
     assert!(!evs.iter().any(|e| matches!(&e.body,
         twr_core::event::EventBody::PromptWithdrawn(p) if p.prompt.contains(&format!("[twr loop {id} report")))));
+}
+
+// ---------------------------------------------------------------------------------------------
+// The sweep audited by runs (`sweep = "runs"`), killed at its points
+// ---------------------------------------------------------------------------------------------
+
+/// The rules turn's template: two rules (the fake thread echoes it).
+const RULES: &str = "Named.\n```twr-rules\n{\"rules\": [{\"name\": \"guard-input\", \"rule\": \"Every parser guards empty input.\", \"where\": \"lib.rs\"}, {\"name\": \"trim-input\", \"rule\": \"Every parser trims its input.\", \"where\": \"everywhere the diff touches\"}]}\n```\n";
+/// The verification turn's template: both rules checked clean.
+const SWEEP_VERIFY: &str = "Verified.\n```twr-sweep\n{\"rules\": [{\"rule\": \"guard-input\", \"result\": \"checked clean\"}, {\"rule\": \"trim-input\", \"result\": \"checked clean\"}], \"gates\": {\"ran\": [\"true\"], \"result\": \"pass\"}}\n```\n";
+
+/// The facts of a whole `medium` loop with `sweep = "runs"` and `max_audit_runs = 1` that
+/// nothing interrupted ([`Env::crash_runs`]): runs 1 and 2 are m1 and m2, 3 and 4 the audits of
+/// the two rules, 5 v1.
+const CLEAN_RUNS: &[&str] = &[
+    "started",
+    "phase Scope",
+    "phase Ladder",
+    "review m1",
+    "findings m1 1",
+    "triage m1",
+    "review m2",
+    "findings m2 0",
+    "transition m2",
+    "phase Sweep",
+    "rules 2",
+    "audit s1",
+    "audited s1 0",
+    "audit s2",
+    "audited s2 0",
+    "phase Verify",
+    "review v1",
+    "findings v1 0",
+    "phase Report",
+    "ended Clean",
+];
+
+impl Env {
+    /// [`Env::crash`] with the sweep audited by runs, `max_audit_runs` at once: the rules turn
+    /// names two rules ([`RULES`]), the verification turn reports both ([`SWEEP_VERIFY`]).
+    fn crash_runs(max_audit_runs: u32) -> Env {
+        let env = Env::crash();
+        env.template("rules", RULES);
+        env.template("sweep-verify", SWEEP_VERIFY);
+        std::fs::write(
+            env.home.join("config.toml"),
+            format!("[loops]\nmax_audit_runs = {max_audit_runs}\n"),
+        )
+        .unwrap();
+        env
+    }
+
+    /// [`Env::api_thread`], its saved settings auditing the sweep by runs.
+    fn api_thread_runs(&self) -> String {
+        let id = self.api_thread();
+        self.ok(&["loop", "settings", "set", "--sweep", "runs"]);
+        id
+    }
+}
+
+/// Killed with both audit runs in flight: they outlive the hub, the next hub kills them before
+/// anything runs, records each failed ("the hub stopped while it ran") and runs each again,
+/// once; the loop goes on to its end, its verification prompt asked once.
+#[test]
+fn a_hub_killed_with_audits_in_flight() {
+    let env = Env::crash_runs(2);
+    let hub = env.start_hub();
+    let thread = env.api_thread_runs();
+    env.hold(3);
+    env.hold(4);
+    let id = env.start_loop();
+    let pids: Vec<i32> = [3, 4]
+        .into_iter()
+        .flat_map(|n| env.run_pids(n, true))
+        .collect();
+    kill(hub);
+    assert!(pids.iter().all(|p| alive(*p)), "{pids:?}");
+    let got = facts(&env.events(&thread));
+    assert_eq!(got[..11], CLEAN_RUNS[..11], "{got:?}");
+    let mut started: Vec<&String> = got[11..].iter().collect();
+    started.sort();
+    assert_eq!(started, ["audit s1", "audit s2"], "{got:?}");
+    let _hub = env.start_hub();
+    for p in &pids {
+        poll(&format!("audit process {p} killed"), || !alive(*p));
+    }
+    let shown = env.wait_ended();
+    assert_eq!(shown["outcome"], "clean", "{shown}");
+    let evs = env.events(&thread);
+    let got = facts(&evs);
+    let count = |f: &str| got.iter().filter(|g| *g == f).count();
+    for rule in ["s1", "s2"] {
+        assert_eq!(count(&format!("audit {rule}")), 2, "{got:?}");
+        assert_eq!(count(&format!("audit failed {rule}")), 1, "{got:?}");
+        assert_eq!(count(&format!("audited {rule} 0")), 1, "{got:?}");
+    }
+    assert_eq!(got[got.len() - 5..], CLEAN_RUNS[CLEAN_RUNS.len() - 5..]);
+    let rules = shown["sweep"]["rules"].as_array().unwrap();
+    assert_eq!(
+        rules[0]["audit"]["failures"][0],
+        "the hub stopped while it ran"
+    );
+    assert_eq!(rules[1]["audit"]["status"], "answered");
+    assert_eq!(env.runs(), 7);
+    assert_eq!(
+        asked(&evs, &id),
+        ["scope", "triage m1", "rules", "sweep", "report"]
+    );
+    nothing_left(&env, &thread, &id);
+}
+
+/// Killed right before the hub records the last audit's answer: that answer and the
+/// verification prompt are one batch, so the next hub finds the audit in flight, records it
+/// failed and runs it again, once, then asks for the verification turn once.
+#[test]
+fn a_hub_killed_before_it_records_the_last_audit() {
+    let env = Env::crash_runs(1);
+    let (hub, gate) = env.start_hub_gated("audit s2");
+    let thread = env.api_thread_runs();
+    // (`api_thread_runs` saved the settings through this hub before it reached the gate.)
+    let id = env.start_loop_until(hub, &gate, &thread);
+    let got = facts(&env.events(&thread));
+    assert_eq!(got, CLEAN_RUNS[..14], "{got:?}");
+    let _hub = env.start_hub();
+    let shown = env.wait_ended();
+    assert_eq!(shown["outcome"], "clean", "{shown}");
+    let evs = env.events(&thread);
+    let mut want: Vec<&str> = CLEAN_RUNS.to_vec();
+    want.splice(14..14, ["audit failed s2", "audit s2"]);
+    assert_eq!(facts(&evs), want);
+    assert_eq!(env.runs(), 6);
+    assert_eq!(
+        asked(&evs, &id),
+        ["scope", "triage m1", "rules", "sweep", "report"]
+    );
+    nothing_left(&env, &thread, &id);
+}
+
+/// Killed during the rules turn and during the verification turn: the next hub asks for the
+/// step again, once; the loop goes on to its end with every fact once.
+#[test]
+fn a_hub_killed_during_the_sweeps_thread_turns() {
+    for (template, text, step) in [
+        ("rules", RULES, "rules"),
+        ("sweep-verify", SWEEP_VERIFY, "sweep"),
+    ] {
+        let env = Env::crash_runs(1);
+        env.template(template, &holding(text));
+        let hub = env.start_hub();
+        let thread = env.api_thread_runs();
+        let id = env.start_loop();
+        poll(step, || {
+            asked(&env.events(&thread), &id).contains(&step.to_string())
+        });
+        kill(hub);
+        env.template(template, text);
+        let _hub = env.start_hub();
+        let shown = env.wait_ended();
+        assert_eq!(shown["outcome"], "clean", "{step}: {shown}");
+        let evs = env.events(&thread);
+        assert_eq!(facts(&evs), CLEAN_RUNS, "{step}");
+        let mut want = vec!["scope", "triage m1", "rules", "sweep", "report"];
+        let at = want.iter().position(|s| *s == step).unwrap();
+        want.insert(at, step);
+        assert_eq!(asked(&evs, &id), want, "{step}");
+        assert_eq!(env.runs(), 5, "{step}");
+        nothing_left(&env, &thread, &id);
+    }
 }

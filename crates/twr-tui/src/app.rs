@@ -1890,6 +1890,17 @@ impl Transcript {
                 p.id.clone(),
                 crate::loops::StepNote::Commit(p.clone()),
             ),
+            // The sweep's rules and audit runs (`sweep = "runs"`): one row each.
+            EventBody::LoopRules(p) => self.push_step(
+                ev.seq,
+                p.id.clone(),
+                crate::loops::StepNote::Rules(p.clone()),
+            ),
+            EventBody::LoopAudit(p) => self.push_step(
+                ev.seq,
+                p.id.clone(),
+                crate::loops::StepNote::Audit(p.clone()),
+            ),
             EventBody::LoopTriage(p) if p.problems.is_empty() => {
                 let round = self.entries.iter_mut().rev().find_map(|e| match e {
                     Entry::LoopRound {

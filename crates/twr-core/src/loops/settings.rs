@@ -272,6 +272,23 @@ pub struct RuntimeAvailability {
     pub accounts: Vec<String>,
     /// It runs subagents of its own (the workers apply).
     pub subagents: bool,
+    /// An ACP agent of a `[runtimes.<name>]` preset (`runtime` is the preset's name): it can
+    /// only review, and only when [`RuntimeAvailability::cannot_review`] is `None`. `found`
+    /// says whether its program is on the hub's `PATH`; whether it is signed in can't be
+    /// told, so a found one counts as logged in.
+    #[serde(skip_serializing_if = "is_false")]
+    pub acp: bool,
+    /// An ACP preset's read-only mode, which its review runs ask the agent for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
+    /// Why an ACP preset can't review (`acp preset foo names no read-only mode`); `None`:
+    /// it can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cannot_review: Option<String>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for RuntimeAvailability {
@@ -285,8 +302,43 @@ impl Default for RuntimeAvailability {
             efforts: Vec::new(),
             accounts: Vec::new(),
             subagents: false,
+            acp: false,
+            review_mode: None,
+            cannot_review: None,
         }
     }
+}
+
+impl RuntimeAvailability {
+    /// Whether it can review, or why not: a built-in reviewer ([`REVIEWER_RUNTIMES`]) can; an
+    /// ACP preset can when it names a read-only mode the hub accepts.
+    pub fn reviews(&self) -> Result<(), String> {
+        if self.acp {
+            return match &self.cannot_review {
+                Some(why) => Err(why.clone()),
+                None => Ok(()),
+            };
+        }
+        if REVIEWER_RUNTIMES.contains(&self.runtime.as_str()) {
+            Ok(())
+        } else {
+            Err(not_a_reviewer(&self.runtime))
+        }
+    }
+}
+
+/// Why `runtime`, which is no built-in reviewer and no ACP preset, can't review.
+fn not_a_reviewer(runtime: &str) -> String {
+    format!(
+        "{runtime} can't review ({} or an acp preset that names a read-only mode can)",
+        REVIEWER_RUNTIMES.join(", ")
+    )
+}
+
+/// The warning of a card whose reviewer is an ACP preset (`mode`: its read-only mode): what
+/// its read-only rests on.
+pub fn acp_reviewer_warning(mode: &str) -> String {
+    format!("acp reviewer: read-only rests on the agent's own \"{mode}\" mode")
 }
 
 /// The thread a loop would run in: its runtime and model.
@@ -311,6 +363,10 @@ pub struct Availability {
     pub runtimes: Vec<RuntimeAvailability>,
     /// The thread.
     pub thread: Option<ThreadModel>,
+    /// The remote box the runtimes were found on (the thread's), when it is not the hub's own:
+    /// its problems name it (`codex isn't installed on box devbox`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub box_name: Option<String>,
 }
 
 impl Availability {
@@ -322,6 +378,31 @@ impl Availability {
     /// Whether `runtime` is installed and logged in.
     pub fn usable(&self, runtime: &str) -> bool {
         self.runtime(runtime).is_some_and(|r| r.found && r.login)
+    }
+
+    /// Whether `runtime` can review, or why not ([`RuntimeAvailability::reviews`]); a runtime
+    /// the hub did not list can't, unless it is a built-in reviewer.
+    pub fn reviews(&self, runtime: &str) -> Result<(), String> {
+        match self.runtime(runtime) {
+            Some(r) => r.reviews(),
+            None if REVIEWER_RUNTIMES.contains(&runtime) => Ok(()),
+            None => Err(not_a_reviewer(runtime)),
+        }
+    }
+
+    /// The runtimes that can review and are installed and logged in: the built-in ones in
+    /// [`REVIEWER_RUNTIMES`]' order, then the ACP presets, in the hub's order.
+    pub fn reviewer_runtimes(&self) -> Vec<&str> {
+        let builtin = REVIEWER_RUNTIMES
+            .iter()
+            .copied()
+            .filter(|rt| self.usable(rt) && self.reviews(rt).is_ok());
+        let acp = self
+            .runtimes
+            .iter()
+            .filter(|r| r.acp && r.found && r.login && r.reviews().is_ok())
+            .map(|r| r.runtime.as_str());
+        builtin.chain(acp).collect()
     }
 }
 
@@ -381,16 +462,24 @@ impl fmt::Display for Problem {
 
 /// The runtime a model setting checks: its runtime's availability problem, if any.
 fn runtime_problem(role: Role, runtime: &str, avail: &Availability) -> Option<Problem> {
+    let on = avail
+        .box_name
+        .as_deref()
+        .map(|b| format!(" on box {b}"))
+        .unwrap_or_default();
     let (kind, message) = match avail.runtime(runtime) {
         None => (
             ProblemKind::NotInstalled,
-            format!("{runtime} isn't installed"),
+            format!("{runtime} isn't installed{on}"),
         ),
         Some(r) if !r.found => (
             ProblemKind::NotInstalled,
-            format!("{runtime} isn't installed"),
+            format!("{runtime} isn't installed{on}"),
         ),
-        Some(r) if !r.login => (ProblemKind::LoggedOut, format!("{runtime} isn't logged in")),
+        Some(r) if !r.login => (
+            ProblemKind::LoggedOut,
+            format!("{runtime} isn't logged in{on}"),
+        ),
         Some(_) => return None,
     };
     Some(Problem {
@@ -468,22 +557,26 @@ pub fn validate(s: &LoopSettings, avail: &Availability, config: &LoopsConfig) ->
         });
     }
     let r = &s.reviewer;
-    if !REVIEWER_RUNTIMES.contains(&r.runtime.as_str()) {
+    let acp = avail.runtime(&r.runtime).is_some_and(|a| a.acp);
+    if let Err(message) = avail.reviews(&r.runtime) {
         out.push(Problem {
             role: Role::Reviewer,
             kind: ProblemKind::NotAReviewer,
-            message: format!(
-                "{} can't review ({} can)",
-                r.runtime,
-                REVIEWER_RUNTIMES.join(", ")
-            ),
+            message,
         });
     } else if let Some(p) = runtime_problem(Role::Reviewer, &r.runtime, avail) {
         out.push(p);
     } else {
         out.extend(model_problem(Role::Reviewer, &r.runtime, &r.model, avail));
-        if let Some(a) = &r.account {
-            out.extend(account_problem(Role::Reviewer, &r.runtime, a, avail));
+        match &r.account {
+            // An ACP agent signs in with its own CLI: twr has no accounts of it.
+            Some(_) if acp => out.push(Problem {
+                role: Role::Reviewer,
+                kind: ProblemKind::UnknownAccount,
+                message: format!("acp preset {} takes no account", r.runtime),
+            }),
+            Some(a) => out.extend(account_problem(Role::Reviewer, &r.runtime, a, avail)),
+            None => {}
         }
         if let Some(p) = &profile {
             let mut efforts: Vec<&str> = p.tiers.iter().map(|t| t.effort.as_str()).collect();
@@ -704,6 +797,13 @@ pub fn propose(s: &LoopSettings, avail: &Availability, config: &LoopsConfig) -> 
     }
     if same_family(&out, avail) {
         warnings.push(SAME_FAMILY_WARNING.to_string());
+    }
+    if let Some(mode) = avail
+        .runtime(&out.reviewer.runtime)
+        .filter(|r| r.acp && r.cannot_review.is_none())
+        .and_then(|r| r.review_mode.as_deref())
+    {
+        warnings.push(acp_reviewer_warning(mode));
     }
     let problems = validate(&out, avail, config);
     Proposal {
@@ -1056,6 +1156,7 @@ mod tests {
                 model: Some("claude-opus-5-5".into()),
                 effort: Some("high".into()),
             }),
+            box_name: None,
         }
     }
 
@@ -1213,6 +1314,15 @@ mod tests {
             ]
         );
         assert!(p.problems.is_empty());
+        // On a remote box, the warning names it.
+        let mut on_box = a.clone();
+        on_box.box_name = Some("devbox".into());
+        let p = propose(&first(), &on_box, &c);
+        assert_eq!(
+            p.warnings[0],
+            "codex isn't installed on box devbox: reviewing with claude-code · claude-opus-5-5 \
+             instead"
+        );
         // Claude Code missing too: Grok.
         a.runtimes.retain(|r| r.runtime != "claude-code");
         a.thread = None;
@@ -1262,6 +1372,113 @@ mod tests {
                 "there is no profile \"gone\" any more: high instead",
                 "codex no longer offers gpt-6.1-sol: reviewing with codex · gpt-7 instead"
             ]
+        );
+    }
+
+    /// An ACP preset reviews when the hub says it names a read-only mode: it is offered beside
+    /// the built-in reviewers, takes no account, checks its listed models and efforts, and the
+    /// card says what its read-only rests on. One that can't review, or whose agent isn't
+    /// installed, is replaced as a missing built-in one is.
+    #[test]
+    fn acp_presets_review_when_they_name_a_read_only_mode() {
+        let c = LoopsConfig::default();
+        let acp = |name: &str, mode: Option<&str>, found: bool| RuntimeAvailability {
+            runtime: name.into(),
+            found,
+            login: found,
+            models: vec!["m-large".into(), "gpt-6.1-sol".into()],
+            efforts: vec!["medium".into(), "xhigh".into()],
+            acp: true,
+            review_mode: mode.map(str::to_string),
+            cannot_review: match mode {
+                Some(_) => None,
+                None => Some(format!("acp preset {name} names no read-only mode")),
+            },
+            ..Default::default()
+        };
+        let mut a = all_found();
+        a.runtimes.push(acp("ex", Some("read-only"), true));
+        a.runtimes.push(acp("bare", None, true));
+        a.runtimes.push(acp("gone", Some("plan"), false));
+        assert_eq!(
+            a.reviewer_runtimes(),
+            ["claude-code", "codex", "grok-build", "ex"]
+        );
+        assert_eq!(a.reviews("ex"), Ok(()));
+        assert_eq!(
+            a.reviews("bare").unwrap_err(),
+            "acp preset bare names no read-only mode"
+        );
+        assert!(a.reviews("nope").unwrap_err().contains("can't review"));
+        let mut s = first();
+        s.reviewer = ReviewerChoice::parse("ex/m-large").unwrap();
+        assert_eq!(validate(&s, &a, &c), vec![]);
+        let p = propose(&s, &a, &c);
+        assert_eq!(p.settings, s);
+        assert_eq!(
+            p.warnings,
+            ["acp reviewer: read-only rests on the agent's own \"read-only\" mode"]
+        );
+        // The model's family when it can be told: an ACP reviewer on gpt beside a codex
+        // implementer is the same family; on a model twr does not know, nothing is said.
+        let mut same = s.clone();
+        same.reviewer.model = "gpt-6.1-sol".into();
+        same.implementer = Some(ModelChoice::parse("claude-code/gpt-6.1-sol:high").unwrap());
+        assert!(same_family(&same, &a));
+        assert!(!same_family(&s, &a));
+        // A model or an effort it does not list, an account.
+        let mut bad = s.clone();
+        bad.reviewer.model = "m-tiny".into();
+        assert_eq!(
+            validate(&bad, &a, &c)[0].message,
+            "ex no longer offers m-tiny"
+        );
+        let mut few = a.clone();
+        let i = few.runtimes.iter().position(|r| r.runtime == "ex").unwrap();
+        few.runtimes[i].efforts = vec!["medium".into()];
+        assert_eq!(
+            validate(&s, &few, &c)[0].message,
+            "ex takes no effort xhigh (medium): profile high asks for it"
+        );
+        let mut bad = s.clone();
+        bad.reviewer.account = Some("work".into());
+        assert_eq!(
+            validate(&bad, &a, &c)[0].message,
+            "acp preset ex takes no account"
+        );
+        // One that names no read-only mode is refused with the reason, and the card moves it.
+        let mut bare = s.clone();
+        bare.reviewer = ReviewerChoice::parse("bare/m-large").unwrap();
+        let v = validate(&bare, &a, &c);
+        assert_eq!(v[0].kind, ProblemKind::NotAReviewer);
+        assert_eq!(v[0].message, "acp preset bare names no read-only mode");
+        let p = propose(&bare, &a, &c);
+        assert_eq!(
+            p.settings.reviewer.to_string(),
+            "claude-code/claude-opus-5-5"
+        );
+        assert_eq!(
+            p.warnings[0],
+            "acp preset bare names no read-only mode: reviewing with claude-code · \
+             claude-opus-5-5 instead"
+        );
+        // Its agent not installed: the same replacement as a missing built-in reviewer.
+        let mut gone = s.clone();
+        gone.reviewer = ReviewerChoice::parse("gone/m-large").unwrap();
+        assert_eq!(validate(&gone, &a, &c)[0].kind, ProblemKind::NotInstalled);
+        let p = propose(&gone, &a, &c);
+        assert_eq!(
+            p.warnings[0],
+            "gone isn't installed: reviewing with claude-code · claude-opus-5-5 instead"
+        );
+        // The JSON a client reads: the ACP keys only on an ACP preset.
+        let v = serde_json::to_value(&a.runtimes[0]).unwrap();
+        assert!(v.get("acp").is_none() && v.get("cannot_review").is_none());
+        let v = serde_json::to_value(a.runtime("bare").unwrap()).unwrap();
+        assert_eq!(v["acp"], true);
+        assert_eq!(
+            v["cannot_review"],
+            "acp preset bare names no read-only mode"
         );
     }
 

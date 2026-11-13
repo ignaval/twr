@@ -33,6 +33,8 @@ export interface LoopSettings {
   commit?: string;
   /** What a review loop commits: `match` (follow the thread) or `none`. */
   review_commit?: string;
+  /** Who audits the sweep's rules: `thread` (the thread, with its own subagents) or `runs`
+   * (one read-only reviewer run per rule, a few at once: one reviewer call per rule). */
   sweep?: string;
   [key: string]: Json;
 }
@@ -43,7 +45,8 @@ export interface Preset {
   workers: WorkersChoice;
   reviewer: ReviewerChoice;
 }
-/** What the hub found of one runtime on its own machine (`loop.settings.get` `runtimes`). */
+/** What the hub found of one runtime on its own machine, or on a thread's remote box
+ * (`loop.settings.get` `runtimes`). */
 export interface RuntimeInfo {
   runtime: string;
   found: boolean;
@@ -59,9 +62,20 @@ export interface RuntimeInfo {
    * installed or logged in, and counts it as both (`found` and `login` are true).
    */
   probed?: boolean;
+  /**
+   * An ACP agent of a `[runtimes.<name>]` preset (`runtime` is its name): it can only review,
+   * and only when `cannot_review` is unset.
+   */
+  acp?: boolean;
+  /** An ACP preset's read-only mode, which its review runs ask the agent for. */
+  review_mode?: string | null;
+  /** Why an ACP preset can't review (`acp preset foo names no read-only mode`). */
+  cannot_review?: string | null;
 }
-/** `loop.settings.get {project?}`. */
+/** `loop.settings.get {project?, thread?}`. */
 export interface SettingsGet {
+  /** The remote box the runtimes were found on (a thread's), else null. */
+  box?: string | null;
   settings?: LoopSettings | null;
   id?: string | null;
   source?: "project" | "workspace" | null;
@@ -100,6 +114,18 @@ export interface Commit {
   repo: string;
   sha: string;
 }
+/** A rule's audit run, when the hub audits the sweep (`sweep = "runs"`, twr-core
+ * `AuditView`). */
+export interface AuditView {
+  /** 1-based: its run is `s<rule>`. */
+  rule: number;
+  name: string;
+  status: "pending" | "running" | "answered" | "not_run";
+  findings: number;
+  /** A run of it failed; the next is its retry. */
+  retried?: boolean;
+  reason?: string | null;
+}
 /** A thread's running loop (`thread.loop`, twr-core `LoopState`). */
 export interface LoopState {
   id: string;
@@ -132,6 +158,10 @@ export interface LoopState {
   commit?: string;
   commits?: Commit[];
   commit_problem?: string | null;
+  /** The step it waits for (`{step: "audits"}`: the sweep's audit runs). */
+  wait?: { step?: string; [key: string]: Json };
+  /** `sweep = "runs"`: the sweep's rules and their audit runs, in order. */
+  audits?: AuditView[];
   [key: string]: Json;
 }
 /** The last loop that ended on a thread (`thread.last_loop`). */
@@ -468,9 +498,15 @@ export function skippedPhases(state: LoopState): string[] {
 
 /** What a running loop waits for, in words. */
 export function waitingWords(
-  l: Pick<LoopState, "waiting_on" | "paused" | "stuck">,
+  l: Pick<LoopState, "waiting_on" | "paused" | "stuck"> &
+    Partial<Pick<LoopState, "wait">>,
 ) {
   if (l.stuck) return `stuck: ${l.stuck}`;
+  if (l.waiting_on === "review" && l.wait?.step === "audits")
+    // Paused, the audits in flight finish; none starts until Resume.
+    return l.paused
+      ? "paused: the audits in flight finish first"
+      : "waiting on the audits";
   if (l.waiting_on === "review")
     // Paused, the review in flight still finishes; the loop then waits for Resume.
     return l.paused
@@ -492,6 +528,34 @@ export function roundWords(
   if (l.waiting_on === "review" && l.rounds.at(-1)?.id === round.id)
     return "under review";
   return `${round.findings} finding${round.findings === 1 ? "" : "s"} · ${round.new_class} new class`;
+}
+
+/** A rule's audit in the inspector: what its run found, or where it is. */
+export function auditWords(a: AuditView): string {
+  switch (a.status) {
+    case "answered":
+      return a.findings === 0
+        ? "no place breaks it"
+        : `${a.findings} finding${a.findings === 1 ? "" : "s"}`;
+    case "running":
+      return a.retried ? "auditing again (its run failed once)" : "auditing";
+    case "not_run":
+      return `not run${a.reason ? `: ${a.reason}` : ""}`;
+    default:
+      return a.retried ? "waiting to run again" : "waiting for a slot";
+  }
+}
+
+/** A thread's card while its loop's sweep audits are its only background work: how many
+ * rules are being audited, of all (`auditing 2 of 5 rules`); else undefined. */
+export function auditingWords(thread: Json): string | undefined {
+  const l = thread?.loop as LoopState | undefined;
+  if (!l || l.wait?.step !== "audits" || !Array.isArray(l.audits)) return;
+  const tasks = Object.values(
+    (thread?.background_tasks || {}) as Record<string, Json>,
+  );
+  if (!tasks.length || !tasks.every((t) => t?.review)) return;
+  return `auditing ${tasks.length} of ${l.audits.length} rule${l.audits.length === 1 ? "" : "s"}`;
 }
 
 /** How a loop ended, in words. */
@@ -1106,6 +1170,7 @@ export type EditorChange =
   /** `""`: the profile's plan check. */
   | { kind: "plan_check"; value: string }
   | { kind: "commit"; value: string }
+  | { kind: "sweep"; value: string }
   | { kind: "save_for"; value: SaveFor };
 
 const defined = <T extends object>(value: T): T =>
@@ -1223,6 +1288,8 @@ export function editSettings(
     }
     case "commit":
       return { ...state, settings: { ...s, commit: change.value } };
+    case "sweep":
+      return { ...state, settings: { ...s, sweep: change.value } };
     case "save_for":
       return { ...state, saveFor: change.value };
   }
@@ -1270,6 +1337,30 @@ export function runtimeUsable(r: RuntimeInfo | undefined): {
   if (!r.found) return { usable: false, why: "not installed" };
   if (!r.login) return { usable: false, why: "not logged in" };
   return { usable: true };
+}
+
+/**
+ * Whether a runtime can be the reviewer, and why not: an ACP preset that names no read-only
+ * mode can't (the hub says why); one that does is usable as any runtime is, and `note` names
+ * the mode its read-only rests on.
+ */
+export function reviewerUsable(r: RuntimeInfo | undefined): {
+  usable: boolean;
+  why?: string;
+  note?: string;
+} {
+  if (r?.acp && r.cannot_review) return { usable: false, why: r.cannot_review };
+  const u = runtimeUsable(r);
+  if (!r?.acp || !u.usable) return u;
+  return { usable: true, note: `acp, ${r.review_mode || "read-only"} mode` };
+}
+
+/** The runtimes a role's picker lists: the implementer's never holds an ACP preset. */
+export function runtimesFor(
+  role: "implementer" | "reviewer",
+  runtimes: RuntimeInfo[],
+): RuntimeInfo[] {
+  return role === "reviewer" ? runtimes : runtimes.filter((r) => !r.acp);
 }
 
 /**

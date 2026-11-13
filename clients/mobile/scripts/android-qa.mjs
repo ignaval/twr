@@ -1871,7 +1871,7 @@ try {
       const report = await loopReadOnlyQA(loopDriver(), loops, {
         shots: loopShots,
         label: "android",
-        step: 40,
+        step: 60,
       });
       writeFileSync(
         join(loopShots, "android-loop-qa-read.json"),

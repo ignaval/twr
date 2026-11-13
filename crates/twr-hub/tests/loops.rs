@@ -929,6 +929,7 @@ async fn project_settings_win_and_overrides_last_one_run() {
     let got = hub
         .loop_settings_get(LoopSettingsFor {
             project: Some("api".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -951,6 +952,7 @@ async fn project_settings_win_and_overrides_last_one_run() {
         .loop_settings_reset(
             LoopSettingsFor {
                 project: Some("api".into()),
+                ..Default::default()
             },
             &user(),
         )
@@ -972,7 +974,7 @@ async fn project_settings_win_and_overrides_last_one_run() {
         Some("medium")
     );
     let got = hub
-        .loop_settings_get(LoopSettingsFor { project: None })
+        .loop_settings_get(LoopSettingsFor::default())
         .await
         .unwrap();
     assert_eq!(got["settings"]["profile"], "high");
@@ -987,7 +989,7 @@ async fn project_settings_win_and_overrides_last_one_run() {
         .unwrap_err();
     assert!(e.message.contains("no profile \"gone\""), "{e:?}");
     // Reset all: the next loop needs the first-run card.
-    hub.loop_settings_reset(LoopSettingsFor { project: None }, &user())
+    hub.loop_settings_reset(LoopSettingsFor::default(), &user())
         .unwrap();
     let card = request(&hub, &t, json!({})).await.unwrap();
     assert_eq!(card["why"], "first_run");
@@ -1004,7 +1006,7 @@ async fn a_hub_without_an_agent_probe_starts_a_loop() {
     o.agent_probe = None;
     let hub = Hub::open(o).await.unwrap();
     let got = hub
-        .loop_settings_get(LoopSettingsFor { project: None })
+        .loop_settings_get(LoopSettingsFor::default())
         .await
         .unwrap();
     for r in got["runtimes"].as_array().unwrap() {
@@ -1152,7 +1154,7 @@ async fn only_the_user_starts_loops_and_answers_their_cards() {
         codes::RELAY_FORBIDDEN
     );
     assert_eq!(
-        hub.loop_settings_reset(LoopSettingsFor { project: None }, &orch)
+        hub.loop_settings_reset(LoopSettingsFor::default(), &orch)
             .unwrap_err()
             .code,
         codes::RELAY_FORBIDDEN
@@ -2742,7 +2744,7 @@ async fn the_card_is_read_and_accounts_are_checked() {
     assert_eq!(get(&card["attn_id"]).unwrap_err().code, codes::NOT_FOUND);
 
     let s = hub
-        .loop_settings_get(LoopSettingsFor { project: None })
+        .loop_settings_get(LoopSettingsFor::default())
         .await
         .unwrap();
     let rt = |name: &str| {
@@ -2784,10 +2786,11 @@ async fn the_card_is_read_and_accounts_are_checked() {
 // Threads a loop can't run in, and threads whose runtime is gone
 // ---------------------------------------------------------------------------------------------
 
-/// A thread on a remote box is refused `not_supported` (loops run on the hub's own machine in
-/// this version), its card or loop never started, whatever the settings.
+/// A thread on a remote box gets its loop as one on the hub's machine (milestone 4: here its
+/// card, the first time; `tests/loops_remote.rs` runs whole loops there); with the box away,
+/// it is refused `box_offline`, and nothing is recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_thread_on_a_remote_box_is_refused() {
+async fn a_thread_on_a_remote_box_gets_its_card_and_is_refused_while_the_box_is_away() {
     use twr_core::config::BoxConfig;
     use twr_core::runner::Secret;
     use twr_runner::{LocalBox, LocalBoxOptions, RunnerOptions};
@@ -2852,31 +2855,23 @@ async fn a_thread_on_a_remote_box_is_refused() {
         .as_str()
         .unwrap()
         .to_string();
-    // With no settings saved (the card would come), with saved ones (it would start), and
-    // with `setup` (the card asked for).
-    for (saved, extra) in [
-        (false, json!({})),
-        (true, json!({})),
-        (true, json!({"setup": true})),
-    ] {
-        if saved {
-            save(&hub, None, first_card()).await;
-        }
-        let e = request(&hub, &t, extra).await.unwrap_err();
-        assert_eq!(e.code, codes::UNSUPPORTED, "{e:?}");
-        assert!(
-            e.message
-                .starts_with("not supported: remote runs on box gpu"),
-            "{e:?}"
-        );
-    }
-    assert!(!events(&hub, &t)
-        .iter()
-        .any(|e| e.kind().starts_with("loop.") || e.kind() == "attention.raised"));
-    assert!(hub.loop_list().as_array().unwrap().is_empty());
-    hub.shutdown().await;
+    let card = request(&hub, &t, json!({})).await.unwrap();
+    assert_eq!(card["status"], "needs_setup", "{card}");
+    // The box away: refused, nothing recorded.
+    let before = events(&hub, &t).len();
     let _ = stop_tx.send(());
     let _ = runner.await;
+    until(&hub, "the box offline", |h| {
+        h.boxes()
+            .iter()
+            .any(|(n, online, _)| n == "gpu" && !*online)
+    })
+    .await;
+    let e = request(&hub, &t, json!({})).await.unwrap_err();
+    assert_eq!(e.code, codes::BOX_OFFLINE, "{e:?}");
+    assert_eq!(events(&hub, &t).len(), before);
+    assert!(hub.loop_list().as_array().unwrap().is_empty());
+    hub.shutdown().await;
 }
 
 /// A thread being deleted (its delete card confirmed, the deletion under way) is refused, and

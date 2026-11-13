@@ -92,7 +92,11 @@ const worker: Thread = {
 
 /** Mounts the inspector's Loops section on a device with only the `read` scope, its hub
  * answering `loop.get` and `loop.report` with `answer`. */
-async function mount(answer: LoopReport | Error, detail: Json = {}) {
+async function mount(
+  answer: LoopReport | Error,
+  detail: Json = {},
+  { inApp = false }: { inApp?: boolean } = {},
+) {
   vi.resetModules();
   const document = installFakeDOM();
   (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -124,7 +128,16 @@ async function mount(answer: LoopReport | Error, detail: Json = {}) {
   const { createRoot } = await import("react-dom/client");
   const { LoopContext, LoopsSection } = await import("../shared/LoopViews");
   const container = document.createElement("div");
-  document.body.appendChild(container);
+  if (inApp) {
+    // The work area, with the section inside the inspector's panel.
+    const app = document.createElement("div");
+    app.setAttribute("class", "work-area");
+    const inspector = document.createElement("aside");
+    inspector.setAttribute("class", "inspector");
+    document.body.appendChild(app);
+    app.appendChild(inspector);
+    inspector.appendChild(container);
+  } else document.body.appendChild(container);
   const root = createRoot(container as unknown as Element);
   const settle = () =>
     act(async () => {
@@ -196,6 +209,22 @@ describe("Open report", () => {
     expect(path?.textContent).toBe("/hub/loops/l1/report.md");
     await m.click(m.find('[aria-label="Copy report path"]')!);
     expect(m.copied).toEqual(["/hub/loops/l1/report.md"]);
+    await m.click(m.find('[aria-label="Close dialog"]')!);
+    expect(m.find('[role="dialog"]')).toBeUndefined();
+    await m.unmount();
+  });
+
+  it("opens in the work area, not inside the inspector's panel", async () => {
+    // On a phone `.scrim` is positioned absolutely: inside the inspector's sliding panel the
+    // sheet would cover that panel only, a narrow column beside the page.
+    const m = await mount(report(), {}, { inApp: true });
+    await m.click(m.find("button", "Open report")!);
+    const dialog = m.find('[role="dialog"]');
+    expect(dialog).toBeDefined();
+    expect(dialog!.closest(".inspector")).toBeNull();
+    expect(dialog!.parentElement!.parentElement!.getAttribute("class")).toBe(
+      "work-area",
+    );
     await m.click(m.find('[aria-label="Close dialog"]')!);
     expect(m.find('[role="dialog"]')).toBeUndefined();
     await m.unmount();

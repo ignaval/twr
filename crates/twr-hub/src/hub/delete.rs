@@ -2364,6 +2364,8 @@ impl Core {
             batch.push(id, None, Source::Hub, body);
         }
         batch.push(id, None, source, EventBody::ThreadDeleted(deleted));
+        // Its loop's folder on a remote box goes with it (the hub's own stays: the record).
+        self.forget_box_loop(hub, id);
         self.append_batch(hub, batch)?;
         Ok(())
     }

@@ -649,6 +649,8 @@ kbd {
   gap: 8px;
 }
 .thread-card-title > b {
+  flex-shrink: 0;
+  max-width: 65%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -672,8 +674,18 @@ kbd {
   font-size: 0.923077rem;
   gap: 4px;
 }
+/* A long status (`background (1 bg)`, a loop's review runs) gives way before the thread's
+ * name: it keeps its icon and ends in an ellipsis, and the name keeps its letters (up to
+ * 65% of the row: a shrinking name shows an ellipsis for a fraction of a pixel). */
 .thread-card-title > .thread-status {
   margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.thread-card-title > .thread-status > .thread-status-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .status-running,
 .status-background {
@@ -844,11 +856,15 @@ kbd {
   padding: 4px 8px;
   min-height: 28px;
 }
+/* `clip`, not `hidden`: a box that clips can't be scrolled. A visually hidden label in a
+   scrolling pane is placed by the pane's positioned ancestor and overflows it, and a
+   `scrollIntoView` in the pane (the inspector's Loops section) would scroll a `hidden`
+   box by that much: the header gone, a blank strip under the composer, and no way back. */
 .work-area {
   display: flex;
   flex: 1;
   min-height: 0;
-  overflow: hidden;
+  overflow: clip;
   position: relative;
 }
 .content-column {
@@ -857,7 +873,7 @@ kbd {
   display: flex;
   flex-direction: column;
   position: relative;
-  overflow: hidden;
+  overflow: clip;
 }
 .conversation-heading {
   display: flex;
@@ -1427,6 +1443,8 @@ kbd {
   overflow: auto;
   flex: 1;
   padding: 20px 16px;
+  /* Places its visually hidden labels, which then scroll and clip with it. */
+  position: relative;
 }
 .thread-runtime {
   color: var(--muted);
@@ -1890,6 +1908,22 @@ meter::-webkit-meter-optimum-value {
 }
 .conversation-attention:empty {
   display: none;
+}
+/* A request that goes on below the area's fold fades out at its bottom edge
+   (`data-more`, shared/scrollCue.ts): in a short window its answers are further down. */
+.conversation-attention[data-more="below"]::after {
+  content: "";
+  display: block;
+  position: sticky;
+  bottom: 0;
+  height: 40px;
+  margin-top: -40px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in srgb, var(--bg) 92%, transparent)
+  );
 }
 .attention-card {
   border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));
@@ -2438,12 +2472,18 @@ meter::-webkit-meter-optimum-value {
 /* Open report: the loop's report.md, scrolling inside the dialog (a sheet on a phone). */
 .loop-report-body {
   overflow: auto;
-  min-height: 0;
+  /* The text keeps some height however large the type: the title and the path (both
+   * fixed) would otherwise take all of a phone's sheet at the largest text size. */
+  min-height: min(10rem, 30dvh);
   padding: 16px 24px 24px;
 }
 .loop-report-body:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: -2px;
+}
+.loop-report-footer {
+  max-height: 22dvh;
+  overflow-y: auto;
 }
 .loop-report-footer .loop-path {
   min-width: 0;

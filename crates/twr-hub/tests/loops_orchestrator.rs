@@ -606,7 +606,7 @@ async fn the_orchestrator_starts_a_loop_only_on_the_users_saved_settings() {
         twr_core::loops::settings::SettingsSource::SetupItem
     );
     let saved = hub
-        .loop_settings_get(LoopSettingsFor { project: None })
+        .loop_settings_get(LoopSettingsFor::default())
         .await
         .unwrap();
     assert_eq!(saved["settings"]["profile"], "high");
@@ -761,7 +761,7 @@ async fn the_card_the_settings_and_the_other_controls_stay_the_users() {
         codes::RELAY_FORBIDDEN
     );
     assert_eq!(
-        code(hub.loop_settings_reset(LoopSettingsFor { project: None }, &orch())),
+        code(hub.loop_settings_reset(LoopSettingsFor::default(), &orch())),
         codes::RELAY_FORBIDDEN
     );
     assert!(item(&hub, &card["attn_id"]).is_some());

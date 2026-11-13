@@ -137,6 +137,16 @@
 //! acp = "gemini --experimental-acp"
 //! attach = "gemini --resume {session}"
 //!
+//! # An ACP preset can review in loops when it names its agent's read-only mode: the hub asks
+//! # the agent for that mode over ACP, refuses a session that does not report it, and refuses
+//! # every permission request of a review run (docs/design/loops.md, "ACP reviewers").
+//! [runtimes.example-agent]
+//! acp = "example-agent --acp"
+//! [runtimes.example-agent.review]
+//! mode = "read-only"               # the agent's own read-only mode id (required)
+//! models = ["example-large"]       # optional: the models the editors offer
+//! efforts = ["medium", "xhigh"]    # optional: efforts it takes; none: the round's isn't passed
+//!
 //! # Review and implementation loops: what the first setup card shows (never saved settings:
 //! # the card saves those), the profiles and the limits (docs/design/loops.md).
 //! [loops]
@@ -1484,6 +1494,58 @@ pub struct RuntimePreset {
     /// `{effort}` (optional, each in one argument with its flag: `--model={model}`) for its
     /// model and reasoning effort; `None`: the thread has no `attach`.
     pub attach: Option<String>,
+    /// `[runtimes.<name>.review]`: how the agent reviews in a loop; `None`: it can't (a loop's
+    /// reviewer must name a read-only mode the agent reports).
+    pub review: Option<PresetReview>,
+}
+
+/// `[runtimes.<name>.review]`: an ACP agent as a loop's reviewer (docs/design/loops.md, "ACP
+/// reviewers"). A review run starts the preset's agent in the thread's worktree, opens one
+/// session in [`PresetReview::mode`] and sends the round's prompt; the session must report
+/// that mode (or a narrower one twr knows), and every permission request is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PresetReview {
+    /// The agent's own read-only permission mode id (`plan`, `read-only`, ...), as its ACP
+    /// session reports it. Required.
+    pub mode: String,
+    /// The models the editors offer for it; empty: any model id typed (none is checked).
+    pub models: Vec<String>,
+    /// The reasoning efforts it takes (its ACP `thought_level` option's values), which a
+    /// profile's tiers must name; empty: a round's effort is not passed (the agent's own).
+    pub efforts: Vec<String>,
+}
+
+/// Longest `[runtimes.<name>.review] mode`, in bytes.
+pub const REVIEW_MODE_MAX: usize = 64;
+
+impl PresetReview {
+    /// Checks the review table of preset `name`: a mode that is a plain id (letters, digits,
+    /// `.`, `_`, `:`, `-`, not starting with `-`), model ids and lowercase efforts.
+    pub fn validate(&self, name: &str) -> anyhow::Result<()> {
+        let m = self.mode.trim();
+        let plain = !m.is_empty()
+            && m.len() <= REVIEW_MODE_MAX
+            && !m.starts_with('-')
+            && m.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+        if !plain {
+            anyhow::bail!(
+                "runtimes.{name}.review.mode: {:?} is not a mode id (the agent's own read-only \
+                 mode, such as \"plan\" or \"read-only\")",
+                self.mode
+            );
+        }
+        for model in &self.models {
+            crate::loops::config::check_model(model)
+                .map_err(|e| anyhow::anyhow!("runtimes.{name}.review.models: {e}"))?;
+        }
+        for effort in &self.efforts {
+            crate::loops::config::check_effort(effort)
+                .map_err(|e| anyhow::anyhow!("runtimes.{name}.review.efforts: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Runtime names a `[runtimes.<name>]` preset may not take (the built-in runtimes).
@@ -1520,6 +1582,9 @@ impl RuntimePreset {
                      session id goes)"
                 );
             }
+        }
+        if let Some(r) = &self.review {
+            r.validate(name)?;
         }
         Ok(())
     }
@@ -1901,6 +1966,7 @@ impl Config {
         self.speech.validate()?;
         self.voice.validate()?;
         self.loops.validate()?;
+        self.check_loop_reviewer()?;
         match parse_span(&self.tui.summary_every_span) {
             Some(d) if d >= MIN_SUMMARY_EVERY => {}
             _ => anyhow::bail!(
@@ -2119,6 +2185,36 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// `[loops] reviewer` names a runtime that can review: a built-in reviewer
+    /// ([`crate::loops::config::REVIEWER_RUNTIMES`]) or a `[runtimes.<name>]` preset with a
+    /// `review` table.
+    fn check_loop_reviewer(&self) -> anyhow::Result<()> {
+        let Ok(r) = self.loops.reviewer() else {
+            return Ok(());
+        };
+        let rt = r.runtime.as_str();
+        if crate::loops::config::REVIEWER_RUNTIMES.contains(&rt) {
+            return Ok(());
+        }
+        match self.runtimes.get(rt) {
+            Some(p) if p.review.is_some() => {
+                if r.account.is_some() {
+                    anyhow::bail!("loops.reviewer: acp preset {rt} takes no account");
+                }
+                Ok(())
+            }
+            Some(_) => anyhow::bail!(
+                "loops.reviewer: acp preset {rt} names no read-only mode (give it a \
+                 [runtimes.{rt}.review] table with the agent's read-only `mode`)"
+            ),
+            None => anyhow::bail!(
+                "loops.reviewer: {rt:?} can't review ({} or an acp preset that names a \
+                 read-only mode can)",
+                crate::loops::config::REVIEWER_RUNTIMES.join(", ")
+            ),
+        }
     }
 
     /// Refuses box tokens shorter than [`crate::runner::TOKEN_MIN_LEN`]: the hub does not
@@ -3748,6 +3844,69 @@ account = "gpu-work"
             "[runtimes.g]\nacp = \"g\"\nmodel = \"x\"",
         ] {
             assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// `[runtimes.<name>.review]` makes an ACP preset a reviewer: a mode id is required, the
+    /// models and efforts are checked, and `[loops] reviewer` may name such a preset only.
+    #[test]
+    fn runtime_presets_that_review() {
+        let c = Config::from_toml_str(
+            "[runtimes.ex]\nacp = \"ex --acp\"\n[runtimes.ex.review]\nmode = \"read-only\"\n\
+             models = [\"ex-large\"]\nefforts = [\"medium\", \"xhigh\"]\n\
+             [loops]\nreviewer = \"ex/ex-large\"",
+        )
+        .unwrap();
+        let r = c.runtimes["ex"].review.as_ref().unwrap();
+        assert_eq!(r.mode, "read-only");
+        assert_eq!(r.models, ["ex-large"]);
+        assert_eq!(r.efforts, ["medium", "xhigh"]);
+        assert_eq!(c.loops.reviewer().unwrap().runtime, "ex");
+        // Only the mode is required.
+        let c = Config::from_toml_str("[runtimes.ex]\nacp = \"ex\"\nreview = { mode = \"plan\" }")
+            .unwrap();
+        assert!(c.runtimes["ex"].review.as_ref().unwrap().models.is_empty());
+        for (bad, why) in [
+            (
+                "[runtimes.ex]\nacp = \"ex\"\nreview = {}",
+                "is not a mode id",
+            ),
+            (
+                "[runtimes.ex]\nacp = \"ex\"\nreview = { mode = \"-s\" }",
+                "is not a mode id",
+            ),
+            (
+                "[runtimes.ex]\nacp = \"ex\"\nreview = { mode = \"a b\" }",
+                "is not a mode id",
+            ),
+            (
+                "[runtimes.ex]\nacp = \"ex\"\nreview = { mode = \"plan\", efforts = [\"High\"] }",
+                "review.efforts",
+            ),
+            (
+                "[runtimes.ex]\nacp = \"ex\"\nreview = { mode = \"plan\", models = [\"a b\"] }",
+                "review.models",
+            ),
+            (
+                "[runtimes.ex]\nacp = \"ex\"\nreview = { mode = \"plan\", command = \"x\" }",
+                "unknown field",
+            ),
+            (
+                "[runtimes.ex]\nacp = \"ex\"\n[loops]\nreviewer = \"ex/m\"",
+                "acp preset ex names no read-only mode",
+            ),
+            (
+                "[runtimes.ex]\nacp = \"ex\"\nreview = { mode = \"plan\" }\n[loops]\nreviewer = \
+                 \"ex:work/m\"",
+                "takes no account",
+            ),
+            (
+                "[loops]\nreviewer = \"gemini/m\"",
+                "\"gemini\" can't review",
+            ),
+        ] {
+            let e = format!("{:#}", Config::from_toml_str(bad).unwrap_err());
+            assert!(e.contains(why), "{bad}: {e}");
         }
     }
 

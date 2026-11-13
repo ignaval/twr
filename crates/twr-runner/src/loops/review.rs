@@ -1,11 +1,14 @@
 //! A review loop's review run: one headless, read-only, schema-constrained call of the
-//! reviewer's CLI in the thread's working directory (docs/design/loops.md, "The review run").
+//! reviewer's CLI in the thread's working directory (docs/design/loops.md, "The review run"),
+//! on the box the thread runs on: the hub's own (`hub::loops`), or a runner's
+//! ([`super::runs`]), with that box's own CLI and login.
 //!
 //! | Reviewer | Call | Schema, answer | Read-only (hardcoded) |
 //! |---|---|---|---|
 //! | Codex | `codex exec --ephemeral --skip-git-repo-check --ignore-rules --color never --json -m <model> -c model_reasoning_effort="<effort>" -` (the prompt on stdin) | `--output-schema <file> -o <answer file>` | `-s read-only -c approval_policy="never" -c mcp_servers={}`: its shell runs in Codex's read-only sandbox, nothing asks, no MCP server |
 //! | Claude Code | `claude -p --model <model> --effort <effort> --output-format json --no-session-persistence --add-dir <loop folder>` (the prompt on stdin) | `--json-schema <schema>`: the result's `structured_output` is written to the answer file | `--permission-mode plan --permission-prompts none --tools Read,Grep,Glob --strict-mcp-config`: no write or shell tool, no MCP server, and anything that would ask is refused |
 //! | Grok Build | `grok -p <prompt> -m <model> --effort <effort> --output-format json` | `--json-schema <schema>`: the result's `structuredOutput` is written to the answer file | `--permission-mode plan --sandbox read-only --tools read_file,grep,list_dir --disable-web-search --no-subagents`: no write or shell tool, under its read-only sandbox profile |
+//! | ACP preset | the preset's agent over ACP: one session, one prompt ([`super::acp_review`]) | none: the findings in the reply's last fenced `json` block, asked again once | the preset's `[runtimes.<name>.review] mode`, which the session must report; every permission request refused |
 //!
 //! Nothing in the settings reaches these flags but the model and the effort (each checked to
 //! be a plain name first, [`plain`]): no setting can widen what the reviewer may do. Unlike a
@@ -14,11 +17,12 @@
 //! it write.
 //!
 //! It runs in the thread's working directory, in a session and process group of its own
-//! (`hub::one_shot`), killed with everything it started when the run ends however it ends: an
+//! (`crate::one_shot`), killed with everything it started when the run ends however it ends: an
 //! answer, the round's timeout (`[loops] round_timeout`), or a cancel (the loop stopped, the
-//! thread stopped, parked or deleted, the hub stopping). Its environment is the hub's without
-//! twr's tokens and markers (every `TWR_*` variable, the runtime generation, the hub's own Claude
-//! Code session's markers), with `TWR_AGENT=<thread>:loop-<loop id>` and, for a reviewer on a
+//! thread stopped, parked or deleted, the hub stopping, a runner's connection to the hub
+//! ending). Its environment is the box's (the hub's, or a runner's) without twr's tokens and
+//! markers (every `TWR_*` variable, the runtime generation, the hub's own Claude Code
+//! session's markers), with `TWR_AGENT=<thread>:loop-<loop id>` and, for a reviewer on a
 //! named account, that account's variables, as a thread on it gets them.
 //!
 //! What it printed goes to `round-<round>.log` in the loop folder, for people, and is never
@@ -35,7 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twr_core::event::Usage;
 use twr_core::loops::contract::{parse_findings, Finding, FINDINGS_SCHEMA, MAX_ANSWER_BYTES};
 
-use super::super::one_shot::{kill_group, scrub_env, Group};
+use crate::one_shot::{kill_group, scrub_env, Group};
 
 /// The most of a CLI's result object (Claude Code's, Grok Build's stdout) read, in bytes.
 const RESULT_MAX: u64 = 8 << 20;
@@ -45,38 +49,44 @@ const USAGE_TAIL: u64 = 256 * 1024;
 
 /// One review run, ready to start.
 #[derive(Debug, Clone)]
-pub(in crate::hub) struct Call {
+pub struct Call {
     /// The reviewer's runtime (`codex`, `claude-code`, `grok-build`).
-    pub(in crate::hub) runtime: String,
+    pub runtime: String,
     /// Its CLI.
-    pub(in crate::hub) bin: PathBuf,
+    pub bin: PathBuf,
     /// The model.
-    pub(in crate::hub) model: String,
+    pub model: String,
     /// The round's effort.
-    pub(in crate::hub) effort: String,
+    pub effort: String,
     /// The thread's working directory.
-    pub(in crate::hub) cwd: PathBuf,
+    pub cwd: PathBuf,
     /// The loop folder.
-    pub(in crate::hub) folder: PathBuf,
+    pub folder: PathBuf,
     /// The prompt.
-    pub(in crate::hub) prompt: String,
+    pub prompt: String,
     /// `findings.schema.json` in the folder.
-    pub(in crate::hub) schema_file: PathBuf,
+    pub schema_file: PathBuf,
     /// `round-<round>.answer.json`.
-    pub(in crate::hub) answer_file: PathBuf,
+    pub answer_file: PathBuf,
     /// `round-<round>.log`.
-    pub(in crate::hub) log_file: PathBuf,
+    pub log_file: PathBuf,
     /// A named account's variables to set, and those to remove.
-    pub(in crate::hub) account_env: Option<twr_adapters::account::AccountEnv>,
+    pub account_env: Option<twr_adapters::account::AccountEnv>,
     /// Its `TWR_AGENT` marker.
-    pub(in crate::hub) marker: String,
+    pub marker: String,
     /// The round's timeout.
-    pub(in crate::hub) timeout: Duration,
+    pub timeout: Duration,
+    /// An ACP preset's agent, when the reviewer is one (`Inner::acp_reviewer`): `Err` says
+    /// why the preset can't review now. `None`: a built-in reviewer's CLI.
+    pub acp: Option<Result<super::acp_review::AcpReviewer, String>>,
+    /// The `PATH` it runs with (a box's login shell's before the runner's, as its runtimes
+    /// get); `None`: this process's.
+    pub path: Option<std::ffi::OsString>,
 }
 
 /// How a review run ended.
 #[derive(Debug, Clone, PartialEq)]
-pub(in crate::hub) enum Ended {
+pub enum Ended {
     /// Its answer, read.
     Answered {
         /// The findings.
@@ -92,7 +102,7 @@ pub(in crate::hub) enum Ended {
 
 /// Whether `s` is a plain model or effort name, never anything a CLI would read as a flag or
 /// a TOML value of its own.
-pub(in crate::hub) fn plain(s: &str) -> bool {
+pub fn plain(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.starts_with('-')
@@ -102,7 +112,7 @@ pub(in crate::hub) fn plain(s: &str) -> bool {
 }
 
 /// The argv of `call` (module docs), without the program.
-pub(in crate::hub) fn argv(call: &Call) -> Result<Vec<String>, String> {
+pub fn argv(call: &Call) -> Result<Vec<String>, String> {
     if !plain(&call.model) {
         return Err(format!("{:?} is no model name", call.model));
     }
@@ -194,7 +204,7 @@ pub(in crate::hub) fn argv(call: &Call) -> Result<Vec<String>, String> {
 }
 
 /// The command of `call`: its program, argv, working directory and environment (module docs).
-pub(in crate::hub) fn command(call: &Call) -> Result<tokio::process::Command, String> {
+pub fn command(call: &Call) -> Result<tokio::process::Command, String> {
     let args = argv(call)?;
     let mut cmd = tokio::process::Command::new(&call.bin);
     cmd.args(&args).current_dir(&call.cwd);
@@ -211,6 +221,9 @@ pub(in crate::hub) fn command(call: &Call) -> Result<tokio::process::Command, St
         ],
         &[],
     );
+    if let Some(p) = &call.path {
+        cmd.env("PATH", p);
+    }
     if let Some((set, remove)) = &call.account_env {
         for k in remove {
             cmd.env_remove(k);
@@ -222,11 +235,16 @@ pub(in crate::hub) fn command(call: &Call) -> Result<tokio::process::Command, St
 
 /// Runs `call` (module docs); `spawned` is told its process group as soon as it started.
 /// `cancel` ends it (its group killed) with the reason it then holds.
-pub(in crate::hub) async fn run(
+pub async fn run(
     call: Call,
     spawned: impl FnOnce(u32),
     mut cancel: tokio::sync::watch::Receiver<Option<String>>,
 ) -> Ended {
+    match call.acp.clone() {
+        Some(Ok(acp)) => return super::acp_review::run(call, acp, spawned, cancel).await,
+        Some(Err(why)) => return Ended::Failed(why),
+        None => {}
+    }
     let mut cmd = match command(&call) {
         Ok(c) => c,
         Err(e) => return Ended::Failed(e),
@@ -384,7 +402,7 @@ fn result_answer(call: &Call, out: &[u8], status: std::process::ExitStatus) -> E
         let why = v["result"].as_str().unwrap_or("an error");
         return Ended::Failed(format!(
             "{what} failed: {}",
-            super::prompts::one_line(why.lines().next().unwrap_or(why))
+            super::one_line(why.lines().next().unwrap_or(why))
         ));
     }
     let structured = ["structured_output", "structuredOutput"]
@@ -452,7 +470,7 @@ fn tail(path: &Path, max: u64) -> String {
 fn last_line(log: &Path) -> String {
     let t = tail(log, 4096);
     match t.lines().rev().find(|l| !l.trim().is_empty()) {
-        Some(l) => format!(": {}", super::prompts::one_line(&truncate(l, 300))),
+        Some(l) => format!(": {}", super::one_line(&truncate(l, 300))),
         None => String::new(),
     }
 }
@@ -495,7 +513,7 @@ fn result_usage(v: &Value) -> Option<Usage> {
 }
 
 /// `d` for people: `1h`, `25m`, `40s`.
-pub(in crate::hub) fn span(d: Duration) -> String {
+pub fn span(d: Duration) -> String {
     let s = d.as_secs();
     if s >= 3600 && s.is_multiple_of(3600) {
         format!("{}h", s / 3600)
@@ -525,6 +543,8 @@ mod tests {
             account_env: None,
             marker: "t1:loop-l1".into(),
             timeout: Duration::from_secs(60),
+            acp: None,
+            path: None,
         }
     }
 

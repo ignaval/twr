@@ -1,5 +1,5 @@
-//! The git a review loop reads, on the hub's own box only (milestone 1: no runner protocol
-//! op): what a scope covers, for the setup card (`branch · 7 commits, 23 files`), and the
+//! The git a loop reads, on the box its thread runs on (the hub's own, or a runner's through
+//! `Op::LoopGit`, [`super::git_answer`]): what a scope covers, for the setup card (`branch · 7 commits, 23 files`), and the
 //! base and baseline digest `loop.started` records.
 //!
 //! Every command goes through the box's own [`LocalGit::read`]: `git -c <SAFE_CONFIG> -C
@@ -24,48 +24,48 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::local::{GitRead, LocalGit};
 use twr_core::loops::settings::Scope;
 use twr_core::proto::{codes, RpcError};
-use twr_runner::local::{GitRead, LocalGit};
 
-use super::super::rpc;
+use super::rpc;
 
 /// Where a loop's thread works: what [`scope`] reads.
 #[derive(Debug, Clone)]
-pub(in crate::hub) struct Target {
+pub struct Target {
     /// The thread's name (for messages).
-    pub(in crate::hub) name: String,
+    pub name: String,
     /// Its working directory (its worktree, or the repository it works in).
-    pub(in crate::hub) dir: PathBuf,
+    pub dir: PathBuf,
     /// The ref its work merges back into (`thread.created` `ext.twr.base_ref`), if recorded.
-    pub(in crate::hub) base_ref: Option<String>,
+    pub base_ref: Option<String>,
     /// Its repository's slug in the loop folder.
-    pub(in crate::hub) slug: String,
+    pub slug: String,
 }
 
 /// What a scope covers, as git says now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::hub) struct ScopeInfo {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScopeInfo {
     /// The scope (the request's, else the default rule's).
-    pub(in crate::hub) scope: Scope,
+    pub scope: Scope,
     /// The commit the diffs start from.
-    pub(in crate::hub) base: String,
+    pub base: String,
     /// `HEAD`.
-    pub(in crate::hub) head: String,
+    pub head: String,
     /// Commits from the base to `HEAD`.
-    pub(in crate::hub) commits: u64,
+    pub commits: u64,
     /// Files changed from the base to the working tree, untracked ones included.
-    pub(in crate::hub) files: u64,
+    pub files: u64,
     /// The digest of the changes in the working tree beyond `HEAD` (`sha256:…`).
-    pub(in crate::hub) dirty_digest: String,
+    pub dirty_digest: String,
     /// The working tree had no change beyond `HEAD`, untracked files included.
-    pub(in crate::hub) clean: bool,
+    pub clean: bool,
 }
 
 impl ScopeInfo {
     /// What the setup card says it covers: `branch · 7 commits, 23 files`, `uncommitted · 3
     /// files`.
-    pub(in crate::hub) fn summary(&self) -> String {
+    pub fn summary(&self) -> String {
         let plural = |n: u64, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
         let mut parts = Vec::new();
         if self.scope != Scope::Uncommitted {
@@ -143,7 +143,7 @@ async fn count(git: &LocalGit, dir: &Path, from: &str, head: &str) -> Result<u64
 /// when the directory is no git repository (or has no commit yet); `bad_request` for a scope
 /// it cannot take (`branch` with no base recorded, a `since` ref or `last` count that names
 /// no commit).
-pub(in crate::hub) async fn scope(
+pub async fn scope(
     git: &LocalGit,
     target: &Target,
     scope: Option<Scope>,
@@ -306,19 +306,19 @@ async fn dirty_digest(
 
 /// The most bytes of a round's diff the reviewer gets per repository; past it the patch is cut
 /// at a line and says so, and the prompt says it loudly ([`RoundDiff::truncated`]).
-pub(in crate::hub) const MAX_DIFF_BYTES: usize = 8 << 20;
+pub const MAX_DIFF_BYTES: usize = 8 << 20;
 
 /// The most untracked files a round's diff shows whole; the others are named.
-pub(in crate::hub) const MAX_UNTRACKED: usize = 500;
+pub const MAX_UNTRACKED: usize = 500;
 
 /// A round's diff of one repository ([`round_diff`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::hub) struct RoundDiff {
+pub struct RoundDiff {
     /// The patch, as the reviewer reads it.
-    pub(in crate::hub) patch: Vec<u8>,
+    pub patch: Vec<u8>,
     /// `(kept, whole)` bytes when it was cut ([`MAX_DIFF_BYTES`]), or untracked files were
     /// left out ([`MAX_UNTRACKED`]: `whole` counts them as 0 bytes then).
-    pub(in crate::hub) truncated: Option<(usize, usize)>,
+    pub truncated: Option<(usize, usize)>,
 }
 
 /// The diff a review round reads of `repo` (the thread's worktree), from commit `base` to the
@@ -335,7 +335,7 @@ pub(in crate::hub) struct RoundDiff {
 /// `skip` names paths (relative to the repository's top) left out of the changes and of the
 /// untracked files: an implementation loop's baseline paths the loop has not touched since
 /// ([`unchanged_since`]). The header counts them. Past [`MAX_SKIPPED`] none is left out.
-pub(in crate::hub) async fn round_diff(
+pub async fn round_diff(
     git: &LocalGit,
     repo: &Path,
     base: &str,
@@ -601,18 +601,18 @@ pub(in crate::hub) async fn round_diff(
 }
 
 /// The most paths a round's diff leaves out ([`round_diff`]'s `skip`); past it, none.
-pub(in crate::hub) const MAX_SKIPPED: usize = 1000;
+pub const MAX_SKIPPED: usize = 1000;
 
 /// The most changed paths [`worktree_paths`] digests; past it the rest are counted as changed
 /// with no digest (never the same as the baseline's).
-pub(in crate::hub) const MAX_PATHS: usize = 20_000;
+pub const MAX_PATHS: usize = 20_000;
 
 /// Per path the worktree of `dir` has changed beyond `HEAD` (tracked changes, staged or not,
 /// and untracked files, not ignored), relative to the repository's top: a digest of what is
 /// there now (`None`: the path is gone). A symbolic link digests its target, a directory (a
 /// submodule, an embedded repository) reads `dir`. Through [`LocalGit::read`] only; the
 /// files themselves are read here.
-pub(in crate::hub) async fn worktree_paths(
+pub async fn worktree_paths(
     git: &LocalGit,
     dir: &Path,
 ) -> Result<BTreeMap<String, Option<String>>, String> {
@@ -682,7 +682,7 @@ fn content_digest(path: &Path) -> Option<String> {
 
 /// The paths of `baseline` (a [`worktree_paths`] read when an implementation loop began) that
 /// `now` still has as they were: the loop has not touched them.
-pub(in crate::hub) fn unchanged_since(
+pub fn unchanged_since(
     baseline: &BTreeMap<String, Option<String>>,
     now: &BTreeMap<String, Option<String>>,
 ) -> Vec<String> {
@@ -696,30 +696,30 @@ pub(in crate::hub) fn unchanged_since(
 /// An implementation loop's baseline of one repository: `HEAD`, the patch of what the
 /// worktree already held, and the digests of the paths it had changed.
 #[derive(Debug, Clone)]
-pub(in crate::hub) struct Baseline {
+pub struct Baseline {
     /// `HEAD`.
-    pub(in crate::hub) head: String,
+    pub head: String,
     /// The patch ([`round_diff`] from `HEAD`).
-    pub(in crate::hub) patch: Vec<u8>,
+    pub patch: Vec<u8>,
     /// Per changed path, its content's digest ([`worktree_paths`]).
-    pub(in crate::hub) paths: BTreeMap<String, Option<String>>,
+    pub paths: BTreeMap<String, Option<String>>,
 }
 
 impl Baseline {
     /// The patch's digest: `loop.started.baseline_digests`.
-    pub(in crate::hub) fn digest(&self) -> String {
+    pub fn digest(&self) -> String {
         twr_core::blob::blob_ref(&self.patch)
     }
 
     /// The baseline in a line, for the setup card and the reviewer's prompt: `clean`, or
     /// `3 paths already changed: a.rs, b.rs, c.rs`.
-    pub(in crate::hub) fn summary(&self) -> String {
+    pub fn summary(&self) -> String {
         baseline_summary(&self.paths)
     }
 }
 
 /// [`Baseline::summary`] of `paths`.
-pub(in crate::hub) fn baseline_summary(paths: &BTreeMap<String, Option<String>>) -> String {
+pub fn baseline_summary(paths: &BTreeMap<String, Option<String>>) -> String {
     if paths.is_empty() {
         return "clean".into();
     }
@@ -739,10 +739,7 @@ pub(in crate::hub) fn baseline_summary(paths: &BTreeMap<String, Option<String>>)
 }
 
 /// The baseline of `target`'s worktree ([`Baseline`]): `unsupported` when it has no commit.
-pub(in crate::hub) async fn baseline(
-    git: &LocalGit,
-    target: &Target,
-) -> Result<Baseline, RpcError> {
+pub async fn baseline(git: &LocalGit, target: &Target) -> Result<Baseline, RpcError> {
     let dir = target.dir.as_path();
     let Some(head) = commit(git, dir, "HEAD").await? else {
         return Err(rpc(
@@ -772,7 +769,7 @@ pub(in crate::hub) async fn baseline(
 /// worktree: committed (`HEAD` holds it) or undone (`HEAD` holds what `from` did). A baseline
 /// path whose content in `HEAD` is neither was changed further by the loop and committed with
 /// its work. `work`: the loop left work there to commit.
-pub(in crate::hub) async fn repo_after(
+pub async fn repo_after(
     git: &LocalGit,
     repo: &Path,
     from: Option<&str>,
@@ -904,7 +901,7 @@ async fn digest_at(git: &LocalGit, top: &Path, rev: &str, path: &str) -> Option<
 
 /// A repository slug for the loop folder (`diff-<slug>-<round>.patch`): `name`'s letters,
 /// digits, `-`, `_` and `.`, others as `-`; `repo` when nothing is left.
-pub(in crate::hub) fn slug(name: &str) -> String {
+pub fn slug(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {

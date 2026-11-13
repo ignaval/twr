@@ -29,6 +29,8 @@ pub mod keys;
 mod long_card_tests;
 pub mod loops;
 #[cfg(test)]
+mod loops_acp_tests;
+#[cfg(test)]
 mod loops_tests;
 pub mod md;
 pub mod notify;

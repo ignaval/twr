@@ -353,7 +353,7 @@ pub struct HubOptions {
     /// (`hub::suggest`): `None` uses the native Codex account's directory
     /// ([`HubOptions::native_dir`]: `$CODEX_HOME`, else `~/.codex`). Tests give a folder.
     pub suggest_codex_home: Option<PathBuf>,
-    /// The reviewer CLIs of review loops (`hub::loops::review`), by runtime (`codex`,
+    /// The reviewer CLIs of review loops (`twr_runner::loops::review`), on the hub's own box, by runtime (`codex`,
     /// `claude-code`, `grok-build`): a runtime not named uses its `TWR_*_BIN`, else its command
     /// on the hub's `PATH`. Tests give scripts.
     pub reviewer_bins: std::collections::BTreeMap<String, PathBuf>,

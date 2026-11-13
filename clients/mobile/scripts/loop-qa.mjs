@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -38,11 +39,24 @@ else
 fi
 echo '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}'
 `;
+const PLAN =
+  'Plan: a CSV export on the reports page.\n```twr-plan\n{"contract_risk": false, "reason": "UI only: a new button"}\n```\n';
+const IMPLEMENT =
+  '!write feature.rs pub fn export_csv() {}\nImplemented.\n```twr-implement\n{"status": "done", "gates": {"ran": ["true"], "result": "pass"}}\n```\n';
 const TEMPLATES = {
   goal: "Gates are green.\n```twr-goal\nHarden the change against bad input.\n```\n",
   triage:
     '{{findings}}\nTriaged.\n```twr-triage\n{"items": [{"id": "{{finding_ids}}", "verdict": "dismissed", "reason": "empty input never reaches it"}], "gates": {"ran": ["true"], "result": "pass"}}\n```\n',
   report: "The loop reviewed the change; nothing is left open.\n",
+  // An implementation loop's steps: the plan, the implement turn that writes a file, and
+  // the report turn, which sleeps while the QA commits the work for it (the fake runtime
+  // runs no git), then names a commit (the hub checks the repository, not the sha). The
+  // commit's wording comes before the block: the fake echoes its indented example as a
+  // fence, and the hub reads the last one.
+  plan: PLAN,
+  implement: IMPLEMENT,
+  "impl-report":
+    '!sleep 8000\nBuilt the CSV export.\n{{commit}}\n```twr-commit\n{"commits": [{"repo": "demo", "sha": "abc1234"}]}\n```\n',
 };
 /** What the hub finds of its agent CLIs: Codex and Claude Code installed and logged in. */
 const AGENTS = JSON.stringify([
@@ -81,6 +95,28 @@ export function loopFixture(home) {
       existsSync(join(reviewers, "count"))
         ? Number(readFileSync(join(reviewers, "count"), "utf8").trim()) || 0
         : 0,
+    /** Replaces template `name` (the hub reads it again for each prompt). */
+    template: (name, text) =>
+      writeFileSync(join(templates, `${name}.md`), text),
+    /** Commits everything in `worktree`, as the thread would for the loop's report turn. */
+    commit(worktree) {
+      const git = (...args) =>
+        execFileSync(
+          "git",
+          [
+            "-C",
+            worktree,
+            "-c",
+            "user.name=QA",
+            "-c",
+            "user.email=qa@example.invalid",
+            ...args,
+          ],
+          { stdio: "ignore" },
+        );
+      git("add", "-A");
+      git("commit", "-q", "-m", "Add the CSV export");
+    },
   };
 }
 
@@ -305,7 +341,7 @@ const HELPERS = String.raw`(() => {
         const r = e.getBoundingClientRect();
         if (r.bottom <= 0 || r.top >= vh) continue;
         const s = getComputedStyle(e);
-        if (e.closest(".visually-hidden")) continue;
+        if (e.closest(".visually-hidden, .sr-only")) continue;
         // A line clamp or an ellipsis cuts on purpose, and says so.
         if ((s.overflowX === "hidden" || s.overflowX === "clip") && e.scrollWidth > e.clientWidth + 1 && s.textOverflow !== "ellipsis" && !(s.webkitLineClamp && s.webkitLineClamp !== "none"))
           problems.push({ kind: "text clipped", element: describe(e), text: text(e).slice(0, 80) });
@@ -612,8 +648,13 @@ export async function loopQA(driver, fixture, options) {
   const rows = await run.ev(
     "async (a, lq) => lq.all('[role=dialog] .loop-setup-rows dt').map(lq.text)",
   );
-  for (const row of ["Profile", "Scope", "Implementer", "Workers", "Reviewer"])
+  for (const row of ["Profile", "Scope", "Implementer", "Reviewer"])
     assert(rows.includes(row), `The setup card shows ${row}: ${rows}`);
+  // The fake runtime runs no subagents: the hub leaves the Workers row out.
+  assert(
+    !rows.includes("Workers"),
+    `No Workers row for a fake thread: ${rows}`,
+  );
   const buttons = await run.ev(
     "async (a, lq) => lq.all('[role=dialog] .attention-options button').map(lq.nameOf)",
   );
@@ -915,7 +956,7 @@ export async function loopQA(driver, fixture, options) {
   f.hold(nextRun);
   await run.tab("Threads");
   await run.tap(".thread-card", { re: `^${THREAD}` });
-  await run.tap(".inspector-loops > button", "Review loop");
+  await run.tap(".inspector-loops .loop-starts button", "Review loop");
   await run.until(
     "async () => { return (await window.twr.rpc('loop.list')).length > 0; }",
     {},
@@ -976,12 +1017,12 @@ export async function loopQA(driver, fixture, options) {
   );
   await d.offline(true);
   await run.until(
-    "async (a, lq) => !!lq.find('.inspector-loops > button', 'Review loop')?.disabled",
+    "async (a, lq) => !!lq.find('.inspector-loops .loop-starts button', 'Review loop')?.disabled",
     {},
     { what: "loop actions off while offline", timeout: 60000 },
   );
   const offline = await run.ev(`async (a, lq) => {
-    const review = lq.find('.inspector-loops > button', 'Review loop');
+    const review = lq.find('.inspector-loops .loop-starts button', 'Review loop');
     review.click();
     const open = lq.find('.inspector .loop-setup-row button', 'Review setup');
     if (open) { open.click(); await lq.sleep(800); }
@@ -1026,10 +1067,639 @@ export async function loopQA(driver, fixture, options) {
   );
   const errors = await run.ev("async () => window.__loopErrors");
   assert.deepEqual(errors, [], "No page errors");
+  await implementQA(run, driver, fixture);
   // Leave the app as found: no details open, on the conversation.
   await run.tab("Chat");
   run.audited();
   return run.report;
+}
+
+const BUILDER = "loop-builder";
+const TASK = "add a CSV export to the reports page";
+
+/** Waits on the host for `check()` (which may be async) to be truthy, and returns it. */
+async function poll(check, what, timeout = 60000) {
+  const deadline = Date.now() + timeout;
+  let last;
+  for (;;) {
+    try {
+      last = await check();
+      if (last) return last;
+    } catch (error) {
+      last = String(error?.message || error);
+    }
+    if (Date.now() > deadline)
+      throw new Error(`Timed out (${timeout} ms): ${what}; last: ${last}`);
+    await delay(250);
+  }
+}
+/** A thread as the hub shows it (`thread.get`). */
+async function threadView(driver, name) {
+  const got = await driver.owner("thread.get", { thread: name });
+  return got.thread || got;
+}
+/** `name`'s running loop (`loop.list`), or undefined. */
+async function runningLoop(driver, name) {
+  return ((await driver.owner("loop.list", {})) || []).find(
+    (l) => l.thread_name === name || l.thread === name,
+  );
+}
+/** Types `text` into the conversation's composer, then puts the keyboard away. */
+async function typeTask(run, name, text) {
+  await run.ev(
+    `async (a, lq) => {
+      const box = lq.need('textarea', 'Message ' + a.name + ' directly');
+      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(box, a.text);
+      box.dispatchEvent(new Event('input', { bubbles: true }));
+      box.blur();
+      await window.Capacitor?.Plugins?.Keyboard?.hide?.().catch?.(() => {});
+      await lq.sleep(300);
+      return true;
+    }`,
+    { name, text },
+  );
+}
+/** Opens `name`'s conversation from the Threads tab. */
+async function openConversation(run, name) {
+  await run.tab("Threads");
+  await run.until(
+    "async (a, lq) => !!lq.find('.thread-card', { re: '^' + a.name })",
+    { name },
+    { what: `${name}'s card` },
+  );
+  await run.tap(".thread-card", { re: `^${name}` });
+  await run.tap("button", "Talk to this thread");
+  await run.until(
+    "async (a, lq) => !!lq.find('textarea', 'Message ' + a.name + ' directly')",
+    { name },
+    { what: `${name}'s composer` },
+  );
+}
+/** The ↻ button beside Send, then its choice: what the choice says. */
+async function openSendAsLoop(run, name) {
+  await run.tap(".send-loop-button", `Send as implementation loop to ${name}…`);
+  return run.until(
+    `async (a, lq) => {
+      const opener = lq.find('.send-loop-button', 'Send as implementation loop to ' + a.name + '…');
+      const choice = lq.find('.send-loop-panel button', 'Send as implementation loop');
+      if (!choice) return false;
+      return { expanded: opener?.getAttribute('aria-expanded'), disabled: choice.disabled, what: lq.text(document.getElementById(choice.getAttribute('aria-describedby'))) };
+    }`,
+    { name },
+    { what: "Send as implementation loop" },
+  );
+}
+/** Whether the open sheet's last answer can be scrolled to and tapped (not under the
+ * home indicator, the keyboard or the edge). */
+const LAST_REACHABLE = `async (a, lq) => {
+  const last = lq.all('[role=dialog] ' + a.selector).at(-1);
+  if (!last) return { reachable: false, why: 'none' };
+  last.scrollIntoView({ block: 'end' });
+  await lq.settle();
+  const r = last.getBoundingClientRect(), vh = visualViewport?.height || innerHeight, safe = lq.insets();
+  const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+  return { reachable: r.bottom <= vh - safe.bottom + 0.5 && r.top >= safe.top - 0.5 && last.contains(hit), name: lq.nameOf(last), box: r.toJSON(), vh, safe };
+}`;
+/** The phone's 600 ms rule on a setup card's sheet: opens it from its row with an
+ * immediate tap on Start and save, which must answer nothing. */
+const EARLY_TAP = `async (a, lq) => {
+  const open = lq.need('.loop-setup-row button', 'Review setup', a.root);
+  open.focus();
+  open.click();
+  let start;
+  const t0 = performance.now();
+  while (!(start = lq.find('[role=dialog] .attention-loop-setup button', 'Start and save')) && performance.now() - t0 < 3000)
+    await new Promise(requestAnimationFrame);
+  if (!start) throw new Error('No sheet');
+  const shownAt = performance.now();
+  const armedAtTap = start.closest('.attention-options').dataset.armed;
+  start.click();
+  await lq.sleep(150);
+  const sent = !!lq.find('[role=dialog] .attention-sent');
+  let armedAt;
+  while (performance.now() - shownAt < 3000) {
+    if (start.closest('.attention-options')?.dataset.armed === 'true') { armedAt = performance.now() - shownAt; break; }
+    await lq.sleep(20);
+  }
+  const dialog = [...document.querySelectorAll('[role=dialog]')].at(-1);
+  return {
+    armedAtTap, sent, armedAfter: Math.round(armedAt),
+    modal: dialog?.getAttribute('aria-modal'),
+    title: lq.text(dialog?.querySelector('h2')),
+    buttons: lq.all('.attention-options button', dialog).map(lq.nameOf),
+    task: lq.text(dialog?.querySelector('.loop-setup-task')),
+    rows: lq.all('.loop-setup-rows dt', dialog).map(lq.text),
+  };
+}`;
+
+/**
+ * Implementation loops on an `operate` phone: the ↻ button beside Send opens Send as
+ * implementation loop; with no saved settings its card holds the task, as a sheet with four
+ * answers under the 600 ms rule; Run without a loop sends the task as a message; Start and
+ * save runs it (the chip, the inspector's plan, implement and rounds, the end with its
+ * commit); Open report shows the report's text as a sheet that scrolls; the New thread
+ * form's switch starts one; offline nothing is started or queued.
+ */
+async function implementQA(run, d, f) {
+  const owner = (method, params) => d.owner(method, params);
+  await owner("loop.settings.reset", {});
+  assert.equal(
+    (await owner("loop.settings.get", {})).settings ?? null,
+    null,
+    "No saved settings",
+  );
+  await owner("thread.new", {
+    project: "demo",
+    name: BUILDER,
+    runtime: "fake",
+  });
+  await openConversation(run, BUILDER);
+
+  // 1. The ↻ button beside Send opens Send as implementation loop.
+  await typeTask(run, BUILDER, TASK);
+  const choice = await openSendAsLoop(run, BUILDER);
+  assert.equal(choice.expanded, "true");
+  assert.equal(choice.disabled, false);
+  assert.match(choice.what, /plans your message as a task/);
+  await run.shots("implement-choice", { root: ".send-as-loop" });
+  run.pass(
+    "the ↻ button beside Send opens Send as implementation loop",
+    choice,
+  );
+
+  // 2. No saved settings: the card holds the task, a row that opens as a sheet with four
+  //    answers in order, under the 600 ms rule.
+  await run.tap(".send-loop-panel button", "Send as implementation loop");
+  await run.until(
+    "async (a, lq) => !!lq.find('.loop-setup-row button', 'Review setup')",
+    {},
+    { what: "the implementation loop's setup row" },
+  );
+  const left = await run.ev(
+    "async (a, lq) => lq.need('textarea', 'Message ' + a.name + ' directly').value",
+    { name: BUILDER },
+  );
+  assert.equal(left, "", "The task left the composer");
+  await run.shots("implement-setup-row", {
+    root: ".loop-setup-row",
+    transient: ["Dismiss notice"],
+  });
+  const early = await run.ev(EARLY_TAP, {});
+  console.log("LOOP_QA_IMPLEMENT_SHEET", JSON.stringify(early));
+  assert.equal(early.armedAtTap, "false", JSON.stringify(early));
+  assert.equal(early.sent, false, "A tap before 600 ms must not answer");
+  assert(early.armedAfter >= 550, `Armed after ${early.armedAfter} ms`);
+  assert.equal(early.modal, "true");
+  assert.equal(early.title, `Implementation loop setup · ${BUILDER}`);
+  assert.deepEqual(early.buttons, [
+    "Start and save",
+    "Change…",
+    "Run without a loop",
+    "Cancel",
+  ]);
+  assert.equal(early.task, TASK, "The sheet shows the task");
+  for (const row of ["Task", "Plan check", "Commit"])
+    assert(early.rows.includes(row), `The card has ${row}: ${early.rows}`);
+  assert.equal(await runningLoop(d, BUILDER), undefined, "Nothing started");
+  run.pass(
+    "with no saved settings the card holds the task: a sheet with its four answers, a tap before 600 ms ignored",
+    early,
+  );
+  await run.shots("implement-setup-sheet", { root: "[role=dialog]" });
+  const reach = await run.ev(LAST_REACHABLE, {
+    selector: ".attention-options button",
+  });
+  assert(
+    reach.reachable,
+    "The sheet scrolls to Cancel: " + JSON.stringify(reach),
+  );
+  await d.orientation("landscape");
+  await delay(1500);
+  await run.shots("implement-setup-sheet-landscape", {
+    root: "[role=dialog]",
+    modes: ["dark"],
+  });
+  const reachSideways = await run.ev(LAST_REACHABLE, {
+    selector: ".attention-options button",
+  });
+  assert(
+    reachSideways.reachable,
+    "Sideways the sheet scrolls to Cancel: " + JSON.stringify(reachSideways),
+  );
+  await d.orientation("portrait");
+  await delay(1500);
+  await d.textSize("largest");
+  await run.until(
+    "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) >= 24",
+    {},
+    { what: "the largest text size", timeout: 20000 },
+  );
+  await run.shots("implement-setup-sheet-largest-text", {
+    root: "[role=dialog]",
+    modes: ["dark"],
+  });
+  const reachLarge = await run.ev(LAST_REACHABLE, {
+    selector: ".attention-options button",
+  });
+  assert(
+    reachLarge.reachable,
+    "At the largest text the sheet scrolls to Cancel: " +
+      JSON.stringify(reachLarge),
+  );
+  await d.textSize("default");
+  await run.until(
+    "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) < 20",
+    {},
+    { what: "the default text size", timeout: 20000 },
+  );
+
+  // 3. Run without a loop: the task goes to the thread as an ordinary message.
+  // A rotation or a text size re-lays the sheet out: its answers arm again from zero.
+  await run.until(
+    "async (a, lq) => lq.find('[role=dialog] .attention-options')?.dataset.armed === 'true'",
+    {},
+    { what: "the sheet's answers arm" },
+  );
+  await run.tap(
+    "[role=dialog] .attention-options button",
+    "Run without a loop",
+  );
+  await run.until(
+    "async (a, lq) => !lq.find('.attention-loop-setup') && !document.querySelector('[role=dialog]')",
+    {},
+    { what: "the card goes on Run without a loop" },
+  );
+  await run.until(
+    `async (a) => {
+      const got = await window.twr.rpc('thread.transcript', { thread: a.name });
+      return (got.events || got).some((e) => e.kind === 'agent.text' && e.data?.final && e.data.text?.includes(a.task));
+    }`,
+    { name: BUILDER, task: TASK },
+    { what: "the task sent as an ordinary message", timeout: 60000 },
+  );
+  assert.equal(await runningLoop(d, BUILDER), undefined, "No loop starts");
+  assert.equal(
+    (await owner("loop.settings.get", {})).settings ?? null,
+    null,
+    "Run without a loop saves nothing",
+  );
+  await run.ev(
+    "async () => { document.activeElement?.blur(); await window.Capacitor?.Plugins?.Keyboard?.hide?.().catch?.(() => {}); return true; }",
+  );
+  await run.shots("implement-run-without", { root: ".transcript-virtual" });
+  run.pass("Run without a loop sends the task as an ordinary message");
+
+  // 4. Again, with Start and save. The plan and implement turns sleep first, to look at
+  //    each; the first review run is held.
+  await poll(
+    async () => (await threadView(d, BUILDER)).current_turn == null,
+    "loop-builder's turn ends",
+  );
+  const first = f.runs() + 1;
+  f.hold(first);
+  f.template("plan", "!sleep 30000\n" + PLAN);
+  f.template("implement", "!sleep 30000\n" + IMPLEMENT);
+  await typeTask(run, BUILDER, TASK);
+  await openSendAsLoop(run, BUILDER);
+  await run.tap(".send-loop-panel button", "Send as implementation loop");
+  await run.until(
+    "async (a, lq) => !!lq.find('.loop-setup-row button', 'Review setup')",
+    {},
+    { what: "the setup row again" },
+  );
+  await run.tap(".loop-setup-row button", "Review setup");
+  await run.until(
+    "async (a, lq) => lq.find('[role=dialog] .attention-options')?.dataset.armed === 'true'",
+    {},
+    { what: "the sheet's answers arm" },
+  );
+  await run.tap("[role=dialog] .attention-options button", "Start and save");
+  await poll(
+    async () => (await runningLoop(d, BUILDER))?.phase === "plan",
+    "the implementation loop plans",
+  );
+  await run.tab("Threads");
+  await run.until(
+    "async (a, lq) => { const i = lq.all('.thread-item').find((i) => lq.text(i).includes(a.name)); return lq.text(i?.querySelector('.loop-chip .loop-badge')) === 'IMPLEMENT LOOP'; }",
+    { name: BUILDER },
+    { what: "the IMPLEMENT LOOP chip on loop-builder's card" },
+  );
+  await run.shots("implement-chip", { root: ".thread-grid" });
+  await run.tap(".thread-item .loop-chip", { re: "^IMPLEMENT LOOP" });
+  const phase = (name) =>
+    run.until(
+      "async (a, lq) => lq.text(document.querySelector('.inspector-loops .loop-phases [aria-current=step]')) === a.name",
+      { name },
+      { what: `the inspector's current phase: ${name}`, timeout: 60000 },
+    );
+  await phase("plan");
+  await run.shots("implement-plan", { root: ".inspector" });
+  await poll(
+    async () => (await runningLoop(d, BUILDER))?.phase === "implement",
+    "the implementation loop implements",
+  );
+  // The implement prompt is out: the templates go back to answering at once.
+  f.template("plan", PLAN);
+  f.template("implement", IMPLEMENT);
+  await phase("implement");
+  await run.until(
+    "async (a, lq) => lq.all('.inspector-loops .loop-implement dd').some((d) => lq.text(d).includes('contract risk no'))",
+    {},
+    { what: "the plan's revision and contract risk" },
+  );
+  await run.shots("implement-implementing", { root: ".inspector" });
+  await poll(() => f.runs() >= first, "the first review run starts", 90000);
+  await phase("ladder");
+  const rounds = await run.until(
+    `async (a, lq) => {
+      const r = lq.all('.inspector-loops .loop-rounds li').map(lq.text);
+      if (!r.some((t) => /under review/.test(t))) return false;
+      document.querySelector('.inspector-loops .loop-rounds')?.scrollIntoView({ block: 'center' });
+      await lq.settle();
+      return { rounds: r, implement: lq.all('.inspector-loops .loop-implement dd').map(lq.text), phases: lq.all('.inspector-loops .loop-phases li').map(lq.text) };
+    }`,
+    {},
+    { what: "the round under review" },
+  );
+  await run.shots("implement-rounds", { root: ".inspector" });
+  run.pass(
+    "Start and save runs it: the IMPLEMENT LOOP chip, the inspector's plan, implement and rounds",
+    rounds,
+  );
+
+  // 5. The end, with its commit (the QA commits for the fake thread at the report turn).
+  f.releaseAll();
+  await poll(
+    async () => (await runningLoop(d, BUILDER))?.phase === "report",
+    "the implementation loop reports",
+    120000,
+  );
+  f.commit((await threadView(d, BUILDER)).worktree);
+  const last = await poll(async () => {
+    const t = await threadView(d, BUILDER);
+    return !t.loop && t.last_loop?.kind === "implement" && t.last_loop;
+  }, "the implementation loop ends");
+  assert.equal(last.outcome, "clean", JSON.stringify(last));
+  assert.equal(last.commits?.length, 1, JSON.stringify(last));
+  const sha = last.commits[0].sha.slice(0, 7);
+  await run.until(
+    "async (a, lq) => lq.text(document.querySelector('.inspector-loops .loop-last')).includes('Last implementation loop: clean') && lq.all('.inspector-loops .loop-commits code').some((c) => lq.text(c).includes(a.sha))",
+    { sha },
+    { what: "the ended loop and its commit in the inspector" },
+  );
+  await run.shots("implement-ended", { root: ".inspector" });
+
+  // 6. Open report: the report's text as a sheet that scrolls.
+  await run.tap(".inspector-loops button", "Open report");
+  await run.until(
+    "async (a, lq) => !!lq.find('[role=dialog] .loop-report-body .markdown')",
+    {},
+    { what: "the report's text", timeout: 30000 },
+  );
+  const reportSheet = await run.ev(`async (a, lq) => {
+    const dialog = [...document.querySelectorAll('[role=dialog]')].at(-1);
+    const body = dialog.querySelector('.loop-report-body');
+    const before = body.scrollTop;
+    body.scrollTop = body.scrollHeight;
+    await lq.settle();
+    const end = body.scrollTop;
+    const lastLine = [...body.querySelectorAll('.markdown > *')].at(-1);
+    const b = body.getBoundingClientRect(), l = lastLine.getBoundingClientRect();
+    body.scrollTop = 0;
+    await lq.settle();
+    return {
+      title: lq.text(dialog.querySelector('h2')),
+      text: lq.text(body),
+      scrolls: getComputedStyle(body).overflowY,
+      scrolled: end > before,
+      // The last block's end shows (a block taller than the sheet starts above it).
+      lastShown: l.bottom <= b.bottom + 0.5 && l.bottom > b.top,
+      boxes: { body: b.toJSON(), last: l.toJSON(), height: body.scrollHeight },
+      region: body.getAttribute('role') + ' ' + lq.nameOf(body),
+      // A sheet across the screen, not a column of the inspector's panel.
+      width: Math.round(dialog.getBoundingClientRect().width),
+      viewport: document.documentElement.clientWidth,
+      inInspector: !!dialog.closest('.inspector'),
+      path: lq.text(dialog.querySelector('.loop-report-footer .loop-path code')),
+    };
+  }`);
+  assert.equal(reportSheet.title, `Implementation loop report · ${BUILDER}`);
+  assert.match(reportSheet.text, /Built the CSV export/);
+  assert.match(reportSheet.text, new RegExp(sha));
+  assert.equal(reportSheet.scrolls, "auto");
+  assert(
+    reportSheet.scrolled,
+    "The report scrolls: " + JSON.stringify(reportSheet),
+  );
+  assert(
+    reportSheet.lastShown,
+    "Its last line can be scrolled to: " + JSON.stringify(reportSheet.boxes),
+  );
+  assert.equal(reportSheet.region, "region Report");
+  assert(
+    !reportSheet.inInspector && reportSheet.width >= reportSheet.viewport - 2,
+    "The report is a sheet across the screen: " + JSON.stringify(reportSheet),
+  );
+  assert.match(reportSheet.path, /report\.md$/);
+  await run.shots("implement-report-sheet", { root: "[role=dialog]" });
+  const reachFooter = await run.ev(LAST_REACHABLE, {
+    selector: ".loop-report-footer button",
+  });
+  assert(reachFooter.reachable, JSON.stringify(reachFooter));
+  await d.orientation("landscape");
+  await delay(1500);
+  await run.shots("implement-report-sheet-landscape", {
+    root: "[role=dialog]",
+    modes: ["dark"],
+  });
+  assert(
+    (await run.ev(LAST_REACHABLE, { selector: ".loop-report-footer button" }))
+      .reachable,
+    "Sideways the report sheet reaches its footer",
+  );
+  await d.orientation("portrait");
+  await delay(1500);
+  await d.textSize("largest");
+  await run.until(
+    "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) >= 24",
+    {},
+    { what: "the largest text size", timeout: 20000 },
+  );
+  await run.shots("implement-report-sheet-largest-text", {
+    root: "[role=dialog]",
+    modes: ["dark"],
+  });
+  assert(
+    (await run.ev(LAST_REACHABLE, { selector: ".loop-report-footer button" }))
+      .reachable,
+    "At the largest text the report sheet reaches its footer",
+  );
+  const largeBody = await run.ev(
+    "async (a, lq) => { const b = [...document.querySelectorAll('[role=dialog]')].at(-1).querySelector('.loop-report-body'); return { height: Math.round(b.clientHeight), font: parseFloat(getComputedStyle(b).fontSize) }; }",
+  );
+  assert(
+    largeBody.height >= 2.5 * largeBody.font,
+    "At the largest text the report's text keeps room to read: " +
+      JSON.stringify(largeBody),
+  );
+  await d.textSize("default");
+  await run.until(
+    "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) < 20",
+    {},
+    { what: "the default text size", timeout: 20000 },
+  );
+  await run.tap("[role=dialog] button", "Close dialog");
+  await run.tab("Threads");
+  await run.until(
+    "async (a, lq) => { const i = lq.all('.thread-item').find((i) => lq.text(i).includes(a.name)); return lq.text(i?.querySelector('.loop-ended')).includes('committed ' + a.sha); }",
+    { name: BUILDER, sha },
+    { what: "the card's ended line with the commit" },
+  );
+  await run.shots("implement-ended-card", { root: ".thread-grid" });
+  run.pass(
+    "the loop ends with its commit; Open report shows the report's text as a sheet that scrolls",
+    {
+      last,
+      reportSheet: { ...reportSheet, text: reportSheet.text.slice(0, 200) },
+    },
+  );
+
+  // 7. The New thread form's switch, on the saved settings.
+  await run.tab("Chat");
+  await run.tap(".conversation-menu > summary");
+  await run.tap(".conversation-menu button", "New thread");
+  await run.until(
+    "async (a, lq) => !!lq.find('[role=dialog] [role=switch]', 'Run as an implementation loop')",
+    {},
+    { what: "the New thread form's switch" },
+  );
+  await run.ev(
+    `async (a, lq) => {
+      const d = [...document.querySelectorAll('[role=dialog]')].at(-1);
+      const set = (name, value) => {
+        const e = lq.need('input, textarea', { re: '^' + name }, d);
+        const proto = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, 'value').set.call(e, value);
+        e.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      set('Project or repository', 'demo');
+      set('Name', 'loop-form');
+      set('First prompt', a.task);
+      document.activeElement?.blur();
+      await window.Capacitor?.Plugins?.Keyboard?.hide?.().catch?.(() => {});
+      return true;
+    }`,
+    { task: TASK },
+  );
+  await run.tap("[role=dialog] [role=switch]", "Run as an implementation loop");
+  const form = await run.until(
+    `async (a, lq) => {
+      const d = [...document.querySelectorAll('[role=dialog]')].at(-1);
+      const sw = lq.find('[role=switch]', 'Run as an implementation loop', d);
+      const line = lq.text(d.querySelector('.new-thread-loop .loop-settings-line'));
+      if (!sw?.checked || !/saved settings/.test(line)) return false;
+      sw.scrollIntoView({ block: 'start' });
+      await lq.settle();
+      return { line, change: !!lq.find('button', 'Change the loop settings…', d) };
+    }`,
+    {},
+    { what: "the switch on, with the saved settings' line" },
+  );
+  assert(form.change, "Change… beside the settings line");
+  await run.shots("new-thread-loop", { root: "[role=dialog]" });
+  await run.tap("[role=dialog] button", "Create thread");
+  await poll(async () => {
+    const t = await threadView(d, "loop-form").catch(() => undefined);
+    return t && (t.loop || t.last_loop);
+  }, "the New thread form's switch starts an implementation loop");
+  const formLoop = (await threadView(d, "loop-form")).loop;
+  if (formLoop) {
+    assert.equal(formLoop.kind, "implement");
+    await owner("loop.control", { thread: "loop-form", action: "stop" });
+    await poll(
+      async () => !(await threadView(d, "loop-form")).loop,
+      "loop-form's loop stops",
+    );
+  }
+  run.pass("the New thread form's switch starts an implementation loop", form);
+
+  // 8. Offline: neither Send as implementation loop nor the card's answers start
+  //    anything, and nothing goes to the outbox.
+  await owner("loop.request", {
+    thread: BUILDER,
+    kind: "implement",
+    task: TASK,
+    setup: true,
+  });
+  await openConversation(run, BUILDER);
+  await run.until(
+    "async (a, lq) => !!lq.find('.loop-setup-row button', 'Review setup')",
+    {},
+    { what: "the raised card's row" },
+  );
+  await typeTask(run, BUILDER, "add a PDF export");
+  await d.offline(true);
+  const offlineChoice = await poll(async () => {
+    const c = await openSendAsLoop(run, BUILDER);
+    if (c.disabled) return c;
+    await run.ev(
+      "async (a, lq) => { lq.find('.send-loop-button', { re: '^Send as implementation loop to' })?.click(); return true; }",
+    );
+    return false;
+  }, "Send as implementation loop is off while offline");
+  const offline = await run.ev(`async (a, lq) => {
+    lq.find('.send-loop-panel button', 'Send as implementation loop')?.click();
+    await lq.sleep(500);
+    lq.find('.send-loop-button', { re: '^Send as implementation loop to' })?.click();
+    lq.find('.loop-setup-row button', 'Review setup')?.click();
+    await lq.sleep(800);
+    const start = lq.find('[role=dialog] .attention-options button', 'Start and save');
+    const without = lq.find('[role=dialog] .attention-options button', 'Run without a loop');
+    start?.click();
+    without?.click();
+    await lq.sleep(800);
+    const journal = await window.Capacitor?.Plugins?.TwrOffline?.list?.().catch(() => undefined);
+    return { start: start ? start.disabled : null, without: without ? without.disabled : null, outbox: lq.text(document.querySelector('.outbox')), journal };
+  }`);
+  await run.shots("implement-offline", { root: "[role=dialog]" });
+  await d.offline(false);
+  await run.until(
+    "async () => { try { await window.twr.rpc('hub.info'); return true; } catch { return false; } }",
+    {},
+    { what: "back online", timeout: 60000 },
+  );
+  await delay(3000);
+  assert.equal(offlineChoice.disabled, true, JSON.stringify(offlineChoice));
+  assert.match(offlineChoice.what, /live connection/);
+  assert.equal(offline.start ?? true, true, JSON.stringify(offline));
+  assert.equal(offline.without ?? true, true, JSON.stringify(offline));
+  assert(
+    !/PDF|CSV|loop/i.test(offline.outbox || ""),
+    "Nothing in the outbox: " + offline.outbox,
+  );
+  assert(
+    !JSON.stringify(offline.journal || "").includes("PDF"),
+    "Nothing in the offline journal: " + JSON.stringify(offline.journal),
+  );
+  assert.equal(await runningLoop(d, BUILDER), undefined, "Nothing started");
+  run.pass(
+    "offline: Send as implementation loop and the card's answers are off; nothing queued or sent",
+    { offlineChoice, offline },
+  );
+  // Leave no card or draft behind.
+  const items = await owner("attention.list", {});
+  for (const item of items.filter((i) =>
+    JSON.stringify(i).includes("loop_setup"),
+  ))
+    await owner("attention.respond", {
+      attn_id: item.attn_id,
+      revision: item.revision,
+      answer: "cancel",
+    });
+  await run.ev(
+    "async (a, lq) => { lq.find('[role=dialog] button', 'Close dialog')?.click(); await lq.sleep(300); return true; }",
+  );
+  await typeTask(run, BUILDER, "");
 }
 
 /** Pairs the app on its pairing form (the onboarding's Pair a hub). */
@@ -1107,7 +1777,7 @@ async function openSettingsLoops(run) {
  */
 export async function loopReadOnlyQA(driver, fixture, options) {
   const run = new Run(driver, fixture, options);
-  run.step = options.step || 40;
+  run.step = options.step || 60;
   const owner = (method, params) => driver.owner(method, params);
   // A setup card the user raised elsewhere.
   await owner("loop.request", { thread: THREAD, kind: "review", setup: true });
@@ -1172,7 +1842,7 @@ export async function loopReadOnlyQA(driver, fixture, options) {
     { what: "the report on a read device", timeout: 60000 },
   );
   const review = await run.ev(
-    "async (a, lq) => { const b = lq.find('.inspector-loops > button', 'Review loop'); return { disabled: b?.disabled, why: b?.title, report: lq.text(document.querySelector('.inspector-report')) }; }",
+    "async (a, lq) => { const b = lq.find('.inspector-loops .loop-starts button', 'Review loop'); return { disabled: b?.disabled, why: b?.title, report: lq.text(document.querySelector('.inspector-report')) }; }",
   );
   assert.equal(review.disabled, true, "A read device cannot start a loop");
   assert.match(review.report, /review loop/);
@@ -1189,8 +1859,128 @@ export async function loopReadOnlyQA(driver, fixture, options) {
     "a read device sees the loop line and the report and changes nothing",
     { card, controls, review, settings },
   );
+  await implementReadOnlyQA(run, driver, fixture);
   run.audited();
   return run.report;
+}
+
+/**
+ * An implementation loop on a `read` device: its card's four answers are off; the chip, the
+ * progress and the report's text show; Send as implementation loop and the controls are
+ * off.
+ */
+async function implementReadOnlyQA(run, d, f) {
+  const owner = (method, params) => d.owner(method, params);
+  // A card holding a task, raised elsewhere.
+  await owner("loop.request", {
+    thread: BUILDER,
+    kind: "implement",
+    task: TASK,
+    setup: true,
+  });
+  await run.tab("Needs you");
+  await run.until(
+    "async (a, lq) => !!lq.all('.loop-setup-row').find((r) => /Implementation loop setup/.test(lq.text(r)))",
+    {},
+    { what: "the implementation loop's card on a read device" },
+  );
+  await run.ev(
+    "async (a, lq) => { lq.all('.loop-setup-row').find((r) => /Implementation loop setup/.test(lq.text(r))).querySelector('button').click(); await lq.sleep(900); return true; }",
+  );
+  const card = await run.until(
+    "async (a, lq) => { const d = [...document.querySelectorAll('[role=dialog]')].at(-1); const b = lq.all('.attention-options button', d); return b.length && { buttons: b.map((e) => ({ name: lq.nameOf(e), disabled: e.disabled })), task: lq.text(d.querySelector('.loop-setup-task')), why: lq.text(d.querySelector('.loop-readonly')) }; }",
+    {},
+    { what: "the card's sheet on a read device" },
+  );
+  assert.deepEqual(
+    card.buttons.map((b) => b.name),
+    ["Start and save", "Change…", "Run without a loop", "Cancel"],
+  );
+  assert(
+    card.buttons.every((b) => b.disabled),
+    "Every answer is off: " + JSON.stringify(card),
+  );
+  assert.equal(card.task, TASK);
+  await run.shots("read-implement-card", { root: "[role=dialog]" });
+  await run.tap("[role=dialog] button", "Close dialog");
+  for (const item of (await owner("attention.list", {})).filter((i) =>
+    JSON.stringify(i).includes("loop_setup"),
+  ))
+    await owner("attention.respond", {
+      attn_id: item.attn_id,
+      revision: item.revision,
+      answer: "cancel",
+    });
+  // Started elsewhere on the saved settings: the chip and the progress, nothing to press.
+  const before = (await threadView(d, BUILDER)).last_loop?.id;
+  const next = f.runs() + 1;
+  f.hold(next);
+  const started = await owner("loop.request", {
+    thread: BUILDER,
+    kind: "implement",
+    task: "add a JSON export to the reports page",
+  });
+  assert.equal(started.status, "started", JSON.stringify(started));
+  await run.tab("Threads");
+  await run.until(
+    "async (a, lq) => { const i = lq.all('.thread-item').find((i) => lq.text(i).includes(a.name)); return lq.text(i?.querySelector('.loop-chip .loop-badge')) === 'IMPLEMENT LOOP'; }",
+    { name: BUILDER },
+    { what: "the IMPLEMENT LOOP chip on a read device", timeout: 60000 },
+  );
+  await run.shots("read-implement-chip", { root: ".thread-grid" });
+  await poll(() => f.runs() >= next, "the loop's first review run", 120000);
+  await run.tap(".thread-item .loop-chip", { re: "^IMPLEMENT LOOP" });
+  const progress = await run.until(
+    "async (a, lq) => { const s = document.querySelector('.inspector-loops'); if (!s || !/IMPLEMENT LOOP/.test(lq.text(s.querySelector('.loop-status')))) return false; return { phases: lq.all('.loop-phases li', s).map(lq.text), implement: lq.all('.loop-implement dd', s).map(lq.text), controls: lq.all('.loop-controls button', s).map((b) => ({ name: lq.nameOf(b), disabled: b.disabled })) }; }",
+    {},
+    { what: "the implementation loop's progress on a read device" },
+  );
+  assert(progress.implement.length > 0, JSON.stringify(progress));
+  assert(
+    progress.controls.length && progress.controls.every((c) => c.disabled),
+    JSON.stringify(progress),
+  );
+  await run.shots("read-implement-progress", { root: ".inspector" });
+  // Send as implementation loop is off.
+  await openConversation(run, BUILDER);
+  const send = await run.ev(
+    "async (a, lq) => { const o = lq.find('.send-loop-button', { re: '^Send as implementation loop to' }); if (!o) return { shown: false }; o.click(); await lq.sleep(300); const c = lq.find('.send-loop-panel button', 'Send as implementation loop'); const out = { shown: true, disabled: c ? c.disabled : null, why: c ? lq.text(document.getElementById(c.getAttribute('aria-describedby'))) : '' }; o.click(); return out; }",
+  );
+  assert(
+    !send.shown || send.disabled !== false,
+    "A read device cannot send as a loop: " + JSON.stringify(send),
+  );
+  // Released, it runs to its end (nothing commits it: `not committed`) and the report's
+  // text shows.
+  f.releaseAll();
+  const last = await poll(
+    async () => {
+      const t = await threadView(d, BUILDER);
+      return !t.loop && t.last_loop?.id !== before && t.last_loop;
+    },
+    "the read device's implementation loop ends",
+    180000,
+  );
+  await run.tab("Threads");
+  await run.tap(".thread-card", { re: `^${BUILDER}` });
+  await run.until(
+    "async (a, lq) => !!lq.find('.inspector-loops button', 'Open report')",
+    {},
+    { what: "Open report on a read device" },
+  );
+  await run.tap(".inspector-loops button", "Open report");
+  const report = await run.until(
+    "async (a, lq) => { const d = [...document.querySelectorAll('[role=dialog]')].at(-1); const t = d && lq.text(d.querySelector('.loop-report-body .markdown')); return t && { title: lq.text(d.querySelector('h2')), text: t.slice(0, 200) }; }",
+    {},
+    { what: "the report's text on a read device", timeout: 30000 },
+  );
+  assert.equal(report.title, `Implementation loop report · ${BUILDER}`);
+  await run.shots("read-implement-report", { root: "[role=dialog]" });
+  await run.tap("[role=dialog] button", "Close dialog");
+  run.pass(
+    "a read device sees an implementation loop's card, chip, progress and report text, and can answer, start or control nothing",
+    { card, progress, send, last, report },
+  );
 }
 
 const calibrations = new WeakMap();

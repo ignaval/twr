@@ -9,8 +9,12 @@
 //
 // `TWR_LOOPS_SHOTS=<dir>` also saves, at every step, the window in the light and the dark
 // theme at the default size and at the minimum width (`NN-step-<light|dark>.png`,
-// `NN-step-min-<light|dark>.png`) and the accessibility tree of the step's region
+// `NN-step-<light|dark>-min.png`) and the accessibility tree of the step's region
 // (`NN-step.aria.txt`), for a person to look at.
+//
+// `TWR_LOOPS_WINDOW=<width>x<height>` runs it in a window of that content size (a CI
+// runner's screen is smaller than the default 1360×900: `1024x674`), set right after
+// launch, before anything is measured.
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
@@ -40,6 +44,13 @@ const shots = process.env.TWR_LOOPS_SHOTS
   ? resolve(process.env.TWR_LOOPS_SHOTS)
   : undefined;
 if (shots) mkdirSync(shots, { recursive: true });
+const windowSize = process.env.TWR_LOOPS_WINDOW
+  ? process.env.TWR_LOOPS_WINDOW.match(/^(\d+)x(\d+)$/)
+      ?.slice(1)
+      .map(Number)
+  : undefined;
+if (process.env.TWR_LOOPS_WINDOW && !windowSize)
+  throw new Error("TWR_LOOPS_WINDOW is <width>x<height>, such as 1024x674");
 
 const home = realpathSync(mkdtempSync(join(tmpdir(), "twr-loops-")));
 const repo = join(home, "repo");
@@ -62,8 +73,9 @@ execFileSync("git", ["init", "-b", "main", repo], { stdio: "ignore" });
 writeFileSync(join(repo, "lib.rs"), "pub fn f() {}\n");
 git("add", "-A");
 git("commit", "-m", "Initial");
+// One sweep audit at a time (step 10): the fake reviewer's runs keep their order.
 const config = (offer) =>
-  `default_runtime = "fake"\n[projects.demo]\nrepo = ${JSON.stringify(repo)}\n[orchestrator]\nautostart = false\n[threads]\nidle_compaction = "off"\n[tui]\nsuggest = false\nsummaries = false\n${offer === false ? "[loops]\noffer_review = false\n" : ""}`;
+  `default_runtime = "fake"\n[projects.demo]\nrepo = ${JSON.stringify(repo)}\n[orchestrator]\nautostart = false\n[threads]\nidle_compaction = "off"\n[tui]\nsuggest = false\nsummaries = false\n[loops]\nmax_audit_runs = 1\n${offer === false ? "offer_review = false\n" : ""}`;
 // The hub starts with the offer off; step 1 turns it on.
 writeFileSync(join(home, "config.toml"), config(false), { mode: 0o600 });
 const reviewers = join(home, "reviewers");
@@ -80,7 +92,9 @@ while [ -f "$here/hold.$n" ]; do sleep 0.05; done
 if [ -f "$here/fail.$n" ]; then echo "fake reviewer failed run $n" >&2; exit 1; fi
 out=""; prev=""
 for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
-if [ "$n" = 1 ]; then
+if [ -f "$here/answers/$n.json" ]; then
+  cp "$here/answers/$n.json" "$out"
+elif [ "$n" = 1 ]; then
   printf '%s' '{"findings": [{"severity": "major", "location": "lib.rs:1", "problem": "it breaks on empty input", "fix": "guard it"}]}' > "$out"
 else
   printf '%s' '{"findings": []}' > "$out"
@@ -92,6 +106,14 @@ chmodSync(codex, 0o755);
 const hold = (n) => writeFileSync(join(reviewers, `hold.${n}`), "");
 const release = (n) => rmSync(join(reviewers, `hold.${n}`), { force: true });
 const failRun = (n) => writeFileSync(join(reviewers, `fail.${n}`), "");
+/** Review run `n` answers `findings` (by default run 1 finds one problem, later runs none). */
+const answer = (n, findings) => {
+  mkdirSync(join(reviewers, "answers"), { recursive: true });
+  writeFileSync(
+    join(reviewers, "answers", `${n}.json`),
+    JSON.stringify({ findings }),
+  );
+};
 const runs = () => {
   try {
     return Number(readFileSync(join(reviewers, "count"), "utf8").trim());
@@ -118,18 +140,25 @@ writeFileSync(
 // runtime runs no git), then names a commit (the hub checks the repository, not the sha).
 // `{{commit}}` comes before the block: the fake echoes the wording's indented example as a
 // fence, and the hub reads the last one.
-writeFileSync(
-  join(templates, "plan.md"),
-  'Plan: a CSV export on the reports page.\n```twr-plan\n{"contract_risk": false, "reason": "UI only: a new button"}\n```\n',
-);
-writeFileSync(
-  join(templates, "implement.md"),
-  '!write feature.rs pub fn export_csv() {}\nImplemented.\n```twr-implement\n{"status": "done", "gates": {"ran": ["true"], "result": "pass"}}\n```\n',
-);
+const PLAN =
+  'Plan: a CSV export on the reports page.\n```twr-plan\n{"contract_risk": false, "reason": "UI only: a new button"}\n```\n';
+const IMPLEMENT =
+  '!write feature.rs pub fn export_csv() {}\nImplemented.\n```twr-implement\n{"status": "done", "gates": {"ran": ["true"], "result": "pass"}}\n```\n';
+writeFileSync(join(templates, "plan.md"), PLAN);
+writeFileSync(join(templates, "implement.md"), IMPLEMENT);
 writeFileSync(
   join(templates, "impl-report.md"),
   '!sleep 4000\nBuilt the CSV export.\n{{commit}}\n```twr-commit\n{"commits": [{"repo": "demo", "sha": "abc1234"}]}\n```\n',
 );
+// A sweep audited by runs (step 10): a triage that fixes the round's finding as a new class
+// (so the `medium` profile sweeps), the rules turn naming two rules, and the verification
+// turn's verdict on each.
+const FIX_TRIAGE =
+  '{{findings}}\nTriaged.\n```twr-triage\n{"items": [{"id": "{{finding_ids}}", "verdict": "fixed", "class": "new-class", "rule": "guard-input"}], "gates": {"ran": ["true"], "result": "pass"}}\n```\n';
+const RULES =
+  'Named.\n```twr-rules\n{"rules": [{"name": "guard-input", "rule": "Every parser guards empty input.", "where": "lib.rs"}, {"name": "trim-input", "rule": "Every parser trims its input.", "where": "everywhere the diff touches"}]}\n```\n';
+const SWEEP_VERIFY =
+  'Verified.\n```twr-sweep\n{"rules": [{"rule": "guard-input", "result": "fixed"}, {"rule": "trim-input", "result": "checked clean"}], "gates": {"ran": ["true"], "result": "pass"}}\n```\n';
 const tokenFile = join(home, "test-user.token");
 writeFileSync(tokenFile, randomUUID(), { mode: 0o600 });
 const bin = resolve("../target/debug");
@@ -207,6 +236,23 @@ try {
   applicationProcess = application.process();
   const page = await application.firstWindow();
   page.on("pageerror", (error) => errors.push(error.message));
+  if (windowSize) {
+    const [width, height] = windowSize;
+    await application.evaluate(
+      ({ BrowserWindow }, [width, height]) =>
+        BrowserWindow.getAllWindows()[0].setContentSize(width, height),
+      windowSize,
+    );
+    await until(
+      () =>
+        page.evaluate(
+          ([width, height]) => innerWidth === width && innerHeight === height,
+          windowSize,
+        ),
+      `The window never took the size ${width}x${height}`,
+      10000,
+    );
+  }
   const connected = () =>
     page
       .locator(".connection-status")
@@ -249,7 +295,7 @@ try {
         await theme(value);
         await page.waitForTimeout(150);
         await page.screenshot({
-          path: join(shots, `${name}-min-${value}.png`),
+          path: join(shots, `${name}-${value}-min.png`),
         });
       }
       await page.setViewportSize(defaultSize);
@@ -368,6 +414,27 @@ try {
       .first()
       .click();
   };
+  /**
+   * At the minimum width the selected thread's inspector shows over the conversation: the
+   * sidebar's drawer, if open, is closed so that it does not cover it, and `region` is
+   * brought into view.
+   */
+  const inspectorNarrow = (region) => async () => {
+    const hide = page.getByRole("button", {
+      name: "Hide sidebar",
+      exact: true,
+    });
+    if (await hide.isVisible()) await hide.click();
+    await inspector.waitFor();
+    await region?.evaluate((n) => n.scrollIntoView({ block: "start" }));
+  };
+  /** Closes the passing notices (they go by themselves after a few seconds). */
+  const dismissNotices = async () => {
+    for (const button of await page
+      .getByRole("button", { name: "Dismiss notice" })
+      .all())
+      if (await button.isVisible()) await button.click();
+  };
   const compact = (name) =>
     page
       .locator(".compact-nav")
@@ -375,8 +442,16 @@ try {
       .first()
       .click();
   /** WCAG contrast of an element's text on its own (opaque) background. */
+  // Buttons ease their colours over 120 ms: a theme switch is measured once those
+  // transitions have ended, never part-way, where text and fill pass through the same grey.
   const contrast = (locator) =>
-    locator.evaluate((node) => {
+    locator.evaluate(async (node) => {
+      await new Promise((done) =>
+        requestAnimationFrame(() => requestAnimationFrame(done)),
+      );
+      await Promise.all(
+        node.getAnimations().map((a) => a.finished.catch(() => {})),
+      );
       const rgb = (value) =>
         value
           .match(/[\d.]+/g)
@@ -425,6 +500,125 @@ try {
           style.outlineStyle !== "none" && parseFloat(style.outlineWidth) > 0,
       };
     });
+
+  /**
+   * A request in the conversation as a person finds it, whatever the window's size: the
+   * requests take at most 35% of the conversation and scroll in their own area, so the
+   * composer stays in view; while the card goes on below that area's fold, a cue at its
+   * bottom edge says so, gone at the end; Tab from the card reaches its first answer and
+   * brings it into view. Leaves the area scrolled to its top, as it was found.
+   */
+  const inlineRequest = async (card, where) => {
+    const area = page.locator(".conversation-attention");
+    const settled = () =>
+      page.evaluate(
+        () =>
+          new Promise((done) =>
+            requestAnimationFrame(() => requestAnimationFrame(done)),
+          ),
+      );
+    const look = () =>
+      area.evaluate((n) => ({
+        scrollable: n.scrollHeight > n.clientHeight + 1,
+        more: n.dataset.more,
+        cue: getComputedStyle(n, "::after").content,
+        send: document
+          .querySelector('button[aria-label="Send message"]')
+          .getBoundingClientRect().bottom,
+        height: innerHeight,
+      }));
+    await area.evaluate((n) => n.scrollTo({ top: 0 }));
+    await settled();
+    const top = await look();
+    assert(
+      top.send <= top.height + 1,
+      `${where}: the composer stays in view under the request`,
+    );
+    assert.equal(
+      top.more,
+      top.scrollable ? "below" : undefined,
+      `${where}: a request that goes on below its area's fold says so`,
+    );
+    assert.equal(
+      top.cue === "none",
+      !top.scrollable,
+      `${where}: the cue shows`,
+    );
+    if (top.scrollable) {
+      await area.evaluate((n) => n.scrollTo({ top: n.scrollHeight }));
+      await settled();
+      const end = await look();
+      assert.equal(end.more, undefined, `${where}: no cue at the area's end`);
+      assert.equal(end.cue, "none");
+      await area.evaluate((n) => n.scrollTo({ top: 0 }));
+      await settled();
+    }
+    const first = card.locator(".attention-options button").first();
+    await card.evaluate((n) => n.focus({ preventScroll: true }));
+    for (let i = 0; i < 4; i++) {
+      if (await first.evaluate((n) => n === document.activeElement)) break;
+      await page.keyboard.press("Tab");
+    }
+    assert(
+      await first.evaluate((n) => n === document.activeElement),
+      `${where}: Tab from the card reaches its first answer`,
+    );
+    await settled();
+    assert(
+      await first.evaluate((n) => {
+        const box = n.getBoundingClientRect();
+        const area = n
+          .closest(".conversation-attention")
+          .getBoundingClientRect();
+        return (
+          box.top >= area.top - 1 &&
+          box.bottom <= area.bottom + 1 &&
+          box.bottom <= innerHeight
+        );
+      }),
+      `${where}: the answer Tab reaches is brought into view`,
+    );
+    await area.evaluate((n) => n.scrollTo({ top: 0 }));
+    await settled();
+  };
+  /** Waits for the inspector's (smooth) scroll to end: the same position twice running. */
+  const inspectorSettled = async (where) => {
+    let last;
+    await until(async () => {
+      const now = await inspector
+        .locator(".inspector-body")
+        .evaluate((n) => n.scrollTop);
+      const still = now === last;
+      last = now;
+      return still;
+    }, `${where}: the inspector never stopped scrolling`);
+  };
+  /**
+   * Bringing a part of the inspector into view scrolls the inspector only: the window's
+   * layout stays where it was (the conversation's top under the top bar, the inspector to
+   * the window's bottom). Waits for a smooth scroll to end first.
+   */
+  const layoutInPlace = async (where) => {
+    await inspectorSettled(where);
+    const boxes = await page.evaluate(() => {
+      const box = (selector) =>
+        document.querySelector(selector)?.getBoundingClientRect();
+      return {
+        area: box(".work-area"),
+        column: box(".content-column"),
+        inspector: box("#twr-inspector"),
+        height: innerHeight,
+      };
+    });
+    assert(
+      Math.abs(boxes.column.top - boxes.area.top) <= 1,
+      `${where}: the conversation stays at the top of the work area (${boxes.column.top} vs ${boxes.area.top})`,
+    );
+    assert(
+      Math.abs(boxes.inspector.bottom - boxes.height) <= 1,
+      `${where}: the inspector reaches the window's bottom (${boxes.inspector.bottom} of ${boxes.height})`,
+    );
+  };
 
   // ---------------------------------------------------------------------------------
   // 1. A turn that ends with changes offers a quiet Review loop; offer_review = false
@@ -573,6 +767,8 @@ try {
     await inspectorCard.evaluate((n) => n === document.activeElement),
     "The raised setup card has the focus",
   );
+  // Measured once its smooth scroll has ended, never part-way.
+  await inspectorSettled("The raised setup card");
   const startBox = await inspectorCard
     .getByRole("button", { name: "Start and save" })
     .boundingBox();
@@ -592,8 +788,14 @@ try {
   const rows = await inspectorCard
     .locator(".loop-setup-rows dt")
     .allInnerTexts();
-  for (const row of ["Profile", "Scope", "Implementer", "Workers", "Reviewer"])
+  for (const row of ["Profile", "Scope", "Implementer", "Reviewer"])
     assert(rows.includes(row), `The setup card has a ${row} row: ${rows}`);
+  // The fake runtime runs no subagents: the hub leaves the Workers row out
+  // (`settings::workers_apply`, `loop_setup.no_workers`).
+  assert(
+    !rows.includes("Workers"),
+    `No Workers row for a fake thread: ${rows}`,
+  );
   for (const name of ["Start and save", "Change…", "Cancel"])
     await inspectorCard.getByRole("button", { name, exact: true }).waitFor();
   assert.equal(
@@ -621,16 +823,20 @@ try {
   await talk();
   const inlineCard = setupIn(page.locator(".conversation-attention"));
   await inlineCard.waitFor();
+  await inlineRequest(inlineCard, "The review loop's setup card");
   await capture("06-setup-inline", inlineCard, { narrow: false });
   console.log(
-    "PASS: the setup card shows in the inspector, in Needs you and in the conversation, with its five rows and three buttons",
+    "PASS: the setup card shows in the inspector, in Needs you and in the conversation, with its rows and three buttons",
   );
 
   // ---------------------------------------------------------------------------------
   // 3. Change… opens the editor; a change goes back to the card as a new revision.
   // ---------------------------------------------------------------------------------
-  // With the keyboard: Tab from Start and save reaches Change…, Enter opens the editor.
+  // The conversation's requests take at most 35% of it: in a short window the card's
+  // answers are below its region's fold, and arm once scrolled into view, as for a person.
+  await inlineCard.locator(".attention-options").scrollIntoViewIfNeeded();
   await inlineCard.locator('.attention-options[data-armed="true"]').waitFor();
+  // With the keyboard: Tab from Start and save reaches Change…, Enter opens the editor.
   await inlineCard.getByRole("button", { name: "Start and save" }).focus();
   await page.keyboard.press("Tab");
   let now = await focused();
@@ -718,6 +924,7 @@ try {
     await inlineCard.locator(".attention-options").getAttribute("data-armed"),
     "false",
   );
+  await inlineCard.locator(".attention-options").scrollIntoViewIfNeeded();
   await inlineCard.locator('.attention-options[data-armed="true"]').waitFor();
   await inlineCard.getByRole("button", { name: "Start and save" }).click();
   await until(() => runs() === 1, "The first review run never started");
@@ -755,6 +962,7 @@ try {
     await loopsSection.evaluate((n) => n === document.activeElement),
     "The chip's click focuses the Loops section",
   );
+  await layoutInPlace("The chip's Loops section");
   const status = loopsSection.locator(".loop-status");
   await status.filter({ hasText: "waiting on the review" }).waitFor();
   assert.match(await status.innerText(), /REVIEW LOOP\s+low/);
@@ -778,7 +986,7 @@ try {
     await controls.getByRole("button", { name, exact: true }).waitFor();
   await ariaOf("11-inspector-running", loopsSection);
   await capture("11-inspector-running", null, {
-    narrow: () => compact("More"),
+    narrow: inspectorNarrow(loopsSection),
     restore: back,
   });
   // With the keyboard only: from the focused section, Tab reaches its controls in order,
@@ -820,6 +1028,44 @@ try {
   console.log(
     "PASS: Start and save starts the loop: chip, background state naming the reviewer, inspector progress, pause and resume",
   );
+  // Open report while it runs: the dialog says the report is not written yet, and where
+  // the hub will write it (`loop.report`); Close gives the focus back to Open report.
+  await loopsSection.getByRole("button", { name: "Open report" }).click();
+  const notYet = page.getByRole("dialog", { name: "Review loop report · api" });
+  await notYet
+    .locator(".loop-report-body")
+    .getByText(
+      "api's review loop is still running: its report is not written yet (the hub writes it when the loop ends)",
+    )
+    .waitFor({ timeout: 15000 });
+  assert.equal(
+    await notYet.locator(".loop-report-body .markdown").count(),
+    0,
+    "No text for a report not written",
+  );
+  assert.match(await notYet.innerText(), /\brunning\b/);
+  const futurePath = await notYet
+    .locator(".loop-report-footer .loop-path code")
+    .innerText();
+  assert.match(futurePath, /report\.md$/);
+  assert(!existsSync(futurePath), "The running loop's report is not written");
+  assert.match(
+    await notYet.locator(".loop-report-footer").textContent(),
+    /To be written on the hub's machine at/,
+  );
+  await ariaOf("25-report-running", notYet);
+  await capture("25-report-running", null);
+  await notYet.getByRole("button", { name: "Close dialog" }).click();
+  await notYet.waitFor({ state: "hidden" });
+  assert.equal(
+    (await focused()).text,
+    "Open report",
+    "Focus goes back to Open report",
+  );
+  assert(thread("api").loop, "Reading the report changes nothing");
+  console.log(
+    "PASS: Open report on a running loop says its report is not written yet, and where it will be",
+  );
   // The first round answers one finding; the thread dismisses it; the verification run
   // is held: the progress shows the round with its finding and the ledger.
   release(1);
@@ -837,7 +1083,7 @@ try {
   await rounds.getByText(/dismissed: empty input never reaches it/).waitFor();
   await ariaOf("13-inspector-rounds", loopsSection);
   await capture("13-inspector-rounds", null, {
-    narrow: () => compact("More"),
+    narrow: inspectorNarrow(loopsSection.getByRole("list", { name: "Rounds" })),
     restore: back,
   });
   console.log(
@@ -884,6 +1130,32 @@ try {
     .innerText();
   assert.match(path, /report\.md$/);
   assert(existsSync(path), "The report's path exists");
+  // The dialog shows the report's text as the hub wrote it, in a region that scrolls.
+  assert.equal(
+    await reportDialog
+      .getAttribute("aria-labelledby")
+      .then((id) =>
+        page.evaluate((id) => document.getElementById(id)?.textContent, id),
+      ),
+    "Review loop report · api",
+  );
+  assert.match(await reportDialog.innerText(), /\bclean\b/);
+  const reportRegion = reportDialog.getByRole("region", { name: "Report" });
+  await reportRegion
+    .getByText("The loop reviewed the change; nothing is left open.")
+    .waitFor();
+  const onDisk = readFileSync(path, "utf8");
+  assert(
+    onDisk.includes("The loop reviewed the change; nothing is left open."),
+    "The dialog's text is report.md's",
+  );
+  assert.equal(
+    await reportRegion.evaluate((n) => getComputedStyle(n).overflowY),
+    "auto",
+    "The report scrolls inside its dialog",
+  );
+  await ariaOf("26-report-finished", reportDialog);
+  await capture("26-report-finished", null);
   await reportDialog.getByRole("button", { name: "Close dialog" }).click();
   await reportDialog.waitFor({ state: "hidden", timeout: 15000 });
   await page.waitForTimeout(1500);
@@ -894,7 +1166,7 @@ try {
   );
   await ariaOf("14-ended", inspector);
   await capture("14-ended", null, {
-    narrow: () => compact("More"),
+    narrow: inspectorNarrow(loopsSection),
     restore: back,
   });
   console.log(
@@ -963,6 +1235,7 @@ try {
     await stuck.getByRole("button", { name, exact: true }).waitFor();
   assert.equal(await stuck.getByRole("button", { name: "Dismiss" }).count(), 0);
   await ariaOf("16-stuck", stuck);
+  await layoutInPlace("The stuck loop's inspector");
   await capture("16-stuck", null, {
     narrow: () => compact("Needs you"),
     restore: select,
@@ -981,11 +1254,17 @@ try {
   );
   // /review --setup shows the card on the saved settings; while the window is hidden it
   // notifies as a request for the loop's settings. Cancel starts and saves nothing.
+  // The notification is waited for while the window is still hidden: shown again at once,
+  // it could come forward before the card reached the app, which then posts none.
   await hidden(async () => {
     await page.waitForTimeout(1500);
-    twr("loop", "review", "api", "--setup", "--json");
-  }).catch(() => {});
-  await notified("Asks you to choose a loop's settings");
+    try {
+      twr("loop", "review", "api", "--setup", "--json");
+    } catch {
+      // Exit 2: the card is left open for the app to answer.
+    }
+    await notified("Asks you to choose a loop's settings");
+  });
   await talk();
   const again = setupIn(page.locator(".conversation-attention"));
   await again.waitFor();
@@ -993,6 +1272,7 @@ try {
     await again.locator(".loop-setup-title").innerText(),
     /^api: review loop setup/,
   );
+  await again.locator(".attention-options").scrollIntoViewIfNeeded();
   await again.locator('.attention-options[data-armed="true"]').waitFor();
   await again.getByRole("button", { name: "Cancel", exact: true }).click();
   await again.waitFor({ state: "hidden", timeout: 15000 });
@@ -1106,6 +1386,7 @@ try {
   await page.getByRole("button", { name: "Talk to this thread" }).click();
   const webBox = page.getByRole("textbox", { name: "Message web directly" });
   await webBox.waitFor();
+  await page.getByText("Loading conversation…").waitFor({ state: "hidden" });
   const task = "add a CSV export to the reports page";
   /** Types the task and picks Send as implementation loop from Send's caret. */
   const sendAsLoop = async () => {
@@ -1123,11 +1404,15 @@ try {
   };
   // The choice is keyboard-reachable and Escape closes it, giving focus back to the caret.
   await sendAsLoop();
-  await ariaOf("20-send-as-loop", page.locator(".composer"));
-  await capture("20-send-as-loop", null, { narrow: false });
   assert.equal((await focused()).text, "Send as implementation loop");
   await page.keyboard.press("Escape");
   assert.equal((await focused()).text, "More ways to send");
+  await sendAsLoop();
+  await ariaOf("20-send-as-loop", page.locator(".composer"));
+  await capture("20-send-as-loop", null);
+  const sendCaret = page.getByRole("button", { name: "More ways to send" });
+  if ((await sendCaret.getAttribute("aria-expanded")) === "true")
+    await sendCaret.click();
   (await sendAsLoop()).click();
   const webSetup = setupIn(page.locator(".conversation-attention"));
   await webSetup.waitFor({ timeout: 15000 });
@@ -1147,6 +1432,7 @@ try {
     await webSetup.getByRole("region", { name: "Task" }).innerText(),
     task,
   );
+  await inlineRequest(webSetup, "The implementation loop's setup card");
   // The conversation's requests take at most a third of it: the card's answers arm once
   // scrolled into view, as for a person.
   await webSetup.locator(".attention-options").scrollIntoViewIfNeeded();
@@ -1155,8 +1441,19 @@ try {
     await webSetup.locator(".attention-options button").allInnerTexts(),
     ["Start and save", "Change…", "Run without a loop", "Cancel"],
   );
+  await dismissNotices();
   await ariaOf("21-setup-task", webSetup);
-  await capture("21-setup-task", null, { narrow: false });
+  await capture("21-setup-task", null, {
+    // Resized, the answers arm again from zero: shown armed.
+    narrow: async () => {
+      await webSetup.locator(".attention-options").scrollIntoViewIfNeeded();
+      await webSetup
+        .locator('.attention-options[data-armed="true"]')
+        .waitFor({ timeout: 5000 });
+    },
+    restore: () =>
+      webSetup.locator(".attention-options").scrollIntoViewIfNeeded(),
+  });
   // In Needs you too, with the same three answers.
   await nav(/Needs you/);
   const needsTask = setupIn(page.locator(".manager"));
@@ -1190,9 +1487,13 @@ try {
     "PASS: Send as implementation loop raises the card holding the task; Run without a loop sends it as a message",
   );
 
-  // Again, with Start and save: the loop runs. Its first review run is held to look.
+  // Again, with Start and save: the loop runs. Its plan and implement turns take a while
+  // (the fake thread sleeps first), to look at the inspector during each; its first review
+  // run is held.
   const firstRun = runs() + 1;
   hold(firstRun);
+  writeFileSync(join(templates, "plan.md"), "!sleep 15000\n" + PLAN);
+  writeFileSync(join(templates, "implement.md"), "!sleep 15000\n" + IMPLEMENT);
   await until(() => thread("web").status !== "running", "web is still busy");
   (await sendAsLoop()).click();
   await webSetup.waitFor({ timeout: 15000 });
@@ -1201,10 +1502,65 @@ try {
   await webSetup.locator(".attention-options").scrollIntoViewIfNeeded();
   await webSetup.locator('.attention-options[data-armed="true"]').waitFor();
   await webSetup.getByRole("button", { name: "Start and save" }).click();
-  await until(() => runs() >= firstRun, "The ladder's first run never started");
-  await select();
-  await webCard().locator(".thread-card").click();
   const webLoops = inspector.locator(".inspector-loops");
+  /** web's card selected: its inspector. */
+  const selectWeb = async () => {
+    await sidebar();
+    await webCard().locator(".thread-card").click();
+    await inspector.waitFor();
+  };
+  const current = () =>
+    webLoops.locator('.loop-phases [aria-current="step"]').innerText();
+  await until(
+    () => thread("web").loop?.phase === "plan",
+    "The implementation loop never planned",
+  );
+  await selectWeb();
+  await until(
+    async () => (await current()) === "plan",
+    "The plan is not current",
+  );
+  await webLoops
+    .locator(".loop-status")
+    .filter({ hasText: "IMPLEMENT LOOP" })
+    .waitFor();
+  await ariaOf("27-implement-plan", webLoops);
+  await capture("27-implement-plan", null, {
+    narrow: inspectorNarrow(webLoops),
+    restore: selectWeb,
+  });
+  console.log("PASS: the inspector shows an implementation loop planning");
+  await until(
+    () => thread("web").loop?.phase === "implement",
+    "The implementation loop never implemented",
+    40000,
+  );
+  // The implement prompt is out: the templates go back to answering at once.
+  writeFileSync(join(templates, "plan.md"), PLAN);
+  writeFileSync(join(templates, "implement.md"), IMPLEMENT);
+  await selectWeb();
+  await until(
+    async () => (await current()) === "implement",
+    "Implement is not current",
+  );
+  await webLoops
+    .locator(".loop-implement dd")
+    .filter({ hasText: "revision 1 · contract risk no: UI only: a new button" })
+    .waitFor();
+  await ariaOf("28-implement-implementing", webLoops);
+  await capture("28-implement-implementing", null, {
+    narrow: inspectorNarrow(webLoops),
+    restore: selectWeb,
+  });
+  console.log(
+    "PASS: the inspector shows the plan's revision and contract risk while the thread implements",
+  );
+  await until(
+    () => runs() >= firstRun,
+    "The ladder's first run never started",
+    40000,
+  );
+  await selectWeb();
   await webLoops
     .locator(".loop-status")
     .filter({ hasText: "IMPLEMENT LOOP" })
@@ -1248,7 +1604,10 @@ try {
     "IMPLEMENT LOOP",
   );
   await ariaOf("22-implement-running", webLoops);
-  await capture("22-implement-running", null, { narrow: false });
+  await capture("22-implement-running", null, {
+    narrow: inspectorNarrow(webLoops),
+    restore: selectWeb,
+  });
   console.log(
     "PASS: Start and save starts the implementation loop: its chip, phases, plan and implement result",
   );
@@ -1302,6 +1661,19 @@ try {
         `^Implementation loop clean after \\d+ rounds? · committed ${sha}$`,
       ),
     );
+    // Once: later summaries list the same end, and it is not news again.
+    for (let i = 0; i < 3; i++) {
+      await send({ type: "inbox-poll" });
+      await page.waitForTimeout(700);
+    }
+    assert.equal(
+      (await notifications()).filter(
+        (n) =>
+          n.title === "web · default" && /^Implementation loop/.test(n.body),
+      ).length,
+      1,
+      "The loop's end notifies once",
+    );
   });
   const sha = thread("web").last_loop.commits[0].sha.slice(0, 7);
   await announced(`web's implementation loop ended: clean; committed ${sha}`);
@@ -1318,9 +1690,46 @@ try {
     .filter({ hasText: `committed ${sha}` })
     .waitFor();
   await ariaOf("23-implement-ended", webLoops);
-  await capture("23-implement-ended", null, { narrow: false });
+  await capture("23-implement-ended", null, {
+    narrow: inspectorNarrow(webLoops),
+    restore: selectWeb,
+  });
   console.log(
     "PASS: the loop plans, implements, reviews, reports and commits; the commit shows and notifies once",
+  );
+
+  // The inspector's Implementation loop… form fits the window: its task and its Start in
+  // view. Cancel starts nothing and gives the focus back to Implementation loop….
+  await selectWeb();
+  await webLoops.getByRole("button", { name: "Implementation loop…" }).click();
+  const implementForm = page.getByRole("dialog", {
+    name: "Implementation loop · web",
+  });
+  await implementForm.waitFor();
+  const windowHeight = await page.evaluate(() => innerHeight);
+  for (const [name, control] of [
+    ["Its Task field", implementForm.getByRole("textbox", { name: "Task" })],
+    [
+      "Start implementation loop",
+      implementForm.getByRole("button", { name: "Start implementation loop" }),
+    ],
+  ]) {
+    const box = await control.boundingBox();
+    assert(
+      box && box.y >= 0 && box.y + box.height <= windowHeight,
+      `${name} is on screen in the Implementation loop… form`,
+    );
+  }
+  await ariaOf("34-implement-form", implementForm);
+  await capture("34-implement-form", null, { narrow: false });
+  await implementForm
+    .getByRole("button", { name: "Cancel", exact: true })
+    .click();
+  await implementForm.waitFor({ state: "hidden" });
+  assert.equal((await focused()).text, "Implementation loop…");
+  assert.equal(thread("web").loop, undefined, "Cancel starts nothing");
+  console.log(
+    "PASS: the inspector's Implementation loop… form fits the window; Cancel starts nothing",
   );
 
   // The New thread form's switch: on saved settings the loop starts at once. Its report
@@ -1349,7 +1758,7 @@ try {
     .getByRole("button", { name: "Change the loop settings…" })
     .waitFor();
   await ariaOf("24-new-thread-loop", form);
-  await capture("24-new-thread-loop", null, { narrow: false });
+  await capture("24-new-thread-loop", null);
   await form.getByRole("button", { name: "Create thread" }).click();
   await until(() => thread("csv"), "The New thread form made no thread");
   await until(
@@ -1357,11 +1766,26 @@ try {
     "The New thread form's switch started no loop",
     30000,
   );
-  await until(() => thread("csv").last_loop, "csv's loop never ended", 90000);
-  assert(
-    thread("csv").last_loop.commit_problem,
-    "Nothing committed: the loop says why",
-  );
+  // It ends with the window hidden: its notification says it was not committed.
+  await hidden(async () => {
+    await until(() => thread("csv").last_loop, "csv's loop never ended", 90000);
+    assert(
+      thread("csv").last_loop.commit_problem,
+      "Nothing committed: the loop says why",
+    );
+    const notice = await until(async () => {
+      await send({ type: "inbox-poll" });
+      return (await notifications()).find((n) => n.title === "csv · default");
+    }, "No notification of csv's loop's end");
+    assert.match(notice.body, /^Implementation loop .+ · not committed: /);
+    await send({ type: "inbox-poll" });
+    await page.waitForTimeout(1000);
+    assert.equal(
+      (await notifications()).filter((n) => n.title === "csv · default").length,
+      1,
+      "csv's end notifies once",
+    );
+  });
   await sidebar();
   await page
     .locator(".thread-list .thread-item")
@@ -1371,6 +1795,298 @@ try {
     .waitFor({ timeout: 15000 });
   console.log(
     "PASS: the New thread form's switch starts an implementation loop with the first prompt as its task; an uncommitted end says so",
+  );
+
+  // ---------------------------------------------------------------------------------
+  // 9. /implement: in a thread's composer every word is the task, and it starts at once on
+  //    the saved settings; in the orchestrator's the first word names the thread.
+  // ---------------------------------------------------------------------------------
+  /** The task the hub holds for `name`'s running loop (`task.md` in its folder). */
+  const heldTask = async (name) => {
+    const detail = await page.evaluate(
+      (name) => window.twr.rpc("loop.get", { thread: name }),
+      name,
+    );
+    try {
+      return readFileSync(join(detail.folder, "task.md"), "utf8");
+    } catch {
+      return JSON.stringify(detail);
+    }
+  };
+  /** Stops `name`'s loop from the command line and waits for its end. */
+  const stopLoop = async (name) => {
+    twr("loop", "stop", name, "--yes");
+    await until(() => !thread(name).loop, `${name}'s loop did not stop`);
+  };
+  await until(
+    () => !["running", "background"].includes(thread("web").status),
+    "web is still busy",
+  );
+  await selectWeb();
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  await webBox.waitFor();
+  const jsonTask = "add a JSON export to the reports page";
+  await webBox.fill(`/implement ${jsonTask}`);
+  await webBox.press("Enter");
+  await until(
+    () => thread("web").loop?.kind === "implement",
+    "/implement in web's composer started no implementation loop",
+  );
+  assert.equal(await setupItem(), undefined, "Saved settings: no setup card");
+  await toast
+    .filter({
+      hasText: /^web started an implementation loop: .+ \(saved settings\)\.$/,
+    })
+    .waitFor();
+  assert.equal(await webBox.inputValue(), "", "/implement clears the composer");
+  assert.match(await heldTask("web"), new RegExp(jsonTask));
+  await ariaOf("29-implement-slash-thread", page.locator(".composer"));
+  await capture("29-implement-slash-thread", null);
+  await stopLoop("web");
+  console.log(
+    "PASS: /implement in a thread's composer starts its loop at once with the words as the task",
+  );
+  await toOrchestrator();
+  const orchestratorBox = page.getByRole("textbox", {
+    name: "Message orchestrator",
+  });
+  await orchestratorBox.waitFor();
+  const pdfTask = "add a PDF export";
+  await orchestratorBox.fill(`/implement csv ${pdfTask}`);
+  await orchestratorBox.press("Enter");
+  await until(
+    () => thread("csv").loop?.kind === "implement",
+    "/implement csv … in the orchestrator's composer started no loop in csv",
+  );
+  assert.equal(thread("web").loop, undefined, "Only the named thread runs it");
+  await toast
+    .filter({ hasText: /^csv started an implementation loop: / })
+    .waitFor();
+  assert.equal(await orchestratorBox.inputValue(), "");
+  const csvTask = await heldTask("csv");
+  assert.match(csvTask, new RegExp(pdfTask));
+  assert(!/^csv\b/.test(csvTask.trim()), "The thread's name is not the task");
+  await capture("30-implement-slash-orchestrator", null);
+  await stopLoop("csv");
+  console.log(
+    "PASS: /implement <thread> <task> in the orchestrator's composer starts the named thread's loop",
+  );
+
+  // ---------------------------------------------------------------------------------
+  // 10. sweep = "runs": the editor's Sweep choice and its hint; the card's `auditing N of M
+  //     rules`; the inspector's rules, their audits and each rule's verdict; the end
+  //     notifies once, with how it ended.
+  // ---------------------------------------------------------------------------------
+  writeFileSync(join(templates, "triage.md"), FIX_TRIAGE);
+  writeFileSync(join(templates, "rules.md"), RULES);
+  writeFileSync(join(templates, "sweep-verify.md"), SWEEP_VERIFY);
+  await page.evaluate(async () => {
+    await window.twr.rpc("thread.new", {
+      project: "demo",
+      name: "sweeper",
+      runtime: "fake",
+      mode: "auto",
+    });
+    await window.twr.rpc("thread.send", {
+      thread: "sweeper",
+      prompt:
+        "!write parse.rs pub fn parse(s: &str) -> usize { s.len() }\nWrote it.",
+    });
+  });
+  await until(() => {
+    const t = thread("sweeper");
+    return t && t.status === "done" && Number(t.git?.dirty_files) > 0;
+  }, "sweeper's turn never ended with changes");
+  const swCard = () =>
+    page.locator(".thread-list .thread-item").filter({ hasText: "sweeper" });
+  const selectSweeper = async () => {
+    await sidebar();
+    await swCard().locator(".thread-card").click();
+    await inspector.waitFor();
+  };
+  await selectSweeper();
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  const swBox = page.getByRole("textbox", { name: "Message sweeper directly" });
+  await swBox.fill("/loop settings --project demo");
+  await swBox.press("Enter");
+  const sweepEditor = page.getByRole("dialog", {
+    name: "Loop settings · demo",
+  });
+  await sweepEditor.waitFor();
+  await sweepEditor
+    .getByText("Loading loop settings…")
+    .waitFor({ state: "hidden" });
+  const sweepField = sweepEditor.getByRole("combobox", {
+    name: "Sweep",
+    exact: true,
+  });
+  const hintOf = (locator) =>
+    locator.evaluate(
+      (n) =>
+        document.getElementById(n.getAttribute("aria-describedby"))
+          ?.textContent || "",
+    );
+  await sweepField.selectOption("thread");
+  assert.equal(
+    await hintOf(sweepField),
+    "The thread audits each rule itself, with its own subagents where it has them.",
+  );
+  await sweepField.selectOption("runs");
+  assert.equal(
+    await hintOf(sweepField),
+    "One read-only reviewer call per rule, a few at once; the thread verifies their reports.",
+  );
+  await sweepEditor
+    .getByRole("combobox", { name: "Profile", exact: true })
+    .selectOption("medium");
+  await sweepEditor
+    .getByRole("group", { name: "Save for" })
+    .getByRole("button", { name: "demo only" })
+    .click();
+  await dismissNotices();
+  await sweepField.scrollIntoViewIfNeeded();
+  await ariaOf("31-editor-sweep", sweepEditor);
+  await capture("31-editor-sweep", null, {
+    restore: () => sweepField.scrollIntoViewIfNeeded(),
+  });
+  await sweepEditor.getByRole("button", { name: "Save settings" }).click();
+  await sweepEditor.getByText("Saved. Loops start on these settings").waitFor();
+  await sweepEditor
+    .getByRole("button", { name: "Close", exact: true })
+    .last()
+    .click();
+  const demoSettings = twrJson("loop", "settings", "--project", "demo");
+  assert.equal(demoSettings.settings.sweep, "runs");
+  assert.equal(demoSettings.settings.profile, "medium");
+  console.log(
+    "PASS: the editor's Sweep choice says what each does and saves sweep = runs",
+  );
+  // m1 finds one problem, which the thread fixes as a new class; m2 finds none; the
+  // rules turn names two rules; their audits run one at a time (`max_audit_runs = 1`):
+  // s1 finds a place that breaks its rule, s2 none; v1 finds nothing.
+  const base = runs();
+  const [m1, s1, s2, v1] = [base + 1, base + 3, base + 4, base + 5];
+  answer(m1, [
+    {
+      severity: "major",
+      location: "parse.rs:1",
+      problem: "parse panics on empty input",
+      fix: "guard it",
+    },
+  ]);
+  answer(s1, [
+    {
+      severity: "minor",
+      location: "parse.rs:1",
+      problem: "parse reads its input unguarded",
+      fix: "return early on empty input",
+    },
+  ]);
+  hold(s1);
+  hold(s2);
+  hold(v1);
+  await swBox.fill("/review");
+  await swBox.press("Enter");
+  await until(() => thread("sweeper").loop, "/review started no loop");
+  assert.equal(await setupItem(), undefined, "Saved settings: no setup card");
+  await until(() => runs() >= s1, "The first audit never started", 60000);
+  await sidebar();
+  const swChip = swCard().locator(".loop-chip");
+  await swChip
+    .locator(".loop-line")
+    .filter({ hasText: /^medium · sweep · auditing 0\/2/ })
+    .waitFor({ timeout: 15000 });
+  await swCard()
+    .locator(".thread-card-summary")
+    .filter({ hasText: "auditing 1 of 2 rules" })
+    .waitFor({ timeout: 15000 });
+  await selectSweeper();
+  const swLoops = inspector.locator(".inspector-loops");
+  const audits = swLoops.getByRole("list", { name: "Sweep audits" });
+  await audits.waitFor({ timeout: 15000 });
+  await audits
+    .getByText(/^s1 guard-input · auditing$/)
+    .waitFor({ timeout: 15000 });
+  await audits.getByText(/^s2 trim-input · waiting for a slot$/).waitFor();
+  assert.equal(
+    await swLoops.locator('.loop-phases [aria-current="step"]').innerText(),
+    "sweep",
+  );
+  await ariaOf("32-sweep-auditing-card", swCard());
+  await ariaOf("32-sweep-auditing", swLoops);
+  await capture("32-sweep-auditing", null, {
+    narrow: inspectorNarrow(swLoops),
+    restore: selectSweeper,
+  });
+  console.log(
+    "PASS: while the rules are audited the card says auditing 1 of 2 rules, the loop line auditing 0/2, the inspector each rule's audit",
+  );
+  release(s1);
+  await until(() => runs() >= s2, "The second audit never started");
+  await audits
+    .getByText(/^s1 guard-input · 1 finding$/)
+    .waitFor({ timeout: 15000 });
+  await audits.getByText(/^s2 trim-input · auditing$/).waitFor();
+  await sidebar();
+  await swChip
+    .locator(".loop-line")
+    .filter({ hasText: /auditing 1\/2/ })
+    .waitFor({ timeout: 15000 });
+  release(s2);
+  // The verification turn reports each rule; v1 is held, to look at the verdicts.
+  await until(() => runs() >= v1, "The verification run never started", 60000);
+  await selectSweeper();
+  await audits
+    .getByText(/^s1 guard-input · 1 finding · fixed$/)
+    .waitFor({ timeout: 15000 });
+  await audits
+    .getByText(/^s2 trim-input · no place breaks it · checked clean$/)
+    .waitFor();
+  await audits.locator("summary").first().click();
+  await audits
+    .getByText("Every parser guards empty input. (where: lib.rs)")
+    .waitFor();
+  await audits.getByText("parse reads its input unguarded").waitFor();
+  await ariaOf("33-sweep-verdicts", swLoops);
+  await capture("33-sweep-verdicts", null, {
+    narrow: inspectorNarrow(audits),
+    restore: selectSweeper,
+  });
+  console.log(
+    "PASS: the inspector lists each rule with its audit's findings and the thread's verdict",
+  );
+  // The end, with the window hidden: one notification, with how it ended.
+  await hidden(async () => {
+    await page.waitForTimeout(1500);
+    release(v1);
+    await until(
+      () => !thread("sweeper").loop && thread("sweeper").last_loop,
+      "The sweep loop never ended",
+      60000,
+    );
+    assert.equal(thread("sweeper").last_loop.outcome, "clean");
+    const notice = await until(async () => {
+      await send({ type: "inbox-poll" });
+      return (await notifications()).find(
+        (n) => n.title === "sweeper · default",
+      );
+    }, "No notification of sweeper's loop's end");
+    assert.match(notice.body, /^Review loop clean after \d+ rounds$/);
+    for (let i = 0; i < 3; i++) {
+      await send({ type: "inbox-poll" });
+      await page.waitForTimeout(700);
+    }
+    assert.equal(
+      (await notifications()).filter((n) => n.title === "sweeper · default")
+        .length,
+      1,
+      "sweeper's end notifies once",
+    );
+  });
+  const swReport = twr("loop", "report", "sweeper");
+  assert.match(swReport, /guard-input/);
+  console.log(
+    "PASS: a review loop audited by runs ends clean and notifies once: Review loop clean after N rounds",
   );
 
   if (errors.length) throw new Error(errors.join("\n"));

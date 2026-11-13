@@ -2690,6 +2690,105 @@ pub struct LoopEnded {
     pub extra: JsonMap,
 }
 
+/// `loop.rules` (on the loop's thread, source `hub`): with `sweep = "runs"`, the rules the
+/// thread named in its sweep's rules turn (`twr-rules`), validated. Rule `k` (1-based, in this
+/// order) is audited by run `s<k>`. Empty: nothing to audit, the sweep ends there. (A refused
+/// block is a `loop.phase` with `problems`, as for every other step.)
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopRules {
+    /// The loop.
+    pub id: String,
+    /// The rules, in order.
+    pub rules: Vec<crate::loops::contract::AuditRule>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `loop.box` (on the loop's thread, source `hub`): the thread's remote box `box` went away
+/// while the loop needs it for a run of the hub's (a review or audit run, a commit's check),
+/// and the loop waits for it (`away`); or it is back (`away: false`). Shown as `waiting on
+/// box <name>` on the loop line; it changes nothing the loop decides (a run the box's going
+/// away ended is a failed run, `loop.findings` / `loop.audit`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopBoxAway {
+    /// The loop.
+    pub id: String,
+    /// The box.
+    #[serde(rename = "box")]
+    pub box_name: String,
+    /// It is away (else: back).
+    pub away: bool,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `loop.audit_started` (on the loop's thread, source `hub`): the audit run of rule `rule`
+/// (`s<rule>`) started (again, with `retry`, after a failed run).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopAuditStarted {
+    /// The loop.
+    pub id: String,
+    /// The rule, 1-based.
+    pub rule: u32,
+    /// Its name.
+    pub name: String,
+    /// The reviewer's effort.
+    pub effort: String,
+    /// The digest of its prompt.
+    pub prompt_digest: Option<String>,
+    /// The run retries a failed one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `loop.audit` (on the loop's thread, source `hub`): the answer of rule `rule`'s audit run,
+/// its findings numbered `s<rule>.<n>`, or a failed run (`failed`, `reason`). A first failure
+/// is retried; a second leaves the rule not run (the thread hears so).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopAudit {
+    /// The loop.
+    pub id: String,
+    /// The rule, 1-based.
+    pub rule: u32,
+    /// Its name.
+    pub name: String,
+    /// The findings; empty: the run found no place that breaks the rule.
+    pub findings: Vec<crate::loops::contract::Finding>,
+    /// The answer file.
+    pub answer_path: Option<String>,
+    /// What the run spent (the thread's, as a review run's).
+    pub usage: Option<Usage>,
+    /// The run failed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
+    /// Why it failed.
+    pub reason: Option<String>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
 // ---------------------------------------------------------------------------------------------
 // EventBody
 // ---------------------------------------------------------------------------------------------
@@ -2908,6 +3007,14 @@ event_body! {
     LoopImplemented(LoopImplemented) => "loop.implemented",
     /// `loop.commit`
     LoopCommit(LoopCommitChecked) => "loop.commit",
+    /// `loop.rules`
+    LoopRules(LoopRules) => "loop.rules",
+    /// `loop.audit_started`
+    LoopAuditStarted(LoopAuditStarted) => "loop.audit_started",
+    /// `loop.audit`
+    LoopAudit(LoopAudit) => "loop.audit",
+    /// `loop.box`
+    LoopBox(LoopBoxAway) => "loop.box",
 }
 
 impl EventBody {
@@ -3465,6 +3572,44 @@ mod tests {
                 problems: vec!["/w: 1 path is uncommitted beyond the baseline: a.rs".into()],
                 ..Default::default()
             }),
+            EventBody::LoopRules(LoopRules {
+                id: "l1".into(),
+                rules: vec![crate::loops::contract::AuditRule {
+                    name: "identity-gating".into(),
+                    rule: "Every handler checks the caller.".into(),
+                    r#where: "src/api/**".into(),
+                }],
+                ..Default::default()
+            }),
+            EventBody::LoopAuditStarted(LoopAuditStarted {
+                id: "l1".into(),
+                rule: 1,
+                name: "identity-gating".into(),
+                effort: "xhigh".into(),
+                prompt_digest: Some("sha256:ab".into()),
+                retry: true,
+                ..Default::default()
+            }),
+            EventBody::LoopAudit(LoopAudit {
+                id: "l1".into(),
+                rule: 1,
+                name: "identity-gating".into(),
+                findings: vec![crate::loops::contract::Finding {
+                    id: "s1.1".into(),
+                    location: "a.rs:3".into(),
+                    problem: "p".into(),
+                    fix: "f".into(),
+                    ..Default::default()
+                }],
+                usage: Some(Usage::default()),
+                ..Default::default()
+            }),
+            EventBody::LoopBox(LoopBoxAway {
+                id: "l1".into(),
+                box_name: "gpu".into(),
+                away: true,
+                ..Default::default()
+            }),
         ]
     }
 
@@ -3936,6 +4081,10 @@ mod tests {
             "loop.transition",
             "loop.control",
             "loop.ended",
+            "loop.rules",
+            "loop.audit_started",
+            "loop.audit",
+            "loop.box",
         ];
         let no = [
             "runtime.limits",

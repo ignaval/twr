@@ -22,6 +22,7 @@ import {
   Repeat,
   RotateCw,
 } from "lucide-react";
+import { createPortal } from "react-dom";
 import type { Attention, Json, Thread } from "./types";
 import { CopyButton, Dialog, Markdown, ModelSelect, Spinner } from "./ui";
 import { errorMessage } from "./errors";
@@ -47,12 +48,16 @@ import {
   phasesOf,
   planWords,
   roundWords,
+  auditWords,
+  type AuditView,
   setupHeading,
   shortSha,
   skipToVerify,
   skippedPhases,
   startedWords,
+  reviewerUsable,
   runtimeUsable,
+  runtimesFor,
   setupCardState,
   settingsLine,
   waitingWords,
@@ -115,6 +120,21 @@ export interface LoopActions {
 }
 
 const noop = async () => false;
+/**
+ * A dialog opened from inside the inspector, mounted in the work area (`.work-area`, which
+ * holds the page and the inspector, between the top bar and a phone's tabs) instead: on a
+ * phone `.scrim` is positioned absolutely, so inside the inspector's sliding panel a sheet
+ * would cover that panel only, a narrow column beside the page. Rendered in place where
+ * there is no document (or no work area), as in tests.
+ */
+export function AppLayer({ children }: { children: ReactNode }) {
+  const host =
+    typeof document !== "undefined"
+      ? document.querySelector<HTMLElement>(".work-area")
+      : null;
+  return host ? createPortal(children, host) : <>{children}</>;
+}
+
 export const LoopContext = createContext<LoopActions>({
   rpc: async () => {
     throw new Error("Not connected");
@@ -458,17 +478,19 @@ export function LoopsSection({
         </>
       )}
       {asking && (
-        <ImplementTaskDialog
-          thread={thread}
-          connected={connected}
-          onClose={() => {
-            setAsking(false);
-            requestAnimationFrame(() => implementOpener.current?.focus());
-          }}
-          onStart={(task) =>
-            loops.startImplement(thread.id, task ? { task } : {})
-          }
-        />
+        <AppLayer>
+          <ImplementTaskDialog
+            thread={thread}
+            connected={connected}
+            onClose={() => {
+              setAsking(false);
+              requestAnimationFrame(() => implementOpener.current?.focus());
+            }}
+            onStart={(task) =>
+              loops.startImplement(thread.id, task ? { task } : {})
+            }
+          />
+        </AppLayer>
       )}
       {detailError && <p className="error-text">{detailError}</p>}
       {state && (
@@ -557,14 +579,16 @@ export function LoopsSection({
             </button>
           )}
           {reportOpen && loopId && (
-            <LoopReportDialog
-              thread={thread}
-              id={loopId}
-              onClose={() => {
-                setReportOpen(false);
-                requestAnimationFrame(() => reportOpener.current?.focus());
-              }}
-            />
+            <AppLayer>
+              <LoopReportDialog
+                thread={thread}
+                id={loopId}
+                onClose={() => {
+                  setReportOpen(false);
+                  requestAnimationFrame(() => reportOpener.current?.focus());
+                }}
+              />
+            </AppLayer>
           )}
           {folder && (
             <details>
@@ -729,11 +753,13 @@ export function ImplementTaskDialog({
       >
         <div className="operation-fields">
           <label className="field" htmlFor={`${ids}-task`}>
-            <span>Task</span>
+            {/* Named by its own word: the hint in the label is its description. */}
+            <span id={`${ids}-task-label`}>Task</span>
             <textarea
               id={`${ids}-task`}
               rows={6}
               value={task}
+              aria-labelledby={`${ids}-task-label`}
               aria-describedby={`${ids}-task-hint ${ids}-settings`}
               placeholder="What to build, as you would write it to the thread"
               onChange={(e) => setTask(e.target.value)}
@@ -991,12 +1017,79 @@ function LoopProgress({
           })}
         </ul>
       )}
+      {Array.isArray(state.audits) && state.audits.length > 0 && (
+        <SweepAudits audits={state.audits} detail={detail} />
+      )}
       <Commits
         commits={state.commits}
         problem={state.commit_problem}
         notes={commitNotes(detail)}
       />
     </div>
+  );
+}
+
+/** The sweep's rules and their audit runs (`sweep = "runs"`), listed like rounds: each rule
+ * with what its audit found, open to its findings and the thread's verdict. */
+function SweepAudits({
+  audits,
+  detail,
+}: {
+  audits: AuditView[];
+  detail?: Json;
+}) {
+  const rules: Json[] = Array.isArray(detail?.sweep?.rules)
+    ? detail.sweep.rules
+    : [];
+  return (
+    <ul className="loop-rounds" aria-label="Sweep audits">
+      {audits.map((a) => {
+        const full = rules.find((r) => r.name === a.name);
+        const findings: Json[] = Array.isArray(full?.audit?.findings)
+          ? full.audit.findings
+          : [];
+        const verdict = full?.verdict;
+        const head = (
+          <>
+            <b>s{a.rule}</b> {a.name} · {auditWords(a)}
+            {verdict?.result
+              ? ` · ${String(verdict.result).replace(/_/g, " ")}`
+              : ""}
+          </>
+        );
+        return (
+          <li key={a.rule}>
+            {findings.length || full?.rule ? (
+              <details>
+                <summary>{head}</summary>
+                {full?.rule && (
+                  <p className="muted">
+                    {full.rule} (where: {full.where})
+                  </p>
+                )}
+                {findings.map((f, i) => (
+                  <div className="loop-finding" key={f.id || i}>
+                    <p>
+                      <b>{f.id}</b>{" "}
+                      <span className={`loop-severity ${f.severity}`}>
+                        {f.severity}
+                      </span>{" "}
+                      <code>{f.location}</code>
+                    </p>
+                    <p>{f.problem}</p>
+                  </div>
+                ))}
+                {verdict?.reason && (
+                  <p className="loop-verdict">{verdict.reason}</p>
+                )}
+              </details>
+            ) : (
+              <span>{head}</span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -1063,16 +1156,18 @@ export function LoopSetupCard({
   );
   if (!phone && !sheet) return card;
   const dialog = sheet && (
-    <Dialog
-      title={`${heading} · ${thread?.name || "twr"}`}
-      onClose={() => {
-        setSheet(false);
-        // The sheet that opened before a new revision remembers no opener of its own.
-        requestAnimationFrame(() => opener.current?.focus());
-      }}
-    >
-      {card}
-    </Dialog>
+    <AppLayer>
+      <Dialog
+        title={`${heading} · ${thread?.name || "twr"}`}
+        onClose={() => {
+          setSheet(false);
+          // The sheet that opened before a new revision remembers no opener of its own.
+          requestAnimationFrame(() => opener.current?.focus());
+        }}
+      >
+        {card}
+      </Dialog>
+    </AppLayer>
   );
   // A sheet opened on a phone that has since grown wider (turned sideways) stays a sheet.
   if (!phone) return dialog;
@@ -1558,9 +1653,14 @@ export function LoopSettingsForm({
   const readOnly = !loops.access.act;
   const load = useCallback(async () => {
     setLoadError("");
+    // A card's editor checks what its thread's box has (a remote box's own CLIs).
     const settings: SettingsGet = await loops.rpc(
       "loop.settings.get",
-      project ? { project } : {},
+      source.kind === "card" && thread
+        ? { thread: thread.id }
+        : project
+          ? { project }
+          : {},
     );
     if (source.kind === "card") {
       const shown = await loops.rpc("loop.setup.get", {
@@ -1704,9 +1804,12 @@ export function LoopSettingsForm({
   const preset = matchingPreset(s, got.presets || []);
   const warnings = card ? card.warnings || [] : got.warnings || [];
   const problems = card ? card.problems || [] : got.problems || [];
-  const runtimeOptions = (selected?: string) =>
-    runtimes.map((r) => {
-      const usable = runtimeUsable(r);
+  const runtimeOptions = (
+    role: "implementer" | "reviewer",
+    selected?: string,
+  ) =>
+    runtimesFor(role, runtimes).map((r) => {
+      const usable = role === "reviewer" ? reviewerUsable(r) : runtimeUsable(r);
       return (
         <option
           key={r.runtime}
@@ -1729,6 +1832,11 @@ export function LoopSettingsForm({
         <p className="muted">
           {loops.access.why || "This device has read-only access."} The settings
           show as they are.
+        </p>
+      )}
+      {got.box && (
+        <p className="muted loop-editor-box">
+          Runtimes as found on box {got.box}: its reviewer runs there.
         </p>
       )}
       {(got.presets || []).length > 0 && (
@@ -1786,7 +1894,7 @@ export function LoopSettingsForm({
                 ? ` (${modelWords({ runtime: thread.runtime, model: thread.model_actual || thread.model, effort: thread.effort })})`
                 : ""}
             </option>
-            {runtimeOptions(s.implementer?.runtime)}
+            {runtimeOptions("implementer", s.implementer?.runtime)}
           </select>
         </label>
         <small id={`${ids}-impl-hint`}>
@@ -1882,7 +1990,7 @@ export function LoopSettingsForm({
               {!runtimeOf(s.reviewer.runtime) && (
                 <option value={s.reviewer.runtime}>{s.reviewer.runtime}</option>
               )}
-              {runtimeOptions(s.reviewer.runtime)}
+              {runtimeOptions("reviewer", s.reviewer.runtime)}
             </select>
           </label>
           <label className="field" htmlFor={`${ids}-rev-model`}>
@@ -1917,7 +2025,8 @@ export function LoopSettingsForm({
           )}
         </div>
         <small className="muted" id={`${ids}-rev-hint`}>
-          Its effort is each round's, from the profile.
+          Its effort is each round's, from the profile. An ACP agent reviews
+          only in the read-only mode its preset names.
         </small>
       </div>
       <div className="loop-editor-row">
@@ -1964,6 +2073,25 @@ export function LoopSettingsForm({
             <option value="per-round">A commit per round</option>
             <option value="none">No commit</option>
           </select>
+        </label>
+        <label className="field" htmlFor={`${ids}-sweep`}>
+          {/* Named by its own word: the hint in the label is its description. */}
+          <span id={`${ids}-sweep-label`}>Sweep</span>
+          <select
+            id={`${ids}-sweep`}
+            value={s.sweep || "thread"}
+            aria-labelledby={`${ids}-sweep-label`}
+            aria-describedby={`${ids}-sweep-hint`}
+            onChange={(e) => change({ kind: "sweep", value: e.target.value })}
+          >
+            <option value="thread">The thread audits the rules</option>
+            <option value="runs">A reviewer run per rule</option>
+          </select>
+          <small id={`${ids}-sweep-hint`} className="muted">
+            {s.sweep === "runs"
+              ? "One read-only reviewer call per rule, a few at once; the thread verifies their reports."
+              : "The thread audits each rule itself, with its own subagents where it has them."}
+          </small>
         </label>
         <label className="field" htmlFor={`${ids}-commit`}>
           <span>Review commits</span>

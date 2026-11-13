@@ -20,8 +20,9 @@
 //! - a tier whose effort is none of those, or whose letter an earlier tier of the profile
 //!   already took (two `medium` tiers), is tagged `t` and its place in the ladder as a letter:
 //!   `ta` for the first tier, `tb` for the second (`tb2.1`);
-//! - `v` is the verification's rounds (`v2.1`), and `p` is the plan check of an implementation
-//!   loop (its one round is `p1`, its findings `p1.1`…); no tier takes either.
+//! - `v` is the verification's rounds (`v2.1`), `p` is the plan check of an implementation
+//!   loop (its one round is `p1`, its findings `p1.1`…), and `s` the sweep's audit runs
+//!   (`sweep = "runs"`: rule 2's audit is `s2`, its findings `s2.1`…); no tier takes any.
 //!
 //! A tag is lowercase letters only and a round number digits only, so an id parses back
 //! ([`FindingId::parse`]).
@@ -78,6 +79,14 @@ pub const MAX_GATES: usize = 32;
 pub const MAX_GATE_BYTES: usize = 512;
 /// Most rules a sweep block may report.
 pub const MAX_SWEEP_RULES: usize = 32;
+/// Most rules a `twr-rules` block may name. Each rule costs one reviewer call at the
+/// verification's effort (`sweep = "runs"`), and the thread verifies every citation of every
+/// audit in one turn: past a dozen, the sweep costs more than a verification cap and the turn
+/// reads more reports than it can check with care. A loop whose findings need more rules than
+/// this has not distilled them: one rule names a class, not a site.
+pub const MAX_AUDIT_RULES: usize = 12;
+/// Longest `rule` sentence or `where` of a `twr-rules` block, in bytes.
+pub const MAX_RULE_TEXT_BYTES: usize = 1024;
 
 /// Fence info string of the scope turn's block.
 pub const GOAL_BLOCK: &str = "twr-goal";
@@ -85,6 +94,8 @@ pub const GOAL_BLOCK: &str = "twr-goal";
 pub const TRIAGE_BLOCK: &str = "twr-triage";
 /// Fence info string of the sweep turn's block.
 pub const SWEEP_BLOCK: &str = "twr-sweep";
+/// Fence info string of the rules turn's block (`sweep = "runs"`).
+pub const RULES_BLOCK: &str = "twr-rules";
 /// Fence info string of an implementation loop's plan turn's block (and of a plan-check
 /// triage that revised the plan).
 pub const PLAN_BLOCK: &str = "twr-plan";
@@ -227,6 +238,26 @@ pub fn parse_findings(text: &str) -> Result<Vec<Finding>, AnswerError> {
     Ok(out)
 }
 
+/// The info string of the fenced block a reviewer without schema enforcement (an ACP agent)
+/// answers in.
+pub const ANSWER_BLOCK: &str = "json";
+
+/// Reads the answer of a reviewer without schema enforcement, given as its reply's text: the
+/// body of the LAST fenced [`ANSWER_BLOCK`] block ([`last_block`]), read by
+/// [`parse_findings`] as an answer file is. Returns the block's body with the findings, or why
+/// there is no valid answer (what the hub asks again about once).
+pub fn findings_in_text(text: &str) -> Result<(String, Vec<Finding>), String> {
+    let Some(body) = last_block(text, ANSWER_BLOCK) else {
+        return Err(format!(
+            "its reply has no closed ```{ANSWER_BLOCK} block with the findings"
+        ));
+    };
+    match parse_findings(body) {
+        Ok(findings) => Ok((body.trim().to_string(), findings)),
+        Err(e) => Err(format!("its last ```{ANSWER_BLOCK} block: {e}")),
+    }
+}
+
 /// `findings` numbered as round `round` (`m3`) names them: `m3.1`, `m3.2`, …
 pub fn number_findings(round: &str, findings: Vec<Finding>) -> Vec<Finding> {
     findings
@@ -243,6 +274,14 @@ pub fn number_findings(round: &str, findings: Vec<Finding>) -> Vec<Finding> {
 pub const VERIFY_TAG: &str = "v";
 /// The tag reserved for an implementation loop's plan check.
 pub const PLAN_CHECK_TAG: &str = "p";
+/// The tag of the sweep's audit runs (`sweep = "runs"`): rule 2's audit is `s2`, its findings
+/// `s2.1`…
+pub const AUDIT_TAG: &str = "s";
+
+/// The id of the audit of rule `rule` (1-based): `s2`.
+pub fn audit_id(rule: u32) -> String {
+    format!("{AUDIT_TAG}{rule}")
+}
 
 /// The tag of each tier of a ladder whose tiers have `efforts`, in order (module docs).
 pub fn tier_tags<S: AsRef<str>>(efforts: &[S]) -> Vec<String> {
@@ -783,6 +822,9 @@ pub enum SweepResult {
     AcceptedResidual,
     /// No site survived verification.
     CheckedClean,
+    /// `sweep = "runs"` only: the rule's audit run failed twice and the thread did not audit
+    /// it either; `reason` says why.
+    NotAudited,
 }
 
 impl SweepResult {
@@ -792,6 +834,7 @@ impl SweepResult {
             SweepResult::Fixed => "fixed",
             SweepResult::AcceptedResidual => "accepted residual",
             SweepResult::CheckedClean => "checked clean",
+            SweepResult::NotAudited => "not audited",
         }
     }
 }
@@ -824,10 +867,13 @@ pub struct Sweep {
 }
 
 /// Reads and checks the ```` ```twr-sweep ```` block `text` ends with:
-/// `{"rules": [{"rule", "result": "fixed" | "accepted residual" | "checked clean", "reason"?,
-/// "location"?}], "gates"?}`. Every rule is named once; an accepted residual has a reason;
-/// `gates`, when given, passed. (`accepted_residual`, `accepted-residual` and the like are
-/// read as `accepted residual`.)
+/// `{"rules": [{"rule", "result": "fixed" | "accepted residual" | "checked clean" | "not
+/// audited", "reason"?, "location"?}], "gates"?}`. Every rule is named once; an accepted
+/// residual and a rule not audited have a reason; `gates`, when given, passed.
+/// (`accepted_residual`, `accepted-residual` and the like are read as `accepted residual`.)
+/// `not audited` is only for a rule whose audit run did not run (`sweep = "runs"`):
+/// [`check_sweep_rules`] checks it against the loop's rules, and a sweep the thread audited
+/// itself refuses it.
 pub fn parse_sweep(text: &str) -> Result<Sweep, Vec<BlockProblem>> {
     let m = block_object(text, SWEEP_BLOCK).map_err(|p| vec![p])?;
     let mut problems = Vec::new();
@@ -852,9 +898,10 @@ pub fn parse_sweep(text: &str) -> Result<Sweep, Vec<BlockProblem>> {
                         Some("fixed") => SweepResult::Fixed,
                         Some("accepted residual") => SweepResult::AcceptedResidual,
                         Some("checked clean") => SweepResult::CheckedClean,
+                        Some("not audited") => SweepResult::NotAudited,
                         _ => {
                             return Err(BlockProblem::Field(format!(
-                                "{rule}: `result` is not fixed, accepted residual or checked clean"
+                                "{rule}: `result` is not fixed, accepted residual, checked clean or not audited"
                             )))
                         }
                     };
@@ -863,6 +910,12 @@ pub fn parse_sweep(text: &str) -> Result<Sweep, Vec<BlockProblem>> {
                     if result == SweepResult::AcceptedResidual && reason.is_none() {
                         return Err(BlockProblem::Field(format!(
                             "{rule} is an accepted residual without a reason: say why it stays"
+                        )));
+                    }
+                    if result == SweepResult::NotAudited && reason.is_none() {
+                        return Err(BlockProblem::Field(format!(
+                            "{rule} is not audited without a reason: audit it yourself, or say \
+                             why it can't be"
                         )));
                     }
                     let location = opt_str(o, "location", &rule, MAX_LOCATION_BYTES)?
@@ -903,6 +956,144 @@ pub fn parse_sweep(text: &str) -> Result<Sweep, Vec<BlockProblem>> {
         return Err(problems);
     }
     Ok(Sweep { rules, gates })
+}
+
+/// Checks a sweep block `sweep` against the loop's state: `rules`, the rules the rules turn
+/// named (`sweep = "runs"`; empty for a sweep the thread audited itself, which names its own),
+/// and `not_run`, those whose audit run did not run. With rules, every one is reported once
+/// and no other; `not audited` is only for a rule of `not_run`. Without rules, `not audited`
+/// is refused: the thread audits every rule it names.
+pub fn check_sweep_rules(sweep: &Sweep, rules: &[String], not_run: &[String]) -> Vec<BlockProblem> {
+    let mut problems = Vec::new();
+    for item in &sweep.rules {
+        if item.result != SweepResult::NotAudited {
+            continue;
+        }
+        if rules.is_empty() {
+            problems.push(BlockProblem::Field(format!(
+                "{} is not audited: this sweep audits its rules itself, so report what you found",
+                item.rule
+            )));
+        } else if rules.contains(&item.rule) && !not_run.contains(&item.rule) {
+            problems.push(BlockProblem::Field(format!(
+                "{} is not audited, but its audit ran: report what you made of its findings",
+                item.rule
+            )));
+        }
+    }
+    if rules.is_empty() {
+        return problems;
+    }
+    for r in rules {
+        if !sweep.rules.iter().any(|i| i.rule == *r) {
+            problems.push(BlockProblem::Field(format!(
+                "rule {r} has no item: report it (fixed, accepted residual, checked clean{})",
+                if not_run.contains(r) {
+                    ", or not audited with a reason"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    for i in &sweep.rules {
+        if !rules.contains(&i.rule) {
+            problems.push(BlockProblem::Field(format!(
+                "rule {} is not one of this sweep's rules ({})",
+                i.rule,
+                rules.join(", ")
+            )));
+        }
+    }
+    problems
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rules (`sweep = "runs"`)
+// ---------------------------------------------------------------------------------------------
+
+/// One rule of the rules turn's block: what an audit run checks.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditRule {
+    /// Its name, kebab-case (`identity-gating`): what the sweep block reports it as.
+    pub name: String,
+    /// What must hold, in one sentence.
+    pub rule: String,
+    /// Where to look: paths, globs, or `everywhere the diff touches`.
+    #[serde(rename = "where")]
+    pub r#where: String,
+}
+
+/// Whether `name` is kebab-case: lowercase ASCII letters and digits in words joined by single
+/// hyphens, starting with a letter.
+fn kebab(name: &str) -> bool {
+    name.split('-').all(|w| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    }) && name.starts_with(|c: char| c.is_ascii_lowercase())
+}
+
+/// Reads and checks the ```` ```twr-rules ```` block `text` ends with: `{"rules": [{"name":
+/// "<kebab-case>", "rule": "<one sentence>", "where": "<paths, globs or 'everywhere the diff
+/// touches'>"}]}`. At most [`MAX_AUDIT_RULES`]; names unique and kebab-case, at most
+/// [`MAX_RULE_BYTES`]; `rule` and `where` non-empty, at most [`MAX_RULE_TEXT_BYTES`]. An
+/// empty list is an answer: nothing to audit.
+pub fn parse_rules(text: &str) -> Result<Vec<AuditRule>, Vec<BlockProblem>> {
+    let m = block_object(text, RULES_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let mut rules: Vec<AuditRule> = Vec::new();
+    match m.get("rules") {
+        Some(Value::Array(a)) if a.len() <= MAX_AUDIT_RULES => {
+            for (i, r) in a.iter().enumerate() {
+                let what = format!("rule {}", i + 1);
+                let Some(o) = r.as_object() else {
+                    problems.push(BlockProblem::Field(format!("{what} is not an object")));
+                    continue;
+                };
+                let item = (|| -> Result<AuditRule, BlockProblem> {
+                    let name = opt_str(o, "name", &what, MAX_RULE_BYTES)?
+                        .filter(|n| !n.is_empty())
+                        .ok_or_else(|| BlockProblem::Field(format!("{what} has no `name`")))?;
+                    if !kebab(&name) {
+                        return Err(BlockProblem::Field(format!(
+                            "{what}: `name` {name:?} is not kebab-case (lowercase words joined \
+                             by hyphens, like identity-gating)"
+                        )));
+                    }
+                    let text = |key: &str| -> Result<String, BlockProblem> {
+                        opt_str(o, key, &name, MAX_RULE_TEXT_BYTES)?
+                            .filter(|t| !t.is_empty())
+                            .ok_or_else(|| BlockProblem::Field(format!("{name} has no `{key}`")))
+                    };
+                    Ok(AuditRule {
+                        rule: text("rule")?,
+                        r#where: text("where")?,
+                        name,
+                    })
+                })();
+                match item {
+                    Ok(item) if rules.iter().any(|r| r.name == item.name) => problems.push(
+                        BlockProblem::Field(format!("rule {} is named twice", item.name)),
+                    ),
+                    Ok(item) => rules.push(item),
+                    Err(p) => problems.push(p),
+                }
+            }
+        }
+        Some(Value::Array(_)) => problems.push(BlockProblem::Field(format!(
+            "`rules` names more than {MAX_AUDIT_RULES} rules: merge them into classes (one rule \
+             names a class of defect, not a site)"
+        ))),
+        _ => problems.push(BlockProblem::Field(format!(
+            "`rules` is not a list of at most {MAX_AUDIT_RULES} rules"
+        ))),
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(rules)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1531,6 +1722,45 @@ mod tests {
         );
     }
 
+    /// An ACP reviewer's reply: the LAST closed ```json block is the answer, read as an
+    /// answer file is; anything else is no answer.
+    #[test]
+    fn the_last_json_block_is_the_answer() {
+        let one =
+            r#"{"findings":[{"severity":"minor","location":"a.rs:1","problem":"p","fix":"f"}]}"#;
+        let text = format!(
+            "I looked.\n```json\n{{\"findings\": []}}\n```\nOn second thought:\n```json\n{one}\n```\nDone."
+        );
+        let (body, f) = findings_in_text(&text).unwrap();
+        assert_eq!(body, one);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].location, "a.rs:1");
+        let (_, none) = findings_in_text("```json\n{\"findings\": []}\n```").unwrap();
+        assert!(none.is_empty());
+        for (bad, why) in [
+            ("No problems found.", "no closed ```json block"),
+            ("{\"findings\": []}", "no closed ```json block"),
+            // Another info string, or an unclosed block, is no answer.
+            (
+                "```JSON\n{\"findings\": []}\n```",
+                "no closed ```json block",
+            ),
+            ("```json\n{\"findings\": []}\n", "no closed ```json block"),
+            // The last block counts, even when an earlier one was valid.
+            (
+                "```json\n{\"findings\": []}\n```\n```json\n{\"findings\": 1}\n```",
+                "does not match the findings schema",
+            ),
+            (
+                "```json\n{\"findings\": [], \"note\": \"x\"}\n```",
+                "does not match the findings schema",
+            ),
+        ] {
+            let e = findings_in_text(bad).unwrap_err();
+            assert!(e.contains(why), "{bad:?}: {e}");
+        }
+    }
+
     #[test]
     fn tier_tags_and_ids() {
         assert_eq!(tier_tags(&["medium", "xhigh"]), ["m", "x"]);
@@ -1742,6 +1972,119 @@ mod tests {
                 "{body}: {e:?}"
             );
         }
+    }
+
+    #[test]
+    fn rules_blocks_read_and_refuse() {
+        let r = parse_rules(
+            "named:\n```twr-rules\n{\"rules\": [{\"name\": \"identity-gating\", \"rule\": \
+             \" Every handler checks the caller. \", \"where\": \"src/api/**\"}, {\"name\": \
+             \"retries-2\", \"rule\": \"r\", \"where\": \"everywhere the diff touches\"}]}\n```",
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].name, "identity-gating");
+        assert_eq!(r[0].rule, "Every handler checks the caller.");
+        assert_eq!(r[1].r#where, "everywhere the diff touches");
+        assert_eq!(
+            parse_rules("```twr-rules\n{\"rules\": []}\n```").unwrap(),
+            vec![]
+        );
+        let many: Vec<String> = (0..=MAX_AUDIT_RULES)
+            .map(|i| format!(r#"{{"name": "r{i}", "rule": "x", "where": "y"}}"#))
+            .collect();
+        let many = format!(r#"{{"rules": [{}]}}"#, many.join(","));
+        for (body, want) in [
+            (
+                r#"{"rules": [{"rule": "x", "where": "y"}]}"#,
+                "has no `name`",
+            ),
+            (
+                r#"{"rules": [{"name": "Identity_Gating", "rule": "x", "where": "y"}]}"#,
+                "not kebab-case",
+            ),
+            (
+                r#"{"rules": [{"name": "a--b", "rule": "x", "where": "y"}]}"#,
+                "not kebab-case",
+            ),
+            (
+                r#"{"rules": [{"name": "1a", "rule": "x", "where": "y"}]}"#,
+                "not kebab-case",
+            ),
+            (
+                r#"{"rules": [{"name": "a", "rule": " ", "where": "y"}]}"#,
+                "a has no `rule`",
+            ),
+            (
+                r#"{"rules": [{"name": "a", "rule": "x"}]}"#,
+                "a has no `where`",
+            ),
+            (
+                r#"{"rules": [{"name": "a", "rule": "x", "where": "y"}, {"name": "a", "rule": "x", "where": "y"}]}"#,
+                "named twice",
+            ),
+            (many.as_str(), "more than 12 rules"),
+            (r#"{"rules": {}}"#, "`rules` is not a list"),
+        ] {
+            let e = parse_rules(&format!("```twr-rules\n{body}\n```")).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{body}: {e:?}"
+            );
+        }
+        assert_eq!(
+            parse_rules("no block").unwrap_err()[0].to_string(),
+            "no ```twr-rules block: end your reply with one"
+        );
+    }
+
+    #[test]
+    fn a_sweep_of_audit_runs_reports_every_rule() {
+        let block = |items: &str| {
+            parse_sweep(&format!("```twr-sweep\n{{\"rules\": [{items}]}}\n```")).unwrap()
+        };
+        let rules = vec!["a".to_string(), "b".to_string()];
+        let not_run = vec!["b".to_string()];
+        let ok = block(
+            r#"{"rule": "a", "result": "fixed"}, {"rule": "b", "result": "not audited", "reason": "no time"}"#,
+        );
+        assert_eq!(ok.rules[1].result, SweepResult::NotAudited);
+        assert!(check_sweep_rules(&ok, &rules, &not_run).is_empty());
+        // Its own audit of a rule not run is a result like any other.
+        let own =
+            block(r#"{"rule": "a", "result": "fixed"}, {"rule": "b", "result": "checked clean"}"#);
+        assert!(check_sweep_rules(&own, &rules, &not_run).is_empty());
+        let words = |s: &Sweep, rules: &[String], not_run: &[String]| {
+            check_sweep_rules(s, rules, not_run)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let missing = block(r#"{"rule": "a", "result": "fixed"}"#);
+        assert!(words(&missing, &rules, &not_run).contains("rule b has no item"));
+        let unknown = block(
+            r#"{"rule": "a", "result": "fixed"}, {"rule": "b", "result": "fixed"}, {"rule": "c", "result": "fixed"}"#,
+        );
+        assert!(words(&unknown, &rules, &not_run).contains("rule c is not one of"));
+        let ran = block(
+            r#"{"rule": "a", "result": "not audited", "reason": "r"}, {"rule": "b", "result": "fixed"}"#,
+        );
+        assert!(words(&ran, &rules, &not_run).contains("a is not audited, but its audit ran"));
+        // A sweep the thread audited itself: its own rules, never `not audited`.
+        assert!(check_sweep_rules(&missing, &[], &[]).is_empty());
+        assert!(words(&ok, &[], &[]).contains("audits its rules itself"));
+        let e = parse_sweep(
+            "```twr-sweep\n{\"rules\": [{\"rule\": \"a\", \"result\": \"not_audited\"}]}\n```",
+        )
+        .unwrap_err();
+        assert!(e[0].to_string().contains("not audited without a reason"));
+        assert_eq!(audit_id(2), "s2");
+        assert_eq!(
+            number_findings(&audit_id(2), vec![Finding::default()])[0].id,
+            "s2.1"
+        );
+        assert_eq!(FindingId::parse("s2.1").unwrap().round_id(), "s2");
     }
 
     #[test]

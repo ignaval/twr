@@ -118,6 +118,7 @@ import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
 import { mayAnswer } from "./arming";
 import { useArming } from "./useArming";
+import { scrollCue } from "./scrollCue";
 import {
   LoopChip,
   LoopContext,
@@ -133,6 +134,7 @@ import {
 import {
   countedRounds,
   endedLately,
+  auditingWords,
   endedLoops,
   endedWords,
   implementRequest,
@@ -3287,6 +3289,7 @@ export default function App({
                 </header>
                 <div
                   className="conversation-attention"
+                  ref={scrollCue}
                   role={
                     view.attention.some(
                       (a) => a.thread === "hub" || a.thread === target?.id,
@@ -4634,7 +4637,9 @@ function ThreadCardButton({
         <span className="visually-hidden">, </span>
         <span className={`thread-status status-${thread.status}`}>
           {statusIcon(thread.status)}
-          {thread.status_label || thread.status}
+          <span className="thread-status-label">
+            {thread.status_label || thread.status}
+          </span>
         </span>
       </div>
 
@@ -4661,7 +4666,8 @@ function ThreadCardButton({
         <span className="thread-card-summary">{report.summary}</span>
       ) : (
         <span className="thread-card-summary">
-          {thread.activity ||
+          {auditingWords(thread) ||
+            thread.activity ||
             (thread.background_tasks &&
               Object.values(thread.background_tasks)
                 .map((t: any) => t.description)

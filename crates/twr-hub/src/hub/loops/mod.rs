@@ -6,10 +6,12 @@
 //! thread, review runs, the stuck item, the report) and steps what happens back into it.
 //!
 //! - [`driver`]: the driver, which turn answers a step, review runs, restart.
-//! - [`review`]: one review run (the reviewer's CLI, read-only).
+//! - [`place`]: the thread's box, through which every git read, the loop folder's copy and
+//!   every review run go (the hub's own, or a remote box's runner, milestone 4).
+//! - `review`, `acp_review`, `git` (`twr_runner::loops`, shared with every runner): one review
+//!   run (the reviewer's CLI, read-only, or an ACP preset's agent), scopes and round diffs.
 //! - [`prompts`]: the templates and the texts sent.
 //! - [`report`]: a loop as its log tells it, and `report.md`.
-//! - [`git`]: scopes and round diffs.
 //!
 //! **The loop folder** is `<data>/loops/<id>/`, private: `findings.schema.json`, `ledger.md`,
 //! a review loop's `goal.md`, an implementation loop's `task.md` (with a task text), `plan.md`
@@ -45,13 +47,14 @@
 //! source the user) are folded into [`LoopsState::saved`]: the workspace's set and each
 //! project's own. Only a user saves them: an answer to a setup card, or `loop.settings.set`.
 //! `[loops]` in the config file only sets what the first card shows; it never counts as saved
-//! settings. Settings are checked against what the hub found of its own box's agent CLIs
-//! (`hub::box_agents`: installed, signed in; a CLI that cannot say whether it is signed in,
+//! settings. Settings are checked against what the hub found of the thread's box's agent CLIs
+//! (its own, `hub::box_agents`, or a remote box's runner's report; outside a thread, its own:
+//! installed, signed in; a CLI that cannot say whether it is signed in,
 //! Grok Build, counts as signed in once found) and the models and efforts twr's pickers know
 //! (`twr_adapters::models`, `efforts`).
 //!
-//! **The rule** (`loop.request`): the thread must be a worker on the hub's own box, not
-//! stopped, parked or being deleted, with a git repository to diff, in a mode that can edit
+//! **The rule** (`loop.request`): the thread must be a worker (on the hub's own box, or on a
+//! remote box that is connected and whose runner runs loops: [`place`]), not stopped, parked or being deleted, with a git repository to diff, in a mode that can edit
 //! (`twr_adapters::mode_level_for`: not `Restricted`, and a mode twr can classify; the hub
 //! never widens a mode), running no loop; `kind: "implement"` is `unsupported` in this
 //! version. The hub then starts at once on saved settings only when `setup` is not set, the
@@ -92,11 +95,13 @@
 //! user's `change…`) raises the card again with the new values under the same id, for the
 //! revision the client showed.
 
+mod audit;
 mod driver;
-mod git;
+mod place;
 mod prompts;
 mod report;
-mod review;
+
+use twr_runner::loops::{acp_review, git, review};
 
 pub(super) use driver::{reap_reviews, watch, LoopRuns};
 pub(super) use report::{kind_words, outcome_words, transition_words};
@@ -110,7 +115,7 @@ use serde_json::{json, Value};
 use twr_core::adapter::Answer;
 use twr_core::event::*;
 use twr_core::loops::config::{
-    check_profile_name, ModelChoice, ReviewerChoice, SweepMode, WorkersChoice, REVIEWER_RUNTIMES,
+    check_profile_name, ModelChoice, ReviewerChoice, WorkersChoice, REVIEWER_RUNTIMES,
 };
 use twr_core::loops::settings::{
     presets, propose, validate, Availability, LoopSettings, Overrides, ProblemKind,
@@ -200,6 +205,11 @@ pub(super) struct StartFacts {
     pub(super) own_commits: bool,
     /// The worktree had no uncommitted change.
     pub(super) clean: bool,
+    /// Where the loop's thread and reviewer read its folder, on a remote box: the box's copy
+    /// (`<runner data>/loops/<id>`, `place`), named in every prompt. Absent on the hub's own
+    /// box, whose folder is the record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) box_folder: Option<String>,
 }
 
 /// An implementation loop's baseline of one repository, in a line.
@@ -282,6 +292,10 @@ pub struct SetupGet {
 pub struct SettingsFor {
     /// A project; none: the workspace's.
     pub project: Option<String>,
+    /// `loop.settings.get` only: a thread, whose project (unless `project` names one) and box
+    /// the settings are checked for: a thread on a remote box is checked against what is
+    /// installed on that box.
+    pub thread: Option<String>,
 }
 
 /// `loop.settings.set`.
@@ -362,7 +376,7 @@ fn parse_scope(scope: Option<&str>) -> Result<Option<Scope>, RpcError> {
 }
 
 /// Whether `s` is well formed: the strings a card or the editor sends parse as their
-/// `[loops]` spelling would, and the sweep is the thread's (`runs` comes later).
+/// `[loops]` spelling would.
 fn check_shape(s: &LoopSettings) -> Result<(), RpcError> {
     let bad = |e: String| rpc(codes::BAD_REQUEST, e);
     check_profile_name(&s.profile).map_err(|e| bad(format!("profile: {e}")))?;
@@ -371,13 +385,6 @@ fn check_shape(s: &LoopSettings) -> Result<(), RpcError> {
     }
     WorkersChoice::parse(&s.workers.to_string()).map_err(|e| bad(format!("workers: {e}")))?;
     ReviewerChoice::parse(&s.reviewer.to_string()).map_err(|e| bad(format!("reviewer: {e}")))?;
-    if s.sweep == SweepMode::Runs {
-        return Err(bad(
-            "sweep \"runs\" comes in a later version: the thread audits the rules itself \
-             (\"thread\")"
-                .into(),
-        ));
-    }
     Ok(())
 }
 
@@ -410,9 +417,35 @@ fn availability(
     accounts: &twr_core::account::AccountsView,
     view: Option<&ThreadView>,
 ) -> Availability {
-    let probed = hub.local_agents.probes() && hub.local_agents.probed_at().is_some();
-    let agents = hub.local_agents.known();
-    let runtimes = REVIEWER_RUNTIMES
+    let box_name = view.map_or(LOCAL_BOX, |v| v.box_name.as_str());
+    availability_on(hub, accounts, view, box_name)
+}
+
+/// [`availability`] on box `box_name` (the thread's, or where a new thread will run). On a
+/// remote box, what that box's runner last reported of its agent CLIs (`Op::Agents`, its
+/// inventory): installed and logged in there, whatever the hub's machine has. A box that
+/// reported none (it probes none, or not yet) counts each runtime as installed and logged
+/// in, as a hub that does not probe does. A thread on a remote box runs on the box's own
+/// login (named accounts are not supported there, docs/accounts.md), so its reviewer can name
+/// no account but the native one. An ACP preset's program can't be looked for on the box: it
+/// counts as found, and a run whose agent is missing fails as any failed run.
+fn availability_on(
+    hub: &Inner,
+    accounts: &twr_core::account::AccountsView,
+    view: Option<&ThreadView>,
+    box_name: &str,
+) -> Availability {
+    let remote = box_name != LOCAL_BOX;
+    let (probed, agents) = if remote {
+        let agents = hub.remote(box_name).map(|r| r.agents()).unwrap_or_default();
+        (!agents.is_empty(), agents)
+    } else {
+        (
+            hub.local_agents.probes() && hub.local_agents.probed_at().is_some(),
+            hub.local_agents.known(),
+        )
+    };
+    let mut runtimes: Vec<RuntimeAvailability> = REVIEWER_RUNTIMES
         .iter()
         .map(|rt| {
             let a = agents.iter().find(|a| a.runtime == *rt);
@@ -433,11 +466,24 @@ fn availability(
                     .iter()
                     .map(|e| e.to_string())
                     .collect(),
-                accounts: account_names(accounts, rt),
+                accounts: if remote {
+                    account_names(accounts, rt).into_iter().take(1).collect()
+                } else {
+                    account_names(accounts, rt)
+                },
                 subagents: *rt == twr_adapters::claude_code::NAME,
+                ..Default::default()
             }
         })
         .collect();
+    runtimes.extend(hub.config.runtimes.iter().map(|(name, preset)| {
+        let mut a = acp_availability(name, preset);
+        if remote {
+            a.found = true;
+            a.login = true;
+        }
+        a
+    }));
     Availability {
         runtimes,
         thread: view.map(|v| ThreadModel {
@@ -445,6 +491,90 @@ fn availability(
             model: v.model.clone(),
             effort: v.effort.clone(),
         }),
+        box_name: remote.then(|| box_name.to_string()),
+    }
+}
+
+/// What a `[runtimes.<name>]` preset is as a reviewer (docs/design/loops.md, "ACP
+/// reviewers"): its agent, or why it can't review. It can when its `review` table names a mode
+/// that is not one twr knows to let the agent act (`default`, `acceptEdits`, `auto`, a bypass
+/// mode): a known read-only mode, or the agent's own id, which the run then holds the session
+/// to exactly.
+fn acp_review_of(
+    name: &str,
+    preset: &twr_core::config::RuntimePreset,
+) -> Result<acp_review::AcpReviewer, String> {
+    use twr_adapters::acp::translate::{mode_level, ModeLevel};
+    let Some(review) = &preset.review else {
+        return Err(format!("acp preset {name} names no read-only mode"));
+    };
+    let mode = review.mode.trim();
+    if mode_level(mode).is_some_and(|l| l != ModeLevel::Restricted) {
+        return Err(format!(
+            "acp preset {name}'s review mode {mode:?} is not read-only: twr knows it as a mode \
+             that lets the agent act"
+        ));
+    }
+    let argv = acp_argv(name, preset)?;
+    Ok(acp_review::AcpReviewer {
+        preset: name.to_string(),
+        argv,
+        mode: mode.to_string(),
+        efforts: !review.efforts.is_empty(),
+    })
+}
+
+/// A preset's agent argv, split as a thread on it would be.
+fn acp_argv(name: &str, preset: &twr_core::config::RuntimePreset) -> Result<Vec<String>, String> {
+    if preset.acp.len() > twr_adapters::acp::COMMAND_MAX {
+        return Err(format!("acp preset {name}'s command is too long"));
+    }
+    let argv = twr_adapters::pty::split_command_line(&preset.acp)
+        .map_err(|e| format!("acp preset {name}'s command does not parse: {e}"))?;
+    match argv.first() {
+        Some(p) if !p.is_empty() => Ok(argv),
+        _ => Err(format!("acp preset {name} names no program")),
+    }
+}
+
+/// What the hub finds of `[runtimes.<name>]` preset `name` as a reviewer: whether its program
+/// is on the hub's `PATH` (whether the agent is signed in can't be told: found, it counts as
+/// signed in), the models and efforts its `review` table lists, and its read-only mode or why
+/// it can't review.
+fn acp_availability(name: &str, preset: &twr_core::config::RuntimePreset) -> RuntimeAvailability {
+    let review = acp_review_of(name, preset);
+    let found = acp_argv(name, preset).is_ok_and(|argv| acp_review::installed(&argv[0]));
+    let listed = preset.review.clone().unwrap_or_default();
+    RuntimeAvailability {
+        runtime: name.to_string(),
+        found,
+        login: found,
+        probed: true,
+        models: listed.models,
+        efforts: listed.efforts,
+        acp: true,
+        review_mode: review.as_ref().ok().map(|a| a.mode.clone()),
+        cannot_review: review.err(),
+        ..Default::default()
+    }
+}
+
+impl Inner {
+    /// The ACP agent reviewer runtime `runtime` names, read from the config when a round runs:
+    /// `None` for a built-in reviewer; `Err` when it is no preset that can review.
+    pub(in crate::hub) fn acp_reviewer(
+        &self,
+        runtime: &str,
+    ) -> Option<Result<acp_review::AcpReviewer, String>> {
+        if REVIEWER_RUNTIMES.contains(&runtime) {
+            return None;
+        }
+        Some(match self.config.runtimes.get(runtime) {
+            Some(preset) => acp_review_of(runtime, preset),
+            None => Err(format!(
+                "{runtime} can't review: it is no built-in reviewer and no [runtimes] preset"
+            )),
+        })
     }
 }
 
@@ -578,6 +708,18 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
         reviewer.push_str(&format!(" · {}", efforts.join(" → ")));
     }
     rows.push(format!("Reviewer     {reviewer}"));
+    // (Shown only when the hub audits the sweep: one reviewer call per rule.)
+    if s.sweep == twr_core::loops::config::SweepMode::Runs {
+        rows.push(format!(
+            "Sweep        runs: one {} audit per rule{}",
+            s.reviewer.model,
+            setup
+                .profile
+                .as_ref()
+                .map(|p| format!(" at {}", p.verify.effort))
+                .unwrap_or_default()
+        ));
+    }
     if setup.kind == LoopKind::Implement {
         rows.push(format!(
             "Plan check   {}",
@@ -722,6 +864,7 @@ impl StartFrom {
                 baseline: BTreeMap::new(),
                 own_commits: found.commits > 0,
                 clean: found.clean,
+                box_folder: None,
             },
             summary: Some(found.summary()),
         }
@@ -750,6 +893,7 @@ impl StartFrom {
                 .into(),
                 own_commits: false,
                 clean: b.paths.is_empty(),
+                box_folder: None,
             },
             summary: Some(b.summary()),
         }
@@ -916,15 +1060,9 @@ impl Hub {
                 LoopKind::Implement,
             )
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
-        if box_name != LOCAL_BOX {
-            return Err(rpc(
-                codes::UNSUPPORTED,
-                format!(
-                    "not supported: {name} would run on box {box_name}, and loops run only on \
-                     the hub's own machine in this version"
-                ),
-            ));
-        }
+        // A box that is away, or whose runner can't run loops, is refused before anything is
+        // made.
+        place::Place::of(&self.inner, box_name)?;
         if let Some(e) = mode_refusal(name, runtime, mode) {
             return Err(e);
         }
@@ -939,8 +1077,12 @@ impl Hub {
         &self,
         l: &NewThreadLoop,
         project: &str,
+        box_name: &str,
     ) -> Option<twr_core::loops::config::ModelChoice> {
-        self.loop_agents().await;
+        match place::Place::of(&self.inner, box_name) {
+            Ok(place) => self.loop_agents_of(&place).await,
+            Err(_) => self.loop_agents().await,
+        }
         let core = self.inner.core();
         let config = &self.inner.config.loops;
         let base = core
@@ -950,7 +1092,7 @@ impl Hub {
             .map(|(s, _)| s.settings.clone())
             .unwrap_or_else(|| LoopSettings::first_card(config));
         let run = l.overrides.apply(&base, LoopKind::Implement).ok()?;
-        let avail = availability(&self.inner, &core.accounts, None);
+        let avail = availability_on(&self.inner, &core.accounts, None, box_name);
         propose(&run, &avail, config).settings.implementer
     }
 
@@ -986,6 +1128,23 @@ impl Hub {
         }
     }
 
+    /// What `place` found of its agent CLIs, known before the answer that needs them: the hub's
+    /// own probed once ([`Hub::loop_agents`]); a remote box's asked of it when it reported none
+    /// yet (its runner's first probe may still run), within a few seconds.
+    async fn loop_agents_of(&self, place: &place::Place) {
+        match place {
+            place::Place::Local(_) => self.loop_agents().await,
+            place::Place::Remote(r) => {
+                if r.rbox.agents().is_empty() {
+                    let _ = r
+                        .rbox
+                        .refresh_agents(false, std::time::Duration::from_secs(5), None)
+                        .await;
+                }
+            }
+        }
+    }
+
     /// Where thread `id` works, for [`git::scope`].
     fn loop_target(&self, id: &str) -> Result<git::Target, RpcError> {
         let core = self.inner.core();
@@ -1004,12 +1163,10 @@ impl Hub {
         })
     }
 
-    /// The hub's own box's git.
-    fn loop_git(&self) -> Result<Arc<twr_runner::local::LocalGit>, RpcError> {
-        self.inner
-            .host(LOCAL_BOX)
-            .and_then(|h| h.local_git())
-            .ok_or_else(|| rpc(codes::UNSUPPORTED, "the hub's own box has no git"))
+    /// The box thread `id` runs on, ready for a loop ([`place::Place::of`]).
+    fn loop_place(&self, id: &str) -> Result<place::Place, RpcError> {
+        let box_name = self.inner.core().view(id)?.box_name.clone();
+        place::Place::of(&self.inner, &box_name)
     }
 
     /// `loop.request {thread, kind, task?, setup?, scope?, overrides?}` (see the module docs):
@@ -1027,8 +1184,9 @@ impl Hub {
             id
         };
         let target = self.loop_target(&id)?;
-        self.loop_agents().await;
-        let from = self.loop_start_from(kind, &target, scope).await?;
+        let place = self.loop_place(&id)?;
+        self.loop_agents_of(&place).await;
+        let from = self.loop_start_from(&place, kind, &target, scope).await?;
         let mut core = self.inner.core();
         // Checked again: the thread may have changed while git ran.
         core.loop_eligible(&id)?;
@@ -1039,18 +1197,18 @@ impl Hub {
     /// an implementation loop's baseline (its files kept until it starts).
     async fn loop_start_from(
         &self,
+        place: &place::Place,
         kind: LoopKind,
         target: &git::Target,
         scope: Option<Scope>,
     ) -> Result<StartFrom, RpcError> {
-        let git = self.loop_git()?;
         match kind {
             LoopKind::Review => {
-                let found = git::scope(&git, target, scope).await?;
+                let found = place.scope(target, scope).await?;
                 Ok(StartFrom::of(target, &found))
             }
             LoopKind::Implement => {
-                let b = git::baseline(&git, target).await?;
+                let b = place.baseline(target).await?;
                 stage_baseline(&self.inner, &b)?;
                 Ok(StartFrom::baseline(target, &b))
             }
@@ -1119,14 +1277,15 @@ impl Hub {
             ));
         }
         // A review loop's new scope, read; an implementation loop's baseline, read again.
+        let place = self.loop_place(&thread)?;
         let found = match (kind, scope) {
             (LoopKind::Review, None) => None,
             (kind, scope) => {
                 let target = self.loop_target(&thread)?;
-                Some(self.loop_start_from(kind, &target, scope).await?)
+                Some(self.loop_start_from(&place, kind, &target, scope).await?)
             }
         };
-        self.loop_agents().await;
+        self.loop_agents_of(&place).await;
         let mut core = self.inner.core();
         let card = core.open_setup_card(&p.attn_id, p.revision)?;
         let view = core.view(&card.thread)?.clone();
@@ -1192,14 +1351,36 @@ impl Hub {
     /// with settings of their own, the presets, each reviewer runtime as found (`runtimes`:
     /// `runtime, found, login, probed, models, efforts, subagents, accounts`; `accounts` empty
     /// when it has only its native one; `probed: false` when the hub does not probe its agent
-    /// CLIs, `found` and `login` then true for not knowing), and the warnings and problems of
-    /// the set that applies (else of the first card's).
+    /// CLIs, `found` and `login` then true for not knowing; then every `[runtimes]` preset with
+    /// `acp: true`, its `review_mode` when it can review, else `cannot_review`, the reason),
+    /// and the warnings and problems of the set that applies (else of the first card's).
     pub async fn loop_settings_get(&self, p: SettingsFor) -> Result<Value, RpcError> {
-        self.loop_agents().await;
+        // A thread's: its box's agents, its project's settings.
+        let view = match &p.thread {
+            Some(t) => {
+                let core = self.inner.core();
+                let id = core.resolve(t)?;
+                Some(core.view(&id)?.clone())
+            }
+            None => None,
+        };
+        match view.as_ref().filter(|v| v.box_name != LOCAL_BOX) {
+            Some(v) => {
+                // (Away or too old: what it last reported, and the problems say so.)
+                if let Ok(place) = place::Place::of(&self.inner, &v.box_name) {
+                    self.loop_agents_of(&place).await;
+                }
+            }
+            None => self.loop_agents().await,
+        }
         let core = self.inner.core();
         let config = &self.inner.config.loops;
-        let avail = availability(&self.inner, &core.accounts, None);
-        let saved = core.loops.saved.for_project(p.project.as_deref());
+        let avail = availability(&self.inner, &core.accounts, view.as_ref());
+        let project = p
+            .project
+            .clone()
+            .or_else(|| view.as_ref().and_then(|v| v.project.clone()));
+        let saved = core.loops.saved.for_project(project.as_deref());
         let first = LoopSettings::first_card(config);
         let shown = saved.map_or(&first, |(s, _)| &s.settings);
         let proposal = propose(shown, &avail, config);
@@ -1207,7 +1388,7 @@ impl Hub {
             .runtimes
             .iter()
             .map(|r| {
-                json!({
+                let mut v = json!({
                     "runtime": r.runtime,
                     "found": r.found,
                     "login": r.login,
@@ -1219,7 +1400,14 @@ impl Hub {
                     "subagents": r.subagents,
                     // A runtime with only its native account has none to pick.
                     "accounts": if r.accounts.len() > 1 { r.accounts.clone() } else { Vec::new() },
-                })
+                });
+                // An ACP preset: whether it can review (its read-only mode), or why not.
+                if r.acp {
+                    v["acp"] = json!(true);
+                    v["review_mode"] = json!(r.review_mode);
+                    v["cannot_review"] = json!(r.cannot_review);
+                }
+                v
             })
             .collect();
         Ok(json!({
@@ -1233,6 +1421,8 @@ impl Hub {
             "runtimes": runtimes,
             "warnings": proposal.warnings,
             "problems": proposal.problems.iter().map(|p| &p.message).collect::<Vec<_>>(),
+            // The remote box the runtimes were found on (a thread's), else null.
+            "box": avail.box_name,
         }))
     }
 
@@ -1281,6 +1471,12 @@ impl Hub {
     /// the first-run card): `{ok, reset}` (`reset`: whether there was anything to forget).
     pub fn loop_settings_reset(&self, p: SettingsFor, caller: &Caller) -> Result<Value, RpcError> {
         users_only(caller, "reset loop settings")?;
+        if p.thread.is_some() {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "loop.settings.reset takes a project, not a thread",
+            ));
+        }
         let mut core = self.inner.core();
         let project = core.loop_project(&self.inner, p.project.as_deref())?;
         let saved = &core.loops.saved;
@@ -1451,6 +1647,7 @@ impl Hub {
                     "paused": l.paused,
                     "stuck": l.stuck,
                     "waiting_on": l.waiting_on,
+                    "box_away": l.box_away,
                     "plan_revision": l.plan_revision,
                     "commit": l.commit,
                     "line": line(l),
@@ -1527,6 +1724,7 @@ impl Hub {
                 "paused": l.paused,
                 "stuck": l.stuck,
                 "waiting_on": l.waiting_on,
+                "box_away": l.box_away,
                 "line": line(l),
                 "state": l,
             }),
@@ -1652,6 +1850,9 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
             EventBody::LoopPlan(p) => p.id == id,
             EventBody::LoopImplemented(p) => p.id == id,
             EventBody::LoopCommit(p) => p.id == id,
+            EventBody::LoopRules(p) => p.id == id,
+            EventBody::LoopAuditStarted(p) => p.id == id,
+            EventBody::LoopAudit(p) => p.id == id,
             _ => false,
         })
         .collect();
@@ -1669,6 +1870,10 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
     let mut controls = Vec::new();
     let mut transition = Value::Null;
     let mut ended = Value::Null;
+    let mut sweep_mode = Value::Null;
+    // `sweep = "runs"`: the rules and their audits; the thread's verdict per rule.
+    let mut rules: Option<Vec<Value>> = None;
+    let mut verdicts: Option<Vec<twr_core::loops::contract::SweepItem>> = None;
     let round = |rounds: &mut Vec<Value>, r: &str| -> usize {
         match rounds.iter().position(|v| v["id"] == r) {
             Some(i) => i,
@@ -1682,6 +1887,7 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
         match &e.body {
             EventBody::LoopStarted(p) => {
                 folder = json!(p.folder);
+                sweep_mode = json!(p.settings.sweep);
                 started = json!({
                     "at": e.ts,
                     "kind": p.kind,
@@ -1741,13 +1947,74 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
                 "notes": p.notes,
                 "passed": p.problems.is_empty(),
             })),
-            EventBody::LoopPhase(p) => phases.push(json!({
-                "at": e.ts,
-                "phase": p.phase,
-                "goal": p.goal,
-                "sweep": p.sweep,
-                "problems": p.problems,
-            })),
+            EventBody::LoopRules(p) => {
+                rules = Some(
+                    p.rules
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            json!({
+                                "name": r.name,
+                                "rule": r.rule,
+                                "where": r.r#where,
+                                "audit": {
+                                    "id": twr_core::loops::contract::audit_id(
+                                        u32::try_from(i + 1).unwrap_or(u32::MAX)
+                                    ),
+                                    "status": "pending",
+                                    "runs": [],
+                                    "failures": [],
+                                    "findings": [],
+                                },
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            EventBody::LoopAuditStarted(p) => {
+                let i = usize::try_from(p.rule).unwrap_or(0).wrapping_sub(1);
+                if let Some(a) = rules.as_mut().and_then(|r| r.get_mut(i)) {
+                    a["audit"]["status"] = json!("running");
+                    a["audit"]["effort"] = json!(p.effort);
+                    if let Some(runs) = a["audit"]["runs"].as_array_mut() {
+                        runs.push(json!({
+                            "at": e.ts,
+                            "retry": p.retry,
+                            "prompt_digest": p.prompt_digest,
+                        }));
+                    }
+                }
+            }
+            EventBody::LoopAudit(p) => {
+                let i = usize::try_from(p.rule).unwrap_or(0).wrapping_sub(1);
+                if let Some(a) = rules.as_mut().and_then(|r| r.get_mut(i)) {
+                    let audit = &mut a["audit"];
+                    if p.failed {
+                        if let Some(f) = audit["failures"].as_array_mut() {
+                            f.push(json!(p.reason));
+                        }
+                        let twice = audit["failures"].as_array().is_some_and(|f| f.len() >= 2);
+                        audit["status"] = json!(if twice { "not_run" } else { "failed" });
+                    } else {
+                        audit["status"] = json!("answered");
+                        audit["findings"] = json!(p.findings);
+                        audit["answer_path"] = json!(p.answer_path);
+                        audit["usage"] = json!(p.usage);
+                    }
+                }
+            }
+            EventBody::LoopPhase(p) => {
+                if p.sweep.is_some() {
+                    verdicts.clone_from(&p.sweep);
+                }
+                phases.push(json!({
+                    "at": e.ts,
+                    "phase": p.phase,
+                    "goal": p.goal,
+                    "sweep": p.sweep,
+                    "problems": p.problems,
+                }))
+            }
             EventBody::LoopReviewStarted(p) => {
                 let i = round(&mut rounds, &p.round);
                 rounds[i]["tier"] = json!(p.tier);
@@ -1811,6 +2078,24 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
     }
     let running = view.r#loop.as_ref().filter(|l| l.id == id);
     let last = view.last_loop.as_ref().filter(|l| l.id == id);
+    // Each rule's audit with the count of its findings, and the thread's verdict on it.
+    let rules = rules.map(|mut rules| {
+        for r in &mut rules {
+            let n = r["audit"]["findings"].as_array().map_or(0, Vec::len);
+            r["audit"]["count"] = json!(n);
+            let verdict = verdicts
+                .iter()
+                .flatten()
+                .find(|v| r["name"].as_str() == Some(v.rule.as_str()));
+            r["verdict"] = json!(verdict);
+        }
+        rules
+    });
+    let sweep = json!({
+        "mode": sweep_mode,
+        "rules": rules,
+        "results": verdicts,
+    });
     json!({
         "thread": view.id,
         "thread_name": view.name,
@@ -1825,6 +2110,7 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
         "rounds": rounds,
         "ledger": ledger,
         "transition": transition,
+        "sweep": sweep,
         "controls": controls,
         "plans": plans,
         "plan_path": plans
@@ -1988,16 +2274,6 @@ impl Core {
             return Err(rpc(
                 codes::BAD_REQUEST,
                 format!("{name} is the orchestrator: a loop runs in a worker thread"),
-            ));
-        }
-        if v.box_name != LOCAL_BOX {
-            return Err(rpc(
-                codes::UNSUPPORTED,
-                format!(
-                    "not supported: {name} runs on box {}, and loops run only on the hub's own \
-                     machine in this version",
-                    v.box_name
-                ),
             ));
         }
         self.refuse_deleting(id)?;
@@ -2195,14 +2471,7 @@ impl Core {
             Some(_) => (base, overrides),
             None => (run, Overrides::default()),
         };
-        let mut proposal = propose(&shown, &avail, config);
-        if proposal.settings.sweep == SweepMode::Runs {
-            proposal.settings.sweep = SweepMode::Thread;
-            proposal.warnings.push(
-                "sweep \"runs\" comes in a later version: the thread audits the rules itself"
-                    .into(),
-            );
-        }
+        let proposal = propose(&shown, &avail, config);
         let setup = LoopSetup {
             kind,
             first_run: saved.is_none(),
@@ -2354,6 +2623,10 @@ impl Core {
         if kind == LoopKind::Implement {
             place_baseline(hub, &from, folder.as_deref());
         }
+        // On a remote box, the thread and the reviewer read the box's copy of the folder.
+        let mut facts = from.facts.clone();
+        facts.box_folder = place::Place::loops_dir(hub, &view.box_name)
+            .map(|d| d.join(&id).to_string_lossy().into_owned());
         let started = LoopStarted {
             id,
             kind,
@@ -2371,7 +2644,7 @@ impl Core {
             commit_fixes,
             requested_by: origin.requested_by,
             folder,
-            ext: twr_ext_map(json!({ LOOP_START_KEY: from.facts })),
+            ext: twr_ext_map(json!({ LOOP_START_KEY: facts })),
             ..Default::default()
         };
         let (state, actions) = LoopState::start(&started).map_err(start_err)?;
@@ -2834,8 +3107,8 @@ mod tests {
         let ok = LoopSettings::first_card(&Default::default());
         check_shape(&ok).unwrap();
         let mut runs = ok.clone();
-        runs.sweep = SweepMode::Runs;
-        assert_eq!(check_shape(&runs).unwrap_err().code, codes::BAD_REQUEST);
+        runs.sweep = twr_core::loops::config::SweepMode::Runs;
+        check_shape(&runs).unwrap();
         let mut bad = ok;
         bad.reviewer.model = String::new();
         assert!(check_shape(&bad)

@@ -310,7 +310,7 @@ final class RemoteHubTests: XCTestCase {
                 // The page answers in JSON, its own exceptions included, so the host sees them.
                 let value = try? await js("""
                   try { const value = await (\(source))(JSON.parse(arg)); return JSON.stringify({ value: value === undefined ? null : value }); }
-                  catch (error) { return JSON.stringify({ error: String(error?.stack || error) }); }
+                  catch (error) { return JSON.stringify({ error: error?.message ? error.message + "\\n" + (error.stack || "") : String(error) }); }
                   """, ["arg": command["arg"] as? String ?? "null"])
                 reply["json"] = value as? String ?? "{\"error\":\"The page did not answer\"}"
             case "orient":

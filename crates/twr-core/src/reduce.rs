@@ -1067,7 +1067,17 @@ impl ThreadView {
                 }
                 self.apply_loop(ev);
             }
+            EventBody::LoopAudit(p) => {
+                // What an audit run spent is the thread's too, as a review run's.
+                if let Some(u) = &p.usage {
+                    self.spent.add(u);
+                }
+                self.apply_loop(ev);
+            }
             EventBody::LoopStarted(_)
+            | EventBody::LoopRules(_)
+            | EventBody::LoopAuditStarted(_)
+            | EventBody::LoopBox(_)
             | EventBody::LoopPhase(_)
             | EventBody::LoopReviewStarted(_)
             | EventBody::LoopTriage(_)

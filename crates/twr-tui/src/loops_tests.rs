@@ -122,6 +122,129 @@ pub(crate) fn looping(st: &mut AppState, thread: &str) -> LoopState {
     m
 }
 
+/// Starts a `medium` loop on `thread` whose sweep the hub audits (`sweep = "runs"`) and runs
+/// it, as the hub's driver records it, into its audits: m1 found one finding (fixed), m2 none;
+/// the rules turn named `a`, `b` and `c`; a's run answered 2 findings, b's runs, c's failed
+/// once and runs again. The thread's turn ended, b's and c's runs are its background tasks.
+pub(crate) fn auditing(st: &mut AppState, thread: &str) -> LoopState {
+    let (m, evs) = auditing_events(thread);
+    control(st, &evs);
+    m
+}
+
+/// [`auditing`]'s events, and the loop's state after them.
+pub(crate) fn auditing_events(thread: &str) -> (LoopState, Vec<Event>) {
+    let mut s = ThreadScript::new(thread);
+    s.at(700);
+    let now = twr_core::testkit::base_time();
+    let mut p = started();
+    p.profile = Profile::builtin("medium").unwrap();
+    p.settings.profile = "medium".into();
+    p.settings.sweep = twr_core::loops::config::SweepMode::Runs;
+    let (mut m, first) = LoopState::start(&p).unwrap();
+    let mut evs = vec![hub(&mut s, EventBody::LoopStarted(Box::new(p)))];
+    let feed = |s: &mut ThreadScript, evs: &mut Vec<Event>, actions: Vec<Step>| {
+        for a in actions {
+            if let Step::Record(body) = a {
+                evs.push(hub(s, body));
+            }
+        }
+    };
+    feed(&mut s, &mut evs, first);
+    let mut step = |m: &mut LoopState, s: &mut ThreadScript, input| {
+        let actions = m.step(input, now).unwrap();
+        feed(s, &mut evs, actions);
+    };
+    step(&mut m, &mut s, Input::GoalWritten { goal: "G".into() });
+    for (round, n) in [("m1", 1), ("m2", 0)] {
+        step(
+            &mut m,
+            &mut s,
+            Input::ReviewStarted {
+                round: round.into(),
+                diffs: vec![],
+                prompt_digest: None,
+            },
+        );
+        step(
+            &mut m,
+            &mut s,
+            Input::ReviewAnswered {
+                round: round.into(),
+                findings: findings(n),
+                answer_path: None,
+                usage: None,
+                unchanged: false,
+            },
+        );
+        if n > 0 {
+            let reply = "done\n\n```twr-triage\n{\"items\": [{\"id\": \"m1.1\", \"verdict\": \
+                         \"fixed\", \"class\": \"new-class\", \"rule\": \"a\"}], \"gates\": \
+                         {\"ran\": [\"cargo test\"], \"result\": \"pass\"}}\n```\n";
+            let input = m.reply_input(reply).unwrap();
+            step(&mut m, &mut s, input);
+        }
+    }
+    let rules = "named\n```twr-rules\n{\"rules\": [{\"name\": \"a\", \"rule\": \"A holds.\", \
+                 \"where\": \"src/**\"}, {\"name\": \"b\", \"rule\": \"B holds.\", \"where\": \
+                 \"src/**\"}, {\"name\": \"c\", \"rule\": \"C holds.\", \"where\": \
+                 \"src/**\"}]}\n```\n";
+    let input = m.reply_input(rules).unwrap();
+    step(&mut m, &mut s, input);
+    for rule in [1, 2, 3] {
+        step(
+            &mut m,
+            &mut s,
+            Input::AuditStarted {
+                rule,
+                prompt_digest: None,
+            },
+        );
+    }
+    step(
+        &mut m,
+        &mut s,
+        Input::AuditAnswered {
+            rule: 1,
+            findings: findings(2),
+            answer_path: None,
+            usage: None,
+        },
+    );
+    step(
+        &mut m,
+        &mut s,
+        Input::AuditFailed {
+            rule: 3,
+            reason: "timed out".into(),
+        },
+    );
+    step(
+        &mut m,
+        &mut s,
+        Input::AuditStarted {
+            rule: 3,
+            prompt_digest: None,
+        },
+    );
+    evs.push(s.turn_ended(twr_core::event::TurnResult::Completed));
+    for (task, desc) in [
+        ("loop:l1:s2", "audit s2 b · gpt-6.1-sol xhigh"),
+        ("loop:l1:s3", "audit s3 c · gpt-6.1-sol xhigh"),
+    ] {
+        evs.push(hub(
+            &mut s,
+            EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                task_id: task.into(),
+                running: true,
+                description: desc.into(),
+                ..Default::default()
+            }),
+        ));
+    }
+    (m, evs)
+}
+
 /// A setup card's summary, as the hub writes it (`hub::loops::card_text`).
 pub(crate) const SETUP_SUMMARY: &str = "gamma: review loop setup (first run: choose its models). \
 Start and save these settings?
@@ -774,6 +897,7 @@ fn the_editor_of_the_saved_settings() {
             RowKey::PlanCheck,
             RowKey::ImplCommit,
             RowKey::ReviewCommit,
+            RowKey::Sweep,
             RowKey::SaveFor,
             RowKey::Save,
             RowKey::Reset,
@@ -867,6 +991,43 @@ fn the_editor_of_the_saved_settings() {
     assert!(st.view.loop_editor.is_none());
 }
 
+/// A setup card's editor checks its thread's box: what `loop.settings.get {thread}` found
+/// there, the reviewers it skips named for a remote box.
+#[test]
+fn a_cards_editor_names_the_box_it_checked() {
+    let mut st = three_threads();
+    raise_setup(&mut st);
+    st.set_focus(Some("t-gamma".into()));
+    run_row(&mut st, ActionKind::LoopChange);
+    let card = json!({"attn_id": "ls1", "revision": 4, "thread": "t-gamma",
+           "setup": {"kind": "review", "first_run": true, "why": "first_run",
+                     "settings": {"profile": "high",
+                                  "reviewer": {"runtime": "codex", "model": "gpt-6.1-sol"},
+                                  "workers": {"model": "claude-opus-5-5", "effort": "high"}},
+                     "save_for": "all", "project": "proj",
+                     "profile": Profile::builtin("high").unwrap(),
+                     "warnings": [], "problems": []},
+           "summary": SETUP_SUMMARY, "options": ["start and save these settings", "cancel"]});
+    st.apply_result(
+        "loop.setup.get",
+        &json!({"asked": {"attn_id": "ls1"}, "result": card}),
+    );
+    let mut got = settings_got();
+    got["box"] = json!("gpu");
+    st.apply_result(
+        "loop.settings.get",
+        &json!({"asked": {"thread": "t-gamma"}, "result": got}),
+    );
+    change(&mut st, RowKey::ReviewerRuntime, KeyCode::Right);
+    let screen = text(&draw(&mut st, 120, 50));
+    assert!(
+        screen.contains("skipped on box gpu: grok-build (not installed)"),
+        "{screen}"
+    );
+    // A thread's are not the workspace's settings line.
+    assert!(st.loop_settings.is_none());
+}
+
 /// A setup card's `change…`: the editor on its draft at the revision loaded; Save sends
 /// `loop.setup.update` at that revision; a conflict reloads it and says the card changed; a
 /// draft with problems keeps it open, one without closes it back to the card.
@@ -880,7 +1041,7 @@ fn change_edits_the_setup_cards_draft() {
         loop_call(&asked),
         [
             ("loop.setup.get", json!({"attn_id": "ls1"})),
-            ("loop.settings.get", json!({}))
+            ("loop.settings.get", json!({"thread": "t-gamma"}))
         ]
     );
     let card = |rev: u64, problems: Value| {
@@ -1361,4 +1522,80 @@ pub(crate) fn implementing(st: &mut AppState, thread: &str, upto: Upto) -> ImplR
     run.to(upto, true);
     control(st, &run.evs);
     run
+}
+
+/// The sweep audited by runs: the loop line counts the rules audited, the card says how many
+/// are being audited, the popup lists each audit, the transcript folds the rules and each
+/// audit to a row, and the editor's Sweep row switches between the thread and runs.
+#[test]
+fn the_sweeps_audit_runs_show_on_the_card_popup_and_transcript() {
+    let mut st = three_threads();
+    let m = auditing(&mut st, "t-gamma");
+    assert_eq!(twr_core::loops::line(&m), "medium · sweep · auditing 1/3");
+    assert_eq!(crate::loops::where_word(&m), "aud 1/3");
+    assert_eq!(crate::loops::audits_text(&m), "s1 a 2 · s2 b ▸ · s3 c ✗ ▸");
+    let t = st.registry.get("t-gamma").unwrap().clone();
+    assert_eq!(t.status(), twr_core::reduce::ThreadStatus::Background);
+    let screen = text(&draw(&mut st, 160, 40));
+    assert!(
+        screen.contains("REVIEW LOOP  sweep · auditing 1/3"),
+        "{screen}"
+    );
+    assert!(screen.contains("auditing 2 of 3 rules"), "{screen}");
+    let rows: Vec<String> = crate::loops::progress_rows(&m, 120)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|r| r == "audits s1 a 2 · s2 b ▸ · s3 c ✗ ▸"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r == "waiting on the audits: gpt-6.1-sol xhigh"),
+        "{rows:?}"
+    );
+    // The transcript's rows.
+    let rules = twr_core::event::LoopRules {
+        id: "l1".into(),
+        rules: vec![twr_core::loops::contract::AuditRule {
+            name: "a".into(),
+            rule: "A holds.".into(),
+            r#where: "src/**".into(),
+        }],
+        ..Default::default()
+    };
+    let note = crate::loops::StepNote::Rules(rules);
+    assert_eq!(crate::loops::step_head(&note), "sweep rules · a");
+    assert_eq!(
+        crate::loops::step_rows(&note),
+        ["a: A holds. (where: src/**)"]
+    );
+    assert!(!note.implementation_only());
+    let failed = crate::loops::StepNote::Audit(twr_core::event::LoopAudit {
+        id: "l1".into(),
+        rule: 3,
+        name: "c".into(),
+        failed: true,
+        reason: Some("timed out".into()),
+        ..Default::default()
+    });
+    assert_eq!(
+        crate::loops::step_head(&failed),
+        "sweep audit s3 c · failed: timed out"
+    );
+    assert!(crate::loops::step_failed(&failed));
+    // The editor: Sweep switches, saved with the settings.
+    st.open_loop_settings(None, false);
+    st.apply_result(
+        "loop.settings.get",
+        &json!({"asked": {}, "result": settings_got()}),
+    );
+    assert_eq!(value(&st, RowKey::Sweep), "thread");
+    change(&mut st, RowKey::Sweep, KeyCode::Right);
+    assert_eq!(value(&st, RowKey::Sweep), "runs");
+    let e = st.view.loop_editor.as_ref().unwrap();
+    let (_, params) = crate::loops::save_request(e).unwrap();
+    assert_eq!(params["settings"]["sweep"], "runs");
 }

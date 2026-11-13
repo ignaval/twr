@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use twr_core::event::*;
 use twr_core::loops::contract::{
     render_ledger_entries, Commit, Finding, FindingClass, Gates, ImplementStatus, LedgerEntry,
-    SweepItem, TriageItem, Verdict, PLAN_CHECK_TAG,
+    SweepItem, SweepResult, TriageItem, Verdict, PLAN_CHECK_TAG,
 };
 use twr_core::loops::{CommitMode, LoopKind, Outcome, TransitionReason, PLAN_CHECK_ROUND};
 
@@ -31,6 +31,32 @@ pub(in crate::hub) struct RoundLog {
     pub(in crate::hub) gates: Option<twr_core::loops::contract::Gates>,
 }
 
+/// One rule of a sweep audited by runs (`sweep = "runs"`) as the log tells it.
+#[derive(Debug, Clone, Default)]
+pub(in crate::hub) struct AuditLog {
+    /// The rule, as the rules turn named it.
+    pub(in crate::hub) rule: twr_core::loops::contract::AuditRule,
+    /// Its run's id (`s2`).
+    pub(in crate::hub) id: String,
+    /// The reviewer's effort.
+    pub(in crate::hub) effort: String,
+    /// Its findings, numbered (empty: none, or no answer yet).
+    pub(in crate::hub) findings: Vec<Finding>,
+    /// It was answered.
+    pub(in crate::hub) answered: bool,
+    /// Why its runs failed, in order (two: not run).
+    pub(in crate::hub) failures: Vec<String>,
+    /// The answer file.
+    pub(in crate::hub) answer_path: Option<String>,
+}
+
+impl AuditLog {
+    /// Its run failed twice: not run.
+    pub(in crate::hub) fn not_run(&self) -> bool {
+        !self.answered && self.failures.len() >= 2
+    }
+}
+
 /// A loop as its log tells it.
 #[derive(Debug, Clone, Default)]
 pub(in crate::hub) struct LoopLog {
@@ -48,6 +74,9 @@ pub(in crate::hub) struct LoopLog {
     pub(in crate::hub) verify_skipped: bool,
     /// The sweep's results.
     pub(in crate::hub) sweep: Option<Vec<SweepItem>>,
+    /// `sweep = "runs"`: the rules the rules turn named (`loop.rules`), with their audits, in
+    /// order; `None` before it named them (or with the thread's sweep).
+    pub(in crate::hub) audits: Option<Vec<AuditLog>>,
     /// Controls, as `(action, by, why)`.
     pub(in crate::hub) controls: Vec<(String, String, Option<String>)>,
     /// An implementation loop's plans (`loop.plan`), in order.
@@ -112,6 +141,37 @@ impl LoopLog {
                     log.transition = Some((p.reason, p.round.clone()));
                     log.verify_skipped = p.verify_skipped;
                 }
+                EventBody::LoopRules(p) if p.id == id => {
+                    log.audits = Some(
+                        p.rules
+                            .iter()
+                            .enumerate()
+                            .map(|(i, r)| AuditLog {
+                                rule: r.clone(),
+                                id: twr_core::loops::contract::audit_id(
+                                    u32::try_from(i + 1).unwrap_or(u32::MAX),
+                                ),
+                                ..Default::default()
+                            })
+                            .collect(),
+                    )
+                }
+                EventBody::LoopAuditStarted(p) if p.id == id => {
+                    if let Some(a) = log.audit_mut(p.rule) {
+                        a.effort.clone_from(&p.effort);
+                    }
+                }
+                EventBody::LoopAudit(p) if p.id == id => {
+                    if let Some(a) = log.audit_mut(p.rule) {
+                        if p.failed {
+                            a.failures.push(p.reason.clone().unwrap_or_default());
+                        } else {
+                            a.findings.clone_from(&p.findings);
+                            a.answered = true;
+                            a.answer_path.clone_from(&p.answer_path);
+                        }
+                    }
+                }
                 EventBody::LoopPlan(p) if p.id == id => log.plans.push(p.clone()),
                 EventBody::LoopImplemented(p) if p.id == id => {
                     log.implemented.push((p.status, p.gates.clone()))
@@ -131,6 +191,12 @@ impl LoopLog {
             }
         }
         log
+    }
+
+    /// Rule `rule`'s audit (1-based).
+    fn audit_mut(&mut self, rule: u32) -> Option<&mut AuditLog> {
+        let i = usize::try_from(rule).ok()?.checked_sub(1)?;
+        self.audits.as_mut()?.get_mut(i)
     }
 
     /// The findings this loop fixed, with the class and rule the thread gave each.
@@ -472,6 +538,26 @@ pub(in crate::hub) fn report(
         }
     }
     let _ = writeln!(out, "\n## Sweep\n");
+    let audits = log.audits.as_deref().unwrap_or_default();
+    if log.audits.is_some() {
+        let _ = writeln!(
+            out,
+            "{}",
+            match audits.len() {
+                0 => "Audited by runs of the reviewer's model: the thread named no rule worth an \
+                      audit."
+                    .to_string(),
+                n => format!(
+                    "Audited by runs of the reviewer's model, one per rule ({n} rule{}), the \
+                     thread verifying their reports.",
+                    if n == 1 { "" } else { "s" }
+                ),
+            }
+        );
+        let _ = writeln!(out);
+    } else if log.sweep.as_ref().is_some_and(|r| !r.is_empty()) {
+        let _ = writeln!(out, "Audited by the thread.\n");
+    }
     match &log.sweep {
         Some(rules) if rules.is_empty() => {
             let _ = writeln!(out, "No rule to audit.");
@@ -483,6 +569,40 @@ pub(in crate::hub) fn report(
                     super::prompts::one_line(&r.rule),
                     r.result.as_str()
                 );
+                // Who audited it: its run (what it found), or the thread.
+                if log.audits.is_some() {
+                    match audits.iter().find(|a| a.rule.name == r.rule) {
+                        Some(a) if a.answered => {
+                            let _ = write!(
+                                line,
+                                " (audit {}: {})",
+                                a.id,
+                                match a.findings.len() {
+                                    0 => "no finding".to_string(),
+                                    1 => "1 finding".to_string(),
+                                    n => format!("{n} findings"),
+                                }
+                            );
+                        }
+                        Some(a) => {
+                            let _ = write!(
+                                line,
+                                " (audit {} not run: {}; {})",
+                                a.id,
+                                a.failures
+                                    .last()
+                                    .map(|f| super::prompts::one_line(f))
+                                    .unwrap_or_default(),
+                                if r.result == SweepResult::NotAudited {
+                                    "nobody audited it"
+                                } else {
+                                    "the thread audited it"
+                                }
+                            );
+                        }
+                        None => {}
+                    }
+                }
                 if let Some(l) = &r.location {
                     let _ = write!(line, " at {}", super::prompts::one_line(l));
                 }
@@ -491,6 +611,9 @@ pub(in crate::hub) fn report(
                 }
                 let _ = writeln!(out, "{line}");
             }
+        }
+        None if log.audits.as_ref().is_some_and(Vec::is_empty) => {
+            let _ = writeln!(out, "No rule to audit.");
         }
         None => {
             let _ = writeln!(
