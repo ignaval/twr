@@ -513,6 +513,9 @@ pub struct LastLoop {
     /// Its commit's check failed twice: what is left (`not committed`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commit_problem: Option<String>,
+    /// Who asked for it: left out for the user.
+    #[serde(skip_serializing_if = "crate::loops::ControlBy::is_user")]
+    pub requested_by: crate::loops::ControlBy,
 }
 
 /// `ext.twr.reason` of the `thread.stopped` the hub records for a runtime its own shutdown
@@ -551,6 +554,7 @@ impl ThreadView {
             kind: l.kind,
             commits: l.commits,
             commit_problem: l.commit_problem,
+            requested_by: l.requested_by,
             ended_turn: self
                 .current_turn
                 .or(self.last_turn.as_ref().map(|t| t.turn)),

@@ -91,10 +91,11 @@ fn hung_closed_text(name: &str, p: &AttentionResolved, turn_ended: bool) -> Stri
     )
 }
 
-/// The orchestrator's line when worker `v` starts loop `p` (`hub::loops`): what it runs on and
-/// where the settings came from, `api started a review loop: high · implementer
-/// claude-opus-5-5 high · reviewer codex gpt-6.1-sol (saved settings; /review --setup changes
-/// them)`.
+/// The orchestrator's line when worker `v` starts loop `p` (`hub::loops`): what it runs on,
+/// where the settings came from and, when the orchestrator asked for it, that it did: `api
+/// started a review loop: high · implementer claude-opus-5-5 high · reviewer codex gpt-6.1-sol
+/// (saved settings; /review --setup changes them)`, `api started a review loop, which the
+/// orchestrator asked for: …`.
 fn loop_started_text(v: &twr_core::reduce::ThreadView, p: &LoopStarted) -> String {
     use twr_core::loops::settings::{SettingsOf, SettingsSource};
     let s = &p.settings;
@@ -153,8 +154,13 @@ fn loop_started_text(v: &twr_core::reduce::ThreadView, p: &LoopStarted) -> Strin
         twr_core::loops::LoopKind::Review => "review",
         twr_core::loops::LoopKind::Implement => "implementation",
     };
+    let asked = match p.requested_by {
+        twr_core::loops::ControlBy::Orchestrator => ", which the orchestrator asked for",
+        _ => "",
+    };
     format!(
-        "{} started a {kind} loop: {} · implementer {implementer} · reviewer {} {} ({from}{run})",
+        "{} started a {kind} loop{asked}: {} · implementer {implementer} · reviewer {} {} \
+         ({from}{run})",
         v.name, p.profile.name, s.reviewer.runtime, s.reviewer.model
     )
 }
@@ -387,7 +393,12 @@ impl Core {
                     if p.by != twr_core::loops::ControlBy::Hub =>
                 {
                     (
-                        format!("{}'s {loop_words}: {} by the user", v.name, p.action.as_str()),
+                        format!(
+                            "{}'s {loop_words}: {} by {}",
+                            v.name,
+                            p.action.as_str(),
+                            p.by.words()
+                        ),
                         Some(e.thread.clone()),
                         routine(twr_ext_map(json!({"loop": p.id})), ROUTINE_LOOP),
                     )

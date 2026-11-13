@@ -197,6 +197,23 @@ pub enum ControlBy {
     Hub,
 }
 
+impl ControlBy {
+    /// Whether it is [`ControlBy::User`] (the default, left out where it is serialized as who
+    /// asked for a loop).
+    pub fn is_user(&self) -> bool {
+        *self == ControlBy::User
+    }
+
+    /// `the user`, `the orchestrator` or `the hub`.
+    pub fn words(&self) -> &'static str {
+        match self {
+            ControlBy::User => "the user",
+            ControlBy::Orchestrator => "the orchestrator",
+            ControlBy::Hub => "the hub",
+        }
+    }
+}
+
 /// What a running loop waits for, as its card says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

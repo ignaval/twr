@@ -297,13 +297,6 @@ impl Hub {
         if let Some(p) = &req.first_prompt {
             super::compact::refuse_compact_command(p, caller.from())?;
         }
-        // A loop is the user's to ask for (`hub::loops`): refused before anything is made.
-        if req.loop_req.is_some() && caller.is_orchestrator() {
-            return Err(rpc(
-                codes::RELAY_FORBIDDEN,
-                "only the user may start a loop: loops are not the orchestrator's in this version",
-            ));
-        }
         // An account on another box: refused before the box is asked (`hub::thread_account`).
         thread_account::refuse_remote_explicit(
             &thread_box_name(&req, cfg),

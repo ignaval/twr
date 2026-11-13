@@ -1057,6 +1057,7 @@ fn a_loop_that_committed_some_repositories_says_both() {
         ended_turn: Some(4),
         commits: vec![commit("/w/api", "abc1234def")],
         commit_problem: Some("/w/web: 1 path is uncommitted beyond the baseline: a.rs".into()),
+        requested_by: Default::default(),
     };
     assert_eq!(
         crate::loops::commit_words(&last, true).as_deref(),

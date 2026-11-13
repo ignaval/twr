@@ -338,6 +338,17 @@ fn completed(body: &EventBody) -> bool {
     reported == TurnResult::Completed
 }
 
+/// Whether loop `id` of worker `v` (running, or the last that ended) was asked for by the
+/// orchestrator (`loop.started` `requested_by`).
+fn asked_by_orchestrator(v: &ThreadView, id: &str) -> bool {
+    let by = match (&v.r#loop, &v.last_loop) {
+        (Some(l), _) if l.id == id => l.requested_by,
+        (_, Some(l)) if l.id == id => l.requested_by,
+        _ => return false,
+    };
+    by == twr_core::loops::ControlBy::Orchestrator
+}
+
 /// Whether `turn.started` is a hub notice (`ext.twr.notice = true`).
 pub fn is_notice(p: &TurnStarted) -> bool {
     twr_ext(&p.ext)
@@ -2020,7 +2031,7 @@ impl Core {
                 let gseq = self.gseq;
                 self.orch.close_item(&p.attn_id, gseq);
             }
-            EventBody::ReportReady(_) => self.queue_notice(ev),
+            EventBody::ReportReady(_) | EventBody::LoopEnded(_) => self.queue_notice(ev),
             // A user message queued for the orchestrator (`say`, `say {to: orchestrator}`, a
             // hub question answered with it, `thread.send`): its arrival, in log order.
             EventBody::DecisionMade(p)
@@ -2194,6 +2205,12 @@ impl Core {
                 ) {
                     return;
                 }
+                // A loop's setup card is the user's to answer, as a question is: the
+                // conversation shows it (`hub::updates`), and the orchestrator that asked for
+                // the loop has its `needs_setup` already.
+                if ev.source == Source::Hub && is_loop_setup_card(&p.ext) {
+                    return;
+                }
                 // A review the orchestrator's own report raised is nothing new to it.
                 let by = twr_ext(&p.ext)
                     .and_then(|t| t.get("report_by"))
@@ -2254,12 +2271,15 @@ impl Core {
                 }
                 // A loop's step: the loop goes on, and its end says how it went
                 // (`hub::loops`).
-                if twr_ext(&p.ext)
-                    .and_then(|t| t.get(LOOP_REPORT_KEY))
-                    .is_some_and(|l| l["step"] != "report" || l["commit"] == "checking")
-                {
+                let loop_mark = twr_ext(&p.ext).and_then(|t| t.get(LOOP_REPORT_KEY));
+                if loop_mark.is_some_and(|l| l["step"] != "report" || l["commit"] == "checking") {
                     return;
                 }
+                // The end of a loop the orchestrator asked for is told to it, however it went:
+                // the loop's report answers its request.
+                let asked = loop_mark
+                    .and_then(|l| l["id"].as_str())
+                    .is_some_and(|id| asked_by_orchestrator(view, id));
                 if p.written_by == "orchestrator" {
                     return;
                 }
@@ -2271,7 +2291,7 @@ impl Core {
                     } else {
                         Vec::new()
                     };
-                if p.grade == Grade::Success && hits.is_empty() {
+                if p.grade == Grade::Success && hits.is_empty() && !asked {
                     return;
                 }
                 let turn = p.turn.or(ev.turn).map_or("?".into(), |t| t.to_string());
@@ -2309,9 +2329,40 @@ impl Core {
                         quoted(&cut(&p.summary, NOTICE_SUMMARY_MAX)),
                         ev.thread
                     ),
-                    for_watches: p.grade == Grade::Success,
+                    for_watches: p.grade == Grade::Success && !asked,
                     watches: hits,
                     idle: None,
+                    hold: None,
+                }
+            }
+            // A loop the orchestrator asked for that failed, with no report to say so (one
+            // that wrote its report is told by it, above; one stopped was stopped by someone
+            // who knows).
+            EventBody::LoopEnded(p)
+                if p.report_path.is_none()
+                    && p.outcome == twr_core::loops::Outcome::Failed
+                    && self
+                        .registry
+                        .get(&ev.thread)
+                        .is_some_and(|v| asked_by_orchestrator(v, &p.id)) =>
+            {
+                Notice {
+                    key: ev.id.clone(),
+                    urgent: true,
+                    attn_id: None,
+                    thread: Some(ev.thread.clone()),
+                    watches: Vec::new(),
+                    for_watches: false,
+                    idle: None,
+                    line: format!(
+                        "- thread={name} loop={} ended outcome=failed reason={} thread_id={}",
+                        p.id,
+                        quoted(&cut(
+                            p.reason.as_deref().unwrap_or("the loop failed"),
+                            NOTICE_SUMMARY_MAX
+                        )),
+                        ev.thread
+                    ),
                     hold: None,
                 }
             }
@@ -5395,6 +5446,10 @@ mod tests {
         assert!(p.contains("list_accounts") && p.contains("only when the user asks"));
         assert!(p.contains("thread off its project's pinned accounts: the hub refuses"));
         assert!(p.contains("On a runtime with one account, don't bring accounts up."));
+        // Loops: only when the user asks; the card is theirs; rounds are routine.
+        assert!(p.contains("start_loop") && p.contains("never on your own initiative"));
+        assert!(p.contains("setup: true") && p.contains("tell_user"));
+        assert!(p.contains("Rounds are routine updates"));
     }
 
     #[test]

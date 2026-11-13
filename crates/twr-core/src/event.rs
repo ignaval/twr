@@ -2396,6 +2396,10 @@ pub struct LoopStarted {
     /// the start did. (Absent in milestone 1's logs: no commit.)
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub commit_fixes: bool,
+    /// Who asked for the loop: the user (left out) or the orchestrator (milestone 3). The
+    /// settings are the user's either way: saved by the user, or chosen on the setup card.
+    #[serde(skip_serializing_if = "crate::loops::ControlBy::is_user")]
+    pub requested_by: crate::loops::ControlBy,
     /// The loop folder.
     pub folder: Option<String>,
     /// Runtime-specific extras.

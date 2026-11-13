@@ -635,6 +635,9 @@ pub struct LoopState {
     /// the plan check revised it.
     #[serde(skip_serializing_if = "is_zero")]
     pub plan_revision: u32,
+    /// Who asked for it (`loop.started`'s `requested_by`): left out for the user.
+    #[serde(skip_serializing_if = "ControlBy::is_user")]
+    pub requested_by: ControlBy,
 
     /// An implementation loop's plan check setting: the settings' `plan_check`, else the
     /// profile's.
@@ -709,6 +712,7 @@ impl LoopState {
                 effort: None,
             },
             commit: CommitMode::of(p),
+            requested_by: p.requested_by,
             plan_check: p.settings.plan_check.unwrap_or(profile.plan_check),
             plan: LoopPlan {
                 tiers: profile.tiers.clone(),

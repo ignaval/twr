@@ -80,7 +80,7 @@
 //! | `account.add`       | `{runtime, account, dir?, share?, native?, dry_run?, after_native_name?}` (users only) | `{runtime, account, native, dir, share, source, config, existing, recorded}`: records `account.added` unless config.toml declares it or a live record says the same; `dry_run` records nothing; `after_native_name` (a named account's dry run only) answers as if the native account were named that first, that rename checked too |
 //! | `account.remove`    | `{runtime, account, move_to?, force?}` (users only)  | `{runtime, account, native, dir, removed, config, threads, moved, running, message, dispatch_error?}`: records `account.removed`; refused for a config account without a record, and while threads run on it unless `move_to` or `force`; `running`: `[{thread, thread_name}]` whose runtime process still runs on the removed login (their thread objects say `runtime_account_removed` `{runtime, account, dir?}` until it stops; `dir`, the directory it was started in, for users only) |
 //! | `account.status`    | `{runtime?, account?, refresh?}` (users only)        | as `account.list`, after checking the logins again with `refresh` |
-//! | `loop.request`      | `{thread, kind, setup?, scope?, overrides?: {profile?, implementer?, workers?, reviewer?, commit?}}` (users only) | `{status: "started", loop}` or `{status: "needs_setup", attn_id, revision, why}`: the hub alone decides which (`hub::loops`): a review loop starts at once only on saved settings that still hold, without `setup`; otherwise the thread's setup card is raised (again, as a new revision, when it has one open). Refused: an unknown thread (`not_found`), the orchestrator (`bad_request`), a remote box's thread or no git workspace (`unsupported`), a stopped, parked or deleting thread, a mode that can't edit, a loop already running (`conflict`), `kind: "implement"` (`unsupported`) |
+//! | `loop.request`      | `{thread, kind, task?, setup?, scope?, overrides?: {profile?, implementer?, workers?, reviewer?, commit?, plan_check?}}` | `{status: "started", thread, thread_name, loop, settings, settings_of}` or `{status: "needs_setup", thread, thread_name, attn_id, revision, why, existing?}`: the hub alone decides which (`hub::loops`): a loop starts at once only on saved settings that still hold, without `setup`, and, for the orchestrator, with no override that differs from them (`existing`: the orchestrator's request found the thread's card open, and left it as it is); otherwise the thread's setup card is raised (again, as a new revision, when it has one open). Refused: an unknown thread (`not_found`), the orchestrator thread (`bad_request`), a remote box's thread or no git workspace (`unsupported`), a stopped, parked or deleting thread, a mode that can't edit, a loop already running (`conflict`) |
 //! | `loop.setup.get`    | `{attn_id}` (users only)                             | `{attn_id, revision, thread, thread_name, setup, summary, options}`: the open setup card as last raised, read only (`not_found` when `attn_id` is no open setup card) |
 //! | `loop.setup.update` | `{attn_id, revision, settings?, save_for?: "all" \| "project", scope?}` (users only) | `{attn_id, revision, setup, summary, options}`: the setup card raised again with the new values (`conflict` when `revision` is not its current one) |
 //! | `loop.settings.get` | `{project?}`                                         | `{settings, id, source: "project" \| "workspace" \| null, first_card, projects, presets, profiles, runtimes: [{runtime, found, login, models, efforts, subagents, accounts}], warnings, problems}` |
@@ -88,7 +88,7 @@
 //! | `loop.settings.reset` | `{project?}` (users only)                          | `{ok, reset}` (`loop.settings_reset`) |
 //! | `loop.get`          | `{thread}` or `{id}`                                 | `{thread, thread_name, id, kind, running, state, line, last, started, phases, rounds: [{id, tier, effort, runs, findings, triage, failed?, reason?, answer_path?, usage?, files: {diffs, prompt?, answer?, log?}}], ledger, transition, controls, ended, folder, files: {goal?, ledger?, schema?, report?}, report_path, outcome}` |
 //! | `loop.list`         | -                                                   | `[{thread, thread_name, id, kind, profile, phase, round, ledger, paused, stuck, waiting_on, line}]`: the running loops |
-//! | `loop.control`      | `{thread, action: "pause" \| "resume" \| "stop" \| "skip_to_verify"}` (users only) | the loop: `{thread, thread_name, id, running, phase, paused, stuck, waiting_on, line, state}`, or once it ended `{thread, thread_name, id, running: false, last}` (`conflict` when it runs none, or the action does nothing now) |
+//! | `loop.control`      | `{thread, action: "pause" \| "resume" \| "stop" \| "skip_to_verify"}` (users only, but `stop`, which the orchestrator may) | the loop: `{thread, thread_name, id, running, phase, paused, stuck, waiting_on, line, state}`, or once it ended `{thread, thread_name, id, running: false, last}` (`conflict` when it runs none, or the action does nothing now) |
 //!
 //! Identity: a connection is `user:<client>` (source of what it does; its
 //! turns are `from: user`, whatever `thread.send` `from` says) unless its `hello` carried the
@@ -148,8 +148,11 @@
 //! stalled) as `by: user, answer: cancel`, routing nothing; a runtime's permission or question
 //! is refused (`bad_request`: answer it or stop the thread), and so is the orchestrator
 //! (`relay_forbidden`).
-//! The `loop.*` methods are the user's only (in neither `ORCHESTRATOR_METHODS` nor
-//! `AGENT_METHODS`, and refused by the hub to the orchestrator identity as well): a loop's
+//! The `loop.*` methods are the user's (none is in `AGENT_METHODS`), but for what the
+//! orchestrator may do with loops (`ORCHESTRATOR_METHODS`: `loop.request`, which starts a loop
+//! only on the user's saved settings and otherwise raises the card for the user; `loop.get`,
+//! `loop.list`; `loop.control` with `stop` alone; `thread.new` with `loop`): the hub refuses it
+//! the rest (`relay_forbidden`), the settings methods and the setup card's included. A loop's
 //! setup card (an `attention.raised` with `ext.twr.loop_setup`, reason `review`, options `start
 //! and save these settings`, `run without a loop` when it holds a task, and `cancel`) is answered with `attention.respond` by the user
 //! alone (`relay_forbidden` for the orchestrator, which may not annotate it either; a
@@ -865,6 +868,12 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "orchestrator.watch",
     "orchestrator.unwatch",
     "orchestrator.watches",
+    // Loops (`hub::loops`): asked for (started only on the user's saved settings, else the
+    // setup card goes to the user), read, and stopped (`stop` alone).
+    "loop.request",
+    "loop.get",
+    "loop.list",
+    "loop.control",
 ];
 
 /// The [`ORCHESTRATOR_METHODS`] that change something: each one marks the orchestrator's turn
@@ -888,6 +897,8 @@ const ORCHESTRATOR_CHANGES: &[&str] = &[
     "context.set",
     "orchestrator.watch",
     "orchestrator.unwatch",
+    "loop.request",
+    "loop.control",
 ];
 
 /// The [`ORCHESTRATOR_METHODS`] that change the orchestrator's own memory (`hub::memory`):

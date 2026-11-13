@@ -54,13 +54,16 @@
 //! stopped, parked or being deleted, with a git repository to diff, in a mode that can edit
 //! (`twr_adapters::mode_level_for`: not `Restricted`, and a mode twr can classify; the hub
 //! never widens a mode), running no loop; `kind: "implement"` is `unsupported` in this
-//! version. The hub then starts at once on saved settings only when the caller is the user,
-//! `setup` is not set, the thread's project has saved settings (its own, else the
-//! workspace's), they still hold, a named implementer is on the thread's runtime, and every
-//! override is one the caller may apply (the user's own: all of them). Overrides apply to that
-//! run only (`loop.started.overrides`); before the first save they prefill the card instead.
-//! Anything else raises the setup card (`needs_setup`), replacing a card the thread already
-//! has (same attention id, a new revision).
+//! version. The hub then starts at once on saved settings only when `setup` is not set, the
+//! thread's project has saved settings (its own, else the workspace's), they still hold, a
+//! named implementer is on the thread's runtime, and every override is one the caller may
+//! apply: the user's own, all of them; the orchestrator's (milestone 3), only those that
+//! change nothing of the saved settings, and none while the thread has a setup card open.
+//! Overrides apply to that run only (`loop.started.overrides`); before the first save they
+//! prefill the card instead. Anything else raises the setup card (`needs_setup`), replacing a
+//! card the thread already has (same attention id, a new revision); the orchestrator's
+//! request leaves an open card as it is (`existing`). `loop.started.requested_by` and the
+//! card's say who asked.
 //!
 //! **The setup card** is an `attention.raised` on the loop's thread, source `hub`, marked
 //! `ext.twr.loop_setup` ([`LoopSetup`]), with the options [`START`] and [`CANCEL`]. Its reason
@@ -315,15 +318,28 @@ pub struct LoopControlParams {
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
-/// `relay_forbidden` for the orchestrator: no loop method is its own in this version.
+/// `relay_forbidden` for the orchestrator, which may ask for a loop, read it and stop it, and
+/// nothing else (milestone 3).
 fn users_only(caller: &Caller, what: &str) -> Result<(), RpcError> {
     if caller.is_orchestrator() {
         return Err(rpc(
             codes::RELAY_FORBIDDEN,
-            format!("only the user may {what}: loops are not the orchestrator's in this version"),
+            format!(
+                "only the user may {what}: the orchestrator can ask for a loop, read it and stop \
+                 it, nothing more"
+            ),
         ));
     }
     Ok(())
+}
+
+/// Who `caller` is, as a loop records who asked for it.
+fn requester(caller: &Caller) -> ControlBy {
+    if caller.is_orchestrator() {
+        ControlBy::Orchestrator
+    } else {
+        ControlBy::User
+    }
 }
 
 /// The loop kind `kind` names: `review` (the default) or `implement`.
@@ -492,8 +508,12 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
         SetupWhy::Overrides => "the request carries settings you did not type".to_string(),
     };
     let s = &setup.settings;
+    let asked = match setup.requested_by {
+        ControlBy::Orchestrator => "; the orchestrator asked for this loop",
+        _ => "",
+    };
     let mut rows = vec![format!(
-        "{name}: {kind} setup ({why}). Start and save these settings?"
+        "{name}: {kind} setup ({why}{asked}). Start and save these settings?"
     )];
     rows.push(format!(
         "Profile      {}",
@@ -827,6 +847,21 @@ fn drop_baseline(hub: &Inner, card: &SetupCard) {
     }
 }
 
+/// Drops the baseline files a request read and kept (`from`) when it neither starts nor
+/// raises a card.
+fn drop_from(hub: &Inner, from: &StartFrom) {
+    let dir = baselines_dir(hub);
+    for (slug, digest) in &from.baseline_digests {
+        if !from.facts.baseline.contains_key(slug) {
+            continue;
+        }
+        let name = baseline_name(digest);
+        for ext in ["patch", "paths.json"] {
+            let _ = std::fs::remove_file(dir.join(format!("{name}.{ext}")));
+        }
+    }
+}
+
 /// Where a loop's settings come from when it starts.
 struct Origin {
     from: SettingsSource,
@@ -835,6 +870,8 @@ struct Origin {
     overrides: Overrides,
     /// An implementation loop's task.
     task: Option<String>,
+    /// Who asked for it.
+    requested_by: ControlBy,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -842,7 +879,8 @@ struct Origin {
 // ---------------------------------------------------------------------------------------------
 
 impl Hub {
-    /// `thread.new`'s `loop`, checked before anything is made: the user's only (with `operate`
+    /// `thread.new`'s `loop`, checked before anything is made: the user's or the
+    /// orchestrator's, which `loop.request`'s rule holds (with `operate`
     /// for a device), an implementation loop with a task, overrides that apply, on the hub's
     /// own box, in a mode that can edit (`mode`, as the thread will get it, on `runtime`).
     pub(super) fn check_new_thread_loop(
@@ -854,7 +892,7 @@ impl Hub {
         runtime: &str,
         mode: &str,
     ) -> Result<(), RpcError> {
-        users_only(caller, "start a loop")?;
+        // (The orchestrator may ask for one: the hub decides, as for `loop.request`.)
         self.inner
             .require_scope(caller, "start a loop", "operate")?;
         if parse_kind(&l.kind)? != LoopKind::Implement {
@@ -978,7 +1016,6 @@ impl Hub {
     /// `{status: "started", loop}` or `{status: "needs_setup", attn_id, revision, why}`. An
     /// implementation loop takes a task and no scope, a review loop a scope and no task.
     pub async fn loop_request(&self, p: LoopRequest, caller: &Caller) -> Result<Value, RpcError> {
-        users_only(caller, "start a loop")?;
         let kind = parse_kind(&p.kind)?;
         twr_core::loops::settings::check_run(kind, p.scope.as_deref(), p.task.as_deref())
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
@@ -1097,6 +1134,11 @@ impl Hub {
         let config = &self.inner.config.loops;
         let mut setup = card.setup.clone();
         if let Some(s) = p.settings {
+            // What the user sets is what runs: the orchestrator's picks for this run (its
+            // overrides) go with the user's change.
+            if setup.requested_by == ControlBy::Orchestrator {
+                setup.overrides = Overrides::default();
+            }
             let proposal = propose(&s, &avail, config);
             setup.settings = proposal.settings;
             setup.warnings = proposal.warnings;
@@ -1424,7 +1466,16 @@ impl Hub {
     /// `loop.list` shows one, with `running: false` once it ended. `conflict` when the thread
     /// runs no loop or the action does nothing now.
     pub fn loop_control(&self, p: LoopControlParams, caller: &Caller) -> Result<Value, RpcError> {
-        users_only(caller, "control a loop")?;
+        // The orchestrator may stop a loop (`stop_loop`), not pause, resume or skip one.
+        let what = match p.action {
+            ControlAction::Pause => "pause a loop",
+            ControlAction::Resume => "resume a loop",
+            ControlAction::SkipToVerify => "skip a loop to its verification",
+            ControlAction::Stop => "",
+        };
+        if p.action != ControlAction::Stop {
+            users_only(caller, what)?;
+        }
         let mut core = self.inner.core();
         let id = core.resolve(&p.thread)?;
         let view = core.view(&id)?.clone();
@@ -1435,7 +1486,7 @@ impl Hub {
             .step(
                 Input::Control {
                     action: p.action,
-                    by: ControlBy::User,
+                    by: requester(caller),
                 },
                 Utc::now(),
             )
@@ -1645,6 +1696,7 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
                     "baseline_digests": p.baseline_digests,
                     "task": p.task,
                     "commit_fixes": p.commit_fixes,
+                    "requested_by": p.requested_by,
                     "baseline": twr_ext(&p.ext)
                         .and_then(|t| t.get(LOOP_START_KEY))
                         .and_then(|s| s.get("baseline"))
@@ -2025,6 +2077,13 @@ impl Core {
             .apply(&base, kind)
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
         let user = !caller.is_orchestrator();
+        // The orchestrator starts a loop only on the user's saved settings as they are: an
+        // override of its that changes any of them raises the card; one that names what is
+        // saved changes nothing, and is not recorded as this run's.
+        let overrides = match &saved {
+            Some((s, _)) if !user && run == s.settings => Overrides::default(),
+            _ => overrides,
+        };
         let why = match &saved {
             None => Some(SetupWhy::FirstRun),
             Some(_) if req.setup => Some(SetupWhy::Asked),
@@ -2047,6 +2106,26 @@ impl Core {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_string);
+        // The orchestrator never starts a loop over a card the thread has open, nor raises it
+        // again: the card is the user's, as they may have changed it. Its request is told
+        // about that card.
+        if !user {
+            if let Some((attn_id, card)) = self.setup_card_of(id) {
+                if from.baseline_digests != card.setup.baseline_digests {
+                    drop_from(hub, &from);
+                }
+                let revision = self.attention.get(&attn_id).map(|i| i.revision);
+                return Ok(json!({
+                    "status": "needs_setup",
+                    "thread": id,
+                    "thread_name": view.name,
+                    "attn_id": attn_id,
+                    "revision": revision,
+                    "why": card.setup.why,
+                    "existing": true,
+                }));
+            }
+        }
         let Some(why) = why else {
             // Saved settings that hold: the run's own overrides must hold too.
             let problems = validate(&run, &avail, config);
@@ -2060,6 +2139,7 @@ impl Core {
                 ));
             }
             let (saved, of) = saved.ok_or_else(|| internal("no saved settings"))?;
+            let run_settings = run.clone();
             let mut batch = Batch::default();
             // A card the thread still has (asked for before, never answered) goes: this
             // start supersedes it (and its kept baseline, unless it is this start's).
@@ -2090,13 +2170,24 @@ impl Core {
                     of: Some(of),
                     overrides,
                     task,
+                    requested_by: requester(caller),
                 },
                 from,
                 caller,
             )?;
             self.append_batch(hub, batch).map_err(append_err)?;
             self.after_start(hub, id, rest, model);
-            return Ok(json!({ "status": "started", "loop": self.loop_json(id) }));
+            return Ok(json!({
+                "status": "started",
+                "thread": id,
+                "thread_name": view.name,
+                "loop": self.loop_json(id),
+                "settings": run_settings,
+                "settings_of": match of {
+                    SettingsOf::Project => view.project.clone(),
+                    SettingsOf::Workspace => None,
+                },
+            }));
         };
         // The card: saved settings (or, the first time, the first card's with the overrides
         // in them) with what is missing replaced; this run's overrides beside them.
@@ -2155,6 +2246,8 @@ impl Core {
         }
         Ok(json!({
             "status": "needs_setup",
+            "thread": id,
+            "thread_name": view.name,
             "attn_id": attn_id,
             "revision": revision,
             "why": why,
@@ -2276,6 +2369,7 @@ impl Core {
             baseline_digests: from.baseline_digests,
             task: origin.task,
             commit_fixes,
+            requested_by: origin.requested_by,
             folder,
             ext: twr_ext_map(json!({ LOOP_START_KEY: from.facts })),
             ..Default::default()
@@ -2470,6 +2564,7 @@ impl Core {
                 of: None,
                 overrides: setup.overrides.clone(),
                 task: setup.task.clone(),
+                requested_by: setup.requested_by,
             },
             StartFrom::card(card),
             caller,

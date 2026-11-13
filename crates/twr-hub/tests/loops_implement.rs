@@ -1489,9 +1489,10 @@ async fn a_new_thread_runs_on_the_named_implementer() {
     hub.shutdown().await;
 }
 
-/// What is refused: `thread.new {loop}` for a review, without a task, by the orchestrator, or
-/// in a mode that can't edit (no thread is made); `loop.request` for an implementation loop in
-/// a `plan` thread, with a scope, or a review loop with a plan check.
+/// What is refused: `thread.new {loop}` for a review, without a task, or in a mode that can't
+/// edit (no thread is made); `loop.request` for an implementation loop in a `plan` thread,
+/// with a scope, or a review loop with a plan check. (The orchestrator's requests:
+/// `loops_orchestrator.rs`.)
 #[tokio::test]
 async fn refusals() {
     let env = Env::new();
@@ -1521,11 +1522,6 @@ async fn refusals() {
         .unwrap_err();
     assert_eq!(e.code, codes::BAD_REQUEST);
     let e = hub
-        .new_thread_by(new("implement", TASK, None), &Caller::Orchestrator)
-        .await
-        .unwrap_err();
-    assert_eq!(e.code, codes::RELAY_FORBIDDEN);
-    let e = hub
         .new_thread(new("implement", TASK, Some("plan")), "test")
         .await
         .unwrap_err();
@@ -1548,15 +1544,6 @@ async fn refusals() {
     .unwrap();
     let e = hub.loop_request(p, &user()).await.unwrap_err();
     assert_eq!(e.code, codes::BAD_REQUEST);
-    let p: LoopRequest =
-        serde_json::from_value(json!({"thread": t, "kind": "implement", "task": TASK})).unwrap();
-    assert_eq!(
-        hub.loop_request(p, &Caller::Orchestrator)
-            .await
-            .unwrap_err()
-            .code,
-        codes::RELAY_FORBIDDEN
-    );
     assert!(!twr_hub::server::AGENT_METHODS.contains(&"thread.new"));
     hub.shutdown().await;
 }

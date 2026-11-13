@@ -713,7 +713,7 @@ pub struct NewThread {
     pub base: Option<String>,
     /// Run the new thread as a loop (`hub::loops`, milestone 2: an implementation loop): its
     /// task is the thread's first prompt, never sent as an ordinary prompt unless the user
-    /// answers the setup card `run without a loop`. The user's only.
+    /// answers the setup card `run without a loop`. The orchestrator's too, under its rule.
     #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
     pub loop_req: Option<NewThreadLoop>,
     /// Internal atomic creation bookkeeping, never accepted by `thread.new`.

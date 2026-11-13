@@ -1093,15 +1093,24 @@ async fn the_card_changes_by_revision() {
     hub.shutdown().await;
 }
 
-/// The orchestrator calls no loop method, answers no setup card, annotates none and dismisses
-/// none; a thread's agent reaches neither; a device needs `operate` for all but the reads.
+/// The orchestrator calls only the loop methods milestone 3 gives it (`loops_orchestrator.rs`),
+/// answers no setup card, annotates none and dismisses none; a thread's agent reaches neither;
+/// a device needs `operate` for all but the reads.
 #[tokio::test]
 async fn only_the_user_starts_loops_and_answers_their_cards() {
     for m in twr_hub::server::METHODS
         .iter()
         .filter(|m| m.starts_with("loop."))
     {
-        assert!(!twr_hub::server::ORCHESTRATOR_METHODS.contains(m), "{m}");
+        let orchestrators = matches!(
+            *m,
+            "loop.request" | "loop.get" | "loop.list" | "loop.control"
+        );
+        assert_eq!(
+            twr_hub::server::ORCHESTRATOR_METHODS.contains(m),
+            orchestrators,
+            "{m}"
+        );
         assert!(!twr_hub::server::AGENT_METHODS.contains(m), "{m}");
         let scope = twr_core::devices::method_scope(m);
         let read = matches!(
@@ -1129,11 +1138,6 @@ async fn only_the_user_starts_loops_and_answers_their_cards() {
     let repo = env.repo("api");
     let t = thread(&hub, &repo, "api").await;
     let orch = Caller::Orchestrator;
-    let p: LoopRequest = serde_json::from_value(json!({"thread": t, "kind": "review"})).unwrap();
-    assert_eq!(
-        hub.loop_request(p, &orch).await.unwrap_err().code,
-        codes::RELAY_FORBIDDEN
-    );
     assert_eq!(
         hub.loop_settings_set(
             LoopSettingsSet {

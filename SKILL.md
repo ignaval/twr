@@ -136,7 +136,8 @@ The orchestrator may call only: `hello`, `hub.info`, `hub.glance`, `box.agents` 
 `control.subscribe`, `decisions.list`, `blob.get`, `report.write`, `context.read`, `context.set`,
 `project.files`, `project.read`, `project.search`, `memory.list`, `memory.read`, `memory.save`,
 `memory.forget`,
-`orchestrator.watch`, `orchestrator.unwatch`, `orchestrator.watches` (not `say`, `attach.*`,
+`orchestrator.watch`, `orchestrator.unwatch`, `orchestrator.watches`, `loop.request`, `loop.get`,
+`loop.list`, `loop.control` (its `stop` alone; see Loops below) (not `say`, `attach.*`,
 any other `orchestrator.*`, `trash.empty`, `trash.restore`, `log.compact`, `log.stats`,
 `box.add`, `box.install`,
 `box.restart`, `box.projects`, `box.token` or `hub.shutdown`); anything else
@@ -541,7 +542,7 @@ MCP tool text:
 | `memory.save` | `{name, type: user\|feedback\|project\|reference, description, body, rev?}` | `{name, rev, op: saved\|updated, count, bytes}`; appends `memory.changed` on the orchestrator thread | `bad_request` (name, type, sizes, a secret), `conflict` (`rev` stale or missing for an existing note; memory full) |
 | `memory.forget` | `{name, rev?}` (`rev` required from the orchestrator) | `{name, op: forgotten, count}`; appends `memory.changed` | `bad_request` (name, rev), `not_found`, `conflict` (`rev` stale; `rev` given for an unreadable file) |
 | `context.set` | `{project, content, expect_hash?}` | `{project, path, hash, bytes, changed, remote?}` | `bad_request` (> 1 MiB), `not_found`, `ambiguous`, `conflict` (`expect_hash` stale; file not UTF-8 or symlinked) |
-| `loop.request` | `{thread, kind: "review" \| "implement", task?, setup?, scope?: "branch" \| "uncommitted" \| "since <ref>" \| "last <n>", overrides?: {profile?, implementer?, workers?, reviewer?, commit?, plan_check?}}` (users only; `task`: an implementation loop's, at most 16 KiB, none meaning what the conversation already settled; `scope`: a review loop's; see Loops below) | `{status: "started", loop}` (the thread's running loop, as `thread.loop` with its `line`) or `{status: "needs_setup", attn_id, revision, why: first_run \| asked \| no_longer_holds \| other_runtime \| overrides}`: the hub decides which, never the caller | `not_found` (thread), `bad_request` (the orchestrator thread; a scope or override that does not parse; a run's overrides that do not hold, each named), `unsupported` (a thread on a remote box, one with no git workspace to diff, or no commit yet), `bad_request` also for a scope with `implement`, a task with `review`, `plan_check` with `review`, `conflict` (a thread someone stopped (not one stopped only by the hub's own shutdown, `stopped_by_hub`: a loop starts its runtime again), a parked or deleting thread; a mode that can't edit, `plan` or `read-only`, or one twr cannot classify: the hub never widens a mode; a loop already running), `relay_forbidden` (the orchestrator) |
+| `loop.request` | `{thread, kind: "review" \| "implement", task?, setup?, scope?: "branch" \| "uncommitted" \| "since <ref>" \| "last <n>", overrides?: {profile?, implementer?, workers?, reviewer?, commit?, plan_check?}}` (the user, or the orchestrator under its own rule; `task`: an implementation loop's, at most 16 KiB, none meaning what the conversation already settled; `scope`: a review loop's; see Loops below) | `{status: "started", thread, thread_name, loop, settings, settings_of}` (`loop`: the thread's running loop, as `thread.loop` with its `line`; `settings`: the settings it runs on, overrides applied; `settings_of`: the project whose own settings they are, null for the workspace's) or `{status: "needs_setup", thread, thread_name, attn_id, revision, why: first_run \| asked \| no_longer_holds \| other_runtime \| overrides, existing?}` (`existing`: the orchestrator's request found the thread's card open and left it as it was): the hub decides which, never the caller | `not_found` (thread), `bad_request` (the orchestrator thread; a scope or override that does not parse; a run's overrides that do not hold, each named), `unsupported` (a thread on a remote box, one with no git workspace to diff, or no commit yet), `bad_request` also for a scope with `implement`, a task with `review`, `plan_check` with `review`, `conflict` (a thread someone stopped (not one stopped only by the hub's own shutdown, `stopped_by_hub`: a loop starts its runtime again), a parked or deleting thread; a mode that can't edit, `plan` or `read-only`, or one twr cannot classify: the hub never widens a mode; a loop already running), `relay_forbidden` (the orchestrator) |
 | `loop.setup.get` | `{attn_id}` (users only) | `{attn_id, revision, thread, thread_name, setup, summary, options}`: the open setup card as last raised (`setup` is its `ext.twr.loop_setup`), read only: no new revision | `not_found` (no open setup card: none, another kind of item, or one resolved since), `relay_forbidden` |
 | `loop.setup.update` | `{attn_id, revision, settings?, save_for?: "all" \| "project", scope?}` (users only): the card's `change…`; `settings` whole, as `loop.settings.get` gives them | `{attn_id, revision, setup, summary, options}`: the setup card raised again with the new values, same `attn_id`, a new `revision` (replacements and warnings worked out again) | `conflict` (raised again since `revision`, or resolved), `not_found`, `bad_request` |
 | `loop.settings.get` | `{project?}` | `{settings, id, source: "project" \| "workspace" \| null, first_card, projects, presets, profiles, runtimes: [{runtime, found, login, probed, models, efforts, subagents, accounts}], warnings, problems}`: the saved set that applies to `project` (its own, else the workspace's; null before the first save), what the first setup card shows (`[loops]`), the projects with settings of their own, the editor's four presets, what the hub found of each reviewer runtime on its own machine (`probed: false`: the hub does not probe its agent CLIs, `TWR_AGENT_PROBE=off`, so it does not know whether the runtime is installed or logged in and counts it as both, `found` and `login` true: no setting is refused or replaced for it, and a run whose CLI is missing fails as a failed run; `subagents`: it runs subagents of its own, so the workers apply; `accounts`: its account names, empty when it has only its native one; a setting naming an account the runtime does not have is a problem), and the warnings and problems of the set that applies | |
@@ -550,7 +551,7 @@ MCP tool text:
 | `loop.get` | `{thread}` or `{id}` | `{thread, thread_name, id, kind, running, state, line, last, started: {…, task, commit_fixes, baseline}, phases, rounds: [{id, tier, effort, runs, findings, triage, failed?, reason?, answer_path?, usage?, files: {diffs, prompt?, answer?, log?}}], ledger, transition, controls, plans: [{at, revision, contract_risk, reason, path}], plan_path, implemented: [{at, status, gates, accepted}], commit_checks: [{at, turn, commits, problems, notes, passed}], ended: {…, commits, commit_problem}, folder, files: {goal?, task?, plan?, plan_1?, baselines?, ledger?, schema?, report?}, report_path, outcome}` (an implementation loop's plan check is round `p1`; the first plan's path reads `plan-1.md` once the plan check revised it): the thread's running loop (else its last), or loop `id`, from `thread.loop` / `last_loop` and its `loop.*` events; `files` are the loop folder's that exist, by absolute path | `not_found`, `bad_request` (both or neither) |
 | `loop.report` | `{thread}` or `{id}` | `{thread, thread_name, id, kind, running, outcome, path, written, text, bytes, truncated, note}`: the report of the thread's running loop (else its last), or of loop `id`, as text, for a client that cannot read the hub's files (a phone, another machine): `text` is `report.md` whole, or its first 256 KiB cut at a line with a marker line naming the path (`truncated`); null with a `note` when there is none to read (a loop still running: `written: false`, `path` where it will be; one that ended `stopped` or `failed`: none is written; a file the hub cannot read). `path` is on the hub's machine. Device scope `read`; not the orchestrator's | `not_found`, `bad_request` (both or neither) |
 | `loop.list` | - | `[{thread, thread_name, id, kind, profile, phase, round, ledger, paused, stuck, waiting_on, plan_revision, commit, line}]`: the running loops | |
-| `loop.control` | `{thread, action: "pause" \| "resume" \| "stop" \| "skip_to_verify"}` (users only) | the loop (`{thread, thread_name, id, running: true, phase, paused, stuck, waiting_on, line, state}`), or once `stop` ended it `{thread, thread_name, id, running: false, last}`: records `loop.control` (and what the step decided: `stop` ends it `stopped`) | `conflict` (no loop, or an action that does nothing now: pause a paused loop, skip past the ladder), `relay_forbidden` |
+| `loop.control` | `{thread, action: "pause" \| "resume" \| "stop" \| "skip_to_verify"}` (users only, but for `stop`, which the orchestrator may call too; `loop.control.by` records who) | the loop (`{thread, thread_name, id, running: true, phase, paused, stuck, waiting_on, line, state}`), or once `stop` ended it `{thread, thread_name, id, running: false, last}`: records `loop.control` (and what the step decided: `stop` ends it `stopped`) | `conflict` (no loop, or an action that does nothing now: pause a paused loop, skip past the ladder), `relay_forbidden` |
 
 Details:
 
@@ -794,8 +795,10 @@ Details:
 - **Loops** (`loop.*`, [the design](docs/design/loops.md); review and implementation loops in
   a thread on the hub's own machine in this version): a loop is a state of one thread
   (`thread.loop`). Only a
-  user starts one, controls it or saves its settings: none of the `loop.*` methods is the
-  orchestrator's or an agent's. `loop.request` starts at once only on saved settings (the
+  user saves its settings, answers its cards, pauses, resumes or skips it: none of the `loop.*`
+  methods is an agent's, and the orchestrator has only `loop.request`, `loop.get`, `loop.list`,
+  `loop.control` with `stop`, and `thread.new` with `loop` (below). `loop.request` starts at
+  once only on saved settings (the
   thread's project's own, else the workspace's) that still hold: their runtimes installed and
   signed in on the hub's machine (as its agent probe found them; a hub that does not probe,
   `TWR_AGENT_PROBE=off`, counts every reviewer runtime as both), their models and efforts ones twr knows, a named implementer
@@ -826,8 +829,9 @@ Details:
   `run without a loop` records the answer and queues the task as the user's own prompt to the
   thread, in one batch, saving nothing. `cancel`, and `attention.dismiss`, close it and record
   nothing else (a task it held is dropped). `thread.new {loop: {kind: "implement", task,
-  setup?, overrides?}}` (the user's only, `operate` for a device; refused before anything is
-  made for `review`, an empty task, a remote box, a mode that can't edit) makes the thread as
+  setup?, overrides?}}` (`operate` for a device; the orchestrator's under its rule, below;
+  refused before anything is made for `review`, an empty task, a remote box, a mode that
+  can't edit) makes the thread as
   usual, its worktree first, then asks for the loop as `loop.request` would, with the task:
   the task is never queued as an ordinary prompt; on saved settings the plan prompt is the
   thread's first turn, else the card holds the task and the thread stays idle, and stays after
@@ -837,6 +841,33 @@ Details:
   with its thread: stopping (by anyone, not the hub's own shutdown nor a restart in new
   settings), parking or deleting it records `loop.ended {outcome: stopped}` and resolves the
   card and the stuck item (`by: thread_stopped`) in the same batch.
+
+  **The orchestrator's loops.** The orchestrator asks for a loop with `loop.request` (MCP
+  `start_loop`) or `thread.new` / `thread.spawn` with `loop` (`spawn_thread`'s `loop`), and the
+  hub holds it to one more rule than the user: it starts the loop at once only when saved
+  settings hold, `setup` is not set, and its overrides change none of them (an override equal
+  to the saved value starts it and is not recorded as this run's: `loop.started.overrides`
+  stays empty; a project with settings of its own is compared with those, whole). Any other
+  request raises the setup card for the user (`why`: `first_run`, `asked`, `no_longer_holds`,
+  `other_runtime`, or `overrides` with the orchestrator's values in the card's `This run`
+  row), and a thread that already has a card open gets nothing new: the result names that
+  card (`existing: true`), not raised again, and no loop starts over it. The card's
+  `requested_by` is `orchestrator` and its summary's first line says `the orchestrator asked
+  for this loop`; a user's `loop.setup.update` with `settings` drops the orchestrator's
+  overrides from such a card, so what the user sets is what runs. A loop the card or saved
+  settings start for the orchestrator records `loop.started.requested_by: "orchestrator"`
+  (left out for the user; `thread.loop.requested_by` and `last_loop.requested_by` the same),
+  its start line in the orchestrator's conversation says `…, which the orchestrator asked
+  for`, and `loop.get`'s `started.requested_by` says it. Its rounds and phases stay routine
+  updates. Its end is a notice line, whatever the grade: the loop's last report (`- thread=<name>
+  report … summary="review loop clean after 2 rounds; report: <path>"`), or, for one that
+  failed without a report, `- thread=<name> loop=<id> ended outcome=failed reason=…` (urgent);
+  a stuck item is an urgent notice as any `error` item is. A setup card queues no notice (as
+  a question does: the conversation shows it). The orchestrator may stop a loop
+  (`loop.control stop`, recorded `by: orchestrator`, its line `api's review loop: stop by the
+  orchestrator`), and nothing more: `pause`, `resume`, `skip_to_verify`, the setup card
+  (answer, dismiss, annotate, `loop.setup.get`, `loop.setup.update`), the stuck item and the
+  settings methods are `relay_forbidden`.
 
   **A running loop.** The hub drives it: each step's prompt to the thread is queued like a
   job's wake prompt (`from: runtime`, source `hub`) in the batch of the step that decided it,
@@ -1783,7 +1814,8 @@ can access it (`chmod 600`).
 Routine permissions, successful reports and confirm outcomes appear as hub-authored
 `conversation.update` events on the orchestrator thread, without a model turn. Only
 exceptional updates require interpretation or annotations, and a worker's final report wakes
-the orchestrator only through a watch it set (`watch_thread`). Complete exact commands on
+the orchestrator only through a watch it set (`watch_thread`), or as the end of a loop it
+asked for (`start_loop`). Complete exact commands on
 `say {to: "orchestrator"}` are preflighted atomically with the existing grammar and seen
 revision checks, audited and acknowledged directly. New user prompts interrupt background
 notice turns while preserving the runtime session and durable update context. Orchestrator
@@ -1794,7 +1826,7 @@ Server name `twr` (Claude Code sees `mcp__twr__<tool>`). Errors come back as too
 text starts with `hub error <code>:`.
 
 A result about one thread (`get_thread`, `spawn_thread`, `send`, `set_mode`, `set_model`,
-`park`, `resume`, `stop`, `write_report`, `watch_thread`) is compact JSON whose first keys are `thread_name`,
+`park`, `resume`, `stop`, `write_report`, `watch_thread`, `start_loop`, `stop_loop`) is compact JSON whose first keys are `thread_name`,
 then `thread` (the id; `spawn_thread`'s is the thread object), then the socket call's other
 keys, sorted. A runtime's summary of the result (its first couple of hundred characters) then
 still names the thread. `get_thread` is the thread object led by those two keys. A
@@ -1805,7 +1837,7 @@ it is the socket call's result as is.
 |---|---|---|
 | `list_threads` | - | `thread.list` |
 | `get_thread` | `thread` | `thread.get` |
-| `spawn_thread` | `project, name?, prompt?, runtime?, model?, effort?, box?, operation_id?` | `thread.spawn`, briefly polls `thread.spawn_status`; returns `{operation_id, status, thread_name?, thread?, send?, machine_load?, warning?, error?}` (`thread_name` first, the id when unnamed; `machine_load` while the machine of a local thread is busy or saturated; `warning`: the box reports the runtime's CLI missing); `box` is any box the hub has (`local` or a configured one), passed to `thread.new` with its errors (`box_offline` for one not configured or not online); its description says to pick one `hub_info` shows online with the runtime's agent found and `logged_in`; the runtime is the project's (else `default_runtime`) unless `runtime` names a built-in agent runtime (`claude-code`, `codex`, `grok-build`) or a `[runtimes]` preset, only when the user asks for one (never a command line), and the permission mode is always `threads.default_mode` (the user's setting); `project` may be a repository folder name, looked up under `project_roots` (result `project_found`; `ambiguous` / `not_found` otherwise) |
+| `spawn_thread` | `project, name?, prompt?, runtime?, model?, effort?, box?, operation_id?, loop?: {kind: "implement", setup?, profile?, reviewer?, implementer?, workers?, commit?, plan_check?}` | `thread.spawn`, briefly polls `thread.spawn_status`; returns `{operation_id, status, thread_name?, thread?, send?, loop?, machine_load?, warning?, error?}` (with `loop`, only when the user asks for an implementation loop: `prompt` is required and becomes `thread.new`'s `loop.task`, never an ordinary prompt; the other `loop` keys are its `setup` and `overrides`; the result's `loop` is what `start_loop` returns of it, or `{status: "error", code, message, tell_user}` when it failed after the thread was made, which stays; the description carries the loop rule) (`thread_name` first, the id when unnamed; `machine_load` while the machine of a local thread is busy or saturated; `warning`: the box reports the runtime's CLI missing); `box` is any box the hub has (`local` or a configured one), passed to `thread.new` with its errors (`box_offline` for one not configured or not online); its description says to pick one `hub_info` shows online with the runtime's agent found and `logged_in`; the runtime is the project's (else `default_runtime`) unless `runtime` names a built-in agent runtime (`claude-code`, `codex`, `grok-build`) or a `[runtimes]` preset, only when the user asks for one (never a command line), and the permission mode is always `threads.default_mode` (the user's setting); `project` may be a repository folder name, looked up under `project_roots` (result `project_found`; `ambiguous` / `not_found` otherwise) |
 | `get_spawn` | `operation_id` | `thread.spawn_status`; check pending or lost responses before retrying. Reuse the same id and identical request. |
 | `send` | `thread, prompt, after?` | `thread.send` (with `after`: held until those threads finish) |
 | `respond_attention` | `attn_id, answer? \| option_index?, message?` | `attention.respond` (relay rule; once per item; may return `needs_confirmation`) |
@@ -1820,6 +1852,9 @@ it is the socket call's result as is.
 | `get_usage` | - | `usage.get` then `usage.threads` for the last 7 days: one line per runtime, then `What threads spent in the last 7 days: api 1.2M tok $3.40 (4 turns); ...; total ...` (the five that spent most). Per runtime: `- <label> plan=<plan>: 5h 78% left (resets <RFC3339>), wk 56% left (resets ...); as of 40s ago`, or "No usage known yet: ..." (read only). The control stream renders `account.usage` as `usage <label>: 5h 78% · wk 56% left` |
 | `list_accounts` | - | `account.list`, as the orchestrator gets it: `{runtimes: [{runtime, several, accounts: [{name, native, source, login, threads, removed?, shadowed?}]}]}`; `several`: the runtime has two or more logged-in accounts, and only then do `list_threads` and `get_thread` show a thread's `account`. Read only: only the user adds, signs in to or removes accounts |
 | `stop` | `thread` | `thread.stop` |
+| `start_loop` | `thread, kind: "review" \| "implement", task?, scope?, setup?, profile?, reviewer?, implementer?, workers?, commit?, plan_check?` | `loop.request {thread, kind, task?, scope?, setup?, overrides: {profile?, reviewer?, implementer?, workers?, commit?, plan_check?}}` (only when the user asks for a loop; the description carries the loop rule, `twr_mcp::LOOP_RULE`); returns `{thread_name, thread, status: "started", loop, kind, line, settings, settings_of?}` (`loop`: its id; `settings`: what it runs on in a line, `profile high · implementer the thread's own · workers claude-opus-5-5 high · reviewer codex gpt-6.1-sol · commit match`, with `plan check` for an implementation loop) or `{thread_name, thread, status: "needs_setup", attn_id, why, existing?, tell_user}` (`tell_user`: a sentence for the orchestrator to pass on, `I've asked you to choose the loop's models on api's card.`, its end saying why for `first_run`, `overrides`, `no_longer_holds` and `other_runtime`; with `existing`, that the card already waits) |
+| `get_loop` | `thread` | `loop.get {thread}`, rendered as a few lines: `api: review loop <id> running: <line>` (or `… ended <outcome>`), where it is (`phase verify, round v2, verify 1/5[, paused][, stuck: …]; waits on the thread's turn \| a review run (reviewer …) \| the user`), `settings: … (the user's saved settings \| the project's saved settings \| chosen by the user on its setup card; asked for by you \| the user)[; this run only: …]`, `task: …`, `rounds: m1 3 findings (2 fixed, 1 dismissed) · m2 clean · x1 failed: … · v2 running` (`p1 (plan check)`; the latest 30), `ledger: N entries`, `plan: <path>`, for an ended one `why it ended: …` and `committed: <sha> (<repo>), …` or `not committed: …`, and `report: <path>` (read only) |
+| `stop_loop` | `thread` | `loop.control {thread, action: "stop"}`; returns `{thread_name, thread, loop, running, outcome}` (there is no tool to pause, resume or skip a loop) |
 | `read_transcript` | `thread, turn?, since_seq?, limit?` (default 500), or `thread, seq, offset?` | `thread.transcript`, default latest turn, semantic rows filtered in SQL before paging, ~8 KiB cap; a line whose text was shortened (cut for the line, or a capped preview) ends with `… [cut; read_transcript seq=<seq> shows it in full]`. With `seq` (not with `since_seq` / `limit`): `thread.events {since_seq: seq - 1, limit: 1}`, its capped fields restored with `blob.get`, and that event's main text in full (`agent.text` text, `turn.started` prompt, tool call input, tool result output, `report.ready` summary, `attention.raised` summary then its numbered options, `attention.resolved` decision and message, `attention.annotated` note, `thread.crashed` stderr tail; any other event, or one without that field: `data` as JSON), 16 KB per call from byte `offset` (default 0) on a UTF-8 boundary, with a footer `[bytes a-b of n; call read_transcript with seq=S offset=b for the rest]` or `[bytes a-b of n; end of #S]` |
 | `subscribe_control` | `since_seq?, wait_ms?` (default 0, max 30000) | `control.read` + a bounded `control.subscribe` wait; ends with `next_seq` |
 | `write_report` | `thread, turn?, summary, grade` | `report.write` |
