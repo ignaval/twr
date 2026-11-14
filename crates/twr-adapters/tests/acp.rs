@@ -1753,3 +1753,72 @@ async fn real_grok_as_generic_acp() {
         println!("SESSION_ID={sid}");
     }
 }
+
+/// codex-acp 2.6.0 sends a command's output to a client without terminals only as
+/// `_meta.terminal_output_delta` (its `rawOutput` is the exit code alone): the result carries
+/// that output. These are its messages for a read in a rootless container, where its sandbox
+/// could not start.
+#[test]
+fn terminal_output_in_meta_is_the_tool_results_output() {
+    let mut tr = opened("manual", None);
+    tr.translate(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"S1"}}"#);
+    let out = tr.translate(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"sessionUpdate":"tool_call","toolCallId":"exec-1","name":"exec_command","kind":"read","title":"Read file '/w/calc.py'","status":"in_progress","locations":[{"path":"/w/calc.py"}]}}}"#,
+    );
+    assert!(out
+        .events
+        .iter()
+        .any(|e| matches!(&e.body, EventBody::AgentToolCall(c) if c.tool == "read")));
+    let out = tr.translate(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"sessionUpdate":"tool_call_update","toolCallId":"exec-1","status":"failed","rawOutput":{"exit_code":1},"_meta":{"terminal_output_delta":{"data":"bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces.\n","terminal_id":"exec-1"}}}}}"#,
+    );
+    let result = out
+        .events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::AgentToolResult(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("the result");
+    assert!(!result.ok);
+    assert!(
+        result
+            .output_summary
+            .starts_with("bwrap: No permissions to create a new namespace"),
+        "{result:?}"
+    );
+    // Output streamed in pieces before the end (a terminal command), then the end with its
+    // exit only: the pieces, in order.
+    tr.translate(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"sessionUpdate":"tool_call","toolCallId":"exec-2","kind":"execute","title":"git log","status":"in_progress"}}}"#,
+    );
+    for piece in ["abc123 first", "\nabc124 second\n"] {
+        let line = json!({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "S1", "update": {"sessionUpdate": "tool_call_update",
+            "toolCallId": "exec-2", "_meta": {"terminal_output": {"data": piece,
+            "terminal_id": "exec-2"}}}}});
+        tr.translate(&line.to_string());
+    }
+    let out = tr.translate(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"sessionUpdate":"tool_call_update","toolCallId":"exec-2","status":"completed","_meta":{"terminal_exit":{"exit_code":0,"signal":null,"terminal_id":"exec-2"}}}}}"#,
+    );
+    let result = out
+        .events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::AgentToolResult(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("the result");
+    assert!(result.ok);
+    assert_eq!(result.output_summary, "abc123 first abc124 second");
+    // Content, when there is some, wins.
+    tr.translate(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"sessionUpdate":"tool_call","toolCallId":"exec-3","kind":"execute","title":"ls","status":"in_progress","_meta":{"terminal_output_delta":{"data":"streamed"}}}}}"#,
+    );
+    let out = tr.translate(
+        r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"S1","update":{"sessionUpdate":"tool_call_update","toolCallId":"exec-3","status":"completed","content":[{"type":"content","content":{"type":"text","text":"from content"}}]}}}"#,
+    );
+    assert!(out.events.iter().any(|e| matches!(&e.body,
+        EventBody::AgentToolResult(r) if r.output_summary == "from content")));
+}

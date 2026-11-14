@@ -538,17 +538,26 @@ fn codex_sandbox_failure(log: &Path) -> Option<String> {
         (first.starts_with("bwrap: ") || first.contains("bubblewrap is unavailable"))
             .then(|| first.to_string())
     })?;
-    let mut said: String = found.chars().take(200).collect();
-    if said.len() < found.len() {
+    Some(sandbox_failed("codex", &found))
+}
+
+/// Why a review run whose reviewer's read-only sandbox could not start fails (`who`: `codex`,
+/// `acp preset codex-acp`; `line`: the sandbox's own error, its first sentence, cut to 200
+/// characters): the same words for every reviewer.
+pub fn sandbox_failed(who: &str, line: &str) -> String {
+    // Its first sentence: bubblewrap's go on with advice for Debian.
+    let line = line.split_once(". ").map_or(line, |(first, _)| first);
+    let mut said: String = line.chars().take(200).collect();
+    if said.len() < line.len() {
         said.push('…');
     }
-    Some(format!(
-        "codex's read-only sandbox could not start here, so the reviewer ran no command and \
+    format!(
+        "{who}'s read-only sandbox could not start here, so the reviewer ran no command and \
          read no file ({said}); its answer is not used. Codex on Linux runs its shell under \
          bubblewrap, which needs unprivileged user namespaces: a rootless container usually \
          has none, and Ubuntu 24.04 and later allow them only to a bwrap with an AppArmor \
-         profile (Ubuntu's bubblewrap package)"
-    ))
+         profile (Ubuntu's bubblewrap package); `twr box doctor` says which"
+    )
 }
 
 /// What a Claude Code or Grok Build run spent, from its result object: its input tokens with

@@ -52,7 +52,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use twr_core::config::{BoxTransport, BoxesFile, Config};
 use twr_core::paths::{sh_word, Paths};
-use twr_core::runner::{AgentInfo, AgentLogin, AgentsReport, LoginPathReport};
+use twr_core::runner::{
+    AgentInfo, AgentLogin, AgentsReport, LoginPathReport, SandboxCheck, SandboxState,
+};
 use twr_hub::ssh_box::{self, BoxLink, Input};
 
 use super::{
@@ -124,9 +126,11 @@ impl Mark {
 #[derive(Debug, Clone, Serialize)]
 struct Check {
     /// What was checked: `hub`, `ssh_batch`, `ssh` (a command box: `command`, `pipe`), `box`,
-    /// `build`, `daemon`, `logind`, `macos`, `login_shell`, `agent`, `git`, `disk`, `project`.
+    /// `build`, `daemon`, `logind`, `macos`, `login_shell`, `agent`, `sandbox` (Codex's on a
+    /// Linux box), `git`, `disk`, `project`.
     check: &'static str,
-    /// Which one (the agent's command, the project's name), for `agent` and `project`.
+    /// Which one (the agent's command, the project's name), for `agent`, `sandbox` and
+    /// `project`.
     item: Option<String>,
     result: Mark,
     message: String,
@@ -146,6 +150,7 @@ impl Check {
         };
         match (&self.item, self.check) {
             (Some(i), "agent") => i.clone(),
+            (Some(i), "sandbox") => format!("{i} sandbox"),
             (Some(i), _) => format!("{base} {i}"),
             (None, _) => base.to_string(),
         }
@@ -2220,6 +2225,114 @@ fn agent_check_said(r: &mut Report, name: &str, a: &AgentInfo, from: &str) {
         format!("{}{from}", agent_said(a)),
         fix,
     );
+    if let Some(c) = &a.sandbox {
+        sandbox_check(r, name, c);
+    }
+}
+
+/// Whether Codex's read-only sandbox starts on Linux box `name` (`c`: the agent probe's
+/// `codex sandbox -- true`), and what to do when it doesn't, by why.
+fn sandbox_check(r: &mut Report, name: &str, c: &SandboxCheck) {
+    let bwraps = match (c.system_bwrap, c.bundled_bwrap) {
+        (true, true) => "a bwrap on the PATH, which Codex prefers, and Codex's own",
+        (true, false) => "a bwrap on the PATH",
+        (false, true) => "Codex's own bwrap, none on the PATH",
+        (false, false) => "no bwrap on the PATH and none next to Codex's executable",
+    };
+    // The sandbox's error, to its first sentence (bubblewrap's go on with advice for Debian).
+    let said = c
+        .said
+        .as_deref()
+        .map(|l| format!(" (`{}`)", l.split_once(". ").map_or(l, |(first, _)| first)))
+        .unwrap_or_default();
+    let blind = "a Codex reviewer on this box runs no command and reads no file, so its \
+                 review runs fail";
+    let again = format!("then `twr box doctor {name}`");
+    let (mark, message, fix) = match c.state {
+        SandboxState::Works => (
+            Mark::Ok,
+            format!("Codex's read-only sandbox starts (there is {bwraps})"),
+            None,
+        ),
+        SandboxState::NoBwrap => (
+            Mark::Warn,
+            format!(
+                "Codex finds no bwrap{said}: there is {bwraps}, as with the bare release \
+                 binary; {blind}"
+            ),
+            Some(format!(
+                "install the distribution's bubblewrap package (`sudo apt install bubblewrap`), \
+                 or Codex from its npm package or `codex-package` archive, which ship a bwrap; \
+                 {again}"
+            )),
+        ),
+        SandboxState::Apparmor => (
+            Mark::Warn,
+            format!(
+                "Codex's bwrap is refused{said}: this kernel gives unprivileged user namespaces \
+                 only to programs with an AppArmor profile (Ubuntu 24.04 and later), and {} has \
+                 none; {blind}",
+                if c.system_bwrap {
+                    "the bwrap on the PATH"
+                } else {
+                    "Codex's own bwrap"
+                }
+            ),
+            Some(if c.system_bwrap {
+                format!(
+                    "make the distribution's bwrap (`/usr/bin/bwrap`, from its bubblewrap \
+                     package, which has a profile) the first on the PATH; {again}"
+                )
+            } else {
+                format!(
+                    "install the distribution's bubblewrap package (`sudo apt install \
+                     bubblewrap`): its bwrap has a profile, and Codex takes a bwrap on the PATH \
+                     over its own; {again}"
+                )
+            }),
+        ),
+        SandboxState::NoNamespaces => (
+            Mark::Warn,
+            format!(
+                "no bwrap can make a namespace here{said}, with {bwraps}: {}; {blind}",
+                if r.command {
+                    "a rootless container (or one without user namespaces) gives none, which \
+                     installing bubblewrap does not change"
+                } else {
+                    "the kernel gives no unprivileged user namespaces here (a container, or \
+                     `user.max_user_namespaces = 0`, or Debian's \
+                     `kernel.unprivileged_userns_clone = 0`)"
+                }
+            ),
+            Some(if r.command {
+                "review this box's loops with another reviewer (claude-code reads without a \
+                 shell), or run them on a box that is not a rootless container"
+                    .to_string()
+            } else {
+                format!(
+                    "allow unprivileged user namespaces on the box, or review its loops with \
+                     another reviewer (claude-code reads without a shell); {again}"
+                )
+            }),
+        ),
+        SandboxState::Fails => (
+            Mark::Warn,
+            format!("Codex's read-only sandbox does not start{said}, with {bwraps}; {blind}"),
+            Some(format!(
+                "`codex sandbox -- true` on the box shows why; {again}"
+            )),
+        ),
+        SandboxState::Unknown => (
+            Mark::Warn,
+            format!(
+                "not known whether Codex's read-only sandbox starts (there is {bwraps}): \
+                 `codex sandbox -- true` gave no answer twr reads (a Codex without `codex \
+                 sandbox`?)"
+            ),
+            None,
+        ),
+    };
+    r.add_item("sandbox", Some("codex"), mark, message, fix);
 }
 
 /// Free disk in the box's data directory (`df`, `df -Pk`'s line) against `[threads]
@@ -3932,6 +4045,123 @@ mod tests {
             json!({"check": "agent", "item": "codex", "result": "warn",
                 "message": "logged out", "fix": "`twr box login gpu codex`"})
         );
+    }
+
+    /// Codex's sandbox on a Linux box, from the box's agent probe, next to the codex line: each
+    /// way it was seen to fail (Codex 0.166.0's own words: the bare binary, its bwrap on Ubuntu
+    /// 26.04 without the bubblewrap package, a rootless nerdctl container) with what to do.
+    #[test]
+    fn codex_sandbox_checks_say_why_and_what_to_do() {
+        let run = |sandbox: Value, command: bool| -> Vec<Check> {
+            let probe = json!({"agents": [
+                {"runtime": "codex", "found": true, "login": "logged_in", "sandbox": sandbox},
+            ]});
+            let side: Result<String, String> =
+                Ok(format!("{AGENTS_MARK}\n{probe}\n{EXIT_MARK}0\n"));
+            let hub = HubBuild::of_info(json!({"version": "0.2.0", "boxes": []}));
+            let pick = ("0123456789abcdef".to_string(), BuildSource::Hub);
+            let mut r = Report::new("lvm", true);
+            r.command = command;
+            agents_checks(
+                &mut r,
+                "lvm",
+                &hub,
+                &DaemonView::NotAsked,
+                Some(&pick),
+                Some(&side),
+                true,
+            );
+            r.checks
+        };
+        let sandbox = |checks: &[Check]| -> Check {
+            let i = checks
+                .iter()
+                .position(|c| c.check == "sandbox")
+                .expect("a sandbox check");
+            // Right after the codex line.
+            assert_eq!(checks[i - 1].label(), "codex");
+            checks[i].clone()
+        };
+        let works = sandbox(&run(
+            json!({"state": "works", "system_bwrap": true, "bundled_bwrap": true}),
+            false,
+        ));
+        assert_eq!(
+            (works.label().as_str(), works.result),
+            ("codex sandbox", Mark::Ok)
+        );
+        assert!(works.message.contains("starts"), "{works:?}");
+        let bare = sandbox(&run(
+            json!({"state": "no_bwrap", "said": "bubblewrap is unavailable: no system bwrap was \
+                found on PATH and no bundled codex-resources/bwrap binary was found next to the \
+                Codex executable"}),
+            false,
+        ));
+        assert_eq!(bare.result, Mark::Warn);
+        assert!(bare.message.contains("Codex finds no bwrap"), "{bare:?}");
+        assert!(bare.message.contains("its review runs fail"), "{bare:?}");
+        assert!(
+            bare.fix
+                .as_deref()
+                .unwrap()
+                .contains("sudo apt install bubblewrap"),
+            "{bare:?}"
+        );
+        let ubuntu = sandbox(&run(
+            json!({"state": "apparmor", "bundled_bwrap": true,
+                "said": "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"}),
+            false,
+        ));
+        assert!(
+            ubuntu.message.contains("AppArmor")
+                && ubuntu
+                    .message
+                    .contains("`bwrap: loopback: Failed RTM_NEWADDR"),
+            "{ubuntu:?}"
+        );
+        assert!(ubuntu
+            .fix
+            .as_deref()
+            .unwrap()
+            .contains("sudo apt install bubblewrap"));
+        let rootless = sandbox(&run(
+            json!({"state": "no_namespaces", "bundled_bwrap": true,
+                "said": "bwrap: No permissions to create a new namespace, likely because the \
+                kernel does not allow non-privileged user namespaces."}),
+            true,
+        ));
+        assert!(
+            rootless.message.contains("rootless container"),
+            "{rootless:?}"
+        );
+        // Bubblewrap's words to their first sentence, the advice for Debian after it left out.
+        let cut = sandbox(&run(
+            json!({"state": "no_namespaces", "said": "bwrap: No permissions to create a new \
+                namespace, likely because the kernel does not allow non-privileged user \
+                namespaces. On e.g. debian this can be enabled with 'sysctl \
+                kernel.unprivileged_userns_clone=1'."}),
+            true,
+        ));
+        assert!(
+            cut.message.contains(
+                "(`bwrap: No permissions to create a new namespace, likely because the kernel \
+                 does not allow non-privileged user namespaces`), with no bwrap on the PATH"
+            ),
+            "{cut:?}"
+        );
+        let fix = rootless.fix.as_deref().unwrap();
+        assert!(
+            fix.contains("another reviewer") && fix.contains("not a rootless container"),
+            "{fix}"
+        );
+        assert!(!fix.contains("apt install"));
+        // A box's build that does not check it, or another agent: no line.
+        let none = run(Value::Null, false);
+        assert!(none.iter().all(|c| c.check != "sandbox"));
+        // None of it fails the box: Claude Code threads (and reviews) still run there.
+        for c in [&bare, &ubuntu, &rootless] {
+            assert_ne!(c.result, Mark::Fail);
+        }
     }
 
     /// A box's projects: its own, and the hub's projects that name it.

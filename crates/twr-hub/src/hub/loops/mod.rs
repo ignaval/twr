@@ -477,6 +477,10 @@ fn availability_on(
                     account_names(accounts, rt)
                 },
                 subagents: *rt == twr_adapters::claude_code::NAME,
+                review_warning: a
+                    .and_then(|a| a.sandbox.as_ref())
+                    .filter(|_| *rt == twr_adapters::codex::NAME)
+                    .and_then(|c| sandbox_warning(c.state, remote.then_some(box_name))),
                 ..Default::default()
             }
         })
@@ -498,6 +502,39 @@ fn availability_on(
         }),
         box_name: remote.then(|| box_name.to_string()),
     }
+}
+
+/// The setup card's warning for a Codex reviewer whose read-only sandbox can't start where the
+/// loop runs (`state`, from the agent probe of `box_name`, else of the hub's own machine);
+/// `None` when it starts or that is not known.
+fn sandbox_warning(
+    state: twr_core::runner::SandboxState,
+    box_name: Option<&str>,
+) -> Option<String> {
+    use twr_core::runner::SandboxState;
+    if !state.blocks_review() {
+        return None;
+    }
+    let why = match state {
+        SandboxState::NoBwrap => "Codex finds no bwrap",
+        SandboxState::Apparmor => "AppArmor refuses Codex's bwrap",
+        SandboxState::NoNamespaces => "no bwrap can make a namespace (a rootless container?)",
+        _ => "bwrap fails",
+    };
+    let (on, doctor) = match box_name {
+        Some(b) => (
+            format!("on box {b}"),
+            format!("`twr box doctor {b}` says what to do"),
+        ),
+        None => (
+            "on this machine".to_string(),
+            "`codex sandbox -- true` shows why".to_string(),
+        ),
+    };
+    Some(format!(
+        "codex's read-only sandbox can't start {on} ({why}): its review runs there would read no \
+         file and fail; pick another reviewer, or fix the sandbox ({doctor})"
+    ))
 }
 
 /// What a `[runtimes.<name>]` preset is as a reviewer (docs/design/loops.md, "ACP
@@ -1357,7 +1394,8 @@ impl Hub {
     /// `runtime, found, login, probed, models, efforts, subagents, accounts`; `accounts` empty
     /// when it has only its native one; `probed: false` when the hub does not probe its agent
     /// CLIs, `found` and `login` then true for not knowing; then every `[runtimes]` preset with
-    /// `acp: true`, its `review_mode` when it can review, else `cannot_review`, the reason),
+    /// `acp: true`, its `review_mode` when it can review, else `cannot_review`, the reason; and
+    /// `review_warning` on a runtime whose review runs would fail there: Codex's sandbox),
     /// and the warnings and problems of the set that applies (else of the first card's).
     pub async fn loop_settings_get(&self, p: SettingsFor) -> Result<Value, RpcError> {
         // A thread's: its box's agents, its project's settings.
@@ -1406,6 +1444,10 @@ impl Hub {
                     // A runtime with only its native account has none to pick.
                     "accounts": if r.accounts.len() > 1 { r.accounts.clone() } else { Vec::new() },
                 });
+                // Why its review runs would fail where the loop runs (Codex's sandbox).
+                if let Some(w) = &r.review_warning {
+                    v["review_warning"] = json!(w);
+                }
                 // An ACP preset: whether it can review (its read-only mode), or why not.
                 if r.acp {
                     v["acp"] = json!(true);
@@ -1802,8 +1844,10 @@ fn report_text(bytes: &[u8], path: &str) -> (String, bool) {
 }
 
 /// The loop folder's files that exist, into `loop.get`'s `detail`: `files` (`goal`, `ledger`,
-/// `schema`, `report`) and each round's `files` (`diffs`, `prompt`, `answer`, `log`), as
-/// absolute paths.
+/// `schema`, `report`), each round's `files` (`diffs`, `prompt`, `answer`, `log`, and
+/// `failed_runs`: what each failed run before the last kept, [`failed_runs`]) and each audit
+/// run's (`sweep.rules[].audit.files`: `prompt`, `answer`, `log`, `failed_runs`), as absolute
+/// paths.
 fn add_files(detail: &mut Value) {
     let Some(folder) = detail["folder"].as_str().map(std::path::PathBuf::from) else {
         return;
@@ -1863,9 +1907,76 @@ fn add_files(detail: &mut Value) {
                     f[key] = path(&name);
                 }
             }
+            if let Some(kept) = failed_runs(&names, &format!("round-{id}"), &path) {
+                f["failed_runs"] = kept;
+            }
             r["files"] = f;
         }
     }
+    // An audit run's files, as a round's.
+    if let Some(rules) = detail
+        .get_mut("sweep")
+        .and_then(|s| s.get_mut("rules"))
+        .and_then(Value::as_array_mut)
+    {
+        for r in rules {
+            let Some(id) = r["audit"]["id"].as_str().map(str::to_string) else {
+                continue;
+            };
+            let stem = format!("audit-{id}");
+            let mut f = json!({});
+            for (key, suffix) in [
+                ("prompt", "prompt.md"),
+                ("answer", "answer.json"),
+                ("log", "log"),
+            ] {
+                let name = format!("{stem}.{suffix}");
+                if has(&name) {
+                    f[key] = path(&name);
+                }
+            }
+            if let Some(kept) = failed_runs(&names, &stem, &path) {
+                f["failed_runs"] = kept;
+            }
+            r["audit"]["files"] = f;
+        }
+    }
+}
+
+/// The files run stem `stem`'s failed runs kept (`report::failed_run_name`) among the folder's
+/// `names`, as `[{run, prompt?, answer?, log?}]` by run number (`path` makes each a path);
+/// `None` when none kept any.
+fn failed_runs(names: &[String], stem: &str, path: &impl Fn(&str) -> Value) -> Option<Value> {
+    let mut runs: BTreeMap<usize, serde_json::Map<String, Value>> = BTreeMap::new();
+    let prefix = format!("{stem}.try");
+    for n in names {
+        let Some((num, suffix)) = n.strip_prefix(&prefix).and_then(|r| r.split_once('.')) else {
+            continue;
+        };
+        let Ok(k) = num.parse::<usize>() else {
+            continue;
+        };
+        let key = match suffix {
+            "prompt.md" => "prompt",
+            "answer.json" => "answer",
+            "log" => "log",
+            _ => continue,
+        };
+        if report::failed_run_name(stem, k, suffix) != *n {
+            continue;
+        }
+        runs.entry(k).or_default().insert(key.into(), path(n));
+    }
+    (!runs.is_empty()).then(|| {
+        Value::Array(
+            runs.into_iter()
+                .map(|(k, mut m)| {
+                    m.insert("run".into(), json!(k));
+                    Value::Object(m)
+                })
+                .collect(),
+        )
+    })
 }
 
 /// `loop.get`'s answer for loop `id` of thread `view`, from its `loop.*` `events`.
@@ -2502,11 +2613,21 @@ impl Core {
         };
         // The card: saved settings (or, the first time, the first card's with the overrides
         // in them) with what is missing replaced; this run's overrides beside them.
+        let run_reviewer = run.reviewer.runtime.clone();
         let (shown, card_overrides) = match &saved {
             Some(_) => (base, overrides),
             None => (run, Overrides::default()),
         };
-        let proposal = propose(&shown, &avail, config);
+        let mut proposal = propose(&shown, &avail, config);
+        // This run's own reviewer (an override) whose review runs would fail where the loop runs
+        // (Codex's sandbox): said too, as for the saved one.
+        if let Some(w) = avail
+            .runtime(&run_reviewer)
+            .and_then(|r| r.review_warning.clone())
+            .filter(|w| !proposal.warnings.contains(w))
+        {
+            proposal.warnings.push(w);
+        }
         let setup = LoopSetup {
             kind,
             first_run: saved.is_none(),

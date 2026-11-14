@@ -1364,6 +1364,25 @@ async fn a_box_that_goes_away_during_a_review_run_fails_it_and_retries_once_back
     assert!(of_kind(&h, &t, "attention.raised").iter().all(
         |e| !matches!(&e.body, EventBody::AttentionRaised(a) if a.reason == AttentionReason::Error)
     ));
+    // The failed run's log, which the hub never read back (the box was away when it ended),
+    // is kept on both sides under its own name; the retry's has the round's.
+    let id = loop_id(&h, &t);
+    let hub_folder = PathBuf::from(get(&h, &t)["folder"].as_str().unwrap());
+    for folder in [hub_folder.clone(), box_folder(&env, &id)] {
+        let read = |n: &str| std::fs::read_to_string(folder.join(n)).unwrap_or_default();
+        assert!(
+            read("round-m1.try1.log").contains("fake reviewer run 1"),
+            "{}",
+            folder.display()
+        );
+        assert!(read("round-m1.log").contains("fake reviewer run 2"));
+        assert!(!read("round-m1.log").contains("fake reviewer run 1"));
+        assert!(folder.join("round-m1.try1.prompt.md").is_file());
+    }
+    assert_eq!(
+        std::fs::read(hub_folder.join("round-m1.try1.log")).unwrap(),
+        std::fs::read(box_folder(&env, &id).join("round-m1.try1.log")).unwrap()
+    );
     runner.shutdown().await;
     h.shutdown().await;
 }

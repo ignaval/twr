@@ -285,6 +285,11 @@ pub struct RuntimeAvailability {
     /// it can.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cannot_review: Option<String>,
+    /// Why its review runs where the loop runs would fail though it is installed and logged
+    /// in (Codex's read-only sandbox can't start on the box, as the box's agent probe found):
+    /// a warning of the setup card when it is the reviewer. Nothing is replaced for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_warning: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -305,6 +310,7 @@ impl Default for RuntimeAvailability {
             acp: false,
             review_mode: None,
             cannot_review: None,
+            review_warning: None,
         }
     }
 }
@@ -814,6 +820,12 @@ pub fn propose(s: &LoopSettings, avail: &Availability, config: &LoopsConfig) -> 
         .and_then(|r| r.review_mode.as_deref())
     {
         warnings.push(acp_reviewer_warning(mode));
+    }
+    if let Some(w) = avail
+        .runtime(&out.reviewer.runtime)
+        .and_then(|r| r.review_warning.as_deref())
+    {
+        warnings.push(w.to_string());
     }
     let problems = validate(&out, avail, config);
     Proposal {

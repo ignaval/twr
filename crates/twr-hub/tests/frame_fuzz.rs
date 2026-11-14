@@ -459,6 +459,7 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
                 login: twr_core::runner::AgentLogin::LoggedIn,
                 method: opt(rng, string),
                 note: opt(rng, string),
+                sandbox: None,
             }],
             launch: opt(rng, string),
             spool: opt(rng, |r| twr_core::runner::SpoolStamp {

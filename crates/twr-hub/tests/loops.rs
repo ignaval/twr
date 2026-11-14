@@ -1000,6 +1000,114 @@ async fn project_settings_win_and_overrides_last_one_run() {
     hub.shutdown().await;
 }
 
+/// Where the agent probe found that Codex's read-only sandbox can't start (a Linux hub in a
+/// rootless container, say), a Codex reviewer on the card is warned about, not replaced: its
+/// review runs there would read no file. A sandbox that starts says nothing.
+#[tokio::test]
+async fn the_card_warns_when_codexs_sandbox_cant_start() {
+    let state = Arc::new(Mutex::new("no_namespaces"));
+    let env = Env::new();
+    let mut o = env.opts();
+    let st = state.clone();
+    o.agent_probe = Some(Arc::new(move || {
+        let sandbox = *st.lock().unwrap();
+        let agents: Vec<AgentInfo> = serde_json::from_value(json!([
+            {"runtime": "claude-code", "found": true, "login": "logged_in"},
+            {"runtime": "codex", "found": true, "login": "logged_in",
+             "sandbox": {"state": sandbox, "bundled_bwrap": true,
+                         "said": "bwrap: No permissions to create a new namespace"}},
+            {"runtime": "grok-build", "found": true, "login": "unknown"},
+        ]))
+        .unwrap();
+        futures::FutureExt::boxed(async move { agents })
+    }));
+    let hub = Hub::open(o).await.unwrap();
+    let repo = env.repo("api");
+    let t = thread(&hub, &repo, "api").await;
+    let wt = hub.thread_view(&t).unwrap().worktree.unwrap();
+    std::fs::write(Path::new(&wt).join("lib.rs"), "fn changed() {}\n").unwrap();
+    let card = request(
+        &hub,
+        &t,
+        json!({"overrides": {"reviewer": "codex/gpt-6.1-sol"}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(card["status"], "needs_setup");
+    let s = setup(&hub, &t, &card["attn_id"]);
+    assert_eq!(s.settings.reviewer.runtime, "codex");
+    assert!(
+        s.warnings.iter().any(|w| w
+            == "codex's read-only sandbox can't start on this machine (no bwrap can make a \
+                namespace (a rootless container?)): its review runs there would read no file \
+                and fail; pick another reviewer, or fix the sandbox (`codex sandbox -- true` \
+                shows why)"),
+        "{:?}",
+        s.warnings
+    );
+    let got = hub
+        .loop_settings_get(LoopSettingsFor::default())
+        .await
+        .unwrap();
+    let codex = got["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["runtime"] == "codex")
+        .unwrap()
+        .clone();
+    assert!(codex["review_warning"].as_str().is_some(), "{codex}");
+    // Claude Code as the reviewer: no such warning.
+    let claude = request(
+        &hub,
+        &t,
+        json!({"overrides": {"reviewer": "claude-code/claude-opus-5-5"}}),
+    )
+    .await
+    .unwrap();
+    let s = setup(&hub, &t, &claude["attn_id"]);
+    assert!(
+        !s.warnings.iter().any(|w| w.contains("sandbox")),
+        "{:?}",
+        s.warnings
+    );
+    // Saved settings with Claude Code reviewing, and this run's reviewer Codex: the card
+    // warns about this run's reviewer.
+    let mut saved = first_card();
+    saved.reviewer =
+        twr_core::loops::config::ReviewerChoice::parse("claude-code/claude-opus-5-5").unwrap();
+    save(&hub, None, saved).await;
+    let card = request(
+        &hub,
+        &t,
+        json!({"setup": true, "overrides": {"reviewer": "codex/gpt-6.1-sol"}}),
+    )
+    .await
+    .unwrap();
+    let s = setup(&hub, &t, &card["attn_id"]);
+    assert_eq!(s.settings.reviewer.runtime, "claude-code");
+    assert!(
+        s.warnings
+            .iter()
+            .any(|w| w.starts_with("codex's read-only sandbox can't start on this machine")),
+        "{:?}",
+        s.warnings
+    );
+    // It starts: nothing to say.
+    *state.lock().unwrap() = "works";
+    hub.box_agents("local", true, BoxView::Full).await.unwrap();
+    let got = hub
+        .loop_settings_get(LoopSettingsFor::default())
+        .await
+        .unwrap();
+    assert!(got["runtimes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["review_warning"].is_null()));
+    hub.shutdown().await;
+}
+
 /// A hub that does not probe its agent CLIs (`TWR_AGENT_PROBE=off`, a test's throwaway hub)
 /// does not know which are installed: it calls none missing, replaces none, and says so in
 /// `loop.settings.get` (`probed: false`); the first card starts a loop that runs to its end.
@@ -1951,6 +2059,22 @@ async fn a_failed_run_is_retried_then_stuck_then_resumed() {
             .contains("boom: run 2 failed"),
         "{g}"
     );
+    // Each run's files are kept: the first failed run's under its own name, the last run's
+    // (the one that counts) under the round's; `loop.get` and `twr loop show` point at them.
+    let folder = PathBuf::from(g["folder"].as_str().unwrap());
+    let read = |n: &str| std::fs::read_to_string(folder.join(n)).unwrap_or_default();
+    assert!(read("round-m1.try1.log").contains("boom: run 1 failed"));
+    assert!(!read("round-m1.try1.log").contains("run 2"));
+    assert!(read("round-m1.log").contains("boom: run 2 failed"));
+    assert!(!read("round-m1.try1.prompt.md").is_empty());
+    let f = &g["rounds"][0]["files"];
+    assert_eq!(f["failed_runs"][0]["run"], 1, "{f}");
+    assert_eq!(
+        f["failed_runs"][0]["log"],
+        json!(folder.join("round-m1.try1.log")),
+        "{f}"
+    );
+    assert_eq!(f["log"], json!(folder.join("round-m1.log")));
     let attn = it["attn_id"].as_str().unwrap().to_string();
     // Not the orchestrator's to answer or annotate.
     let orch = Caller::Orchestrator;
@@ -1971,6 +2095,22 @@ async fn a_failed_run_is_retried_then_stuck_then_resumed() {
     assert_eq!(last.outcome, twr_core::loops::Outcome::Clean);
     // Two failed, the third clean; `low`'s v1 would repeat it at the same effort: skipped.
     assert_eq!(env.runs(), 3);
+    // The second failed run's files went aside too when the third ran; the report names them.
+    assert!(read("round-m1.try1.log").contains("boom: run 1 failed"));
+    assert!(read("round-m1.try2.log").contains("boom: run 2 failed"));
+    assert!(read("round-m1.log").contains("fake reviewer run 3"));
+    assert!(!read("round-m1.log").contains("boom"));
+    let g = get(&hub, &t);
+    let kept: Vec<u64> = g["rounds"][0]["files"]["failed_runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["run"].as_u64().unwrap())
+        .collect();
+    assert_eq!(kept, vec![1, 2]);
+    let report = read("report.md");
+    assert!(report.contains("(round-m1.try1.log)"), "{report}");
+    assert!(report.contains("(round-m1.try2.log)"), "{report}");
     hub.shutdown().await;
 }
 

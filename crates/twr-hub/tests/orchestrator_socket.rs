@@ -472,6 +472,7 @@ async fn the_orchestrator_reads_the_boxes_state_only() {
                     login: AgentLogin::LoggedIn,
                     method: Some("claude.ai".into()),
                     note: None,
+                    sandbox: None,
                 }]
             }
             .boxed()

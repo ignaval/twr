@@ -350,6 +350,7 @@ mod tests {
             login: AgentLogin::LoggedIn,
             method: Some("claude.ai".into()),
             note: Some("a note".into()),
+            sandbox: None,
         }
     }
 

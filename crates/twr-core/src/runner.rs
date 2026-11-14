@@ -845,6 +845,67 @@ pub struct AgentInfo {
     /// status` took longer than 10s").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Codex on a Linux box: whether its read-only sandbox starts there ([`SandboxCheck`]).
+    /// `None` for the other agents, on another OS, or from a box whose twr does not check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxCheck>,
+}
+
+/// Whether Codex's read-only sandbox starts on a Linux box, as the agent probe found it
+/// (`twr_adapters::agents`: `codex sandbox -c sandbox_mode="read-only" -- true`, Codex's own
+/// sandbox around `true`). Codex runs every shell command there under bubblewrap, which needs
+/// unprivileged user namespaces; where it can't start, each command fails before it runs, and
+/// a Codex reviewer reads no file.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxCheck {
+    /// What the probe found.
+    pub state: SandboxState,
+    /// A `bwrap` is on the `PATH` Codex gets (Codex prefers it to its own).
+    pub system_bwrap: bool,
+    /// Codex's own `bwrap` is next to its executable (`codex-resources/bwrap`, as its npm
+    /// package and `codex-package` archive ship it; the bare release binary has none).
+    pub bundled_bwrap: bool,
+    /// The line of the sandbox's own error, when it failed (`bwrap: ...`, `bubblewrap is
+    /// unavailable: ...`): printable, short, and only such a line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub said: Option<String>,
+}
+
+/// What [`SandboxCheck`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxState {
+    /// The sandbox started (`true` ran in it).
+    Works,
+    /// Codex found no `bwrap`: none on the `PATH` and none next to its executable.
+    NoBwrap,
+    /// The kernel restricts unprivileged user namespaces with AppArmor (Ubuntu 24.04 and
+    /// later) and the `bwrap` Codex ran has no profile for them (Codex's own).
+    Apparmor,
+    /// No `bwrap` can make a namespace here (`No permissions to create a new namespace`): a
+    /// rootless container, or a kernel that allows none.
+    NoNamespaces,
+    /// It failed otherwise ([`SandboxCheck::said`]).
+    Fails,
+    /// Not known: the probe could not run it, or it said nothing twr can read (a Codex without
+    /// `codex sandbox`). Also any value a newer box sends that this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl SandboxState {
+    /// Whether a Codex review run on the box would read no file (its sandbox can't start).
+    pub fn blocks_review(self) -> bool {
+        matches!(
+            self,
+            SandboxState::NoBwrap
+                | SandboxState::Apparmor
+                | SandboxState::NoNamespaces
+                | SandboxState::Fails
+        )
+    }
 }
 
 /// What `twr runner --agents` prints (one JSON object): the box's agents as its runner would
@@ -1958,6 +2019,7 @@ mod tests {
                 login: AgentLogin::LoggedIn,
                 method: Some("claude.ai".into()),
                 note: None,
+                sandbox: None,
             }],
             launch: Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d".into()),
             spool: Some(SpoolStamp {

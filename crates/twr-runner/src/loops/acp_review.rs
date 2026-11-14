@@ -23,6 +23,12 @@
 //!   during the review run (<paths>): ...`. twr leaves the change where it is (it never
 //!   reverts work) and says so in the round's log. A directory that is no git repository is
 //!   not checked (the log says so).
+//! - **A sandbox that can't start.** A tool call that failed with the sandbox's own error
+//!   ([`sandbox_error`]: `bwrap: ...`, Codex's `bubblewrap is unavailable: ...`) fails the run,
+//!   whatever the agent answered: its command never ran, so the reviewer read nothing
+//!   (codex-acp's `read-only` mode in a rootless container answered an empty list so). The
+//!   words are the built-in Codex reviewer's (`review::sandbox_failed`). A command that failed
+//!   otherwise is the agent's business.
 //! - **The answer.** The prompt is the round's, with [`OUTPUT_CONTRACT`] after it: the
 //!   findings in one fenced `json` block matching `findings.schema.json`. The hub reads the
 //!   LAST such block of the reply (`contract::findings_in_text`, the same `parse_findings` the
@@ -108,15 +114,34 @@ pub fn read_only_mode(reported: &str, asked: &str) -> bool {
         && (reported == asked.trim() || mode_level(reported) == Some(ModeLevel::Restricted))
 }
 
-/// The round's log, appended to (for people; never read to judge the round).
-struct Log(Option<std::fs::File>);
+/// The round's log, appended to (for people; never read to judge the round), and the one fact
+/// the run takes from what it logs: a tool call that failed because the agent's sandbox could
+/// not start ([`sandbox_error`]).
+struct Log {
+    file: Option<std::fs::File>,
+    /// The first such failure's error line.
+    sandbox: Option<String>,
+}
 
 impl Log {
     fn line(&mut self, text: &str) {
-        if let Some(f) = &mut self.0 {
+        if let Some(f) = &mut self.file {
             let _ = writeln!(f, "{text}");
         }
     }
+}
+
+/// The sandbox's own error at the start of a failed tool call's output (`bwrap: ...`, or
+/// Codex's `bubblewrap is unavailable: ...` when it finds no bwrap): the agent's command never
+/// ran, since its sandbox could not start. Any other failure is the agent's business.
+pub fn sandbox_error(output: &str) -> Option<&str> {
+    let output = output.trim_start();
+    if output.starts_with("bwrap: ") {
+        return Some(output);
+    }
+    output
+        .find("bubblewrap is unavailable")
+        .map(|i| &output[i..])
 }
 
 /// Runs `call` on `acp` (module docs); `spawned` is told the agent's process group.
@@ -134,7 +159,10 @@ pub async fn run(
         .truncate(true)
         .open(&call.log_file)
     {
-        Ok(f) => Log(Some(f)),
+        Ok(f) => Log {
+            file: Some(f),
+            sandbox: None,
+        },
         Err(e) => return Ended::Failed(format!("cannot open {}: {e}", call.log_file.display())),
     };
     if !super::review::plain(&call.model) {
@@ -268,6 +296,17 @@ pub async fn run(
             }
             return Ended::Failed(why);
         }
+    }
+    // A command that failed because the agent's sandbox could not start: the reviewer read
+    // nothing, whatever it answered (often an empty list) or however its turn ended.
+    if let Some(line) = log.sandbox.clone() {
+        if let Err(Ended::Cancelled(why)) = outcome {
+            log.line(&format!("twr: the run was cancelled: {why}"));
+            return Ended::Cancelled(why);
+        }
+        let why = super::review::sandbox_failed(&format!("acp preset {}", acp.preset), &line);
+        log.line(&format!("twr: {why}"));
+        return Ended::Failed(why);
     }
     let (body, findings, usage) = match outcome {
         Ok(r) => r,
@@ -444,6 +483,9 @@ async fn next(
                 if r.ok { "done" } else { "failed" },
                 r.output_summary
             ));
+            if !r.ok && log.sandbox.is_none() {
+                log.sandbox = sandbox_error(&r.output_summary).map(str::to_string);
+            }
             Next::Other
         }
         EventBody::AttentionRaised(p) => {

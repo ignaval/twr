@@ -24,6 +24,13 @@ prompt.<n>, its working directory to cwd.<n> and its environment to env.<n>, the
                  agent whose read-only mode did not hold)
   perm.<n>    -> asks session/request_permission first (allow_once, allow_always, reject_once,
                  reject_always) and writes the option chosen to perm-answer.<n>
+  sandbox.<n> -> its sandbox can't start, as codex-acp 2.6.0's read-only mode did in a rootless
+                 container: a read (`tool_call` kind read) fails with bubblewrap's error as its
+                 `_meta.terminal_output_delta` (`rawOutput` only the exit code), then it asks to
+                 run it outside the sandbox (session/request_permission: allow_once,
+                 allow_always, reject_once "cancel"); refused, the read fails again with no
+                 output and the turn ends `cancelled` with no answer. The file's text, if any,
+                 is the line it fails with (else bubblewrap's in a rootless container)
   answers/<n>.txt -> its text is the reply (two chunks); else a reply with no findings in a
                  fenced json block
 The prompt result reports usage as the real adapters do: 100 uncached input tokens beside
@@ -180,6 +187,49 @@ def prompt(msg):
         r = wait_response(rid)
         outcome = r.get("result", {}).get("outcome", {})
         open(here("perm-answer"), "w").write(outcome.get("optionId", outcome.get("outcome", "")))
+    if os.path.exists(here("sandbox")):
+        said = open(here("sandbox")).read().strip() or (
+            "bwrap: No permissions to create a new namespace, likely because the kernel does "
+            "not allow non-privileged user namespaces. On e.g. debian this can be enabled with "
+            "'sysctl kernel.unprivileged_userns_clone=1'.")
+        path = os.path.join(os.getcwd(), "lib.rs")
+        chunk(sid, "I'll read the diff and the changed file.\n")
+        first = {"toolCallId": f"exec-{n}-1", "name": "exec_command", "kind": "read",
+                 "title": f"Read file '{path}'", "status": "in_progress",
+                 "locations": [{"path": path}]}
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid,
+              "update": dict(first, sessionUpdate="tool_call")}})
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid,
+              "update": {"sessionUpdate": "tool_call_update", "toolCallId": f"exec-{n}-1",
+                         "status": "failed", "rawOutput": {"exit_code": 1},
+                         "_meta": {"terminal_output_delta": {
+                             "data": said + "\n", "terminal_id": f"exec-{n}-1"}}}}})
+        again = {"toolCallId": f"exec-{n}-2", "kind": "read", "title": f"Read file '{path}'",
+                 "status": "in_progress", "locations": [{"path": path}]}
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid,
+              "update": dict(again, sessionUpdate="tool_call")}})
+        next_id[0] += 1
+        rid = next_id[0]
+        send({"jsonrpc": "2.0", "id": rid, "method": "session/request_permission",
+              "params": {"sessionId": sid, "toolCall": {
+                  "toolCallId": f"exec-{n}-2", "title": f"Read file '{path}'",
+                  "rawInput": {"command": "cat lib.rs", "cwd": os.getcwd()}, "kind": "execute",
+                  "status": "pending", "locations": [{"path": path}]}, "options": [
+                  {"optionId": "allow_once", "name": "Yes, proceed", "kind": "allow_once"},
+                  {"optionId": "accept_execpolicy_amendment",
+                   "name": "Yes, and don't ask again for commands that start with `cat lib.rs`",
+                   "kind": "allow_always"},
+                  {"optionId": "cancel", "name": "No, and tell Codex what to do differently",
+                   "kind": "reject_once"}]}})
+        r = wait_response(rid)
+        outcome = r.get("result", {}).get("outcome", {})
+        open(here("perm-answer"), "w").write(outcome.get("optionId", outcome.get("outcome", "")))
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid,
+              "update": {"sessionUpdate": "tool_call_update", "toolCallId": f"exec-{n}-2",
+                         "status": "failed", "rawOutput": {"exit_code": None}}}})
+        return {"stopReason": "cancelled", "usage": {
+            "inputTokens": 100, "cachedReadTokens": 5000, "cachedWriteTokens": 0,
+            "outputTokens": 10, "totalTokens": 5110}}
     answer = os.path.join(state, "answers", f"{n}.txt")
     if os.path.exists(answer):
         reply = open(answer).read()

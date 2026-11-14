@@ -724,6 +724,78 @@ async fn two_bad_replies_fail_the_run_and_the_ladder_retries_it() {
     hub.shutdown().await;
 }
 
+/// An ACP reviewer whose sandbox could not start (codex-acp's read-only mode in a rootless
+/// container: each command fails in bubblewrap, it asks to run outside the sandbox, twr refuses,
+/// its turn ends without an answer, and asked once more it answers an empty list having read
+/// nothing) fails its run, saying why, whatever it answered; the retry fails the same way and
+/// the loop sticks. Before, the loop ended `clean`.
+#[tokio::test]
+async fn a_review_whose_sandbox_could_not_start_fails() {
+    let env = Env::new();
+    std::fs::write(env.state().join("sandbox.1"), "").unwrap();
+    std::fs::write(env.state().join("sandbox.3"), "").unwrap();
+    let hub = env.hub().await;
+    let t = looping(&env, &hub, "api", settings("low", "ex/m-large")).await;
+    until(&hub, "stuck", |h| {
+        running(h, &t).is_some_and(|l| l.stuck.is_some())
+    })
+    .await;
+    let stuck = running(&hub, &t).unwrap().stuck.unwrap();
+    assert!(
+        stuck.starts_with(
+            "review round m1 failed twice: acp preset ex's read-only sandbox could not start \
+             here, so the reviewer ran no command and read no file (bwrap: No permissions to \
+             create a new namespace"
+        ),
+        "{stuck}"
+    );
+    // Bubblewrap's first sentence, not its advice for Debian.
+    assert!(
+        stuck.contains("non-privileged user namespaces); its answer is not used"),
+        "{stuck}"
+    );
+    assert!(!stuck.contains("debian"), "{stuck}");
+    // The escalation was refused, never allowed; each run asked once more and got its blind
+    // answer.
+    assert_eq!(env.agent_file("perm-answer.1"), "cancel");
+    assert_eq!(env.count("count"), 4);
+    let g = get(&hub, &t);
+    let f = &g["rounds"][0]["files"];
+    for log in [f["failed_runs"][0]["log"].as_str(), f["log"].as_str()] {
+        let log = std::fs::read_to_string(log.unwrap()).unwrap();
+        assert!(
+            log.contains("tool failed: -> bwrap: No permissions to create a new namespace"),
+            "{log}"
+        );
+        assert!(log.contains("twr: acp preset ex's read-only sandbox could not start here"));
+    }
+    hub.shutdown().await;
+}
+
+/// A command that failed for its own reasons (no sandbox error) is the reviewer's business:
+/// the run stands on its answer.
+#[tokio::test]
+async fn an_ordinary_failed_command_does_not_fail_a_review() {
+    let env = Env::new();
+    std::fs::write(
+        env.state().join("sandbox.1"),
+        "cat: lib.rs: No such file or directory",
+    )
+    .unwrap();
+    let hub = env.hub().await;
+    let t = looping(&env, &hub, "api", settings("low", "ex/m-large")).await;
+    let last = ended(&hub, &t).await;
+    assert_eq!(last.outcome, twr_core::loops::Outcome::Clean);
+    let g = get(&hub, &t);
+    let log = std::fs::read_to_string(g["rounds"][0]["files"]["log"].as_str().unwrap()).unwrap();
+    assert!(
+        log.contains("tool failed: -> cat: lib.rs: No such file or directory"),
+        "{log}"
+    );
+    assert!(!log.contains("sandbox could not start"), "{log}");
+    hub.shutdown().await;
+}
+
 /// A permission request during a review run is refused (`reject_once`, never an allow), noted
 /// in the round's log, and raises nothing for the user; the run goes on to its answer.
 #[tokio::test]

@@ -1955,6 +1955,7 @@ fn show_text(d: &Value) -> String {
                 "  {id} {effort}: failed: {}",
                 first_line(r["reason"].as_str().unwrap_or("-"))
             ));
+            out.extend(failed_run_rows(&r["files"], true));
             continue;
         }
         let findings = r["findings"].as_array().cloned().unwrap_or_default();
@@ -1965,6 +1966,7 @@ fn show_text(d: &Value) -> String {
             n => format!("{n} findings"),
         };
         out.push(format!("  {id} {effort}: {count}"));
+        out.extend(failed_run_rows(&r["files"], false));
         let triage = &r["triage"];
         for f in &findings {
             let fid = str_of(&f["id"]);
@@ -2060,6 +2062,30 @@ fn show_text(d: &Value) -> String {
     out.join("\n")
 }
 
+/// Where a round's or audit run's runs that failed left their logs (`files` of `loop.get`):
+/// one row per kept failed run (`failed_runs`), then, when the last run failed too (`failed`),
+/// its own log.
+fn failed_run_rows(files: &Value, failed: bool) -> Vec<String> {
+    let mut out: Vec<String> = files["failed_runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|k| {
+            let file = k["log"].as_str().or_else(|| k["prompt"].as_str())?;
+            Some(format!(
+                "    failed run {}: {file}",
+                k["run"].as_u64().unwrap_or(0)
+            ))
+        })
+        .collect();
+    if failed {
+        if let Some(log) = files["log"].as_str() {
+            out.push(format!("    log: {log}"));
+        }
+    }
+    out
+}
+
 /// The sweep's rows of `loop.get`'s answer `d` when the hub audited it (`sweep = "runs"`):
 /// each rule, its audit (findings, failed, not run) and the thread's verdict, with each
 /// finding of the audit; nothing for a sweep the thread audited itself.
@@ -2117,6 +2143,7 @@ fn sweep_rows(d: &Value) -> Vec<String> {
             first_line(str_of(&r["rule"])),
             first_line(str_of(&r["where"]))
         ));
+        out.extend(failed_run_rows(&a["files"], a["status"] == "not_run"));
         for f in a["findings"].as_array().into_iter().flatten() {
             out.push(format!(
                 "    {} {} {}: {}",

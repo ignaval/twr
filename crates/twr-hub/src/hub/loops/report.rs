@@ -4,6 +4,7 @@
 //! and triage, the sweep, the commit's checks) and what `report.md` says ([`report`]).
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use twr_core::event::*;
 use twr_core::loops::contract::{
@@ -11,6 +12,55 @@ use twr_core::loops::contract::{
     SweepItem, SweepResult, TriageItem, Verdict, PLAN_CHECK_TAG,
 };
 use twr_core::loops::{CommitMode, LoopKind, Outcome, TransitionReason, PLAN_CHECK_ROUND};
+
+/// The suffixes of a reviewer run's files in the loop folder (`round-m1.prompt.md`,
+/// `audit-s2.log`).
+pub(in crate::hub) const RUN_FILES: [&str; 3] = ["prompt.md", "answer.json", "log"];
+
+/// The name failed run `n` (1-based) of run stem `stem` keeps its file `suffix` under once
+/// another run of it starts: `<stem>.try<n>.<suffix>` (`round-m1.try1.log`). The run that
+/// counts, the last, keeps `<stem>.<suffix>`.
+pub(in crate::hub) fn failed_run_name(stem: &str, n: usize, suffix: &str) -> String {
+    format!("{stem}.try{n}.{suffix}")
+}
+
+/// The log (else the prompt) of failed run `n` (1-based) of `stem` in `folder`, by name: its
+/// kept file, or, for the last run (`last`), the stem's own; `None` when it wrote none (it
+/// failed before its prompt was written).
+pub(in crate::hub) fn failed_run_file(
+    folder: &Path,
+    stem: &str,
+    n: usize,
+    last: bool,
+) -> Option<String> {
+    ["log", "prompt.md"].iter().find_map(|s| {
+        let kept = failed_run_name(stem, n, s);
+        if folder.join(&kept).is_file() {
+            return Some(kept);
+        }
+        let own = format!("{stem}.{s}");
+        (last && folder.join(&own).is_file()).then_some(own)
+    })
+}
+
+/// `why1 (round-m1.try1.log); why2 (round-m1.log)`: the failures of run stem `stem`, each with
+/// its log in `folder` when it has one; the last failure is the stem's own run when nothing
+/// ran after it (`answered` false).
+fn failures_with_files(folder: &Path, stem: &str, failures: &[String], answered: bool) -> String {
+    failures
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let last = !answered && i + 1 == failures.len();
+            let why = super::prompts::one_line(f);
+            match failed_run_file(folder, stem, i + 1, last) {
+                Some(name) => format!("{why} ({name})"),
+                None => why,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 /// One round as the log tells it.
 #[derive(Debug, Clone, Default)]
@@ -507,11 +557,12 @@ pub(in crate::hub) fn report(
                     line,
                     "; failed run{}: {}",
                     if r.failures.len() == 1 { "" } else { "s" },
-                    r.failures
-                        .iter()
-                        .map(|f| super::prompts::one_line(f))
-                        .collect::<Vec<_>>()
-                        .join("; ")
+                    failures_with_files(
+                        Path::new(folder),
+                        &format!("round-{}", r.id),
+                        &r.failures,
+                        r.answered
+                    )
                 );
             }
             let _ = writeln!(out, "{line}");
@@ -575,12 +626,24 @@ pub(in crate::hub) fn report(
                         Some(a) if a.answered => {
                             let _ = write!(
                                 line,
-                                " (audit {}: {})",
+                                " (audit {}: {}{})",
                                 a.id,
                                 match a.findings.len() {
                                     0 => "no finding".to_string(),
                                     1 => "1 finding".to_string(),
                                     n => format!("{n} findings"),
+                                },
+                                match a.failures.len() {
+                                    0 => String::new(),
+                                    _ => format!(
+                                        "; failed run: {}",
+                                        failures_with_files(
+                                            Path::new(folder),
+                                            &format!("audit-{}", a.id),
+                                            &a.failures,
+                                            true
+                                        )
+                                    ),
                                 }
                             );
                         }
@@ -589,10 +652,12 @@ pub(in crate::hub) fn report(
                                 line,
                                 " (audit {} not run: {}; {})",
                                 a.id,
-                                a.failures
-                                    .last()
-                                    .map(|f| super::prompts::one_line(f))
-                                    .unwrap_or_default(),
+                                failures_with_files(
+                                    Path::new(folder),
+                                    &format!("audit-{}", a.id),
+                                    &a.failures,
+                                    false
+                                ),
                                 if r.result == SweepResult::NotAudited {
                                     "nobody audited it"
                                 } else {
