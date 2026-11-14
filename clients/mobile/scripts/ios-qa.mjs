@@ -29,6 +29,7 @@ import {
   loopReadOnlyQA,
   pairInApp,
   revokeInApp,
+  surfacesQA,
 } from "./loop-qa.mjs";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const kind = process.env.TWR_IOS_KIND?.trim() || "all";
@@ -168,6 +169,8 @@ const selected = requestedKinds.map((family) => {
 const bin = resolve("../target/debug");
 // TWR_IOS_LOOP_ONLY=1 runs only the review-loop QA (testReviewLoops pairs the app itself).
 const loopOnly = process.env.TWR_IOS_LOOP_ONLY === "1";
+// TWR_SURFACES_QA_ONLY=1 (with TWR_IOS_LOOP_ONLY=1) runs only the shared surfaces' audit.
+const surfacesOnly = process.env.TWR_SURFACES_QA_ONLY === "1";
 const loopShots = process.env.TWR_LOOP_QA_SHOTS || "test-results/loops";
 const execFileAsync = promisify(execFile);
 mkdirSync("test-results/ios", { recursive: true });
@@ -722,13 +725,22 @@ for (const [
             });
           }
           const options = { shots: loopShots, label: "ios" };
-          const report = await loopQA(driver, loops, options);
-          writeFileSync(
-            join(loopShots, "ios-loop-qa.json"),
-            JSON.stringify(report, null, 2),
-          );
-          console.log("PASS: review loops on an iPhone");
-          loops.releaseAll();
+          if (!surfacesOnly) {
+            const report = await loopQA(driver, loops, options);
+            writeFileSync(
+              join(loopShots, "ios-loop-qa.json"),
+              JSON.stringify(report, null, 2),
+            );
+            console.log("PASS: review loops on an iPhone");
+            loops.releaseAll();
+          }
+          // The cards, a thread's details, the conversation's header and the composer.
+          await surfacesQA(driver, loops, options);
+          console.log("PASS: the shared surfaces' audit on an iPhone");
+          if (surfacesOnly) {
+            channel.finish();
+            return;
+          }
           const { code } = await ownerCall("device.pair_begin", {
             scopes: ["read"],
           });

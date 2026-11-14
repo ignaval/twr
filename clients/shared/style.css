@@ -43,6 +43,9 @@
   --terminal-selection: #29434a;
   --destination-strength: 100%;
   --destination: var(--accent);
+  /* How much of a thread's light-theme ink its name uses (shared/threadColor.ts): 0% in a
+   * dark theme, 100% in a light one. */
+  --light-share: 0%;
   --content-width: 760px;
   --header-height: 48px;
   --font-ui:
@@ -378,10 +381,16 @@ kbd {
   color: var(--accent);
 }
 .app {
-  --destination-ink: color-mix(
+  /* The orchestrator's accent, or (a thread's conversation) its name's ink for the theme. */
+  --destination-mix: color-mix(
     in srgb,
     var(--destination) var(--destination-strength),
     var(--text)
+  );
+  --destination-ink: color-mix(
+    in srgb,
+    var(--destination-ink-light, var(--destination-mix)) var(--light-share),
+    var(--destination-ink-dark, var(--destination-mix))
   );
   display: flex;
   height: 100dvh;
@@ -658,6 +667,16 @@ kbd {
   font-size: 1rem;
   font-weight: 500;
   line-height: 1.5;
+}
+/* A thread's name (or mark) drawn in its colour: the colour's ink for the theme in use,
+ * which reads at 4.5:1 wherever a name sits (shared/threadColor.ts, threadStyle). The
+ * colour itself stays on the dots, bands and tints. */
+.thread-ink {
+  color: color-mix(
+    in srgb,
+    var(--thread-ink-light, var(--text)) var(--light-share),
+    var(--thread-ink-dark, var(--text))
+  );
 }
 .thread-color-dot {
   border-radius: 50%;
@@ -2918,6 +2937,7 @@ meter::-webkit-meter-optimum-value {
   --scrim: rgb(20 22 25 / 35%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
   --destination-strength: 45%;
+  --light-share: 100%;
 }
 @media (prefers-color-scheme: light) {
   :root[data-theme="system"] {
@@ -2948,6 +2968,7 @@ meter::-webkit-meter-optimum-value {
     --scrim: rgb(20 22 25 / 35%);
     --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
     --destination-strength: 45%;
+    --light-share: 100%;
   }
 }
 
@@ -2984,6 +3005,7 @@ meter::-webkit-meter-optimum-value {
   --shadow-pop: 0 12px 40px
     color-mix(in srgb, var(--shadow-color) 40%, transparent);
   --destination-strength: 45%;
+  --light-share: var(--omarchy-light-share, 0%);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -3606,7 +3628,6 @@ meter::-webkit-meter-optimum-value {
   display: none;
 }
 .dive-marker {
-  color: var(--thread-color);
   flex-shrink: 0;
 }
 .palette-list > button[data-cli="true"] b,
@@ -3918,8 +3939,9 @@ meter::-webkit-meter-optimum-value {
   border: 0;
 }
 
-/* Voice mode (shared/VoiceControl.tsx): the microphone and hands-free buttons sit beside Send;
-   what voice is doing floats just above the composer, like the mention list. */
+/* Voice mode (shared/VoiceControl.tsx): the microphone and hands-free buttons sit beside Send
+   (32 pixels on the desktop, 44 points on a phone: mobile.css); what voice is doing floats
+   just above the composer, like the mention list. */
 .voice-button {
   border-radius: 6px;
   width: 32px;

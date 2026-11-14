@@ -161,11 +161,38 @@ select {
 [data-mobile="true"] .composer-bottom > span {
   display: none;
 }
-[data-mobile="true"] .send-button {
+[data-mobile="true"] .send-button,
+[data-mobile="true"] .voice-button {
   min-width: 44px;
   min-height: 44px;
   width: 44px;
   height: 44px;
+}
+/* Every control beside the message is a 44-point target: Upload, the microphone,
+ * hands-free, Send and Send as implementation loop take 248 points. A phone in portrait
+ * (and a fold's narrow pane) gives them their own row under the message, Upload at its
+ * start and the rest at its end, and the message the composer's whole width; a wider
+ * screen (landscape, a tablet) keeps them beside it. */
+@media (max-width: 519px) {
+  [data-mobile="true"] .composer > textarea {
+    grid-column: 1 / -1;
+  }
+  [data-mobile="true"] .composer-bottom {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    padding: 0 6px 6px;
+  }
+}
+[data-mobile="true"][data-fold="vertical"] .composer > textarea {
+  grid-column: 1 / -1;
+}
+[data-mobile="true"][data-fold="vertical"] .composer-bottom {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  padding: 0 6px 6px;
+}
+[data-mobile="true"] .composer-actions {
+  margin-left: auto;
 }
 .attachment-button {
   overflow: hidden;

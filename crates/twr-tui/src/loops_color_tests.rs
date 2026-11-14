@@ -1,11 +1,13 @@
-//! The loop UI's colors on every terminal ([`crate::loops`]; docs/tui.md, "Colors"): each of
-//! its surfaces drawn through the real draw code in full color, brought down ([`degrade`]) to
-//! 16 colors and to none, and read on a dark terminal and on a light one, since the TUI can't
-//! tell which it runs on. A text cell on a fill the TUI drew reads at 4.5:1 at least against
-//! it (the terminal's own text color, on both, when the TUI leaves it); a text cell in a color
-//! of the TUI's on the terminal's own background reads at 3:1 at least, on black and on white
-//! alike. The loop's badges keep fills of their own with 16 colors, and with none still say
-//! what they are.
+//! The loop UI's colors on every terminal ([`crate::loops`]; docs/tui.md, "Colors"), and
+//! those every item and card share with it: each item's option keys (a permission, a question,
+//! a review, an error, the loop's cards; on its card, in its popup, its box in the
+//! conversation, a grid tile, a phone) and a card's activity text. Each surface is drawn
+//! through the real draw code in full color, brought down ([`degrade`]) to 16 colors and to
+//! none, and read on a dark terminal and on a light one, since the TUI can't tell which it runs
+//! on. A text cell on a fill the TUI drew reads at 4.5:1 at least against it (the terminal's
+//! own text color, on both, when the TUI leaves it); a text cell in a color of the TUI's on the
+//! terminal's own background reads at 3:1 at least, on black and on white alike. The loop's
+//! badges keep fills of their own with 16 colors, and with none still say what they are.
 //!
 //! `TWR_LOOP_SHOTS=<dir> cargo test -p twr-tui loop_ui_shots -- --ignored` writes each surface
 //! in each variant as an HTML page, for a human to look at.
@@ -556,7 +558,8 @@ fn dive_surface(name: &'static str, title: &'static str, buf: Buffer, last: &str
     }
 }
 
-/// Every surface of the loop UI, in each of its states.
+/// Every surface of the loop UI, in each of its states, then the items' and cards' others
+/// ([`request_surfaces`], [`activity_surfaces`]).
 fn surfaces() -> Vec<Surface> {
     let mut out = Vec::new();
     // The loop line on a card.
@@ -748,6 +751,309 @@ fn surfaces() -> Vec<Surface> {
     });
     out.extend(impl_surfaces());
     out.extend(sweep_surfaces());
+    out.extend(request_surfaces());
+    out.extend(activity_surfaces());
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests and activity: every item's option keys and a card's activity text
+// ---------------------------------------------------------------------------------------------
+
+/// The card of thread `name`: its box, border and all, found by its title.
+fn card_of(buf: &Buffer, name: &str) -> Rect {
+    let corner = ["┌", "┏", "╔"]
+        .iter()
+        .find_map(|c| find(buf, &format!("{c} {name} ")).first().copied())
+        .unwrap_or_else(|| panic!("no card {name}:\n{}", screen(buf)));
+    boxed(buf, (corner.0 + 1, corner.1 + 1))
+}
+
+/// The rightmost place of `needle` on screen (the popup or the conversation, right of the
+/// cards).
+fn rightmost(buf: &Buffer, needle: &str) -> (u16, u16) {
+    find(buf, needle)
+        .into_iter()
+        .max_by_key(|p| p.0)
+        .unwrap_or_else(|| panic!("no {needle:?}:\n{}", screen(buf)))
+}
+
+/// The last place of `needle` inside box `b`.
+fn within(buf: &Buffer, b: Rect, needle: &str) -> (u16, u16) {
+    find(buf, needle)
+        .into_iter()
+        .rfind(|p| b.contains((*p).into()))
+        .unwrap_or_else(|| panic!("no {needle:?} in {b:?}:\n{}", screen(buf)))
+}
+
+/// Raises a `reason` item `attn` on thread `id` with `options`.
+fn raise_item(st: &mut AppState, id: &str, attn: &str, reason: AttentionReason, options: &[&str]) {
+    let mut s = ThreadScript::new(id);
+    s.at(700);
+    let ev = s.event(EventBody::AttentionRaised(AttentionRaised {
+        attn_id: attn.into(),
+        reason,
+        summary: format!("{} asks", reason_label(reason).to_lowercase()),
+        options: options.iter().map(|o| o.to_string()).collect(),
+        ..Default::default()
+    }));
+    control(st, &[ev]);
+}
+
+/// Item `badge` on thread `name`'s card (from its badge's row to `last`'s: its summary, its
+/// options and their keys, a note) and in its popup (from its badge to its last option).
+#[allow(clippy::too_many_arguments)]
+fn item_surfaces(
+    st: &mut AppState,
+    id: &str,
+    name: &str,
+    badge: &str,
+    last: &str,
+    last_option: &str,
+    names: [&'static str; 2],
+    titles: [&'static str; 2],
+) -> [Surface; 2] {
+    let buf = full(st, 160, 40);
+    let card = card_of(&buf, name);
+    let a = find(&buf, badge)
+        .into_iter()
+        .find(|p| card.contains((*p).into()))
+        .unwrap_or_else(|| panic!("no {badge:?} on {name}'s card:\n{}", screen(&buf)));
+    let end = find(&buf, last)
+        .into_iter()
+        .find(|p| card.contains((*p).into()))
+        .unwrap_or_else(|| panic!("no {last:?} on {name}'s card:\n{}", screen(&buf)));
+    let on_card = Surface {
+        name: names[0],
+        title: titles[0],
+        cells: vec![rows_of(card, a.1, end.1)],
+        crop: card,
+        buf,
+    };
+    st.set_focus(Some(id.into()));
+    popup_open(st);
+    let buf = full(st, 160, 40);
+    let a = rightmost(&buf, badge);
+    let popup = boxed(&buf, a);
+    let end = within(&buf, popup, last_option);
+    let in_popup = Surface {
+        name: names[1],
+        title: titles[1],
+        cells: vec![rows_of(popup, a.1, end.1)],
+        crop: popup,
+        buf,
+    };
+    st.handle_key(key(KeyCode::Esc));
+    st.set_focus(None);
+    [on_card, in_popup]
+}
+
+/// Every kind of request on its card and in its popup, the request's box in the conversation,
+/// a grid tile's and the compact layout's: each with its options' keys
+/// ([`crate::ui::option_key`]).
+fn request_surfaces() -> Vec<Surface> {
+    let mut out = Vec::new();
+    // A permission (with a note), and its box in the orchestrator's conversation.
+    let mut st = three_threads();
+    out.extend(item_surfaces(
+        &mut st,
+        "t-beta",
+        "beta",
+        " PERMISSION ",
+        "note: build dir only",
+        " 2 deny",
+        ["permission-card", "permission-popup"],
+        [
+            "A permission on its card: its options' keys",
+            "A permission's popup: its options' keys",
+        ],
+    ));
+    let buf = full(&mut st, 160, 40);
+    let a = rightmost(&buf, "Bash: rm -rf target");
+    let b = boxed(&buf, a);
+    let end = within(&buf, b, "note: build dir only");
+    out.push(Surface {
+        name: "permission-box",
+        title: "A permission's box in the orchestrator's conversation",
+        cells: vec![rows_of(b, a.1, end.1)],
+        crop: b,
+        buf,
+    });
+    // A review (from a turn that gave up).
+    out.extend(item_surfaces(
+        &mut st,
+        "t-alpha",
+        "alpha",
+        " REVIEW ",
+        "2 dismiss",
+        " 2 dismiss",
+        ["review-card", "review-popup"],
+        [
+            "A review on its card: its options' keys",
+            "A review's popup: its options' keys",
+        ],
+    ));
+    // A question with three options, and an error.
+    let mut st = three_threads();
+    raise_item(
+        &mut st,
+        "t-gamma",
+        "q1",
+        AttentionReason::Question,
+        &["yes", "no", "later"],
+    );
+    out.extend(item_surfaces(
+        &mut st,
+        "t-gamma",
+        "gamma",
+        " QUESTION ",
+        "3 later",
+        " 3 later",
+        ["question-card", "question-popup"],
+        [
+            "A question on its card: its options' keys",
+            "A question's popup: its options' keys",
+        ],
+    ));
+    let mut st = three_threads();
+    raise_item(
+        &mut st,
+        "t-gamma",
+        "e1",
+        AttentionReason::Error,
+        &["retry", "dismiss"],
+    );
+    out.extend(item_surfaces(
+        &mut st,
+        "t-gamma",
+        "gamma",
+        " ERROR ",
+        "2 dismiss",
+        " 2 dismiss",
+        ["error-card", "error-popup"],
+        [
+            "An error on its card: its options' keys",
+            "An error's popup: its options' keys",
+        ],
+    ));
+    // A grid tile.
+    let mut st = three_threads();
+    st.handle_key(ctrl('g'));
+    let buf = full(&mut st, 160, 40);
+    let tile = card_of(&buf, "beta");
+    let a = at(&buf, " PERMISSION ", 0);
+    let end = at(&buf, "2 deny", 0);
+    out.push(Surface {
+        name: "permission-tile",
+        title: "A permission on a grid tile: its options' keys",
+        cells: vec![rows_of(tile, a.1, end.1)],
+        crop: tile,
+        buf,
+    });
+    // The compact layout: a card, and the popup's options on bands.
+    let mut st = three_threads();
+    st.view.compact_width = 60;
+    st.show_pane(crate::app::CompactPane::Threads);
+    let buf = full(&mut st, 40, 30);
+    let card = card_of(&buf, "beta");
+    let a = at(&buf, " PERMISSION ", 0);
+    let end = at(&buf, "2 deny", 0);
+    out.push(Surface {
+        name: "compact-card",
+        title: "A permission on a phone's card: its options' keys",
+        cells: vec![rows_of(card, a.1, end.1)],
+        crop: card,
+        buf,
+    });
+    st.handle_key(key(KeyCode::Enter));
+    let buf = full(&mut st, 40, 30);
+    let a = rightmost(&buf, " REVIEW ");
+    let popup = boxed(&buf, a);
+    let end = within(&buf, popup, " 2 dismiss");
+    out.push(Surface {
+        name: "compact-popup",
+        title: "A phone's popup: its options' keys on the bands",
+        cells: vec![rows_of(popup, a.1, end.1 + 1)],
+        crop: popup,
+        buf,
+    });
+    out
+}
+
+/// A card's activity text after its state word: a thread at work, one on background work, one
+/// waiting on its loop's reviewer.
+fn activity_surfaces() -> Vec<Surface> {
+    let mut out = Vec::new();
+    // From the row of `first` to the row of `last` (the rows it wraps to).
+    let section =
+        |name: &'static str, title: &'static str, buf: Buffer, first: &str, last: &str| {
+            let card = card_of(&buf, "gamma");
+            let a = within(&buf, card, first);
+            let end = within(&buf, card, last);
+            Surface {
+                name,
+                title,
+                cells: vec![rows_of(card, a.1, end.1)],
+                crop: card,
+                buf,
+            }
+        };
+    let mut st = three_threads();
+    st.apply_result(
+        "thread.activity",
+        &json!({"t-gamma": {"activity": "running cargo test", "doing": "Bash: cargo test"}}),
+    );
+    out.push(section(
+        "activity-running",
+        "A running thread's card: what it does",
+        full(&mut st, 160, 40),
+        "running cargo test",
+        "running cargo test",
+    ));
+    let mut st = three_threads();
+    let mut g = ThreadScript::new("t-gamma");
+    g.at(800);
+    let mut evs = vec![g.turn_ended(TurnResult::Completed)];
+    evs.push(hub(
+        &mut g,
+        EventBody::TaskUpdated(TaskUpdated {
+            task_id: "b1".into(),
+            running: true,
+            description: "cargo build --release".into(),
+            ..Default::default()
+        }),
+    ));
+    control(&mut st, &evs);
+    st.apply_result(
+        "thread.activity",
+        &json!({"t-gamma": {"activity": "waiting on cargo build --release"}}),
+    );
+    out.push(section(
+        "activity-background",
+        "A card waiting on background work: what runs",
+        full(&mut st, 160, 40),
+        "background",
+        "--release",
+    ));
+    let mut st = three_threads();
+    looping(&mut st, "t-gamma");
+    reviewing(&mut st);
+    out.push(section(
+        "activity-reviewer",
+        "A looping card waiting on its reviewer: the reviewer's run",
+        full(&mut st, 160, 40),
+        "reviewer gpt-6.1-sol",
+        "reviewer gpt-6.1-sol",
+    ));
+    // The same in the compact layout and on a grid tile.
+    st.handle_key(ctrl('g'));
+    out.push(section(
+        "activity-reviewer-tile",
+        "A grid tile waiting on its reviewer: the reviewer's run",
+        full(&mut st, 160, 40),
+        "reviewer gpt-6.1-sol",
+        "reviewer gpt-6.1-sol",
+    ));
     out
 }
 
@@ -1019,24 +1325,47 @@ fn impl_dive_surface(name: &'static str, title: &'static str, buf: Buffer) -> Su
 // Measuring
 // ---------------------------------------------------------------------------------------------
 
-/// An option's key (the `1` of `1 start`): the style every item's options share (yellow,
-/// bold), not one of the loop's. On a light terminal it is short of 3:1 on any item (1.70:1:
-/// no named yellow reads on white), so it is measured apart ([`Reading::keys`]) and left to a
-/// change of that shared style.
-fn option_key(was: &Cell) -> bool {
-    was.fg == Color::Yellow
-        && was.bg == Color::Reset
-        && was.modifier.contains(Modifier::BOLD)
-        && !was.symbol().is_empty()
-        && was.symbol().chars().all(|c| c.is_ascii_digit())
+/// Cells on these surfaces known to be short of what they need, left for changes of their own
+/// (not the loop UI's, nor an option's key or a card's activity): each by the colors it is
+/// drawn in (text, fill), and what it is.
+const KNOWN_SHORT: [(Color, Color, &str); 5] = [
+    // 3.6:1 at 256 and 16 colors, dark and light.
+    (Color::Black, Color::Red, "the PERMISSION badge"),
+    // 1.3:1 and 1.8:1 on a light terminal; 3.2:1 (dark) and 4.4:1 (light) with 16 colors.
+    (
+        Color::Reset,
+        Color::Indexed(236),
+        "a phone popup's band, its text",
+    ),
+    (
+        Color::Reset,
+        Color::Indexed(238),
+        "a phone popup's other band, its text",
+    ),
+    // 2.8:1 on white; 1.7:1 with 16 colors (yellow).
+    (crate::icon::ACCENT, Color::Reset, "the working icon"),
+    // 2.2:1 on white.
+    (
+        Color::Green,
+        Color::Reset,
+        "a card's state word, running or background",
+    ),
+];
+
+/// What `was` (a cell as drawn in full color) is, if [`KNOWN_SHORT`] lists it.
+fn known_short(was: &Cell) -> Option<&'static str> {
+    KNOWN_SHORT
+        .iter()
+        .find(|(fg, bg, _)| was.fg == *fg && was.bg == *bg)
+        .map(|(.., what)| *what)
 }
 
-/// What a surface reads as on a terminal: the lowest contrast of the loop's text cells, each
-/// one short of what it needs, and the lowest of the items' option keys ([`option_key`]).
+/// What a surface reads as on a terminal: the lowest contrast of its text cells, each one
+/// short of what it needs, and those of [`KNOWN_SHORT`] met (apart: they count in neither).
 struct Reading {
     lowest: f64,
     short: Vec<String>,
-    keys: Option<f64>,
+    known: Vec<&'static str>,
 }
 
 fn read(s: &Surface, v: Variant) -> Reading {
@@ -1044,7 +1373,7 @@ fn read(s: &Surface, v: Variant) -> Reading {
     degrade(&mut buf, v.depth);
     let mut lowest = f64::INFINITY;
     let mut short = Vec::new();
-    let mut keys: Option<f64> = None;
+    let mut known = Vec::new();
     for r in &s.cells {
         for y in r.top()..r.bottom() {
             let row: String = (r.left()..r.right()).map(|x| sym(&buf, x, y)).collect();
@@ -1056,9 +1385,13 @@ fn read(s: &Surface, v: Variant) -> Reading {
                 let sh = shown(cell, v);
                 let c = contrast(sh.fg, sh.bg);
                 let was = &s.buf[(x, y)];
-                if option_key(was) {
-                    keys = Some(keys.map_or(c, |k| k.min(c)));
-                    continue;
+                if c < needed(sh) {
+                    if let Some(what) = known_short(was) {
+                        if !known.contains(&what) {
+                            known.push(what);
+                        }
+                        continue;
+                    }
                 }
                 lowest = lowest.min(c);
                 if c < needed(sh) {
@@ -1082,34 +1415,114 @@ fn read(s: &Surface, v: Variant) -> Reading {
     Reading {
         lowest,
         short,
-        keys,
+        known,
     }
 }
 
-/// Every text cell of every loop surface reads, on every terminal.
+/// Every text cell of every surface reads, on every terminal: an option's key and a card's
+/// activity text as any other. Those [`KNOWN_SHORT`] lists are left out, and each of them is
+/// still short somewhere (one that reads now comes off the list).
 #[test]
 fn every_loop_surface_reads_on_every_terminal() {
     let mut fails = Vec::new();
     let mut table = String::new();
+    let mut met = Vec::new();
     for s in surfaces() {
         let _ = write!(table, "{:28}", s.name);
         for v in VARIANTS {
             let r = read(&s, v);
-            let _ = write!(table, " {:>6.2}", r.lowest);
-            match r.keys {
-                Some(k) => {
-                    let _ = write!(table, " ({k:>5.2})");
-                }
-                None => table.push_str("        "),
-            }
+            let _ = write!(
+                table,
+                " {:>6.2}{}",
+                r.lowest,
+                if r.known.is_empty() { " " } else { "*" }
+            );
             for what in r.short {
                 fails.push(format!("{} {}: {what}", s.name, v.name));
             }
+            met.extend(r.known);
         }
         table.push('\n');
     }
-    eprintln!("{table}");
+    eprintln!("{table}(* a cell of KNOWN_SHORT left out)");
     assert!(fails.is_empty(), "{}", fails.join("\n"));
+    for (.., what) in KNOWN_SHORT {
+        assert!(
+            met.contains(&what),
+            "{what} reads now: take it off KNOWN_SHORT"
+        );
+    }
+}
+
+/// Every option key, on every kind of item, on its card, its popup, its box in the
+/// conversation, a grid tile and a phone: a key cap ([`crate::ui::KEY_CAP`]) of its own
+/// fill with 16 colors too, and in reverse video with none (so it still stands apart from
+/// its option's text).
+#[test]
+fn option_keys_are_key_caps_on_every_surface() {
+    let all = surfaces();
+    let with_keys = [
+        "permission-card",
+        "permission-popup",
+        "permission-box",
+        "permission-tile",
+        "review-card",
+        "review-popup",
+        "question-card",
+        "question-popup",
+        "error-card",
+        "error-popup",
+        "compact-card",
+        "compact-popup",
+        "setup-card-first-run",
+        "setup-popup-first-run",
+        "setup-card-warning",
+        "setup-popup-warning",
+        "setup-card-blocked",
+        "setup-popup-blocked",
+        "stuck-card",
+        "stuck-popup",
+        "impl-setup-card",
+        "impl-setup-popup",
+    ];
+    for name in with_keys {
+        let s = all
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no surface {name}"));
+        let caps: Vec<(u16, u16)> = s
+            .cells
+            .iter()
+            .flat_map(|r| r.positions())
+            .map(|p| (p.x, p.y))
+            .filter(|&p| {
+                let c = &s.buf[p];
+                let cap = crate::ui::KEY_CAP;
+                // (The QUESTION badge has the same colors: its letters are no key.)
+                (Some(c.fg), Some(c.bg), c.modifier) == (cap.fg, cap.bg, cap.add_modifier)
+                    && c.symbol().chars().all(|c| c.is_ascii_digit())
+            })
+            .collect();
+        assert!(!caps.is_empty(), "{}: no key", s.name);
+        for v in VARIANTS {
+            let mut buf = s.buf.clone();
+            degrade(&mut buf, v.depth);
+            for &p in &caps {
+                let c = &buf[p];
+                match v.depth {
+                    Depth::None => {
+                        assert!(
+                            c.modifier.contains(Modifier::REVERSED),
+                            "{} {}",
+                            s.name,
+                            v.name
+                        )
+                    }
+                    _ => assert_eq!((c.fg, c.bg), (Color::Black, Color::Yellow), "{}", s.name),
+                }
+            }
+        }
+    }
 }
 
 /// The fill and modifiers of `badge`'s cells where it is first drawn on `s`, on terminal `v`;
@@ -1273,15 +1686,20 @@ fn page(title: &str, v: Variant, body: &str) -> String {
 /// What a page says of a surface's reading.
 fn caption(s: &Surface, v: Variant) -> String {
     let r = read(s, v);
-    let mut out = format!(
-        "<p>lowest contrast of the loop's text cells: {:.2}:1",
-        r.lowest
-    );
-    if let Some(k) = r.keys {
-        let _ = write!(out, " · the items' shared option keys: {k:.2}:1");
+    let mut out = format!("<p>lowest contrast of its text cells: {:.2}:1", r.lowest);
+    if !r.known.is_empty() {
+        let _ = write!(
+            out,
+            " · known short, left for a change of their own: {}",
+            r.known.join(", ")
+        );
     }
     if r.short.is_empty() {
-        out.push_str(" · every cell reads</p>");
+        out.push_str(if r.known.is_empty() {
+            " · every cell reads</p>"
+        } else {
+            " · every other cell reads</p>"
+        });
     } else {
         let _ = write!(out, " · {} short:</p><p>", r.short.len());
         for s in &r.short {
@@ -1302,7 +1720,9 @@ fn loop_ui_shots() {
     };
     let dir = std::path::PathBuf::from(dir);
     let all = surfaces();
-    let mut top = String::from("<h1>twr TUI: the loop UI's surfaces</h1>\n<ul>\n");
+    let mut top = String::from(
+        "<h1>twr TUI: the loop UI's surfaces, option keys and activity text</h1>\n<ul>\n",
+    );
     for v in VARIANTS {
         let sub = dir.join(v.name);
         std::fs::create_dir_all(&sub).unwrap();

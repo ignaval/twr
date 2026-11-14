@@ -23,7 +23,15 @@ import { captureMobileUI } from "./ui-captures.mjs";
 import { multiHubQA } from "./multi-hub-qa.mjs";
 import { systemPickerQA } from "./system-picker-qa.mjs";
 import { shellAction } from "./native-actions.mjs";
-import { adbTap, loopFixture, loopQA, loopReadOnlyQA } from "./loop-qa.mjs";
+import {
+  adbTap,
+  loopFixture,
+  loopQA,
+  loopReadOnlyQA,
+  surfacesQA,
+} from "./loop-qa.mjs";
+// TWR_SURFACES_QA_ONLY=1 skips the review-loop QA and runs only the shared surfaces' audit.
+const surfacesOnly = process.env.TWR_SURFACES_QA_ONLY === "1";
 const adb =
   process.env.TWR_ADB ||
   join(process.env.HOME, "Library/Android/sdk/platform-tools/adb");
@@ -181,6 +189,27 @@ function loopDriver() {
         "font_scale",
         size === "largest" ? "2.0" : "1",
       ]),
+    /** The screen narrowed to `points` wide (a 360-point phone), or its own size (null). */
+    width(points) {
+      if (!points) {
+        adbRun(["shell", "wm", "size", "reset"]);
+        return;
+      }
+      const density = Number(
+        adbRun(["shell", "wm", "density"]).match(/(\d+)\s*$/m)[1],
+      );
+      const physical = adbRun(["shell", "wm", "size"])
+        .match(/Physical size: (\d+)x(\d+)/)
+        .slice(1)
+        .map(Number);
+      const [, height] = [Math.min(...physical), Math.max(...physical)];
+      adbRun([
+        "shell",
+        "wm",
+        "size",
+        `${Math.round((points * density) / 160)}x${height}`,
+      ]);
+    },
     offline(on) {
       offline = on;
       if (on) for (const socket of proxySockets) socket.destroy();
@@ -1792,21 +1821,31 @@ try {
 
     // Review loops on an operate device, then (below) on a read device.
     try {
-      const report = await loopQA(loopDriver(), loops, {
+      if (!surfacesOnly) {
+        const report = await loopQA(loopDriver(), loops, {
+          shots: loopShots,
+          label: "android",
+        });
+        writeFileSync(
+          join(loopShots, "android-loop-qa.json"),
+          JSON.stringify(report, null, 2),
+        );
+        console.log("PASS: review loops on an Android phone");
+        loops.releaseAll();
+      }
+      // The cards, a thread's details, the conversation's header and the composer.
+      await surfacesQA(loopDriver(), loops, {
         shots: loopShots,
         label: "android",
       });
-      writeFileSync(
-        join(loopShots, "android-loop-qa.json"),
-        JSON.stringify(report, null, 2),
-      );
+      console.log("PASS: the shared surfaces' audit on an Android phone");
     } finally {
       loops.releaseAll();
       offline = false;
       adbRun(["shell", "settings", "put", "system", "font_scale", "1"]);
       adbRun(["shell", "settings", "put", "system", "user_rotation", "0"]);
+      adbRun(["shell", "wm", "size", "reset"]);
     }
-    console.log("PASS: review loops on an Android phone");
     const readOnlyCode = (
       await ownerCall("device.pair_begin", { scopes: ["read"] })
     ).code;
@@ -1867,20 +1906,22 @@ try {
     console.log(
       "PASS: read-only grants disable hub mutations and retain local appearance controls",
     );
-    try {
-      const report = await loopReadOnlyQA(loopDriver(), loops, {
-        shots: loopShots,
-        label: "android",
-        step: 60,
-      });
-      writeFileSync(
-        join(loopShots, "android-loop-qa-read.json"),
-        JSON.stringify(report, null, 2),
-      );
-    } finally {
-      loops.releaseAll();
-    }
-    console.log("PASS: review loops on a read-only Android device");
+    if (!surfacesOnly)
+      try {
+        const report = await loopReadOnlyQA(loopDriver(), loops, {
+          shots: loopShots,
+          label: "android",
+          step: 60,
+        });
+        writeFileSync(
+          join(loopShots, "android-loop-qa-read.json"),
+          JSON.stringify(report, null, 2),
+        );
+      } finally {
+        loops.releaseAll();
+      }
+    if (!surfacesOnly)
+      console.log("PASS: review loops on a read-only Android device");
     const stopped = new Promise((resolve) => fixtureHub.once("exit", resolve));
     fixtureHub.kill("SIGTERM");
     await stopped;

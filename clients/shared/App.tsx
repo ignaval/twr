@@ -166,6 +166,7 @@ import {
   turnAnnouncement,
   useModal,
 } from "./a11y";
+import { parseHex, threadInk, threadStyle } from "./threadColor";
 const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
@@ -254,6 +255,10 @@ function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
         ? "light"
         : "dark";
   root.style.setProperty("--omarchy-scheme", scheme);
+  root.style.setProperty(
+    "--omarchy-light-share",
+    scheme === "light" ? "100%" : "0%",
+  );
   const accent = rgb(theme.accent);
   if (accent) {
     const luminance = accent
@@ -2550,9 +2555,16 @@ export default function App({
       .toLowerCase()
       .includes(query.toLowerCase()),
   );
+  // A thread's conversation: its colour, and the ink its name is written in ("To:").
   const rootStyle = target
     ? ({
         "--destination": destination ? target.accent : "var(--accent)",
+        ...(destination && parseHex(target.accent)
+          ? {
+              "--destination-ink-light": threadInk(target.accent, "light"),
+              "--destination-ink-dark": threadInk(target.accent, "dark"),
+            }
+          : {}),
       } as CSSProperties)
     : {};
   const shell = (
@@ -2809,11 +2821,7 @@ export default function App({
                           <li key={thread.id}>
                             <button
                               className="workspace-thread"
-                              style={
-                                {
-                                  "--thread-color": thread.accent,
-                                } as CSSProperties
-                              }
+                              style={threadStyle(thread.accent)}
                               title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
                               onClick={(event) =>
                                 openIn(entry.name, thread.id, event.detail > 1)
@@ -3355,7 +3363,12 @@ export default function App({
                             aria-controls="twr-inspector"
                             onClick={() => setSelected(t.id)}
                           >
-                            <span style={{ color: t.accent }}>{t.name}</span>
+                            <span
+                              className="thread-ink"
+                              style={threadStyle(t.accent)}
+                            >
+                              {t.name}
+                            </span>
                             <span className="visually-hidden">: </span>
                             <span>{t.last_report.summary}</span>
                             <ArrowUpRight size={14} />
@@ -3749,7 +3762,10 @@ export default function App({
                 <span className="thread-runtime">
                   {selectedThread.runtime} · {selectedThread.box_name}
                 </span>
-                <h2 style={{ color: selectedThread.accent }}>
+                <h2
+                  className="thread-ink"
+                  style={threadStyle(selectedThread.accent)}
+                >
                   {selectedThread.name}
                 </h2>
                 <div
@@ -4603,7 +4619,7 @@ function ThreadCardButton({
       className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
       aria-current={dived ? "location" : undefined}
       aria-describedby={selected ? "twr-thread-open-hint" : undefined}
-      style={{ "--thread-color": thread.accent } as CSSProperties}
+      style={threadStyle(thread.accent)}
       onClick={(event) => {
         // A click on the loop chip opens the inspector at the loop's progress.
         if (
@@ -4628,7 +4644,7 @@ function ThreadCardButton({
         {dived && (
           <ArrowUpRight
             size={13}
-            className="dive-marker"
+            className="dive-marker thread-ink"
             role="img"
             aria-label="Current destination"
           />

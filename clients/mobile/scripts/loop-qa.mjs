@@ -9,6 +9,8 @@
  * gives Playwright's WebView page and adb, ios-qa.mjs an XCTest command channel and simctl.
  * Every step saves full-screen PNGs in light and dark appearance and audits the loop
  * surfaces on screen: accessible names, 44-point targets, contrast, clipping and safe areas.
+ * `surfacesQA` audits the same way the surfaces every screen shares: the thread cards, a
+ * thread's details, the conversation's header and the whole composer.
  */
 import assert from "node:assert/strict";
 import {
@@ -349,9 +351,8 @@ const HELPERS = String.raw`(() => {
         const disabled = e.closest("button:disabled, fieldset:disabled, [aria-disabled=true]");
         let faded = 1;
         for (let n = e; n && n.nodeType === 1; n = n.parentElement) faded *= Number(getComputedStyle(n).opacity);
-        // A thread's own colour (its name) is the thread's, not this surface's.
-        const accent = e.closest("[style*='color']");
-        if (!disabled && faded > 0.9 && !accent) {
+        // A thread's name in its colour is text like any other (its ink, shared/threadColor.ts).
+        if (!disabled && faded > 0.9) {
           const value = ratio(e);
           const size = parseFloat(s.fontSize), bold = Number(s.fontWeight) >= 700;
           const need = size >= 24 || (bold && size >= 18.66) ? 3 : 4.5;
@@ -1700,6 +1701,161 @@ async function implementQA(run, d, f) {
     "async (a, lq) => { lq.find('[role=dialog] button', 'Close dialog')?.click(); await lq.sleep(300); return true; }",
   );
   await typeTask(run, BUILDER, "");
+}
+
+/** Threads the surfaces QA makes: the hub gives the first threads the most different
+ * colours, so the cards show several. */
+const SURFACE_THREADS = [
+  "docs-site",
+  "api-auth",
+  "ui-polish",
+  "db-migrate",
+  "perf-budget",
+];
+
+/**
+ * The surfaces every screen shares, audited whole (names, 44-point targets, contrast,
+ * clipping, safe areas) as the loop screens are: the thread cards in several colours, a
+ * selected card and its details (the name in the thread's colour), the conversation's
+ * header, and the whole composer, the keyboard open and a draft in it (the "To:" chip in
+ * the thread's colour, the message, Upload, the microphone, hands-free, Send and Send as
+ * implementation loop) in portrait, in landscape, at the largest text and, where the
+ * driver can narrow the screen (`driver.width`), at 360 and 390 points; each in the light
+ * and the dark appearance. Each composer screen's control boxes go in the report.
+ */
+export async function surfacesQA(driver, fixture, options) {
+  const run = new Run(driver, fixture, {
+    ...options,
+    label: `${options.label || driver.platform}-surfaces`,
+  });
+  const d = driver;
+  for (const name of SURFACE_THREADS)
+    await d.owner("thread.new", { project: "demo", name, runtime: "fake" });
+  await run.tab("Threads");
+  await run.until(
+    "async (a, lq) => a.names.every((n) => lq.all('.thread-card').some((c) => lq.text(c).startsWith(n)))",
+    { names: SURFACE_THREADS },
+    { what: "the new threads' cards" },
+  );
+  await run.ev(
+    "async (a, lq) => { document.querySelector('.thread-grid')?.scrollTo?.(0, 0); document.querySelector('.thread-card')?.scrollIntoView({ block: 'start' }); await lq.settle(); return true; }",
+  );
+  await run.shots("cards", { root: ".thread-grid" });
+  // The thread whose colour is the lightest (the hardest to read in the light theme).
+  const thread = await run.ev(
+    `async (a, lq) => {
+    const lum = (hex) => { const v = parseInt(hex.trim().slice(1), 16); return [16, 8, 0].map((s) => ((v >> s) & 255) / 255).map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4)).reduce((t, c, i) => t + c * [0.2126, 0.7152, 0.0722][i], 0); };
+    const cards = lq.all('.thread-card').map((c) => ({ name: lq.text(c.querySelector('.thread-card-title > b')), color: getComputedStyle(c).getPropertyValue('--thread-color') }));
+    return cards.filter((c) => a.names.includes(c.name) && /^\\s*#[0-9a-f]{6}\\s*$/i.test(c.color)).sort((x, y) => lum(y.color) - lum(x.color))[0].name;
+  }`,
+    { names: SURFACE_THREADS },
+  );
+  await run.tap(".thread-card", { re: `^${thread}` });
+  await run.until("async (a, lq) => !!lq.find('.inspector h2', a.name)", {
+    name: thread,
+  });
+  await run.shots("details", { root: ".inspector" });
+  await run.tap("button", "Talk to this thread");
+  await run.until(
+    "async (a, lq) => !!lq.find('.composer textarea', 'Message ' + a.name + ' directly')",
+    { name: thread },
+    { what: `the conversation with ${thread}` },
+  );
+  await run.ev(
+    "async () => { document.activeElement?.blur(); await window.Capacitor.Plugins.Keyboard?.hide?.().catch?.(() => {}); return true; }",
+  );
+  await delay(500);
+  await run.shots("conversation", {
+    root: ".conversation-heading, .composer",
+  });
+
+  /** The composer with a draft and the keyboard open: its screens and its controls' boxes. */
+  const composer = async (name, opts = {}) => {
+    await run.ev(
+      `async (a, lq) => {
+        const input = lq.need('.composer textarea');
+        input.focus();
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, a.draft);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        await window.Capacitor.Plugins.Keyboard?.show?.().catch?.(() => {});
+        return true;
+      }`,
+      { draft: "Check the build on a narrow phone" },
+    );
+    let keyboard = await run
+      .until(
+        "async () => document.documentElement.dataset.keyboard === 'true'",
+        {},
+        { timeout: 8000, what: "the keyboard" },
+      )
+      .then(() => true)
+      .catch(() => false);
+    // A Simulator with its hardware keyboard shows none: the composer gets the height a
+    // keyboard leaves (336 points in portrait, 209 in landscape), as RemoteHubTests does.
+    if (!keyboard)
+      keyboard = await run.ev(`async (a, lq) => {
+        const root = document.documentElement;
+        window.__surfacesHeight = root.style.getPropertyValue('--viewport-height');
+        root.style.setProperty('--viewport-height', (innerHeight - (innerWidth > innerHeight ? 209 : 336)) + 'px');
+        root.dataset.keyboard = 'true';
+        await lq.settle();
+        return 'emulated';
+      }`);
+    await delay(600);
+    await run.shots(name, { root: ".composer", ...opts });
+    const boxes = await run.ev(`async (a, lq) => {
+      const composer = lq.need('.composer');
+      const controls = lq.all('button, label.attachment-button, textarea', composer);
+      return {
+        viewport: { width: innerWidth, height: Math.round(visualViewport?.height || innerHeight) },
+        composer: composer.getBoundingClientRect().toJSON(),
+        controls: controls.map((e) => { const r = e.getBoundingClientRect(); return { name: lq.nameOf(e), x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width * 10) / 10, height: Math.round(r.height * 10) / 10 }; }),
+      };
+    }`);
+    run.pass(`composer ${name}`, { keyboard, ...boxes });
+    (run.report.composer ||= []).push({ name, keyboard, ...boxes });
+    await run.ev(
+      "async () => { const root = document.documentElement; if (window.__surfacesHeight !== undefined) { root.style.setProperty('--viewport-height', window.__surfacesHeight); root.dataset.keyboard = 'false'; delete window.__surfacesHeight; } document.activeElement?.blur(); await window.Capacitor.Plugins.Keyboard?.hide?.().catch?.(() => {}); return true; }",
+    );
+    await delay(500);
+  };
+  try {
+    await composer("composer");
+    if (d.width) {
+      for (const width of [390, 360]) {
+        await d.width(width);
+        await delay(1500);
+        await composer(`composer-${width}`);
+      }
+      await d.width(null);
+      await delay(1500);
+    }
+    await d.orientation("landscape");
+    await delay(1500);
+    await composer("composer-landscape");
+    await d.orientation("portrait");
+    await delay(1500);
+    await d.textSize("largest");
+    await delay(1500);
+    await composer("composer-largest-text");
+    if (d.width) {
+      await d.width(360);
+      await delay(1500);
+      await composer("composer-360-largest-text");
+    }
+  } finally {
+    if (d.width) await d.width(null);
+    await d.orientation("portrait");
+    await d.textSize("default");
+    await delay(1500);
+  }
+  if (run.dir)
+    writeFileSync(
+      join(run.dir, `${run.label}-qa.json`),
+      JSON.stringify(run.report, null, 2),
+    );
+  run.audited();
+  return run.report;
 }
 
 /** Pairs the app on its pairing form (the onboarding's Pair a hub). */

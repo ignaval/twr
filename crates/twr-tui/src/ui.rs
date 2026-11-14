@@ -951,12 +951,8 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
         let chosen = i == p.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
-            Span::styled(
-                format!("{} ", i + 1),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            option_key(i + 1),
+            Span::raw(" "),
             Span::styled(
                 format!("{label:<name_width$}  "),
                 if chosen {
@@ -1047,16 +1043,12 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
         let chosen = i == m.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
-            Span::styled(
-                if i < 9 {
-                    format!("{} ", i + 1)
-                } else {
-                    "  ".to_string()
-                },
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            if i < 9 {
+                option_key(i + 1)
+            } else {
+                Span::raw(" ")
+            },
+            Span::raw(" "),
         ];
         let style = if chosen {
             Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -2420,9 +2412,7 @@ fn section_lines(
     item: bool,
 ) -> (Vec<Line<'static>>, Line<'static>) {
     let dim = Style::default().fg(Color::DarkGray);
-    let doing = Style::default()
-        .fg(Color::Gray)
-        .add_modifier(Modifier::ITALIC);
+    let doing = ACTIVITY;
     let status = t.status();
     let status_text = card_status(t);
     let mut spans: Vec<Span<'static>> = match working_icon(state, t) {
@@ -2506,6 +2496,15 @@ fn section_lines(
     }
     (lines, line)
 }
+
+/// The style of what a card says a thread does, after its state word (`· reviewer
+/// gpt-6.1-sol medium · 6m`, `· thinking`): wherever a card is drawn (the stack, a grid tile,
+/// the compact layout). A grey in italics that reads on a dark terminal and a light one alike
+/// (6.1:1 on black, 3.5:1 on white; with 16 colors, dark grey: 5.2:1 and 4.0:1), lighter than
+/// the dim grey of the report and the `·` around it.
+pub(crate) const ACTIVITY: Style = Style::new()
+    .fg(Color::Indexed(245))
+    .add_modifier(Modifier::ITALIC);
 
 /// The activity line of thread `t` while it waits, in the background, on its loop's review
 /// run alone: the run's description and how long it has run (`reviewer gpt-6.1-sol xhigh ·
@@ -3836,6 +3835,22 @@ fn context_rows(fields: &[(&str, &str)], width: usize) -> Vec<(Line<'static>, Jo
         .collect()
 }
 
+/// An option's key, the `1` of `1 allow`: its digit as a key cap, bold black on the
+/// selection's yellow ([`KEY_CAP`]). Every list of options a number key answers draws its
+/// keys with it (a card's or tile's item, the action popup, the detail view, the pickers), so
+/// they look alike everywhere. A fill of its own, as the `QUESTION` badge has: the TUI can't
+/// tell a dark terminal from a light one, and no yellow text reads on white.
+pub(crate) fn option_key(n: usize) -> Span<'static> {
+    Span::styled(n.to_string(), KEY_CAP)
+}
+
+/// The style of an option's key ([`option_key`]): black on yellow, 12:1 at 256 and at 16
+/// colors, on a dark terminal and a light one alike; with no colors, reverse video.
+pub(crate) const KEY_CAP: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Yellow)
+    .add_modifier(Modifier::BOLD);
+
 /// Every option, numbered: `1 allow  2 deny` for the first nine (their number keys answer
 /// them), then `10. label` (no key answers those, but they are part of what the item asks: an
 /// item is drawn in full only with all of them on screen), in rows of at most `width` cells:
@@ -3852,9 +3867,6 @@ fn option_rows(options: &[String], width: usize) -> Vec<Line<'static>> {
 /// one line, however they are packed into rows, so a place in them is the same text at any
 /// width (an option wrapped inside a word continues right after it).
 fn option_rows_joined(options: &[String], width: usize) -> Vec<(Line<'static>, Join)> {
-    let key = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
     let no_key = Style::default().fg(Color::DarkGray);
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -3862,7 +3874,7 @@ fn option_rows_joined(options: &[String], width: usize) -> Vec<(Line<'static>, J
     let mut used = 0;
     for (n, opt) in options.iter().enumerate() {
         let number = if n < 9 {
-            Span::styled(format!("{}", n + 1), key)
+            option_key(n + 1)
         } else {
             Span::styled(format!("{}.", n + 1), no_key)
         };
@@ -8492,21 +8504,12 @@ fn render_action_popup(
             for span in &mut line.spans {
                 span.style = style;
             }
-            // An answer's number in the color the cards give it.
-            if k == 0 && kept && !selected && matches!(row.kind, ActionKind::Answer(n) if n <= 9) {
+            // An answer's number as the cards draw it ([`option_key`]), after the row's space.
+            if let (0, true, false, ActionKind::Answer(n @ 1..=9)) = (k, kept, selected, row.kind) {
                 let text = line.spans[0].content.to_string();
-                let number: String = text.chars().take(2).collect();
                 let rest: String = text.chars().skip(2).collect();
                 line.spans[0] = Span::raw(rest);
-                line.spans.insert(
-                    0,
-                    Span::styled(
-                        number,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                );
+                line.spans.splice(0..0, [Span::raw(" "), option_key(n)]);
             }
         }
         // On a phone each row is two rows tall, in a band (alternate shades, so its rows tell
@@ -8522,7 +8525,8 @@ fn render_action_popup(
                 for line in &mut lines {
                     let fill = inner_w.saturating_sub(line.width());
                     line.spans.push(Span::raw(" ".repeat(fill)));
-                    for span in &mut line.spans {
+                    // (An answer's key keeps its own fill.)
+                    for span in line.spans.iter_mut().filter(|s| s.style.bg.is_none()) {
                         span.style = span.style.bg(Color::Indexed(band));
                     }
                 }
@@ -16881,7 +16885,11 @@ mod tests {
         assert!(all.ends_with("9 o9  10. o10  11. o11"), "{all}");
         let rows = option_rows(&many, 200);
         let ten = rows[0].spans.iter().find(|s| s.content == "10.").unwrap();
-        assert_ne!(ten.style.fg, Some(Color::Yellow), "no key");
+        assert_eq!(ten.style.bg, None, "no key");
+        // A key is a key cap: its digit alone, black on yellow (the space after it is not).
+        let one = &rows[0].spans[0];
+        assert_eq!((one.content.as_ref(), one.style), ("1", KEY_CAP));
+        assert_eq!(rows[0].spans[1].style.bg, None);
         // Wrapping breaks at spaces and keeps the styles.
         let line = Line::from(vec![
             Span::styled("ab", Style::default().fg(Color::Red)),

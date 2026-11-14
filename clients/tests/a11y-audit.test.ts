@@ -358,6 +358,41 @@ describe("styles that keep controls usable", () => {
     );
     expect(loopTargets).toContain("min-height: 44px");
     expect(loopTargets).toContain("min-width: 44px");
+    // Every control in the composer's row: Upload, the microphone, hands-free, Send (and
+    // Send as implementation loop, above). The microphone and hands-free were 32 wide.
+    const composerTargets = rule(
+      mobile,
+      '[data-mobile="true"] .send-button,\n[data-mobile="true"] .voice-button',
+    );
+    for (const size of [
+      "min-width: 44px",
+      "min-height: 44px",
+      "width: 44px",
+      "height: 44px",
+    ])
+      expect(composerTargets).toContain(size);
+    expect(rule(mobile, ".attachment-button")).toContain("min-width: 44px");
+    expect(rule(mobile, ".attachment-button")).toContain("min-height: 44px");
+    // 5 × 44 points and their gaps do not fit beside the message on a 360-point phone:
+    // in portrait (and a fold's narrow pane) they get their own row under it, at full size.
+    const narrowAt = mobile.indexOf("@media (max-width: 519px) {");
+    expect(narrowAt).toBeGreaterThan(0);
+    const narrow = mobile.slice(narrowAt, mobile.indexOf("\n}\n", narrowAt));
+    expect(narrow).toMatch(
+      /\.composer > textarea \{\s*grid-column: 1 \/ -1;\s*\}/,
+    );
+    expect(narrow).toMatch(
+      /\.composer-bottom \{\s*grid-column: 1 \/ -1;\s*grid-row: 3;/,
+    );
+    expect(
+      rule(
+        mobile,
+        '[data-mobile="true"][data-fold="vertical"] .composer-bottom',
+      ),
+    ).toContain("grid-row: 3");
+    expect(narrow).not.toMatch(/(width|height): (3\d|2\d)px/);
+    // The desktop keeps its compact 32-pixel buttons.
+    expect(rule(css, ".voice-button")).toContain("width: 32px");
     // iOS ignores min-height on a menu select: its height must say 44.
     expect(
       rule(mobile, '[data-mobile="true"] select:not([multiple]):not([size])'),

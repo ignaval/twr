@@ -25,6 +25,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 - A message of yours sent as an implementation loop's report turn ended, then a hub restart while its commit was checked, asked the thread for the report again; now only the check runs again.
 - The setup card showed its Workers row for an implementer whose runtime runs no subagents; it shows it only where the workers apply.
 - The iOS and Android apps could start with the wrong status bar and a black edge around the page: on a slow start they read the theme's colors before the stylesheet had applied, sent the native side a light theme on black, and never corrected it. They now wait for the stylesheet, and sync again once the page has loaded.
+- In the TUI on a light terminal, the keys of a request's options (the `1` of `1 allow`) were yellow on white and a card's activity text a light grey on white, both close to invisible. A key is now a key cap, its digit black on yellow, on every card, tile, popup and picker ([tui.md](docs/tui.md#colors)), and the activity text a grey in italics that reads on a dark terminal and a light one, with 256 colors or 16.
 
 ## [0.4.0] - 2026-11-10
 
