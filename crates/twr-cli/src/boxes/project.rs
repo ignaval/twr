@@ -1102,7 +1102,8 @@ fn open_pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // A raw pointer: openpty takes the size by `*mut` on macOS and `*const` on Linux.
+            std::ptr::addr_of_mut!(size),
         )
     };
     if r != 0 {

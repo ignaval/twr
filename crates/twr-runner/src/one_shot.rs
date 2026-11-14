@@ -42,8 +42,11 @@ pub async fn call_tree(group: Option<u32>) -> Vec<(u32, u64, i64)> {
 ///   while it is still that process, whatever environment it shows (macOS 27 shows none of
 ///   Apple's own programs', `/bin/sh` and `/bin/zsh` among them);
 /// - then every process that still carries the call's marker, exactly that marker (another
-///   call's, such as a concurrent audit run's, is never touched): what left the tree before
-///   it was read (its parent exited first).
+///   call's, such as a concurrent audit run's, is never touched), and that this process no
+///   longer leads to by parent links ([`crate::reap::reap_agent_marked_orphans`]): what left
+///   the tree before it was read (its parent exited first). A step's next run carries the
+///   same marker and may already run while the run it replaces ends here: it still descends
+///   from this process and is left alone.
 ///
 /// Whether anything outside the group was signalled. Reads the process table (`ps` off
 /// Linux) off the async runtime.
@@ -63,7 +66,7 @@ pub async fn end_call(group: Option<u32>, marker: &str, tree: Vec<(u32, u64, i64
     };
     tokio::task::spawn_blocking(move || {
         let killed = !outside.is_empty() && crate::reap::kill_each(&outside);
-        let reaped = !markers.is_empty() && crate::reap::reap_agent_marked(&markers);
+        let reaped = !markers.is_empty() && crate::reap::reap_agent_marked_orphans(&markers);
         killed || reaped
     })
     .await
