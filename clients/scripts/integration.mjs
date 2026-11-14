@@ -808,8 +808,14 @@ try {
     const empty = await composerBox();
     const words =
       "Keep every option labelled and in the same order for the keyboard as on screen. ";
-    await suggestedComposer.fill(words.repeat(2));
-    const some = await composerBox();
+    // As much text as first makes the field taller: how many words that takes depends on
+    // the window's width and the platform's font.
+    let some = empty;
+    for (let n = 1; n <= 12; n += 1) {
+      await suggestedComposer.fill(words.repeat(n));
+      some = await composerBox();
+      if (some.height > empty.height + some.lineHeight / 2) break;
+    }
     await suggestedComposer.fill(words.repeat(12));
     const long = await composerBox();
     await suggestedComposer.fill("");
