@@ -1,6 +1,6 @@
 # Design: implementation and review loops
 
-Status: draft 4, 2026-11-13; ACP reviewers verified with real agents 2026-11-14. All four milestones are built on branch `claude/review-loops`: 1 (review loops), 2 (implementation loops), 3 (the orchestrator's tools) and 4 (ACP reviewers, `sweep = "runs"` and loops on remote boxes). Written against `dev` at `0eb4567`, `ignaval/skills` at its default branch (`implementation-loop`, `review-loop`, `agents/loop-worker.md`), Codex 0.167.2 and Claude Code as installed here.
+Status: draft 4, 2026-11-13; ACP reviewers and SSH and container boxes verified with real runs 2026-11-14. All four milestones are built and on `dev`: 1 (review loops), 2 (implementation loops), 3 (the orchestrator's tools) and 4 (ACP reviewers, `sweep = "runs"` and loops on remote boxes). Written against `dev` at `0eb4567`, `ignaval/skills` at its default branch (`implementation-loop`, `review-loop`, `agents/loop-worker.md`), Codex 0.167.2 and Claude Code as installed here.
 
 Changes from draft 1: a loop is a state of one thread, not a pair of threads with a card of its own, and the reviewer is a background run of that thread. Changes from draft 2: the setup card is mandatory on the first loop and its answer is saved for later runs; the loop shows only on its thread's card; any runtime can be implementer or reviewer; an implementation loop commits at the end. Changes from draft 3: one shared first-run card and one set of settings for both kinds of loop, settings per project, and the command line, desktop and mobile clients.
 
