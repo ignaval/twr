@@ -1242,12 +1242,34 @@ pub const TAB_BAR_ROWS: u16 = 2;
 /// back, notices, `✕ close`, buttons) is a row tall, as on a desktop.
 pub const TAP_ROWS: u16 = TAB_BAR_ROWS;
 /// The fills of a phone's menu choices drawn as bands ([`tap_band`]), neighbors alternating.
-pub(crate) const BAND: Color = Color::Indexed(236);
-pub(crate) const BAND_ALT: Color = Color::Indexed(238);
+pub(crate) const BAND: Color = crate::color::BAND;
+pub(crate) const BAND_ALT: Color = crate::color::BAND_ALT;
+
+/// `style`, a text's on band `bg`: the band's fill where the text has none of its own (a key
+/// cap keeps its own, and its text), and a text color that reads on it at 4.5:1 at least,
+/// whatever the terminal's background: [`crate::color::BAND_TEXT`] for a text in the
+/// terminal's own color, [`crate::color::BAND_DIM`] for a dim one, and the band's text for
+/// a color that doesn't read on it (`not installed` in red).
+pub(crate) fn on_band(style: Style, bg: Color) -> Style {
+    if style.bg.is_some_and(|b| b != Color::Reset) {
+        return style;
+    }
+    let reads = |c: Color| {
+        matches!((crate::color::rgb(c), crate::color::rgb(bg)), (Some(a), Some(b))
+            if crate::color::contrast(a, b) >= 4.5)
+    };
+    let fg = match style.fg {
+        None | Some(Color::Reset) => crate::color::BAND_TEXT,
+        Some(Color::DarkGray) => crate::color::BAND_DIM,
+        Some(c) if reads(c) => c,
+        Some(_) => crate::color::BAND_TEXT,
+    };
+    style.fg(fg).bg(bg)
+}
 
 /// `lines`, a menu choice on a phone, as a band: at least [`TAP_ROWS`] rows, each filled to
-/// `width` cells with `bg` behind its text (where it has none of its own), so that its rows
-/// show as one choice.
+/// `width` cells with `bg` behind its text (where it has none of its own), its text in colors
+/// that read on it ([`on_band`]), so that its rows show as one choice.
 pub(crate) fn tap_band(
     mut lines: Vec<Line<'static>>,
     width: usize,
@@ -1260,9 +1282,7 @@ pub(crate) fn tap_band(
         let fill = width.saturating_sub(line.width());
         line.spans.push(Span::raw(" ".repeat(fill)));
         for span in &mut line.spans {
-            if span.style.bg.is_none() {
-                span.style = span.style.bg(bg);
-            }
+            span.style = on_band(span.style, bg);
         }
     }
     lines
@@ -1343,7 +1363,7 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
     } else {
         Style::default()
             .fg(Color::Indexed(252))
-            .bg(Color::Indexed(238))
+            .bg(crate::color::BAND_ALT)
     };
     let n = u32::try_from(names.len()).unwrap_or(3);
     let shares = Layout::horizontal(vec![Constraint::Ratio(1, n); names.len()]).split(bar);
@@ -3406,13 +3426,16 @@ pub(crate) fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'st
     out
 }
 
-/// The badge span for an attention reason.
+/// The badge span for an attention reason: its label in bold on its fill, in black or white,
+/// whichever reads better ([`crate::color::text_on`]: white on the `PERMISSION` red, black on
+/// the others), at 4.5:1 at least with 256 colors and 16.
 fn badge(reason: AttentionReason) -> Span<'static> {
+    let fill = reason_color(reason);
     Span::styled(
         format!(" {} ", reason_label(reason)),
         Style::default()
-            .fg(Color::Black)
-            .bg(reason_color(reason))
+            .fg(crate::color::text_on(fill))
+            .bg(fill)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -4170,13 +4193,16 @@ fn tile_body(state: &AppState, t: &ThreadView, width: u16) -> CardBody {
     card_body(state, t, usize::from(width), Some((&turns, &spent)))
 }
 
+/// The color of state `s`'s word: each reads at 3:1 at least on black and on white, with 256
+/// colors and with 16 (where running, waiting and done are fills under black or white text,
+/// [`crate::color::degrade`]).
 pub(crate) fn status_color(s: ThreadStatus) -> Color {
     match s {
-        ThreadStatus::Running | ThreadStatus::Background => Color::Green,
-        ThreadStatus::Waiting => Color::Yellow,
+        ThreadStatus::Running | ThreadStatus::Background => crate::color::RUNNING,
+        ThreadStatus::Waiting => crate::color::WAITING,
         ThreadStatus::Error => Color::Red,
-        ThreadStatus::Done => Color::Blue,
-        ThreadStatus::Idle => Color::Gray,
+        ThreadStatus::Done => crate::color::DONE,
+        ThreadStatus::Idle => crate::color::IDLE,
         ThreadStatus::Parked => Color::DarkGray,
         ThreadStatus::Attached => Color::Magenta,
     }
@@ -5264,14 +5290,15 @@ impl View {
             let row = Line::from(cut_spans(vec![Span::styled(label, style)], self.width));
             self.out.push((row, Join::Skip, None, Edge::Bottom));
         }
-        // Taken back: struck out and dimmed.
+        // Taken back: struck out and dimmed. Each text reads on the band at 4.5:1 at least,
+        // on a dark terminal and a light one.
         let band = match withdrawn {
             true => Style::default()
-                .fg(Color::Indexed(245))
-                .bg(Color::Indexed(237)),
+                .fg(crate::color::BAND_DIM)
+                .bg(crate::color::PROMPT_BAND),
             false => Style::default()
-                .fg(Color::Indexed(231))
-                .bg(Color::Indexed(237)),
+                .fg(crate::color::BAND_TEXT)
+                .bg(crate::color::PROMPT_BAND),
         };
         let struck = Style::default().add_modifier(Modifier::CROSSED_OUT);
         let indent = self.indent();
@@ -5288,7 +5315,7 @@ impl View {
                 }
                 // The mark takes the first two cells; the line's own indentation stays.
                 let rest = line.spans[0].content.get(2..).unwrap_or("").to_string();
-                line.spans[0] = Span::styled("❯ ", Style::default().fg(MUTED));
+                line.spans[0] = Span::styled("❯ ", Style::default().fg(crate::color::BAND_DIM));
                 if !rest.is_empty() {
                     line.spans.insert(1, Span::raw(rest));
                 }
@@ -8516,7 +8543,7 @@ fn render_action_popup(
         // apart), all of it the row's ([`TAP_ROWS`]).
         if state.compact() {
             let tall = usize::from(TAP_ROWS);
-            let band = if i.is_multiple_of(2) { 236 } else { 238 };
+            let band = if i.is_multiple_of(2) { BAND } else { BAND_ALT };
             let pad = Line::from(Span::raw(" ".repeat(inner_w)));
             if lines.len() < tall {
                 lines.resize(tall, pad);
@@ -8526,8 +8553,8 @@ fn render_action_popup(
                     let fill = inner_w.saturating_sub(line.width());
                     line.spans.push(Span::raw(" ".repeat(fill)));
                     // (An answer's key keeps its own fill.)
-                    for span in line.spans.iter_mut().filter(|s| s.style.bg.is_none()) {
-                        span.style = span.style.bg(Color::Indexed(band));
+                    for span in &mut line.spans {
+                        span.style = on_band(span.style, band);
                     }
                 }
             } else {
@@ -16693,7 +16720,7 @@ mod tests {
         let a = st.view.panes.get(&PaneId::Transcript).unwrap().area;
         assert_eq!(buf[(a.x + 2, a.y + 2)].symbol(), "L");
         assert_eq!(buf[(a.x + 2, a.y + 2)].fg, MUTED);
-        assert_eq!(buf[(a.x + 4, a.y)].bg, Color::Indexed(237));
+        assert_eq!(buf[(a.x + 4, a.y)].bg, crate::color::PROMPT_BAND);
         // Narrow, beside the narrower sidebar: the header cut to fit the view's columns.
         let w = screen_for(&st, 60);
         let lines = draw_panes(&mut st, w, 30);
@@ -18094,10 +18121,9 @@ mod tests {
         st
     }
 
-    /// With 16 colors a message's band reads, taken back or not: the band, a taken-back
-    /// message's dimmed text and every message's mark all come down to dark grey, and the text
-    /// and the mark take a light grey on it; a message's own text stays white, brighter than a
-    /// taken-back one's.
+    /// With 16 colors a message's band reads, taken back or not: the band is blue (no dark grey
+    /// carries light text at 4.5:1), every message's mark and a taken-back message's dimmed
+    /// text light grey on it, and a message's own text white, brighter than a taken-back one's.
     #[test]
     fn sixteen_colors_keep_a_messages_text_and_mark_on_its_band() {
         let mut st = with_taken_back();
@@ -18110,7 +18136,7 @@ mod tests {
         let back = find_text(&buf, area, "❯ stop that").expect(&s);
         for (row, text) in [(sent, Color::White), (back, Color::Gray)] {
             let cell = |x: u16| &buf[(x, row.y)];
-            assert_eq!(cell(row.x).bg, Color::DarkGray, "the band: {s}");
+            assert_eq!(cell(row.x).bg, Color::Blue, "the band: {s}");
             assert_eq!(cell(row.x).fg, Color::Gray, "the mark: {s}");
             assert_eq!(cell(row.x + 2).fg, text, "the text: {s}");
             for x in row.x..area.right() {
@@ -18125,7 +18151,8 @@ mod tests {
     /// No cell of a frame drawn in 16 colors has its text in its fill's color where full color
     /// drew them apart, in the usual views: the cards with a dive and a selection, the
     /// orchestrator's conversation with a taken-back message (wide, and narrow with the cards
-    /// in a row above), the grid, the compact screens.
+    /// in a row above), the grid, the compact screens. (A cell in the terminal's own colors,
+    /// such as the working icon, reads whatever they are.)
     #[test]
     fn sixteen_colors_never_hide_a_cells_text_in_the_usual_views() {
         use crate::app::tests::draw_at;
@@ -18140,7 +18167,7 @@ mod tests {
             let s = screen(&buffer_lines(&basic));
             for (i, (f, b)) in full.content.iter().zip(&basic.content).enumerate() {
                 assert_eq!(f.symbol(), b.symbol(), "{what}: the same frame: {s}");
-                if f.fg != f.bg {
+                if f.fg != f.bg && (b.fg, b.bg) != (Color::Reset, Color::Reset) {
                     let (x, y) = (i as u16 % w, i as u16 / w);
                     assert_ne!(
                         b.fg, b.bg,

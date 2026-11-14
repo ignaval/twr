@@ -1,7 +1,9 @@
 //! The loop UI's colors on every terminal ([`crate::loops`]; docs/tui.md, "Colors"), and
-//! those every item and card share with it: each item's option keys (a permission, a question,
-//! a review, an error, the loop's cards; on its card, in its popup, its box in the
-//! conversation, a grid tile, a phone) and a card's activity text. Each surface is drawn
+//! those every item and card share with it: each item's option keys and badge (a permission, a
+//! question, a review, an error, a stalled notice, the loop's cards; on its card, in its popup,
+//! its box in the conversation, a grid tile, a phone), a card's activity text, every state word
+//! (on a card, a tile, a phone, in the conversation and the sidebar), the working icon, the
+//! bands of a phone and of your messages, and code in a reply. Each surface is drawn
 //! through the real draw code in full color, brought down ([`degrade`]) to 16 colors and to
 //! none, and read on a dark terminal and on a light one, since the TUI can't tell which it runs
 //! on. A text cell on a fill the TUI drew reads at 4.5:1 at least against it (the terminal's
@@ -753,6 +755,11 @@ fn surfaces() -> Vec<Surface> {
     out.extend(sweep_surfaces());
     out.extend(request_surfaces());
     out.extend(activity_surfaces());
+    out.extend(state_surfaces());
+    out.extend(sidebar_surfaces());
+    out.push(conversation_surface());
+    out.extend(band_surfaces());
+    out.extend(stalled_surfaces());
     out
 }
 
@@ -1322,50 +1329,485 @@ fn impl_dive_surface(name: &'static str, title: &'static str, buf: Buffer) -> Su
 }
 
 // ---------------------------------------------------------------------------------------------
+// The states, the working icon, the badges, the bands and code
+// ---------------------------------------------------------------------------------------------
+
+/// The threads of [`all_states`]: each one's name, and the word its card says its state with.
+const STATES: [(&str, &str); 8] = [
+    ("run", "running"),
+    ("bg", "background"),
+    ("wait", "waiting"),
+    ("err", "failed"),
+    ("done", "done"),
+    ("idle", "idle"),
+    ("park", "parked"),
+    ("att", "attached"),
+];
+
+/// A thread in each state ([`ThreadStatus`]), named as [`STATES`] says: running (the working
+/// icon on its card), on background work (the icon too), waiting on a permission, failed,
+/// done with a report, idle, parked and attached.
+fn all_states() -> AppState {
+    let mut st = AppState::new();
+    let mut evs = Vec::new();
+    for (i, (name, _)) in STATES.iter().enumerate() {
+        let mut s = ThreadScript::new(format!("t-{name}"));
+        s.at(10 * i as i64);
+        evs.push(s.created(name));
+        match *name {
+            "run" => evs.push(s.turn_started("work")),
+            "bg" => {
+                evs.push(s.turn_started("build"));
+                evs.push(s.turn_ended(TurnResult::Completed));
+                evs.push(hub(
+                    &mut s,
+                    EventBody::TaskUpdated(TaskUpdated {
+                        task_id: "b1".into(),
+                        running: true,
+                        description: "cargo build".into(),
+                        ..Default::default()
+                    }),
+                ));
+            }
+            "wait" => {
+                evs.push(s.turn_started("deploy"));
+                evs.push(s.raise("pm1", AttentionReason::Permission));
+            }
+            "err" => {
+                evs.push(s.turn_started("fix"));
+                evs.push(s.turn_ended(TurnResult::Error));
+            }
+            "done" => {
+                evs.push(s.turn_started("docs"));
+                evs.push(s.turn_ended(TurnResult::Completed));
+                evs.push(s.report(Some(1), twr_core::event::Grade::Success));
+            }
+            "park" => evs.push(s.parked()),
+            "att" => evs.push(s.attached()),
+            _ => {}
+        }
+    }
+    control(&mut st, &evs);
+    st
+}
+
+/// The row of each of `needles` (its first place inside box `b`), across the box's inside.
+fn rows_in(buf: &Buffer, b: Rect, needles: &[&str]) -> Vec<Rect> {
+    needles
+        .iter()
+        .map(|n| {
+            let (_, y) = find(buf, n)
+                .into_iter()
+                .find(|p| inside(b).contains((*p).into()))
+                .unwrap_or_else(|| panic!("no {n:?} in {b:?}:\n{}", screen(buf)));
+            rows_of(b, y, y)
+        })
+        .collect()
+}
+
+/// Each thread's state row on its card (or tile), the cards of [`all_states`] drawn on `buf`.
+fn state_rows(buf: &Buffer) -> Vec<Rect> {
+    STATES
+        .iter()
+        .flat_map(|(name, word)| {
+            // (A title may lead with the project: `┌ pr… · bg ─`.)
+            let (x, y) = at(buf, &format!(" {name} ─"), 0);
+            rows_in(buf, boxed(buf, (x + 1, y + 1)), &[word])
+        })
+        .collect()
+}
+
+/// The part of `buf` the rows `cells` take, a row more above and below.
+fn around(buf: &Buffer, cells: &[Rect]) -> Rect {
+    let top = cells.iter().map(|r| r.top()).min().unwrap_or(0);
+    let bottom = cells.iter().map(|r| r.bottom()).max().unwrap_or(0);
+    let left = cells.iter().map(|r| r.left()).min().unwrap_or(0);
+    let right = cells.iter().map(|r| r.right()).max().unwrap_or(0);
+    let top = top.saturating_sub(1);
+    let bottom = (bottom + 1).min(buf.area.height);
+    Rect::new(
+        left.saturating_sub(1),
+        top,
+        (right + 1).min(buf.area.width) - left.saturating_sub(1),
+        bottom - top,
+    )
+}
+
+/// Every state word ([`STATES`]) on a card in the stack, on a grid tile and on a phone's
+/// card; the working icon leading the running and background ones.
+fn state_surfaces() -> Vec<Surface> {
+    let mut out = Vec::new();
+    let mut st = all_states();
+    st.view.show_parked = true;
+    let buf = full(&mut st, 160, 60);
+    let cells = state_rows(&buf);
+    out.push(Surface {
+        name: "states-cards",
+        title: "Every state word on its card, the working icon on two",
+        crop: around(&buf, &cells),
+        cells,
+        buf,
+    });
+    st.handle_key(ctrl('g'));
+    let buf = full(&mut st, 160, 60);
+    let cells = state_rows(&buf);
+    out.push(Surface {
+        name: "states-tiles",
+        title: "Every state word on a grid tile, the working icon on two",
+        crop: around(&buf, &cells),
+        cells,
+        buf,
+    });
+    let mut st = all_states();
+    st.view.show_parked = true;
+    st.view.compact_width = 60;
+    st.show_pane(crate::app::CompactPane::Threads);
+    let buf = full(&mut st, 40, 90);
+    let cells = state_rows(&buf);
+    out.push(Surface {
+        name: "states-phone",
+        title: "Every state word on a phone's card, the working icon on two",
+        crop: around(&buf, &cells),
+        cells,
+        buf,
+    });
+    out
+}
+
+/// The sidebar with a workspace whose orchestrator is in each state (its card's status row:
+/// `running`, `running in the background`, `waiting on you`, `failed`, `attached`, `parked`,
+/// `idle`), the working icon on the cards of those at work, and a workspace listing a thread
+/// in each state under its card (`├ run · running`).
+fn sidebar_surfaces() -> Vec<Surface> {
+    use crate::workspace::{Glance, OrchGlance, Tab, TabHub, WorkerGlance};
+    use twr_core::reduce::ThreadStatus;
+    let mut st = crate::app::tests::with_orch();
+    st.workspace = Some("default".into());
+    st.instance_name = Some("default".into());
+    let running = |waiting| TabHub::Running {
+        threads: 1,
+        running: 1,
+        permissions: waiting,
+        questions: 0,
+    };
+    let orch = |name: &str, status, active, waiting| Tab {
+        name: name.into(),
+        hub: running(waiting),
+        glance: Some(Glance {
+            active,
+            orch: Some(OrchGlance {
+                status,
+                ..Default::default()
+            }),
+            workers: None,
+        }),
+    };
+    let statuses = [
+        ThreadStatus::Running,
+        ThreadStatus::Background,
+        ThreadStatus::Waiting,
+        ThreadStatus::Error,
+        ThreadStatus::Done,
+        ThreadStatus::Idle,
+        ThreadStatus::Parked,
+        ThreadStatus::Attached,
+    ];
+    let workers: Vec<WorkerGlance> = statuses
+        .iter()
+        .zip(STATES)
+        .enumerate()
+        .map(|(i, (status, (name, _)))| WorkerGlance {
+            id: format!("w-{name}"),
+            name: name.into(),
+            status: *status,
+            color: Some(u8::try_from(i).unwrap()),
+            parked: false,
+        })
+        .collect();
+    let mut tabs = vec![
+        Tab {
+            name: "default".into(),
+            hub: TabHub::Unknown,
+            glance: None,
+        },
+        orch("ws-run", ThreadStatus::Running, true, 0),
+        orch("ws-bg", ThreadStatus::Background, true, 0),
+        orch("ws-wait", ThreadStatus::Waiting, false, 1),
+        orch("ws-err", ThreadStatus::Error, false, 0),
+        orch("ws-att", ThreadStatus::Attached, false, 0),
+        orch("ws-park", ThreadStatus::Parked, false, 0),
+        orch("ws-idle", ThreadStatus::Idle, false, 0),
+    ];
+    // (A card lists six rows at most: four each.)
+    for (name, part) in [("ws-list", &workers[..4]), ("ws-more", &workers[4..])] {
+        let mut list = orch(name, ThreadStatus::Idle, false, 0);
+        list.glance.as_mut().unwrap().workers = Some(part.to_vec());
+        tabs.push(list);
+    }
+    st.set_tabs(tabs);
+    let buf = full(&mut st, 160, 90);
+    let col = |needle: &str| at(&buf, needle, 0);
+    let mut cells = Vec::new();
+    let width = st.dock_width();
+    for (ws, word) in [
+        ("ws-run", "running"),
+        ("ws-bg", "running in the background"),
+        ("ws-wait", "waiting on you"),
+        ("ws-err", "failed"),
+        ("ws-att", "attached"),
+        ("ws-park", "parked"),
+        ("ws-idle", "idle"),
+    ] {
+        // The card's name row (the working icon) and its status row under it.
+        let name = col(ws);
+        let status = find(&buf, word)
+            .into_iter()
+            .find(|p| p.1 > name.1 && p.0 < width)
+            .unwrap_or_else(|| panic!("no {word:?} under {ws}:\n{}", screen(&buf)));
+        cells.push(Rect::new(0, status.1, width, 1));
+        if matches!(ws, "ws-run" | "ws-bg") {
+            cells.push(Rect::new(1, name.1, 1, 1));
+        }
+    }
+    let list = col("ws-list");
+    for (name, _) in STATES {
+        let p = find(&buf, &format!(" {name} · "))
+            .into_iter()
+            .find(|p| p.1 > list.1 && p.0 < width)
+            .unwrap_or_else(|| panic!("no {name} under ws-list:\n{}", screen(&buf)));
+        // From after its name (in the thread's color, which shows on white at 2:1 by design:
+        // docs/tui.md, "Colors") to the card's edge.
+        let x = p.0 + 1 + u16::try_from(name.len()).unwrap();
+        cells.push(Rect::new(x, p.1, width - x, 1));
+    }
+    vec![Surface {
+        name: "states-sidebar",
+        title: "The sidebar: each orchestrator state, and a thread in each state under a card",
+        crop: Rect::new(0, 0, width + 1, buf.area.height),
+        cells,
+        buf,
+    }]
+}
+
+/// The cells drawn in the working icon's color ([`crate::icon::ACCENT`]) on `buf`.
+fn icon_cells(buf: &Buffer) -> Vec<Rect> {
+    buf.area
+        .positions()
+        .filter(|p| buf[*p].fg == crate::icon::ACCENT)
+        .map(|p| Rect::new(p.x, p.y, 1, 1))
+        .collect()
+}
+
+/// The orchestrator's reply in [`conversation_surface`]: inline code, a code block, a box for
+/// each thread of [`all_states`] (its state in the box's title), then a line still streaming
+/// in (the working cursor after it).
+fn conversation_reply() -> String {
+    let mut text = String::from(
+        "Here is where things stand. Run `cargo test --workspace` before you push.\n\n\
+         ```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n",
+    );
+    for (name, _) in STATES {
+        let _ = write!(
+            text,
+            "<thread name=\"{name}\">\n{name} says hello.\n</thread>\n"
+        );
+    }
+    text.push_str("Still looking at the build");
+    text
+}
+
+/// The orchestrator's conversation while it works: a message of yours on its band, one taken
+/// back, the reply ([`conversation_reply`]) with inline code and a code block and a box per
+/// thread naming its state, the working icon in the header and the cursor after the reply.
+fn conversation_surface() -> Surface {
+    let mut st = all_states();
+    st.view.show_parked = true;
+    let mut o = ThreadScript::new("t-orch");
+    o.at(200);
+    let mut evs = crate::app::tests::orch_events(&mut o, "t-orch");
+    evs.push(o.turn_started("news?"));
+    control(&mut st, &evs);
+    let user = |prompt: &str, withdrawn| crate::app::Entry::TurnStart {
+        seq: 0,
+        turn: Some(1),
+        from: TurnFrom::User,
+        prompt: prompt.into(),
+        notice: false,
+        withdrawn,
+    };
+    st.transcript.as_mut().unwrap().set_entries(vec![
+        user("news? and run the tests", false),
+        user("never mind", true),
+        crate::app::Entry::Text {
+            seq: 0,
+            text: conversation_reply(),
+            open: true,
+            final_seq: None,
+        },
+    ]);
+    let buf = full(&mut st, 160, 80);
+    let pane = st
+        .view
+        .panes
+        .get(&crate::select::PaneId::Transcript)
+        .unwrap_or_else(|| panic!("no transcript:\n{}", screen(&buf)))
+        .area;
+    let row = |y: u16| Rect::new(pane.x, y, pane.width, 1);
+    let mut cells: Vec<Rect> = [
+        "news? and run the tests",
+        "taken back",
+        "never mind",
+        "cargo test --workspace",
+        "fn main() {",
+        "println!",
+        "Still looking",
+    ]
+    .iter()
+    .map(|n| row(at(&buf, n, 0).1))
+    .collect();
+    // Each box's state in its title, after the thread's name (the name and the frame are in
+    // the thread's color, 2:1 on white by design).
+    for (name, _) in STATES {
+        // (The last: a request's box, above, names its reason.)
+        let (x, y) = *find(&buf, &format!("╭─ {name} · ")).last().unwrap();
+        let x = x + 3 + u16::try_from(name.len()).unwrap() + 3;
+        let end = (x..buf.area.width)
+            .find(|&i| sym(&buf, i, y) == "─")
+            .unwrap_or(buf.area.width);
+        cells.push(Rect::new(x, y, end - x, 1));
+    }
+    let icons = icon_cells(&buf);
+    assert!(
+        icons.len() >= 2,
+        "the header's icon and the cursor:\n{}",
+        screen(&buf)
+    );
+    cells.extend(icons);
+    Surface {
+        name: "conversation",
+        title: "The conversation: your message's band, code, each state in a box, the working icon",
+        crop: Rect::new(pane.x, 0, pane.width, buf.area.height),
+        cells,
+        buf,
+    }
+}
+
+/// Every text a phone's bands carry ([`crate::color::BAND`], [`crate::color::BAND_ALT`]): the
+/// action popup's rows (an answer's key cap, a row the typed filter leaves out, dimmed, and
+/// the selected one), the orchestrator picker's runtimes (`installed` in green, `not
+/// installed` in red, `(default)` dim), the completions (a command in cyan, its description
+/// dim, the selected one), the tab bar (`Needs you 2` in yellow) and the Threads screen's
+/// buttons.
+fn band_surfaces() -> Vec<Surface> {
+    let mut out = Vec::new();
+    let phone = |st: &mut AppState| {
+        st.view.compact_width = 60;
+    };
+    // The action popup, a filter typed so some rows are left out.
+    let mut st = three_threads();
+    phone(&mut st);
+    st.show_pane(crate::app::CompactPane::Threads);
+    full(&mut st, 40, 40);
+    st.handle_key(key(KeyCode::Enter));
+    st.handle_key(key(KeyCode::Char('d')));
+    let buf = full(&mut st, 40, 40);
+    let a = rightmost(&buf, " REVIEW ");
+    let popup = boxed(&buf, a);
+    out.push(Surface {
+        name: "bands-popup",
+        title: "A phone's popup filtered: its rows on bands, some dimmed",
+        cells: vec![rows_of(popup, a.1, popup.bottom() - 2)],
+        crop: popup,
+        buf,
+    });
+    // The orchestrator picker.
+    let mut st = three_threads();
+    phone(&mut st);
+    st.view.picker = crate::app::Picker::from_show(
+        &json!({
+            "thread": null, "retired": 0,
+            "configured": {"runtime": "codex", "explicit": false},
+            "runtimes": ["claude-code", "codex", "gemini"],
+            "installed": {"claude-code": true, "codex": false},
+        }),
+        &Default::default(),
+    );
+    let buf = full(&mut st, 40, 40);
+    let a = at(&buf, "claude-code", 0);
+    let b = boxed(&buf, a);
+    let end = at(&buf, "gemini", 0);
+    out.push(Surface {
+        name: "bands-picker",
+        title: "The orchestrator picker on a phone: its runtimes on bands",
+        cells: vec![rows_of(b, a.1, end.1 + 1)],
+        crop: b,
+        buf,
+    });
+    // The completions of a command, the second selected.
+    let mut st = three_threads();
+    phone(&mut st);
+    st.show_pane(crate::app::CompactPane::Chat);
+    st.handle_key(key(KeyCode::Char('/')));
+    st.handle_key(key(KeyCode::Down));
+    let buf = full(&mut st, 40, 40);
+    let a = at(&buf, " commands ", 0);
+    let b = boxed(&buf, (a.0, a.1 + 1));
+    out.push(Surface {
+        name: "bands-completions",
+        title: "A phone's completions: commands on bands, one selected",
+        cells: vec![inside(b)],
+        crop: b,
+        buf,
+    });
+    // The tab bar, something waiting, and the Threads screen's buttons.
+    let mut st = crate::sidebar::tests::in_workspaces("default");
+    st.show_pane(crate::app::CompactPane::Threads);
+    let buf = full(&mut st, 40, 60);
+    let new = at(&buf, "+ New workspace", 0);
+    out.push(Surface {
+        name: "bands-tabs",
+        title: "A phone's tab bar (Needs you in yellow) and its buttons",
+        cells: vec![
+            Rect::new(0, 0, buf.area.width, crate::ui::TAB_BAR_ROWS),
+            Rect::new(0, new.1, buf.area.width, 1),
+        ],
+        crop: buf.area,
+        buf,
+    });
+    out
+}
+
+/// A stalled notice on its card and in its popup.
+fn stalled_surfaces() -> [Surface; 2] {
+    let mut st = three_threads();
+    raise_item(
+        &mut st,
+        "t-gamma",
+        "s1",
+        AttentionReason::Stalled,
+        &["keep waiting", "stop"],
+    );
+    item_surfaces(
+        &mut st,
+        "t-gamma",
+        "gamma",
+        " STALLED ",
+        "2 stop",
+        " 2 stop",
+        ["stalled-card", "stalled-popup"],
+        ["A stalled notice on its card", "A stalled notice's popup"],
+    )
+}
+
+// ---------------------------------------------------------------------------------------------
 // Measuring
 // ---------------------------------------------------------------------------------------------
 
-/// Cells on these surfaces known to be short of what they need, left for changes of their own
-/// (not the loop UI's, nor an option's key or a card's activity): each by the colors it is
-/// drawn in (text, fill), and what it is.
-const KNOWN_SHORT: [(Color, Color, &str); 5] = [
-    // 3.6:1 at 256 and 16 colors, dark and light.
-    (Color::Black, Color::Red, "the PERMISSION badge"),
-    // 1.3:1 and 1.8:1 on a light terminal; 3.2:1 (dark) and 4.4:1 (light) with 16 colors.
-    (
-        Color::Reset,
-        Color::Indexed(236),
-        "a phone popup's band, its text",
-    ),
-    (
-        Color::Reset,
-        Color::Indexed(238),
-        "a phone popup's other band, its text",
-    ),
-    // 2.8:1 on white; 1.7:1 with 16 colors (yellow).
-    (crate::icon::ACCENT, Color::Reset, "the working icon"),
-    // 2.2:1 on white.
-    (
-        Color::Green,
-        Color::Reset,
-        "a card's state word, running or background",
-    ),
-];
-
-/// What `was` (a cell as drawn in full color) is, if [`KNOWN_SHORT`] lists it.
-fn known_short(was: &Cell) -> Option<&'static str> {
-    KNOWN_SHORT
-        .iter()
-        .find(|(fg, bg, _)| was.fg == *fg && was.bg == *bg)
-        .map(|(.., what)| *what)
-}
-
-/// What a surface reads as on a terminal: the lowest contrast of its text cells, each one
-/// short of what it needs, and those of [`KNOWN_SHORT`] met (apart: they count in neither).
+/// What a surface reads as on a terminal: the lowest contrast of its text cells, and each one
+/// short of what it needs.
 struct Reading {
     lowest: f64,
     short: Vec<String>,
-    known: Vec<&'static str>,
 }
 
 fn read(s: &Surface, v: Variant) -> Reading {
@@ -1373,7 +1815,6 @@ fn read(s: &Surface, v: Variant) -> Reading {
     degrade(&mut buf, v.depth);
     let mut lowest = f64::INFINITY;
     let mut short = Vec::new();
-    let mut known = Vec::new();
     for r in &s.cells {
         for y in r.top()..r.bottom() {
             let row: String = (r.left()..r.right()).map(|x| sym(&buf, x, y)).collect();
@@ -1385,14 +1826,6 @@ fn read(s: &Surface, v: Variant) -> Reading {
                 let sh = shown(cell, v);
                 let c = contrast(sh.fg, sh.bg);
                 let was = &s.buf[(x, y)];
-                if c < needed(sh) {
-                    if let Some(what) = known_short(was) {
-                        if !known.contains(&what) {
-                            known.push(what);
-                        }
-                        continue;
-                    }
-                }
                 lowest = lowest.min(c);
                 if c < needed(sh) {
                     let what = format!(
@@ -1412,46 +1845,29 @@ fn read(s: &Surface, v: Variant) -> Reading {
             }
         }
     }
-    Reading {
-        lowest,
-        short,
-        known,
-    }
+    Reading { lowest, short }
 }
 
-/// Every text cell of every surface reads, on every terminal: an option's key and a card's
-/// activity text as any other. Those [`KNOWN_SHORT`] lists are left out, and each of them is
-/// still short somewhere (one that reads now comes off the list).
+/// Every text cell of every surface reads, on every terminal, with no exception: an option's
+/// key, a card's activity text, a state word, the working icon, a badge, a band's text and
+/// code as any other.
 #[test]
 fn every_loop_surface_reads_on_every_terminal() {
     let mut fails = Vec::new();
     let mut table = String::new();
-    let mut met = Vec::new();
     for s in surfaces() {
         let _ = write!(table, "{:28}", s.name);
         for v in VARIANTS {
             let r = read(&s, v);
-            let _ = write!(
-                table,
-                " {:>6.2}{}",
-                r.lowest,
-                if r.known.is_empty() { " " } else { "*" }
-            );
+            let _ = write!(table, " {:>6.2}", r.lowest);
             for what in r.short {
                 fails.push(format!("{} {}: {what}", s.name, v.name));
             }
-            met.extend(r.known);
         }
         table.push('\n');
     }
-    eprintln!("{table}(* a cell of KNOWN_SHORT left out)");
+    eprintln!("{table}");
     assert!(fails.is_empty(), "{}", fails.join("\n"));
-    for (.., what) in KNOWN_SHORT {
-        assert!(
-            met.contains(&what),
-            "{what} reads now: take it off KNOWN_SHORT"
-        );
-    }
 }
 
 /// Every option key, on every kind of item, on its card, its popup, its box in the
@@ -1687,19 +2103,8 @@ fn page(title: &str, v: Variant, body: &str) -> String {
 fn caption(s: &Surface, v: Variant) -> String {
     let r = read(s, v);
     let mut out = format!("<p>lowest contrast of its text cells: {:.2}:1", r.lowest);
-    if !r.known.is_empty() {
-        let _ = write!(
-            out,
-            " · known short, left for a change of their own: {}",
-            r.known.join(", ")
-        );
-    }
     if r.short.is_empty() {
-        out.push_str(if r.known.is_empty() {
-            " · every cell reads</p>"
-        } else {
-            " · every other cell reads</p>"
-        });
+        out.push_str(" · every cell reads</p>");
     } else {
         let _ = write!(out, " · {} short:</p><p>", r.short.len());
         for s in &r.short {
@@ -1721,7 +2126,7 @@ fn loop_ui_shots() {
     let dir = std::path::PathBuf::from(dir);
     let all = surfaces();
     let mut top = String::from(
-        "<h1>twr TUI: the loop UI's surfaces, option keys and activity text</h1>\n<ul>\n",
+        "<h1>twr TUI: the loop UI's surfaces, option keys, activity text, states, bands and code</h1>\n<ul>\n",
     );
     for v in VARIANTS {
         let sub = dir.join(v.name);
