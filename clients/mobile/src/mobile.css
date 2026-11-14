@@ -257,6 +257,7 @@ select {
   border-color: var(--terminal-border);
 }
 .terminal-accessory [aria-pressed="true"] {
+  border-color: var(--terminal-accent);
   background: color-mix(
     in srgb,
     var(--terminal-accent) 16%,
@@ -314,6 +315,7 @@ select {
   height: 28px;
   border-radius: 14px;
   background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 .mobile-tabs button > svg {
   position: relative;

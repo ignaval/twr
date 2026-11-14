@@ -17,8 +17,11 @@
   --active: rgb(255 255 255 / 7.5%);
   --border: #282e35;
   --border-strong: #3b444e;
-  /* A field's edge (an Omarchy palette makes it read at 3:1). */
-  --field-border: var(--border);
+  /* A control's edge, 3:1 on every surface a control sits on (WCAG 1.4.11): a field's
+   * (the palette's underline too), the composer's, a checkbox's, a slider's track, a
+   * selected segment's and a selected thread card's. `--border` is for lines that
+   * identify nothing. */
+  --field-border: #6b7480;
   --text: #e6e9ec;
   --muted: #a3abb4;
   --faint: #959ea8;
@@ -41,6 +44,7 @@
   --terminal-text: #e6e9ec;
   --terminal-muted: #a3abb4;
   --terminal-border: #323941;
+  --terminal-field-border: #68717c;
   --terminal-accent: #62c7d4;
   --terminal-selection: #29434a;
   --destination-strength: 100%;
@@ -104,7 +108,7 @@ button:disabled {
 button:focus-visible,
 a:focus-visible,
 summary:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus);
   outline-offset: 3px;
 }
 /* Keyboard focus stays visible on every focusable element, including custom
@@ -194,12 +198,62 @@ input::placeholder,
 textarea::placeholder {
   color: var(--faint);
 }
+/* Checkboxes (and the switches drawn as them) and sliders are drawn with the theme's tokens,
+ * so their edges read at 3:1 in every engine: the box's edge, the checked fill and its
+ * mark; the slider's track and its thumb. */
 input[type="checkbox"] {
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  flex-shrink: 0;
   min-width: 16px;
   min-height: 16px;
   width: 16px;
   height: 16px;
-  accent-color: var(--accent);
+  padding: 0;
+  border: 1px solid var(--field-border);
+  border-radius: 4px;
+  background: var(--bg);
+  cursor: pointer;
+}
+input[type="checkbox"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+input[type="checkbox"]:checked::before {
+  content: "";
+  width: 8px;
+  height: 4px;
+  border: solid var(--accent-fg);
+  border-width: 0 0 2px 2px;
+  transform: translateY(-1px) rotate(-45deg);
+}
+input[type="checkbox"]:disabled,
+input[type="range"]:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+input[type="range"] {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--field-border);
+}
+/* The thumb's ring is the page's colour: it parts the thumb from the track. */
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -7px;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  background: var(--accent);
 }
 textarea {
   resize: vertical;
@@ -300,6 +354,10 @@ kbd {
 .icon-button.on {
   color: var(--accent);
   background: var(--accent-soft);
+}
+/* A pressed toggle (Toggle tool calls, Focus) has an edge; hovering has none. */
+.icon-button.on {
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 .primary {
   background: var(--accent);
@@ -466,6 +524,7 @@ kbd {
 .primary-nav > button.active:hover {
   background: var(--accent-soft);
   color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .key-hint {
   margin-left: auto;
@@ -595,6 +654,7 @@ kbd {
 .workspace-orchestrator.active:hover {
   background: var(--accent-soft);
   color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .workspace-entry .thread-list {
   padding-left: 18px;
@@ -650,7 +710,7 @@ kbd {
   background: var(--hover);
 }
 .thread-card.selected {
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   background: var(--active);
 }
 .thread-card-title {
@@ -1245,15 +1305,17 @@ kbd {
   width: calc(100% - 48px);
   max-width: var(--content-width);
   margin: 0 auto 24px;
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   border-radius: 10px;
   box-shadow: none;
 }
+/* Focused, the edge takes some of the destination's ink (its readable colour), so it keeps
+ * 3:1 with any thread's colour. */
 .composer:focus-within {
   border-color: color-mix(
     in srgb,
-    var(--destination) 55%,
-    var(--border-strong)
+    var(--destination-ink) 55%,
+    var(--field-border)
   );
 }
 .composer-label {
@@ -1567,6 +1629,7 @@ kbd {
     var(--terminal-text) 7%,
     var(--terminal-panel)
   );
+  box-shadow: inset 0 -2px 0 var(--terminal-accent);
 }
 .terminal-tab > button {
   background: none;
@@ -1595,6 +1658,11 @@ kbd {
   height: 100%;
   flex-direction: column;
 }
+/* The terminal keeps its dark palette in every theme: its focus ring is its own accent. */
+.terminal-dock,
+.terminal-session {
+  --focus: var(--terminal-accent);
+}
 .terminal-surface {
   flex: 1;
   min-height: 0;
@@ -1615,7 +1683,7 @@ kbd {
   font-size: 0.846154rem;
   background: var(--terminal-panel);
   color: var(--terminal-text);
-  border-color: var(--terminal-border);
+  border-color: var(--terminal-field-border);
   padding: 4px 8px;
   min-height: 28px;
 }
@@ -1767,7 +1835,7 @@ meter::-webkit-meter-optimum-value {
   border-top: 1px solid var(--border);
 }
 .thread-card.large.selected {
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   background: var(--active);
 }
 .thread-card.large .thread-card-title > b {
@@ -1887,7 +1955,7 @@ meter::-webkit-meter-optimum-value {
 }
 .segmented > button.active {
   background: var(--overlay);
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   color: var(--text);
 }
 .config-editor {
@@ -2014,13 +2082,12 @@ meter::-webkit-meter-optimum-value {
   padding: 8px 14px 14px;
 }
 .attention-response > input {
-  border-bottom: 1px solid var(--border);
   margin-bottom: 12px;
   box-shadow: none;
   font-size: 1rem;
   padding: 6px 8px;
   background: var(--bg);
-  border: 1px solid var(--border);
+  border: 1px solid var(--field-border);
   border-radius: 6px;
 }
 .attention-options {
@@ -2826,10 +2893,11 @@ meter::-webkit-meter-optimum-value {
   padding-top: 20px;
   border-top: 1px solid var(--border);
 }
+/* The palette's field has no box of its own: the line under it is its edge. */
 .palette-search {
   display: flex;
   align-items: center;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--field-border);
   color: var(--muted);
   padding: 8px 20px;
   gap: 12px;
@@ -2927,6 +2995,7 @@ meter::-webkit-meter-optimum-value {
   --active: rgb(0 0 0 / 7%);
   --border: #deded9;
   --border-strong: #c2c5c7;
+  --field-border: #868b90;
   --text: #1c1f22;
   --muted: #565d64;
   --faint: #5f666e;
@@ -2958,6 +3027,7 @@ meter::-webkit-meter-optimum-value {
     --active: rgb(0 0 0 / 7%);
     --border: #deded9;
     --border-strong: #c2c5c7;
+    --field-border: #868b90;
     --text: #1c1f22;
     --muted: #565d64;
     --faint: #5f666e;
@@ -2982,7 +3052,7 @@ meter::-webkit-meter-optimum-value {
 :root[data-platform="linux"][data-theme="system"][data-omarchy="true"] {
   /* Every colour comes from the theme through shared/omarchy.ts, which keeps each one's
    * hue and moves its lightness only as far as it takes to read at 4.5:1 (3:1 for a
-   * field's edge) wherever the app draws it. */
+   * control's edge, which is `--border-strong` here) wherever the app draws it. */
   color-scheme: var(--omarchy-scheme, dark);
   --bg: var(--omarchy-bg);
   --panel: var(--omarchy-panel);
@@ -3166,6 +3236,7 @@ meter::-webkit-meter-optimum-value {
 .palette-options > button.active {
   background: var(--hover);
   color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .slash-suggestions > button {
   display: flex;
@@ -3281,7 +3352,7 @@ meter::-webkit-meter-optimum-value {
 }
 
 .thread-card.dived.selected {
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
 }
 
 .topbar-left > span {
@@ -3408,6 +3479,9 @@ meter::-webkit-meter-optimum-value {
   background: var(--hover);
   color: var(--text);
 }
+.manage-nav button.active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 
 .conversation-menu {
   display: none;
@@ -3456,6 +3530,16 @@ meter::-webkit-meter-optimum-value {
 
 .conversation-menu > div > button:hover {
   background: var(--hover);
+}
+/* Tool calls and Reasoning are on: a check at the row's end. */
+.conversation-menu > div > button[aria-pressed="true"]::after {
+  content: "";
+  width: 8px;
+  height: 4px;
+  margin-inline-start: auto;
+  border: solid var(--accent);
+  border-width: 0 0 2px 2px;
+  transform: translateY(-2px) rotate(-45deg);
 }
 
 /* Responsive layout keeps the same type scale; only the arrangement changes. */

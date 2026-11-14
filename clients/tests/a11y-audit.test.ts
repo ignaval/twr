@@ -6,6 +6,7 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { Dialog, FieldInput } from "../shared/ui";
 import { MessageBody } from "../shared/MessageBody";
+import { controlPairs, failing, themeScope } from "./css-contrast";
 
 /* A dependency-free accessibility lint over the shared React UI: it parses the
  * TSX with the TypeScript compiler already used by the build, and checks theme
@@ -264,6 +265,19 @@ describe("theme contrast", () => {
       expect(contrast(theme["accent-fg"], theme.accent)).toBeGreaterThan(4.5);
       expect(contrast(theme["danger-fg"], theme.danger)).toBeGreaterThan(4.5);
       expect(failures).toEqual([]);
+    });
+});
+
+describe("control contrast", () => {
+  // Every control's edge and state indicator (WCAG 2.2 1.4.11), resolved from the real
+  // stylesheets: fields, the composer, checkboxes and switches, sliders, the selected
+  // segment, tab, thread card and list item, pressed toggles and the focus ring, on every
+  // surface and tint they sit on (tests/css-contrast.ts).
+  for (const theme of ["dark", "light"] as const)
+    it(`reads at 3:1 for every control edge and state in the ${theme} theme`, () => {
+      const list = controlPairs(themeScope(theme));
+      expect(list.length).toBeGreaterThan(80);
+      expect(failing(list)).toEqual([]);
     });
 });
 
