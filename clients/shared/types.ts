@@ -19,6 +19,11 @@ export interface Thread {
   repo?: string;
   report?: Json;
   git?: Json;
+  /** Stopped (`thread.stopped`): by someone, or only by the hub's own shutdown. */
+  stopped?: boolean;
+  /** Stopped only by the hub's own shutdown (only while `stopped`): the thread goes on, and
+   * a loop may start on it, as soon as it is sent something. */
+  stopped_by_hub?: boolean;
   [key: string]: Json;
 }
 export interface Attention {
@@ -33,6 +38,10 @@ export interface Attention {
   incomplete?: boolean;
   /** A confirm or delete card: the hub's own question only the user answers. */
   proposal?: boolean;
+  /** A loop's setup card: only the user answers it (Start and save, Cancel). */
+  loop_setup?: boolean;
+  /** A stuck loop's item: only the user answers it (resume, stop); never dismissed. */
+  loop_stuck?: boolean;
 }
 export interface ViewState {
   threads: Thread[];
@@ -201,9 +210,10 @@ export interface AttentionSummaryItem {
   reason: string;
   /**
    * The hub's own cards, which only the user answers: `confirm`, what the orchestrator
-   * proposed from your message; `delete`, a deletion of threads.
+   * proposed from your message; `delete`, a deletion of threads; `loop_setup`, the settings
+   * a loop starts on; `loop_stuck`, a loop that waits for you to resume or stop it.
    */
-  card?: "confirm" | "delete";
+  card?: "confirm" | "delete" | "loop_setup" | "loop_stuck";
   /** Still being raised: not notified until it is complete. */
   incomplete?: boolean;
 }
@@ -224,6 +234,23 @@ export interface AttentionSummary {
    * what the new source lists first is never taken for news.
    */
   workspaces: { name: string; stream?: string }[];
+  /**
+   * The last loop that ended on each thread, with how it ended: the desktop notifies a loop
+   * that ends once, as it does a new request (desktop/notify-state.ts `LoopWatch`).
+   */
+  loops?: LoopEndSummary[];
+}
+/** A thread's last loop that ended, for the host app's notification of it. */
+export interface LoopEndSummary {
+  workspace: string;
+  thread: string;
+  /** The thread's name. */
+  title: string;
+  /** The loop's id: a new id is a new end. */
+  id: string;
+  /** How it ended: `review loop clean after 6 rounds`, an implementation loop's commit or
+   * `not committed`. */
+  words: string;
 }
 export type InstallKind =
   "development" | "mac" | "appimage" | "deb" | "pacman" | "portable";

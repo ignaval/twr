@@ -117,6 +117,19 @@ use crate::workdirs::WorkdirUse;
 /// Looks an adapter up by runtime name.
 pub type AdapterLookup = Arc<dyn Fn(&str) -> Option<Arc<dyn Adapter>> + Send + Sync>;
 
+/// Whether `op` is one of the loop ops ([`crate::loops`]).
+fn is_loop_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::LoopGit { .. }
+            | Op::LoopFiles { .. }
+            | Op::LoopRun { .. }
+            | Op::LoopRunWait { .. }
+            | Op::LoopRunCancel { .. }
+            | Op::LoopForget { .. }
+    )
+}
+
 /// Room left in a frame for the `rseq` digits and framing.
 const FRAME_MARGIN: usize = 64;
 
@@ -176,6 +189,9 @@ pub struct LocalBoxOptions {
     /// agent CLIs: [`crate::agents`]); none by default, a runner's asks both
     /// ([`crate::RunnerOptions::box_options`]).
     pub env: BoxEnv,
+    /// Where the box keeps its copies of loop folders (`<data_dir>/loops`,
+    /// [`crate::loops::folder`]).
+    pub loops: PathBuf,
 }
 
 impl std::fmt::Debug for LocalBoxOptions {
@@ -213,6 +229,7 @@ impl LocalBoxOptions {
             git: LocalGit::default(),
             machine_lock: None,
             env: BoxEnv::none(),
+            loops: data_dir.join("loops"),
         }
     }
 }
@@ -322,6 +339,8 @@ struct Inner {
     receipt_hold: Mutex<Option<std::sync::mpsc::Sender<ChangeReceiptPause>>>,
     /// The login shell's `PATH` and the agents ([`crate::agents`]).
     agents: BoxAgents,
+    /// The loops' review runs on this box ([`crate::loops::runs`]).
+    loop_runs: crate::loops::runs::BoxRuns,
 }
 
 /// A repository change paused by [`LocalBox::hold_change_receipts`] (tests) as the
@@ -432,6 +451,9 @@ impl LocalBox {
         )?;
         let spool = Arc::new(Spool::open(&opts.spool_path, opts.spool_max_bytes)?);
         recover_runtimes(&spool)?;
+        // Review runs a runner that died left behind, and loop folders no hub used for long.
+        crate::loops::runs::reap_left(&opts.loops);
+        crate::loops::folder::prune(&opts.loops);
         let start_time = reap::own_start_time();
         Ok(LocalBox {
             inner: Arc::new(Inner {
@@ -469,6 +491,7 @@ impl LocalBox {
                 changes: watch::Sender::new(0),
                 receipt_hold: Mutex::new(None),
                 agents: BoxAgents::new(opts.env),
+                loop_runs: crate::loops::runs::BoxRuns::new(opts.loops),
             }),
         })
     }
@@ -477,6 +500,20 @@ impl LocalBox {
     /// answer; `None` when the box asks none or the shell gave none.
     pub async fn login_path(&self) -> Option<Arc<twr_adapters::resolve::LoginPath>> {
         self.inner.agents.login_path().await
+    }
+
+    /// What the box can do for loops, for the inventory ([`twr_core::runner::LoopsSupport`]).
+    pub fn loops_support(&self) -> twr_core::runner::LoopsSupport {
+        twr_core::runner::LoopsSupport {
+            version: twr_core::runner::LOOPS_VERSION,
+            dir: self.inner.loop_runs.loops().to_path_buf(),
+        }
+    }
+
+    /// The loops' review runs on this box ([`crate::loops::runs`]): a connection to the hub
+    /// numbers itself with them, and ends its runs when it is over.
+    pub fn loop_runs(&self) -> &crate::loops::runs::BoxRuns {
+        &self.inner.loop_runs
     }
 
     /// The box's agents as last probed (none before the first probe ended, or when the box
@@ -660,6 +697,20 @@ impl LocalBox {
             // Upload IDs, exact chunk offsets/data and terminal receipts provide their own
             // idempotence. Streaming chunks must not evict ordinary durable command results.
             let _permit = self.inner.upload_permits.acquire().await.ok();
+            return CmdResult::new(cmd_id, self.execute(op).await);
+        }
+        // The loop ops are reads, writes of whole files, and runs named by the hub's own run
+        // id ([`crate::loops`]): none is recorded (a repeat does what the first did, or reports
+        // the same run), so a large diff or log never lands in the spool. Git reads and file
+        // writes take an ordinary slot; a wait for a run, its start and its end take none, so
+        // runs waited for never hold up the box's git.
+        if is_loop_op(&op) {
+            let _permit = match &op {
+                Op::LoopGit { .. } | Op::LoopFiles { .. } => {
+                    self.inner.op_permits.acquire().await.ok()
+                }
+                _ => None,
+            };
             return CmdResult::new(cmd_id, self.execute(op).await);
         }
 
@@ -1117,6 +1168,59 @@ impl LocalBox {
                 })
             }
             // As last probed, unless asked for a fresh look (or none was made yet).
+            Op::LoopGit { query } => {
+                crate::loops::git_answer(git, self.inner.loop_runs.loops(), query).await
+            }
+            Op::LoopFiles {
+                loop_id,
+                files,
+                read,
+                max,
+            } => crate::loops::folder::files(
+                self.inner.loop_runs.loops(),
+                &loop_id,
+                &files,
+                &read,
+                max,
+            ),
+            Op::LoopRun { loop_id, run, spec } => {
+                let login = self.login_path().await;
+                let agents = &self.inner.agents;
+                let cwd = spec.cwd.clone();
+                let resolve = |runtime: &str| {
+                    let program =
+                        twr_adapters::resolve::runtime_program(runtime, |k| agents.bin_var(k));
+                    let path = twr_adapters::resolve::runtime_path(&[], login.as_deref());
+                    match program {
+                        Some(program) => {
+                            let r = twr_adapters::resolve::resolve(
+                                &program,
+                                &[],
+                                login.as_deref(),
+                                &cwd,
+                            );
+                            (Some(r.found.unwrap_or(program)), r.path)
+                        }
+                        None => (None, path),
+                    }
+                };
+                self.inner
+                    .loop_runs
+                    .start(&loop_id, &run, spec.clone(), &resolve)
+                    .map(|s| json!(s))
+            }
+            Op::LoopRunWait { run, wait_ms } => {
+                Ok(json!(self.inner.loop_runs.wait(&run, wait_ms).await))
+            }
+            Op::LoopRunCancel { run, why } => {
+                Ok(json!(self.inner.loop_runs.cancel(&run, &why).await))
+            }
+            Op::LoopForget { loop_id } => self
+                .inner
+                .loop_runs
+                .forget(&loop_id)
+                .await
+                .map(|()| Value::Null),
             Op::Agents { refresh } => {
                 let agents = if refresh || !self.inner.agents.probed() {
                     self.probe_agents().await

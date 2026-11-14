@@ -265,6 +265,9 @@ pub struct BoxInfo {
     /// [`twr_core::runner::valid_launch`]): `launchd <label>`, `systemd <unit>` or `detached`.
     /// `hub.info` shows it to users only.
     pub launch: Option<String>,
+    /// What the runner can do for loops (its inventory's, [`twr_core::runner::LoopsSupport`]):
+    /// `None` from a runner too old to run them, which the hub then asks nothing of the sort.
+    pub loops: Option<twr_core::runner::LoopsSupport>,
 }
 
 /// A box's report of its agent CLIs as the hub keeps it: the probe's own filters applied
@@ -1121,6 +1124,11 @@ impl RemoteBox {
                 .launch
                 .clone()
                 .filter(|l| twr_core::runner::valid_launch(l)),
+            // (A loops directory must be an absolute path for the prompts that name its files.)
+            loops: inv
+                .loops
+                .clone()
+                .filter(|l| l.version >= 1 && l.dir.is_absolute()),
         });
         drop(st);
         *self.refusal_slot() = None;
@@ -1444,6 +1452,42 @@ impl RemoteBox {
             Kind::Session => rx.await,
         };
         r.unwrap_or_else(|_| Err(offline(&self.inner.name)))
+    }
+
+    /// Runs request `op` on the box and waits for its result (at most [`REQUEST_TIMEOUT`]):
+    /// `box_offline` at once while the box is offline or when its connection drops.
+    pub async fn request(&self, op: Op) -> Result<Value, CmdError> {
+        self.call(op, Kind::Request).await
+    }
+
+    /// Issues request `op` now (its frame queued on the current connection before this
+    /// returns, so it goes out ahead of anything issued after it), and returns the wait for
+    /// its result: `box_offline` at once while the box is offline.
+    pub fn issue(
+        &self,
+        op: Op,
+    ) -> Result<impl std::future::Future<Output = Result<Value, CmdError>> + Send + 'static, CmdError>
+    {
+        let what = op.name();
+        let (cmd_id, rx) = self.begin(op, Kind::Request, None)?;
+        let guard = PendingGuard {
+            rbox: self.clone(),
+            cmd_id,
+        };
+        let name = self.inner.name.clone();
+        Ok(async move {
+            let _guard = guard;
+            match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+                Ok(r) => r.unwrap_or_else(|_| Err(offline(&name))),
+                Err(_) => Err(CmdError::new(
+                    cmd_errors::FAILED,
+                    format!(
+                        "box {name:?} did not answer {what} within {}s",
+                        REQUEST_TIMEOUT.as_secs()
+                    ),
+                )),
+            }
+        })
     }
 
     /// Asks the runner to stop run `run` (whatever runs, when `None`) of a session the hub

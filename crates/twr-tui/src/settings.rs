@@ -53,10 +53,13 @@ pub enum Key {
     CodexAuto,
     /// `wake_after_secs`, the hub's (shown only).
     WakeAfter,
+    /// The saved loop settings, the hub's: opens the loop settings editor
+    /// ([`crate::loops`]).
+    Loops,
 }
 
 /// The rows, in order.
-pub const KEYS: [Key; 11] = [
+pub const KEYS: [Key; 12] = [
     Key::Suggest,
     Key::SuggestModel,
     Key::Summaries,
@@ -68,6 +71,7 @@ pub const KEYS: [Key; 11] = [
     Key::Colors,
     Key::CodexAuto,
     Key::WakeAfter,
+    Key::Loops,
 ];
 
 /// The compact widths a change steps through (0: never compact).
@@ -380,6 +384,26 @@ fn rows(state: &AppState, s: &Settings) -> Vec<Row> {
                 kept: "wake_after_secs · the hub's: edit the file, then restart the hub".into(),
                 editable: false,
             },
+            Key::Loops => Row {
+                key,
+                label: "Loops",
+                value: match state.loop_settings.as_ref() {
+                    Some(g) if g["settings"].is_object() => {
+                        let s = &g["settings"];
+                        format!(
+                            "{} · reviewer {}",
+                            s["profile"].as_str().unwrap_or("?"),
+                            s["reviewer"]["runtime"].as_str().unwrap_or("?")
+                        )
+                    }
+                    Some(_) => "nothing saved: the first loop shows its setup card".into(),
+                    None => "the review loops' settings".into(),
+                },
+                kept: "the hub's, per workspace or project · Enter opens the loop settings \
+                       editor"
+                    .into(),
+                editable: true,
+            },
         })
         .collect()
 }
@@ -431,7 +455,9 @@ pub fn step(state: &AppState, key: Key, forward: bool) -> Option<Change> {
             Change::CompactWidth(next)
         }
         Key::WsSidebar => Change::WsSidebar(v.sidebar_hidden),
-        Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter => return None,
+        Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter | Key::Loops => {
+            return None
+        }
     })
 }
 
@@ -481,14 +507,31 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
             Span::styled(label, base),
             Span::styled(row.value, value_style),
         ]);
+        // Cut with `…` only when it is too wide; else padded to the width (a selected row is
+        // reversed across it).
+        if head.width() > inner_w {
+            head = Line::from(crate::ui::cut_spans(head.spans, inner_w));
+        }
         let pad = inner_w.saturating_sub(head.width());
         head.spans.push(Span::styled(" ".repeat(pad), base));
-        lines.push(crate::ui::ellipsized(head, inner_w));
-        let kept = format!("{:w$}{}", "", row.kept, w = LABEL + 2);
-        lines.extend(crate::ui::wrap_line(
-            Line::from(Span::styled(kept, dim)),
-            inner_w,
-        ));
+        lines.push(head);
+        // Where it is kept, under the value column, each wrapped row too.
+        let indent = LABEL + 2;
+        let kept = if inner_w >= indent + 12 {
+            crate::ui::wrap_line(
+                Line::from(Span::styled(row.kept.clone(), dim)),
+                inner_w - indent,
+            )
+            .into_iter()
+            .map(|mut l| {
+                l.spans.insert(0, Span::raw(" ".repeat(indent)));
+                l
+            })
+            .collect()
+        } else {
+            crate::ui::wrap_line(Line::from(Span::styled(row.kept.clone(), dim)), inner_w)
+        };
+        lines.extend(kept);
         spans.push((row.key, start..lines.len()));
     }
     lines.push(Line::default());

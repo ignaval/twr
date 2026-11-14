@@ -127,10 +127,17 @@ pub struct BackgroundTask {
     /// another task. 0 in snapshots from before it was kept.
     #[serde(default)]
     pub started_seq: u64,
-    /// A job the hub runs for the thread ([`crate::event::JOB_TASK_PREFIX`]): no end of a
-    /// runtime clears it, only its own end.
+    /// Work the hub runs for the thread: a job ([`crate::event::JOB_TASK_PREFIX`]) or a review
+    /// loop's review run ([`BackgroundTask::review`]). No end of a runtime clears it, only its
+    /// own end.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub job: bool,
+    /// A review loop's review run ([`crate::event::LOOP_TASK_PREFIX`], with [`BackgroundTask::job`]):
+    /// the loop's, not the thread's own work ([`ThreadView::own_background`]); its description
+    /// names the reviewer and its effort (`reviewer gpt-6.1-sol xhigh`), and its
+    /// [`BackgroundTask::started_at`] how long it has run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review: bool,
     /// A job started not to tell its thread when it ends (`ext.twr.job.wake: false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
@@ -395,8 +402,8 @@ pub struct ThreadView {
     /// that freed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trimmed: Option<(DateTime<Utc>, u64)>,
-    /// What its turns spent: tokens and cost, summed from `turn.ended` `usage`
-    /// ([`crate::usage::Spent`]).
+    /// What its turns and its loops' review runs spent: tokens and cost, summed from
+    /// `turn.ended` and `loop.findings` `usage` ([`crate::usage::Spent`]).
     #[serde(default, skip_serializing_if = "crate::usage::Spent::is_empty")]
     pub spent: crate::usage::Spent,
     /// How full its session's context is: the latest `turn.ended` `context`, then what a
@@ -437,6 +444,12 @@ pub struct ThreadView {
     /// Stopped (`thread.stopped`, except the one closing a runtime restarted for a mode,
     /// model or effort change, [`is_settings_restart`]).
     pub stopped: bool,
+    /// Stopped by the hub's own shutdown (`thread.stopped` `ext.twr.reason`
+    /// [`HUB_SHUTDOWN_REASON`]), not by anyone: the thread goes on, and so does its loop, as
+    /// soon as it is sent something, and a loop may start on it (`loop.request` refuses a
+    /// thread someone stopped). Only while `stopped`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped_by_hub: bool,
     /// Crashed since the last turn started.
     pub crashed: bool,
     /// The turn the latest crash took down: the turn open at `thread.crashed`, or, when the hub
@@ -468,9 +481,86 @@ pub struct ThreadView {
     /// for an orchestrator and for a view no registry folded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<u8>,
+    /// The loop it runs, from its `loop.started` to its `loop.ended`
+    /// ([`crate::loops::LoopState`], folded by [`crate::loops::LoopState::apply`], the code
+    /// the hub's driver steps with). A loop also ends, `stopped`, when its thread is stopped
+    /// by anyone (not a runtime restarted in new settings, nor one the hub's own shutdown
+    /// stopped: the loop goes on when the hub starts again), parked, deleted or restored from
+    /// the trash, whether or not the hub wrote its `loop.ended`. A crash leaves it: the hub
+    /// pauses it, stuck, until the user resumes or stops it.
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub r#loop: Option<crate::loops::LoopView>,
+    /// The last loop that ended on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_loop: Option<LastLoop>,
 }
 
+/// The last loop that ended on a thread ([`ThreadView::last_loop`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LastLoop {
+    /// Its id.
+    pub id: String,
+    /// Its kind.
+    pub kind: crate::loops::LoopKind,
+    /// How it ended.
+    pub outcome: crate::loops::Outcome,
+    /// The thread's turn when it ended (its report turn, for a loop that reported).
+    pub ended_turn: Option<u64>,
+    /// What it committed, as the hub's check found it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<crate::loops::contract::Commit>,
+    /// Its commit's check failed twice: what is left (`not committed`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_problem: Option<String>,
+    /// Who asked for it: left out for the user.
+    #[serde(skip_serializing_if = "crate::loops::ControlBy::is_user")]
+    pub requested_by: crate::loops::ControlBy,
+}
+
+/// `ext.twr.reason` of the `thread.stopped` the hub records for a runtime its own shutdown
+/// stopped (`twr-hub`'s `HUB_SHUTDOWN`): no one stopped the thread, and its loop goes on.
+pub const HUB_SHUTDOWN_REASON: &str = "hub_shutdown";
+
 impl ThreadView {
+    /// Folds a `loop.*` event of its loop into [`ThreadView::r#loop`]: a `loop.started`
+    /// starts one (of either kind; one with a profile that has nothing to run starts none), the
+    /// others apply to it, and a loop that ended moves to [`ThreadView::last_loop`].
+    fn apply_loop(&mut self, ev: &Event) {
+        if let EventBody::LoopStarted(p) = &ev.body {
+            self.r#loop = crate::loops::LoopState::start(p).ok().map(|(s, _)| s);
+            return;
+        }
+        let Some(l) = &mut self.r#loop else {
+            return;
+        };
+        l.apply(ev);
+        if l.ended {
+            self.end_loop(None);
+        }
+    }
+
+    /// Its loop is over: into [`ThreadView::last_loop`], with `outcome` when the loop did not
+    /// end itself (its thread was stopped, parked, deleted or restored: `stopped`).
+    pub fn end_loop(&mut self, outcome: Option<crate::loops::Outcome>) {
+        let Some(l) = self.r#loop.take() else {
+            return;
+        };
+        self.last_loop = Some(LastLoop {
+            outcome: outcome
+                .or(l.outcome.filter(|_| l.ended))
+                .unwrap_or(crate::loops::Outcome::Stopped),
+            id: l.id,
+            kind: l.kind,
+            commits: l.commits,
+            commit_problem: l.commit_problem,
+            requested_by: l.requested_by,
+            ended_turn: self
+                .current_turn
+                .or(self.last_turn.as_ref().map(|t| t.turn)),
+        });
+    }
+
     /// Who it was, alone: its id, name, former names, aliases, role, color, box and creation
     /// time (what [`Registry`] keeps of a thread purged from the trash).
     pub fn identity(&self) -> ThreadView {
@@ -492,9 +582,12 @@ impl ThreadView {
     }
 
     /// Whether the thread has background work of its own: a task of its runtime's or a job,
-    /// not a `!` command the user runs ([`BackgroundTask::shell`]).
+    /// not a `!` command the user runs ([`BackgroundTask::shell`]) nor its loop's review run
+    /// ([`BackgroundTask::review`]: the loop's own next step follows its end).
     pub fn own_background(&self) -> bool {
-        self.background_tasks.values().any(|t| !t.shell)
+        self.background_tasks
+            .values()
+            .any(|t| !t.shell && !t.review)
     }
 
     /// An empty view for `id`.
@@ -513,9 +606,10 @@ impl ThreadView {
         if self.created_at.is_none() {
             self.created_at = Some(ev.ts);
         }
-        // Hub conversation facts, what the hub measures or trims of its worktree, and its
-        // jobs are not activity from this runtime.
-        if !is_job_task(&ev.source, &ev.body)
+        // Hub conversation facts, what the hub measures or trims of its worktree, its jobs and
+        // review runs and its loop's steps are not activity from this runtime.
+        if !is_hub_task(&ev.source, &ev.body)
+            && !ev.kind().starts_with("loop.")
             && !matches!(
                 ev.body,
                 EventBody::ConversationUpdate(_)
@@ -609,6 +703,7 @@ impl ThreadView {
                 self.compacting = None;
                 self.set_session(&p.session_id);
                 self.stopped = false;
+                self.stopped_by_hub = false;
                 self.actual_model = reported_model(p.ext.as_ref()).map(str::to_string);
             }
             EventBody::ThreadResumed(p) => {
@@ -617,11 +712,13 @@ impl ThreadView {
                 self.task_tracking_closed = false;
                 self.parked = false;
                 self.stopped = false;
+                self.stopped_by_hub = false;
             }
             EventBody::ThreadParked(p) => {
                 self.set_session(&p.session_id);
                 self.parked = true;
                 self.close_for_exit();
+                self.end_loop(Some(crate::loops::Outcome::Stopped));
             }
             EventBody::ThreadStopped(p) => {
                 self.set_session(&p.session_id);
@@ -629,6 +726,11 @@ impl ThreadView {
                 // stopped by anyone: the thread keeps its status while its runtime starts again.
                 if !is_settings_restart(p) {
                     self.stopped = true;
+                    self.stopped_by_hub =
+                        twr_str(p.ext.as_ref(), "reason") == Some(HUB_SHUTDOWN_REASON);
+                    if !self.stopped_by_hub {
+                        self.end_loop(Some(crate::loops::Outcome::Stopped));
+                    }
                 }
                 self.close_for_exit();
             }
@@ -649,6 +751,7 @@ impl ThreadView {
                 self.open_attention.clear();
                 self.git = None;
                 self.close_for_exit();
+                self.end_loop(Some(crate::loops::Outcome::Stopped));
             }
             EventBody::ThreadRenamed(p) => {
                 if p.name != self.name {
@@ -732,6 +835,7 @@ impl ThreadView {
                 self.current_turn_compact = true;
                 // (A crash before it stays the thread's failure: `crashed`, `crashed_turn`.)
                 self.stopped = false;
+                self.stopped_by_hub = false;
                 self.parked = false;
             }
             EventBody::TurnStarted(p) => {
@@ -775,6 +879,7 @@ impl ThreadView {
                 self.crashed = false;
                 self.crashed_turn = None;
                 self.stopped = false;
+                self.stopped_by_hub = false;
                 self.parked = false;
                 self.reported = false;
             }
@@ -823,8 +928,10 @@ impl ThreadView {
                 self.reported = false;
             }
             EventBody::TaskUpdated(p) => {
-                // A job runs whatever the runtime does; only the hub records one.
-                let job = is_job_task(&ev.source, &ev.body);
+                // A job or a review run runs whatever the runtime does; only the hub records
+                // one.
+                let job = is_hub_task(&ev.source, &ev.body);
+                let review = is_loop_task(&ev.source, &ev.body);
                 if p.running
                     && !p.task_id.is_empty()
                     && (job || (!self.stopped && !self.parked && !self.task_tracking_closed))
@@ -837,6 +944,7 @@ impl ThreadView {
                             updated_at: ev.ts,
                             started_seq: ev.seq,
                             job,
+                            review,
                             group: None,
                             quiet: job
                                 && p.ext
@@ -952,6 +1060,34 @@ impl ThreadView {
                     self.forget_cache();
                 }
             }
+            EventBody::LoopFindings(p) => {
+                // What a review run spent is the thread's too.
+                if let Some(u) = &p.usage {
+                    self.spent.add(u);
+                }
+                self.apply_loop(ev);
+            }
+            EventBody::LoopAudit(p) => {
+                // What an audit run spent is the thread's too, as a review run's.
+                if let Some(u) = &p.usage {
+                    self.spent.add(u);
+                }
+                self.apply_loop(ev);
+            }
+            EventBody::LoopStarted(_)
+            | EventBody::LoopRules(_)
+            | EventBody::LoopAuditStarted(_)
+            | EventBody::LoopBox(_)
+            | EventBody::LoopPhase(_)
+            | EventBody::LoopReviewStarted(_)
+            | EventBody::LoopTriage(_)
+            | EventBody::LoopLedger(_)
+            | EventBody::LoopTransition(_)
+            | EventBody::LoopControl(_)
+            | EventBody::LoopPlan(_)
+            | EventBody::LoopImplemented(_)
+            | EventBody::LoopCommit(_)
+            | EventBody::LoopEnded(_) => self.apply_loop(ev),
             EventBody::ConversationUpdate(p) => {
                 match twr_str(p.ext.as_ref(), IDLE_COMPACTION_KEY) {
                     Some("off") => self.idle_compaction_off = true,
@@ -1454,10 +1590,12 @@ impl Registry {
             return;
         }
         if let EventBody::ThreadDeleted(d) = &ev.body {
-            let view = self
+            let mut view = self
                 .threads
                 .remove(&ev.thread)
                 .unwrap_or_else(|| ThreadView::new(ev.thread.clone()));
+            // (A deleted thread's loop is over.)
+            view.end_loop(Some(crate::loops::Outcome::Stopped));
             self.deleted.insert(ev.thread.clone(), view);
             match &d.trash {
                 Some(item) => self.deleted_items.insert(ev.thread.clone(), item.clone()),
@@ -1694,6 +1832,15 @@ pub struct AttentionItem {
     /// proposals, which only the user answers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub proposal: bool,
+    /// A loop's setup card ([`is_loop_setup_card`], raised by the hub): it blocks no thread
+    /// (its reason is `review`, so its thread keeps working while it is open), but it is the
+    /// user's to answer and is ordered with the questions ([`AttentionItem::rank`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_setup: bool,
+    /// A stuck loop's item ([`is_loop_stuck_item`], raised by the hub, reason `error`): the
+    /// user's alone to answer (`resume` or `stop`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_stuck: bool,
     /// What a permission or question was raised in ([`RequestContext::of`]), when its event
     /// says anything about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1770,21 +1917,31 @@ impl RequestContext {
 }
 
 impl AttentionItem {
+    /// Where it stands in the stack's order: its reason's priority, a loop's setup card that
+    /// of a question.
+    pub fn rank(&self) -> u8 {
+        if self.loop_setup {
+            AttentionReason::Question.priority()
+        } else {
+            self.reason.priority()
+        }
+    }
+
     /// Whether the client-local pin set pins this item (by attn_id or by thread id).
     pub fn is_pinned(&self, pins: &HashSet<String>) -> bool {
         pins.contains(&self.attn_id) || pins.contains(&self.thread)
     }
 }
 
-/// Attention ordering: reason priority (permission, question, error, review, stalled), then
-/// age (older first), then pin (pinned first), then event id for determinism.
+/// Attention ordering: reason priority (permission, question, error, review, stalled; a
+/// loop's setup card with the questions, [`AttentionItem::rank`]), then age (older first), then
+/// pin (pinned first), then event id for determinism.
 ///
 /// Pins are client-local view state; an entry pins an item when it equals the
 /// item's attn_id or thread id.
 pub fn compare_attention(a: &AttentionItem, b: &AttentionItem, pins: &HashSet<String>) -> Ordering {
-    a.reason
-        .priority()
-        .cmp(&b.reason.priority())
+    a.rank()
+        .cmp(&b.rank())
         .then(a.raised_at.cmp(&b.raised_at))
         .then(b.is_pinned(pins).cmp(&a.is_pinned(pins)))
         .then(a.event_id.cmp(&b.event_id))
@@ -1842,6 +1999,8 @@ impl AttentionStack {
                     item.call_id = p.call_id.clone();
                     item.revision = revision;
                     item.proposal = is_confirm_card(&ev.thread, &p.ext);
+                    item.loop_setup = ev.source == Source::Hub && is_loop_setup_card(&p.ext);
+                    item.loop_stuck = ev.source == Source::Hub && is_loop_stuck_item(&p.ext);
                     item.context = RequestContext::of(p.reason, &p.ext);
                     return;
                 }
@@ -1860,6 +2019,8 @@ impl AttentionStack {
                         revision,
                         first_revision: revision,
                         proposal: is_confirm_card(&ev.thread, &p.ext),
+                        loop_setup: ev.source == Source::Hub && is_loop_setup_card(&p.ext),
+                        loop_stuck: ev.source == Source::Hub && is_loop_stuck_item(&p.ext),
                         context: RequestContext::of(p.reason, &p.ext),
                     },
                 );
@@ -5095,5 +5256,239 @@ mod tests {
         view.apply(&script.event(start));
         assert_eq!(view.status(), S::Background);
         assert!(view.current_turn.is_none());
+    }
+
+    /// A loop started on a thread, stepped by the machine: the view's `loop` is the
+    /// machine's state at every step, and its end moves it to `last_loop`.
+    #[test]
+    fn a_thread_folds_its_loop() {
+        use crate::loops::config::{Profile, ReviewerChoice};
+        use crate::loops::{line, Action, Input, LoopState, Outcome, Phase};
+        let mut t = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.event(EventBody::ThreadCreated(ThreadCreated {
+            name: "api".into(),
+            runtime: "fake".into(),
+            ..Default::default()
+        })));
+        let started = LoopStarted {
+            id: "l1".into(),
+            profile: Profile::builtin("high").unwrap(),
+            max_rounds_per_tier: 25,
+            settings: crate::loops::settings::LoopSettings {
+                profile: "high".into(),
+                reviewer: ReviewerChoice::parse("codex/gpt-6.1-sol").unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (mut m, first) = LoopState::start(&started).unwrap();
+        v.apply(&t.event(EventBody::LoopStarted(Box::new(started))));
+        let mut feed = |v: &mut ThreadView, actions: Vec<Action>| {
+            for a in actions {
+                if let Action::Record(body) = a {
+                    v.apply(&t.event(body));
+                }
+            }
+        };
+        feed(&mut v, first);
+        assert_eq!(v.r#loop.as_ref(), Some(&m));
+        assert_eq!(line(v.r#loop.as_ref().unwrap()), "high · scope");
+        let now = crate::testkit::base_time();
+        let mut step = |v: &mut ThreadView, m: &mut LoopState, input| {
+            feed(v, m.step(input, now).unwrap());
+            assert_eq!(
+                v.r#loop.as_ref().filter(|_| !m.ended),
+                (!m.ended).then_some(&*m)
+            );
+        };
+        step(&mut v, &mut m, Input::GoalWritten { goal: "G".into() });
+        // (Not `unchanged`: the verification runs rather than being skipped.)
+        for round in ["m1", "x1", "v1"] {
+            step(
+                &mut v,
+                &mut m,
+                Input::ReviewAnswered {
+                    round: round.into(),
+                    findings: vec![],
+                    answer_path: None,
+                    usage: None,
+                    unchanged: false,
+                },
+            );
+        }
+        assert_eq!(v.r#loop.as_ref().unwrap().phase, Phase::Report);
+        step(
+            &mut v,
+            &mut m,
+            Input::ReportWritten {
+                report_path: "/r.md".into(),
+            },
+        );
+        assert_eq!(v.r#loop, None);
+        assert_eq!(
+            v.last_loop,
+            Some(LastLoop {
+                id: "l1".into(),
+                kind: crate::loops::LoopKind::Review,
+                outcome: Outcome::Clean,
+                ended_turn: None,
+                ..Default::default()
+            })
+        );
+        // Serialized as `loop`, and gone when there is none.
+        let j = serde_json::to_value(&v).unwrap();
+        assert!(j.get("loop").is_none());
+        assert_eq!(j["last_loop"]["outcome"], "clean");
+    }
+
+    /// What stopping, parking, deleting or restoring a thread does to its loop, and what a
+    /// crash, a restart in new settings and the hub's own shutdown do not.
+    #[test]
+    fn a_stopped_parked_or_deleted_thread_has_no_loop() {
+        use crate::loops::config::Profile;
+        let started = |t: &mut ThreadScript| {
+            t.event(EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "l1".into(),
+                profile: Profile::builtin("low").unwrap(),
+                ..Default::default()
+            })))
+        };
+        let reason = |r: &str| SessionPayload {
+            ext: Some(
+                serde_json::json!({"twr": {"reason": r}})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ..Default::default()
+        };
+        let mut t = ThreadScript::new("t1");
+        for (body, keeps) in [
+            (EventBody::ThreadStopped(SessionPayload::default()), false),
+            (EventBody::ThreadParked(SessionPayload::default()), false),
+            (EventBody::ThreadStopped(reason(HUB_SHUTDOWN_REASON)), true),
+            (EventBody::ThreadStopped(reason(MODEL_RESTART_REASON)), true),
+            (EventBody::ThreadCrashed(ThreadCrashed::default()), true),
+        ] {
+            let mut v = ThreadView::new("t1");
+            v.apply(&started(&mut t));
+            assert!(v.r#loop.is_some());
+            let kind = body.kind().to_string();
+            let by_hub = matches!(&body, EventBody::ThreadStopped(p)
+                if twr_str(p.ext.as_ref(), "reason") == Some(HUB_SHUTDOWN_REASON));
+            v.apply(&t.event(body));
+            assert_eq!(v.r#loop.is_some(), keeps, "{kind}");
+            // Who stopped it: the hub's shutdown only for its own reason; started again, no one.
+            assert_eq!(v.stopped_by_hub, by_hub, "{kind}");
+            if by_hub {
+                assert!(v.stopped);
+                v.apply(&t.event(EventBody::ThreadStarted(SessionPayload::default())));
+                assert!(!v.stopped && !v.stopped_by_hub);
+            }
+            if !keeps {
+                assert_eq!(
+                    v.last_loop.as_ref().map(|l| l.outcome),
+                    Some(crate::loops::Outcome::Stopped),
+                    "{kind}"
+                );
+            }
+        }
+        // Deleted: the registry's deleted view keeps no loop.
+        let mut r = Registry::default();
+        let mut a = ThreadScript::new("a");
+        r.apply(&a.event(EventBody::ThreadCreated(ThreadCreated {
+            name: "a".into(),
+            ..Default::default()
+        })));
+        r.apply(&started(&mut a));
+        assert!(r.threads["a"].r#loop.is_some());
+        r.apply(&a.event(EventBody::ThreadDeleted(ThreadDeleted {
+            name: "a".into(),
+            ..Default::default()
+        })));
+        assert!(r.deleted["a"].r#loop.is_none());
+        // An implementation loop starts one too, in its plan phase, and its new steps fold
+        // into it; one with a profile that has nothing to run starts none.
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.event(EventBody::LoopStarted(Box::new(LoopStarted {
+            id: "l2".into(),
+            kind: crate::loops::LoopKind::Implement,
+            profile: Profile::builtin("low").unwrap(),
+            ..Default::default()
+        }))));
+        assert_eq!(
+            v.r#loop.as_ref().map(|l| l.phase),
+            Some(crate::loops::Phase::Plan)
+        );
+        v.apply(&t.event(EventBody::LoopPlan(crate::event::LoopPlanned {
+            id: "l2".into(),
+            revision: 1,
+            ..Default::default()
+        })));
+        assert_eq!(
+            v.r#loop.as_ref().map(|l| l.phase),
+            Some(crate::loops::Phase::Implement)
+        );
+        assert_eq!(
+            crate::loops::line(v.r#loop.as_ref().unwrap()),
+            "low · implementing"
+        );
+        v.apply(&t.event(EventBody::LoopEnded(LoopEnded {
+            id: "l2".into(),
+            outcome: crate::loops::Outcome::Clean,
+            commits: vec![crate::loops::contract::Commit {
+                repo: "/w".into(),
+                sha: "abc1234".into(),
+            }],
+            ..Default::default()
+        })));
+        let last = v.last_loop.as_ref().unwrap();
+        assert_eq!(last.kind, crate::loops::LoopKind::Implement);
+        assert_eq!(last.commits.len(), 1);
+        assert_eq!(last.commit_problem, None);
+        let mut empty = Profile::builtin("low").unwrap();
+        empty.tiers.clear();
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.event(EventBody::LoopStarted(Box::new(LoopStarted {
+            id: "l3".into(),
+            kind: crate::loops::LoopKind::Implement,
+            profile: empty,
+            ..Default::default()
+        }))));
+        assert!(v.r#loop.is_none());
+    }
+
+    /// The loop line and its badge.
+    #[test]
+    fn loop_lines() {
+        use crate::loops::{badge, line, LoopKind, LoopView, Phase, VerifyProgress};
+        let view = |phase, round: Option<&str>, ledger, paused| LoopView {
+            profile: "high".into(),
+            phase,
+            round: round.map(str::to_string),
+            ledger,
+            paused,
+            verify: VerifyProgress { done: 0, cap: 2 },
+            ..Default::default()
+        };
+        assert_eq!(
+            line(&view(Phase::Ladder, Some("m3"), 2, false)),
+            "high · ladder m3 · ledger 2"
+        );
+        assert_eq!(
+            line(&view(Phase::Verify, Some("v1"), 0, false)),
+            "high · verify 1/2"
+        );
+        assert_eq!(line(&view(Phase::Sweep, None, 0, false)), "high · sweep");
+        assert_eq!(
+            line(&view(Phase::Scope, None, 0, true)),
+            "high · scope · paused"
+        );
+        let mut stuck = view(Phase::Ladder, Some("x2"), 1, true);
+        stuck.stuck = Some("review round x2 failed twice".into());
+        assert_eq!(line(&stuck), "high · ladder x2 · ledger 1 · stuck");
+        assert_eq!(badge(LoopKind::Review), "REVIEW LOOP");
+        assert_eq!(badge(LoopKind::Implement), "IMPLEMENT LOOP");
     }
 }

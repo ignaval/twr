@@ -20,6 +20,17 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { qaSource } from "../../scripts/qa-source.mjs";
+import {
+  IOS_ACCEPT_CONFIRM,
+  IOS_TAP,
+  commandChannel,
+  loopFixture,
+  loopQA,
+  loopReadOnlyQA,
+  pairInApp,
+  revokeInApp,
+  surfacesQA,
+} from "./loop-qa.mjs";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const kind = process.env.TWR_IOS_KIND?.trim() || "all";
 const defaultRuntimes = { phone: "27.0", fold: "27.1", tablet: "27.0" };
@@ -156,6 +167,11 @@ const selected = requestedKinds.map((family) => {
   return { family, template, runtime };
 });
 const bin = resolve("../target/debug");
+// TWR_IOS_LOOP_ONLY=1 runs only the review-loop QA (testReviewLoops pairs the app itself).
+const loopOnly = process.env.TWR_IOS_LOOP_ONLY === "1";
+// TWR_SURFACES_QA_ONLY=1 (with TWR_IOS_LOOP_ONLY=1) runs only the shared surfaces' audit.
+const surfacesOnly = process.env.TWR_SURFACES_QA_ONLY === "1";
+const loopShots = process.env.TWR_LOOP_QA_SHOTS || "test-results/loops";
 const execFileAsync = promisify(execFile);
 mkdirSync("test-results/ios", { recursive: true });
 for (const [
@@ -301,8 +317,13 @@ for (const [
     `default_runtime = "fake"\n[projects.demo]\nrepo = ${JSON.stringify(repo)}\n[orchestrator]\nruntime = "fake"\nautostart = false\n[tui]\nsuggest = false\nsummaries = false\n`,
     { mode: 0o600 },
   );
+  // A fake reviewer and loop templates, for the review-loop QA (loop-qa.mjs).
+  const loops = loopFixture(fixture);
+  const channel = commandChannel();
+  let offline = false;
   const env = {
     ...process.env,
+    ...loops.env,
     TWR_HOME: fixture,
     HOME: fixture,
     TWR_TEST_USER_TOKEN_FILE: token,
@@ -471,6 +492,7 @@ for (const [
     }
 
     server = createServer(async (req, res) => {
+      if (await channel.handle(req, res)) return;
       res.setHeader("content-type", "application/json");
       if (req.url === "/fixture") {
         try {
@@ -593,6 +615,10 @@ for (const [
     });
     await new Promise((r) => server.listen(47423, "127.0.0.1", r));
     proxy = createProxy((socket) => {
+      if (offline) {
+        socket.destroy();
+        return;
+      }
       const upstream = connectTCP(47421, "127.0.0.1");
       for (const current of [socket, upstream]) {
         proxySockets.add(current);
@@ -637,13 +663,122 @@ for (const [
         "-test-timeouts-enabled",
         "YES",
         "-maximum-test-execution-time-allowance",
-        "600",
+        "1800",
+        ...(loopOnly
+          ? ["-only-testing:AppTests/RemoteHubTests/testReviewLoops"]
+          : []),
         "CODE_SIGNING_ALLOWED=YES",
         "CODE_SIGN_IDENTITY=-",
       ],
       { stdio: "inherit" },
     );
-    const exit = await new Promise((r) => test.on("exit", r));
+    const exited = new Promise((r) => test.on("exit", r));
+    // Review loops, on the phone only: the host drives testReviewLoops (loop-qa.mjs).
+    let loopOutcome;
+    if (family === "phone") {
+      channel.enable();
+      const sim = (...args) =>
+        execFileSync("xcrun", ["simctl", ...args], { stdio: "ignore" });
+      const driver = {
+        platform: "ios",
+        evaluate: (source, arg) =>
+          channel.call("js", { source, arg: JSON.stringify(arg ?? null) }),
+        tap: (point) =>
+          channel.call("js", { source: IOS_TAP, arg: JSON.stringify(point) }),
+        shot: (file) => sim("io", device.udid, "screenshot", file),
+        appearance: (mode) => sim("ui", device.udid, "appearance", mode),
+        orientation: (value) => channel.call("orient", { value }),
+        textSize: (size) =>
+          sim(
+            "ui",
+            device.udid,
+            "content_size",
+            size === "largest"
+              ? "accessibility-extra-extra-extra-large"
+              : "large",
+          ),
+        offline(on) {
+          offline = on;
+          if (on) for (const socket of proxySockets) socket.destroy();
+        },
+        owner: ownerCall,
+        async nativeConfirm(click) {
+          await channel.call("js", { source: IOS_ACCEPT_CONFIRM, arg: "null" });
+          await click();
+        },
+      };
+      loopOutcome = Promise.race([
+        channel.started,
+        exited.then(() => {
+          throw new Error("XCTest ended before testReviewLoops ran");
+        }),
+      ])
+        .then(async () => {
+          if (loopOnly) {
+            const { code } = await ownerCall("device.pair_begin", {
+              scopes: ["read", "operate", "admin", "terminal"],
+            });
+            await pairInApp(driver, {
+              url: "http://127.0.0.1:47424",
+              code,
+              name: "iOS loop QA",
+            });
+          }
+          const options = { shots: loopShots, label: "ios" };
+          if (!surfacesOnly) {
+            const report = await loopQA(driver, loops, options);
+            writeFileSync(
+              join(loopShots, "ios-loop-qa.json"),
+              JSON.stringify(report, null, 2),
+            );
+            console.log("PASS: review loops on an iPhone");
+            loops.releaseAll();
+          }
+          // The cards, a thread's details, the conversation's header and the composer.
+          await surfacesQA(driver, loops, options);
+          console.log("PASS: the shared surfaces' audit on an iPhone");
+          if (surfacesOnly) {
+            channel.finish();
+            return;
+          }
+          const { code } = await ownerCall("device.pair_begin", {
+            scopes: ["read"],
+          });
+          await revokeInApp(driver);
+          await pairInApp(driver, {
+            url: "http://127.0.0.1:47424",
+            code,
+            name: "iOS read only",
+          });
+          const readOnly = await loopReadOnlyQA(driver, loops, {
+            ...options,
+            step: 60,
+          });
+          writeFileSync(
+            join(loopShots, "ios-loop-qa-read.json"),
+            JSON.stringify(readOnly, null, 2),
+          );
+          console.log("PASS: review loops on a read-only iPhone");
+          channel.finish();
+        })
+        .catch((error) => {
+          channel.finish(String(error.stack || error).slice(0, 4000));
+          throw error;
+        })
+        .finally(() => {
+          loops.releaseAll();
+          offline = false;
+          for (const args of [
+            ["ui", device.udid, "content_size", "large"],
+            ["ui", device.udid, "appearance", "dark"],
+          ])
+            try {
+              sim(...args);
+            } catch {}
+        });
+      loopOutcome.catch(() => {});
+    }
+    const exit = await exited;
     if (!existsSync(screenshot)) {
       console.warn(
         "Friendly PNG export missing; native app snapshots are retained in the XCTest result bundle.",
@@ -669,6 +804,7 @@ for (const [
         }
       }
     }
+    if (loopOutcome) await loopOutcome;
     assert.equal(exit, 0, `${device.name} native integration tests must pass`);
     if (existsSync(performancePath)) {
       const report = JSON.parse(readFileSync(performancePath, "utf8"));

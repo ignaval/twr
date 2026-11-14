@@ -399,6 +399,9 @@ export class FakeElement extends FakeNode {
     const value = this.getAttribute("tabindex");
     return value == null ? 0 : Number(value);
   }
+  set tabIndex(value: number) {
+    this.setAttribute("tabindex", String(value));
+  }
   get children() {
     return this.childNodes.filter(
       (node): node is FakeElement => node instanceof FakeElement,

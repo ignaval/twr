@@ -112,17 +112,30 @@ impl Core {
             // dropped, and nothing is dropped unless the thread is stopped.
             let plan = if view.current_turn.is_some() {
                 self.closing_plan(&id, Exit::Stopped).map_err(append_err)?
-            } else if !view.stopped {
-                VecDeque::from([Planned {
-                    turn: None,
-                    source: caller.source(),
-                    body: EventBody::ThreadStopped(SessionPayload {
-                        session_id: view.session_id.clone(),
-                        ..Default::default()
-                    }),
-                }])
             } else {
-                VecDeque::new()
+                // Its loop ends, and its setup card goes, with the stop (`hub::loops`; the
+                // closing sequence above records them itself), also when the thread counts as
+                // stopped already (by the hub's shutdown): the user stopped it now.
+                let mut plan: VecDeque<Planned> = self
+                    .loop_closing(&id, "stopped")
+                    .into_iter()
+                    .map(|body| Planned {
+                        turn: None,
+                        source: Source::Hub,
+                        body,
+                    })
+                    .collect();
+                if !view.stopped {
+                    plan.push_back(Planned {
+                        turn: None,
+                        source: caller.source(),
+                        body: EventBody::ThreadStopped(SessionPayload {
+                            session_id: view.session_id.clone(),
+                            ..Default::default()
+                        }),
+                    });
+                }
+                plan
             };
             let mut batch = Batch {
                 drop_queues: vec![id.clone()],
@@ -252,10 +265,28 @@ impl Hub {
     /// removed again.
     pub async fn new_thread_bound(
         &self,
-        mut req: NewThread,
+        req: NewThread,
         caller: &Caller,
         bound: Option<&OrchCall>,
     ) -> Result<Value, RpcError> {
+        let (mut out, pending) = self.new_thread_made(req, caller, bound).await?;
+        // The loop, once the thread is recorded with its worktree (`hub::loops`): it starts
+        // on saved settings (the plan prompt is the thread's first turn) or raises its setup
+        // card holding the task; the thread is idle meanwhile, and stays so after a cancel.
+        if let Some((id, l)) = pending {
+            out["loop"] = self.new_thread_loop(&id, l, caller).await;
+        }
+        Ok(out)
+    }
+
+    /// [`Hub::new_thread_bound`] up to the thread recorded: its JSON, and the loop it asked for
+    /// with its id.
+    async fn new_thread_made(
+        &self,
+        mut req: NewThread,
+        caller: &Caller,
+        bound: Option<&OrchCall>,
+    ) -> Result<(Value, Option<(String, super::NewThreadLoop)>), RpcError> {
         let cfg = &self.inner.config;
         let bound = match caller.is_orchestrator() {
             true => bound
@@ -288,6 +319,23 @@ impl Hub {
         }
         let no_worktree = req.no_worktree
             || !(req.worktree || req.base.is_some() || cfg.project_worktree(&req.project));
+        // A thread asked for with a loop and no runtime or model of its own runs on the loop's
+        // named implementer (`the thread's own`: the project's, as without a loop).
+        if let Some(l) = req.loop_req.clone() {
+            if req.runtime.is_none() && req.model.is_none() {
+                if let Some(m) = self
+                    .new_thread_implementer(&l, &target.project, &box_name)
+                    .await
+                {
+                    req.runtime = Some(match &m.account {
+                        Some(a) => format!("{}:{a}", m.runtime),
+                        None => m.runtime.clone(),
+                    });
+                    req.model = Some(m.model.clone());
+                    req.effort = m.effort.clone();
+                }
+            }
+        }
         let spec = self.thread_runtime(&req, caller, target.runtime.as_deref(), &host)?;
         // The configured project whose account pins apply: the one named, else the one of the
         // repository the path is in, however it names it (looked up only when a pin could
@@ -304,6 +352,10 @@ impl Hub {
             self.thread_account(&req, caller, &spec, pins_project.as_deref(), &box_name)?;
         let runtime = spec.runtime.clone();
         let mode = self.thread_mode(&req, caller, &runtime)?;
+        if let Some(l) = &req.loop_req {
+            let name = req.name.as_deref().unwrap_or(&target.project);
+            self.check_new_thread_loop(l, caller, name, &box_name, &runtime, &mode)?;
+        }
         let model = thread_model(&req, cfg)?;
         let local = !host.is_remote();
         let effort = thread_effort(&req, &runtime)?;
@@ -480,7 +532,8 @@ impl Hub {
                 "repo": path.to_string_lossy(),
             });
         }
-        Ok(out)
+        let pending = req.loop_req.take().map(|l| (id.clone(), l));
+        Ok((out, pending))
     }
 
     /// Refuses the orchestrator (`bad_request`) or a paired device without `admin`

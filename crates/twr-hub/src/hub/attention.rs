@@ -21,13 +21,14 @@ use super::{
 
 impl Hub {
     /// `attention.list`: open attention items in stack order, each with its thread's `name`.
-    /// Without `all`, only items that block a thread (permission, question).
+    /// Without `all`, only items that block a thread (permission, question), loops' setup
+    /// cards and stuck loops' items (the user's to answer, though they block nothing).
     pub fn attention_list(&self, all: bool) -> Vec<Value> {
         let core = self.inner.core();
         core.attention
             .ordered(&HashSet::new())
             .into_iter()
-            .filter(|i| all || i.reason.is_blocking())
+            .filter(|i| all || i.reason.is_blocking() || i.loop_setup || i.loop_stuck)
             .map(|i| {
                 let mut j = serde_json::to_value(i).unwrap_or(Value::Null);
                 let name = core
@@ -290,6 +291,20 @@ impl Core {
         // The item at its current revision: everything below judges (and records) this one.
         let item = self.open_item(attn_id)?;
         self.check_answer_basis(attn_id, &item, caller, basis)?;
+        // A loop's setup card: only the user answers it, and its start writes the loop's
+        // start with the answer (`hub::loops`); a dismissal is a cancel.
+        if let Some(card) = self.loops.cards.get(attn_id).cloned() {
+            return self
+                .answer_loop_card(hub, &item, &card, response, caller)
+                .map(|ev| Relay::Applied(Box::new(ev)));
+        }
+        // A stuck loop's item: only the user answers it; `resume` and `stop` control the loop
+        // with the answer (`hub::loops`).
+        if let Some(thread) = self.loops.stuck.get(attn_id).cloned() {
+            return self
+                .answer_stuck_item(hub, &item, &thread, response, caller)
+                .map(|ev| Relay::Applied(Box::new(ev)));
+        }
         let dismiss = matches!(response, Response::Dismiss);
         if dismiss {
             self.refuse_runtime_dismiss(attn_id, &item)?;

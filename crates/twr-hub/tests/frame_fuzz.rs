@@ -290,7 +290,92 @@ fn spawn_config(rng: &mut Rng) -> WireSpawnConfig {
     }
 }
 
+/// A loop op ([`Op::LoopGit`] and the other `loop_*` ops, inventory `loops` version 1).
+fn loop_op(rng: &mut Rng) -> Op {
+    use twr_core::runner::{LoopAcp, LoopFile, LoopFileName, LoopGitQuery, LoopRunSpec};
+    let paths = |r: &mut Rng| BTreeMap::from([(string(r), opt(r, string))]);
+    match rng.below(9) {
+        0 => Op::LoopGit {
+            query: LoopGitQuery::Scope {
+                dir: string(rng).into(),
+                name: string(rng),
+                base_ref: opt(rng, string),
+                scope: opt(rng, |_| twr_core::loops::settings::Scope::Uncommitted),
+            },
+        },
+        1 => Op::LoopGit {
+            query: LoopGitQuery::Baseline {
+                dir: string(rng).into(),
+                name: string(rng),
+            },
+        },
+        2 => Op::LoopGit {
+            query: LoopGitQuery::Diff {
+                repo: string(rng).into(),
+                base: string(rng),
+                baseline: paths(rng),
+                save: opt(rng, |r| LoopFileName {
+                    loop_id: string(r),
+                    name: string(r),
+                }),
+                digest_only: rng.chance(50),
+            },
+        },
+        3 => Op::LoopGit {
+            query: LoopGitQuery::After {
+                repo: string(rng).into(),
+                from: opt(rng, string),
+                baseline: paths(rng),
+                work: rng.chance(50),
+            },
+        },
+        4 => Op::LoopFiles {
+            loop_id: string(rng),
+            files: vec![LoopFile {
+                name: string(rng),
+                digest: string(rng),
+                data: opt(rng, string),
+            }],
+            read: vec![string(rng)],
+            max: number(rng),
+        },
+        5 => Op::LoopRun {
+            loop_id: string(rng),
+            run: string(rng),
+            spec: LoopRunSpec {
+                runtime: string(rng),
+                model: string(rng),
+                effort: string(rng),
+                cwd: string(rng).into(),
+                stem: string(rng),
+                marker: string(rng),
+                timeout_secs: number(rng),
+                acp: opt(rng, |r| LoopAcp {
+                    preset: string(r),
+                    argv: vec![string(r)],
+                    mode: string(r),
+                    efforts: r.chance(50),
+                }),
+            },
+        },
+        6 => Op::LoopRunWait {
+            run: string(rng),
+            wait_ms: number(rng),
+        },
+        7 => Op::LoopRunCancel {
+            run: string(rng),
+            why: string(rng),
+        },
+        _ => Op::LoopForget {
+            loop_id: string(rng),
+        },
+    }
+}
+
 fn op(rng: &mut Rng) -> Op {
+    if rng.chance(30) {
+        return loop_op(rng);
+    }
     match rng.below(8) {
         0 => Op::Spawn {
             thread: string(rng),
@@ -378,6 +463,10 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
             launch: opt(rng, string),
             spool: opt(rng, |r| twr_core::runner::SpoolStamp {
                 generation: opt(r, string),
+            }),
+            loops: opt(rng, |r| twr_core::runner::LoopsSupport {
+                version: r.next() as u32,
+                dir: string(r).into(),
             }),
         }),
         3 | 4 => RunnerMsg::Event {

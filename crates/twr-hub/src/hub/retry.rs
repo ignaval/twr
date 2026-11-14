@@ -414,6 +414,14 @@ impl Core {
     /// there. Run when a turn fails, at startup, and when a thread is stopped
     /// ([`Core::react_to_stop`]).
     pub(super) fn react_to_failure(&mut self, hub: &Inner, thread: &str) -> anyhow::Result<()> {
+        self.react_to_failure_of(hub, thread)?;
+        // A loop's failed turn: stuck, unless retried (`hub::loops::driver`).
+        self.loop_after_failure(hub, thread);
+        Ok(())
+    }
+
+    /// [`Core::react_to_failure`] of the failure itself.
+    fn react_to_failure_of(&mut self, hub: &Inner, thread: &str) -> anyhow::Result<()> {
         let Some(view) = self.registry.get(thread).cloned() else {
             return Ok(());
         };

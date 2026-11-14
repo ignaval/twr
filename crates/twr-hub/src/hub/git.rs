@@ -638,7 +638,9 @@ impl Hub {
             if rt.is_some_and(ThreadRt::giving_up) {
                 return Err(rpc(codes::CONFLICT, RuntimeExiting(id).to_string()));
             }
-            if !force && !view.background_tasks.is_empty() {
+            // (A loop's review run is no work of the thread's: the park ends the loop, and the
+            // run with it, `hub::loops`.)
+            if !force && view.background_tasks.values().any(|t| !t.review) {
                 return Err(rpc(codes::CONFLICT, "background work is running; wait for it or use force (stops the runtime and its tasks)"));
             }
             if let Some(turn) = view.current_turn {

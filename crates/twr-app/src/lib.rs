@@ -74,6 +74,11 @@ pub fn view(fold: &ClientFold) -> Value {
                 let (r, g, b) =
                     twr_core::palette::cube_rgb(twr_core::palette::THREAD_PALETTE[color]);
                 value["accent"] = json!(format!("#{r:02x}{g:02x}{b:02x}"));
+                // A running loop: its badge and line, as every client draws them.
+                if let Some(l) = &t.r#loop {
+                    value["loop_badge"] = json!(twr_core::loops::badge(l.kind));
+                    value["loop_line"] = json!(twr_core::loops::line(l));
+                }
                 value
             })
             .collect();
@@ -216,6 +221,16 @@ pub fn allowed_method(method: &str) -> bool {
             | "control.read"
             | "blob.get"
             | "notify.looking"
+            | "loop.request"
+            | "loop.setup.get"
+            | "loop.setup.update"
+            | "loop.settings.get"
+            | "loop.settings.set"
+            | "loop.settings.reset"
+            | "loop.get"
+            | "loop.report"
+            | "loop.list"
+            | "loop.control"
     )
 }
 
@@ -224,7 +239,10 @@ pub fn validate_call(method: &str, params: &Value) -> anyhow::Result<()> {
         allowed_method(method),
         "Unsupported desktop operation: {method}"
     );
-    if matches!(method, "attention.respond" | "attention.dismiss") {
+    if matches!(
+        method,
+        "attention.respond" | "attention.dismiss" | "loop.setup.update"
+    ) {
         anyhow::ensure!(
             params["revision"].as_u64().is_some_and(|r| r > 0),
             "Review the current request before answering it (a revision is required)"
@@ -236,6 +254,56 @@ pub fn validate_call(method: &str, params: &Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Every loop method goes through the desktop, and the setup card's change needs the
+    /// revision it was made on, as an answer does.
+    #[test]
+    fn loop_methods_are_allowed() {
+        for m in twr_core::devices::METHOD_SCOPES
+            .iter()
+            .flat_map(|(_, m)| m.iter())
+            .filter(|m| m.starts_with("loop."))
+        {
+            assert!(allowed_method(m), "{m}");
+        }
+        assert!(validate_call("loop.setup.update", &json!({"attn_id": "a"})).is_err());
+        assert!(
+            validate_call("loop.setup.update", &json!({"attn_id": "a", "revision": 3})).is_ok()
+        );
+    }
+    /// A thread in a loop is presented with its loop's badge and line; one without has neither.
+    #[test]
+    fn presented_threads_carry_the_loop_line() {
+        use twr_core::event::{EventBody, LoopStarted};
+        use twr_core::loops::config::Profile;
+        let mut fold = ClientFold::default();
+        let mut api = twr_core::testkit::ThreadScript::new("t1");
+        let mut web = twr_core::testkit::ThreadScript::new("t2");
+        for ev in [
+            api.created("api"),
+            web.created("web"),
+            api.event(EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "l1".into(),
+                profile: Profile::builtin("low").unwrap(),
+                ..Default::default()
+            }))),
+        ] {
+            fold.apply(&ev, None);
+        }
+        let out = Presentation::default().project(&fold);
+        let thread = |name: &str| {
+            out["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(thread("api")["loop_badge"], "REVIEW LOOP");
+        assert_eq!(thread("api")["loop_line"], "low · scope");
+        assert!(thread("web").get("loop_badge").is_none());
+        assert!(thread("web").get("loop_line").is_none());
+    }
     #[test]
     fn snapshot_projection_keeps_stalls_resolved_while_the_app_was_closed() {
         let mut fold = ClientFold::default();

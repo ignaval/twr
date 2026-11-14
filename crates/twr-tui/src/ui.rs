@@ -148,8 +148,14 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         render_picker(frame, body, state, &mut panes);
     } else if state.view.new_ws.is_some() {
         crate::sidebar::render_new(frame, body, state, &mut panes);
-    } else if state.view.settings.is_some() {
-        crate::settings::render(frame, body, state, &mut panes);
+    } else if state.view.settings.is_some() || state.view.loop_editor.is_some() {
+        // The loop settings editor over the settings when their Loops row opened it.
+        if state.view.settings.is_some() {
+            crate::settings::render(frame, body, state, &mut panes);
+        }
+        if state.view.loop_editor.is_some() {
+            crate::loops::render(frame, body, state, &mut panes);
+        }
     } else if let Some(panel) = &state.view.runner {
         frame.render_widget(ratatui::widgets::Clear, body);
         frame.render_widget(
@@ -945,12 +951,8 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
         let chosen = i == p.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
-            Span::styled(
-                format!("{} ", i + 1),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            option_key(i + 1),
+            Span::raw(" "),
             Span::styled(
                 format!("{label:<name_width$}  "),
                 if chosen {
@@ -1041,16 +1043,12 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
         let chosen = i == m.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
-            Span::styled(
-                if i < 9 {
-                    format!("{} ", i + 1)
-                } else {
-                    "  ".to_string()
-                },
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            if i < 9 {
+                option_key(i + 1)
+            } else {
+                Span::raw(" ")
+            },
+            Span::raw(" "),
         ];
         let style = if chosen {
             Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -1859,6 +1857,7 @@ pub(crate) fn card_height(
     let (rows, section) = if id == HUB_THREAD {
         let (head, attn) = hub_card_parts(state, usize::from(inner));
         let body = CardBody {
+            looping: None,
             section: Vec::new(),
             one: None,
             attn,
@@ -2234,9 +2233,17 @@ fn render_card(
         .first()
         .filter(|_| icon::is_working(t))
         .cloned();
+    // The status row, and its icon, come after the loop line when there is one.
+    let below = u16::from(body.looping.is_some());
     let (rows, drawn) = card_rows(body, inner.height, inner.width);
-    if let Some(cells) = shows_icon(&rows, status_row.as_ref()) {
-        note_icon(panes, state, &t.id, inner, cells);
+    let status_rows = rows.get(usize::from(below)..).unwrap_or_default();
+    if let Some(cells) = shows_icon(status_rows, status_row.as_ref()) {
+        let at = Rect {
+            y: inner.y.saturating_add(below),
+            height: inner.height.saturating_sub(below),
+            ..inner
+        };
+        note_icon(panes, state, &t.id, at, cells);
     }
     frame.render_widget(
         Paragraph::new(rows).block(block).style(parked_style(t)),
@@ -2286,6 +2293,10 @@ fn note_icon(panes: &mut Panes, state: &AppState, thread: &str, inner: Rect, cel
 /// is drawn: its status section ([`section_lines`]), its top attention item when one is open,
 /// then its git state, last. (Who runs it is in its title, [`card_block`].)
 struct CardBody {
+    /// The loop line, when the thread runs a loop (a card's, never a tile's): first, never
+    /// cut before the rows under it; and its short form, what a one-row card shows
+    /// ([`crate::loops::card_line`], [`crate::loops::short_line`]).
+    looping: Option<(Line<'static>, Line<'static>)>,
     /// The state and what it does or came to.
     section: Vec<Line<'static>>,
     /// The section on one row, cut with `…`: shown in place of its rows when it has but one.
@@ -2345,7 +2356,22 @@ fn card_body(
         (None, Some(g)) => Some(git_line(g, width)),
         (None, None) => None,
     };
+    // The loop line: on a card (stack, sidebar), not on a grid tile. Once the loop ended, how
+    // it ended and what it committed, until the thread's next turn.
+    let looping = match (&t.r#loop, crate::loops::ended_due(t)) {
+        _ if tile.is_some() => None,
+        (Some(l), _) => Some((
+            crate::loops::card_line(l, width),
+            crate::loops::short_line(l, &card_status(t), width),
+        )),
+        (None, Some(last)) => {
+            let line = crate::loops::ended_line(last, width);
+            Some((line.clone(), line))
+        }
+        (None, None) => None,
+    };
     CardBody {
+        looping,
         section,
         one: Some(one),
         attn,
@@ -2386,9 +2412,7 @@ fn section_lines(
     item: bool,
 ) -> (Vec<Line<'static>>, Line<'static>) {
     let dim = Style::default().fg(Color::DarkGray);
-    let doing = Style::default()
-        .fg(Color::Gray)
-        .add_modifier(Modifier::ITALIC);
+    let doing = ACTIVITY;
     let status = t.status();
     let status_text = card_status(t);
     let mut spans: Vec<Span<'static>> = match working_icon(state, t) {
@@ -2445,13 +2469,19 @@ fn section_lines(
             return (wrapped(spans), line);
         }
     }
-    let activity = state
-        .activity
-        .get(&t.id)
-        .map(|a| one_row(&a.activity))
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| twr_core::activity::fallback(t).to_string());
-    let activity = with_work(state, t, activity);
+    let activity = match review_activity(t) {
+        // A review loop's review run, all the thread waits on: the reviewer and how long.
+        Some(review) => review,
+        None => {
+            let activity = state
+                .activity
+                .get(&t.id)
+                .map(|a| one_row(&a.activity))
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| twr_core::activity::fallback(t).to_string());
+            with_work(state, t, activity)
+        }
+    };
     match after_state(&activity, &status_text, status) {
         After::Nothing => {}
         After::Joined(rest) => spans.push(Span::styled(rest, doing)),
@@ -2465,6 +2495,58 @@ fn section_lines(
         }
     }
     (lines, line)
+}
+
+/// The style of what a card says a thread does, after its state word (`· reviewer
+/// gpt-6.1-sol medium · 6m`, `· thinking`): wherever a card is drawn (the stack, a grid tile,
+/// the compact layout). A grey in italics that reads on a dark terminal and a light one alike
+/// (6.1:1 on black, 3.5:1 on white; with 16 colors, dark grey: 5.2:1 and 4.0:1), lighter than
+/// the dim grey of the report and the `·` around it.
+pub(crate) const ACTIVITY: Style = Style::new()
+    .fg(Color::Indexed(245))
+    .add_modifier(Modifier::ITALIC);
+
+/// The activity line of thread `t` while it waits, in the background, on its loop's review
+/// run alone: the run's description and how long it has run (`reviewer gpt-6.1-sol xhigh ·
+/// 6m`); on its sweep's audit runs alone, how many rules they audit of all and how long the
+/// oldest has run (`auditing 2 of 5 rules · 3m`). `None` otherwise (it works, or has other
+/// background work too).
+fn review_activity(t: &ThreadView) -> Option<String> {
+    if t.status() != ThreadStatus::Background {
+        return None;
+    }
+    // The sweep's audit runs (`sweep = "runs"`): how many rules are being audited, of all.
+    if let Some(l) = t
+        .r#loop
+        .as_ref()
+        .filter(|l| l.wait == twr_core::loops::Wait::Audits)
+    {
+        let mut tasks = t.background_tasks.values().filter(|b| b.in_background());
+        if tasks.clone().all(|b| b.review) {
+            let running = tasks.clone().count();
+            let mut out = format!("auditing {running} of {} rules", l.audits.len());
+            if let Some(at) = tasks.by_ref().filter_map(|b| b.started_at).min() {
+                let secs = (chrono::Utc::now() - at).num_seconds();
+                out.push_str(&format!(" · {}", twr_core::work::ago(secs)));
+            }
+            return Some(out);
+        }
+        return None;
+    }
+    let mut tasks = t.background_tasks.values().filter(|b| b.in_background());
+    let task = tasks.next().filter(|b| b.review)?;
+    if tasks.next().is_some() {
+        return None;
+    }
+    let mut out = one_row(&task.description);
+    if out.is_empty() {
+        out = "reviewer".into();
+    }
+    if let Some(at) = task.started_at {
+        let secs = (chrono::Utc::now() - at).num_seconds();
+        out.push_str(&format!(" · {}", twr_core::work::ago(secs)));
+    }
+    Some(out)
 }
 
 /// `activity` (a card's activity line) followed by what thread `t` has in flight while its
@@ -2567,11 +2649,12 @@ fn card_status(t: &ThreadView) -> String {
         },
         s => s.as_str().to_string(),
     };
-    // (A task a tool call of its turn waits for in the foreground is that call's.)
+    // (A task a tool call of its turn waits for in the foreground is that call's; a loop's
+    // review run is the loop's, which its activity names.)
     match t
         .background_tasks
         .values()
-        .filter(|b| b.in_background())
+        .filter(|b| b.in_background() && !b.review)
         .count()
     {
         0 => word,
@@ -2608,11 +2691,32 @@ fn card_rows_counted(
 ) -> (Vec<Line<'static>>, Option<(String, u64)>, usize) {
     let height = usize::from(height);
     let CardBody {
+        looping,
         mut section,
         one,
         attn,
         git,
     } = body;
+    // The loop line first, never cut before the rows under it: on a one-row card it is what
+    // remains, in its short form.
+    if let Some((line, short)) = looping {
+        if height == 0 {
+            return (Vec::new(), None, 0);
+        }
+        if height == 1 {
+            return (vec![short], None, 1);
+        }
+        let rest = CardBody {
+            looping: None,
+            section,
+            one,
+            attn,
+            git,
+        };
+        let (mut rows, drawn, n) = card_rows_counted(rest, (height - 1) as u16, width);
+        rows.insert(0, line);
+        return (rows, drawn, n + 1);
+    }
     // No blank row from the status section or the last report: their paragraph breaks are
     // left out here (the detail views, which show the whole text, keep them). An item keeps
     // every row, blank or only spaces: they are its content (spaces inside a quoted argument
@@ -3409,6 +3513,8 @@ struct WrapKey {
     /// Its text is only a capped preview: loading (`Some(false)`) or not loadable
     /// (`Some(true)`).
     cut: Option<bool>,
+    /// A loop's setup card in full (the action popup's), not its compact form (a card's).
+    full: bool,
 }
 
 /// An item's rows ([`WrapCache`]): the text they were wrapped from (its badge too: an item
@@ -3556,6 +3662,23 @@ fn attention_rows(
     width: usize,
     tile: bool,
 ) -> Option<Arc<AttnRows>> {
+    attention_rows_as(state, thread, width, tile, false)
+}
+
+/// [`attention_rows`] as the action popup shows them: a loop's setup card in full
+/// ([`crate::loops::setup_rows`]), not in the compact form a card shows.
+fn attention_rows_full(state: &AppState, thread: &str, width: usize) -> Option<Arc<AttnRows>> {
+    attention_rows_as(state, thread, width, false, true)
+}
+
+/// [`attention_rows`], `full`: a loop's setup card in full.
+fn attention_rows_as(
+    state: &AppState,
+    thread: &str,
+    width: usize,
+    tile: bool,
+    full: bool,
+) -> Option<Arc<AttnRows>> {
     let items = state.card_items(thread);
     let top = *items.first()?;
     let incomplete = state.incomplete(top);
@@ -3566,15 +3689,14 @@ fn attention_rows(
         tile,
         more: items.len() - 1,
         cut: incomplete.map(|i| i.failed),
+        full: full && top.loop_setup,
     };
-    let (more, cut) = (key.more, key.cut);
+    let (more, cut, full) = (key.more, key.cut, key.full);
     let top = shown_item(state, top);
     let top = top.as_ref();
-    Some(
-        state
-            .wraps
-            .attn(key, top, || attention_rows_of(top, more, cut, width, tile)),
-    )
+    Some(state.wraps.attn(key, top, || {
+        attention_rows_of(top, more, cut, width, tile, full)
+    }))
 }
 
 /// `item` as the views show it: a delete card, whose text is the hub's own, with the commands
@@ -3608,13 +3730,23 @@ fn attention_rows_of(
     cut: Option<bool>,
     width: usize,
     tile: bool,
+    full: bool,
 ) -> AttnRows {
     let dim = Style::default().fg(Color::DarkGray);
-    let mut head = vec![
-        badge(top.reason),
-        Span::raw(" "),
-        Span::raw(top.summary.clone()),
-    ];
+    // A loop's setup card: its compact form on a card or tile (which never counts as drawn
+    // in full: the popup or the detail view shows the whole card), or its rows in full.
+    let compact = top.loop_setup && !full;
+    let mut head = if compact {
+        crate::loops::setup_compact(top)
+    } else if top.loop_setup {
+        Vec::new()
+    } else {
+        vec![
+            crate::loops::item_badge(top).unwrap_or_else(|| badge(top.reason)),
+            Span::raw(" "),
+            Span::raw(top.summary.clone()),
+        ]
+    };
     if let Some(failed) = cut {
         let why = if failed {
             " (could not load the full text)"
@@ -3631,7 +3763,15 @@ fn attention_rows_of(
     if tile && more > 0 {
         head.push(Span::styled(format!(" (+{more})"), dim));
     }
-    let mut core = wrap_line(Line::from(head), width);
+    let mut core = if top.loop_setup && !compact {
+        let mut rows = crate::loops::setup_rows(top, width);
+        if !head.is_empty() {
+            rows.extend(wrap_line(Line::from(head), width));
+        }
+        rows
+    } else {
+        wrap_line(Line::from(head), width)
+    };
     core.extend(option_rows(&top.options, width));
     let mut extra = Vec::new();
     if !tile {
@@ -3663,7 +3803,7 @@ fn attention_rows_of(
             ));
         }
     }
-    let exact = core.iter().all(|l| l.width() <= width.max(1));
+    let exact = !compact && core.iter().all(|l| l.width() <= width.max(1));
     AttnRows::new(
         (top.attn_id.clone(), top.revision),
         core,
@@ -3695,6 +3835,22 @@ fn context_rows(fields: &[(&str, &str)], width: usize) -> Vec<(Line<'static>, Jo
         .collect()
 }
 
+/// An option's key, the `1` of `1 allow`: its digit as a key cap, bold black on the
+/// selection's yellow ([`KEY_CAP`]). Every list of options a number key answers draws its
+/// keys with it (a card's or tile's item, the action popup, the detail view, the pickers), so
+/// they look alike everywhere. A fill of its own, as the `QUESTION` badge has: the TUI can't
+/// tell a dark terminal from a light one, and no yellow text reads on white.
+pub(crate) fn option_key(n: usize) -> Span<'static> {
+    Span::styled(n.to_string(), KEY_CAP)
+}
+
+/// The style of an option's key ([`option_key`]): black on yellow, 12:1 at 256 and at 16
+/// colors, on a dark terminal and a light one alike; with no colors, reverse video.
+pub(crate) const KEY_CAP: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Yellow)
+    .add_modifier(Modifier::BOLD);
+
 /// Every option, numbered: `1 allow  2 deny` for the first nine (their number keys answer
 /// them), then `10. label` (no key answers those, but they are part of what the item asks: an
 /// item is drawn in full only with all of them on screen), in rows of at most `width` cells:
@@ -3711,9 +3867,6 @@ fn option_rows(options: &[String], width: usize) -> Vec<Line<'static>> {
 /// one line, however they are packed into rows, so a place in them is the same text at any
 /// width (an option wrapped inside a word continues right after it).
 fn option_rows_joined(options: &[String], width: usize) -> Vec<(Line<'static>, Join)> {
-    let key = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
     let no_key = Style::default().fg(Color::DarkGray);
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -3721,7 +3874,7 @@ fn option_rows_joined(options: &[String], width: usize) -> Vec<(Line<'static>, J
     let mut used = 0;
     for (n, opt) in options.iter().enumerate() {
         let number = if n < 9 {
-            Span::styled(format!("{}", n + 1), key)
+            option_key(n + 1)
         } else {
             Span::styled(format!("{}.", n + 1), no_key)
         };
@@ -3792,6 +3945,7 @@ fn render_hub_card(
     let inner = block.inner(area);
     let (head, attn) = hub_card_parts(state, usize::from(inner.width));
     let body = CardBody {
+        looping: None,
         section: Vec::new(),
         one: None,
         attn,
@@ -4308,6 +4462,8 @@ fn block_key(entry: &Entry, index: usize, threads: &Threads) -> String {
         Entry::Tool { call_id, .. } => return format!("block:{thread}:tool:{call_id}"),
         Entry::TurnEnd { .. } => ("end", 0),
         Entry::Shell { seq, .. } => ("shell", *seq),
+        Entry::LoopRound { seq, .. } => ("loop-round", *seq),
+        Entry::LoopStep { seq, .. } => ("loop-step", *seq),
     };
     // Synthetic entries used by offscreen callers may have no event position.
     let id = if seq == 0 {
@@ -4853,9 +5009,16 @@ pub fn transcript_view_spans(
                     turn.map_or_else(|| format!("#{i}"), |t| t.to_string())
                 );
                 v.block(Kind::Compact);
+                // A loop's prompt (it can be long: it carries the findings) names its step.
+                let marker = crate::loops::prompt_step(prompt).map_or_else(
+                    || NOTICE_MARKER.to_string(),
+                    |(id, step)| {
+                        crate::loops::prompt_marker(&step, loop_kind(entries, threads, &id, &step))
+                    },
+                );
                 if collapse.folded(&key) {
                     let about = notice_thread(prompt);
-                    let row = marker_row(NOTICE_MARKER, about, threads, width);
+                    let row = marker_row(&marker, about, threads, width);
                     v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
                 } else {
                     let at = v.out.len();
@@ -4864,11 +5027,30 @@ pub fn transcript_view_spans(
                         2,
                         ("", dim),
                         Vec::new(),
-                        &format!("{NOTICE_MARKER}:\n{prompt}"),
+                        &format!("{marker}:\n{prompt}"),
                         dim,
                     );
                     limit_block(&mut v, at, block_key(&entries[i], i, threads), threads);
                 }
+            }
+            // A review round: one row, unless expanded ([`crate::loops::round_head`]).
+            Entry::LoopRound { loop_id, round, .. }
+                if collapse.folded(&format!("loop-round:{loop_id}:{round}")) =>
+            {
+                let key = format!("loop-round:{loop_id}:{round}");
+                v.block(Kind::Compact);
+                let row = loop_round_row(&entries[i], width);
+                v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
+            }
+            // An implementation loop's step: one row, unless expanded
+            // ([`crate::loops::step_head`]).
+            Entry::LoopStep { loop_id, seq, .. }
+                if collapse.folded(&format!("loop-step:{loop_id}:{seq}")) =>
+            {
+                let key = format!("loop-step:{loop_id}:{seq}");
+                v.block(Kind::Compact);
+                let row = loop_step_row(&entries[i], width);
+                v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
             }
             Entry::TurnEnd {
                 result: TurnResult::Completed,
@@ -5178,6 +5360,66 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
         Entry::Shell { .. } => {
             v.block(Kind::Block);
             shell_rows(v, e, threads);
+        }
+        Entry::LoopStep { note, .. } => {
+            v.block(Kind::Compact);
+            let dim = Style::default().fg(Color::DarkGray);
+            let color = if crate::loops::step_failed(note) {
+                Color::Red
+            } else {
+                crate::loops::LOOP_COLOR
+            };
+            v.marked(
+                0,
+                ("↻ ", Style::default().fg(color)),
+                Vec::new(),
+                &crate::loops::step_head(note),
+                Style::default().fg(MUTED),
+            );
+            for row in crate::loops::step_rows(note) {
+                v.marked(4, ("⎿ ", dim), Vec::new(), &row, dim);
+            }
+        }
+        Entry::LoopRound {
+            round,
+            reviewer,
+            findings,
+            failed,
+            triage,
+            took,
+            ..
+        } => {
+            v.block(Kind::Compact);
+            let dim = Style::default().fg(Color::DarkGray);
+            let head = crate::loops::round_head(
+                round,
+                reviewer.as_deref(),
+                took.as_deref(),
+                findings,
+                failed.as_deref(),
+                triage,
+            );
+            let color = if failed.is_some() {
+                Color::Red
+            } else {
+                crate::loops::LOOP_COLOR
+            };
+            v.marked(
+                0,
+                ("↻ ", Style::default().fg(color)),
+                Vec::new(),
+                &head,
+                Style::default().fg(MUTED),
+            );
+            if let Some(why) = failed {
+                v.marked(4, ("", dim), Vec::new(), why, dim);
+            }
+            for (finding, verdict) in crate::loops::round_rows(findings, triage) {
+                v.marked(2, ("• ", dim), Vec::new(), &finding, Style::default());
+                if let Some(verdict) = verdict {
+                    v.marked(4, ("⎿ ", dim), Vec::new(), &verdict, dim);
+                }
+            }
         }
         Entry::Notice { level, text, .. } => {
             v.block(Kind::Compact);
@@ -5545,6 +5787,110 @@ fn routine_row(
     let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
     line.push(Span::styled(hint, dim));
     Line::from(cut_spans(line, width))
+}
+
+/// The row of a folded review round ([`crate::app::Entry::LoopRound`]): `↻ review round m3 ·
+/// gpt-6.1-sol medium · 2 findings (ctrl+o to expand)`, cut to `width`.
+fn loop_round_row(e: &Entry, width: usize) -> Line<'static> {
+    let Entry::LoopRound {
+        round,
+        reviewer,
+        findings,
+        failed,
+        triage,
+        took,
+        ..
+    } = e
+    else {
+        return Line::default();
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let head = crate::loops::round_head(
+        round,
+        reviewer.as_deref(),
+        took.as_deref(),
+        findings,
+        failed.as_deref(),
+        triage,
+    );
+    let color = if failed.is_some() {
+        Color::Red
+    } else {
+        crate::loops::LOOP_COLOR
+    };
+    let hint = if findings.is_empty() && failed.is_none() {
+        ""
+    } else {
+        " (ctrl+o to expand)"
+    };
+    let spans = vec![
+        Span::styled("↻ ", Style::default().fg(color)),
+        Span::styled(head, Style::default().fg(MUTED)),
+    ];
+    let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
+    line.push(Span::styled(hint, dim));
+    Line::from(cut_spans(line, width))
+}
+
+/// The row of a folded implementation loop's step ([`crate::app::Entry::LoopStep`]): `↻ plan ·
+/// revision 1 · contract risk: no (ctrl+o to expand)`, `↻ committed abc1234`, cut to `width`.
+fn loop_step_row(e: &Entry, width: usize) -> Line<'static> {
+    let Entry::LoopStep { note, .. } = e else {
+        return Line::default();
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let color = if crate::loops::step_failed(note) {
+        Color::Red
+    } else {
+        crate::loops::LOOP_COLOR
+    };
+    let hint = if crate::loops::step_rows(note).is_empty() {
+        ""
+    } else {
+        " (ctrl+o to expand)"
+    };
+    let spans = vec![
+        Span::styled("↻ ", Style::default().fg(color)),
+        Span::styled(crate::loops::step_head(note), Style::default().fg(MUTED)),
+    ];
+    let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
+    line.push(Span::styled(hint, dim));
+    Line::from(cut_spans(line, width))
+}
+
+/// The kind of loop `id` whose prompt names `step`: an implementation loop's when the step is
+/// one only it has, or the transcript has a step row of that loop's, or the thread's running
+/// or last loop is one; else a review loop's.
+fn loop_kind(
+    entries: &[Entry],
+    threads: &Threads,
+    id: &str,
+    step: &str,
+) -> twr_core::loops::LoopKind {
+    use twr_core::loops::LoopKind;
+    if crate::loops::implementation_step(step) {
+        return LoopKind::Implement;
+    }
+    // The thread's running or last loop first (a look-up per thread), then the transcript.
+    let known = threads.state.and_then(|s| {
+        s.registry.list().into_iter().find_map(|t| {
+            t.r#loop
+                .as_ref()
+                .filter(|l| l.id == id)
+                .map(|l| l.kind)
+                .or_else(|| t.last_loop.as_ref().filter(|l| l.id == id).map(|l| l.kind))
+        })
+    });
+    known.unwrap_or_else(|| {
+        if entries.iter().any(|e| {
+            matches!(e, Entry::LoopStep { loop_id, note, .. }
+                if loop_id == id && note.implementation_only())
+        }) {
+            LoopKind::Implement
+        } else {
+            LoopKind::Review
+        }
+    })
 }
 
 /// The row of a folded hub notice turn: `· hub update`, after the thread it is about.
@@ -6381,6 +6727,7 @@ fn render_orch_banner(
     panes.add(PaneId::Thread(orch.to_string()), inner);
     let attn = attention_rows(state, orch, usize::from(inner.width), false);
     let body = CardBody {
+        looping: None,
         section: Vec::new(),
         one: None,
         attn,
@@ -6420,6 +6767,7 @@ fn card_detail_rows(
         tile: false,
         more,
         cut: None,
+        full: true,
     };
     state
         .wraps
@@ -6429,25 +6777,41 @@ fn card_detail_rows(
 /// [`card_detail_rows`] for `item`, wrapped now.
 fn card_detail_rows_of(item: &AttentionItem, more: usize, width: usize) -> DetailRows {
     const HEAD: &str = "From your message:";
-    let (head, rest) = match item.summary.strip_prefix(HEAD) {
-        Some(rest) => (HEAD, rest.trim_start()),
-        None => ("", item.summary.as_str()),
-    };
-    let mut rows = wrap_line(
-        Line::from(vec![
-            badge(item.reason),
-            Span::raw(" "),
-            Span::raw(head.to_string()),
-        ]),
-        width,
-    );
-    for action in rest.split(" · ").filter(|a| !a.trim().is_empty()) {
-        // A span keeps the action's line breaks (`Line::from` a string would drop them).
-        rows.extend(wrap_line(
-            Line::from(Span::raw(format!("• {}", action.trim()))),
+    let mut rows = if item.loop_setup {
+        // A loop's setup card: as the hub wrote it, its rows aligned.
+        crate::loops::setup_rows(item, width)
+    } else if item.loop_stuck {
+        // A stuck loop's item: its badge and its text.
+        wrap_line(
+            Line::from(vec![
+                crate::loops::item_badge(item).unwrap_or_else(|| badge(item.reason)),
+                Span::raw(" "),
+                Span::raw(item.summary.clone()),
+            ]),
             width,
-        ));
-    }
+        )
+    } else {
+        let (head, rest) = match item.summary.strip_prefix(HEAD) {
+            Some(rest) => (HEAD, rest.trim_start()),
+            None => ("", item.summary.as_str()),
+        };
+        let mut rows = wrap_line(
+            Line::from(vec![
+                badge(item.reason),
+                Span::raw(" "),
+                Span::raw(head.to_string()),
+            ]),
+            width,
+        );
+        for action in rest.split(" · ").filter(|a| !a.trim().is_empty()) {
+            // A span keeps the action's line breaks (`Line::from` a string would drop them).
+            rows.extend(wrap_line(
+                Line::from(Span::raw(format!("• {}", action.trim()))),
+                width,
+            ));
+        }
+        rows
+    };
     rows.push(Line::default());
     let mut tail = option_rows(&item.options, width);
     let options = rows.len()..rows.len() + tail.len();
@@ -6524,10 +6888,9 @@ fn render_card_detail(
                 } else {
                     state.registry.get(orch).map_or(orch, |t| t.name.as_str())
                 };
-                format!(
-                    " {name} · {} · Esc returns ",
-                    reason_label(item.reason).to_lowercase()
-                )
+                let label = crate::loops::item_label(item)
+                    .map_or_else(|| reason_label(item.reason).to_lowercase(), str::to_string);
+                format!(" {name} · {label} · Esc returns ")
             },
             Style::default().add_modifier(Modifier::BOLD),
         )))
@@ -6723,6 +7086,7 @@ fn request_detail_rows(state: &AppState, item: &AttentionItem, width: usize) -> 
         tile: false,
         more: 0,
         cut,
+        full: false,
     };
     state.wraps.request(key, item, || {
         // A permission reads exactly as it runs: no space of it dropped by word wrapping.
@@ -8140,21 +8504,12 @@ fn render_action_popup(
             for span in &mut line.spans {
                 span.style = style;
             }
-            // An answer's number in the color the cards give it.
-            if k == 0 && kept && !selected && matches!(row.kind, ActionKind::Answer(n) if n <= 9) {
+            // An answer's number as the cards draw it ([`option_key`]), after the row's space.
+            if let (0, true, false, ActionKind::Answer(n @ 1..=9)) = (k, kept, selected, row.kind) {
                 let text = line.spans[0].content.to_string();
-                let number: String = text.chars().take(2).collect();
                 let rest: String = text.chars().skip(2).collect();
                 line.spans[0] = Span::raw(rest);
-                line.spans.insert(
-                    0,
-                    Span::styled(
-                        number,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                );
+                line.spans.splice(0..0, [Span::raw(" "), option_key(n)]);
             }
         }
         // On a phone each row is two rows tall, in a band (alternate shades, so its rows tell
@@ -8170,7 +8525,8 @@ fn render_action_popup(
                 for line in &mut lines {
                     let fill = inner_w.saturating_sub(line.width());
                     line.spans.push(Span::raw(" ".repeat(fill)));
-                    for span in &mut line.spans {
+                    // (An answer's key keeps its own fill.)
+                    for span in line.spans.iter_mut().filter(|s| s.style.bg.is_none()) {
                         span.style = span.style.bg(Color::Indexed(band));
                     }
                 }
@@ -8708,6 +9064,9 @@ pub fn queued_sender(it: &crate::queue::Queued) -> &'static str {
     }
 }
 
+/// The action popup's text when nothing waits on what it is on (`target`): a queued
+/// message's rows ([`popup_queued_rows`]); for a worker's card, while its thread runs a loop,
+/// the loop's progress ([`crate::loops::progress_rows`]), else its last report (above).
 fn popup_report_rows(
     state: &AppState,
     target: &crate::app::ActionTarget,
@@ -8719,12 +9078,14 @@ fn popup_report_rows(
     let crate::app::ActionTarget::Card(id) = target else {
         return Vec::new();
     };
-    let Some(r) = state
-        .registry
-        .get(id)
-        .filter(|t| !t.is_orchestrator())
-        .and_then(|t| t.last_report.as_ref())
-    else {
+    let Some(t) = state.registry.get(id).filter(|t| !t.is_orchestrator()) else {
+        return Vec::new();
+    };
+    // A thread in a loop: the loop's progress, from its state.
+    if let Some(l) = &t.r#loop {
+        return crate::loops::progress_rows(l, width);
+    }
+    let Some(r) = t.last_report.as_ref() else {
         return Vec::new();
     };
     let dim = Style::default().fg(Color::DarkGray);
@@ -8799,7 +9160,7 @@ fn popup_item_rows(
         let d = card_detail_rows(state, item, 0, width);
         return without_options(&d, Vec::new());
     }
-    let Some(a) = attention_rows(state, card, width, false) else {
+    let Some(a) = attention_rows_full(state, card, width) else {
         return (Vec::new(), true);
     };
     let options = option_rows(&item.options, width).len();
@@ -13153,6 +13514,7 @@ mod tests {
             let a = Arc::new(AttnRows::new(("a".into(), 1), core, extra, true, true));
             let before = copies();
             let body = CardBody {
+                looping: None,
                 section: vec![l("waiting".into())],
                 one: None,
                 attn: Some(a),
@@ -13255,6 +13617,7 @@ mod tests {
         assert_eq!(st.seen_gseq(), st.last_gseq);
         // The seam: a card one row short of the item beside its section's row cuts it.
         let body = |a: &Arc<AttnRows>| CardBody {
+            looping: None,
             section: vec![Line::from("waiting")],
             one: None,
             attn: Some(a.clone()),
@@ -14373,7 +14736,7 @@ mod tests {
                 assert_eq!(rows[open].trim(), "/open [thread]", "{w}x{h}");
                 assert!(rows[open + 1].starts_with("    talk"), "{w}x{h}: {rows:?}");
             } else {
-                // The commands' longest entry is the /trash usage.
+                // The commands' longest entry is the /review usage.
                 let longest = crate::slash::COMMANDS
                     .iter()
                     .map(|c| c.1.chars().count())
@@ -16522,7 +16885,11 @@ mod tests {
         assert!(all.ends_with("9 o9  10. o10  11. o11"), "{all}");
         let rows = option_rows(&many, 200);
         let ten = rows[0].spans.iter().find(|s| s.content == "10.").unwrap();
-        assert_ne!(ten.style.fg, Some(Color::Yellow), "no key");
+        assert_eq!(ten.style.bg, None, "no key");
+        // A key is a key cap: its digit alone, black on yellow (the space after it is not).
+        let one = &rows[0].spans[0];
+        assert_eq!((one.content.as_ref(), one.style), ("1", KEY_CAP));
+        assert_eq!(rows[0].spans[1].style.bg, None);
         // Wrapping breaks at spaces and keeps the styles.
         let line = Line::from(vec![
             Span::styled("ab", Style::default().fg(Color::Red)),
@@ -16568,6 +16935,7 @@ mod tests {
             )))
         };
         let body = || CardBody {
+            looping: None,
             section: vec![l("running · one"), l("two"), l("three")],
             one: None,
             attn: attn(&["Q", "1 a"], &["note"]),
@@ -16604,6 +16972,7 @@ mod tests {
         // No item: the section's later rows give way to the git line, its last one shown
         // ending in `…`.
         let plain = || CardBody {
+            looping: None,
             section: vec![
                 l("done ✓ · one"),
                 l("two"),
@@ -19462,3 +19831,14 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "loops_ui_tests.rs"]
+mod loops_ui_tests;
+
+#[cfg(test)]
+#[path = "loops_color_tests.rs"]
+mod loops_color_tests;
+#[cfg(test)]
+#[path = "loops_impl_tests.rs"]
+mod loops_impl_tests;

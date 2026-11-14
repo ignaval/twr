@@ -1273,13 +1273,17 @@ pub(crate) async fn serve<S: HubStream>(
 ) -> Served {
     let mut welcomed = false;
     let mut reader = None;
+    // The loops' review runs this connection starts end with it ([`crate::loops::runs`]).
+    let conn = lbox.loop_runs().connection_opened();
     let result = tokio::select! {
-        r = serve_inner(ws, lbox, opts, epoch_hint, stop, &mut welcomed, &mut reader) => r,
+        r = crate::loops::runs::CONNECTION.scope(conn, serve_inner(ws, lbox, opts, epoch_hint, stop, &mut welcomed, &mut reader)) => r,
         () = replaced => Err(anyhow!("a newer connection from the hub replaced this one")),
     };
     if let Some(r) = reader {
         r.join().await;
     }
+    lbox.loop_runs()
+        .connection_closed(conn, "the box's connection to the hub ended");
     Served { welcomed, result }
 }
 
@@ -1325,11 +1329,10 @@ async fn serve_inner<S: HubStream>(
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RunnerMsg>();
     let last_rx = Arc::new(Mutex::new(Instant::now()));
     let reader = reader_slot.insert(Reader {
-        task: tokio::spawn(read_loop(
-            stream,
-            lbox.clone(),
-            out_tx.clone(),
-            last_rx.clone(),
+        // (Its commands keep this connection's number: `crate::loops::runs::CONNECTION`.)
+        task: tokio::spawn(crate::loops::runs::CONNECTION.scope(
+            crate::loops::runs::CONNECTION.try_with(|c| *c).unwrap_or(0),
+            read_loop(stream, lbox.clone(), out_tx.clone(), last_rx.clone()),
         )),
         done: false,
     });
@@ -1594,6 +1597,7 @@ async fn handshake<S: HubStream>(
         spool: Some(SpoolStamp {
             generation: lbox.spool().generation()?,
         }),
+        loops: Some(lbox.loops_support()),
     });
     sink.send(text(&inventory)?)
         .await
@@ -1645,6 +1649,8 @@ async fn read_loop<S: HubStream>(
     last_rx: Arc<Mutex<Instant>>,
 ) -> anyhow::Result<()> {
     let spool = lbox.spool().clone();
+    // The connection the reader serves (its commands' [`crate::loops::runs::CONNECTION`]).
+    let conn = crate::loops::runs::CONNECTION.try_with(|c| *c).unwrap_or(0);
     while let Some(msg) = stream.next().await {
         let msg = msg.context("reading from the hub")?;
         *last_rx.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
@@ -1680,7 +1686,9 @@ async fn read_loop<S: HubStream>(
                     let lbox = lbox.clone();
                     let out = out.clone();
                     tokio::spawn(async move {
-                        let r = lbox.handle_cmd(&cmd_id, op).await;
+                        let r = crate::loops::runs::CONNECTION
+                            .scope(conn, lbox.handle_cmd(&cmd_id, op))
+                            .await;
                         drop(change);
                         let _ = out.send(RunnerMsg::CmdResult(r));
                     });

@@ -1,0 +1,2385 @@
+//! What a loop reads from models: the reviewer's findings, and the fenced blocks the thread
+//! ends its loop turns with (`twr-goal`, `twr-triage`, `twr-sweep`; an implementation loop's
+//! `twr-plan`, `twr-implement` and `twr-commit`); plus the ledger the hub builds from them and
+//! the check of a loop's commit (docs/design/loops.md, "Contracts" and "Milestone 2:
+//! implementation notes").
+//!
+//! Everything here is parsed from another model's output, so every parser is strict about
+//! shape and bounded in size, and none panics: a reviewer's answer that does not parse is a
+//! failed review run, and a block that does not validate is the list of problems the hub puts
+//! in its one correction prompt.
+//!
+//! # Finding ids
+//!
+//! A finding is named `<tag><round>.<n>`: `m3.2` is the second finding of the third round of
+//! the tier tagged `m`. Round numbers count within their tier (or within the verification),
+//! from 1, so the tag keeps ids unique within a loop. The tags ([`tier_tags`]):
+//!
+//! - a ladder tier is tagged by its effort: `n` minimal, `l` low, `m` medium, `h` high, `x`
+//!   xhigh, `z` max, `u` ultra;
+//! - a tier whose effort is none of those, or whose letter an earlier tier of the profile
+//!   already took (two `medium` tiers), is tagged `t` and its place in the ladder as a letter:
+//!   `ta` for the first tier, `tb` for the second (`tb2.1`);
+//! - `v` is the verification's rounds (`v2.1`), `p` is the plan check of an implementation
+//!   loop (its one round is `p1`, its findings `p1.1`…), and `s` the sweep's audit runs
+//!   (`sweep = "runs"`: rule 2's audit is `s2`, its findings `s2.1`…); no tier takes any.
+//!
+//! A tag is lowercase letters only and a round number digits only, so an id parses back
+//! ([`FindingId::parse`]).
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// The JSON schema a review run's answer is constrained to: the skills' `findings.schema.json`,
+/// in meaning unchanged. An empty `findings` list means the reviewer found nothing.
+pub const FINDINGS_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "location", "problem", "fix"],
+        "properties": {
+          "severity": { "type": "string", "enum": ["blocker", "major", "minor"] },
+          "location": { "type": "string" },
+          "problem": { "type": "string" },
+          "fix": { "type": "string" }
+        }
+      }
+    }
+  }
+}
+"#;
+
+/// Largest reviewer answer the hub reads, in bytes.
+pub const MAX_ANSWER_BYTES: usize = 256 * 1024;
+/// Most findings one answer may hold.
+pub const MAX_FINDINGS: usize = 100;
+/// Longest `location`, in bytes.
+pub const MAX_LOCATION_BYTES: usize = 1024;
+/// Longest `problem` or `fix`, in bytes.
+pub const MAX_FINDING_TEXT_BYTES: usize = 16 * 1024;
+/// Largest fenced block the hub reads from a thread's message, in bytes.
+pub const MAX_BLOCK_BYTES: usize = 64 * 1024;
+/// Longest GOAL paragraph, in bytes.
+pub const MAX_GOAL_BYTES: usize = 4096;
+/// Longest reason (a dismissal's, an accepted residual's), in bytes.
+pub const MAX_REASON_BYTES: usize = 2048;
+/// Longest rule name, in bytes.
+pub const MAX_RULE_BYTES: usize = 80;
+/// Most gate commands a block may list.
+pub const MAX_GATES: usize = 32;
+/// Longest gate command, in bytes.
+pub const MAX_GATE_BYTES: usize = 512;
+/// Most rules a sweep block may report.
+pub const MAX_SWEEP_RULES: usize = 32;
+/// Most rules a `twr-rules` block may name. Each rule costs one reviewer call at the
+/// verification's effort (`sweep = "runs"`), and the thread verifies every citation of every
+/// audit in one turn: past a dozen, the sweep costs more than a verification cap and the turn
+/// reads more reports than it can check with care. A loop whose findings need more rules than
+/// this has not distilled them: one rule names a class, not a site.
+pub const MAX_AUDIT_RULES: usize = 12;
+/// Longest `rule` sentence or `where` of a `twr-rules` block, in bytes.
+pub const MAX_RULE_TEXT_BYTES: usize = 1024;
+
+/// Fence info string of the scope turn's block.
+pub const GOAL_BLOCK: &str = "twr-goal";
+/// Fence info string of a triage turn's block.
+pub const TRIAGE_BLOCK: &str = "twr-triage";
+/// Fence info string of the sweep turn's block.
+pub const SWEEP_BLOCK: &str = "twr-sweep";
+/// Fence info string of the rules turn's block (`sweep = "runs"`).
+pub const RULES_BLOCK: &str = "twr-rules";
+/// Fence info string of an implementation loop's plan turn's block (and of a plan-check
+/// triage that revised the plan).
+pub const PLAN_BLOCK: &str = "twr-plan";
+/// Fence info string of an implementation loop's implement turn's block.
+pub const IMPLEMENT_BLOCK: &str = "twr-implement";
+/// Fence info string of the block a loop's commit ends with.
+pub const COMMIT_BLOCK: &str = "twr-commit";
+
+/// Longest plan (the plan turn's message without its blocks), in bytes.
+pub const MAX_PLAN_BYTES: usize = 128 * 1024;
+/// Most commits a `twr-commit` block may list.
+pub const MAX_COMMITS: usize = 64;
+/// Longest repository path a `twr-commit` block may name, in bytes.
+pub const MAX_REPO_BYTES: usize = 4096;
+/// Most paths a failed commit check names, per repository (the rest are counted).
+pub const MAX_LEFT_SHOWN: usize = 5;
+
+// ---------------------------------------------------------------------------------------------
+// Findings
+// ---------------------------------------------------------------------------------------------
+
+/// How bad a finding is, as the reviewer says.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Must be fixed.
+    Blocker,
+    /// Should be fixed.
+    Major,
+    /// Worth fixing.
+    #[default]
+    Minor,
+}
+
+impl Severity {
+    /// As the schema writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Blocker => "blocker",
+            Severity::Major => "major",
+            Severity::Minor => "minor",
+        }
+    }
+}
+
+/// One finding of a review run, numbered by the loop.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Finding {
+    /// Its id (`m3.2`, module docs), given by the loop; empty in a reviewer's answer.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    /// How bad it is.
+    pub severity: Severity,
+    /// Where (`file:line`).
+    pub location: String,
+    /// What is wrong.
+    pub problem: String,
+    /// What the reviewer would do.
+    pub fix: String,
+}
+
+/// The answer exactly as the schema allows it: no other key, every key given.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAnswer {
+    findings: Vec<RawFinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFinding {
+    severity: Severity,
+    location: String,
+    problem: String,
+    fix: String,
+}
+
+/// Why a reviewer's answer was not read: a failed review run, never a finding.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AnswerError {
+    /// Larger than [`MAX_ANSWER_BYTES`].
+    #[error("the answer is larger than {MAX_ANSWER_BYTES} bytes")]
+    TooLarge,
+    /// Not JSON of the schema's shape (an unknown severity, a missing or unknown key).
+    #[error("the answer does not match the findings schema: {0}")]
+    Shape(String),
+    /// More than [`MAX_FINDINGS`] findings.
+    #[error("the answer has more than {MAX_FINDINGS} findings")]
+    TooMany,
+    /// A field longer than its bound.
+    #[error("finding {index}: its {field} is longer than {max} bytes")]
+    FieldTooLong {
+        /// 1-based place of the finding.
+        index: usize,
+        /// The field.
+        field: &'static str,
+        /// Its bound.
+        max: usize,
+    },
+}
+
+/// Reads a reviewer's answer file: `{"findings": [{severity, location, problem, fix}]}` and
+/// nothing else, within the size bounds. The findings come back without ids
+/// ([`number_findings`] gives them).
+pub fn parse_findings(text: &str) -> Result<Vec<Finding>, AnswerError> {
+    if text.len() > MAX_ANSWER_BYTES {
+        return Err(AnswerError::TooLarge);
+    }
+    let raw: RawAnswer =
+        serde_json::from_str(text.trim()).map_err(|e| AnswerError::Shape(e.to_string()))?;
+    if raw.findings.len() > MAX_FINDINGS {
+        return Err(AnswerError::TooMany);
+    }
+    let mut out = Vec::with_capacity(raw.findings.len());
+    for (i, f) in raw.findings.into_iter().enumerate() {
+        for (field, value, max) in [
+            ("location", &f.location, MAX_LOCATION_BYTES),
+            ("problem", &f.problem, MAX_FINDING_TEXT_BYTES),
+            ("fix", &f.fix, MAX_FINDING_TEXT_BYTES),
+        ] {
+            if value.len() > max {
+                return Err(AnswerError::FieldTooLong {
+                    index: i + 1,
+                    field,
+                    max,
+                });
+            }
+        }
+        out.push(Finding {
+            id: String::new(),
+            severity: f.severity,
+            location: f.location,
+            problem: f.problem,
+            fix: f.fix,
+        });
+    }
+    Ok(out)
+}
+
+/// The info string of the fenced block a reviewer without schema enforcement (an ACP agent)
+/// answers in.
+pub const ANSWER_BLOCK: &str = "json";
+
+/// Reads the answer of a reviewer without schema enforcement, given as its reply's text: the
+/// body of the LAST fenced [`ANSWER_BLOCK`] block ([`last_block`]), read by
+/// [`parse_findings`] as an answer file is. Returns the block's body with the findings, or why
+/// there is no valid answer (what the hub asks again about once).
+pub fn findings_in_text(text: &str) -> Result<(String, Vec<Finding>), String> {
+    let Some(body) = last_block(text, ANSWER_BLOCK) else {
+        return Err(format!(
+            "its reply has no closed ```{ANSWER_BLOCK} block with the findings"
+        ));
+    };
+    match parse_findings(body) {
+        Ok(findings) => Ok((body.trim().to_string(), findings)),
+        Err(e) => Err(format!("its last ```{ANSWER_BLOCK} block: {e}")),
+    }
+}
+
+/// `findings` numbered as round `round` (`m3`) names them: `m3.1`, `m3.2`, …
+pub fn number_findings(round: &str, findings: Vec<Finding>) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| Finding {
+            id: format!("{round}.{}", i + 1),
+            ..f
+        })
+        .collect()
+}
+
+/// The tag of the verification's rounds (module docs).
+pub const VERIFY_TAG: &str = "v";
+/// The tag reserved for an implementation loop's plan check.
+pub const PLAN_CHECK_TAG: &str = "p";
+/// The tag of the sweep's audit runs (`sweep = "runs"`): rule 2's audit is `s2`, its findings
+/// `s2.1`…
+pub const AUDIT_TAG: &str = "s";
+
+/// The id of the audit of rule `rule` (1-based): `s2`.
+pub fn audit_id(rule: u32) -> String {
+    format!("{AUDIT_TAG}{rule}")
+}
+
+/// The tag of each tier of a ladder whose tiers have `efforts`, in order (module docs).
+pub fn tier_tags<S: AsRef<str>>(efforts: &[S]) -> Vec<String> {
+    let mut tags: Vec<String> = Vec::with_capacity(efforts.len());
+    for (i, effort) in efforts.iter().enumerate() {
+        let letter = match effort.as_ref() {
+            "minimal" => Some("n"),
+            "low" => Some("l"),
+            "medium" => Some("m"),
+            "high" => Some("h"),
+            "xhigh" => Some("x"),
+            "max" => Some("z"),
+            "ultra" => Some("u"),
+            _ => None,
+        };
+        let tag = match letter {
+            Some(l) if !tags.iter().any(|t| t == l) => l.to_string(),
+            _ => {
+                let place = u8::try_from(i).ok().filter(|i| *i < 26).unwrap_or(25);
+                format!("t{}", char::from(b'a' + place))
+            }
+        };
+        tags.push(tag);
+    }
+    tags
+}
+
+/// A finding id taken apart: `m3.2` is tag `m`, round 3, finding 2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindingId {
+    /// The tier's tag, [`VERIFY_TAG`] or [`PLAN_CHECK_TAG`].
+    pub tag: String,
+    /// The round within its tier, from 1.
+    pub round: u32,
+    /// The finding within its round, from 1.
+    pub n: u32,
+}
+
+impl FindingId {
+    /// Parses `<tag><round>.<n>`; `None` for anything else.
+    pub fn parse(s: &str) -> Option<FindingId> {
+        let (round_id, n) = s.split_once('.')?;
+        let digits = round_id.find(|c: char| c.is_ascii_digit())?;
+        let (tag, round) = round_id.split_at(digits);
+        let plain_digits = |d: &str| !d.is_empty() && d.chars().all(|c| c.is_ascii_digit());
+        if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_lowercase()) {
+            return None;
+        }
+        if !plain_digits(round) || !plain_digits(n) {
+            return None;
+        }
+        Some(FindingId {
+            tag: tag.to_string(),
+            round: round.parse().ok()?,
+            n: n.parse().ok()?,
+        })
+    }
+
+    /// The id of its round (`m3`).
+    pub fn round_id(&self) -> String {
+        format!("{}{}", self.tag, self.round)
+    }
+}
+
+impl fmt::Display for FindingId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{}.{}", self.tag, self.round, self.n)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fenced blocks
+// ---------------------------------------------------------------------------------------------
+
+/// The body of the last fenced block with info string `info` in `text` (a line of three or
+/// more backticks followed by `info`, up to a line of as many backticks or more and nothing
+/// else; up to three spaces of indentation on either). `None`: no such block, or the last one
+/// is never closed.
+pub fn last_block<'a>(text: &'a str, info: &str) -> Option<&'a str> {
+    let mut found = None;
+    let mut open: Option<(usize, usize)> = None; // (fence length, body start)
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        let start = pos;
+        pos += line.len();
+        let bare = line.trim_end_matches(['\n', '\r']);
+        let indent = bare.len() - bare.trim_start_matches(' ').len();
+        if indent > 3 {
+            continue;
+        }
+        let rest = &bare[indent..];
+        let ticks = rest.len() - rest.trim_start_matches('`').len();
+        if ticks < 3 {
+            continue;
+        }
+        let after = rest[ticks..].trim();
+        match open {
+            Some((len, body)) => {
+                if ticks >= len && after.is_empty() {
+                    found = Some(&text[body..start]);
+                    open = None;
+                }
+            }
+            None if after == info => open = Some((ticks, pos)),
+            None => {}
+        }
+    }
+    found
+}
+
+/// Why a block a thread ended its turn with was refused: what the correction prompt says.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BlockProblem {
+    /// No closed block of that kind.
+    #[error("no ```{0} block: end your reply with one")]
+    Missing(&'static str),
+    /// Larger than [`MAX_BLOCK_BYTES`].
+    #[error("the ```{0} block is larger than {MAX_BLOCK_BYTES} bytes")]
+    TooLarge(&'static str),
+    /// Not JSON, or not an object.
+    #[error("the ```{block} block is not a JSON object: {why}")]
+    NotJson {
+        /// The block's kind.
+        block: &'static str,
+        /// The parser's words.
+        why: String,
+    },
+    /// Empty where it must say something.
+    #[error("the ```{0} block is empty")]
+    Empty(&'static str),
+    /// A required key is missing or of the wrong type.
+    #[error("{0}")]
+    Field(String),
+    /// A finding of the round has no item.
+    #[error("finding {0} has no item: give it a verdict")]
+    NoItem(String),
+    /// An item names no finding of the round.
+    #[error("item {0} is not a finding of this round")]
+    UnknownFinding(String),
+    /// Two items for one finding.
+    #[error("finding {0} has more than one item")]
+    Repeated(String),
+    /// A `dismissed` item without a reason.
+    #[error("{0} is dismissed without a reason: say why it is not a defect")]
+    NoReason(String),
+    /// A `duplicate` item that names no ledger entry.
+    #[error("{0} is a duplicate without `of`: name the ledger entry it repeats (L1, L2…)")]
+    NoOf(String),
+    /// A `duplicate` of an entry the ledger does not have.
+    #[error("{id} is a duplicate of {of}, which is not in the ledger")]
+    UnknownEntry {
+        /// The finding.
+        id: String,
+        /// The entry it named.
+        of: String,
+    },
+    /// A `fixed` item without a class.
+    #[error("{0} is fixed without a class: new-class, known-site or follow-on")]
+    NoClass(String),
+    /// The gates were red.
+    #[error("gates.result is fail: gates must be green before the loop goes on")]
+    GatesFailed,
+}
+
+/// A block's JSON object, or why not.
+fn block_object(
+    text: &str,
+    info: &'static str,
+) -> Result<serde_json::Map<String, Value>, BlockProblem> {
+    let body = last_block(text, info).ok_or(BlockProblem::Missing(info))?;
+    if body.len() > MAX_BLOCK_BYTES {
+        return Err(BlockProblem::TooLarge(info));
+    }
+    match serde_json::from_str::<Value>(body) {
+        Ok(Value::Object(m)) => Ok(m),
+        Ok(_) => Err(BlockProblem::NotJson {
+            block: info,
+            why: "it is not an object".into(),
+        }),
+        Err(e) => Err(BlockProblem::NotJson {
+            block: info,
+            why: e.to_string(),
+        }),
+    }
+}
+
+/// `m[key]` as a string of at most `max` bytes, trimmed; `Ok(None)` when absent or null.
+fn opt_str(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+    what: &str,
+    max: usize,
+) -> Result<Option<String>, BlockProblem> {
+    match m.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) if s.len() <= max => Ok(Some(s.trim().to_string())),
+        Some(Value::String(_)) => Err(BlockProblem::Field(format!(
+            "{what}: `{key}` is longer than {max} bytes"
+        ))),
+        Some(_) => Err(BlockProblem::Field(format!(
+            "{what}: `{key}` is not a string"
+        ))),
+    }
+}
+
+/// The GOAL paragraph of the scope turn's ```` ```twr-goal ```` block: plain text, trimmed,
+/// at most [`MAX_GOAL_BYTES`].
+pub fn parse_goal(text: &str) -> Result<String, Vec<BlockProblem>> {
+    let body = last_block(text, GOAL_BLOCK).ok_or(vec![BlockProblem::Missing(GOAL_BLOCK)])?;
+    let goal = body.trim();
+    if goal.is_empty() {
+        return Err(vec![BlockProblem::Empty(GOAL_BLOCK)]);
+    }
+    if goal.len() > MAX_GOAL_BYTES {
+        return Err(vec![BlockProblem::Field(format!(
+            "the GOAL paragraph is longer than {MAX_GOAL_BYTES} bytes: one paragraph"
+        ))]);
+    }
+    Ok(goal.to_string())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gates
+// ---------------------------------------------------------------------------------------------
+
+/// Whether the gates passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateResult {
+    /// Green.
+    #[default]
+    Pass,
+    /// Red.
+    Fail,
+}
+
+/// The gates a turn ran: `{"ran": [commands], "result": "pass" | "fail"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Gates {
+    /// The commands, as the thread reports them.
+    pub ran: Vec<String>,
+    /// Whether they passed.
+    pub result: GateResult,
+}
+
+/// `m["gates"]`, read: `Ok(None)` when absent.
+fn parse_gates(m: &serde_json::Map<String, Value>) -> Result<Option<Gates>, BlockProblem> {
+    let Some(g) = m.get("gates").filter(|g| !g.is_null()) else {
+        return Ok(None);
+    };
+    let Some(g) = g.as_object() else {
+        return Err(BlockProblem::Field("`gates` is not an object".into()));
+    };
+    let ran = match g.get("ran") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) if a.len() <= MAX_GATES => {
+            let mut ran = Vec::with_capacity(a.len());
+            for c in a {
+                match c.as_str() {
+                    Some(s) if s.len() <= MAX_GATE_BYTES => ran.push(s.to_string()),
+                    _ => {
+                        return Err(BlockProblem::Field(format!(
+                            "`gates.ran` holds something that is not a command of at most \
+                             {MAX_GATE_BYTES} bytes"
+                        )))
+                    }
+                }
+            }
+            ran
+        }
+        Some(_) => {
+            return Err(BlockProblem::Field(format!(
+                "`gates.ran` is not a list of at most {MAX_GATES} commands"
+            )))
+        }
+    };
+    let result = match g.get("result").and_then(Value::as_str) {
+        Some("pass") => GateResult::Pass,
+        Some("fail") => GateResult::Fail,
+        _ => {
+            return Err(BlockProblem::Field(
+                "`gates.result` is not \"pass\" or \"fail\"".into(),
+            ))
+        }
+    };
+    Ok(Some(Gates { ran, result }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Triage
+// ---------------------------------------------------------------------------------------------
+
+/// What the thread made of a finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Valid, and fixed.
+    #[default]
+    Fixed,
+    /// Not a defect, or intended: it goes into the ledger with its reason.
+    Dismissed,
+    /// Already in the ledger (`of`).
+    Duplicate,
+}
+
+/// The class of a fixed finding (the skills' NEW-CLASS / KNOWN-SITE / FOLLOW-ON).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FindingClass {
+    /// A rule the loop had not met yet.
+    #[default]
+    NewClass,
+    /// Another site of a rule already met.
+    KnownSite,
+    /// A defect in one of the loop's own fixes.
+    FollowOn,
+}
+
+impl FindingClass {
+    /// As the triage block writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FindingClass::NewClass => "new-class",
+            FindingClass::KnownSite => "known-site",
+            FindingClass::FollowOn => "follow-on",
+        }
+    }
+}
+
+/// One item of a triage block.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TriageItem {
+    /// The finding (`m3.1`).
+    pub id: String,
+    /// What the thread made of it.
+    pub verdict: Verdict,
+    /// A `fixed` finding's class.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class: Option<FindingClass>,
+    /// A `fixed` finding's rule, a short name the sweep may audit (`identity-gating`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// A `dismissed` finding's reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// A `duplicate` finding's ledger entry (`L4`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub of: Option<String>,
+}
+
+/// A triage block, validated.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Triage {
+    /// One item per finding of the round, in the round's order.
+    pub items: Vec<TriageItem>,
+    /// The gates the turn ran (green).
+    pub gates: Gates,
+}
+
+/// Reads and checks the ```` ```twr-triage ```` block `text` ends with, for a round whose
+/// findings have ids `round` and a ledger whose entries have ids `ledger` (docs/design,
+/// "The triage block"): every finding has exactly one item and no item names another; a
+/// `dismissed` item has a non-empty reason; a `duplicate` names an existing ledger entry in
+/// `of`; a `fixed` item has a class (and may have a rule); `gates.result` is `pass`. Every
+/// problem found is listed, in the block's order, for the one correction prompt. Keys it does
+/// not know are ignored.
+pub fn parse_triage(
+    text: &str,
+    round: &[String],
+    ledger: &[String],
+) -> Result<Triage, Vec<BlockProblem>> {
+    triage_with(text, round, ledger, true)
+}
+
+/// [`parse_triage`]'s checks; `review`: a review round's triage (every `fixed` item has a class,
+/// and `gates` are required), else the plan check's (a class is optional, and `gates`, when
+/// given, passed).
+fn triage_with(
+    text: &str,
+    round: &[String],
+    ledger: &[String],
+    review: bool,
+) -> Result<Triage, Vec<BlockProblem>> {
+    let m = block_object(text, TRIAGE_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let items = match m.get("items") {
+        Some(Value::Array(a)) => a.as_slice(),
+        _ => {
+            problems.push(BlockProblem::Field("`items` is not a list".into()));
+            &[]
+        }
+    };
+    let mut by_id: Vec<Option<TriageItem>> = vec![None; round.len()];
+    for (i, item) in items.iter().enumerate() {
+        let what = format!("item {}", i + 1);
+        let Some(o) = item.as_object() else {
+            problems.push(BlockProblem::Field(format!("{what} is not an object")));
+            continue;
+        };
+        let id = match o.get("id").and_then(Value::as_str) {
+            Some(id) => id.trim().to_string(),
+            None => {
+                problems.push(BlockProblem::Field(format!("{what} has no `id`")));
+                continue;
+            }
+        };
+        let Some(place) = round.iter().position(|r| *r == id) else {
+            problems.push(BlockProblem::UnknownFinding(clip(&id)));
+            continue;
+        };
+        if by_id[place].is_some() {
+            problems.push(BlockProblem::Repeated(id));
+            continue;
+        }
+        let verdict = match o.get("verdict").and_then(Value::as_str) {
+            Some("fixed") => Verdict::Fixed,
+            Some("dismissed") => Verdict::Dismissed,
+            Some("duplicate") => Verdict::Duplicate,
+            _ => {
+                problems.push(BlockProblem::Field(format!(
+                    "{id}: `verdict` is not fixed, dismissed or duplicate"
+                )));
+                by_id[place] = Some(TriageItem::default());
+                continue;
+            }
+        };
+        let fields = (|| -> Result<TriageItem, BlockProblem> {
+            let mut t = TriageItem {
+                id: id.clone(),
+                verdict,
+                ..Default::default()
+            };
+            match verdict {
+                Verdict::Fixed => {
+                    t.class = match o.get("class").and_then(Value::as_str) {
+                        Some("new-class") => Some(FindingClass::NewClass),
+                        Some("known-site") => Some(FindingClass::KnownSite),
+                        Some("follow-on") => Some(FindingClass::FollowOn),
+                        None if o.get("class").is_none_or(Value::is_null) && review => {
+                            return Err(BlockProblem::NoClass(id.clone()))
+                        }
+                        None if o.get("class").is_none_or(Value::is_null) => None,
+                        _ => {
+                            return Err(BlockProblem::Field(format!(
+                                "{id}: `class` is not new-class, known-site or follow-on"
+                            )))
+                        }
+                    };
+                    t.rule = opt_str(o, "rule", &id, MAX_RULE_BYTES)?.filter(|r| !r.is_empty());
+                }
+                Verdict::Dismissed => {
+                    t.reason =
+                        opt_str(o, "reason", &id, MAX_REASON_BYTES)?.filter(|r| !r.is_empty());
+                    if t.reason.is_none() {
+                        return Err(BlockProblem::NoReason(id.clone()));
+                    }
+                }
+                Verdict::Duplicate => {
+                    let of = opt_str(o, "of", &id, 32)?.filter(|r| !r.is_empty());
+                    let Some(of) = of else {
+                        return Err(BlockProblem::NoOf(id.clone()));
+                    };
+                    if !ledger.contains(&of) {
+                        return Err(BlockProblem::UnknownEntry { id: id.clone(), of });
+                    }
+                    t.of = Some(of);
+                }
+            }
+            Ok(t)
+        })();
+        match fields {
+            Ok(t) => by_id[place] = Some(t),
+            Err(p) => {
+                problems.push(p);
+                // (Counted as present: its problem is named, not "no item" as well.)
+                by_id[place] = Some(TriageItem::default());
+            }
+        }
+    }
+    for (id, item) in round.iter().zip(&by_id) {
+        if item.is_none() {
+            problems.push(BlockProblem::NoItem(id.clone()));
+        }
+    }
+    let gates = match parse_gates(&m) {
+        Ok(Some(g)) => {
+            if g.result == GateResult::Fail {
+                problems.push(BlockProblem::GatesFailed);
+            }
+            g
+        }
+        Ok(None) if review => {
+            problems.push(BlockProblem::Field(
+                "no `gates`: run the gates and report them, {\"ran\": [...], \"result\": \"pass\"}"
+                    .into(),
+            ));
+            Gates::default()
+        }
+        Ok(None) => Gates::default(),
+        Err(p) => {
+            problems.push(p);
+            Gates::default()
+        }
+    };
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(Triage {
+        items: by_id.into_iter().flatten().collect(),
+        gates,
+    })
+}
+
+/// `s`, at most 64 bytes of it (an id another model made up, quoted back to it).
+fn clip(s: &str) -> String {
+    let mut end = s.len().min(64);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sweep
+// ---------------------------------------------------------------------------------------------
+
+/// What the sweep found of a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepResult {
+    /// Sites were found and fixed.
+    #[default]
+    Fixed,
+    /// Sites were found and left, with a reason: they go into the ledger.
+    AcceptedResidual,
+    /// No site survived verification.
+    CheckedClean,
+    /// `sweep = "runs"` only: the rule's audit run failed twice and the thread did not audit
+    /// it either; `reason` says why.
+    NotAudited,
+}
+
+impl SweepResult {
+    /// As the report writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SweepResult::Fixed => "fixed",
+            SweepResult::AcceptedResidual => "accepted residual",
+            SweepResult::CheckedClean => "checked clean",
+            SweepResult::NotAudited => "not audited",
+        }
+    }
+}
+
+/// One rule of a sweep block.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SweepItem {
+    /// The rule's name.
+    pub rule: String,
+    /// What the sweep found of it.
+    pub result: SweepResult,
+    /// Why an accepted residual is left (required), or a note on the others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Where an accepted residual is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+}
+
+/// A sweep block, validated.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Sweep {
+    /// One item per rule audited.
+    pub rules: Vec<SweepItem>,
+    /// The gates the turn ran, if it reported them (green).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gates: Option<Gates>,
+}
+
+/// Reads and checks the ```` ```twr-sweep ```` block `text` ends with:
+/// `{"rules": [{"rule", "result": "fixed" | "accepted residual" | "checked clean" | "not
+/// audited", "reason"?, "location"?}], "gates"?}`. Every rule is named once; an accepted
+/// residual and a rule not audited have a reason; `gates`, when given, passed.
+/// (`accepted_residual`, `accepted-residual` and the like are read as `accepted residual`.)
+/// `not audited` is only for a rule whose audit run did not run (`sweep = "runs"`):
+/// [`check_sweep_rules`] checks it against the loop's rules, and a sweep the thread audited
+/// itself refuses it.
+pub fn parse_sweep(text: &str) -> Result<Sweep, Vec<BlockProblem>> {
+    let m = block_object(text, SWEEP_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let mut rules: Vec<SweepItem> = Vec::new();
+    match m.get("rules") {
+        Some(Value::Array(a)) if a.len() <= MAX_SWEEP_RULES => {
+            for (i, r) in a.iter().enumerate() {
+                let what = format!("rule {}", i + 1);
+                let Some(o) = r.as_object() else {
+                    problems.push(BlockProblem::Field(format!("{what} is not an object")));
+                    continue;
+                };
+                let item = (|| -> Result<SweepItem, BlockProblem> {
+                    let rule = opt_str(o, "rule", &what, MAX_RULE_BYTES)?
+                        .filter(|r| !r.is_empty())
+                        .ok_or_else(|| BlockProblem::Field(format!("{what} has no `rule`")))?;
+                    let normal = o
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_ascii_lowercase().replace(['_', '-'], " "));
+                    let result = match normal.as_deref() {
+                        Some("fixed") => SweepResult::Fixed,
+                        Some("accepted residual") => SweepResult::AcceptedResidual,
+                        Some("checked clean") => SweepResult::CheckedClean,
+                        Some("not audited") => SweepResult::NotAudited,
+                        _ => {
+                            return Err(BlockProblem::Field(format!(
+                                "{rule}: `result` is not fixed, accepted residual, checked clean or not audited"
+                            )))
+                        }
+                    };
+                    let reason =
+                        opt_str(o, "reason", &rule, MAX_REASON_BYTES)?.filter(|r| !r.is_empty());
+                    if result == SweepResult::AcceptedResidual && reason.is_none() {
+                        return Err(BlockProblem::Field(format!(
+                            "{rule} is an accepted residual without a reason: say why it stays"
+                        )));
+                    }
+                    if result == SweepResult::NotAudited && reason.is_none() {
+                        return Err(BlockProblem::Field(format!(
+                            "{rule} is not audited without a reason: audit it yourself, or say \
+                             why it can't be"
+                        )));
+                    }
+                    let location = opt_str(o, "location", &rule, MAX_LOCATION_BYTES)?
+                        .filter(|r| !r.is_empty());
+                    Ok(SweepItem {
+                        rule,
+                        result,
+                        reason,
+                        location,
+                    })
+                })();
+                match item {
+                    Ok(item) if rules.iter().any(|r| r.rule == item.rule) => problems.push(
+                        BlockProblem::Field(format!("rule {} is reported twice", item.rule)),
+                    ),
+                    Ok(item) => rules.push(item),
+                    Err(p) => problems.push(p),
+                }
+            }
+        }
+        _ => problems.push(BlockProblem::Field(format!(
+            "`rules` is not a list of at most {MAX_SWEEP_RULES} rules"
+        ))),
+    }
+    let gates = match parse_gates(&m) {
+        Ok(g) => {
+            if g.as_ref().is_some_and(|g| g.result == GateResult::Fail) {
+                problems.push(BlockProblem::GatesFailed);
+            }
+            g
+        }
+        Err(p) => {
+            problems.push(p);
+            None
+        }
+    };
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(Sweep { rules, gates })
+}
+
+/// Checks a sweep block `sweep` against the loop's state: `rules`, the rules the rules turn
+/// named (`sweep = "runs"`; empty for a sweep the thread audited itself, which names its own),
+/// and `not_run`, those whose audit run did not run. With rules, every one is reported once
+/// and no other; `not audited` is only for a rule of `not_run`. Without rules, `not audited`
+/// is refused: the thread audits every rule it names.
+pub fn check_sweep_rules(sweep: &Sweep, rules: &[String], not_run: &[String]) -> Vec<BlockProblem> {
+    let mut problems = Vec::new();
+    for item in &sweep.rules {
+        if item.result != SweepResult::NotAudited {
+            continue;
+        }
+        if rules.is_empty() {
+            problems.push(BlockProblem::Field(format!(
+                "{} is not audited: this sweep audits its rules itself, so report what you found",
+                item.rule
+            )));
+        } else if rules.contains(&item.rule) && !not_run.contains(&item.rule) {
+            problems.push(BlockProblem::Field(format!(
+                "{} is not audited, but its audit ran: report what you made of its findings",
+                item.rule
+            )));
+        }
+    }
+    if rules.is_empty() {
+        return problems;
+    }
+    for r in rules {
+        if !sweep.rules.iter().any(|i| i.rule == *r) {
+            problems.push(BlockProblem::Field(format!(
+                "rule {r} has no item: report it (fixed, accepted residual, checked clean{})",
+                if not_run.contains(r) {
+                    ", or not audited with a reason"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    for i in &sweep.rules {
+        if !rules.contains(&i.rule) {
+            problems.push(BlockProblem::Field(format!(
+                "rule {} is not one of this sweep's rules ({})",
+                i.rule,
+                rules.join(", ")
+            )));
+        }
+    }
+    problems
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rules (`sweep = "runs"`)
+// ---------------------------------------------------------------------------------------------
+
+/// One rule of the rules turn's block: what an audit run checks.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuditRule {
+    /// Its name, kebab-case (`identity-gating`): what the sweep block reports it as.
+    pub name: String,
+    /// What must hold, in one sentence.
+    pub rule: String,
+    /// Where to look: paths, globs, or `everywhere the diff touches`.
+    #[serde(rename = "where")]
+    pub r#where: String,
+}
+
+/// Whether `name` is kebab-case: lowercase ASCII letters and digits in words joined by single
+/// hyphens, starting with a letter.
+fn kebab(name: &str) -> bool {
+    name.split('-').all(|w| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    }) && name.starts_with(|c: char| c.is_ascii_lowercase())
+}
+
+/// Reads and checks the ```` ```twr-rules ```` block `text` ends with: `{"rules": [{"name":
+/// "<kebab-case>", "rule": "<one sentence>", "where": "<paths, globs or 'everywhere the diff
+/// touches'>"}]}`. At most [`MAX_AUDIT_RULES`]; names unique and kebab-case, at most
+/// [`MAX_RULE_BYTES`]; `rule` and `where` non-empty, at most [`MAX_RULE_TEXT_BYTES`]. An
+/// empty list is an answer: nothing to audit.
+pub fn parse_rules(text: &str) -> Result<Vec<AuditRule>, Vec<BlockProblem>> {
+    let m = block_object(text, RULES_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let mut rules: Vec<AuditRule> = Vec::new();
+    match m.get("rules") {
+        Some(Value::Array(a)) if a.len() <= MAX_AUDIT_RULES => {
+            for (i, r) in a.iter().enumerate() {
+                let what = format!("rule {}", i + 1);
+                let Some(o) = r.as_object() else {
+                    problems.push(BlockProblem::Field(format!("{what} is not an object")));
+                    continue;
+                };
+                let item = (|| -> Result<AuditRule, BlockProblem> {
+                    let name = opt_str(o, "name", &what, MAX_RULE_BYTES)?
+                        .filter(|n| !n.is_empty())
+                        .ok_or_else(|| BlockProblem::Field(format!("{what} has no `name`")))?;
+                    if !kebab(&name) {
+                        return Err(BlockProblem::Field(format!(
+                            "{what}: `name` {name:?} is not kebab-case (lowercase words joined \
+                             by hyphens, like identity-gating)"
+                        )));
+                    }
+                    let text = |key: &str| -> Result<String, BlockProblem> {
+                        opt_str(o, key, &name, MAX_RULE_TEXT_BYTES)?
+                            .filter(|t| !t.is_empty())
+                            .ok_or_else(|| BlockProblem::Field(format!("{name} has no `{key}`")))
+                    };
+                    Ok(AuditRule {
+                        rule: text("rule")?,
+                        r#where: text("where")?,
+                        name,
+                    })
+                })();
+                match item {
+                    Ok(item) if rules.iter().any(|r| r.name == item.name) => problems.push(
+                        BlockProblem::Field(format!("rule {} is named twice", item.name)),
+                    ),
+                    Ok(item) => rules.push(item),
+                    Err(p) => problems.push(p),
+                }
+            }
+        }
+        Some(Value::Array(_)) => problems.push(BlockProblem::Field(format!(
+            "`rules` names more than {MAX_AUDIT_RULES} rules: merge them into classes (one rule \
+             names a class of defect, not a site)"
+        ))),
+        _ => problems.push(BlockProblem::Field(format!(
+            "`rules` is not a list of at most {MAX_AUDIT_RULES} rules"
+        ))),
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(rules)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan
+// ---------------------------------------------------------------------------------------------
+
+/// `text` without its closed fenced blocks whose info string is one of `infos` (fence lines
+/// included, as [`last_block`] reads a fence), trimmed: what a plan turn's message is without
+/// its `twr-plan` block. A fence never closed stays, as text.
+pub fn without_blocks(text: &str, infos: &[&str]) -> String {
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<(usize, usize)> = None; // (fence length, block start)
+    let mut pos = 0;
+    for line in text.split_inclusive('\n') {
+        let start = pos;
+        pos += line.len();
+        let bare = line.trim_end_matches(['\n', '\r']);
+        let indent = bare.len() - bare.trim_start_matches(' ').len();
+        if indent > 3 {
+            continue;
+        }
+        let rest = &bare[indent..];
+        let ticks = rest.len() - rest.trim_start_matches('`').len();
+        if ticks < 3 {
+            continue;
+        }
+        let after = rest[ticks..].trim();
+        match open {
+            Some((len, from)) => {
+                if ticks >= len && after.is_empty() {
+                    cut.push((from, pos));
+                    open = None;
+                }
+            }
+            None if infos.contains(&after) => open = Some((ticks, start)),
+            None => {}
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (from, to) in cut {
+        out.push_str(&text[at..from]);
+        at = to;
+    }
+    out.push_str(&text[at..]);
+    out.trim().to_string()
+}
+
+/// A plan an implementation loop's thread wrote: its `twr-plan` block and the message without
+/// its blocks, which is the plan the hub writes to `plan.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Plan {
+    /// The plan touches money paths, schemas or migrations, or cross-repo contracts.
+    pub contract_risk: bool,
+    /// Why, in a line.
+    pub reason: String,
+    /// The plan itself.
+    pub text: String,
+}
+
+/// The `twr-plan` block's fields of `text`, and its plan: the message without the blocks
+/// `infos` names.
+fn plan_of(text: &str, infos: &[&str]) -> Result<Plan, Vec<BlockProblem>> {
+    let m = block_object(text, PLAN_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let contract_risk = match m.get("contract_risk") {
+        Some(Value::Bool(b)) => *b,
+        _ => {
+            problems.push(BlockProblem::Field(
+                "`contract_risk` is not true or false: does the plan touch money paths, \
+                 schemas or migrations, or cross-repo contracts?"
+                    .into(),
+            ));
+            false
+        }
+    };
+    let reason = match opt_str(&m, "reason", "the plan", MAX_REASON_BYTES) {
+        Ok(Some(r)) if !r.is_empty() => r,
+        Ok(_) => {
+            problems.push(BlockProblem::Field(
+                "the plan: no `reason`: say in a line why contract_risk is what it is".into(),
+            ));
+            String::new()
+        }
+        Err(p) => {
+            problems.push(p);
+            String::new()
+        }
+    };
+    let plan = without_blocks(text, infos);
+    if plan.is_empty() {
+        problems.push(BlockProblem::Field(
+            "the plan is empty: write it in the message, above the ```twr-plan block".into(),
+        ));
+    } else if plan.len() > MAX_PLAN_BYTES {
+        problems.push(BlockProblem::Field(format!(
+            "the plan is longer than {MAX_PLAN_BYTES} bytes"
+        )));
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(Plan {
+        contract_risk,
+        reason,
+        text: plan,
+    })
+}
+
+/// Reads the plan turn's reply `text`: the ```` ```twr-plan ```` block it ends with,
+/// `{"contract_risk": true | false, "reason": "…"}` (a reason is required), and the plan, which
+/// is the message without its `twr-plan` blocks (not empty, at most [`MAX_PLAN_BYTES`]).
+pub fn parse_plan(text: &str) -> Result<Plan, Vec<BlockProblem>> {
+    plan_of(text, &[PLAN_BLOCK])
+}
+
+/// The plan check's triage, validated: one item per finding, and the revised plan when it
+/// changed the plan.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanTriage {
+    /// One item per finding of `p1`, in its order.
+    pub items: Vec<TriageItem>,
+    /// The revised plan: the message without its `twr-triage` and `twr-plan` blocks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Plan>,
+}
+
+/// Reads and checks the plan check's triage reply `text`, for findings `round` (`p1.1`…) and
+/// a ledger whose entries have ids `ledger`: its ```` ```twr-triage ```` block as
+/// [`parse_triage`] reads a round's, but a `fixed` item's class is optional and `gates` are not
+/// required (when given, they passed); and, when it changed the plan, a ```` ```twr-plan ````
+/// block, the message without its blocks being the revised plan ([`parse_plan`]'s checks). A
+/// `fixed` item means the plan changed, so it needs the revised plan.
+pub fn parse_plan_triage(
+    text: &str,
+    round: &[String],
+    ledger: &[String],
+) -> Result<PlanTriage, Vec<BlockProblem>> {
+    let triage = triage_with(text, round, ledger, false);
+    let plan = last_block(text, PLAN_BLOCK)
+        .map(|_| plan_of(text, &[PLAN_BLOCK, TRIAGE_BLOCK]))
+        .transpose();
+    match (triage, plan) {
+        (Ok(t), Ok(plan)) => {
+            let fixed: Vec<&str> = t
+                .items
+                .iter()
+                .filter(|i| i.verdict == Verdict::Fixed)
+                .map(|i| i.id.as_str())
+                .collect();
+            if plan.is_none() && !fixed.is_empty() {
+                return Err(vec![BlockProblem::Field(format!(
+                    "{} fixed, but no ```twr-plan block: write the revised plan in the message \
+                     and end it with the block too",
+                    fixed.join(", ")
+                ))]);
+            }
+            Ok(PlanTriage {
+                items: t.items,
+                plan,
+            })
+        }
+        (t, p) => {
+            let mut problems = t.err().unwrap_or_default();
+            problems.extend(p.err().unwrap_or_default());
+            Err(problems)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Implement
+// ---------------------------------------------------------------------------------------------
+
+/// How far the implement turn got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImplementStatus {
+    /// The plan is implemented.
+    #[default]
+    Done,
+    /// Some of it.
+    Partial,
+}
+
+impl ImplementStatus {
+    /// As the block writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ImplementStatus::Done => "done",
+            ImplementStatus::Partial => "partial",
+        }
+    }
+}
+
+/// The implement turn's `twr-implement` block, read.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Implemented {
+    /// How far it got.
+    pub status: ImplementStatus,
+    /// The gates it ran.
+    pub gates: Gates,
+}
+
+impl Implemented {
+    /// Why the loop can't go on to its review with it: anything but `done` with gates that
+    /// passed ("gates must be green before review"). Empty: it can.
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.status != ImplementStatus::Done {
+            out.push(format!(
+                "status is {}: finish the plan; gates must be green before review",
+                self.status.as_str()
+            ));
+        }
+        if self.gates.result != GateResult::Pass {
+            out.push("gates.result is fail: gates must be green before review".into());
+        }
+        out
+    }
+}
+
+/// Reads the ```` ```twr-implement ```` block the implement turn's reply `text` ends with:
+/// `{"status": "done" | "partial", "gates": {"ran": […], "result": "pass" | "fail"}}`, both keys
+/// required. A partial status or red gates read fine: whether the loop goes on is the machine's
+/// call ([`Implemented::problems`]).
+pub fn parse_implement(text: &str) -> Result<Implemented, Vec<BlockProblem>> {
+    let m = block_object(text, IMPLEMENT_BLOCK).map_err(|p| vec![p])?;
+    let mut problems = Vec::new();
+    let status = match m.get("status").and_then(Value::as_str).map(str::trim) {
+        Some("done") => ImplementStatus::Done,
+        Some("partial") => ImplementStatus::Partial,
+        _ => {
+            problems.push(BlockProblem::Field(
+                "`status` is not \"done\" or \"partial\"".into(),
+            ));
+            ImplementStatus::Partial
+        }
+    };
+    let gates = match parse_gates(&m) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            problems.push(BlockProblem::Field(
+                "no `gates`: run the gates and report them, {\"ran\": [...], \"result\": \"pass\"}"
+                    .into(),
+            ));
+            Gates::default()
+        }
+        Err(p) => {
+            problems.push(p);
+            Gates::default()
+        }
+    };
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(Implemented { status, gates })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Commit
+// ---------------------------------------------------------------------------------------------
+
+/// A commit a loop made: a repository and the commit's sha.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Commit {
+    /// The repository (its path).
+    pub repo: String,
+    /// The commit.
+    pub sha: String,
+}
+
+/// Whether `sha` reads as a commit id: 7 to 64 hexadecimal digits.
+fn is_sha(sha: &str) -> bool {
+    (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Reads the ```` ```twr-commit ```` block `text` ends with: `{"commits": [{"repo": "<path>",
+/// "sha": "<sha>"}]}`, at most [`MAX_COMMITS`], each named once. The list may be empty (a loop
+/// that committed as it went, or had nothing to commit): what was committed is the hub's check
+/// to say ([`check_commit`]), not the block's.
+pub fn parse_commit(text: &str) -> Result<Vec<Commit>, Vec<BlockProblem>> {
+    let m = block_object(text, COMMIT_BLOCK).map_err(|p| vec![p])?;
+    let Some(Value::Array(list)) = m.get("commits") else {
+        return Err(vec![BlockProblem::Field(
+            "`commits` is not a list of {\"repo\", \"sha\"}".into(),
+        )]);
+    };
+    if list.len() > MAX_COMMITS {
+        return Err(vec![BlockProblem::Field(format!(
+            "`commits` lists more than {MAX_COMMITS} commits"
+        ))]);
+    }
+    let mut problems = Vec::new();
+    let mut out: Vec<Commit> = Vec::new();
+    for (i, c) in list.iter().enumerate() {
+        let what = format!("commit {}", i + 1);
+        let Some(o) = c.as_object() else {
+            problems.push(BlockProblem::Field(format!("{what} is not an object")));
+            continue;
+        };
+        let commit = (|| -> Result<Commit, BlockProblem> {
+            let repo = opt_str(o, "repo", &what, MAX_REPO_BYTES)?
+                .filter(|r| !r.is_empty())
+                .ok_or_else(|| BlockProblem::Field(format!("{what} has no `repo`")))?;
+            let sha = opt_str(o, "sha", &what, 64)?
+                .filter(|s| is_sha(s))
+                .ok_or_else(|| {
+                    BlockProblem::Field(format!(
+                        "{what}: `sha` is not a commit id (7 to 64 hex digits)"
+                    ))
+                })?;
+            Ok(Commit { repo, sha })
+        })();
+        match commit {
+            Ok(c) if out.contains(&c) => problems.push(BlockProblem::Field(format!(
+                "{} {} is listed twice",
+                clip(&c.repo),
+                c.sha
+            ))),
+            Ok(c) => out.push(c),
+            Err(p) => problems.push(p),
+        }
+    }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(out)
+}
+
+/// What the hub found of one repository when it checked a loop's commit.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoAfter {
+    /// The repository (its path).
+    pub repo: String,
+    /// `HEAD` the commit is measured from (the loop's baseline `HEAD` for an implementation
+    /// loop; `None`: the repository had no commit).
+    pub from: Option<String>,
+    /// `HEAD` now.
+    pub head: Option<String>,
+    /// The loop left work there to commit (its last round's diff showed changes, or, for a
+    /// review loop, it fixed something).
+    pub work: bool,
+    /// The paths still changed in the worktree beyond what the baseline had.
+    pub left: Vec<String>,
+    /// `HEAD`'s tree is `from`'s: whatever moved `HEAD` committed no change (an empty commit,
+    /// or one undone by another).
+    pub same_tree: bool,
+    /// The baseline's paths that are no longer changed in the worktree as the baseline had
+    /// them because `HEAD` now holds the baseline's change (committed by mistake).
+    pub baseline_committed: Vec<String>,
+    /// The baseline's paths whose change is gone: the worktree and `HEAD` are back to what
+    /// `from` had.
+    pub baseline_undone: Vec<String>,
+}
+
+/// The paths `paths` as a problem names them: the first [`MAX_LEFT_SHOWN`], then how many more.
+fn shown_paths(paths: &[String]) -> String {
+    let mut shown: Vec<String> = paths.iter().take(MAX_LEFT_SHOWN).map(|p| clip(p)).collect();
+    if paths.len() > MAX_LEFT_SHOWN {
+        shown.push(format!("and {} more", paths.len() - MAX_LEFT_SHOWN));
+    }
+    shown.join(", ")
+}
+
+/// `1 path is` / `3 paths are`.
+fn paths_are(n: usize) -> String {
+    match n {
+        1 => "1 path is".to_string(),
+        n => format!("{n} paths are"),
+    }
+}
+
+/// The hub's check of a loop's commit, given what it found of each repository. It follows
+/// git, not the thread's `twr-commit` block: a repository passes when nothing is left in its
+/// worktree beyond what the baseline had, the baseline's own changes are still uncommitted as
+/// the baseline had them, and, where the loop left work, `HEAD` moved to a commit that changed
+/// something. Each repository is either committed or has a problem, never both: the commits
+/// are those of the repositories that passed and whose `HEAD` moved (its new `HEAD`); the
+/// problems, one line per problem (none holds `; `, which joins them), name the others, for the
+/// one correction prompt and, after a
+/// second failure, `loop.ended.commit_problem`. The check passed when there is no problem.
+pub fn check_commit(repos: &[RepoAfter]) -> (Vec<Commit>, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut commits = Vec::new();
+    for r in repos {
+        let moved = r.head.is_some() && r.head != r.from;
+        let mut mine = Vec::new();
+        if !r.left.is_empty() {
+            mine.push(format!(
+                "{}: {} uncommitted beyond the baseline: {}",
+                r.repo,
+                paths_are(r.left.len()),
+                shown_paths(&r.left)
+            ));
+        } else if r.work && (!moved || r.same_tree) {
+            mine.push(format!(
+                "{}: the loop's changes are neither in the worktree nor committed ({})",
+                r.repo,
+                if moved {
+                    "HEAD moved, but to a commit that changed nothing"
+                } else {
+                    "HEAD did not move"
+                }
+            ));
+        }
+        if !r.baseline_committed.is_empty() {
+            mine.push(format!(
+                "{}: the baseline's changes were committed, which were not the loop's to commit \
+                 ({} no longer uncommitted as the loop found it): {}",
+                r.repo,
+                paths_are(r.baseline_committed.len()),
+                shown_paths(&r.baseline_committed)
+            ));
+        }
+        if !r.baseline_undone.is_empty() {
+            mine.push(format!(
+                "{}: the baseline's changes are gone ({} back to what HEAD had when the loop \
+                 began): {}",
+                r.repo,
+                paths_are(r.baseline_undone.len()),
+                shown_paths(&r.baseline_undone)
+            ));
+        }
+        if !mine.is_empty() {
+            // (A repository with a problem is not counted committed, whatever HEAD did: say
+            // where it is, so the problem is whole.)
+            if let Some(head) = r.head.as_ref().filter(|_| moved) {
+                if let Some(last) = mine.last_mut() {
+                    last.push_str(&format!(" (HEAD is at {})", head.get(..12).unwrap_or(head)));
+                }
+            }
+            problems.extend(mine);
+            continue;
+        }
+        if let Some(head) = r.head.as_ref().filter(|_| moved) {
+            commits.push(Commit {
+                repo: r.repo.clone(),
+                sha: head.clone(),
+            });
+        }
+    }
+    (commits, problems)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ledger
+// ---------------------------------------------------------------------------------------------
+
+/// Why an entry is in the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerKind {
+    /// A finding the thread dismissed: not a defect, or intended.
+    #[default]
+    Dismissed,
+    /// A site the sweep found and left on purpose.
+    AcceptedResidual,
+}
+
+/// One entry of the ledger every reviewer prompt names ("do not re-raise").
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LedgerEntry {
+    /// `L1`, `L2`, … in the order entries were added ([`ledger_id`]).
+    pub id: String,
+    /// Why it is there.
+    pub kind: LedgerKind,
+    /// What it came from: a finding id (`m3.2`) or, for an accepted residual, its rule.
+    pub from: String,
+    /// Where, as the finding or the sweep said.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub location: String,
+    /// The finding's problem, or the rule's name for an accepted residual.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub problem: String,
+    /// Why it is not changed.
+    pub reason: String,
+}
+
+/// The id of the `n`th ledger entry, from 1: `L1`.
+pub fn ledger_id(n: usize) -> String {
+    format!("L{n}")
+}
+
+/// `ledger.md`: the text the reviewer reads by path, its title and the reviewer's
+/// instruction over [`render_ledger_entries`].
+pub fn render_ledger(entries: &[LedgerEntry]) -> String {
+    let mut out = String::from(
+        "# Ledger\n\nPREVIOUSLY REVIEWED — intentionally NOT changed, and ACCEPTED RESIDUALS. \
+         Do NOT re-raise anything listed here.\n\n",
+    );
+    if entries.is_empty() {
+        out.push_str("none yet\n");
+    } else {
+        out.push_str(&render_ledger_entries(entries));
+    }
+    out
+}
+
+/// The ledger's entries, one item each (empty: none): the body of `ledger.md`, and what the
+/// loop report shows under its own heading. Lines of `entries` are kept to one line each
+/// (newlines become spaces), so an entry can't pose as a heading.
+pub fn render_ledger_entries(entries: &[LedgerEntry]) -> String {
+    let one_line = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for e in entries {
+        let kind = match e.kind {
+            LedgerKind::Dismissed => "dismissed",
+            LedgerKind::AcceptedResidual => "accepted residual",
+        };
+        out.push_str(&format!("- {} ({kind}, {})", e.id, one_line(&e.from)));
+        if !e.location.is_empty() {
+            out.push_str(&format!(" `{}`", one_line(&e.location).replace('`', "'")));
+        }
+        if !e.problem.is_empty() {
+            out.push_str(&format!(": {}", one_line(&e.problem)));
+        }
+        out.push_str(&format!("\n  Reason: {}\n", one_line(&e.reason)));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_schema_is_the_skills_schema() {
+        let ours: Value = serde_json::from_str(FINDINGS_SCHEMA).unwrap();
+        let skills = serde_json::json!({
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["findings"],
+          "properties": {
+            "findings": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["severity", "location", "problem", "fix"],
+                "properties": {
+                  "severity": { "type": "string", "enum": ["blocker", "major", "minor"] },
+                  "location": { "type": "string" },
+                  "problem": { "type": "string" },
+                  "fix": { "type": "string" }
+                }
+              }
+            }
+          }
+        });
+        assert_eq!(ours, skills);
+    }
+
+    #[test]
+    fn findings_parse_and_number() {
+        let text = r#"{"findings":[{"severity":"major","location":"a.rs:3","problem":"p","fix":"f"},
+            {"severity":"blocker","location":"b.rs:1","problem":"q","fix":"g"}]}"#;
+        let f = number_findings("m3", parse_findings(text).unwrap());
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].id, "m3.1");
+        assert_eq!(f[1].id, "m3.2");
+        assert_eq!(f[1].severity, Severity::Blocker);
+        assert_eq!(parse_findings("{\"findings\": []}\n").unwrap(), vec![]);
+    }
+
+    #[test]
+    fn findings_refuse_what_the_schema_does() {
+        let one = |extra: &str| {
+            format!(
+                r#"{{"findings":[{{"severity":"major","location":"a","problem":"p"{extra}}}]}}"#
+            )
+        };
+        for (bad, why) in [
+            ("not json".to_string(), "does not match"),
+            ("[]".to_string(), "does not match"),
+            ("{}".to_string(), "does not match"),
+            (r#"{"findings":[],"x":1}"#.to_string(), "does not match"),
+            (one(""), "does not match"),
+            (one(r#","fix":"f","id":"m1.1""#), "does not match"),
+            (
+                r#"{"findings":[{"severity":"critical","location":"a","problem":"p","fix":"f"}]}"#
+                    .to_string(),
+                "does not match",
+            ),
+            (
+                r#"{"findings":[{"severity":"major","location":1,"problem":"p","fix":"f"}]}"#
+                    .to_string(),
+                "does not match",
+            ),
+        ] {
+            let e = parse_findings(&bad).unwrap_err();
+            assert!(e.to_string().contains(why), "{bad}: {e}");
+        }
+        let huge = " ".repeat(MAX_ANSWER_BYTES + 1);
+        assert_eq!(parse_findings(&huge), Err(AnswerError::TooLarge));
+        let many = format!(
+            "{{\"findings\":[{}]}}",
+            vec![
+                r#"{"severity":"minor","location":"a","problem":"p","fix":"f"}"#;
+                MAX_FINDINGS + 1
+            ]
+            .join(",")
+        );
+        assert_eq!(parse_findings(&many), Err(AnswerError::TooMany));
+        let long = format!(
+            r#"{{"findings":[{{"severity":"minor","location":"{}","problem":"p","fix":"f"}}]}}"#,
+            "a".repeat(MAX_LOCATION_BYTES + 1)
+        );
+        assert_eq!(
+            parse_findings(&long),
+            Err(AnswerError::FieldTooLong {
+                index: 1,
+                field: "location",
+                max: MAX_LOCATION_BYTES
+            })
+        );
+    }
+
+    /// An ACP reviewer's reply: the LAST closed ```json block is the answer, read as an
+    /// answer file is; anything else is no answer.
+    #[test]
+    fn the_last_json_block_is_the_answer() {
+        let one =
+            r#"{"findings":[{"severity":"minor","location":"a.rs:1","problem":"p","fix":"f"}]}"#;
+        let text = format!(
+            "I looked.\n```json\n{{\"findings\": []}}\n```\nOn second thought:\n```json\n{one}\n```\nDone."
+        );
+        let (body, f) = findings_in_text(&text).unwrap();
+        assert_eq!(body, one);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].location, "a.rs:1");
+        let (_, none) = findings_in_text("```json\n{\"findings\": []}\n```").unwrap();
+        assert!(none.is_empty());
+        for (bad, why) in [
+            ("No problems found.", "no closed ```json block"),
+            ("{\"findings\": []}", "no closed ```json block"),
+            // Another info string, or an unclosed block, is no answer.
+            (
+                "```JSON\n{\"findings\": []}\n```",
+                "no closed ```json block",
+            ),
+            ("```json\n{\"findings\": []}\n", "no closed ```json block"),
+            // The last block counts, even when an earlier one was valid.
+            (
+                "```json\n{\"findings\": []}\n```\n```json\n{\"findings\": 1}\n```",
+                "does not match the findings schema",
+            ),
+            (
+                "```json\n{\"findings\": [], \"note\": \"x\"}\n```",
+                "does not match the findings schema",
+            ),
+        ] {
+            let e = findings_in_text(bad).unwrap_err();
+            assert!(e.contains(why), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn tier_tags_and_ids() {
+        assert_eq!(tier_tags(&["medium", "xhigh"]), ["m", "x"]);
+        assert_eq!(tier_tags(&["low", "high", "max"]), ["l", "h", "z"]);
+        assert_eq!(tier_tags(&["medium", "medium", "turbo"]), ["m", "tb", "tc"]);
+        for tag in tier_tags(&["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
+            assert!(tag != VERIFY_TAG && tag != PLAN_CHECK_TAG);
+        }
+        let id = FindingId::parse("m3.2").unwrap();
+        assert_eq!((id.tag.as_str(), id.round, id.n), ("m", 3, 2));
+        assert_eq!(id.round_id(), "m3");
+        assert_eq!(id.to_string(), "m3.2");
+        assert_eq!(FindingId::parse("tb12.10").unwrap().to_string(), "tb12.10");
+        for bad in ["m3", "3.2", "M3.2", "m.2", "m3.", "m3.x", "m-3.2", ""] {
+            assert_eq!(FindingId::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn last_block_takes_the_last_closed_fence() {
+        let text = "x\n```twr-triage\n{\"a\":1}\n```\ntext\n  ````twr-triage\n{\"a\":2}\n````\n";
+        assert_eq!(last_block(text, "twr-triage"), Some("{\"a\":2}\n"));
+        assert_eq!(last_block("```twr-triage\nopen", "twr-triage"), None);
+        assert_eq!(last_block("```json\n{}\n```", "twr-triage"), None);
+        // A shorter fence inside does not close it.
+        let nested = "```twr-goal\nsee:\n```` no\n```\n";
+        assert_eq!(last_block(nested, "twr-goal"), Some("see:\n```` no\n"));
+        assert_eq!(
+            parse_goal("```twr-goal\n  Make it fast.\n```").unwrap(),
+            "Make it fast."
+        );
+        assert_eq!(
+            parse_goal("```twr-goal\n\n```").unwrap_err(),
+            vec![BlockProblem::Empty(GOAL_BLOCK)]
+        );
+        assert_eq!(
+            parse_goal("no block").unwrap_err(),
+            vec![BlockProblem::Missing(GOAL_BLOCK)]
+        );
+    }
+
+    fn triage(body: &str) -> String {
+        format!("I fixed things.\n\n```twr-triage\n{body}\n```\n")
+    }
+
+    #[test]
+    fn a_valid_triage_block_reads() {
+        let t = parse_triage(
+            &triage(
+                r#"{"items": [
+  {"id": "m3.1", "verdict": "fixed", "class": "new-class", "rule": "identity-gating"},
+  {"id": "m3.2", "verdict": "dismissed", "reason": "the retry is idempotent"},
+  {"id": "m3.3", "verdict": "duplicate", "of": "L4", "note": "ignored"}
+ ],
+ "gates": {"ran": ["cargo test --workspace"], "result": "pass"}}"#,
+            ),
+            &ids(&["m3.1", "m3.2", "m3.3"]),
+            &ids(&["L1", "L2", "L3", "L4"]),
+        )
+        .unwrap();
+        assert_eq!(t.items.len(), 3);
+        assert_eq!(t.items[0].class, Some(FindingClass::NewClass));
+        assert_eq!(t.items[0].rule.as_deref(), Some("identity-gating"));
+        assert_eq!(
+            t.items[1].reason.as_deref(),
+            Some("the retry is idempotent")
+        );
+        assert_eq!(t.items[2].of.as_deref(), Some("L4"));
+        assert_eq!(t.gates.ran, ["cargo test --workspace"]);
+    }
+
+    #[test]
+    fn each_triage_rule_names_its_problem() {
+        let round = ids(&["m1.1", "m1.2"]);
+        let ledger = ids(&["L1"]);
+        let gates = r#""gates": {"ran": [], "result": "pass"}"#;
+        let check = |body: String, want: Vec<BlockProblem>| {
+            let got = parse_triage(&triage(&body), &round, &ledger).unwrap_err();
+            assert_eq!(got, want, "{body}");
+        };
+        let fixed2 = r#"{"id": "m1.2", "verdict": "fixed", "class": "known-site"}"#;
+        check(
+            format!(r#"{{"items": [{fixed2}], {gates}}}"#),
+            vec![BlockProblem::NoItem("m1.1".into())],
+        );
+        check(
+            format!(
+                r#"{{"items": [{fixed2}, {fixed2}, {{"id": "m1.1", "verdict": "fixed", "class": "follow-on"}}], {gates}}}"#
+            ),
+            vec![BlockProblem::Repeated("m1.2".into())],
+        );
+        check(
+            format!(
+                r#"{{"items": [{fixed2}, {{"id": "m9.1", "verdict": "fixed"}}, {{"id": "m1.1", "verdict": "dismissed", "reason": "  "}}], {gates}}}"#
+            ),
+            vec![
+                BlockProblem::UnknownFinding("m9.1".into()),
+                BlockProblem::NoReason("m1.1".into()),
+            ],
+        );
+        check(
+            format!(
+                r#"{{"items": [{fixed2}, {{"id": "m1.1", "verdict": "duplicate"}}], {gates}}}"#
+            ),
+            vec![BlockProblem::NoOf("m1.1".into())],
+        );
+        check(
+            format!(
+                r#"{{"items": [{fixed2}, {{"id": "m1.1", "verdict": "duplicate", "of": "L7"}}], {gates}}}"#
+            ),
+            vec![BlockProblem::UnknownEntry {
+                id: "m1.1".into(),
+                of: "L7".into(),
+            }],
+        );
+        check(
+            format!(r#"{{"items": [{fixed2}, {{"id": "m1.1", "verdict": "fixed"}}], {gates}}}"#),
+            vec![BlockProblem::NoClass("m1.1".into())],
+        );
+        check(
+            format!(
+                r#"{{"items": [{fixed2}, {{"id": "m1.1", "verdict": "fixed", "class": "big"}}], {gates}}}"#
+            ),
+            vec![BlockProblem::Field(
+                "m1.1: `class` is not new-class, known-site or follow-on".into(),
+            )],
+        );
+        check(
+            format!(r#"{{"items": [{fixed2}, {{"id": "m1.1", "verdict": "maybe"}}], {gates}}}"#),
+            vec![BlockProblem::Field(
+                "m1.1: `verdict` is not fixed, dismissed or duplicate".into(),
+            )],
+        );
+        let both =
+            format!(r#"{fixed2}, {{"id": "m1.1", "verdict": "fixed", "class": "new-class"}}"#);
+        check(
+            format!(r#"{{"items": [{both}], "gates": {{"ran": ["make"], "result": "fail"}}}}"#),
+            vec![BlockProblem::GatesFailed],
+        );
+        check(
+            format!(r#"{{"items": [{both}]}}"#),
+            vec![BlockProblem::Field(
+                "no `gates`: run the gates and report them, {\"ran\": [...], \"result\": \"pass\"}"
+                    .into(),
+            )],
+        );
+        check(
+            format!(r#"{{"items": [{both}], "gates": {{"result": "green"}}}}"#),
+            vec![BlockProblem::Field(
+                "`gates.result` is not \"pass\" or \"fail\"".into(),
+            )],
+        );
+        assert_eq!(
+            parse_triage("no block here", &round, &ledger).unwrap_err(),
+            vec![BlockProblem::Missing(TRIAGE_BLOCK)]
+        );
+        let e = parse_triage(&triage("{oops"), &round, &ledger).unwrap_err();
+        assert!(matches!(e[..], [BlockProblem::NotJson { .. }]), "{e:?}");
+        let big = triage(&" ".repeat(MAX_BLOCK_BYTES + 1));
+        assert_eq!(
+            parse_triage(&big, &round, &ledger).unwrap_err(),
+            vec![BlockProblem::TooLarge(TRIAGE_BLOCK)]
+        );
+        // The messages the correction prompt gets.
+        assert_eq!(
+            BlockProblem::NoOf("m1.1".into()).to_string(),
+            "m1.1 is a duplicate without `of`: name the ledger entry it repeats (L1, L2…)"
+        );
+        assert_eq!(
+            BlockProblem::GatesFailed.to_string(),
+            "gates.result is fail: gates must be green before the loop goes on"
+        );
+    }
+
+    #[test]
+    fn sweep_blocks_read_and_refuse() {
+        let s = parse_sweep(
+            "```twr-sweep\n{\"rules\": [{\"rule\": \"identity-gating\", \"result\": \"fixed\"},\
+             {\"rule\": \"retries\", \"result\": \"accepted_residual\", \"reason\": \"bounded\", \
+             \"location\": \"a.rs:9\"}, {\"rule\": \"locks\", \"result\": \"checked clean\"}]}\n```",
+        )
+        .unwrap();
+        assert_eq!(s.rules.len(), 3);
+        assert_eq!(s.rules[1].result, SweepResult::AcceptedResidual);
+        assert_eq!(s.gates, None);
+        for (body, want) in [
+            (
+                r#"{"rules": [{"rule": "r", "result": "accepted residual"}]}"#,
+                "accepted residual without a reason",
+            ),
+            (r#"{"rules": [{"result": "fixed"}]}"#, "has no `rule`"),
+            (
+                r#"{"rules": [{"rule": "r", "result": "done"}]}"#,
+                "`result` is not",
+            ),
+            (
+                r#"{"rules": [{"rule": "r", "result": "fixed"}, {"rule": "r", "result": "fixed"}]}"#,
+                "reported twice",
+            ),
+            (r#"{"rules": 1}"#, "`rules` is not a list"),
+            (
+                r#"{"rules": [], "gates": {"ran": [], "result": "fail"}}"#,
+                "gates must be green",
+            ),
+        ] {
+            let e = parse_sweep(&format!("```twr-sweep\n{body}\n```")).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{body}: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_blocks_read_and_refuse() {
+        let r = parse_rules(
+            "named:\n```twr-rules\n{\"rules\": [{\"name\": \"identity-gating\", \"rule\": \
+             \" Every handler checks the caller. \", \"where\": \"src/api/**\"}, {\"name\": \
+             \"retries-2\", \"rule\": \"r\", \"where\": \"everywhere the diff touches\"}]}\n```",
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].name, "identity-gating");
+        assert_eq!(r[0].rule, "Every handler checks the caller.");
+        assert_eq!(r[1].r#where, "everywhere the diff touches");
+        assert_eq!(
+            parse_rules("```twr-rules\n{\"rules\": []}\n```").unwrap(),
+            vec![]
+        );
+        let many: Vec<String> = (0..=MAX_AUDIT_RULES)
+            .map(|i| format!(r#"{{"name": "r{i}", "rule": "x", "where": "y"}}"#))
+            .collect();
+        let many = format!(r#"{{"rules": [{}]}}"#, many.join(","));
+        for (body, want) in [
+            (
+                r#"{"rules": [{"rule": "x", "where": "y"}]}"#,
+                "has no `name`",
+            ),
+            (
+                r#"{"rules": [{"name": "Identity_Gating", "rule": "x", "where": "y"}]}"#,
+                "not kebab-case",
+            ),
+            (
+                r#"{"rules": [{"name": "a--b", "rule": "x", "where": "y"}]}"#,
+                "not kebab-case",
+            ),
+            (
+                r#"{"rules": [{"name": "1a", "rule": "x", "where": "y"}]}"#,
+                "not kebab-case",
+            ),
+            (
+                r#"{"rules": [{"name": "a", "rule": " ", "where": "y"}]}"#,
+                "a has no `rule`",
+            ),
+            (
+                r#"{"rules": [{"name": "a", "rule": "x"}]}"#,
+                "a has no `where`",
+            ),
+            (
+                r#"{"rules": [{"name": "a", "rule": "x", "where": "y"}, {"name": "a", "rule": "x", "where": "y"}]}"#,
+                "named twice",
+            ),
+            (many.as_str(), "more than 12 rules"),
+            (r#"{"rules": {}}"#, "`rules` is not a list"),
+        ] {
+            let e = parse_rules(&format!("```twr-rules\n{body}\n```")).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{body}: {e:?}"
+            );
+        }
+        assert_eq!(
+            parse_rules("no block").unwrap_err()[0].to_string(),
+            "no ```twr-rules block: end your reply with one"
+        );
+    }
+
+    #[test]
+    fn a_sweep_of_audit_runs_reports_every_rule() {
+        let block = |items: &str| {
+            parse_sweep(&format!("```twr-sweep\n{{\"rules\": [{items}]}}\n```")).unwrap()
+        };
+        let rules = vec!["a".to_string(), "b".to_string()];
+        let not_run = vec!["b".to_string()];
+        let ok = block(
+            r#"{"rule": "a", "result": "fixed"}, {"rule": "b", "result": "not audited", "reason": "no time"}"#,
+        );
+        assert_eq!(ok.rules[1].result, SweepResult::NotAudited);
+        assert!(check_sweep_rules(&ok, &rules, &not_run).is_empty());
+        // Its own audit of a rule not run is a result like any other.
+        let own =
+            block(r#"{"rule": "a", "result": "fixed"}, {"rule": "b", "result": "checked clean"}"#);
+        assert!(check_sweep_rules(&own, &rules, &not_run).is_empty());
+        let words = |s: &Sweep, rules: &[String], not_run: &[String]| {
+            check_sweep_rules(s, rules, not_run)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let missing = block(r#"{"rule": "a", "result": "fixed"}"#);
+        assert!(words(&missing, &rules, &not_run).contains("rule b has no item"));
+        let unknown = block(
+            r#"{"rule": "a", "result": "fixed"}, {"rule": "b", "result": "fixed"}, {"rule": "c", "result": "fixed"}"#,
+        );
+        assert!(words(&unknown, &rules, &not_run).contains("rule c is not one of"));
+        let ran = block(
+            r#"{"rule": "a", "result": "not audited", "reason": "r"}, {"rule": "b", "result": "fixed"}"#,
+        );
+        assert!(words(&ran, &rules, &not_run).contains("a is not audited, but its audit ran"));
+        // A sweep the thread audited itself: its own rules, never `not audited`.
+        assert!(check_sweep_rules(&missing, &[], &[]).is_empty());
+        assert!(words(&ok, &[], &[]).contains("audits its rules itself"));
+        let e = parse_sweep(
+            "```twr-sweep\n{\"rules\": [{\"rule\": \"a\", \"result\": \"not_audited\"}]}\n```",
+        )
+        .unwrap_err();
+        assert!(e[0].to_string().contains("not audited without a reason"));
+        assert_eq!(audit_id(2), "s2");
+        assert_eq!(
+            number_findings(&audit_id(2), vec![Finding::default()])[0].id,
+            "s2.1"
+        );
+        assert_eq!(FindingId::parse("s2.1").unwrap().round_id(), "s2");
+    }
+
+    #[test]
+    fn a_plan_reads_without_its_block() {
+        let text = "## Goal\nCSV export.\n\n```rust\nfn x() {}\n```\n\n```twr-plan\n\
+                    {\"contract_risk\": true, \"reason\": \" a migration \"}\n```\n";
+        let p = parse_plan(text).unwrap();
+        assert!(p.contract_risk);
+        assert_eq!(p.reason, "a migration");
+        // Other fences stay; only the plan block goes.
+        assert_eq!(p.text, "## Goal\nCSV export.\n\n```rust\nfn x() {}\n```");
+        for (text, want) in [
+            ("a plan, no block", "no ```twr-plan block"),
+            (
+                "plan\n```twr-plan\n{\"contract_risk\": \"yes\", \"reason\": \"r\"}\n```",
+                "`contract_risk` is not true or false",
+            ),
+            (
+                "plan\n```twr-plan\n{\"contract_risk\": false}\n```",
+                "no `reason`",
+            ),
+            (
+                "```twr-plan\n{\"contract_risk\": false, \"reason\": \"r\"}\n```",
+                "the plan is empty",
+            ),
+            ("plan\n```twr-plan\n[1]\n```", "not a JSON object"),
+        ] {
+            let e = parse_plan(text).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{text}: {e:?}"
+            );
+        }
+        let long = format!(
+            "{}\n```twr-plan\n{{\"contract_risk\": false, \"reason\": \"r\"}}\n```",
+            "x".repeat(MAX_PLAN_BYTES + 1)
+        );
+        assert!(parse_plan(&long).unwrap_err()[0]
+            .to_string()
+            .contains("longer than"));
+        // An unclosed block is no block, and stays as text.
+        assert_eq!(
+            without_blocks("a\n```twr-plan\nb", &[PLAN_BLOCK]),
+            "a\n```twr-plan\nb"
+        );
+        assert_eq!(
+            without_blocks(
+                "a\n```twr-plan\n{}\n```\nb\n````twr-triage\n{}\n````\n",
+                &[PLAN_BLOCK, TRIAGE_BLOCK]
+            ),
+            "a\nb"
+        );
+    }
+
+    #[test]
+    fn a_plan_check_triage_reads_and_refuses() {
+        let round = ids(&["p1.1", "p1.2"]);
+        let items = r#"{"items": [{"id": "p1.1", "verdict": "fixed"},
+            {"id": "p1.2", "verdict": "dismissed", "reason": "versioned API"}]}"#;
+        let plan = "```twr-plan\n{\"contract_risk\": true, \"reason\": \"api\"}\n```";
+        // No gates and no class needed; the revised plan is the message without both blocks.
+        let t = parse_plan_triage(
+            &format!("Revised plan.\n\n{}\n{plan}\n", triage(items)),
+            &round,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(t.items.len(), 2);
+        assert_eq!(t.items[0].class, None);
+        let p = t.plan.unwrap();
+        // (`triage` writes "I fixed things." before its block.)
+        assert_eq!(p.text, "Revised plan.\n\nI fixed things.");
+        assert!(p.contract_risk);
+        // A fix needs the revised plan.
+        let e = parse_plan_triage(&triage(items), &round, &[]).unwrap_err();
+        assert_eq!(
+            e,
+            vec![BlockProblem::Field(
+                "p1.1 fixed, but no ```twr-plan block: write the revised plan in the message and \
+                 end it with the block too"
+                    .into()
+            )]
+        );
+        // Dismissals only: no plan needed.
+        let dismissed = r#"{"items": [{"id": "p1.1", "verdict": "dismissed", "reason": "a"},
+            {"id": "p1.2", "verdict": "dismissed", "reason": "b"}]}"#;
+        assert_eq!(
+            parse_plan_triage(&triage(dismissed), &round, &[])
+                .unwrap()
+                .plan,
+            None
+        );
+        // Gates, when given, passed; a triage and a plan both wrong say both.
+        let red = r#"{"items": [{"id": "p1.1", "verdict": "dismissed", "reason": "a"},
+            {"id": "p1.2", "verdict": "dismissed", "reason": "b"}],
+            "gates": {"ran": [], "result": "fail"}}"#;
+        assert_eq!(
+            parse_plan_triage(&triage(red), &round, &[]).unwrap_err(),
+            vec![BlockProblem::GatesFailed]
+        );
+        let bad_plan = "```twr-plan\n{\"reason\": \"api\"}\n```";
+        let e = parse_plan_triage(
+            &format!("{}{bad_plan}", triage(r#"{"items": []}"#)),
+            &round,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(e.len(), 3, "{e:?}");
+        assert_eq!(e[0], BlockProblem::NoItem("p1.1".into()));
+        assert!(e[2].to_string().contains("contract_risk"));
+        // A review round's triage still needs both.
+        let e = parse_triage(&triage(items), &round, &[]).unwrap_err();
+        assert!(e.contains(&BlockProblem::NoClass("p1.1".into())));
+    }
+
+    #[test]
+    fn an_implement_block_reads_and_says_what_holds_the_loop() {
+        let block = |body: &str| format!("Done.\n```twr-implement\n{body}\n```\n");
+        let i = parse_implement(&block(
+            r#"{"status": "done", "gates": {"ran": ["cargo test"], "result": "pass"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(i.status, ImplementStatus::Done);
+        assert_eq!(i.problems(), Vec::<String>::new());
+        let i = parse_implement(&block(
+            r#"{"status": "partial", "gates": {"ran": [], "result": "fail"}}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            i.problems(),
+            [
+                "status is partial: finish the plan; gates must be green before review",
+                "gates.result is fail: gates must be green before review"
+            ]
+        );
+        for (body, want) in [
+            (r#"{"gates": {"ran": [], "result": "pass"}}"#, "`status`"),
+            (r#"{"status": "done"}"#, "no `gates`"),
+            (
+                r#"{"status": "done", "gates": {"result": "green"}}"#,
+                "`gates.result`",
+            ),
+        ] {
+            let e = parse_implement(&block(body)).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{body}: {e:?}"
+            );
+        }
+        assert_eq!(
+            parse_implement("done").unwrap_err(),
+            vec![BlockProblem::Missing(IMPLEMENT_BLOCK)]
+        );
+    }
+
+    #[test]
+    fn a_commit_block_reads_and_the_check_says_what_is_left() {
+        let block = |body: &str| format!("Report.\n```twr-commit\n{body}\n```\n");
+        let c = parse_commit(&block(
+            r#"{"commits": [{"repo": "/w", "sha": "abc1234def"}]}"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            c,
+            [Commit {
+                repo: "/w".into(),
+                sha: "abc1234def".into()
+            }]
+        );
+        assert_eq!(parse_commit(&block(r#"{"commits": []}"#)).unwrap(), []);
+        for (body, want) in [
+            (r#"{}"#, "`commits` is not a list"),
+            (r#"{"commits": [{"sha": "abc1234"}]}"#, "has no `repo`"),
+            (
+                r#"{"commits": [{"repo": "/w", "sha": "xyz"}]}"#,
+                "not a commit id",
+            ),
+            (
+                r#"{"commits": [{"repo": "/w", "sha": "abc1234"}, {"repo": "/w", "sha": "abc1234"}]}"#,
+                "listed twice",
+            ),
+            (r#"{"commits": [1]}"#, "not an object"),
+        ] {
+            let e = parse_commit(&block(body)).unwrap_err();
+            assert!(
+                e.iter().any(|p| p.to_string().contains(want)),
+                "{body}: {e:?}"
+            );
+        }
+        assert_eq!(
+            parse_commit("no block").unwrap_err(),
+            vec![BlockProblem::Missing(COMMIT_BLOCK)]
+        );
+
+        let repo = |head: &str, work: bool, left: &[&str]| RepoAfter {
+            repo: "/w".into(),
+            from: Some("aaaaaaa".into()),
+            head: Some(head.into()),
+            work,
+            left: left.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let commit = Commit {
+            repo: "/w".into(),
+            sha: "bbbbbbb".into(),
+        };
+        // Committed, nothing left.
+        assert_eq!(
+            check_commit(&[repo("bbbbbbb", true, &[])]),
+            (vec![commit.clone()], vec![])
+        );
+        // Nothing to commit: nothing moved, nothing is wrong.
+        assert_eq!(
+            check_commit(&[repo("aaaaaaa", false, &[])]),
+            (vec![], vec![])
+        );
+        // Work vanished without a commit (stashed, say).
+        assert_eq!(
+            check_commit(&[repo("aaaaaaa", true, &[])]).1,
+            ["/w: the loop's changes are neither in the worktree nor committed (HEAD did not move)"]
+        );
+        // ... or with an empty commit.
+        let mut empty = repo("bbbbbbb", true, &[]);
+        empty.same_tree = true;
+        let (commits, problems) = check_commit(&[empty]);
+        assert!(commits.is_empty());
+        assert_eq!(
+            problems,
+            ["/w: the loop's changes are neither in the worktree nor committed (HEAD moved, but \
+              to a commit that changed nothing) (HEAD is at bbbbbbb)"]
+        );
+        // Left behind, the list cut at five: not counted committed though HEAD moved.
+        let many = ["a", "b", "c", "d", "e", "f", "g"];
+        assert_eq!(
+            check_commit(&[repo("bbbbbbb", true, &many)]),
+            (
+                vec![],
+                vec![
+                    "/w: 7 paths are uncommitted beyond the baseline: a, b, c, d, e, and 2 more \
+                     (HEAD is at bbbbbbb)"
+                        .to_string()
+                ]
+            )
+        );
+        assert_eq!(
+            check_commit(&[repo("aaaaaaa", true, &["a.rs"])]).1,
+            ["/w: 1 path is uncommitted beyond the baseline: a.rs"]
+        );
+        // The baseline committed by mistake, or undone.
+        let mut b = repo("bbbbbbb", true, &[]);
+        b.baseline_committed = vec!["old.rs".into()];
+        b.baseline_undone = vec!["gone.rs".into(), "too.rs".into()];
+        let (commits, problems) = check_commit(&[b]);
+        assert!(commits.is_empty());
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].contains("1 path is no longer uncommitted"),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains("old.rs"));
+        assert!(problems[1].contains("2 paths are back"), "{problems:?}");
+        assert!(problems[1].ends_with("gone.rs, too.rs (HEAD is at bbbbbbb)"));
+        // Two repositories: each committed or with a problem, never both.
+        let mut other = repo("ccccccc", true, &["x.rs"]);
+        other.repo = "/v".into();
+        let (commits, problems) = check_commit(&[repo("bbbbbbb", true, &[]), other]);
+        assert_eq!(commits, [commit]);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].starts_with("/v: "));
+    }
+
+    #[test]
+    fn the_ledger_renders_one_line_per_entry() {
+        assert!(render_ledger(&[]).ends_with("none yet\n"));
+        let text = render_ledger(&[
+            LedgerEntry {
+                id: ledger_id(1),
+                kind: LedgerKind::Dismissed,
+                from: "m3.2".into(),
+                location: "src/a.rs:10".into(),
+                problem: "retry is\nnot idempotent".into(),
+                reason: "it is: upsert on (user_id, key)".into(),
+            },
+            LedgerEntry {
+                id: ledger_id(2),
+                kind: LedgerKind::AcceptedResidual,
+                from: "identity-gating".into(),
+                reason: "\n# heading\n".into(),
+                ..Default::default()
+            },
+        ]);
+        assert!(text.contains(
+            "- L1 (dismissed, m3.2) `src/a.rs:10`: retry is not idempotent\n  Reason: it is: upsert on (user_id, key)\n"
+        ), "{text}");
+        assert!(text.contains("- L2 (accepted residual, identity-gating)\n  Reason: # heading\n"));
+        assert!(!text.contains("\n# heading"));
+    }
+}

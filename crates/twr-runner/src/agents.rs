@@ -211,6 +211,15 @@ impl BoxAgents {
     }
 
     /// The agents as last probed (none before the first probe ends).
+    /// `TWR_*_BIN` variable `k` as the box reads it ([`BoxEnv::bin_vars`], else this
+    /// process's environment): how its agent probe and its review runs pick a program.
+    pub(crate) fn bin_var(&self, k: &str) -> Option<std::ffi::OsString> {
+        match &self.env.bin_vars {
+            None => std::env::var_os(k),
+            Some(vars) => vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
+        }
+    }
+
     pub(crate) fn known(&self) -> Vec<AgentInfo> {
         self.cache()
             .as_ref()

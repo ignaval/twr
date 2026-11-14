@@ -6,6 +6,7 @@ import {
   trapTarget,
   turnAnnouncement,
 } from "../shared/a11y";
+import { endedLoops, startedNotice } from "../shared/loops";
 
 class FakeNode {
   attributes = new Map<string, string>();
@@ -161,6 +162,68 @@ describe("announcement text", () => {
     expect(
       attentionAnnouncement({ reason: "x", summary: "a".repeat(400) }).length,
     ).toBeLessThan(200);
+  });
+
+  it("says what a loop's setup card and a stuck loop ask, not their reason", () => {
+    // A setup card's reason is `review` (it blocks nothing), a stuck loop's is `error`.
+    expect(
+      attentionAnnouncement({
+        reason: "review",
+        loop_setup: true,
+        threadName: "api",
+      }),
+    ).toBe("Needs you: api asks you to choose a loop's settings");
+    expect(
+      attentionAnnouncement({
+        reason: "error",
+        loop_stuck: true,
+        threadName: "api",
+      }),
+    ).toBe("Needs you: api has a loop that is stuck");
+  });
+
+  it("says which loop a setup card is for, not the task it holds", () => {
+    expect(
+      attentionAnnouncement({
+        reason: "review",
+        loop_setup: true,
+        threadName: "api",
+        summary:
+          "api: implementation loop setup (first run: choose its models). Start and save these settings?\nProfile      high\nTask         drop the users table",
+      }),
+    ).toBe(
+      "Needs you: api asks you to choose a loop's settings: api: implementation loop setup (first run: choose its models). Start and save these settings?",
+    );
+  });
+
+  it("says a loop's end with how it ended and its commit", () => {
+    const known = endedLoops(undefined, [{ id: "t1", name: "api" }]).known;
+    const said = (last_loop: object) =>
+      endedLoops(known, [{ id: "t1", name: "api", last_loop }]).said;
+    expect(
+      said({
+        id: "l1",
+        kind: "implement",
+        outcome: "clean",
+        commits: [{ repo: "/w", sha: "abc1234def" }],
+      }),
+    ).toEqual(["api's implementation loop ended: clean; committed abc1234"]);
+    expect(
+      said({
+        id: "l1",
+        kind: "implement",
+        outcome: "cap_expired",
+        commit_problem: "1 path is uncommitted",
+      }),
+    ).toEqual([
+      "api's implementation loop ended: verification cap reached with findings left; not committed: 1 path is uncommitted",
+    ]);
+    expect(said({ id: "l1", kind: "review", outcome: "stopped" })).toEqual([
+      "api's review loop ended: stopped",
+    ]);
+    expect(startedNotice("api", "implement")).toBe(
+      "api started an implementation loop.",
+    );
   });
 
   it("reports how a turn ended", () => {

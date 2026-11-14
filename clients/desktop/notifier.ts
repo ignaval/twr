@@ -4,7 +4,10 @@ import type { DiagnosticLog } from "./diagnostics";
 import {
   AttentionWatch,
   Burst,
+  LoopWatch,
   answered,
+  isLoopNotice,
+  loopNotices,
   notices,
   stillWaiting,
   type Notice,
@@ -44,11 +47,13 @@ export const systemPost: Post = (notice, handlers) => {
 
 /**
  * OS notifications for new permissions, questions and the hub's confirm and delete cards in
- * any workspace while the window is not in front (desktop/notify-state.ts decides which). A
- * click shows the window at the request; it never answers it.
+ * any workspace while the window is not in front (desktop/notify-state.ts decides which), and
+ * for a loop that ends, once, with how it ended. A click shows the window at the request (or
+ * the loop's thread); it never answers it.
  */
 export class Notifier {
   private watch = new AttentionWatch();
+  private loops = new LoopWatch();
   private burst = new Burst();
   private timer?: ReturnType<typeof setTimeout>;
   private latest?: AttentionSummary;
@@ -76,8 +81,13 @@ export class Notifier {
       this.burst.add(news, this.now());
       this.schedule();
     }
+    // A loop's end is no request: it goes out at once, and no answer takes it back.
+    const ended = this.loops.observe(summary, this.host.attended());
+    if (ended.length && this.active)
+      for (const notice of loopNotices(ended)) this.show(notice);
     for (const [notification, keys] of this.posted)
-      if (answered(keys, summary)) this.remove(notification);
+      if (!isLoopNotice(keys) && answered(keys, summary))
+        this.remove(notification);
   }
 
   /** The window came to the front: what it shows needs no notification any more. */

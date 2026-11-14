@@ -1379,6 +1379,358 @@ pub fn project_search(r: &Value) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------------------------
+// Loops (`start_loop`, `get_loop`, `stop_loop`, `spawn_thread`'s `loop`)
+// ---------------------------------------------------------------------------------------------
+
+/// `runtime[:account]`.
+fn runtime_with_account(m: &Value) -> String {
+    match m.get("account").and_then(Value::as_str) {
+        Some(a) => format!("{}:{a}", str_of(m, "runtime")),
+        None => str_of(m, "runtime").to_string(),
+    }
+}
+
+/// The words of `parts` that are strings, joined by spaces.
+fn words(parts: &[Option<&str>]) -> String {
+    parts
+        .iter()
+        .flatten()
+        .filter(|w| !w.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A loop's settings (`LoopSettings` as the hub gives them) for a loop of `kind` (`review` or
+/// `implement`), in a line: `profile high · implementer the thread's own · workers
+/// claude-opus-5-5 high · reviewer codex gpt-6.1-sol · commit match`.
+pub fn loop_settings(s: &Value, kind: &str) -> String {
+    let implementer = match s.get("implementer").filter(|m| m.is_object()) {
+        Some(m) => words(&[
+            Some(&runtime_with_account(m)),
+            m.get("model").and_then(Value::as_str),
+            m.get("effort").and_then(Value::as_str),
+        ]),
+        None => "the thread's own".into(),
+    };
+    let w = &s["workers"];
+    let workers = words(&[
+        w.get("model").and_then(Value::as_str),
+        w.get("effort").and_then(Value::as_str),
+    ]);
+    let r = &s["reviewer"];
+    let reviewer = words(&[
+        Some(&runtime_with_account(r)),
+        r.get("model").and_then(Value::as_str),
+    ]);
+    let mut out = vec![
+        format!("profile {}", str_of(s, "profile")),
+        format!("implementer {implementer}"),
+        format!("workers {workers}"),
+        format!("reviewer {reviewer}"),
+    ];
+    if kind == "implement" {
+        out.push(format!("commit {}", str_of(s, "commit")));
+        out.push(format!(
+            "plan check {}",
+            s.get("plan_check")
+                .and_then(Value::as_str)
+                .unwrap_or("the profile's")
+        ));
+    } else {
+        out.push(format!("commit {}", str_of(s, "review_commit")));
+    }
+    out.join(" · ")
+}
+
+/// What the orchestrator tells the user when a loop it asked for on thread `name` waits for
+/// the setup card (`why`, `existing`: the card was already open).
+fn setup_words(name: &str, why: &str, existing: bool) -> String {
+    if existing {
+        return format!(
+            "{name}'s loop setup card is already waiting for you: the loop starts once you \
+             answer it."
+        );
+    }
+    let ask = format!("I've asked you to choose the loop's models on {name}'s card");
+    match why {
+        "first_run" => {
+            format!("{ask}: it's your first loop, and your choice is saved for the next ones.")
+        }
+        "overrides" => format!(
+            "{ask}: the settings you named differ from your saved ones, so they're on the card \
+             for you to confirm."
+        ),
+        "no_longer_holds" => format!("{ask}: one of your saved loop settings no longer holds."),
+        "other_runtime" => {
+            format!("{ask}: {name} runs on another runtime than your saved implementer.")
+        }
+        _ => format!("{ask}."),
+    }
+}
+
+/// `loop.request`'s result for thread `name`, as `start_loop` returns it (and `spawn_thread`
+/// its `loop`): `{status: "started", loop, kind, line, settings, settings_of?}`,
+/// `{status: "needs_setup", attn_id, why, existing?, tell_user}` or `{status: "error", code,
+/// message, tell_user}` (a new thread's loop that failed after the thread was made).
+pub fn loop_request(r: &Value, name: &str) -> Value {
+    match str_of(r, "status") {
+        "started" => {
+            let l = &r["loop"];
+            let kind = str_of(l, "kind");
+            let mut out = serde_json::json!({
+                "status": "started",
+                "loop": l["id"],
+                "kind": kind,
+                "line": l["line"],
+                "settings": loop_settings(&r["settings"], kind),
+            });
+            if let Some(p) = r.get("settings_of").filter(|p| p.is_string()) {
+                out["settings_of"] = p.clone();
+            }
+            out
+        }
+        "needs_setup" => {
+            let existing = r.get("existing").and_then(Value::as_bool) == Some(true);
+            let mut out = serde_json::json!({
+                "status": "needs_setup",
+                "attn_id": r["attn_id"],
+                "why": r["why"],
+                "tell_user": setup_words(name, str_of(r, "why"), existing),
+            });
+            if existing {
+                out["existing"] = Value::Bool(true);
+            }
+            out
+        }
+        "error" => serde_json::json!({
+            "status": "error",
+            "code": r["code"],
+            "message": r["message"],
+            "tell_user": format!(
+                "{name} was made, but its loop did not start: {}",
+                str_of(r, "message")
+            ),
+        }),
+        _ => r.clone(),
+    }
+}
+
+/// `the thread's turn`, `a review run` or `the user`, as a loop waits on it.
+fn waits_on(state: &Value) -> String {
+    match str_of(state, "waiting_on") {
+        "review" => {
+            let r = &state["reviewer"];
+            format!(
+                "a review run (reviewer {})",
+                words(&[
+                    r.get("runtime").and_then(Value::as_str),
+                    r.get("model").and_then(Value::as_str),
+                    r.get("effort").and_then(Value::as_str),
+                ])
+            )
+        }
+        "user" => "the user".into(),
+        _ => "the thread's turn".into(),
+    }
+}
+
+/// One round of `loop.get`'s `rounds`: `m1 3 findings (2 fixed, 1 dismissed)`, `m2 clean`,
+/// `x1 failed: <reason>`, `m3 running`.
+fn round_words(r: &Value) -> String {
+    let id = str_of(r, "id");
+    let label = if id == "p1" {
+        "p1 (plan check)".to_string()
+    } else {
+        id.to_string()
+    };
+    if r.get("failed").and_then(Value::as_bool) == Some(true) {
+        let (why, _) = one_line_cut(str_of(r, "reason"), 120);
+        return format!("{label} failed: {why}");
+    }
+    if r.get("failed").is_none_or(Value::is_null) {
+        return format!("{label} running");
+    }
+    let n = r["findings"].as_array().map_or(0, Vec::len);
+    if n == 0 {
+        return format!("{label} clean");
+    }
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for item in r["triage"]["items"].as_array().into_iter().flatten() {
+        let v = str_of(item, "verdict").to_string();
+        match counts.iter_mut().find(|(k, _)| *k == v) {
+            Some((_, c)) => *c += 1,
+            None => counts.push((v, 1)),
+        }
+    }
+    let triage = if counts.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            counts
+                .iter()
+                .map(|(k, c)| format!("{c} {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!("{label} {}{triage}", plural(n as u64, "finding"))
+}
+
+/// Most rounds `get_loop` lists (the latest).
+const LOOP_ROUNDS: usize = 30;
+
+/// `get_loop`: `loop.get`'s answer in a few lines: the loop, where it is and what it waits on,
+/// the settings it runs on and who asked, its rounds with their findings, the ledger, the
+/// plan, how it ended (with its commits, or `not committed`) and its report.
+pub fn loop_state(r: &Value) -> String {
+    let name = str_of(r, "thread_name");
+    let kind = str_of(r, "kind");
+    let words_of_kind = if kind == "implement" {
+        "implementation loop"
+    } else {
+        "review loop"
+    };
+    let running = r.get("running").and_then(Value::as_bool) == Some(true);
+    let mut out = Vec::new();
+    let state = &r["state"];
+    if running {
+        out.push(format!(
+            "{name}: {words_of_kind} {} running: {}",
+            str_of(r, "id"),
+            str_of(r, "line")
+        ));
+        let mut at = format!("phase {}", str_of(state, "phase"));
+        if let Some(round) = state.get("round").and_then(Value::as_str) {
+            at.push_str(&format!(", round {round}"));
+        }
+        if let (Some(done), Some(cap)) = (
+            state["verify"]["done"].as_u64(),
+            state["verify"]["cap"].as_u64(),
+        ) {
+            at.push_str(&format!(", verify {done}/{cap}"));
+        }
+        if state.get("paused").and_then(Value::as_bool) == Some(true) {
+            at.push_str(", paused");
+        }
+        if let Some(why) = state.get("stuck").and_then(Value::as_str) {
+            let (why, _) = one_line_cut(why, 200);
+            at.push_str(&format!(", stuck: {why}"));
+        }
+        out.push(format!("{at}; waits on {}", waits_on(state)));
+    } else {
+        out.push(format!(
+            "{name}: {words_of_kind} {} ended {}",
+            str_of(r, "id"),
+            str_of(r, "outcome")
+        ));
+    }
+    let started = &r["started"];
+    if started.is_object() {
+        let from = match (
+            str_of(started, "settings_from"),
+            str_of(started, "settings_of"),
+        ) {
+            ("setup_item", _) => "chosen by the user on its setup card".to_string(),
+            (_, "project") => "the project's saved settings".to_string(),
+            _ => "the user's saved settings".to_string(),
+        };
+        let by = match str_of(started, "requested_by") {
+            "orchestrator" => "you",
+            _ => "the user",
+        };
+        let mut line = format!(
+            "settings: {} ({from}; asked for by {by})",
+            loop_settings(&started["settings"], kind)
+        );
+        if let Some(o) = started["overrides"].as_object().filter(|o| !o.is_empty()) {
+            let o: Vec<String> = o
+                .iter()
+                .map(|(k, v)| format!("{k} {}", v.as_str().unwrap_or_default()))
+                .collect();
+            line.push_str(&format!("; this run only: {}", o.join(", ")));
+        }
+        out.push(line);
+        if let Some(task) = started.get("task").and_then(Value::as_str) {
+            let (task, _) = one_line_cut(task, 200);
+            out.push(format!("task: {task}"));
+        }
+    }
+    let rounds = r["rounds"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if !rounds.is_empty() {
+        let skip = rounds.len().saturating_sub(LOOP_ROUNDS);
+        let listed: Vec<String> = rounds[skip..].iter().map(round_words).collect();
+        out.push(format!(
+            "rounds: {}{}",
+            if skip > 0 {
+                format!("({skip} earlier not shown) ")
+            } else {
+                String::new()
+            },
+            listed.join(" · ")
+        ));
+    }
+    let ledger = r["ledger"].as_array().map_or(0, Vec::len);
+    out.push(format!(
+        "ledger: {ledger} {}",
+        if ledger == 1 { "entry" } else { "entries" }
+    ));
+    if let Some(plan) = r.get("plan_path").and_then(Value::as_str) {
+        out.push(format!("plan: {plan}"));
+    }
+    if !running {
+        let ended = &r["ended"];
+        if let Some(why) = ended.get("reason").and_then(Value::as_str) {
+            let (why, _) = one_line_cut(why, 200);
+            out.push(format!("why it ended: {why}"));
+        }
+        let commits: Vec<String> = ended["commits"]
+            .as_array()
+            .or(r["last"]["commits"].as_array())
+            .into_iter()
+            .flatten()
+            .map(|c| {
+                let sha = str_of(c, "sha");
+                format!("{} ({})", sha.get(..12).unwrap_or(sha), str_of(c, "repo"))
+            })
+            .collect();
+        let problem = ended
+            .get("commit_problem")
+            .and_then(Value::as_str)
+            .or(r["last"].get("commit_problem").and_then(Value::as_str));
+        if let Some(p) = problem {
+            let (p, _) = one_line_cut(p, 200);
+            out.push(format!("not committed: {p}"));
+        } else if !commits.is_empty() {
+            out.push(format!("committed: {}", commits.join(", ")));
+        }
+    }
+    if let Some(path) = r.get("report_path").and_then(Value::as_str) {
+        out.push(format!("report: {path}"));
+    }
+    out.join("\n")
+}
+
+/// `stop_loop`: `loop.control`'s answer, `{thread_name, thread, loop, running, outcome}`
+/// (`line` while it runs on).
+pub fn loop_stopped(r: &Value) -> Value {
+    let running = r.get("running").and_then(Value::as_bool) == Some(true);
+    let mut out = serde_json::json!({
+        "thread_name": r["thread_name"],
+        "thread": r["thread"],
+        "loop": r["id"],
+        "running": running,
+    });
+    if running {
+        out["line"] = r["line"].clone();
+    } else {
+        out["outcome"] = r["last"]["outcome"].clone();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2123,5 +2475,82 @@ mod tests {
             "turn 5 started (from user) (a new session: earlier session s1 not resumed, its \
              account was removed) (with the handoff from its previous runtime): go on"
         );
+    }
+
+    /// An ended loop says how it ended, what it committed (or `not committed`), its plan and
+    /// its report; a `p1` round is the plan check; the user's own loop says so.
+    #[test]
+    fn an_ended_loop_reads_in_a_few_lines() {
+        let settings = json!({
+            "profile": "medium",
+            "implementer": {"runtime": "claude-code", "model": "claude-opus-5-5", "effort": "high"},
+            "workers": {"model": "claude-sonnet-5-5"},
+            "reviewer": {"runtime": "codex", "account": "work", "model": "gpt-6.1-sol"},
+            "commit": "end", "review_commit": "match", "sweep": "thread",
+        });
+        let detail = |ended: Value| {
+            json!({
+                "thread": "T1", "thread_name": "export", "id": "L2", "kind": "implement",
+                "running": false, "line": null, "state": null,
+                "last": {"id": "L2", "kind": "implement", "outcome": "clean"},
+                "started": {"settings": settings, "settings_from": "setup_item",
+                            "overrides": {"profile": "low"}, "task": "add a CSV\nexport"},
+                "rounds": [
+                    {"id": "p1", "findings": [{}], "failed": false,
+                     "triage": {"items": [{"verdict": "dismissed"}]}},
+                    {"id": "m1", "findings": [], "failed": false, "triage": null},
+                ],
+                "ledger": [{}, {}],
+                "plan_path": "/d/loops/L2/plan.md",
+                "ended": ended,
+                "report_path": "/d/loops/L2/report.md",
+                "outcome": "clean",
+            })
+        };
+        let out = loop_state(&detail(json!({
+            "outcome": "clean", "report_path": "/d/loops/L2/report.md",
+            "commits": [{"repo": "/w/export", "sha": "0123456789abcdef0123"}],
+        })));
+        assert_eq!(
+            out,
+            "export: implementation loop L2 ended clean\n\
+             settings: profile medium · implementer claude-code claude-opus-5-5 high · workers \
+             claude-sonnet-5-5 · reviewer codex:work gpt-6.1-sol · commit end · plan check the \
+             profile's (chosen by the user on its setup card; asked for by the user); this run \
+             only: profile low\n\
+             task: add a CSV ⏎ export\n\
+             rounds: p1 (plan check) 1 finding (1 dismissed) · m1 clean\n\
+             ledger: 2 entries\n\
+             plan: /d/loops/L2/plan.md\n\
+             committed: 0123456789ab (/w/export)\n\
+             report: /d/loops/L2/report.md"
+        );
+        let out = loop_state(&detail(json!({
+            "outcome": "cap_expired", "report_path": "/d/loops/L2/report.md",
+            "commit_problem": "2 files left uncommitted",
+        })));
+        assert!(
+            out.contains("\nnot committed: 2 files left uncommitted\n"),
+            "{out}"
+        );
+        // A loop request's result: an error after the thread was made says so.
+        let r = loop_request(
+            &json!({"status": "error", "code": "unsupported", "message": "no commit yet"}),
+            "export",
+        );
+        assert_eq!(
+            r["tell_user"],
+            "export was made, but its loop did not start: no commit yet"
+        );
+        let r = loop_request(
+            &json!({"status": "needs_setup", "attn_id": "A1", "why": "first_run",
+                    "existing": true}),
+            "export",
+        );
+        assert_eq!(r["existing"], true);
+        assert!(r["tell_user"]
+            .as_str()
+            .unwrap()
+            .starts_with("export's loop setup card is already waiting for you"));
     }
 }

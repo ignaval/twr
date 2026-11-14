@@ -323,8 +323,9 @@ impl Hub {
     }
 
     /// `usage.threads {since?, by?}`: what the turns spent ([`Spent`]), summed from the log's
-    /// `turn.ended` events since `since` (all of them without it), grouped `by` thread (the
-    /// default), project or runtime (the adapter that reported the turn). Deleted threads
+    /// `turn.ended` events (and review loops' review runs, `loop.findings`) since `since` (all
+    /// of them without it), grouped `by` thread (the default), project or runtime (the adapter
+    /// that reported the turn, a review run's reviewer). Deleted threads
     /// count too. `{since, by, rows: [{key, label, input, output, cost, turns, costed_turns}],
     /// total}`, the rows by cost, then tokens, the most first; `cost` is null when no turn of
     /// the row reported one.
@@ -347,7 +348,7 @@ impl Hub {
             let conn = inner.reader();
             let mut stmt = conn.prepare_cached(
                 "SELECT thread, ts, source, data FROM events \
-                 WHERE kind = 'turn.ended' AND (?1 IS NULL OR ts >= ?1)",
+                 WHERE kind IN ('turn.ended', 'loop.findings', 'loop.audit') AND (?1 IS NULL OR ts >= ?1)",
             )?;
             let mut rows = stmt.query([from])?;
             let mut out = Vec::new();
@@ -368,6 +369,11 @@ impl Hub {
                     .filter(|u| u.is_object())
                     .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok())
                 {
+                    // A review or audit run's is its reviewer runtime's (`hub::loops`).
+                    let source = match data.pointer("/ext/twr/reviewer").and_then(Value::as_str) {
+                        Some(rt) => format!("adapter:{rt}"),
+                        None => source,
+                    };
                     out.push((thread, source, usage));
                 }
             }

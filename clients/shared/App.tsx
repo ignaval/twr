@@ -18,6 +18,7 @@ import { errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
+  Fragment,
   useCallback,
   useEffect,
   useId,
@@ -31,7 +32,6 @@ import {
   type CSSProperties,
   type FormEvent,
   type ReactNode,
-  type RefObject,
 } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -116,7 +116,46 @@ import { Manager, JobLog, type Section } from "./Managers";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
-import { armed, armsIn, hidden, mayAnswer, shown, type Arming } from "./arming";
+import { mayAnswer } from "./arming";
+import { useArming } from "./useArming";
+import { scrollCue } from "./scrollCue";
+import {
+  LoopChip,
+  LoopContext,
+  LoopEditorDialog,
+  LoopEndedLine,
+  LoopSetupCard,
+  LoopsSection,
+  NewThreadLoopLine,
+  ReviewLoopOffer,
+  isPhone,
+  type LoopActions,
+} from "./LoopViews";
+import {
+  countedRounds,
+  endedLately,
+  auditingWords,
+  endedLoops,
+  endedWords,
+  implementRequest,
+  loopAccess,
+  loopSlash,
+  newThreadLoop,
+  newThreadRequest,
+  newThreadValues,
+  sendAsLoop,
+  startedNotice,
+  startedWords,
+  offerReviewSetting,
+  offersReview,
+  requestLine,
+  reviewRequest,
+  type EditorSource,
+  type ImplementRequest,
+  type LoopControlAction,
+  type LoopState,
+  type ReviewRequest,
+} from "./loops";
 import {
   announce,
   attentionAnnouncement,
@@ -127,6 +166,7 @@ import {
   turnAnnouncement,
   useModal,
 } from "./a11y";
+import { parseHex, threadInk, threadStyle } from "./threadColor";
 const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
@@ -215,6 +255,10 @@ function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
         ? "light"
         : "dark";
   root.style.setProperty("--omarchy-scheme", scheme);
+  root.style.setProperty(
+    "--omarchy-light-share",
+    scheme === "light" ? "100%" : "0%",
+  );
   const accent = rgb(theme.accent);
   if (accent) {
     const luminance = accent
@@ -493,12 +537,26 @@ export default function App({
   // the box is cleared, never on each key.
   const hasDraft = useHasDraft(drafts, draftKey);
   const selectedThread = view.threads.find((t) => t.id === selected);
+  // A phone shows the inspector over the conversation: a notice goes inside it, in the
+  // flow, never over its controls.
+  const noticeInInspector = !!selectedThread && isPhone();
   // The desktop tray/menu bar, Dock badge and notifications mirror what needs the user in
   // every workspace: this one's live view and the others' latest reads. The live view's
   // stream starts over on each (re)connection and resync, so what it lists first is not
   // taken for news (desktop/notify-state.ts).
   const [resyncs, setResyncs] = useState(0);
   const liveStream = useRef({ epoch: 0, connected: false, resyncs: 0 });
+  // Rounds each running loop has run, by loop id: its end's notification counts them (the
+  // view of an ended loop keeps none). The plan check's `p1` is no round of the ladder.
+  const loopRounds = useRef(new Map<string, number>());
+  for (const thread of view.threads) {
+    const running = thread.loop as LoopState | undefined;
+    if (running?.id) {
+      loopRounds.current.set(running.id, countedRounds(running.rounds));
+      if (loopRounds.current.size > 500)
+        loopRounds.current.delete(loopRounds.current.keys().next().value!);
+    }
+  }
   useEffect(() => {
     if (!window.twrApp) return;
     const stream = liveStream.current;
@@ -517,6 +575,7 @@ export default function App({
           ? `live:${hostId}:${workspace}:${stream.epoch}`
           : undefined,
         sources: inboxSources,
+        loopRounds: loopRounds.current,
       }),
     );
   }, [
@@ -645,6 +704,21 @@ export default function App({
     void rpc("orchestrator.show")
       .then((show) => {
         if (live) setModelCatalog(show?.models);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [connected, workspace, rpc]);
+  // `[loops] offer_review` (`config.show`), once per connection: the Review loop button on
+  // a finished turn with changes. An older hub has no `loops`, and offers it.
+  const [offerReview, setOfferReview] = useState(true);
+  useEffect(() => {
+    if (!connected) return;
+    let live = true;
+    void rpc("config.show")
+      .then((config) => {
+        if (live) setOfferReview(offerReviewSetting(config));
       })
       .catch(() => {});
     return () => {
@@ -1376,6 +1450,8 @@ export default function App({
       announce(
         attentionAnnouncement({
           reason: item.reason,
+          loop_setup: item.loop_setup === true,
+          loop_stuck: item.loop_stuck === true,
           summary: item.summary,
           threadName: view.threads.find((t) => t.id === item.thread)?.name,
         }),
@@ -1383,6 +1459,20 @@ export default function App({
     if (fresh.length > 3)
       announce(`${fresh.length - 3} more requests need you`);
   }, [view.attention, connected, workspace]);
+  // A loop that ends is said, as a new request is: in any thread, not only the one shown.
+  const knownLoops = useRef<{ workspace: string; ids: Map<string, string> }>(
+    undefined,
+  );
+  useEffect(() => {
+    if (!connected) return;
+    const known = knownLoops.current;
+    const { said, known: ids } = endedLoops(
+      known?.workspace === workspace ? known.ids : undefined,
+      view.threads,
+    );
+    knownLoops.current = { workspace, ids };
+    for (const words of said.slice(0, 3)) announce(words);
+  }, [view.threads, connected, workspace]);
   const turnBaseline = useRef<{ thread?: string; end?: string }>({});
   useEffect(() => {
     const end = events.findLast((event) => event.kind === "turn.ended");
@@ -1429,12 +1519,17 @@ export default function App({
             );
           setOperation(undefined);
         } else {
-          const params = parameters(operation, values);
+          let params = parameters(operation, values);
+          // The New thread form's first prompt: the loop's task with Run as an
+          // implementation loop on (`thread.new {loop}`), else sent once the thread exists.
+          let firstPrompt: string | undefined;
           if (operation.method === "thread.new") {
             if (!values._cwd)
               throw new Error(
                 "Choose a working directory to resolve project paths.",
               );
+            ({ params, firstPrompt } = newThreadRequest(params));
+            if (params.loop) liveAnswerCheck();
             params.desktop_cwd = values._cwd;
           }
           const value = await rpc(operation.method!, params);
@@ -1445,6 +1540,31 @@ export default function App({
             setDestination(value.id);
             setSelected(undefined);
             setSection("chat");
+            const name = value.name || value.id;
+            const loop = newThreadLoop(value);
+            if (loop?.status === "error")
+              fail(
+                `${name} was made, but its implementation loop did not start: ${loop.message}`,
+              );
+            else if (loop?.status === "started")
+              setNotice(startedNotice(name, "implement"));
+            else if (loop?.status === "needs_setup")
+              setNotice(
+                `Choose ${name}'s loop settings on its setup card: it holds the task until you answer.`,
+              );
+            if (firstPrompt)
+              await rpc("thread.send", {
+                thread: value.id,
+                prompt: firstPrompt,
+              }).catch((error) => {
+                // Kept in its box, to send again.
+                drafts.set(workspace + ":" + value.id, (old) =>
+                  appendDraft(old, firstPrompt!),
+                );
+                fail(
+                  `${name} was made, but its first prompt was not sent: ${errorMessage(error)}`,
+                );
+              });
           } else if (operation.id === "delete") {
             setOperation(undefined);
             setSection("attention");
@@ -1590,6 +1710,44 @@ export default function App({
       setSending(false);
       input.current?.focus();
     }
+  };
+  /** Send as implementation loop: the draft is the task of a loop on the thread whose
+   * conversation is shown. Live only, never to the outbox; an empty draft asks first, since
+   * the task is then what the conversation already settled. */
+  const sendAsImplementation = () => {
+    const thread = destination
+      ? view.threads.find((t) => t.id === destination)
+      : undefined;
+    if (!thread || thread.is_orchestrator || sending) return;
+    const key = draftKey;
+    const draft = drafts.get(key);
+    let plan: ReturnType<typeof sendAsLoop>;
+    try {
+      plan = sendAsLoop(draft);
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    const run = async () => {
+      setSending(true);
+      try {
+        if (
+          await startImplement(thread.id, plan.task ? { task: plan.task } : {})
+        )
+          drafts.set(key, (old) => (old === draft ? "" : old));
+      } finally {
+        setSending(false);
+        input.current?.focus();
+      }
+    };
+    if (plan.confirm)
+      setConfirmation({
+        title: `Start an implementation loop on ${thread.name} with no task?`,
+        detail: `Nothing was typed, so the loop's task is what your conversation with ${thread.name} already settled. Its plan says how the thread reads it.`,
+        action: "Start loop",
+        run: () => void run(),
+      });
+    else void run();
   };
   // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
   // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
@@ -1767,7 +1925,9 @@ export default function App({
           action("rename", { ...args, thread: thread(args.thread) });
           break;
         case "New":
-          action("new", args);
+          // `/new <project> --implement <task>`: the form, with its switch on and the task
+          // as its first prompt.
+          action("new", newThreadValues(args));
           break;
         case "Delete":
           action("delete", { threads: args });
@@ -1907,6 +2067,44 @@ export default function App({
               voice: cmd.kind === "Voice" ? cmd.args : "",
               rate: cmd.kind === "Rate" ? cmd.args : "",
             });
+          break;
+        }
+        case "Review": {
+          const { thread: reviewed, ...request } = reviewRequest(args, chosen);
+          if (await startReview(reviewed, request)) drafts.set(draftKey, "");
+          return;
+        }
+        case "Implement": {
+          // In a thread's conversation every word is the task; elsewhere a first word that
+          // names a thread is the thread (twr-core `slash::implement_target`).
+          const { thread: implemented, ...request } = implementRequest(args, {
+            dive: destination,
+            chosen: selected || destination,
+            threads: view.threads,
+          });
+          const target = named(implemented);
+          if (!target) throw new Error(`No thread named ${implemented}.`);
+          if (target.is_orchestrator)
+            throw new Error(
+              "The orchestrator runs no loop: name a worker thread.",
+            );
+          if (await startImplement(target.id, request))
+            drafts.set(draftKey, "");
+          return;
+        }
+        case "Loop": {
+          const what = loopSlash(args, chosen);
+          if (what.kind === "saved") setLoopEditor(what);
+          else {
+            const target = named(what.thread);
+            if (!target) throw new Error(`No thread named ${what.thread}.`);
+            if (what.kind === "status") showLoop(target.id);
+            else {
+              if (await controlLoop(target.id, what.action))
+                drafts.set(draftKey, "");
+              return;
+            }
+          }
           break;
         }
         case "Quit":
@@ -2163,6 +2361,151 @@ export default function App({
     },
     [liveAnswerCheck, rpc],
   );
+  // Loops (shared/LoopViews.tsx): every start, control and settings save goes through these,
+  // under the same live-view guard as answers: nothing goes to the outbox.
+  const [loopEditor, setLoopEditor] = useState<EditorSource>();
+  const [loopSettingsVersion, setLoopSettingsVersion] = useState(0);
+  /** The thread whose inspector should bring its Loops section into view. */
+  const [loopFocus, setLoopFocus] = useState<string>();
+  const [notice, setNotice] = useState("");
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(""), 6000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+  const loopNavigation = useRef({
+    destination,
+    section,
+    narrow,
+    threads: view.threads,
+  });
+  loopNavigation.current = {
+    destination,
+    section,
+    narrow,
+    threads: view.threads,
+  };
+  /** The thread whose setup card, just raised, the inspector brings into view and focuses:
+   * the inspector opens at its top, with the card's buttons below the fold. */
+  const [revealSetup, setRevealSetup] = useState<string>();
+  useEffect(() => {
+    if (!revealSetup) return;
+    const card = [
+      ...document.querySelectorAll<HTMLElement>(
+        "#twr-inspector .attention-loop-setup",
+      ),
+    ].find((node) => node.dataset.thread === revealSetup);
+    if (!card) return;
+    card.scrollIntoView({ block: "nearest", behavior: scrollBehavior() });
+    card.focus({ preventScroll: true });
+    setRevealSetup(undefined);
+  }, [revealSetup, view.attention, selected]);
+  /** Selects thread `id` and brings its inspector's Loops section into view. */
+  const showLoop = useCallback((id: string) => {
+    setSelected(id);
+    setLoopFocus(id);
+  }, []);
+  /** `loop.request` for a loop of either kind; says what came of it: the loop started (with
+   * what it runs on), or its setup card is up and brought into view. */
+  const requestLoop = useCallback(
+    async (request: ReviewRequest | ImplementRequest): Promise<boolean> => {
+      try {
+        liveAnswerCheck();
+        const result = await rpc("loop.request", request);
+        const thread = request.thread;
+        const nav = loopNavigation.current;
+        const found = nav.threads.find((t) =>
+          [t.id, t.name, ...(t.aliases || [])].includes(thread),
+        );
+        const name = found?.name || thread;
+        if (result?.status === "started") {
+          // What it runs on, as the hub tells the orchestrator: the models stay in sight.
+          const detail = await rpc("loop.get", { thread }).catch(
+            () => undefined,
+          );
+          const words = startedWords(detail?.started, found);
+          const line = words || result.loop?.line;
+          setNotice(startedNotice(name, request.kind, line));
+        } else if (result?.status === "needs_setup") {
+          // The card is the user's to answer: bring it into view, never answer it here.
+          if (!found) setSection("attention");
+          else if (nav.section === "chat" && nav.destination === found.id) {
+            // The conversation shows its thread's requests above the transcript.
+          } else if (nav.narrow) setSection("attention");
+          else {
+            setSelected(found.id);
+            setRevealSetup(found.id);
+          }
+          setNotice(
+            request.kind === "implement" && request.task
+              ? `Choose ${name}'s loop settings on its setup card: it holds your task until you answer.`
+              : `Choose ${name}'s loop settings on its setup card.`,
+          );
+        }
+        return true;
+      } catch (error) {
+        fail(error);
+        return false;
+      }
+    },
+    [liveAnswerCheck, rpc, fail],
+  );
+  const startReview = useCallback(
+    (thread: string, options: Omit<ReviewRequest, "thread" | "kind"> = {}) =>
+      requestLoop({ thread, kind: "review", ...options }),
+    [requestLoop],
+  );
+  const startImplement = useCallback(
+    (thread: string, options: Omit<ImplementRequest, "thread" | "kind"> = {}) =>
+      requestLoop({ thread, kind: "implement", ...options }),
+    [requestLoop],
+  );
+  const controlLoop = useCallback(
+    async (thread: string, action: LoopControlAction): Promise<boolean> => {
+      try {
+        liveAnswerCheck();
+        const result = await rpc("loop.control", { thread, action });
+        announce(
+          result?.running === false
+            ? "The loop stopped"
+            : `Loop ${action === "skip_to_verify" ? "skips to verify" : action === "pause" ? "paused" : action === "resume" ? "resumed" : action}`,
+        );
+        return true;
+      } catch (error) {
+        fail(error);
+        return false;
+      }
+    },
+    [liveAnswerCheck, rpc, fail],
+  );
+  const loopActions = useMemo<LoopActions>(
+    () => ({
+      rpc,
+      fail,
+      access: loopAccess({ scopes: deviceScopes, connected }),
+      offerReview,
+      catalog: modelCatalog,
+      startReview,
+      startImplement,
+      control: controlLoop,
+      openEditor: setLoopEditor,
+      confirm: setConfirmation,
+      settingsVersion: loopSettingsVersion,
+      settingsChanged: () => setLoopSettingsVersion((n) => n + 1),
+    }),
+    [
+      rpc,
+      fail,
+      deviceScopes,
+      connected,
+      offerReview,
+      modelCatalog,
+      startReview,
+      startImplement,
+      controlLoop,
+      loopSettingsVersion,
+    ],
+  );
   const earlierTarget = target?.id;
   const earlier = useCallback(async () => {
     if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
@@ -2212,12 +2555,19 @@ export default function App({
       .toLowerCase()
       .includes(query.toLowerCase()),
   );
+  // A thread's conversation: its colour, and the ink its name is written in ("To:").
   const rootStyle = target
     ? ({
         "--destination": destination ? target.accent : "var(--accent)",
+        ...(destination && parseHex(target.accent)
+          ? {
+              "--destination-ink-light": threadInk(target.accent, "light"),
+              "--destination-ink-dark": threadInk(target.accent, "dark"),
+            }
+          : {}),
       } as CSSProperties)
     : {};
-  return (
+  const shell = (
     <div className={`app ${sidebar ? "" : "sidebar-hidden"}`} style={rootStyle}>
       <button
         type="button"
@@ -2432,6 +2782,12 @@ export default function App({
                               pinned={pins.includes(thread.id)}
                               onSelect={selectThread}
                               onOpen={openThread}
+                              onLoop={showLoop}
+                              offer={offersReview(
+                                thread,
+                                offerReview,
+                                view.attention,
+                              )}
                             />
                           ))}
                           {!visible.length && (
@@ -2465,11 +2821,7 @@ export default function App({
                           <li key={thread.id}>
                             <button
                               className="workspace-thread"
-                              style={
-                                {
-                                  "--thread-color": thread.accent,
-                                } as CSSProperties
-                              }
+                              style={threadStyle(thread.accent)}
                               title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
                               onClick={(event) =>
                                 openIn(entry.name, thread.id, event.detail > 1)
@@ -2945,6 +3297,7 @@ export default function App({
                 </header>
                 <div
                   className="conversation-attention"
+                  ref={scrollCue}
                   role={
                     view.attention.some(
                       (a) => a.thread === "hub" || a.thread === target?.id,
@@ -2988,6 +3341,13 @@ export default function App({
                   summaries={assistance.summaries}
                   onError={fail}
                   onVisibleRoutines={setVisibleRoutines}
+                  offer={
+                    destination &&
+                    target &&
+                    offersReview(target, offerReview, view.attention)
+                      ? target
+                      : undefined
+                  }
                 />
                 {!destination && workers.some((t) => t.last_report) && (
                   <details className="reports">
@@ -2998,16 +3358,26 @@ export default function App({
                     {workers
                       .filter((t) => t.last_report)
                       .map((t) => (
-                        <button
-                          key={t.id}
-                          aria-controls="twr-inspector"
-                          onClick={() => setSelected(t.id)}
-                        >
-                          <span style={{ color: t.accent }}>{t.name}</span>
-                          <span className="visually-hidden">: </span>
-                          <span>{t.last_report.summary}</span>
-                          <ArrowUpRight size={14} />
-                        </button>
+                        <div className="report-row" key={t.id}>
+                          <button
+                            aria-controls="twr-inspector"
+                            onClick={() => setSelected(t.id)}
+                          >
+                            <span
+                              className="thread-ink"
+                              style={threadStyle(t.accent)}
+                            >
+                              {t.name}
+                            </span>
+                            <span className="visually-hidden">: </span>
+                            <span>{t.last_report.summary}</span>
+                            <ArrowUpRight size={14} />
+                          </button>
+                          <LoopEndedLine thread={t} />
+                          {offersReview(t, offerReview, view.attention) && (
+                            <ReviewLoopOffer thread={t} />
+                          )}
+                        </div>
                       ))}
                   </details>
                 )}
@@ -3169,6 +3539,11 @@ export default function App({
                   onEdit={forgetAcceptedSuggestion}
                   send={send}
                   submitSlash={submitSlash}
+                  sendAsLoop={
+                    target && !target.is_orchestrator && destination
+                      ? sendAsImplementation
+                      : undefined
+                  }
                   uploads={uploads}
                   submitVoice={submitVoice}
                   voiceHint={voiceHintWords}
@@ -3229,6 +3604,12 @@ export default function App({
                       pinned={pins.includes(t.id)}
                       onSelect={selectThread}
                       onOpen={openThread}
+                      // A narrow window (a phone) has no sidebar list beside the grid: the
+                      // grid is where its cards are, so they carry the loop chip and offer.
+                      onLoop={narrow ? showLoop : undefined}
+                      offer={
+                        narrow && offersReview(t, offerReview, view.attention)
+                      }
                       large
                     />
                   ))}
@@ -3339,6 +3720,7 @@ export default function App({
                 action={action}
                 cliAction={cliAction}
                 fail={fail}
+                connected={connected}
               />
             )}
           </div>
@@ -3361,10 +3743,29 @@ export default function App({
                 </button>
               </header>
               <div className="inspector-body">
+                {notice && !error && noticeInInspector && (
+                  // On a phone the inspector fills the screen under the header, where a
+                  // toast would cover its close button: the notice takes its place in it.
+                  <div role="status" className="inspector-notice">
+                    <Check size={15} aria-hidden="true" />
+                    <span>{notice}</span>
+                    <button
+                      className="icon-button"
+                      aria-label="Dismiss notice"
+                      title="Dismiss"
+                      onClick={() => setNotice("")}
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                )}
                 <span className="thread-runtime">
                   {selectedThread.runtime} · {selectedThread.box_name}
                 </span>
-                <h2 style={{ color: selectedThread.accent }}>
+                <h2
+                  className="thread-ink"
+                  style={threadStyle(selectedThread.accent)}
+                >
                   {selectedThread.name}
                 </h2>
                 <div
@@ -3434,6 +3835,15 @@ export default function App({
                     fail={fail}
                   />
                 ))}
+                {!selectedThread.is_orchestrator && (
+                  <LoopsSection
+                    key={selectedThread.id}
+                    thread={selectedThread}
+                    connected={connected}
+                    focus={loopFocus === selectedThread.id}
+                    onFocused={() => setLoopFocus(undefined)}
+                  />
+                )}
                 {selectedThread.last_report && (
                   <section className="inspector-report">
                     <h3>Latest report</h3>
@@ -3643,6 +4053,30 @@ export default function App({
           </button>
         </div>
       )}
+      {notice && !error && !noticeInInspector && (
+        <div role="status" className="toast notice-toast" data-modal-keep="">
+          <Check size={17} aria-hidden="true" />
+          <span>{notice}</span>
+          <button
+            aria-label="Dismiss notice"
+            title="Dismiss"
+            onClick={() => setNotice("")}
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
+      {loopEditor && (
+        <LoopEditorDialog
+          source={loopEditor}
+          thread={
+            loopEditor.kind === "card"
+              ? view.threads.find((t) => t.id === loopEditor.thread)
+              : undefined
+          }
+          onClose={() => setLoopEditor(undefined)}
+        />
+      )}
       {palette && (
         <Dialog
           title="Commands"
@@ -3759,60 +4193,79 @@ export default function App({
             }}
           >
             <div className="operation-fields">
-              {operation.fields.map((field) => (
-                <FieldInput
-                  key={field.key}
-                  field={
-                    field.key === "runtime"
-                      ? {
-                          ...field,
-                          options: [
-                            ...new Set([
-                              "claude-code",
-                              "codex",
-                              "grok-build",
-                              ...(info?.agents || []).map(
-                                (a: Json) => a.runtime,
-                              ),
-                            ]),
-                          ],
-                        }
-                      : field.type === "model" || field.type === "effort"
-                        ? {
-                            ...field,
-                            choices: (field.type === "model"
-                              ? modelChoices
-                              : effortChoices)(
-                              modelCatalog,
-                              formRuntime(
-                                operation,
-                                values,
-                                view.threads,
-                                info?.orchestrator?.configured?.explicit ===
-                                  false
-                                  ? info.orchestrator.configured.runtime
-                                  : undefined,
-                              ),
-                            ),
-                          }
-                        : field.key === "mode" && !permitted("admin")
+              {operation.fields
+                .filter(
+                  (field) =>
+                    // The setup card choice goes with the New thread form's loop only.
+                    !(
+                      operation.id === "new" &&
+                      field.key === "loop_setup" &&
+                      !values.implement
+                    ),
+                )
+                .map((field) => (
+                  <Fragment key={field.key}>
+                    <FieldInput
+                      field={
+                        field.key === "runtime"
                           ? {
                               ...field,
                               options: [
-                                "manual",
-                                "plan",
-                                "read-only",
-                                "dontAsk",
+                                ...new Set([
+                                  "claude-code",
+                                  "codex",
+                                  "grok-build",
+                                  ...(info?.agents || []).map(
+                                    (a: Json) => a.runtime,
+                                  ),
+                                ]),
                               ],
                             }
-                          : field
-                  }
-                  value={values[field.key]}
-                  onChange={(value) =>
-                    setValues((old) => ({ ...old, [field.key]: value }))
-                  }
-                />
-              ))}
+                          : field.type === "model" || field.type === "effort"
+                            ? {
+                                ...field,
+                                choices: (field.type === "model"
+                                  ? modelChoices
+                                  : effortChoices)(
+                                  modelCatalog,
+                                  formRuntime(
+                                    operation,
+                                    values,
+                                    view.threads,
+                                    info?.orchestrator?.configured?.explicit ===
+                                      false
+                                      ? info.orchestrator.configured.runtime
+                                      : undefined,
+                                  ),
+                                ),
+                              }
+                            : field.key === "mode" && !permitted("admin")
+                              ? {
+                                  ...field,
+                                  options: [
+                                    "manual",
+                                    "plan",
+                                    "read-only",
+                                    "dontAsk",
+                                  ],
+                                }
+                              : field
+                      }
+                      value={values[field.key]}
+                      onChange={(value) =>
+                        setValues((old) => ({ ...old, [field.key]: value }))
+                      }
+                    />
+                    {operation.id === "new" &&
+                      field.key === "implement" &&
+                      values.implement && (
+                        <NewThreadLoopLine
+                          project={values.project}
+                          connected={connected}
+                        />
+                      )}
+                  </Fragment>
+                ))}
               {(operation.cli || operation.method === "thread.new") && (
                 <FieldInput
                   field={{
@@ -4074,6 +4527,9 @@ export default function App({
       </span>
     </div>
   );
+  return (
+    <LoopContext.Provider value={loopActions}>{shell}</LoopContext.Provider>
+  );
 }
 
 /** Memoized, with stable `onSelect`/`onOpen` taking the thread's id and `items` shared
@@ -4086,6 +4542,8 @@ const ThreadCard = memo(function ThreadCard({
   pinned,
   onSelect,
   onOpen,
+  onLoop,
+  offer = false,
   large = false,
   listItem = false,
 }: {
@@ -4096,6 +4554,11 @@ const ThreadCard = memo(function ThreadCard({
   pinned: boolean;
   onSelect: (id: string) => void;
   onOpen: (id: string) => void;
+  /** The loop chip's click: the sidebar's cards show the chip, and so do the grid's in a
+   * narrow window (a phone), where the grid is the thread list. */
+  onLoop?: (id: string) => void;
+  /** Offer a Review loop on the thread's finished turn with changes (where the chip shows). */
+  offer?: boolean;
   large?: boolean;
   listItem?: boolean;
 }) {
@@ -4108,15 +4571,24 @@ const ThreadCard = memo(function ThreadCard({
       pinned={pinned}
       onSelect={() => onSelect(thread.id)}
       onOpen={() => onOpen(thread.id)}
+      onLoop={onLoop && (() => onLoop(thread.id))}
       large={large}
     />
   );
-  return listItem ? (
-    <div role="listitem" className="thread-item">
+  const item = offer ? (
+    <>
       {card}
-    </div>
+      <ReviewLoopOffer thread={thread} className="thread-card-offer" />
+    </>
   ) : (
     card
+  );
+  return listItem ? (
+    <div role="listitem" className={`thread-item ${offer ? "has-offer" : ""}`}>
+      {item}
+    </div>
+  ) : (
+    item
   );
 });
 function ThreadCardButton({
@@ -4127,6 +4599,7 @@ function ThreadCardButton({
   pinned,
   onSelect,
   onOpen,
+  onLoop,
   large,
 }: {
   thread: Thread;
@@ -4136,6 +4609,7 @@ function ThreadCardButton({
   pinned: boolean;
   onSelect: () => void;
   onOpen: () => void;
+  onLoop?: () => void;
   large: boolean;
 }) {
   const git = thread.git || thread.git_snapshot;
@@ -4145,8 +4619,17 @@ function ThreadCardButton({
       className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
       aria-current={dived ? "location" : undefined}
       aria-describedby={selected ? "twr-thread-open-hint" : undefined}
-      style={{ "--thread-color": thread.accent } as CSSProperties}
-      onClick={onSelect}
+      style={threadStyle(thread.accent)}
+      onClick={(event) => {
+        // A click on the loop chip opens the inspector at the loop's progress.
+        if (
+          onLoop &&
+          event.target instanceof Element &&
+          event.target.closest(".loop-chip")
+        )
+          onLoop();
+        else onSelect();
+      }}
       onDoubleClick={onOpen}
       onKeyDown={(e) => {
         if (e.key === "Enter" && selected) {
@@ -4161,7 +4644,7 @@ function ThreadCardButton({
         {dived && (
           <ArrowUpRight
             size={13}
-            className="dive-marker"
+            className="dive-marker thread-ink"
             role="img"
             aria-label="Current destination"
           />
@@ -4170,22 +4653,37 @@ function ThreadCardButton({
         <span className="visually-hidden">, </span>
         <span className={`thread-status status-${thread.status}`}>
           {statusIcon(thread.status)}
-          {thread.status_label || thread.status}
+          <span className="thread-status-label">
+            {thread.status_label || thread.status}
+          </span>
         </span>
       </div>
 
+      {onLoop && thread.loop_line && (
+        <>
+          <span className="visually-hidden">. </span>
+          <LoopChip thread={thread} />
+        </>
+      )}
+      {onLoop && !thread.loop_line && endedLately(thread) && (
+        <>
+          <span className="visually-hidden">. </span>
+          <LoopEndedLine thread={thread} />
+        </>
+      )}
       <span className="visually-hidden">. </span>
       {items[0] ? (
         <span className="thread-card-request">
           <AlertCircle size={12} />
           <span className="visually-hidden">Request: </span>
-          {items[0].summary}
+          {requestLine(items[0])}
         </span>
       ) : report && ["done", "idle", "parked"].includes(thread.status) ? (
         <span className="thread-card-summary">{report.summary}</span>
       ) : (
         <span className="thread-card-summary">
-          {thread.activity ||
+          {auditingWords(thread) ||
+            thread.activity ||
             (thread.background_tasks &&
               Object.values(thread.background_tasks)
                 .map((t: any) => t.description)
@@ -4212,47 +4710,6 @@ function ThreadCardButton({
       </span>
     </button>
   );
-}
-/** Tracks how long an attention card's options have been on screen: from mount, or from
- * when they scroll into view, and again from zero after they leave it or the window is
- * hidden. `identity` restarts it for a new item or revision. */
-function useArming(target: RefObject<HTMLElement | null>, identity: string) {
-  const state = useRef<Arming>({});
-  const [isArmed, setArmed] = useState(false);
-  useEffect(() => {
-    state.current = hidden();
-    setArmed(false);
-    const node = target.current;
-    const observable = !!node && typeof IntersectionObserver !== "undefined";
-    let onScreen = !observable;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const update = () => {
-      clearTimeout(timer);
-      const now = performance.now();
-      state.current =
-        onScreen && document.visibilityState !== "hidden"
-          ? shown(state.current, now)
-          : hidden();
-      setArmed(armed(state.current, now));
-      const wait = armsIn(state.current, now);
-      if (wait) timer = setTimeout(update, wait);
-    };
-    let observer: IntersectionObserver | undefined;
-    if (observable) {
-      observer = new IntersectionObserver((entries) => {
-        onScreen = entries[entries.length - 1].isIntersecting;
-        update();
-      });
-      observer.observe(node);
-    } else update();
-    document.addEventListener("visibilitychange", update);
-    return () => {
-      clearTimeout(timer);
-      observer?.disconnect();
-      document.removeEventListener("visibilitychange", update);
-    };
-  }, [identity]);
-  return { armed: isArmed, state: () => state.current };
 }
 function AttentionCard({
   item,
@@ -4324,6 +4781,15 @@ function AttentionCard({
     settle(() => onRespond(item, value, message || undefined));
   const locked = readOnly || busy || sent || !item.revision || item.incomplete;
   const waiting = !locked && !arming.armed;
+  if (item.loop_setup)
+    return (
+      <LoopSetupCard
+        item={item}
+        thread={thread}
+        readOnly={readOnly}
+        onRespond={onRespond}
+      />
+    );
   return (
     <article
       className={`attention-card attention-${item.reason}`}
@@ -4354,11 +4820,13 @@ function AttentionCard({
       <header>
         <span className="attention-kind" id={`${ids}-kind`}>
           <AlertCircle size={14} />
-          {item.reason === "permission"
-            ? "Permission requested"
-            : item.reason === "question"
-              ? "Question for you"
-              : item.reason}
+          {item.loop_stuck
+            ? "Loop stuck"
+            : item.reason === "permission"
+              ? "Permission requested"
+              : item.reason === "question"
+                ? "Question for you"
+                : item.reason}
         </span>
         <span id={`${ids}-thread`}>{thread?.name || "twr"}</span>
       </header>
@@ -4430,7 +4898,11 @@ function AttentionCard({
                 ? "Allow"
                 : option === "deny"
                   ? "Deny"
-                  : option}
+                  : item.loop_stuck
+                    ? // A stuck loop's `resume` and `stop`, worded as the loop's
+                      // own Resume and Stop.
+                      option.charAt(0).toUpperCase() + option.slice(1)
+                    : option}
             </button>
           ))}
           {!options.length &&
@@ -4459,15 +4931,16 @@ function AttentionCard({
                 </button>
               </form>
             )}
-          {!["permission", "question"].includes(item.reason) && (
-            <button
-              disabled={locked}
-              aria-disabled={waiting || undefined}
-              onClick={() => void settle(() => onDismiss(item))}
-            >
-              Dismiss
-            </button>
-          )}
+          {!["permission", "question"].includes(item.reason) &&
+            !item.loop_stuck && (
+              <button
+                disabled={locked}
+                aria-disabled={waiting || undefined}
+                onClick={() => void settle(() => onDismiss(item))}
+              >
+                Dismiss
+              </button>
+            )}
           {busy && <Spinner />}
           {sent && (
             <span className="attention-sent" role="status">
@@ -4500,7 +4973,10 @@ const Conversation = memo(function Conversation({
   summaries,
   onVisibleRoutines,
   onError,
+  offer,
 }: {
+  /** The thread whose finished turn with changes the conversation offers a review loop. */
+  offer?: Thread;
   onVisibleRoutines: (threads: string[]) => void;
   onError: (error: unknown) => void;
   summaries: Summary[];
@@ -4804,6 +5280,14 @@ const Conversation = memo(function Conversation({
           );
         })}
       </div>
+      {offer && !loading && (
+        <div className="loop-offer-row">
+          <span>
+            {offer.name}'s last turn left changes no loop has reviewed.
+          </span>
+          <ReviewLoopOffer thread={offer} />
+        </div>
+      )}
       {!following && (
         <button
           className="jump-latest"
