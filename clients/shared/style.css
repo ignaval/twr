@@ -17,6 +17,8 @@
   --active: rgb(255 255 255 / 7.5%);
   --border: #282e35;
   --border-strong: #3b444e;
+  /* A field's edge (an Omarchy palette makes it read at 3:1). */
+  --field-border: var(--border);
   --text: #e6e9ec;
   --muted: #a3abb4;
   --faint: #959ea8;
@@ -119,7 +121,7 @@ input,
 textarea,
 select {
   width: 100%;
-  border: 1px solid var(--border);
+  border: 1px solid var(--field-border);
   border-radius: 6px;
   background: var(--bg);
   color: var(--text);
@@ -2973,39 +2975,55 @@ meter::-webkit-meter-optimum-value {
 }
 
 :root[data-platform="linux"][data-theme="system"][data-omarchy="true"] {
+  /* Every colour comes from the theme through shared/omarchy.ts, which keeps each one's
+   * hue and moves its lightness only as far as it takes to read at 4.5:1 (3:1 for a
+   * field's edge) wherever the app draws it. */
   color-scheme: var(--omarchy-scheme, dark);
-  --bg: var(--omarchy-bg, #0e1013);
-  --text: var(--omarchy-fg, #e6e9ec);
-  --accent: var(--omarchy-accent, #62c7d4);
-  --accent-fg: var(--omarchy-accent-fg, #06191c);
-  --panel: color-mix(in srgb, var(--bg) 94%, var(--text));
-  --raised: color-mix(in srgb, var(--bg) 89%, var(--text));
-  --overlay: color-mix(in srgb, var(--bg) 92%, var(--text));
-  --bubble: color-mix(in srgb, var(--bg) 90%, var(--text));
-  --hover: color-mix(in srgb, var(--bg) 92%, var(--text));
-  --active: color-mix(in srgb, var(--bg) 86%, var(--text));
-  --border: color-mix(in srgb, var(--bg) 80%, var(--text));
-  --border-strong: color-mix(in srgb, var(--bg) 65%, var(--text));
-  --muted: color-mix(in srgb, var(--text) 85%, var(--bg));
-  --faint: color-mix(in srgb, var(--text) 80%, var(--bg));
-  --accent-soft: color-mix(in srgb, var(--bg) 87%, var(--accent));
-  --warning: var(
-    --omarchy-warning,
-    color-mix(in srgb, var(--text) 80%, #d6a22f)
-  );
-  --warning-soft: color-mix(in srgb, var(--bg) 90%, var(--warning));
-  --danger: var(--omarchy-danger, color-mix(in srgb, var(--text) 70%, #db4b4b));
-  --danger-soft: color-mix(in srgb, var(--bg) 90%, var(--danger));
-  --danger-fg: var(--bg);
-  --success: color-mix(in srgb, var(--text) 70%, #3b9c6e);
-  --loop: color-mix(in srgb, var(--text) 70%, #8f6fe0);
-  --loop-soft: color-mix(in srgb, var(--bg) 88%, var(--loop));
+  --bg: var(--omarchy-bg);
+  --panel: var(--omarchy-panel);
+  --raised: var(--omarchy-raised);
+  --overlay: var(--omarchy-overlay);
+  --bubble: var(--omarchy-bubble);
+  --hover: var(--omarchy-hover);
+  --active: var(--omarchy-active);
+  --border: var(--omarchy-border);
+  --border-strong: var(--omarchy-border-strong);
+  --field-border: var(--border-strong);
+  --text: var(--omarchy-text);
+  --muted: var(--omarchy-muted);
+  --faint: var(--omarchy-faint);
+  --accent: var(--omarchy-accent);
+  --accent-fg: var(--omarchy-accent-fg);
+  --accent-soft: var(--omarchy-accent-soft);
+  --warning: var(--omarchy-warning);
+  --warning-soft: var(--omarchy-warning-soft);
+  --danger: var(--omarchy-danger);
+  --danger-soft: var(--omarchy-danger-soft);
+  --danger-fg: var(--omarchy-danger-fg);
+  --success: var(--omarchy-success);
+  --loop: var(--omarchy-loop);
+  --loop-soft: var(--omarchy-loop-soft);
+  --selection: var(--omarchy-selection);
   --scrim: color-mix(in srgb, var(--bg) 75%, transparent);
   --shadow-color: color-mix(in srgb, var(--bg) 25%, #000);
   --shadow-pop: 0 12px 40px
     color-mix(in srgb, var(--shadow-color) 40%, transparent);
   --destination-strength: 45%;
   --light-share: var(--omarchy-light-share, 0%);
+}
+:root[data-platform="linux"][data-theme="system"][data-omarchy="true"]
+  ::selection {
+  background: var(--selection);
+  color: var(--text);
+}
+/* A thread's name: its colour's ink for this palette (set on the root for each of the
+ * hub's colours); the orchestrator's "To:" is the accent. */
+:root[data-platform="linux"][data-theme="system"][data-omarchy="true"]
+  .thread-ink {
+  color: var(--thread-ink-omarchy, var(--text));
+}
+:root[data-platform="linux"][data-theme="system"][data-omarchy="true"] .app {
+  --destination-ink: var(--destination-ink-omarchy, var(--accent));
 }
 
 @media (prefers-reduced-motion: reduce) {

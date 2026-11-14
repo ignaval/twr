@@ -139,8 +139,20 @@ the sidebar; Ctrl/Cmd-G toggles the grid. The focus filter is Cmd-Shift-F on mac
 and Ctrl-Shift-F on Linux, preserving normal text-editing Control keys. Narrow windows expose Chat / Needs you / Threads / More;
 all manager pages remain accessible through More. In short windows, expanding a terminal
 temporarily gives it the main area. Dark is the default. Light and System are available in Appearance; System follows
-the selected Omarchy theme on Linux. Native menus and window backgrounds follow
+the selected Omarchy theme on Linux. The app reads the theme's `colors.toml` (its
+`background`, `foreground`, `accent`, `selection`, `red`, `yellow` and `mode`) and derives
+every colour it draws from them. Text in every colour reads at 4.5:1 on every background it
+sits on, and a field's edge and the focus ring at 3:1, whatever the theme: a colour that
+already does is used exactly as the theme gives it, and one that does not keeps its hue and
+moves its lightness only as far as it takes. Thread names in their own colour get an ink
+for the theme's surfaces the same way. A theme without a valid `background` and
+`foreground` leaves the app's own colours in place. Disabled controls are dimmed below
+these ratios, which WCAG allows for inactive controls. Native menus and window backgrounds follow
 the client preference, which is restored on the next launch.
+
+The message field grows with what you write, wrapped lines included, at every text size,
+up to 240 px or 40% of the window, then scrolls inside. It shrinks again when the text is
+deleted or sent, and Send, the microphone and Upload stay in view.
 
 ### Loops
 

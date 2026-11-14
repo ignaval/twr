@@ -65,7 +65,7 @@ build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](des
 | Packaged startup | Production user authentication, bundled engine startup, native PTY, hub survives app quit |
 | Native interface | All manager pages, New menu, thread selection, orchestrator and direct-worker destinations |
 | Appearance | Dark first launch, persisted Light/Dark/System, native window/menu colors, Omarchy light/dark palette and contrast |
-| Responsive UI | Narrow panes, long-message disclosure, errors above form fields, sticky composer, 44 px mobile controls |
+| Responsive UI | Narrow panes, long-message disclosure, errors above form fields, sticky composer, a message field that grows with wrapped text at 22 px in full and 390 px windows and shrinks back, 44 px mobile controls |
 | Slash commands | Model/effort/runtime, account-add routing, multi-delete targets, boolean flags, unknown workspace safety |
 | Messages | Streaming, question/permission responses, revision checks, queued message take-back |
 | Jobs | Launch, live output and cancellation |
@@ -120,3 +120,8 @@ attachments, with friendly PNG copies when the local export succeeds.
 validated IPC. `node scripts/omarchy-qa.mjs`, run inside a Hyprland session, checks
 actual theme-file changes, text contrast and native Linux window colors. These are
 focused local checks in addition to the packaged functional suites.
+`tests/omarchy-contrast.test.ts` (part of `npm test`) runs on any machine: it resolves
+`style.css` with the palette the app derives for each stock Omarchy theme (their colours
+are fixtures in `tests/omarchy-themes.ts`, from Omarchy v4.5.0) and for broken themes, and
+checks every text, fill, selection, field-edge, focus-ring and thread-name pair the app
+draws.

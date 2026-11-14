@@ -1812,8 +1812,77 @@ export async function surfacesQA(driver, fixture, options) {
         controls: controls.map((e) => { const r = e.getBoundingClientRect(); return { name: lq.nameOf(e), x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width * 10) / 10, height: Math.round(r.height * 10) / 10 }; }),
       };
     }`);
-    run.pass(`composer ${name}`, { keyboard, ...boxes });
-    (run.report.composer ||= []).push({ name, keyboard, ...boxes });
+    // The message grows with its text, wrapped lines included (Composer.tsx, fitToText),
+    // up to its cap, then scrolls inside; it shrinks again when the text goes; and the
+    // controls stay above the keyboard all along.
+    const fill = (text) =>
+      run.ev(
+        `async (a, lq) => {
+          const input = lq.need('.composer textarea');
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(input, a.text);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          await lq.settle();
+          const style = getComputedStyle(input);
+          const controls = lq.all('button, label.attachment-button', lq.need('.composer-bottom')).map((e) => e.getBoundingClientRect());
+          return {
+            height: Math.round(input.getBoundingClientRect().height * 10) / 10,
+            min: parseFloat(style.minHeight),
+            cap: parseFloat(style.maxHeight),
+            lineHeight: parseFloat(style.lineHeight),
+            hidden: input.scrollHeight - input.clientHeight,
+            controls: controls.length,
+            controlsBottom: Math.round(Math.max(...controls.map((r) => r.bottom))),
+            controlsRight: Math.round(Math.max(...controls.map((r) => r.right))),
+            visible: Math.round(Math.min(visualViewport?.height || innerHeight, document.body.getBoundingClientRect().bottom)),
+            width: innerWidth,
+          };
+        }`,
+        { text },
+      );
+    const words =
+      "Keep every option labelled and in the same order for the keyboard as on screen. ";
+    const growth = { empty: await fill("") };
+    growth.two = await fill(words.repeat(2));
+    await run.shots(`${name}-grown`, {
+      root: ".composer",
+      modes: ["dark"],
+    });
+    growth.long = await fill(words.repeat(14));
+    growth.cleared = await fill("");
+    await fill("Check the build on a narrow phone");
+    const { empty, two, long, cleared } = growth;
+    const room = empty.cap - empty.height >= empty.lineHeight / 2;
+    const problems = [];
+    if (
+      room &&
+      !(
+        two.height > empty.height &&
+        (two.hidden <= 1 || Math.abs(two.height - two.cap) <= 1)
+      )
+    )
+      problems.push("a wrapped message did not make the field taller");
+    if (!(
+      Math.abs(long.height - Math.max(long.cap, long.min)) <= 1 &&
+      long.hidden > 0
+    ))
+      problems.push(
+        "a long message did not grow the field to its cap and scroll inside",
+      );
+    if (Math.abs(cleared.height - empty.height) > 1)
+      problems.push("the field did not shrink back when the text went");
+    for (const box of [two, long])
+      if (
+        box.controls < 3 ||
+        box.controlsBottom > box.visible + 1 ||
+        box.controlsRight > box.width + 1
+      )
+        problems.push("a control left the screen or went under the keyboard");
+    if (problems.length)
+      throw new Error(
+        `composer ${name}: ${problems.join("; ")}: ${JSON.stringify(growth)}`,
+      );
+    run.pass(`composer ${name}`, { keyboard, ...boxes, growth });
+    (run.report.composer ||= []).push({ name, keyboard, ...boxes, growth });
     await run.ev(
       "async () => { const root = document.documentElement; if (window.__surfacesHeight !== undefined) { root.style.setProperty('--viewport-height', window.__surfacesHeight); root.dataset.keyboard = 'false'; delete window.__surfacesHeight; } document.activeElement?.blur(); await window.Capacitor.Plugins.Keyboard?.hide?.().catch?.(() => {}); return true; }",
     );
