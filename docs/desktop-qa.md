@@ -65,7 +65,7 @@ build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](des
 | Packaged startup | Production user authentication, bundled engine startup, native PTY, hub survives app quit |
 | Native interface | All manager pages, New menu, thread selection, orchestrator and direct-worker destinations |
 | Appearance | Dark first launch, persisted Light/Dark/System, native window/menu colors, Omarchy light/dark palette and contrast |
-| Responsive UI | Narrow panes, long-message disclosure, errors above form fields, sticky composer, 44 px mobile controls |
+| Responsive UI | Narrow panes, long-message disclosure, errors above form fields, sticky composer, a message field that grows with wrapped text at 22 px in full and 390 px windows and shrinks back, 44 px mobile controls |
 | Slash commands | Model/effort/runtime, account-add routing, multi-delete targets, boolean flags, unknown workspace safety |
 | Messages | Streaming, question/permission responses, revision checks, queued message take-back |
 | Jobs | Launch, live output and cancellation |
@@ -75,11 +75,13 @@ build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](des
 | Speech | A selected message reaches a real speaker process using a silent custom command engine |
 | CLI forms | Invalid-argument preflight keeps input, leading-dash values, subprocess arguments, remote workspace defaults |
 | Terminals | Native keyboard input, attach, login fixture, reload restoration, completed sessions do not consume active limit |
+| Loops | Review and implementation loops with a fake reviewer (`scripts/loops-integration.mjs`); on a dial-in runner box on the same machine: the card's warnings naming the box, a reviewer account the box does not use, the runner stopped during a review run (the wait said once, shown after a reload and a reconnect) and started again, an implementation loop that commits, no start while the box is away; an ACP preset as the reviewer (the scripted ACP agent of the hub's tests): the pickers, the card's warning, a loop to its end, the preset removed |
 
 ## Verification limits
 
-Real Anthropic/OpenAI/Grok authentication and paid turns, live SSH/container/dial-in hosts,
-and audible platform speech have not been tested end to end in this pass. Their existing
+Real Anthropic/OpenAI/Grok authentication and paid turns, live SSH/container/dial-in hosts on
+other machines, and audible platform speech have not been tested end to end in this pass
+(loops run through the app on a dial-in runner on the same machine, above). Their existing
 CLI implementations are bundled and reachable; the above fixtures validate the desktop
 bridge and UI rather than those external services. An installed Ubuntu 22.04 Debian package passed every CLI form workflow of the integration
 suite with the default Chromium sandbox enabled. Its native terminal module was built against
@@ -120,3 +122,8 @@ attachments, with friendly PNG copies when the local export succeeds.
 validated IPC. `node scripts/omarchy-qa.mjs`, run inside a Hyprland session, checks
 actual theme-file changes, text contrast and native Linux window colors. These are
 focused local checks in addition to the packaged functional suites.
+`tests/omarchy-contrast.test.ts` (part of `npm test`) runs on any machine: it resolves
+`style.css` with the palette the app derives for each stock Omarchy theme (their colours
+are fixtures in `tests/omarchy-themes.ts`, from Omarchy v4.5.0) and for broken themes, and
+checks every text, fill, selection, field-edge, focus-ring and thread-name pair the app
+draws.

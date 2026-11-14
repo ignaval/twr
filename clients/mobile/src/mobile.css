@@ -888,11 +888,14 @@ select {
   .topbar {
   display: none;
 }
+/* The message grows with its text (Composer.tsx, fitToText) to four lines, or three on a
+ * very short screen, and never past 40% of the height the keyboard leaves, so the
+ * composer's controls stay on screen above it. Past that, the text scrolls inside. */
 [data-mobile="true"] .composer > textarea {
-  max-height: min(40dvh, calc(4lh + 20px));
+  max-height: min(calc(var(--viewport-height, 100dvh) * 0.4), calc(4lh + 20px));
 }
 :root[data-mobile="true"].tiny-content .composer > textarea {
-  max-height: min(40dvh, calc(3lh + 20px));
+  max-height: min(calc(var(--viewport-height, 100dvh) * 0.4), calc(3lh + 20px));
 }
 
 /* Disclosure rows (a loop round's findings, the loop folder, Latest thread reports, Full
@@ -901,6 +904,15 @@ select {
   min-height: 44px;
   padding-block: max(0px, calc((44px - 1.5em) / 2));
   line-height: 1.5;
+}
+/* A loop's rounds: a plain round's row as tall as a disclosure row (44 points), so a round
+ * that fails or answers moves nothing below it. */
+[data-mobile="true"] .loop-rounds > li {
+  min-height: 44px;
+  padding-block: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
 /* A model picker's switch back to its list. */
 [data-mobile="true"] .input-with-button > button {

@@ -65,8 +65,10 @@ const AGENTS: &str = r#"[{"runtime": "codex", "found": true, "login": "logged_in
 /// none after, to its `-o` file; with `hold.<n>` it waits until the file goes.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 here=$(dirname "$0")
+until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
+rmdir "$here/count.lock"
 cat > /dev/null
 while [ -f "$here/hold.$n" ]; do sleep 0.05; done
 out=""; prev=""
@@ -454,8 +456,10 @@ fn a_review_loop_from_the_command_line() {
 /// findings.
 const CRASH_CODEX: &str = r#"#!/bin/sh
 here=$(dirname "$0")
+until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
+rmdir "$here/count.lock"
 cat > /dev/null
 out=""; prev=""
 for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done

@@ -752,6 +752,25 @@ async fn every_mode_report_is_checked() {
     }
 }
 
+/// codex-acp 2.6.0's modes (`read-only`, `workspace-write`, `agent`, `agent-full-access`, as
+/// a real session reported them): its full-access mode is a bypass mode, never accepted for a
+/// thread that asked for no mode, and its workspace mode accepts edits; `read-only` is the
+/// restricted mode a loop's reviewer is held to.
+#[test]
+fn codex_acp_modes_are_known() {
+    use twr_adapters::acp::translate::{mode_acceptable, mode_level, ModeLevel};
+    assert_eq!(mode_level("agent-full-access"), Some(ModeLevel::Bypass));
+    assert!(!mode_acceptable("agent-full-access", ""));
+    assert!(!mode_acceptable("agent-full-access", "acceptEdits"));
+    assert_eq!(mode_level("workspace-write"), Some(ModeLevel::AcceptEdits));
+    assert!(mode_acceptable("workspace-write", "acceptEdits"));
+    assert!(!mode_acceptable("workspace-write", "default"));
+    assert_eq!(mode_level("agent"), Some(ModeLevel::Auto));
+    assert!(!mode_acceptable("agent", "read-only"));
+    assert_eq!(mode_level("read-only"), Some(ModeLevel::Restricted));
+    assert!(mode_acceptable("read-only", "acceptEdits"));
+}
+
 /// A mode id twr does not know is accepted only when it is exactly the requested one;
 /// otherwise the session is switched (to the requested mode, or a known restricted one) or
 /// fails.

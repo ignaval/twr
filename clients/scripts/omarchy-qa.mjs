@@ -150,6 +150,14 @@ const readUI = () =>
       "faint",
       "accent",
       "accent-fg",
+      "raised",
+      "hover",
+      "warning",
+      "danger",
+      "danger-fg",
+      "success",
+      "loop",
+      "field-border",
     ]) {
       probe.style.backgroundColor = `var(--${token})`;
       tokens[token] = hex(getComputedStyle(probe).backgroundColor);
@@ -184,13 +192,31 @@ const readability = (ui) => {
   for (const surface of [
     "background",
     "panel",
+    "raised",
     "overlay",
+    "hover",
     "active",
     "bubble",
   ]) {
     const background =
       surface === "background" ? ui.background : ui.tokens[surface];
-    for (const text of ["text", "muted", "faint"]) {
+    // A field's edge reads at 3:1 on what is around it (shared/omarchy.ts).
+    const edge = contrast(ui.tokens["field-border"], background);
+    values[`field-border/${surface}`] = Math.round(edge * 100) / 100;
+    assert(
+      edge >= 3,
+      `${ui.scheme} field edge on ${surface} contrast ${edge.toFixed(2)} is below 3:1`,
+    );
+    for (const text of [
+      "text",
+      "muted",
+      "faint",
+      "accent",
+      "warning",
+      "danger",
+      "success",
+      "loop",
+    ]) {
       const foreground = text === "text" ? ui.text : ui.tokens[text];
       const ratio = contrast(foreground, background);
       values[`${text}/${surface}`] = Math.round(ratio * 100) / 100;
@@ -205,6 +231,12 @@ const readability = (ui) => {
   assert(
     values.primary >= 4.5,
     `${ui.scheme} primary-button contrast is below 4.5:1`,
+  );
+  values.danger =
+    Math.round(contrast(ui.tokens["danger-fg"], ui.tokens.danger) * 100) / 100;
+  assert(
+    values.danger >= 4.5,
+    `${ui.scheme} danger-button contrast is below 4.5:1`,
   );
   return values;
 };

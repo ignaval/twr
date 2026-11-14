@@ -283,6 +283,12 @@ impl Core {
             }
             self.append_batch(hub, batch)?;
         }
+        // A remote box's copy of the loop folder gets what the next step reads (the plan an
+        // implement turn reads, the ledger a sweep reads), issued on the box's connection
+        // ahead of the step's prompt, and the report of a loop that ended.
+        if staged.prompted || staged.ended {
+            self.sync_box_folder(hub, thread, true);
+        }
         // A review due, or a prompt queued: the loop's watch starts the one, the caller's
         // dispatch (or the watch) the other.
         if staged.kicks() {

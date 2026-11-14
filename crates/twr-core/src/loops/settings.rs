@@ -327,10 +327,11 @@ impl RuntimeAvailability {
     }
 }
 
-/// Why `runtime`, which is no built-in reviewer and no ACP preset, can't review.
+/// Why `runtime`, which is no built-in reviewer and no ACP preset, can't review: also what a
+/// saved setting naming a preset since removed from the config reads on its card.
 fn not_a_reviewer(runtime: &str) -> String {
     format!(
-        "{runtime} can't review ({} or an acp preset that names a read-only mode can)",
+        "{runtime} is no reviewer: neither a built-in one ({}) nor an acp preset in the config",
         REVIEWER_RUNTIMES.join(", ")
     )
 }
@@ -517,7 +518,9 @@ fn effort_problem(
     })
 }
 
-/// `account` on `runtime`, if twr knows the runtime's accounts and not this one.
+/// `account` on `runtime`, if twr knows the runtime's accounts and not this one. On a remote
+/// box every runtime runs on the box's own login (named accounts are not supported there):
+/// only its native account, the first the hub lists, holds, and the problem says why.
 fn account_problem(
     role: Role,
     runtime: &str,
@@ -525,6 +528,13 @@ fn account_problem(
     avail: &Availability,
 ) -> Option<Problem> {
     let r = avail.runtime(runtime)?;
+    if let Some(b) = &avail.box_name {
+        return (r.accounts.first().map(String::as_str) != Some(account)).then(|| Problem {
+            role,
+            kind: ProblemKind::UnknownAccount,
+            message: format!("box {b} runs {runtime} on its own login, not account {account}"),
+        });
+    }
     (!r.accounts.is_empty() && !r.accounts.iter().any(|a| a == account)).then(|| Problem {
         role,
         kind: ProblemKind::UnknownAccount,
@@ -1268,6 +1278,25 @@ mod tests {
             kinds(&s, &a),
             [(Role::Reviewer, ProblemKind::UnknownAccount)]
         );
+        // On a remote box only the box's own login holds, and the card says why: with the
+        // account listed by the hub, and with none listed at all.
+        let mut on_box = a.clone();
+        on_box.box_name = Some("devbox".into());
+        on_box.runtimes[1].accounts = vec!["default".into()];
+        let v = validate(&s, &on_box, &c);
+        assert_eq!(
+            v[0].message,
+            "box devbox runs codex on its own login, not account team"
+        );
+        on_box.runtimes[1].accounts = vec![];
+        assert_eq!(
+            kinds(&s, &on_box),
+            [(Role::Reviewer, ProblemKind::UnknownAccount)]
+        );
+        s.reviewer.account = Some("default".into());
+        on_box.runtimes[1].accounts = vec!["default".into()];
+        assert_eq!(kinds(&s, &on_box), []);
+        s.reviewer.account = Some("team".into());
         let mut s = first();
         s.implementer = Some(ModelChoice::parse("codex/gpt-6.1-sol:high").unwrap());
         assert_eq!(
@@ -1409,7 +1438,11 @@ mod tests {
             a.reviews("bare").unwrap_err(),
             "acp preset bare names no read-only mode"
         );
-        assert!(a.reviews("nope").unwrap_err().contains("can't review"));
+        assert_eq!(
+            a.reviews("nope").unwrap_err(),
+            "nope is no reviewer: neither a built-in one (claude-code, codex, grok-build) nor \
+             an acp preset in the config"
+        );
         let mut s = first();
         s.reviewer = ReviewerChoice::parse("ex/m-large").unwrap();
         assert_eq!(validate(&s, &a, &c), vec![]);
@@ -1461,6 +1494,20 @@ mod tests {
             p.warnings[0],
             "acp preset bare names no read-only mode: reviewing with claude-code · \
              claude-opus-5-5 instead"
+        );
+        // The saved reviewer's preset removed from the config: the card says it is no
+        // preset there any more, and moves it.
+        let mut removed = a.clone();
+        removed.runtimes.retain(|r| r.runtime != "ex");
+        let p = propose(&s, &removed, &c);
+        assert_eq!(
+            p.settings.reviewer.to_string(),
+            "claude-code/claude-opus-5-5"
+        );
+        assert_eq!(
+            p.warnings[0],
+            "ex is no reviewer: neither a built-in one (claude-code, codex, grok-build) nor an \
+             acp preset in the config: reviewing with claude-code · claude-opus-5-5 instead"
         );
         // Its agent not installed: the same replacement as a missing built-in reviewer.
         let mut gone = s.clone();

@@ -46,6 +46,7 @@ import {
   workspaceSchema,
 } from "./validation";
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
+import { parseOmarchyColors } from "../shared/omarchy";
 import { ENGINE_BINARIES, cleanupEngines, stageEngines } from "./engines";
 import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
@@ -442,20 +443,12 @@ function openNotices() {
 function omarchyTheme(): Record<string, string> | null {
   if (process.platform !== "linux") return null;
   try {
-    const text = readFileSync(
-      join(homedir(), ".config/omarchy/current/theme/colors.toml"),
-      "utf8",
+    return parseOmarchyColors(
+      readFileSync(
+        join(homedir(), ".config/omarchy/current/theme/colors.toml"),
+        "utf8",
+      ),
     );
-    const colors: Record<string, string> = {};
-    for (const line of text.split("\n")) {
-      const match = line.match(
-        /^\s*(background|foreground|accent|selection|selection_background|muted|dark_background|darker_background|lighter_background|red|green|yellow|blue|magenta|cyan|bright_(?:red|green|yellow|blue|magenta|cyan)|color[0-9]+)\s*=\s*["'](#[a-fA-F0-9]{6})["']/,
-      );
-      if (match) colors[match[1]] = match[2];
-    }
-    const mode = text.match(/^\s*mode\s*=\s*["'](light|dark)["']/m);
-    if (mode) colors.mode = mode[1];
-    return colors.background && colors.foreground ? colors : null;
   } catch {
     return null;
   }

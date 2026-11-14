@@ -563,6 +563,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(crate::color::LABEL))
         .title(" settings ")
         .title(crate::ui::close_title());
     let inner = block.inner(rect);

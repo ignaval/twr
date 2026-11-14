@@ -35,25 +35,26 @@ export const THREAD_COLORS = THREAD_PALETTE.map(cubeHex);
 /** WCAG's minimum for normal text, and the ink's target (a little over it, so a background
  * composited to 8 bits on screen cannot round it under). */
 export const MIN_CONTRAST = 4.5;
-const TARGET = 4.6;
+export const TARGET = 4.6;
 
 export type Theme = "light" | "dark";
 
-type RGB = [number, number, number];
+export type RGB = [number, number, number];
+
+/** The backgrounds a name can sit on: four surfaces, and the hover and selected overlays
+ * (a colour at an opacity; 1 for the opaque ones an Omarchy palette derives). */
+export interface Surfaces {
+  bg: string;
+  panel: string;
+  raised: string;
+  overlay: string;
+  hover: [RGB, number];
+  active: [RGB, number];
+}
 
 /** The theme tokens a name can sit on (style.css: `:root` and `:root[data-theme="light"]`;
  * a test keeps them equal). */
-export const SURFACES: Record<
-  Theme,
-  {
-    bg: string;
-    panel: string;
-    raised: string;
-    overlay: string;
-    hover: [RGB, number];
-    active: [RGB, number];
-  }
-> = {
+export const SURFACES: Record<Theme, Surfaces> = {
   dark: {
     bg: "#0e1013",
     panel: "#13161a",
@@ -83,7 +84,7 @@ export function parseHex(value: string): RGB | undefined {
   const n = parseInt(m[1], 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
-function toHex(rgb: readonly number[]) {
+export function toHex(rgb: readonly number[]) {
   return (
     "#" +
     rgb
@@ -111,10 +112,14 @@ export function contrast(a: RGB, b: RGB) {
   return (high + 0.05) / (low + 0.05);
 }
 
-/** Every background a thread's name is drawn on in `theme`, for the thread coloured
- * `color`, named by where it is (for a failing test to say). */
-export function backgrounds(theme: Theme, color: RGB): [string, RGB][] {
-  const s = SURFACES[theme];
+/** Every background a thread's name is drawn on in `theme` (a built-in theme, or the
+ * surfaces of a palette taken from the desktop), for the thread coloured `color`, named by
+ * where it is (for a failing test to say). */
+export function backgrounds(
+  theme: Theme | Surfaces,
+  color: RGB,
+): [string, RGB][] {
+  const s = typeof theme === "string" ? SURFACES[theme] : theme;
   const out: [string, RGB][] = [];
   for (const base of ["bg", "panel", "raised", "overlay"] as const) {
     const plain = parseHex(s[base])!;
@@ -178,37 +183,90 @@ function atLightness(L: number, a: number, b: number): RGB {
   ) as RGB;
 }
 
-const worst = (ink: RGB, against: [string, RGB][]) =>
-  Math.min(...against.map(([, bg]) => contrast(ink, bg)));
+/** The lowest contrast a colour of luminance `ink` has on any of `against`. */
+function worstOf(ink: number, against: readonly number[]) {
+  let low = Infinity;
+  for (const bg of against)
+    low = Math.min(
+      low,
+      (Math.max(ink, bg) + 0.05) / (Math.min(ink, bg) + 0.05),
+    );
+  return low;
+}
+
+const WHITE: RGB = [255, 255, 255];
+const BLACK: RGB = [0, 0, 0];
+
+/** `color` as it must be drawn to read at `target`:1 on every one of `against`: `color`
+ * itself when it already does, else the nearest colour of the same hue (OKLab hue, as much
+ * of its chroma as sRGB holds) whose lightness reaches it. `direction` fixes the way the
+ * lightness may move (1 lighter, -1 darker); without it the smaller move wins. When no
+ * lightness reaches the target, the black or white that comes closest. A colour that
+ * already reads at `keep`:1 (the target unless given) is kept as it is. */
+export function readableOn(
+  color: RGB,
+  against: readonly RGB[],
+  target: number,
+  direction?: 1 | -1,
+  keep = target,
+): RGB {
+  const lums = against.map(luminance);
+  const worst = (c: RGB) => worstOf(luminance(c), lums);
+  if (worst(color) >= keep) return color;
+  const [L, a, b] = toOklab(color);
+  let best: { ink: RGB; move: number } | undefined;
+  for (const sign of direction ? [direction] : ([1, -1] as const)) {
+    let found = false;
+    for (let l = L + sign * 0.002; l > 0 && l < 1; l += sign * 0.002) {
+      const ink = atLightness(l, a, b);
+      if (worst(ink) >= target) {
+        const move = Math.abs(l - L);
+        if (!best || move < best.move) best = { ink, move };
+        found = true;
+        break;
+      }
+    }
+    const end = sign > 0 ? WHITE : BLACK;
+    if (!found && !best && worst(end) >= target) best = { ink: end, move: 1 };
+  }
+  if (best) return best.ink;
+  return worst(WHITE) >= worst(BLACK) ? WHITE : BLACK;
+}
 
 const cache = new Map<string, string>();
-/** The colour `color` (`#rrggbb`) is written in as text in `theme`: `color` itself when it
- * already reads at 4.5:1 on every background a name sits on there, else the nearest colour
- * of the same hue (darker in the light theme, lighter in the dark one) that does. */
-export function threadInk(color: string, theme: Theme): string {
-  const key = theme + color.toLowerCase();
+/** The colour `color` (`#rrggbb`) is written in as text in `theme` (a built-in theme, or a
+ * palette's surfaces): `color` itself when it already reads at 4.5:1 on every background a
+ * name sits on there, else the nearest colour of the same hue that does (darker in the
+ * light theme, lighter in the dark one; on other surfaces, the smaller move). */
+export function threadInk(color: string, theme: Theme | Surfaces): string {
+  const key =
+    (typeof theme === "string" ? theme : JSON.stringify(theme)) +
+    color.toLowerCase();
   const hit = cache.get(key);
   if (hit) return hit;
   const rgb = parseHex(color);
   if (!rgb) return color;
-  const against = backgrounds(theme, rgb);
-  let ink = rgb;
-  if (worst(rgb, against) < TARGET) {
-    const [L, a, b] = toOklab(rgb);
-    const step = theme === "light" ? -0.002 : 0.002;
-    for (let l = L + step; l > 0 && l < 1; l += step) {
-      ink = atLightness(l, a, b);
-      if (worst(ink, against) >= TARGET) break;
-    }
-  }
-  const out = toHex(ink);
+  const against = backgrounds(theme, rgb).map(([, bg]) => bg);
+  const direction = theme === "light" ? -1 : theme === "dark" ? 1 : undefined;
+  const out = toHex(readableOn(rgb, against, TARGET, direction));
+  if (cache.size > 2000) cache.clear();
   cache.set(key, out);
   return out;
 }
 
+/** The root custom property an Omarchy palette sets for the ink of thread colour `color`
+ * (shared/omarchy.ts), as a `var()` that falls back to the palette's text. */
+export function omarchyInkVar(color: string) {
+  return `var(--omarchy-ink-${color.slice(1).toLowerCase()}, var(--text))`;
+}
+
 /** The lowest contrast `ink` has on the backgrounds a name sits on in `theme` for a thread
  * coloured `color`, and which background that is. */
-export function lowestContrast(ink: string, color: string, theme: Theme) {
+export function lowestContrast(
+  ink: string,
+  color: string,
+  theme: Theme | Surfaces,
+) {
   const against = backgrounds(theme, parseHex(color)!);
   let low: { ratio: number; on: string } = { ratio: Infinity, on: "" };
   for (const [on, bg] of against) {
@@ -218,8 +276,9 @@ export function lowestContrast(ink: string, color: string, theme: Theme) {
   return low;
 }
 
-/** The custom properties an element drawn in a thread's colour carries: the colour, and the
- * ink of each theme for its name (`.thread-ink`). No colour (an old cached row): none. */
+/** The custom properties an element drawn in a thread's colour carries: the colour, the
+ * ink of each built-in theme for its name, and the Omarchy palette's ink (set on the root
+ * by the palette, `.thread-ink`). No colour (an old cached row): none. */
 export function threadStyle(
   color: string | undefined,
   prefix = "thread",
@@ -229,5 +288,6 @@ export function threadStyle(
     [`--${prefix}-color`]: color,
     [`--${prefix}-ink-light`]: threadInk(color, "light"),
     [`--${prefix}-ink-dark`]: threadInk(color, "dark"),
+    [`--${prefix}-ink-omarchy`]: omarchyInkVar(color),
   } as CSSProperties;
 }

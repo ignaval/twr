@@ -233,6 +233,7 @@ async fn save(hub: &Hub, settings: LoopSettings) -> Result<Value, twr_core::prot
         LoopSettingsSet {
             project: None,
             settings,
+            ..Default::default()
         },
         &user(),
     )
@@ -439,6 +440,8 @@ impl Adapter for Scripted {
 async fn an_acp_reviewer_runs_a_whole_loop() {
     let env = Env::new();
     env.reply(1, &reply_with(2));
+    // The first run's agent runs a command unasked, announced as claude-agent-acp does it.
+    std::fs::write(env.state().join("tool.1"), "git log --oneline").unwrap();
     let hub = env.hub().await;
     // `loop.settings.get` lists the presets: those that review with their mode, the others
     // with why not.
@@ -515,9 +518,11 @@ async fn an_acp_reviewer_runs_a_whole_loop() {
     assert_eq!(f[0].findings.len(), 2);
     assert_eq!(f[0].findings[0].id, "m1.1");
     assert_eq!(f[0].findings[1].location, "src/lib.rs:2");
+    // The input counts the cached part (ACP's `inputTokens` leaves it out, as the real
+    // adapters report it), and the cost is what the session's `usage_update` rose by.
     assert_eq!(
-        f[0].usage.as_ref().map(|u| (u.input, u.output)),
-        Some((100, 10))
+        f[0].usage.as_ref().map(|u| (u.input, u.output, u.cost)),
+        Some((6000, 10, Some(0.25)))
     );
     assert!(f[1].findings.is_empty() && !f[1].failed);
     // The triage got the findings as data.
@@ -585,12 +590,23 @@ async fn an_acp_reviewer_runs_a_whole_loop() {
     let log = std::fs::read_to_string(g["rounds"][0]["files"]["log"].as_str().unwrap()).unwrap();
     assert!(log.contains("twr: acp reviewer ex"), "{log}");
     assert!(log.contains("in mode read-only"), "{log}");
+    // What the agent reported of its session, for people: its modes, model and effort.
+    assert!(log.contains("twr: the agent reported {"), "{log}");
+    assert!(
+        log.contains(r#""available_modes":["default","read-only"]"#),
+        "{log}"
+    );
+    assert!(log.contains(r#""effort":"medium""#), "{log}");
     assert!(log.contains("agent: I read the diff"), "{log}");
+    // A tool announced bare is logged with the command its update named, and what it gave.
+    assert!(log.contains("tool: execute Terminal"), "{log}");
+    assert!(
+        log.contains(r#"tool done: {"command":"git log --oneline"} -> f81cb73 a"#),
+        "{log}"
+    );
     hub.shutdown().await;
 }
 
-/// A reply without a valid block is asked again once, in the same session; the second reply's
-/// block is the answer, and the run counts once.
 /// The sweep audited by runs on an ACP reviewer (`sweep = "runs"`): the audit run of each
 /// rule is one session of the preset's agent in its read-only mode, at the verification's
 /// effort, its answer read from the reply's last json block; its findings reach the thread's
@@ -627,7 +643,7 @@ async fn an_acp_reviewer_audits_the_sweeps_rules() {
         })
         .unwrap();
     assert_eq!(a.findings[0].id, "s1.1");
-    assert_eq!(a.usage.as_ref().map(|u| u.input), Some(100));
+    assert_eq!(a.usage.as_ref().map(|u| u.input), Some(6000));
     assert!(evs.iter().any(|e| matches!(&e.body,
         EventBody::LoopAuditStarted(s) if s.effort == "xhigh")));
     let g = get(&hub, &t);
@@ -645,6 +661,8 @@ async fn an_acp_reviewer_audits_the_sweeps_rules() {
     hub.shutdown().await;
 }
 
+/// A reply without a valid block is asked again once, in the same session; the second reply's
+/// block is the answer, and the run counts once.
 #[tokio::test]
 async fn a_reply_without_a_block_is_asked_again_once() {
     let env = Env::new();
@@ -731,6 +749,48 @@ async fn a_permission_request_during_a_review_is_refused_and_logged() {
     hub.shutdown().await;
 }
 
+/// A reviewer whose read-only mode did not keep it out of the files: the working tree changed
+/// during the run, so the run failed whatever it answered (its findings are not used), the
+/// change stays where it is, and the round's log says so; the retry changed it again, and the
+/// loop is stuck.
+#[tokio::test]
+async fn a_review_run_that_changes_the_working_tree_fails() {
+    let env = Env::new();
+    std::fs::write(env.state().join("write.1"), "one").unwrap();
+    std::fs::write(env.state().join("write.2"), "two").unwrap();
+    env.reply(1, &reply_with(1));
+    let hub = env.hub().await;
+    let t = looping(&env, &hub, "api", settings("low", "ex/m-large")).await;
+    until(&hub, "stuck", |h| {
+        running(h, &t).is_some_and(|l| l.stuck.is_some())
+    })
+    .await;
+    let stuck = running(&hub, &t).unwrap().stuck.unwrap();
+    assert!(
+        stuck.contains(
+            "the working tree changed during the review run (REVIEWED.md): acp preset ex's \
+             \"read-only\" mode may not have kept it read-only (twr can't tell who wrote \
+             there)"
+        ),
+        "{stuck}"
+    );
+    let f = findings_events(&hub, &t);
+    assert_eq!(f.len(), 2);
+    assert!(f.iter().all(|f| f.failed && f.findings.is_empty()), "{f:?}");
+    let wt = hub.thread_view(&t).unwrap().worktree.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&wt).join("REVIEWED.md")).unwrap(),
+        "two"
+    );
+    let g = get(&hub, &t);
+    let log = std::fs::read_to_string(g["rounds"][0]["files"]["log"].as_str().unwrap()).unwrap();
+    assert!(
+        log.contains("twr: the working tree changed during the review run (REVIEWED.md)"),
+        "{log}"
+    );
+    hub.shutdown().await;
+}
+
 /// An agent that reports no permission mode can't be held to its read-only mode: the session
 /// is refused before any prompt, a failed run, retried, then stuck.
 #[tokio::test]
@@ -770,6 +830,27 @@ async fn stopping_the_loop_kills_its_acp_reviewer() {
     .await
     .expect("the held agent's pids");
     assert!(alive(pids.0) && alive(pids.1));
+    // The card's activity names the preset with its model: an ACP agent's model ids are
+    // its own, and do not say who reviews.
+    until(&hub, "the review task", |h| {
+        h.thread_view(&t)
+            .is_ok_and(|v| !v.background_tasks.is_empty())
+    })
+    .await;
+    let j = hub.get_thread(&t).unwrap();
+    let task = j["background_tasks"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert!(
+        task["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("reviewer ex m-large medium · 0m"),
+        "{task}"
+    );
     hub.loop_control(
         twr_hub::hub::LoopControlParams {
             thread: t.clone(),
@@ -788,6 +869,21 @@ async fn stopping_the_loop_kills_its_acp_reviewer() {
     let last = ended(&hub, &t).await;
     assert_eq!(last.outcome, twr_core::loops::Outcome::Stopped);
     assert!(findings_events(&hub, &t).iter().all(|f| !f.failed));
+    // The round's log says the run was cancelled, and why.
+    let g = get(&hub, &t);
+    let log_file = g["rounds"][0]["files"]["log"].as_str().unwrap().to_string();
+    let log = timeout(WAIT, async {
+        loop {
+            let log = std::fs::read_to_string(&log_file).unwrap_or_default();
+            if log.contains("twr: the run was cancelled: ") {
+                return log;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the cancel in the round's log");
+    assert!(!log.contains("the run failed"), "{log}");
     let _ = std::fs::remove_file(env.state().join("hold.1"));
     hub.shutdown().await;
 }

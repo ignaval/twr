@@ -220,8 +220,10 @@ impl Env {
 const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
 while ! mkdir "$here/lock" 2>/dev/null; do sleep 0.01; done
+until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
+rmdir "$here/count.lock"
 rmdir "$here/lock"
 : > "$here/argv.$n"
 for a in "$@"; do printf '%s\n' "$a" >> "$here/argv.$n"; done
@@ -487,6 +489,7 @@ async fn looping(env: &Env, hub: &Hub, name: &str, settings: LoopSettings) -> St
         LoopSettingsSet {
             project: None,
             settings,
+            ..Default::default()
         },
         &user(),
     )

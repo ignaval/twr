@@ -177,8 +177,10 @@ impl Env {
 /// answers no findings.
 const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
+until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
+rmdir "$here/count.lock"
 cat > /dev/null 2>/dev/null
 if [ -f "$here/fail.$n" ]; then echo "boom: run $n failed" >&2; exit 3; fi
 ans="$here/answers/none.json"
@@ -400,6 +402,7 @@ async fn save(hub: &Hub, project: Option<&str>, settings: LoopSettings) {
         LoopSettingsSet {
             project: project.map(str::to_string),
             settings,
+            ..Default::default()
         },
         &user(),
     )
@@ -753,6 +756,7 @@ async fn the_card_the_settings_and_the_other_controls_stay_the_users() {
                 LoopSettingsSet {
                     project: None,
                     settings: settings("low", "codex/gpt-6.1-sol"),
+                    ..Default::default()
                 },
                 &orch()
             )

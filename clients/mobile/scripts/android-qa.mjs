@@ -28,6 +28,7 @@ import {
   loopFixture,
   loopQA,
   loopReadOnlyQA,
+  remoteLoopQA,
   surfacesQA,
 } from "./loop-qa.mjs";
 // TWR_SURFACES_QA_ONLY=1 skips the review-loop QA and runs only the shared surfaces' audit.
@@ -215,7 +216,65 @@ function loopDriver() {
       if (on) for (const socket of proxySockets) socket.destroy();
     },
     owner: ownerCall,
+    // For loops on a remote box and ACP reviewers (loop-qa.mjs `remoteLoopQA`): the hub's
+    // home, binaries and environment, and a restart on its config plus more.
+    home: fixture,
+    bin,
+    env,
+    restartHub: restartFixtureHub,
   };
+}
+let baseConfig;
+/** Restarts the fixture's hub on its first config plus `extra`; the app reconnects
+ * through the gateway, as after any hub restart. */
+async function restartFixtureHub(extra = "") {
+  baseConfig ??= readFileSync(join(fixture, "config.toml"), "utf8");
+  if (fixtureHub.exitCode === null && fixtureHub.signalCode === null) {
+    const stopped = new Promise((resolve) => fixtureHub.once("exit", resolve));
+    fixtureHub.kill("SIGTERM");
+    await stopped;
+  }
+  writeFileSync(join(fixture, "config.toml"), baseConfig + extra, {
+    mode: 0o600,
+  });
+  const oldPid = hubPid;
+  fixtureHub = spawn(join(bin, "twr"), ["hub"], {
+    env,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  fixtureHub.stderr.on("data", (chunk) => (stderr += chunk));
+  await expect
+    .poll(
+      () => {
+        try {
+          return JSON.parse(
+            execFileSync(join(bin, "twr"), ["info", "--json"], {
+              env,
+              encoding: "utf8",
+              timeout: 5000,
+            }),
+          ).pid;
+        } catch {
+          return oldPid;
+        }
+      },
+      { timeout: 30000 },
+    )
+    .toBe(fixtureHub.pid);
+  hubPid = fixtureHub.pid;
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async () => {
+          try {
+            return (await window.twr.rpc("hub.info")).pid;
+          } catch {
+            return 0;
+          }
+        }),
+      { timeout: 60000 },
+    )
+    .toBe(hubPid);
 }
 async function ownerCall(method, params) {
   const child = spawn(join(bin, "twr-desktop-bridge"), ["default"], {
@@ -1832,6 +1891,18 @@ try {
         );
         console.log("PASS: review loops on an Android phone");
         loops.releaseAll();
+        // Loops on a remote box, and an ACP preset as the reviewer.
+        const remote = await remoteLoopQA(loopDriver(), loops, {
+          shots: loopShots,
+          label: "android",
+        });
+        writeFileSync(
+          join(loopShots, "android-remote-loop-qa.json"),
+          JSON.stringify(remote, null, 2),
+        );
+        console.log(
+          "PASS: loops on a remote box and ACP reviewers on an Android phone",
+        );
       }
       // The cards, a thread's details, the conversation's header and the composer.
       await surfacesQA(loopDriver(), loops, {

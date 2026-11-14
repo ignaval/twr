@@ -757,6 +757,259 @@ try {
   console.log(
     "Small-model disclosure, provider stub, placeholder suggestion, Tab and → acceptance and explicit send boundary passed",
   );
+  // The message field grows with its text, wrapped lines included, at the largest text
+  // size, in a full window and a phone-width one: up to its cap, then it scrolls inside;
+  // it shrinks again when the text goes, and Send, the microphone and Upload stay on
+  // screen.
+  await page
+    .getByRole("button", { name: "Settings", exact: true })
+    .first()
+    .click();
+  const interfaceText = page.getByRole("slider", { name: "Interface text" });
+  await interfaceText.fill("22");
+  await page.waitForFunction(
+    () =>
+      getComputedStyle(document.documentElement)
+        .getPropertyValue("--text-size")
+        .trim() === "22px",
+  );
+  await page
+    .locator(".thread-list .thread-card")
+    .filter({ hasText: "api" })
+    .click();
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  await suggestedComposer.waitFor();
+  const composerBox = () =>
+    page.evaluate(() => {
+      const field = document.querySelector(".composer textarea");
+      const style = getComputedStyle(field);
+      const controls = [
+        ...document.querySelectorAll(
+          ".composer-bottom button, .composer-bottom label",
+        ),
+      ].map((e) => e.getBoundingClientRect());
+      return {
+        height: field.getBoundingClientRect().height,
+        cap: parseFloat(style.maxHeight),
+        lineHeight: parseFloat(style.lineHeight),
+        hidden: field.scrollHeight - field.clientHeight,
+        controls: controls.length,
+        controlsBottom: Math.max(...controls.map((r) => r.bottom)),
+        controlsRight: Math.max(...controls.map((r) => r.right)),
+        width: innerWidth,
+        viewport: innerHeight,
+      };
+    });
+  const grown = [];
+  for (const size of [null, { width: 390, height: 844 }]) {
+    if (size) await page.setViewportSize(size);
+    await page.waitForTimeout(300);
+    await suggestedComposer.fill("");
+    const empty = await composerBox();
+    const words =
+      "Keep every option labelled and in the same order for the keyboard as on screen. ";
+    // As much text as first makes the field taller: how many words that takes depends on
+    // the window's width and the platform's font.
+    let some = empty;
+    for (let n = 1; n <= 12; n += 1) {
+      await suggestedComposer.fill(words.repeat(n));
+      some = await composerBox();
+      if (some.height > empty.height + some.lineHeight / 2) break;
+    }
+    await suggestedComposer.fill(words.repeat(12));
+    const long = await composerBox();
+    await suggestedComposer.fill("");
+    const cleared = await composerBox();
+    grown.push({ width: long.width, empty, some, long, cleared });
+    const where = `${long.width}-wide window at 22 px`;
+    assert(
+      some.height > empty.height + some.lineHeight / 2 && some.hidden <= 1,
+      `${where}: a wrapped message must make the field taller and show all of it: ${JSON.stringify(some)}`,
+    );
+    assert(
+      Math.abs(long.height - long.cap) <= 1 && long.hidden > 0,
+      `${where}: a long message grows the field to its cap, then scrolls inside: ${JSON.stringify(long)}`,
+    );
+    assert(
+      Math.abs(cleared.height - empty.height) <= 1,
+      `${where}: the field shrinks back when the text goes: ${JSON.stringify(cleared)}`,
+    );
+    for (const box of [some, long])
+      assert(
+        box.controls >= 3 &&
+          box.controlsBottom <= box.viewport + 1 &&
+          box.controlsRight <= box.width + 1,
+        `${where}: Send, the microphone and Upload stay on screen: ${JSON.stringify(box)}`,
+      );
+  }
+  await page.setViewportSize(fullViewport);
+  const sidebarBack = page.getByRole("button", {
+    name: "Show sidebar",
+    exact: true,
+  });
+  if (await sidebarBack.isVisible()) await sidebarBack.click();
+  await page
+    .getByRole("button", { name: "Settings", exact: true })
+    .first()
+    .click();
+  await interfaceText.fill("13");
+  await page
+    .locator(".thread-list .thread-card")
+    .filter({ hasText: "api" })
+    .click();
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  await suggestedComposer.waitFor();
+  console.log(
+    "PASS: the message field grows with wrapped text at 22 px, to its cap, and shrinks back, in full and phone-width windows",
+    JSON.stringify(
+      grown.map((g) => ({
+        width: g.width,
+        empty: g.empty.height,
+        two: g.some.height,
+        long: g.long.height,
+        cleared: g.cleared.height,
+      })),
+    ),
+  );
+  // An Omarchy theme whose own colours fail 4.5:1 (Nord: its red is 2.1:1 on the selected
+  // row), as the renderer draws it: the page's computed colours, the browser's own colour
+  // mixing included. The app runs on macOS here, so the page is told it is on Linux for
+  // the check and the theme comes as the main process sends it (shared/omarchy.ts).
+  if (application.evaluate) {
+    const nord = {
+      mode: "dark",
+      background: "#2e3440",
+      foreground: "#d8dee9",
+      accent: "#81a1c1",
+      selection: "#434c5e",
+      red: "#bf616a",
+      yellow: "#ebcb8b",
+    };
+    const was = await page.evaluate(() => ({
+      platform: document.documentElement.dataset.platform,
+      theme: document.documentElement.dataset.theme,
+    }));
+    await page.evaluate(() => {
+      document.documentElement.dataset.platform = "linux";
+      document.documentElement.dataset.theme = "system";
+    });
+    const sendTheme = (theme) =>
+      application.evaluate(
+        ({ BrowserWindow }, theme) =>
+          BrowserWindow.getAllWindows()[0].webContents.send("twr:event", {
+            type: "theme",
+            theme,
+          }),
+        theme,
+      );
+    await sendTheme(nord);
+    await page.waitForFunction(
+      () => document.documentElement.dataset.omarchy === "true",
+    );
+    const drawn = await page.evaluate(() => {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 1;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      // The colour on screen of `layers` painted one over the other.
+      const rgb = (...layers) => {
+        context.clearRect(0, 0, 1, 1);
+        for (const layer of layers) {
+          context.fillStyle = layer;
+          context.fillRect(0, 0, 1, 1);
+        }
+        return [...context.getImageData(0, 0, 1, 1).data].slice(0, 3);
+      };
+      const lum = (c) =>
+        c
+          .map((v) => v / 255)
+          .map((v) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4))
+          .reduce((t, v, i) => t + v * [0.2126, 0.7152, 0.0722][i], 0);
+      const ratio = (a, ...b) => {
+        const [x, y] = [lum(rgb(a)), lum(rgb(...b))].sort((p, q) => q - p);
+        return Math.round(((x + 0.05) / (y + 0.05)) * 100) / 100;
+      };
+      const probe = document.createElement("div");
+      document.body.append(probe);
+      const token = (name) => {
+        probe.style.color = `var(--${name})`;
+        return getComputedStyle(probe).color;
+      };
+      const pairs = {};
+      for (const fg of [
+        "text",
+        "muted",
+        "faint",
+        "accent",
+        "warning",
+        "danger",
+        "success",
+        "loop",
+      ])
+        for (const bg of [
+          "bg",
+          "panel",
+          "raised",
+          "overlay",
+          "hover",
+          "active",
+          "danger-soft",
+          "warning-soft",
+        ])
+          pairs[`${fg} on ${bg}`] = ratio(token(fg), token(bg));
+      pairs["accent-fg on accent"] = ratio(token("accent-fg"), token("accent"));
+      pairs["danger-fg on danger"] = ratio(token("danger-fg"), token("danger"));
+      const input = document.createElement("input");
+      document.body.append(input);
+      const edge = ratio(getComputedStyle(input).borderTopColor, token("bg"));
+      input.remove();
+      probe.remove();
+      // The "To:" chip's thread name, in its colour's ink, on the chip's tint of that
+      // colour over the composer.
+      const name = document.querySelector(".destination-chip b");
+      return {
+        pairs,
+        edge,
+        background: getComputedStyle(document.documentElement).backgroundColor,
+        name: ratio(
+          getComputedStyle(name).color,
+          getComputedStyle(document.querySelector(".composer")).backgroundColor,
+          getComputedStyle(name.closest(".destination-chip")).backgroundColor,
+        ),
+      };
+    });
+    const low = Object.entries(drawn.pairs).filter(([, r]) => r < 4.5);
+    assert.deepEqual(
+      low,
+      [],
+      `Nord's text in the app must read at 4.5:1: ${JSON.stringify(low)}`,
+    );
+    assert(
+      drawn.edge >= 3,
+      `Nord's field edges must read at 3:1: ${drawn.edge}`,
+    );
+    assert(
+      drawn.name >= 4.5,
+      `A thread's name must read at 4.5:1 on Nord: ${drawn.name}`,
+    );
+    assert.equal(
+      drawn.background,
+      "rgb(46, 52, 64)",
+      "Nord's own background is kept",
+    );
+    await sendTheme(null);
+    await page.evaluate((was) => {
+      document.documentElement.dataset.platform = was.platform;
+      document.documentElement.dataset.theme = was.theme;
+    }, was);
+    console.log(
+      "PASS: an Omarchy theme that fails 4.5:1 on its own (Nord) reads at 4.5:1 for text and 3:1 for field edges in the renderer",
+      JSON.stringify({
+        lowest: Math.min(...Object.values(drawn.pairs)),
+        edge: drawn.edge,
+        name: drawn.name,
+      }),
+    );
+  }
   // Real configuration CAS and validation, with an external edit between read and save.
   const config = await page.evaluate(() => window.twr.configRead());
   await page.evaluate(async (config) => {

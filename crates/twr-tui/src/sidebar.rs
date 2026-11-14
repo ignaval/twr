@@ -727,7 +727,7 @@ fn render_buttons(frame: &mut Frame, buttons: Rect, panes: &mut Panes, selected:
         let style = if selected == Some(&row) {
             crate::ui::selected_fill()
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(crate::color::LABEL)
         };
         let label = format!(" {text}");
         let pad = width.saturating_sub(crate::edit::width(&label));
@@ -802,9 +802,18 @@ fn card_rows(
     if let TabHub::Running { running, .. } = hub {
         let waiting = hub.waiting();
         if waiting > 0 {
+            // Waiting on you: the state's amber; a fill on the current card's reverse video;
+            // the selection's black on its yellow.
+            let waits = name_style.fg(crate::color::WAITING);
             badges.push(Span::styled(
                 format!(" ⚠{waiting}"),
-                name_style.fg(Color::Yellow),
+                if selected {
+                    name_style
+                } else if current {
+                    crate::ui::lit(waits)
+                } else {
+                    waits
+                },
             ));
         }
         if running > 0 {
@@ -1394,6 +1403,7 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(crate::color::LABEL))
         .title(" new workspace ")
         .title(crate::ui::close_title());
     let inner = block.inner(rect);

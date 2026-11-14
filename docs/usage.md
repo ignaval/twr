@@ -311,11 +311,12 @@ twr loop settings --edit                     # change the workspace's in your ed
 twr loop settings --edit --project api       # give api its own
 twr loop settings set --preset claude --profile medium   # change named settings, no editor
 twr loop settings set --sweep runs                       # the hub audits the sweep: one reviewer run per rule
+twr loop settings set --box gpu --reviewer codex/gpt-6.1-sol   # checked against box gpu's agents
 twr loop settings --reset --project api      # api uses the workspace's again
 twr loop settings --reset                    # forget every saved set: the next loop shows the card
 ```
 
-`--edit` opens the TOML document of the card's `2 change…` (without the card's own `save_for` and `scope`), on a private temporary copy: if saving fails, the copy is kept and its path printed. `set` takes `--profile`, `--implementer`, `--workers`, `--reviewer`, `--commit` (a review loop's), `--implementation-commit`, `--plan-check` (`profile` for the profile's) and `--preset` (`claude-codex`: Claude Code implements and Codex reviews, the default; `claude`, `codex`, `grok`: all on one runtime), and saves the others as they apply now. `--reset` asks y/N on a terminal; without one, pass `--yes`. Only you save settings, from a client of yours: the orchestrator and the threads' agents cannot, and `[loops]` in the config file only sets what the first card shows ([configuration.md](configuration.md#notes-on-some-keys)).
+`--edit` opens the TOML document of the card's `2 change…` (without the card's own `save_for` and `scope`), on a private temporary copy: if saving fails, the copy is kept and its path printed. `set` takes `--profile`, `--implementer`, `--workers`, `--reviewer`, `--commit` (a review loop's), `--implementation-commit`, `--plan-check` (`profile` for the profile's) and `--preset` (`claude-codex`: Claude Code implements and Codex reviews, the default; `claude`, `codex`, `grok`: all on one runtime), and saves the others as they apply now. `set` checks the settings against the agent CLIs of the hub's own machine, or of the project's box for `--project` with `[projects.<name>] box`; `--box <box>` checks them against that box's instead. So when your loops run on a box and the hub's machine lacks their reviewer, save them with `--box` (a loop always checks its thread's box, and brings the card back when they don't hold there). `--reset` asks y/N on a terminal; without one, pass `--yes`. Only you save settings, from a client of yours: the orchestrator and the threads' agents cannot, and `[loops]` in the config file only sets what the first card shows ([configuration.md](configuration.md#notes-on-some-keys)).
 
 ### Pause, stop, skip
 
@@ -323,7 +324,7 @@ twr loop settings --reset                    # forget every saved set: the next 
 
 A step that fails (a review run that fails twice, a turn that fails, a triage block refused twice) makes the loop stuck: it raises an item on the thread's card with **resume**, which asks for that step again, and **stop**. Only you answer it. A loop survives a hub restart and goes on where it was.
 
-`twr loop list` lists the running loops, `twr loop show <thread>` the thread's running loop, else its last: its settings and where they came from, each phase, each round with its findings and the thread's verdicts, the ledger, the transition, and how it ended. An implementation loop's adds its task and baseline, each plan (its revision, contract risk and path), each implement turn (its status and gates), the plan check's round `p1`, each commit check with its notes, and the commits and `not committed: …`. Pause, resume, stop and skip work on either kind; skip is refused before an implementation loop's ladder (nothing is built to verify yet).
+`twr loop list` lists the running loops, with what each waits on (`box gpu (away)` while its box is away), `twr loop show <thread>` the thread's running loop, else its last: its settings and where they came from, each phase, each round with its findings and the thread's verdicts, the ledger, the transition, and how it ended. An implementation loop's adds its task and baseline, each plan (its revision, contract risk and path), each implement turn (its status and gates), the plan check's round `p1`, each commit check with its notes, and the commits and `not committed: …`. Pause, resume, stop and skip work on either kind; skip is refused before an implementation loop's ladder (nothing is built to verify yet).
 
 ### Asking the orchestrator for a loop
 
@@ -346,16 +347,26 @@ The reviewer runs on the hub's machine as a program of yours, one headless call 
 An ACP agent can review too, when its `[runtimes.<name>]` preset has a `review` table naming the agent's read-only mode ([configuration.md](configuration.md#notes-on-some-keys)):
 
 ```toml
-[runtimes.example-agent]          # a fictional agent
-acp = "example-agent --acp"
-[runtimes.example-agent.review]
+[runtimes.codex-acp]              # Codex over ACP: @agentclientprotocol/codex-acp 2.6.0
+acp = "codex-acp"
+[runtimes.codex-acp.review]
 mode = "read-only"                # the agent's own read-only mode
-models = ["example-large"]
+models = ["gpt-6.1-sol"]
+efforts = ["low", "medium", "high", "xhigh", "max"]
+
+[runtimes.claude-acp]             # Claude Code over ACP: @agentclientprotocol/claude-agent-acp 0.107.0
+acp = "claude-agent-acp"
+[runtimes.claude-acp.review]
+mode = "plan"
+models = ["sonnet", "opus"]
+efforts = ["low", "medium", "high", "xhigh", "max"]
 ```
 
-Then `example-agent/example-large` is a reviewer like `codex/gpt-6.1-sol`: in `--reviewer`, the settings card and every settings editor, which list the presets that can review beside Claude Code, Codex and Grok Build, and show the others disabled with the reason (`acp preset bare names no read-only mode`). A card with an ACP reviewer always warns `acp reviewer: read-only rests on the agent's own "read-only" mode` (see [security-model.md](security-model.md#the-relay-rule)). An ACP agent whose program isn't on the hub's `PATH` is `not installed`, and the card moves the reviewer to the next built-in one, as it does for a missing CLI. The same-family warning uses the model's family when twr can tell it from the name, and says nothing otherwise.
+Both were verified with real loops (versions as above; [configuration.md](configuration.md#notes-on-some-keys) says how to install them and what each mode lets the agent do). Then `codex-acp/gpt-6.1-sol` is a reviewer like `codex/gpt-6.1-sol`: in `--reviewer`, the settings card and every settings editor, which list the presets that can review beside Claude Code, Codex and Grok Build, and show the others disabled with the reason (`acp preset bare names no read-only mode`). A card with an ACP reviewer always warns `acp reviewer: read-only rests on the agent's own "read-only" mode` (see [security-model.md](security-model.md#the-relay-rule)). An ACP agent whose program isn't on the hub's `PATH` is `not installed`, and the card moves the reviewer to the next built-in one, as it does for a missing CLI. The same-family warning uses the model's family when twr can tell it from the name, and says nothing otherwise.
 
-Each round starts the agent in the thread's worktree, opens one ACP session in that mode, on the round's model (and effort, when the preset lists `efforts`), and sends the round's prompt with one more paragraph: answer with the findings in one fenced `json` block. The hub reads the last such block of the reply, checked like any reviewer's answer. A reply without a valid block is asked once more in the same session; a second one is a failed run, which the loop retries once like any failed run. A session that doesn't report the read-only mode, or another read-only one twr knows, never gets the prompt: the run fails. Every permission request the agent makes during the run is refused and noted in the round's log (`round-<round>.log` in the loop folder), which also holds what the agent said and the tools it called. What it spent is what its ACP prompt results report, or nothing.
+Each round starts the agent in the thread's worktree, opens one ACP session in that mode, on the round's model (and effort, when the preset lists `efforts`), and sends the round's prompt with one more paragraph: answer with the findings in one fenced `json` block. The hub reads the last such block of the reply, checked like any reviewer's answer. A reply without a valid block is asked once more in the same session; a second one is a failed run, which the loop retries once like any failed run. A session that doesn't report the read-only mode, or another read-only one twr knows, never gets the prompt: the run fails. Every permission request the agent makes during the run is refused and noted in the round's log (`round-<round>.log` in the loop folder), which also holds what the agent's session reported (its version, modes, model and effort), what it said, and each tool it called with what the tool ran. What it spent is what its ACP prompt results report, cached input included, with the cost when the agent reports one (Claude's does, Codex's doesn't), or nothing.
+
+Read-only is the agent's mode, not twr's, and the two verified agents differ. Codex's `read-only` runs commands in Codex's read-only sandbox, where a write fails. Claude's `plan` runs shell commands it judges safe without asking, the repository's tests included, and anything your or the repository's Claude Code allow rules allow; it stays out of the files only because the model keeps to plan mode. So twr reads the thread's working tree (its `HEAD`, and every changed or untracked path) before and after each run. A run that changed it failed, whatever it answered: the round's log and the stuck item say `the working tree changed during the review run (<paths>): acp preset claude-acp's "plan" mode may not have kept it read-only (twr can't tell who wrote there), ...`. twr leaves the change where it is for you to look at. The check can't tell who made the change, so anything else that writes a file git doesn't ignore into the worktree during a review run (a job of the thread's, a watcher) fails the run too. The check sees the thread's repository only: Claude's plan mode, for one, writes its plan under `~/.claude/plans/`. For a reviewer with no shell at all, use the built-in `claude-code` or `codex` reviewer.
 
 ## Attach
 
@@ -517,7 +528,7 @@ total    5      1.2M  31k  $3.40
 5 turn(s) since 2026-10-04T12:00:00Z. IN counts cache reads and writes; ...
 ```
 
-This sums the tokens the threads' turns used, from the log (deleted threads included), and the cost where the runtime reports one. Claude Code reports a cost on every plan: the API price of the tokens, a measure of size rather than a bill on a subscription. Codex, Grok Build and ACP agents report none (`-`). `twr thread list`'s SPENT column and the TUI's grid tiles show each thread's total, and the orchestrator's `get_usage` ends with the five threads that spent most in the last 7 days. `--json` prints the `usage.threads` answer.
+This sums the tokens the threads' turns used, from the log (deleted threads included), and the cost where the runtime reports one. Claude Code reports a cost on every plan: the API price of the tokens, a measure of size rather than a bill on a subscription. Codex and Grok Build report none (`-`), and an ACP agent only when its session reports one (claude-agent-acp does: the API price of the tokens, as Claude Code's). `twr thread list`'s SPENT column and the TUI's grid tiles show each thread's total, and the orchestrator's `get_usage` ends with the five threads that spent most in the last 7 days. `--json` prints the `usage.threads` answer.
 
 ## Follow the log
 

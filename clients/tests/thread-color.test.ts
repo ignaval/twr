@@ -15,6 +15,7 @@ import {
   parseHex,
   threadInk,
   threadStyle,
+  type Surfaces,
   type Theme,
 } from "../shared/threadColor";
 
@@ -177,11 +178,69 @@ describe("thread colours", () => {
       }
   });
 
+  it("reads at 4.5:1 on any background, not only the built-in themes'", () => {
+    // Surfaces of every lightness, from near black to white, opaque hover and selection as
+    // an Omarchy palette derives them: each colour's ink reads on all of them, keeps its hue
+    // and is the colour itself where that already reads.
+    let seed = 7;
+    const random = () =>
+      ((seed = (seed * 16807) % 2147483647) / 2147483647) * 255;
+    const failures: string[] = [];
+    for (let n = 0; n < 40; n++) {
+      const bg = [random(), random(), random()].map(Math.round) as [
+        number,
+        number,
+        number,
+      ];
+      const text =
+        contrast(bg, [255, 255, 255]) > contrast(bg, [0, 0, 0])
+          ? [255, 255, 255]
+          : [0, 0, 0];
+      const surface = (share: number) =>
+        over(text as never, share, bg).map(Math.round) as [
+          number,
+          number,
+          number,
+        ];
+      const hex = (c: number[]) =>
+        "#" + c.map((v) => v.toString(16).padStart(2, "0")).join("");
+      const surfaces: Surfaces = {
+        bg: hex(bg),
+        panel: hex(surface(0.06)),
+        raised: hex(surface(0.11)),
+        overlay: hex(surface(0.08)),
+        hover: [surface(0.08), 1],
+        active: [surface(0.14), 1],
+      };
+      // A background no colour can reach 4.5:1 on (a mid grey) is the palette's to move.
+      if (Math.max(contrast(bg, [255, 255, 255]), contrast(bg, [0, 0, 0])) < 7)
+        continue;
+      for (const color of THREAD_COLORS) {
+        const ink = threadInk(color, surfaces);
+        const { ratio, on } = lowestContrast(ink, color, surfaces);
+        if (ratio < MIN_CONTRAST)
+          failures.push(
+            `${color} on ${surfaces.bg} ${on}: ${ratio.toFixed(2)}`,
+          );
+        if (lowestContrast(color, color, surfaces).ratio >= 4.6)
+          expect(ink).toBe(color);
+        const [before, after] = [hue(color), hue(ink)];
+        if (before.chroma >= 0.03 && hue(ink).chroma >= 0.03)
+          expect(
+            Math.abs(((after.angle - before.angle + 540) % 360) - 180),
+          ).toBeLessThan(8);
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+
   it("puts the colour and both inks on an element, and nothing for no colour", () => {
     expect(threadStyle("#ff87af")).toEqual({
       "--thread-color": "#ff87af",
       "--thread-ink-light": threadInk("#ff87af", "light"),
       "--thread-ink-dark": threadInk("#ff87af", "dark"),
+      // An Omarchy palette's ink for the colour, set on the root (shared/omarchy.ts).
+      "--thread-ink-omarchy": "var(--omarchy-ink-ff87af, var(--text))",
     });
     expect(threadStyle("")).toEqual({});
     expect(threadStyle(undefined)).toEqual({});

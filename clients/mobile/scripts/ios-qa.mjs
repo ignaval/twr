@@ -27,6 +27,7 @@ import {
   loopFixture,
   loopQA,
   loopReadOnlyQA,
+  remoteLoopQA,
   pairInApp,
   revokeInApp,
   surfacesQA,
@@ -409,14 +410,19 @@ for (const [
     console.log(`Gateway ready after ${Date.now() - started} ms`);
     // Authenticate the fixture owner before Simulator's cold boot overloads ps.
     // Keep this socket open and create a fresh five-minute code after boot.
-    owner = connectTCP({ path: join(fixture, "hub.sock") });
     const replies = new Map();
     let nextID = 0;
-    const lines = createInterface({ input: owner });
-    lines.on("line", (line) => {
-      const response = JSON.parse(line);
-      replies.get(response.id)?.(response);
-    });
+    /** The owner's socket to the hub (again after a hub restart). */
+    const connectOwner = () => {
+      owner?.destroy();
+      owner = connectTCP({ path: join(fixture, "hub.sock") });
+      const lines = createInterface({ input: owner });
+      lines.on("line", (line) => {
+        const response = JSON.parse(line);
+        replies.get(response.id)?.(response);
+      });
+    };
+    connectOwner();
     const ownerCall = (method, params) =>
       new Promise((resolve, reject) => {
         const id = ++nextID;
@@ -432,12 +438,50 @@ for (const [
         });
         owner.write(JSON.stringify({ id, method, params }) + "\n");
       });
-    const hello = await ownerCall("hello", {
-      client: "ios-qa-owner",
-      protocol: clientProtocol,
-      user_token: readFileSync(token, "utf8").trim(),
-    });
-    assert(hello.identity.startsWith("user:"));
+    const greet = async () => {
+      const hello = await ownerCall("hello", {
+        client: "ios-qa-owner",
+        protocol: clientProtocol,
+        user_token: readFileSync(token, "utf8").trim(),
+      });
+      assert(hello.identity.startsWith("user:"));
+    };
+    await greet();
+    const baseConfig = readFileSync(join(fixture, "config.toml"), "utf8");
+    /** Restarts the fixture's hub on its first config plus `extra` (loop-qa.mjs's box and
+     * ACP presets); the owner connects again, and the app reconnects through the gateway. */
+    const restartHub = async (extra = "") => {
+      if (hub.exitCode === null && hub.signalCode === null) {
+        const stopped = new Promise((r) => hub.once("exit", r));
+        hub.kill("SIGTERM");
+        await stopped;
+      }
+      writeFileSync(join(fixture, "config.toml"), baseConfig + extra, {
+        mode: 0o600,
+      });
+      hub = spawn(join(bin, "twr"), ["hub"], {
+        env,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      hub.stderr.on("data", (chunk) => (hubLog += chunk));
+      const deadline = Date.now() + 60000;
+      for (;;) {
+        try {
+          const info = JSON.parse(
+            execFileSync(join(bin, "twr"), ["info", "--json"], {
+              env,
+              encoding: "utf8",
+              timeout: 5000,
+            }),
+          );
+          if (info.pid === hub.pid) break;
+        } catch {}
+        assert(Date.now() < deadline, "The restarted hub never answered");
+        await delay(200);
+      }
+      connectOwner();
+      await greet();
+    };
     execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
     execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
       stdio: "inherit",
@@ -702,6 +746,11 @@ for (const [
           if (on) for (const socket of proxySockets) socket.destroy();
         },
         owner: ownerCall,
+        // For loops on a remote box and ACP reviewers (loop-qa.mjs `remoteLoopQA`).
+        home: fixture,
+        bin,
+        env,
+        restartHub,
         async nativeConfirm(click) {
           await channel.call("js", { source: IOS_ACCEPT_CONFIRM, arg: "null" });
           await click();
@@ -733,6 +782,15 @@ for (const [
             );
             console.log("PASS: review loops on an iPhone");
             loops.releaseAll();
+            // Loops on a remote box, and an ACP preset as the reviewer.
+            const remote = await remoteLoopQA(driver, loops, options);
+            writeFileSync(
+              join(loopShots, "ios-remote-loop-qa.json"),
+              JSON.stringify(remote, null, 2),
+            );
+            console.log(
+              "PASS: loops on a remote box and ACP reviewers on an iPhone",
+            );
           }
           // The cards, a thread's details, the conversation's header and the composer.
           await surfacesQA(driver, loops, options);

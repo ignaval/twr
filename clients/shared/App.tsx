@@ -136,6 +136,7 @@ import {
   endedLately,
   auditingWords,
   endedLoops,
+  boxWaits,
   endedWords,
   implementRequest,
   loopAccess,
@@ -166,7 +167,8 @@ import {
   turnAnnouncement,
   useModal,
 } from "./a11y";
-import { parseHex, threadInk, threadStyle } from "./threadColor";
+import { omarchyProperties } from "./omarchy";
+import { omarchyInkVar, parseHex, threadInk, threadStyle } from "./threadColor";
 const Terminal = lazy(() =>
   import("./Terminal").then((module) => ({ default: module.Terminal })),
 );
@@ -227,53 +229,16 @@ function storedList(key: string): string[] {
     return [];
   }
 }
+/** Draw with the selected Omarchy theme (Linux, System appearance): every token comes from
+ * `omarchyProperties`, which keeps the theme's colours where they read and adjusts the
+ * others (shared/omarchy.ts). A theme without a usable background and text: the app's own. */
 function applyOmarchyTheme(theme: Record<string, string> | null | undefined) {
   const root = document.documentElement;
-  root.dataset.omarchy = theme ? "true" : "false";
-  if (!theme) return;
-  for (const [key, value] of Object.entries({
-    bg: theme.background,
-    fg: theme.foreground,
-    accent: theme.accent,
-    warning: theme.yellow || theme.color3,
-    danger: theme.red || theme.color1,
-    selection: theme.selection || theme.selection_background,
-  }))
-    root.style.setProperty("--omarchy-" + key, value || "");
-  const rgb = (value?: string) => {
-    if (!value || !/^#[0-9a-f]{6}$/i.test(value)) return undefined;
-    return [1, 3, 5].map((i) => parseInt(value.slice(i, i + 2), 16));
-  };
-  const background = rgb(theme.background);
-  const scheme =
-    theme.mode === "light" || theme.mode === "dark"
-      ? theme.mode
-      : background &&
-          (background[0] * 299 + background[1] * 587 + background[2] * 114) /
-            1000 >
-            140
-        ? "light"
-        : "dark";
-  root.style.setProperty("--omarchy-scheme", scheme);
-  root.style.setProperty(
-    "--omarchy-light-share",
-    scheme === "light" ? "100%" : "0%",
-  );
-  const accent = rgb(theme.accent);
-  if (accent) {
-    const luminance = accent
-      .map((channel) => channel / 255)
-      .map((channel) =>
-        channel <= 0.04045
-          ? channel / 12.92
-          : ((channel + 0.055) / 1.055) ** 2.4,
-      )
-      .reduce((sum, value, i) => sum + value * [0.2126, 0.7152, 0.0722][i], 0);
-    root.style.setProperty(
-      "--omarchy-accent-fg",
-      luminance > 0.179 ? "#06191c" : "#ffffff",
-    );
-  }
+  const properties = omarchyProperties(theme);
+  root.dataset.omarchy = properties ? "true" : "false";
+  if (!properties) return;
+  for (const [name, value] of Object.entries(properties))
+    root.style.setProperty(name, value);
 }
 
 export default function App({
@@ -1473,6 +1438,22 @@ export default function App({
     knownLoops.current = { workspace, ids };
     for (const words of said.slice(0, 3)) announce(words);
   }, [view.threads, connected, workspace]);
+  // A loop that starts or stops waiting on its thread's remote box is said once, in any
+  // thread: the loop line and the inspector show it, in words.
+  const knownBoxWaits = useRef<{
+    workspace: string;
+    ids: Map<string, string>;
+  }>(undefined);
+  useEffect(() => {
+    if (!connected) return;
+    const known = knownBoxWaits.current;
+    const { said, known: ids } = boxWaits(
+      known?.workspace === workspace ? known.ids : undefined,
+      view.threads,
+    );
+    knownBoxWaits.current = { workspace, ids };
+    for (const words of said.slice(0, 3)) announce(words);
+  }, [view.threads, connected, workspace]);
   const turnBaseline = useRef<{ thread?: string; end?: string }>({});
   useEffect(() => {
     const end = events.findLast((event) => event.kind === "turn.ended");
@@ -2563,6 +2544,7 @@ export default function App({
           ? {
               "--destination-ink-light": threadInk(target.accent, "light"),
               "--destination-ink-dark": threadInk(target.accent, "dark"),
+              "--destination-ink-omarchy": omarchyInkVar(target.accent),
             }
           : {}),
       } as CSSProperties)

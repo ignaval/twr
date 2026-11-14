@@ -6,6 +6,7 @@
 // writes them when something else fills the box (take back, uploads, the outbox).
 import {
   useEffect,
+  useLayoutEffect,
   useState,
   useSyncExternalStore,
   type FormEvent,
@@ -19,6 +20,25 @@ import { VoiceControl } from "./VoiceControl";
 import { Spinner } from "./ui";
 import { SendAsLoop } from "./LoopViews";
 import type { DesktopAPI, Json, Thread } from "./types";
+
+/**
+ * Makes the message field as tall as its text, wrapped lines included: at least its CSS
+ * `min-height` (its `rows`), at most its CSS `max-height`, past which the text scrolls
+ * inside it. The composer's own box keeps its height while the field is measured, so the
+ * conversation above it does not move (one scrolled to its end stays there).
+ */
+export function fitToText(field: HTMLTextAreaElement | null) {
+  if (!field?.isConnected) return;
+  const box = field.parentElement;
+  const held = box?.style.height ?? "";
+  if (box) box.style.height = `${box.getBoundingClientRect().height}px`;
+  field.style.height = "";
+  // The field's borders (box-sizing: border-box) on top of its text and padding.
+  const needed = field.scrollHeight + field.offsetHeight - field.clientHeight;
+  if (needed > field.offsetHeight)
+    field.style.height = `${Math.ceil(needed)}px`;
+  if (box) box.style.height = held;
+}
 
 /**
  * The message drafts, one per destination: `<workspace>:orchestrator` or
@@ -164,6 +184,27 @@ export function Composer({
   const [mentionIndex, setMentionIndex] = useState(memory.mentionIndex);
   const [mentionHidden, setMentionHidden] = useState(memory.mentionHidden);
   const [slashIndex, setSlashIndex] = useState(memory.slashIndex);
+  // The field grows and shrinks with its text (fitToText): on every change of the text
+  // (typing, sending, a draft put back), of its width (a resized window, a rotated phone)
+  // and of the text size.
+  useLayoutEffect(() => fitToText(input.current), [draft, input]);
+  useEffect(() => {
+    const field = input.current;
+    if (!field || typeof ResizeObserver === "undefined") return;
+    let width = field.clientWidth;
+    const refit = () => fitToText(field);
+    const resized = new ResizeObserver(() => {
+      if (field.clientWidth === width) return;
+      width = field.clientWidth;
+      refit();
+    });
+    resized.observe(field);
+    window.addEventListener("twr:typography", refit);
+    return () => {
+      resized.disconnect();
+      window.removeEventListener("twr:typography", refit);
+    };
+  }, [input]);
   useEffect(() => {
     Object.assign(memory, {
       slashHidden,
@@ -294,13 +335,8 @@ export function Composer({
                   ? `Message ${target?.name} directly…`
                   : "Ask your orchestrator to build something…"
           }
-          rows={Math.min(
-            6,
-            Math.max(
-              document.documentElement.dataset.mobile === "true" ? 1 : 2,
-              draft.split("\n").length,
-            ),
-          )}
+          // The empty field's height; fitToText grows it with the text.
+          rows={document.documentElement.dataset.mobile === "true" ? 1 : 2}
           disabled={(!connected && !journal) || !operate}
           onKeyDown={(e) => {
             if (e.nativeEvent.isComposing || e.keyCode === 229) return;

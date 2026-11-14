@@ -139,8 +139,20 @@ the sidebar; Ctrl/Cmd-G toggles the grid. The focus filter is Cmd-Shift-F on mac
 and Ctrl-Shift-F on Linux, preserving normal text-editing Control keys. Narrow windows expose Chat / Needs you / Threads / More;
 all manager pages remain accessible through More. In short windows, expanding a terminal
 temporarily gives it the main area. Dark is the default. Light and System are available in Appearance; System follows
-the selected Omarchy theme on Linux. Native menus and window backgrounds follow
+the selected Omarchy theme on Linux. The app reads the theme's `colors.toml` (its
+`background`, `foreground`, `accent`, `selection`, `red`, `yellow` and `mode`) and derives
+every colour it draws from them. Text in every colour reads at 4.5:1 on every background it
+sits on, and a field's edge and the focus ring at 3:1, whatever the theme: a colour that
+already does is used exactly as the theme gives it, and one that does not keeps its hue and
+moves its lightness only as far as it takes. Thread names in their own colour get an ink
+for the theme's surfaces the same way. A theme without a valid `background` and
+`foreground` leaves the app's own colours in place. Disabled controls are dimmed below
+these ratios, which WCAG allows for inactive controls. Native menus and window backgrounds follow
 the client preference, which is restored on the next launch.
+
+The message field grows with what you write, wrapped lines included, at every text size,
+up to 240 px or 40% of the window, then scrolls inside. It shrinks again when the text is
+deleted or sent, and Send, the microphone and Upload stay in view.
 
 ### Loops
 
@@ -229,6 +241,18 @@ machine.
   written yet. A `read` device can open it. While the loop's turn is the thread's last, its
   sidebar card and **Latest thread reports** show the same in a line (`IMPLEMENT LOOP
   clean · committed abc1234`, `clean · committed abc1234 · not committed: …`).
+- **On a remote box.** A loop in a thread on a remote box runs as on the hub's own. Its
+  setup card checks what the box has and names it (`codex isn't installed on box devbox:
+  reviewing with claude-code · claude-opus-5-5 instead`), and the editor says `Runtimes as
+  found on box devbox`. The box runs every runtime on its own login, so a saved reviewer
+  account other than that brings the card back on the default account and says why (`box
+  devbox runs codex on its own login, not account work`). When the box goes away during a
+  review run, the loop line says `waiting on box devbox`, the inspector `waiting on box
+  devbox` and the round `m1 waits for box devbox`, and a screen reader hears it once; the
+  loop's controls still work. When the box is back the round runs again (`m1 under review
+  again`) and the loop goes on, and that is said once too. While a box is away nothing
+  offers to start a loop on its threads: the buttons wait and say `Box devbox is away: a
+  loop can start once it is back.`
 - **Settings.** **Change…** in the Loops section and `/loop settings` open the editor:
   the four presets, the implementer (the thread's own, or a runtime, model and effort), its
   workers where its runtime has subagents, the reviewer (runtime, model, and account where
@@ -238,7 +262,11 @@ machine.
   or this project). Only runtimes that are installed and logged in can be chosen; the
   others show why not. The reviewer's list also has the ACP presets: one that names its
   read-only mode reads `ex (acp, read-only mode)`, and one that doesn't is disabled with the
-  reason ([usage.md](usage.md#acp-reviewers)); the implementer's list has none. A hub that does not check its agent CLIs (`TWR_AGENT_PROBE=off`)
+  reason ([usage.md](usage.md#acp-reviewers)); the implementer's list has none. A line
+  under the reviewer's picker names every reviewer that can't be picked, with why (`Can't
+  review: bare (acp preset bare names no read-only mode)`), and an ACP preset picked says
+  the mode its read-only rests on and the efforts every round of the profile must use; a
+  screen reader hears both with the picker. A hub that does not check its agent CLIs (`TWR_AGENT_PROBE=off`)
   can't say, so every runtime can be chosen, marked `not checked`. **Settings › Loops** shows the same editor, the projects with their
   own settings (open or remove them) and **Reset all**.
 
@@ -413,7 +441,17 @@ keyboard and screen-reader text of each. Then an implementation loop: Send as
 implementation loop with no saved settings raises the card holding the task, **Run without
 a loop** sends it as a message, **Start and save** runs the plan, the implement turn, the
 review rounds, the report and the commit (the script commits for the fake thread), its end
-notifies, and the New thread form's switch starts one that ends `not committed`. With `TWR_LOOPS_SHOTS=<dir>` it also saves each
+notifies, and the New thread form's switch starts one that ends `not committed`. Then loops
+on a remote box: a dial-in `twr runner` of box `lab` on the same machine, with its own fake
+Codex and Claude Code, which its agent probe finds. The setup card names the box when its
+reviewer is not installed there, and comes back on the default account for a saved reviewer
+account; the runner stopped during a review run makes the loop wait on its box, said once,
+with its controls working and its wait shown again after a reload and a reconnect; started
+again, the loop goes on from the same round and ends; an implementation loop on the box
+commits; with the box away no start is offered. Then an ACP preset as the reviewer (the
+hub tests' scripted ACP agent, beside a preset with no review mode and one whose mode is
+`default`): the pickers of the setup card, Settings › Loops and a project's editor, the
+card's warning, a loop on it to its end, and the preset removed from the config. With `TWR_LOOPS_SHOTS=<dir>` it also saves each
 step in both themes, at the default size and the minimum width, with its accessibility tree.
 `TWR_LOOPS_WINDOW=<width>x<height>` runs it in a window of that size, such as a CI runner's
 `1024x674`, where the requests in the conversation scroll in their own area and the script

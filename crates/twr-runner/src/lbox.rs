@@ -701,14 +701,14 @@ impl LocalBox {
         }
         // The loop ops are reads, writes of whole files, and runs named by the hub's own run
         // id ([`crate::loops`]): none is recorded (a repeat does what the first did, or reports
-        // the same run), so a large diff or log never lands in the spool. Git reads and file
-        // writes take an ordinary slot; a wait for a run, its start and its end take none, so
-        // runs waited for never hold up the box's git.
+        // the same run), so a large diff or log never lands in the spool. Git reads take an
+        // ordinary slot. File writes take none: the connection's reader runs them in order,
+        // ahead of the prompt that follows them, and must not wait behind the box's git. A
+        // wait for a run, its start and its end take none either, so runs waited for never
+        // hold up the box's git.
         if is_loop_op(&op) {
             let _permit = match &op {
-                Op::LoopGit { .. } | Op::LoopFiles { .. } => {
-                    self.inner.op_permits.acquire().await.ok()
-                }
+                Op::LoopGit { .. } => self.inner.op_permits.acquire().await.ok(),
                 _ => None,
             };
             return CmdResult::new(cmd_id, self.execute(op).await);

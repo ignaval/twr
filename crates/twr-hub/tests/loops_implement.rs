@@ -178,8 +178,10 @@ fn user() -> Caller {
 /// working directory; `hold.<n>` holds it; it answers `answers/<n>.json`, else no findings.
 const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
+until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
+rmdir "$here/count.lock"
 : > "$here/argv.$n"
 for a in "$@"; do printf '%s\n' "$a" >> "$here/argv.$n"; done
 pwd > "$here/cwd.$n"
@@ -606,6 +608,7 @@ async fn save(hub: &Hub, settings: LoopSettings) {
         LoopSettingsSet {
             project: None,
             settings,
+            ..Default::default()
         },
         &user(),
     )

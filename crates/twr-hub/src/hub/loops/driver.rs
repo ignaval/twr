@@ -98,13 +98,26 @@ pub(in crate::hub) struct LoopRun {
     run: String,
     /// Its loop.
     loop_id: String,
-    /// The reviewer's model and the round's effort, as its task says them.
+    /// The reviewer ([`reviewer_words`]) and the round's effort, as its task says them.
     model: String,
     effort: String,
     /// When it began.
     began: Instant,
     /// Ends it, with the reason.
     cancel: tokio::sync::watch::Sender<Option<String>>,
+}
+
+/// The reviewer as a run's description names it (a thread's card shows it): its model
+/// (`gpt-6.1-sol`), which names a built-in reviewer; for an ACP preset, whose model ids are its
+/// agent's own, the preset first (`ex m-large`).
+pub(super) fn reviewer_words(hub: &Inner, runtime: &str, model: &str) -> String {
+    if hub.config.runtimes.contains_key(runtime)
+        && !twr_core::loops::config::REVIEWER_RUNTIMES.contains(&runtime)
+    {
+        format!("{runtime} {model}")
+    } else {
+        model.to_string()
+    }
 }
 
 /// The review runs this hub runs now, by thread, and whether loops are driven yet (not before
@@ -194,6 +207,8 @@ pub(in crate::hub) struct Staged {
     pub(in crate::hub) write_report: bool,
     /// Audit runs are to start (`sweep = "runs"`).
     pub(in crate::hub) audits: bool,
+    /// The loop ended: a remote box's copy of its folder gets its last files (`report.md`).
+    pub(in crate::hub) ended: bool,
 }
 
 impl Staged {
@@ -204,6 +219,7 @@ impl Staged {
             check: self.check || other.check,
             write_report: self.write_report || other.write_report,
             audits: self.audits || other.audits,
+            ended: self.ended || other.ended,
         }
     }
 
@@ -526,6 +542,7 @@ impl Core {
                     closes |= matches!(&body, EventBody::LoopControl(c)
                         if matches!(c.action, twr_core::loops::ControlAction::Resume | twr_core::loops::ControlAction::Stop))
                         || matches!(body, EventBody::LoopEnded(_));
+                    staged.ended |= matches!(body, EventBody::LoopEnded(_));
                     let source = first.take().unwrap_or(Source::Hub);
                     batch.push(thread, turn, source, body);
                 }
@@ -1746,8 +1763,9 @@ impl Core {
         thread: &str,
         staged: Staged,
     ) {
-        // A remote box's copy of the loop folder gets what the step reads, ahead of its prompt.
-        self.sync_box_folder(hub, thread, staged.prompted);
+        // A remote box's copy of the loop folder gets what the step reads, ahead of its prompt,
+        // and the last files of a loop that ended (its report).
+        self.sync_box_folder(hub, thread, staged.prompted || staged.ended);
         if staged.prompted {
             if let Err(e) = self.try_dispatch(hub, thread) {
                 tracing::warn!(%thread, error = %format!("{e:#}"), "dispatching a loop's prompt failed");
@@ -2050,7 +2068,7 @@ impl Core {
     /// right after. The previous loop of the thread has its folder on the box removed when a
     /// new one first writes there. The thread's later turns may still read its last loop's
     /// files: they stay until then, or until the thread is deleted.
-    pub(super) fn sync_box_folder(&mut self, hub: &Arc<Inner>, thread: &str, now: bool) {
+    pub(in crate::hub) fn sync_box_folder(&mut self, hub: &Inner, thread: &str, now: bool) {
         let Some(view) = self.registry.get(thread) else {
             return;
         };
@@ -2066,6 +2084,15 @@ impl Core {
             return;
         };
         let box_name = view.box_name.clone();
+        // The thread's previous loop, while a new one runs: its folder on the box goes when
+        // the new one first writes there. Read from the thread's record, not only from what
+        // this hub wrote: a hub restarted since knows nothing of it.
+        let previous = view
+            .r#loop
+            .as_ref()
+            .and(view.last_loop.as_ref())
+            .map(|l| l.id.clone())
+            .filter(|l| *l != loop_id);
         let Ok(place) = Place::of(hub, &box_name) else {
             return;
         };
@@ -2124,7 +2151,13 @@ impl Core {
         self.loop_runs
             .synced
             .insert(thread.to_string(), (loop_id.clone(), epoch));
-        let old = last.map(|(l, _)| l).filter(|l| *l != loop_id);
+        // This loop's first write on the box since this hub started: what came before goes.
+        let first = last.as_ref().is_none_or(|(l, _)| *l != loop_id);
+        let old = last
+            .map(|(l, _)| l)
+            .filter(|l| *l != loop_id)
+            .or(previous)
+            .filter(|_| first);
         tokio::spawn(async move {
             match asked.await {
                 Ok(v) => {
@@ -2199,7 +2232,7 @@ impl Core {
             LoopRun {
                 run: run.clone(),
                 loop_id: state.id.clone(),
-                model: state.reviewer.model.clone(),
+                model: reviewer_words(hub, &state.reviewer.runtime, &state.reviewer.model),
                 effort: state.reviewer.effort.clone().unwrap_or_default(),
                 began: Instant::now(),
                 cancel: tx,
@@ -2412,7 +2445,10 @@ impl Core {
             loop_id: id.to_string(),
             place: place.clone(),
             task,
-            description: format!("reviewer {} {effort}", reviewer.model),
+            description: format!(
+                "reviewer {} {effort}",
+                reviewer_words(hub, &reviewer.runtime, &reviewer.model)
+            ),
             call: review::Call {
                 runtime: reviewer.runtime.clone(),
                 bin: hub.reviewer_bin(&reviewer.runtime),

@@ -219,6 +219,30 @@ async function talk(page, name) {
     .getByRole("button", { name: "Talk to this thread", exact: true })
     .click();
 }
+// Adds `message` to the stored outbox behind the app's back, for a reload to find. The app
+// writes this record whole from memory (a draft it is still saving, say), and such a write
+// landing after the script's would drop the message: add it again until it stays.
+async function addToOutbox(page, message) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await page.evaluate(async (message) => {
+      const key = "offline-pending:local";
+      const record = JSON.parse(await window.twr.secureRead(key));
+      if (record.outbox.some((item) => item.id === message.id)) return;
+      record.outbox.push(message);
+      await window.twr.secureWrite(key, JSON.stringify(record));
+    }, message);
+    await page.waitForTimeout(500);
+    const kept = await page.evaluate(async (id) => {
+      const record = JSON.parse(
+        await window.twr.secureRead("offline-pending:local"),
+      );
+      return record.outbox.some((item) => item.id === id);
+    }, message.id);
+    if (kept) return;
+  }
+  throw new Error("The message added to the stored outbox did not stay there");
+}
+
 async function saved(page) {
   return page.evaluate(async () => {
     const history = JSON.parse(
@@ -277,12 +301,7 @@ async function exerciseReviewControls(page, history) {
     state: "review",
     error: "QA: check delivery before retrying",
   };
-  await page.evaluate(async (message) => {
-    const key = "offline-pending:local";
-    const record = JSON.parse(await window.twr.secureRead(key));
-    record.outbox.push(message);
-    await window.twr.secureWrite(key, JSON.stringify(record));
-  }, message);
+  await addToOutbox(page, message);
   await page.reload();
   await page
     .locator(".connection-status")
@@ -314,12 +333,7 @@ async function exerciseReviewControls(page, history) {
   // A separate unsent operation exercises same-ID retry; moving the first one
   // to a draft must have removed it from automatic delivery.
   message.id = randomUUID();
-  await page.evaluate(async (message) => {
-    const key = "offline-pending:local";
-    const record = JSON.parse(await window.twr.secureRead(key));
-    record.outbox.push(message);
-    await window.twr.secureWrite(key, JSON.stringify(record));
-  }, message);
+  await addToOutbox(page, message);
   await page.reload();
   await page
     .locator(".connection-status")
@@ -364,12 +378,7 @@ async function exerciseDefiniteRejection(page) {
     state: "review",
     error: "QA: retry original operation",
   };
-  await page.evaluate(async (message) => {
-    const key = "offline-pending:local";
-    const record = JSON.parse(await window.twr.secureRead(key));
-    record.outbox.push(message);
-    await window.twr.secureWrite(key, JSON.stringify(record));
-  }, message);
+  await addToOutbox(page, message);
   await page.reload();
   await page
     .locator(".connection-status")

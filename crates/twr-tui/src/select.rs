@@ -7,7 +7,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 
 use crate::edit::width;
 
@@ -626,7 +626,9 @@ impl Selection {
         out
     }
 
-    /// Shows the selection: its cells are drawn reversed.
+    /// Shows the selection: its cells are drawn reversed, a cell in a color of its own on the
+    /// terminal's background as a fill of that color under black or white text
+    /// ([`crate::ui::lit`]).
     pub fn highlight(&self, buf: &mut Buffer) {
         let (s, e) = self.bounds();
         for y in s.y..=e.y {
@@ -635,7 +637,17 @@ impl Selection {
             };
             for x in x0..=x1 {
                 if buf.area.contains(Position { x, y }) {
-                    buf[(x, y)].modifier.toggle(Modifier::REVERSED);
+                    let cell = &mut buf[(x, y)];
+                    if cell.fg != Color::Reset
+                        && cell.bg == Color::Reset
+                        && !cell.modifier.contains(Modifier::REVERSED)
+                    {
+                        let fill = crate::color::bright(cell.fg);
+                        cell.fg = crate::color::text_on(fill);
+                        cell.bg = fill;
+                    } else {
+                        cell.modifier.toggle(Modifier::REVERSED);
+                    }
                 }
             }
         }
@@ -866,6 +878,32 @@ mod tests {
             !rev(0, 1) && !rev(11, 1) && !rev(13, 1),
             "no border, no other pane"
         );
+    }
+
+    /// A selected cell in a color of its own on the terminal's background is a fill of that
+    /// color under black or white text, which reads on a dark terminal and a light one (reversed,
+    /// its text would be the terminal's background); a label's teal is filled with its bright
+    /// cyan. A cell in the terminal's own colors, or on a fill of its own, is reversed.
+    #[test]
+    fn highlight_fills_a_colored_text() {
+        use ratatui::style::Color;
+        let (mut buf, panes) = two_panes(&["abcd"], &[], vec![]);
+        let thread = crate::color::THREAD_COLORS[0];
+        buf[(2, 1)].fg = thread;
+        buf[(3, 1)].fg = crate::color::LABEL;
+        (buf[(4, 1)].fg, buf[(4, 1)].bg) = (Color::Black, Color::Yellow);
+        let mut sel = Selection::start(panes.at(1, 1).unwrap(), 1, 1);
+        sel.extend(4, 1);
+        sel.highlight(&mut buf);
+        let cell = |x: u16| (buf[(x, 1)].fg, buf[(x, 1)].bg, buf[(x, 1)].modifier);
+        assert_eq!(cell(1), (Color::Reset, Color::Reset, Modifier::REVERSED));
+        let on = crate::color::text_on(thread);
+        assert_eq!(cell(2), (on, thread, Modifier::empty()));
+        assert_eq!(
+            cell(3),
+            (Color::Indexed(16), Color::Indexed(80), Modifier::empty())
+        );
+        assert_eq!(cell(4), (Color::Black, Color::Yellow, Modifier::REVERSED));
     }
 
     #[test]
