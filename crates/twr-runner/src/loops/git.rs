@@ -664,6 +664,46 @@ pub async fn worktree_paths(
     Ok(paths)
 }
 
+/// What a working tree holds, as far as git sees it: its `HEAD` and every changed or untracked
+/// path with a digest of its content ([`worktree_paths`]). An ACP review run reads it before
+/// and after the agent runs: a reviewer in a mode that is read-only by the agent's word alone
+/// must leave it as it was ([`TreeState::changed_paths`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeState {
+    /// `HEAD`, or `None` before the first commit.
+    pub head: Option<String>,
+    /// [`worktree_paths`] of the repository.
+    pub paths: BTreeMap<String, Option<String>>,
+}
+
+impl TreeState {
+    /// The paths that differ between `self` (before) and `after`, sorted, with `HEAD` named
+    /// as such when it moved; empty when nothing changed.
+    pub fn changed_paths(&self, after: &TreeState) -> Vec<String> {
+        let mut changed: Vec<String> = Vec::new();
+        if self.head != after.head {
+            changed.push("HEAD".into());
+        }
+        let keys: std::collections::BTreeSet<&String> =
+            self.paths.keys().chain(after.paths.keys()).collect();
+        for k in keys {
+            if self.paths.get(k) != after.paths.get(k) {
+                changed.push(k.clone());
+            }
+        }
+        changed
+    }
+}
+
+/// The [`TreeState`] of the repository holding `dir`.
+pub async fn tree_state(git: &LocalGit, dir: &Path) -> Result<TreeState, String> {
+    let head = commit(git, dir, "HEAD")
+        .await
+        .map_err(|e| format!("cannot read HEAD: {}", e.message))?;
+    let paths = worktree_paths(git, dir).await?;
+    Ok(TreeState { head, paths })
+}
+
 /// A digest of what `path` holds ([`worktree_paths`]).
 fn content_digest(path: &Path) -> Option<String> {
     let meta = std::fs::symlink_metadata(path).ok()?;

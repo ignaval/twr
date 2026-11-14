@@ -13,7 +13,16 @@
 //!   twr knows, is refused before the prompt is sent.
 //! - **Permissions.** Every permission request (and any question) during the run is answered
 //!   with a refusal (`reject_once`), never an allow, and noted in the round's log. twr never
-//!   widens anything for a reviewer.
+//!   widens anything for a reviewer. What the agent runs *without* asking is its own mode's
+//!   business: claude-agent-acp's `plan` runs shell commands it judges safe (the repository's
+//!   test suite among them, and whatever the user's or the repository's Claude Code allow rules
+//!   allow) without a request, and keeps out of the files only by the model's own discipline.
+//! - **The working tree.** Read before the agent starts and again once its group is killed
+//!   ([`super::git::tree_state`]: `HEAD`, and a digest of every changed or untracked path). A
+//!   run in which it changed failed, whatever the agent answered: `the working tree changed
+//!   during the review run (<paths>): ...`. twr leaves the change where it is (it never
+//!   reverts work) and says so in the round's log. A directory that is no git repository is
+//!   not checked (the log says so).
 //! - **The answer.** The prompt is the round's, with [`OUTPUT_CONTRACT`] after it: the
 //!   findings in one fenced `json` block matching `findings.schema.json`. The hub reads the
 //!   LAST such block of the reply (`contract::findings_in_text`, the same `parse_findings` the
@@ -21,12 +30,14 @@
 //!   valid block is asked once more, in the same session ([`ask_again`]); a second bad reply is
 //!   a failed run, which the ladder retries as any failed run. The reply is data: nothing of
 //!   it but the block is read, and the findings reach the thread as data, as every reviewer's.
-//! - **Usage** is what the agent's prompt results report (summed over the two prompts), or
-//!   nothing.
+//! - **Usage** is what the agent's prompt results report (summed over the two prompts: input
+//!   with its cached part, output, and the cost when the agent reports one), or nothing.
 //! - **Process.** As every review run (`crate::one_shot`): a session and process group of its
 //!   own, killed when the run ends however it ends (an answer, the round's timeout, a cancel);
 //!   twr's tokens and markers scrubbed from its environment, `TWR_AGENT=<thread>:loop-<id>` in
-//!   their place. What the agent said and did goes to `round-<round>.log` for people.
+//!   their place. What the agent said and did goes to `round-<round>.log` for people,
+//!   starting with what its session reported (`ext.acp` of `thread.started`: version, model,
+//!   effort, mode reports, available modes).
 
 use std::io::Write;
 use std::path::Path;
@@ -168,6 +179,17 @@ pub async fn run(
         ),
         ..Default::default()
     };
+    let git = crate::local::LocalGit::default();
+    let before = match super::git::tree_state(&git, &call.cwd).await {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log.line(&format!(
+                "twr: the working tree can't be read ({e}): this run can't check that it \
+                 stays unchanged"
+            ));
+            None
+        }
+    };
     let adapter = AcpAdapter::with_command(acp.argv.clone()).stop_grace(STOP_GRACE);
     let mut handle = match adapter.spawn(cfg, None) {
         Ok(h) => h,
@@ -217,11 +239,38 @@ pub async fn run(
     if let Some(pgid) = group.0.take() {
         kill_group(pgid);
     }
+    // Read-only rests on the agent's mode; whether the tree stayed as it was, twr can see.
+    if let Some(before) = &before {
+        let changed = match super::git::tree_state(&git, &call.cwd).await {
+            Ok(after) => before.changed_paths(&after),
+            Err(e) => vec![format!("(unreadable after the run: {e})")],
+        };
+        if !changed.is_empty() {
+            let why = format!(
+                "the working tree changed during the review run ({}): acp preset {}'s {:?} \
+                 mode may not have kept it read-only (twr can't tell who wrote there), so the \
+                 run's answer is not used (twr left the change in place)",
+                changed_list(&changed),
+                acp.preset,
+                acp.mode
+            );
+            log.line(&format!("twr: {why}"));
+            if let Err(Ended::Cancelled(c)) = outcome {
+                log.line(&format!("twr: the run was cancelled: {c}"));
+                return Ended::Cancelled(c);
+            }
+            return Ended::Failed(why);
+        }
+    }
     let (body, findings, usage) = match outcome {
         Ok(r) => r,
         Err(Ended::Failed(why)) => {
             log.line(&format!("twr: the run failed: {why}"));
             return Ended::Failed(why);
+        }
+        Err(Ended::Cancelled(why)) => {
+            log.line(&format!("twr: the run was cancelled: {why}"));
+            return Ended::Cancelled(why);
         }
         Err(e) => return e,
     };
@@ -360,6 +409,9 @@ async fn next(
                 p.session_id.as_deref().unwrap_or("?"),
                 ext["mode"].as_str().unwrap_or("(none reported)")
             ));
+            // What the agent said of itself: its version, model, effort, every mode source's
+            // current mode and the modes it offers, how the mode was set.
+            log.line(&format!("twr: the agent reported {ext}"));
             Next::Started(ext)
         }
         EventBody::AgentText(t) if t.is_final => {
@@ -368,6 +420,23 @@ async fn next(
         }
         EventBody::AgentToolCall(c) => {
             log.line(&format!("tool: {} {}", c.tool, c.input_summary));
+            Next::Other
+        }
+        EventBody::AgentToolResult(r) => {
+            // The input a call announced bare got later (`ext.acp.input`): what ran.
+            let input = r
+                .ext
+                .as_ref()
+                .and_then(|x| x.get(twr_adapters::acp::EXT))
+                .and_then(|a| a.get("input"))
+                .and_then(Value::as_str)
+                .map(|i| format!(" {i}"))
+                .unwrap_or_default();
+            log.line(&format!(
+                "tool {}:{input} -> {}",
+                if r.ok { "done" } else { "failed" },
+                r.output_summary
+            ));
             Next::Other
         }
         EventBody::AttentionRaised(p) => {
@@ -382,9 +451,10 @@ async fn next(
         }
         EventBody::TurnEnded(p) => {
             if let Some(u) = &p.usage {
-                let total = usage.get_or_insert(Usage::default());
-                total.input += u.input;
-                total.output += u.output;
+                *usage = Some(match usage.take() {
+                    Some(total) => total.add(u),
+                    None => u.clone(),
+                });
             }
             match p.result {
                 TurnResult::Error => {
@@ -446,6 +516,21 @@ fn why_exited(stderr_tail: &str) -> String {
         Some(w) => format!(": {}", super::one_line(&truncate(w, 300))),
         None => String::new(),
     }
+}
+
+/// `a, b, c` of the first few `paths`, `and <n> more` after them.
+fn changed_list(paths: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let mut s = paths
+        .iter()
+        .take(SHOWN)
+        .map(|p| super::one_line(p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > SHOWN {
+        s.push_str(&format!(" and {} more", paths.len() - SHOWN));
+    }
+    s
 }
 
 fn truncate(s: &str, max: usize) -> String {
