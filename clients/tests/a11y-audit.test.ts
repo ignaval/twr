@@ -266,6 +266,52 @@ describe("theme contrast", () => {
       expect(contrast(theme["danger-fg"], theme.danger)).toBeGreaterThan(4.5);
       expect(failures).toEqual([]);
     });
+
+  // Warning text on the tints it sits on: Needs you's count (warning-soft) on the selected
+  // sidebar row (accent-soft over the panel), and the composer's "To:" chip in shell mode
+  // (warning at 12% over the panel). The app's own palettes are what an unusable Omarchy
+  // theme falls back to; both pairs were under 4.5:1 in the light one (4.01:1, 4.48:1).
+  const tints = (start: number) => {
+    const block = css.slice(start, css.indexOf("}", start));
+    return Object.fromEntries(
+      [
+        ...block.matchAll(
+          /--([a-z-]+):\s*rgb\((\d+) (\d+) (\d+) \/ ([\d.]+)%\);/g,
+        ),
+      ].map((m) => [m[1], { rgb: [+m[2], +m[3], +m[4]], alpha: +m[5] / 100 }]),
+    );
+  };
+  const over = (top: number[], alpha: number, bottom: number[]) =>
+    top.map((v, i) => v * alpha + bottom[i] * (1 - alpha));
+  const toHex = (rgb: number[]) =>
+    "#" + rgb.map((v) => Math.round(v).toString(16).padStart(2, "0")).join("");
+  for (const [name, theme, start] of [
+    ["dark", dark, 0],
+    ["light", light, lightStart],
+  ] as const)
+    it(`reads warning text on its tints in the ${name} theme`, () => {
+      const soft = tints(start);
+      const panel = hex(theme.panel);
+      const row = over(
+        soft["accent-soft"].rgb,
+        soft["accent-soft"].alpha,
+        panel,
+      );
+      const count = over(
+        soft["warning-soft"].rgb,
+        soft["warning-soft"].alpha,
+        row,
+      );
+      const chip = over(hex(theme.warning), 0.12, panel);
+      expect(
+        contrast(theme.warning, toHex(count)),
+        "the Needs you count on the selected row",
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(
+        contrast(theme.warning, toHex(chip)),
+        "the shell-mode chip",
+      ).toBeGreaterThanOrEqual(4.5);
+    });
 });
 
 describe("control contrast", () => {

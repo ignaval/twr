@@ -780,7 +780,8 @@ try {
     "Small-model disclosure, provider stub, placeholder suggestion, Tab and → acceptance and explicit send boundary passed",
   );
   // The message field grows with its text, wrapped lines included, at the largest text
-  // size, in a full window and a phone-width one: up to its cap, then it scrolls inside;
+  // size, in a full window and a phone-width one: up to its cap (or the room the window
+  // has), then it scrolls inside;
   // it shrinks again when the text goes, and Send, the microphone and Upload stay on
   // screen.
   await page
@@ -810,9 +811,17 @@ try {
           ".composer-bottom button, .composer-bottom label",
         ),
       ].map((e) => e.getBoundingClientRect());
+      const composer = field.parentElement;
       return {
         height: field.getBoundingClientRect().height,
         cap: parseFloat(style.maxHeight),
+        // Where the composer (with its margin) ends, and the column that clips it.
+        composerBottom:
+          composer.getBoundingClientRect().bottom +
+          parseFloat(getComputedStyle(composer).marginBottom),
+        columnBottom: composer
+          .closest(".content-column")
+          .getBoundingClientRect().bottom,
         lineHeight: parseFloat(style.lineHeight),
         hidden: field.scrollHeight - field.clientHeight,
         controls: controls.length,
@@ -848,9 +857,14 @@ try {
       some.height > empty.height + some.lineHeight / 2 && some.hidden <= 1,
       `${where}: a wrapped message must make the field taller and show all of it: ${JSON.stringify(some)}`,
     );
+    // To its cap, or, in a window with less room, to where the composer meets the
+    // column's bottom with its buttons in view.
     assert(
-      Math.abs(long.height - long.cap) <= 1 && long.hidden > 0,
-      `${where}: a long message grows the field to its cap, then scrolls inside: ${JSON.stringify(long)}`,
+      (Math.abs(long.height - long.cap) <= 1 ||
+        (long.height > some.height &&
+          Math.abs(long.composerBottom - long.columnBottom) <= 1)) &&
+        long.hidden > 0,
+      `${where}: a long message grows the field to its cap or the window's room, then scrolls inside: ${JSON.stringify(long)}`,
     );
     assert(
       Math.abs(cleared.height - empty.height) <= 1,

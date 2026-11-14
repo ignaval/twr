@@ -3002,8 +3002,8 @@ meter::-webkit-meter-optimum-value {
   --accent: #076c7c;
   --accent-fg: #ffffff;
   --accent-soft: rgb(7 108 124 / 10%);
-  --warning: #8a5c00;
-  --warning-soft: rgb(138 92 0 / 10%);
+  --warning: #7c5300;
+  --warning-soft: rgb(124 83 0 / 10%);
   --danger: #b83a34;
   --danger-soft: rgb(184 58 52 / 9%);
   --danger-fg: #ffffff;
@@ -3034,8 +3034,8 @@ meter::-webkit-meter-optimum-value {
     --accent: #076c7c;
     --accent-fg: #ffffff;
     --accent-soft: rgb(7 108 124 / 10%);
-    --warning: #8a5c00;
-    --warning-soft: rgb(138 92 0 / 10%);
+    --warning: #7c5300;
+    --warning-soft: rgb(124 83 0 / 10%);
     --danger: #b83a34;
     --danger-soft: rgb(184 58 52 / 9%);
     --danger-fg: #ffffff;

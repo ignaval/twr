@@ -146,18 +146,27 @@ segment, tab, thread card and list item; a pressed toggle; and the focus ring. T
 checkboxes, switches and sliders itself for this, the same in every engine. Lines that only
 separate or frame content (dividers, card and dialog outlines) stay light. On Omarchy the app
 reads the theme's `colors.toml` (its `background`, `foreground`, `accent`, `selection`,
-`red`, `yellow` and `mode`) and derives every colour it draws from them. Text in every colour
-reads at 4.5:1 on every background it sits on, and the controls at 3:1 as above: a colour
-that already does is used exactly as the theme gives it, and one that does not keeps its hue
-and moves its lightness only as far as it takes. Thread names in their own colour get an ink
+`red`, `yellow` and `mode`) from `~/.local/state/omarchy/current/theme`, where Omarchy 4
+keeps it, or from `~/.config/omarchy/current/theme` on an older Omarchy, and derives every
+colour it draws from them. It checks the file every 5 seconds and follows a theme switch
+without a restart; the moment in a switch when `omarchy-theme-set` has removed the old theme
+and not yet moved the new one in is not taken for "no theme". Text in every colour reads at
+4.5:1 on every background it sits on, and the controls at 3:1 as above: a colour that
+already does is used exactly as the theme gives it, and one that does not keeps its hue and
+moves its lightness only as far as it takes. Thread names in their own colour get an ink
 for the theme's surfaces the same way. A theme without a valid `background` and
 `foreground` leaves the app's own colours in place. Disabled controls are dimmed below
 these ratios, which WCAG allows for inactive controls. Native menus and window backgrounds follow
-the client preference, which is restored on the next launch.
+the client preference, which is restored on the next launch. On Linux the menu bar is the
+exception: Electron draws it from the GTK theme the app started with, whatever the
+preference or the Omarchy theme, so under the default GTK theme it stays light over a dark
+theme.
 
 The message field grows with what you write, wrapped lines included, at every text size,
-up to 240 px or 40% of the window, then scrolls inside. It shrinks again when the text is
-deleted or sent, and Send, the microphone and Upload stay in view.
+up to 240 px or 40% of the window, then scrolls inside. In a window with less room than
+that (a short one at a large text size, or with a notice above the conversation) it stops
+where the composer still fits, so Send, the microphone and Upload stay in view. It shrinks
+again when the text is deleted or sent.
 
 ### Loops
 

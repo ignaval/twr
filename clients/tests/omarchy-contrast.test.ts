@@ -106,6 +106,31 @@ function pairs(properties: Record<string, string>): Pair[] {
     new Map([...scope, ["--destination", "var(--accent)"]]),
   )!;
   chips.push(["accent 12% chip", onto(orchestratorChip, token("panel"))]);
+  // A message that starts with "!" runs in a shell: the composer's chip and the name in it
+  // take the warning colour (`.composer.shell-mode` sets --destination to it).
+  expect(decl(".composer.shell,\n.composer.shell-mode", "--destination")).toBe(
+    "var(--warning)",
+  );
+  expect(
+    decl(
+      ".shell-mode .composer-label b,\n.shell-mode .destination-dot",
+      "color",
+    ),
+  ).toBe("var(--warning)");
+  const shellChip = onto(
+    resolve(
+      decl(".destination-chip", "background"),
+      new Map([...scope, ["--destination", "var(--warning)"]]),
+    )!,
+    token("panel"),
+  );
+  chips.push(["warning 12% chip (shell mode)", shellChip]);
+  check(
+    'warning "To:" name on the shell-mode chip',
+    token("warning"),
+    shellChip,
+    TEXT_CONTRAST,
+  );
   expect(decl(".composer", "background")).toBe("var(--panel)");
   for (const base of BASES)
     pills.push([
@@ -209,6 +234,43 @@ function pairs(properties: Record<string, string>): Pair[] {
   expect(decl(".composer", "border-color")).toBe("var(--field-border)");
   for (const [on, bg] of surfaces.slice(0, 7))
     check(`field edge on ${on}`, token("field-border"), bg, EDGE_CONTRAST);
+  // The composer's edge while it has the focus (it has no other focus ring), for the
+  // orchestrator and each thread colour, and in shell mode.
+  const appInk = declarations(block(css, `${OMARCHY} .app`)).get(
+    "--destination-ink",
+  )!;
+  for (const color of ["orchestrator", ...THREAD_COLORS]) {
+    const thread = color !== "orchestrator";
+    const edge = opaque(
+      resolve(
+        decl(".composer:focus-within", "border-color"),
+        new Map([
+          ...scope,
+          ["--destination", thread ? color : "var(--accent)"],
+          ["--destination-ink", appInk],
+          ...(thread
+            ? [["--destination-ink-omarchy", omarchyInkVar(color)] as const]
+            : []),
+        ]),
+      ),
+      "focused composer edge",
+    );
+    for (const [on, bg] of surfaces.slice(0, 7))
+      check(
+        `focused composer edge (${color}) on ${on}`,
+        edge,
+        bg,
+        EDGE_CONTRAST,
+      );
+  }
+  expect(decl(".composer.shell-mode", "border-color")).toBe("var(--warning)");
+  for (const [on, bg] of surfaces.slice(0, 7))
+    check(
+      `shell-mode composer edge on ${on}`,
+      token("warning"),
+      bg,
+      EDGE_CONTRAST,
+    );
   for (const [on, bg] of surfaces)
     check(`focus ring on ${on}`, token("focus"), bg, EDGE_CONTRAST);
   // Every control's edge and state indicator (tests/css-contrast.ts), with the properties
@@ -411,8 +473,12 @@ describe("broken Omarchy themes", () => {
       foreground: "#000000",
       red: "#ff0000",
     });
+    const reader = readFileSync(join(root, "desktop/omarchy-theme.ts"), "utf8");
+    expect(reader).toMatch(
+      /return parseOmarchyColors\(readFileSync\(omarchyColorsFile\(home\)/,
+    );
     const main = readFileSync(join(root, "desktop/main.ts"), "utf8");
-    expect(main).toMatch(/return parseOmarchyColors\(\s*readFileSync\(/);
+    expect(main).toMatch(/readOmarchyTheme\(homedir\(\)\)/);
     const app = readFileSync(join(root, "shared/App.tsx"), "utf8");
     expect(app).toMatch(/const properties = omarchyProperties\(theme\);/);
   });
@@ -464,6 +530,44 @@ describe("the stylesheet draws only checked pairs", () => {
     "color-mix(in srgb, var(--success) 12%, transparent)",
     "color-mix(in srgb, var(--thread-color) 8%, var(--panel))",
   ]);
+  it("draws every field's edge in a checked colour", () => {
+    // A field's own rule may not put back an edge the palette does not hold to 3:1 (the
+    // rule for every field uses --field-border; focus moves it to the accent).
+    const edges = new Set([
+      "var(--field-border)",
+      "var(--accent)",
+      "var(--focus)",
+      "0",
+      "none",
+      // The terminal keeps its own dark palette in every theme; its search field's edge is
+      // held to 3:1 against it (tests/css-contrast.ts).
+      "var(--terminal-border)",
+      "var(--terminal-field-border)",
+    ]);
+    const field =
+      /(^|[\s,>+~(])(input|textarea|select)(?![-\w])(?!\[type="(checkbox|radio|range)"\])/;
+    const unknown: string[] = [];
+    for (const sheet of sheets) {
+      const source = readFileSync(join(root, sheet), "utf8").replace(
+        /\/\*[\s\S]*?\*\//g,
+        "",
+      );
+      for (const rule of source.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+        const selector = rule[1].replace(/\s+/g, " ").trim();
+        if (!field.test(selector)) continue;
+        for (const m of rule[2].matchAll(
+          /(border(?:-(?:top|right|bottom|left))?(?:-color)?)\s*:\s*([^;]+);/g,
+        )) {
+          const value = m[2].replace(/\s+/g, " ").trim();
+          const color = /var\([^)]*\)\)?$/.exec(value)?.[0] ?? value;
+          if (!edges.has(color))
+            unknown.push(`${sheet}: ${selector}: ${m[1]}: ${value}`);
+        }
+      }
+    }
+    expect(unknown).toEqual([]);
+  });
+
   it("names a checked colour in every color and background", () => {
     const unknown: string[] = [];
     for (const sheet of sheets) {
