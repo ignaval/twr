@@ -60,7 +60,7 @@ use twr_core::event::{EventBody, TurnResult, Usage};
 use twr_core::loops::contract::{findings_in_text, Finding, FINDINGS_SCHEMA, MAX_ANSWER_BYTES};
 
 use super::review::{span, Call, Ended};
-use crate::one_shot::{call_tree, end_call, scrubbed_names, Group, REAPED_LINE};
+use crate::one_shot::{call_tree, end_call, scrubbed_names, Group, LiveCall, REAPED_LINE};
 
 /// How long the agent has to exit once its session is stopped, before its group is killed.
 const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -151,6 +151,7 @@ pub async fn run(
     spawned: impl FnOnce(u32),
     mut cancel: tokio::sync::watch::Receiver<Option<String>>,
 ) -> Ended {
+    let live = LiveCall::new(&call.marker);
     // A previous run's answer is never taken for this one's.
     let _ = std::fs::remove_file(&call.answer_file);
     let mut log = match std::fs::OpenOptions::new()
@@ -271,7 +272,7 @@ pub async fn run(
     // Its group and what it started outside it (Claude Code's Bash tool runs each command in a
     // session of its own), before the tree is read again: nothing of the run may write there
     // afterwards.
-    if end_call(group.0.take(), &call.marker, tree).await {
+    if end_call(group.0.take(), &call.marker, tree, live).await {
         log.line(REAPED_LINE);
     }
     // Read-only rests on the agent's mode; whether the tree stayed as it was, twr can see.

@@ -39,7 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twr_core::event::Usage;
 use twr_core::loops::contract::{parse_findings, Finding, FINDINGS_SCHEMA, MAX_ANSWER_BYTES};
 
-use crate::one_shot::{call_tree, end_call, scrub_env, Group, REAPED_LINE};
+use crate::one_shot::{call_tree, end_call, scrub_env, Group, LiveCall, REAPED_LINE};
 
 /// The most of a CLI's result object (Claude Code's, Grok Build's stdout) read, in bytes.
 const RESULT_MAX: u64 = 8 << 20;
@@ -245,6 +245,7 @@ pub async fn run(
         Some(Err(why)) => return Ended::Failed(why),
         None => {}
     }
+    let live = LiveCall::new(&call.marker);
     let mut cmd = match command(&call) {
         Ok(c) => c,
         Err(e) => return Ended::Failed(e),
@@ -340,7 +341,7 @@ pub async fn run(
     // What it started goes with it, whatever way it ended: its group, and what left the group
     // (a tool's command in a session of its own).
     let tree = call_tree(group.0).await;
-    if end_call(group.0.take(), &call.marker, tree).await {
+    if end_call(group.0.take(), &call.marker, tree, live).await {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .append(true)

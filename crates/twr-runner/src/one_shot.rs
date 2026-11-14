@@ -46,31 +46,90 @@ pub async fn call_tree(group: Option<u32>) -> Vec<(u32, u64, i64)> {
 ///   longer leads to by parent links ([`crate::reap::reap_agent_marked_orphans`]): what left
 ///   the tree before it was read (its parent exited first). A step's next run carries the
 ///   same marker and may already run while the run it replaces ends here: it still descends
-///   from this process and is left alone.
+///   from this process and is left alone, and while such a call is counted (`live`,
+///   [`LiveCall`]) nothing at all is reaped by marker here.
 ///
 /// Whether anything outside the group was signalled. Reads the process table (`ps` off
 /// Linux) off the async runtime.
-pub async fn end_call(group: Option<u32>, marker: &str, tree: Vec<(u32, u64, i64)>) -> bool {
+pub async fn end_call(
+    group: Option<u32>,
+    marker: &str,
+    tree: Vec<(u32, u64, i64)>,
+    live: LiveCall,
+) -> bool {
     if let Some(pgid) = group {
         kill_group(pgid);
     }
+    // While another call under this marker runs in this process (a step's next run), nothing
+    // is reaped by marker here: that call's own end does it.
+    let alone = live.alone();
     let outside: Vec<(u32, u64)> = tree
         .into_iter()
         .filter(|&(_, _, pgrp)| Some(pgrp) != group.map(i64::from))
         .map(|(pid, start, _)| (pid, start))
         .collect();
-    let markers = if marker.is_empty() {
+    let markers = if marker.is_empty() || !alone {
         Vec::new()
     } else {
         vec![marker.to_string()]
     };
-    tokio::task::spawn_blocking(move || {
+    let ended = tokio::task::spawn_blocking(move || {
         let killed = !outside.is_empty() && crate::reap::kill_each(&outside);
         let reaped = !markers.is_empty() && crate::reap::reap_agent_marked_orphans(&markers);
         killed || reaped
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(false);
+    drop(live);
+    ended
+}
+
+/// How many one-shot calls run now in this process under each `TWR_AGENT` marker.
+static LIVE_CALLS: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// A one-shot call that runs now, counted under its marker from before its process starts
+/// until [`end_call`] is done with it (or it is dropped: a call that never started one).
+/// A step's next run has the marker of the run it replaces and may start while that one is
+/// still ending; the ending one then reaps nothing by marker ([`LiveCall::alone`]).
+pub struct LiveCall(String);
+
+impl LiveCall {
+    pub fn new(marker: &str) -> LiveCall {
+        if !marker.is_empty() {
+            let mut live = LIVE_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+            *live
+                .get_or_insert_with(Default::default)
+                .entry(marker.to_string())
+                .or_insert(0) += 1;
+        }
+        LiveCall(marker.to_string())
+    }
+
+    /// Whether no other call under this one's marker runs now in this process.
+    fn alone(&self) -> bool {
+        let live = LIVE_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        live.as_ref()
+            .and_then(|l| l.get(&self.0))
+            .is_none_or(|n| *n <= 1)
+    }
+}
+
+impl Drop for LiveCall {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut live = LIVE_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = live.as_mut() {
+            if let Some(n) = l.get_mut(&self.0) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    l.remove(&self.0);
+                }
+            }
+        }
+    }
 }
 
 /// What [`end_call`] adds to a run's log when it ended anything outside the run's group.
@@ -125,4 +184,29 @@ pub fn scrubbed_names(prefixes: &[&str], keep: &[&str]) -> Vec<String> {
         out.push(gen);
     }
     out
+}
+
+#[cfg(test)]
+mod live_call_tests {
+    use super::LiveCall;
+
+    /// A call is alone under its marker until another under the same one runs, and again once
+    /// that one is done; another marker's calls don't count, and a call without a marker is
+    /// never counted.
+    #[test]
+    fn a_call_is_alone_until_another_under_its_marker_runs() {
+        let marker = format!("live-call-test-{}", std::process::id());
+        let first = LiveCall::new(&marker);
+        assert!(first.alone());
+        let second = LiveCall::new(&marker);
+        assert!(!first.alone());
+        assert!(!second.alone());
+        let other = LiveCall::new(&format!("{marker}-other"));
+        assert!(other.alone());
+        drop(first);
+        assert!(second.alone());
+        drop(second);
+        assert!(LiveCall::new(&marker).alone());
+        assert!(LiveCall::new("").alone());
+    }
 }

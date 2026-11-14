@@ -503,6 +503,9 @@ echo '{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}'
     struct TestBox {
         dir: tempfile::TempDir,
         runs: BoxRuns,
+        /// Its runs' `TWR_AGENT` marker, its own: these tests run at once in one process, and
+        /// a reap by marker ([`reap_left`]) takes every process that carries it.
+        marker: String,
     }
 
     impl TestBox {
@@ -514,7 +517,13 @@ echo '{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}'
             std::fs::write(dir.path().join("answer"), r#"{"findings": []}"#).unwrap();
             std::fs::create_dir_all(dir.path().join("wt")).unwrap();
             let runs = BoxRuns::new(dir.path().join("loops"));
-            TestBox { dir, runs }
+            static BOXES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let marker = format!(
+                "T1:loop-L1-{}-{}",
+                std::process::id(),
+                BOXES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            TestBox { dir, runs, marker }
         }
 
         fn spec(&self, stem: &str) -> LoopRunSpec {
@@ -524,7 +533,7 @@ echo '{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}'
                 effort: "medium".into(),
                 cwd: self.dir.path().join("wt"),
                 stem: stem.into(),
-                marker: "T1:loop-L1".into(),
+                marker: self.marker.clone(),
                 timeout_secs: 60,
                 acp: None,
             }
