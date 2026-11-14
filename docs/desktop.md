@@ -543,6 +543,9 @@ and `libsecret` as possibly unneeded. The packaged app leaves out node-pty's Win
 sources (`deps/`, `src/` and the `win32` prebuilds), which namcap would otherwise read as a
 dependency on Python.
 
+`release/omarchy-pkgs/` holds a recipe for the same archive in Omarchy's own package
+repository (omacom/omarchy-pkgs), with the steps to submit it; it has not been submitted.
+
 `install.sh --desktop` installs the release's Arch package, `.deb`, AppImage or Mac app, checked
 against the signed `desktop-sha256sums.txt` ([install.md](install.md#desktop-app)). The Homebrew
 tap `ignaval/homebrew-twr` has a formula for the CLI (`twr`, the release archives) and a cask for
