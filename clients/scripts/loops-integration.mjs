@@ -29,6 +29,7 @@ import {
   existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
+import { createServer } from "node:net";
 import { join, resolve } from "node:path";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -54,6 +55,8 @@ if (process.env.TWR_LOOPS_WINDOW && !windowSize)
 
 const home = realpathSync(mkdtempSync(join(tmpdir(), "twr-loops-")));
 const repo = join(home, "repo");
+// Step 11's remote box: a dial-in runner's own TWR_HOME.
+const boxHome = join(home, "box");
 mkdirSync(repo);
 const git = (...args) =>
   execFileSync(
@@ -209,6 +212,8 @@ let application;
 let applicationProcess;
 let hub;
 let hubLog = "";
+let runner;
+let runnerLog = "";
 const errors = [];
 const startHub = async () => {
   hub = spawn(join(bin, "twr"), ["hub"], {
@@ -2089,6 +2094,856 @@ try {
     "PASS: a review loop audited by runs ends clean and notifies once: Review loop clean after N rounds",
   );
 
+  // ---------------------------------------------------------------------------------
+  // 11. Loops on a thread on a remote box: a dial-in `twr runner` of box `lab` on this
+  //     machine (its own TWR_HOME), with its own fake Codex and Claude Code, which its
+  //     agent probe finds (`TWR_*_BIN`). The setup card's warnings name the box; a
+  //     reviewer account other than the box's own login does not hold there; the runner
+  //     stopped during a review run makes the loop wait on its box, in words, said once;
+  //     started again, the loop goes on from the same round, without a reload.
+  // ---------------------------------------------------------------------------------
+  const freePort = () =>
+    new Promise((done, fail) => {
+      const server = createServer();
+      server.once("error", fail);
+      server.listen(0, "127.0.0.1", () => {
+        const { port } = server.address();
+        server.close(() => done(port));
+      });
+    });
+  const boxPort = await freePort();
+  const boxToken = twr("runner", "token").trim();
+  mkdirSync(boxHome, { recursive: true });
+  writeFileSync(join(boxHome, "lab.token"), boxToken + "\n", { mode: 0o600 });
+  const boxRevs = join(home, "box-reviewers");
+  mkdirSync(boxRevs, { recursive: true });
+  // The box's fake Codex: its agent probe's `--version` and `login status`, then review runs
+  // as the hub's fake answers them (`hold.<n>` holds run n; every run finds nothing).
+  const boxCodex = join(boxRevs, "codex");
+  writeFileSync(
+    boxCodex,
+    `#!/bin/sh
+here=$(dirname "$0")
+case "$1" in --version) echo "codex-cli 0.99.0"; exit 0;; login) exit 0;; esac
+n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$here/count"
+cat > /dev/null
+while [ -f "$here/hold.$n" ]; do sleep 0.05; done
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+printf '%s' '{"findings": []}' > "$out"
+echo '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}'
+`,
+  );
+  chmodSync(boxCodex, 0o755);
+  // The box's Claude Code answers only its agent probe: it reviews nothing here.
+  const boxClaude = join(boxRevs, "claude");
+  writeFileSync(
+    boxClaude,
+    `#!/bin/sh
+case "$1" in --version) echo "2.0.0 (Claude Code)"; exit 0;; auth) echo '{"loggedIn": true, "authMethod": "claude.ai"}'; exit 0;; esac
+exit 1
+`,
+  );
+  chmodSync(boxClaude, 0o755);
+  const boxRuns = () => {
+    try {
+      return Number(readFileSync(join(boxRevs, "count"), "utf8").trim());
+    } catch {
+      return 0;
+    }
+  };
+  const boxHold = (n) => writeFileSync(join(boxRevs, `hold.${n}`), "");
+  const boxRelease = (n) => rmSync(join(boxRevs, `hold.${n}`), { force: true });
+  // The ACP presets (step 12), on the scripted ACP reviewer of the hub's tests: `ex` reviews
+  // in its agent's "read-only" mode; `bare` names no review mode; `loose` names one twr knows
+  // lets the agent act.
+  const acpState = join(home, "acp");
+  mkdirSync(acpState, { recursive: true });
+  const acpAgent = `python3 ${resolve("../crates/twr-hub/tests/fixtures/acp/reviewer_agent.py")} ${acpState}`;
+  const acpPresets = (withEx) =>
+    (withEx
+      ? `[runtimes.ex]\nacp = ${JSON.stringify(acpAgent)}\n[runtimes.ex.review]\nmode = "read-only"\nmodels = ["m-large", "m-small"]\nefforts = ["medium", "xhigh"]\n`
+      : "") +
+    `[runtimes.bare]\nacp = ${JSON.stringify(acpAgent)}\n[runtimes.loose]\nacp = ${JSON.stringify(acpAgent)}\n[runtimes.loose.review]\nmode = "default"\n`;
+  // Codex has a second account, `work`, on the hub's machine.
+  const workAccount = join(home, "accounts", "codex-work");
+  mkdirSync(workAccount, { recursive: true, mode: 0o700 });
+  const remoteConfig = (withEx = true) =>
+    config(true) +
+    `[hub]\nlisten = "127.0.0.1:${boxPort}"\n[boxes.lab]\ntoken = "${boxToken}"\n[accounts.codex.work]\ndir = ${JSON.stringify(workAccount)}\n` +
+    acpPresets(withEx);
+  const restartHub = async (text) => {
+    twr("hub", "stop");
+    await new Promise((r) => hub.once("exit", r));
+    writeFileSync(join(home, "config.toml"), text, { mode: 0o600 });
+    await startHub();
+    await connected();
+  };
+  await restartHub(remoteConfig());
+  const settingsOf = (name) =>
+    page.evaluate(
+      (thread) => window.twr.rpc("loop.settings.get", { thread }),
+      name,
+    );
+  /** The box's runner, with Codex installed there or not (its probe then finds none). */
+  const startRunner = async ({ codex = true } = {}) => {
+    const runnerEnv = {
+      ...env,
+      TWR_HOME: boxHome,
+      TWR_TEST_USER_TOKEN_FILE: join(boxHome, "user.token"),
+      TWR_BOX_PROBE: "on",
+      TWR_CODEX_BIN: codex ? boxCodex : join(boxRevs, "no-codex"),
+      TWR_CLAUDE_BIN: boxClaude,
+      TWR_GROK_BIN: join(boxRevs, "no-grok"),
+      XDG_STATE_HOME: join(boxHome, "state"),
+    };
+    delete runnerEnv.TWR_TEST_AGENTS;
+    runner = spawn(
+      join(bin, "twr"),
+      [
+        "runner",
+        "--hub",
+        `ws://127.0.0.1:${boxPort}`,
+        "--box=lab",
+        `--token-file=${join(boxHome, "lab.token")}`,
+        `--data-dir=${join(boxHome, "data")}`,
+      ],
+      { env: runnerEnv, stdio: ["ignore", "ignore", "pipe"] },
+    );
+    runner.stderr.on("data", (d) => (runnerLog += d));
+    await until(
+      () => {
+        try {
+          return twrJson("box", "status", "lab").state === "online";
+        } catch {
+          return false;
+        }
+      },
+      `Box lab never came online: ${runnerLog.slice(-2000)}`,
+    );
+  };
+  /** Waits until the hub has the box's agents as its runner found them. */
+  const boxAgents = (codexFound) =>
+    until(async () => {
+      const got = await settingsOf("boxer");
+      const codex = got.runtimes.find((r) => r.runtime === "codex");
+      return got.box === "lab" && codex?.probed && codex.found === codexFound;
+    }, "Box lab never reported its agents");
+  const stopRunner = async () => {
+    if (!runner || runner.exitCode !== null) return;
+    runner.kill("SIGTERM");
+    await new Promise((r) => runner.once("exit", r));
+  };
+  const boxRepo = join(home, "box-repo");
+  mkdirSync(boxRepo);
+  /** Commits `paths` (every change, without) in `dir`, as the thread would. */
+  const commitIn = (dir, message, paths = ["-A"]) => {
+    execFileSync("git", ["-C", dir, "add", ...paths], { stdio: "ignore" });
+    execFileSync(
+      "git",
+      [
+        "-C",
+        dir,
+        "-c",
+        "user.name=Desktop Test",
+        "-c",
+        "user.email=desktop@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        message,
+      ],
+      { stdio: "ignore" },
+    );
+  };
+  execFileSync("git", ["init", "-q", "-b", "main", boxRepo]);
+  writeFileSync(join(boxRepo, "lib.rs"), "pub fn f() {}\n");
+  commitIn(boxRepo, "Initial");
+  await startRunner({ codex: false });
+  twr(
+    "thread",
+    "new",
+    boxRepo,
+    "--box",
+    "lab",
+    "--runtime",
+    "fake",
+    "--name",
+    "boxer",
+    "--mode",
+    "auto",
+  );
+  const boxer = () => thread("boxer");
+  await until(() => boxer()?.worktree, "boxer has no worktree");
+  writeFileSync(join(boxer().worktree, "lib.rs"), "fn parse(s: &str) {}\n");
+  await boxAgents(false);
+  twr("loop", "settings", "--reset", "--yes");
+  const boxerCard = () =>
+    page.locator(".thread-list .thread-item").filter({ hasText: "boxer" });
+  const selectBoxer = async () => {
+    await sidebar();
+    await boxerCard().locator(".thread-card").click();
+    await inspector.waitFor();
+    await inspector.getByRole("heading", { name: "boxer" }).waitFor();
+  };
+  /** WCAG contrast of an element's text on the first opaque background behind it. */
+  const textContrast = (locator) =>
+    locator.evaluate(async (node) => {
+      await new Promise((done) =>
+        requestAnimationFrame(() => requestAnimationFrame(done)),
+      );
+      const rgba = (value) => value.match(/[\d.]+/g).map(Number);
+      let back = node;
+      let bg = rgba(getComputedStyle(back).backgroundColor);
+      while (back.parentElement && bg.length === 4 && bg[3] === 0) {
+        back = back.parentElement;
+        bg = rgba(getComputedStyle(back).backgroundColor);
+      }
+      const lum = (c) =>
+        c
+          .slice(0, 3)
+          .map((v) => v / 255)
+          .map((v) => (v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4))
+          .reduce((sum, v, i) => sum + v * [0.2126, 0.7152, 0.0722][i], 0);
+      const [a, b] = [lum(rgba(getComputedStyle(node).color)), lum(bg)];
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    });
+  /** `locator`'s text reads at 4.5:1 in the light and the dark theme. */
+  const readsInBoth = async (locator, where) => {
+    for (const value of ["light", "dark"]) {
+      await theme(value);
+      const ratio = await textContrast(locator);
+      assert(
+        ratio >= 4.5,
+        `${where} reads at ${ratio.toFixed(2)}:1 (${value})`,
+      );
+    }
+    await theme("dark");
+  };
+  const optionsOf = (select) =>
+    select.evaluate((n) =>
+      [...n.options].map((o) => ({
+        value: o.value,
+        text: o.textContent,
+        disabled: o.disabled,
+      })),
+    );
+  const armed = async (card) => {
+    await card.locator(".attention-options").scrollIntoViewIfNeeded();
+    await card.locator('.attention-options[data-armed="true"]').waitFor();
+  };
+
+  // The first loop on the box, whose runner found no Codex: the card reviews with Claude
+  // Code, and its warning names the box.
+  await selectBoxer();
+  const boxLoops = inspector.locator(".inspector-loops");
+  await boxLoops
+    .getByRole("button", { name: "Review loop", exact: true })
+    .click();
+  const boxSetup = setupIn(inspector);
+  await boxSetup.waitFor({ timeout: 15000 });
+  await boxSetup
+    .getByText(
+      "codex isn't installed on box lab: reviewing with claude-code · claude-opus-5-5 instead",
+    )
+    .waitFor();
+  assert.match(
+    await boxSetup.locator(".loop-setup-rows").innerText(),
+    /Reviewer\s+claude-code · claude-opus-5-5 · medium → xhigh/,
+  );
+  await ariaOf("40-box-not-installed", boxSetup);
+  await capture("40-box-not-installed", null, {
+    narrow: inspectorNarrow(boxSetup),
+    restore: selectBoxer,
+  });
+  // Change… : the editor checks what the box has, and says which reviewers can't review
+  // there and why, in words.
+  await armed(boxSetup);
+  await boxSetup.getByRole("button", { name: "Change…" }).click();
+  const boxEditor = page.getByRole("dialog", { name: "Loop settings · boxer" });
+  await boxEditor.waitFor();
+  await boxEditor
+    .getByText("Loading loop settings…")
+    .waitFor({ state: "hidden" });
+  await boxEditor
+    .getByText("Runtimes as found on box lab: its reviewer runs there.")
+    .waitFor();
+  const boxSkipped = boxEditor.locator(".loop-editor-skipped");
+  assert.equal(
+    await boxSkipped.innerText(),
+    `Can't review on box lab: codex (not installed); grok-build (not installed); bare (acp preset bare names no read-only mode); loose (acp preset loose's review mode "default" is not read-only: twr knows it as a mode that lets the agent act)`,
+  );
+  await readsInBoth(boxSkipped, "The reviewers that can't review");
+  await ariaOf("41-box-editor", boxEditor);
+  await capture("41-box-editor", null, { narrow: false });
+  await page.keyboard.press("Escape");
+  await boxEditor.waitFor({ state: "hidden" });
+  await armed(boxSetup);
+  await boxSetup.getByRole("button", { name: "Cancel" }).click();
+  await boxSetup.waitFor({ state: "hidden" });
+  console.log(
+    "PASS: a box thread's setup card names the box when its reviewer is not installed there; the editor says what can't review there",
+  );
+
+  // Saved settings whose reviewer is Codex's account `work`: on the box, which runs every
+  // runtime on its own login, they do not hold. The card comes back on the default account
+  // and says why.
+  await stopRunner();
+  await startRunner({ codex: true });
+  await boxAgents(true);
+  await page.evaluate(() =>
+    window.twr.rpc("loop.settings.set", {
+      settings: {
+        profile: "low",
+        implementer: null,
+        workers: { model: "claude-opus-5-5", effort: "high" },
+        reviewer: { runtime: "codex", account: "work", model: "gpt-6.1-sol" },
+      },
+    }),
+  );
+  assert.equal(twrJson("loop", "settings").settings.reviewer.account, "work");
+  boxHold(1);
+  await selectBoxer();
+  await boxLoops
+    .getByRole("button", { name: "Review loop", exact: true })
+    .click();
+  await boxSetup.waitFor({ timeout: 15000 });
+  assert.match(
+    await boxSetup.locator(".loop-setup-title").innerText(),
+    /^boxer: review loop setup \(a saved setting no longer holds\)/,
+  );
+  await boxSetup
+    .getByText(
+      "box lab runs codex on its own login, not account work: using its default account",
+    )
+    .waitFor();
+  assert.match(
+    await boxSetup.locator(".loop-setup-rows").innerText(),
+    /Reviewer\s+codex · gpt-6\.1-sol · medium\n/,
+  );
+  await ariaOf("42-box-account", boxSetup);
+  await capture("42-box-account", null, {
+    narrow: inspectorNarrow(boxSetup),
+    restore: selectBoxer,
+  });
+  console.log(
+    "PASS: a reviewer account other than the box's own login comes back on the card with the default account, saying why",
+  );
+
+  // Start and save: the review run on the box is held, then its runner is stopped.
+  await armed(boxSetup);
+  await boxSetup.getByRole("button", { name: "Start and save" }).click();
+  await until(() => boxRuns() === 1, "The box's review run never started");
+  assert.equal(
+    twrJson("loop", "settings").settings.reviewer.account ?? null,
+    null,
+    "Start and save saved the default account",
+  );
+  await sidebar();
+  const boxChip = boxerCard().locator(".loop-chip");
+  await boxChip
+    .locator(".loop-line")
+    .filter({ hasText: /^low · ladder m1$/ })
+    .waitFor();
+  await selectBoxer();
+  const boxStatus = boxLoops.locator(".loop-status");
+  await boxStatus.filter({ hasText: "waiting on the review" }).waitFor();
+  const boxRounds = boxLoops.getByRole("list", { name: "Rounds" });
+  await boxRounds.getByText("m1 under review").waitFor();
+  const boxControls = boxLoops.getByRole("group", { name: "Loop controls" });
+  const pauseTop = () =>
+    boxControls
+      .getByRole("button", { name: /^(Pause|Resume)$/ })
+      .evaluate(
+        (n) =>
+          n.getBoundingClientRect().top -
+          n.closest(".inspector-loops").getBoundingClientRect().top,
+      );
+  const runningTop = await pauseTop();
+  await stopRunner();
+  await until(
+    () => boxer().loop?.box_away === "lab",
+    "The loop never waited on its box",
+  );
+  // The loop line on the card and the inspector say so, in words, by the box's name.
+  await boxChip
+    .locator(".loop-line")
+    .filter({ hasText: /^low · ladder m1 · waiting on box lab$/ })
+    .waitFor();
+  await boxStatus
+    .filter({ hasText: /REVIEW LOOP\s+low · waiting on box lab$/ })
+    .waitFor();
+  await boxRounds.getByText("m1 waits for box lab").waitFor();
+  assert.equal(
+    await pauseTop(),
+    runningTop,
+    "The Loops section's controls stay where they were",
+  );
+  await announced(
+    "boxer's review loop waits on box lab: it goes on when the box is back",
+  );
+  // Its controls work while the box is away: the hub holds them, not the box.
+  await boxControls.getByRole("button", { name: "Pause", exact: true }).click();
+  await boxStatus.filter({ hasText: "paused, waiting on box lab" }).waitFor();
+  await announced("Loop paused");
+  assert.equal(twrJson("loop", "list")[0].paused, true);
+  await boxControls
+    .getByRole("button", { name: "Resume", exact: true })
+    .click();
+  await boxStatus.filter({ hasText: /waiting on box lab$/ }).waitFor();
+  await announced("Loop resumed");
+  assert.equal(
+    (await live()).split(" | ").filter((s) => s.includes("waits on box lab"))
+      .length,
+    1,
+    "The wait is said once",
+  );
+  await ariaOf("43-box-away", boxLoops);
+  await capture("43-box-away", null, {
+    narrow: inspectorNarrow(boxLoops),
+    restore: selectBoxer,
+  });
+  console.log(
+    "PASS: the runner stopped during a review run: the loop line and the inspector say the loop waits on box lab, said once; its controls still work",
+  );
+
+  // The app opened while the loop waits (the renderer reloaded: its state comes from the
+  // hub's snapshot), then its own connection dropped and back (the hub restarted).
+  const listen = () =>
+    page.evaluate(() => {
+      window.__said = [];
+      new MutationObserver(() => {
+        for (const node of document.querySelectorAll("[data-twr-live]"))
+          if (node.textContent && window.__said.at(-1) !== node.textContent)
+            window.__said.push(node.textContent);
+      }).observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+      });
+    });
+  await page.reload();
+  await listen();
+  await connected();
+  await sidebar();
+  await boxChip
+    .locator(".loop-line")
+    .filter({ hasText: /waiting on box lab$/ })
+    .waitFor();
+  await selectBoxer();
+  await boxStatus.filter({ hasText: /waiting on box lab$/ }).waitFor();
+  await boxRounds.getByText("m1 waits for box lab").waitFor();
+  twr("hub", "stop");
+  await new Promise((r) => hub.once("exit", r));
+  await startHub();
+  await connected();
+  await selectBoxer();
+  await boxStatus.filter({ hasText: /waiting on box lab$/ }).waitFor();
+  await page.waitForTimeout(1500);
+  assert(
+    !(await live()).includes("waits on box lab"),
+    "A wait the app opened on is shown, not said again",
+  );
+  console.log(
+    "PASS: opened, and reconnected, while the loop waits: the app shows the wait from the snapshot",
+  );
+
+  // The runner started again: the loop goes on from the same round, without a reload.
+  boxRelease(1);
+  boxHold(2);
+  await startRunner({ codex: true });
+  await until(() => boxRuns() === 2, "The round's retry never started");
+  await announced("boxer's review loop goes on: box lab is back");
+  await boxChip
+    .locator(".loop-line")
+    .filter({ hasText: /^low · ladder m1$/ })
+    .waitFor();
+  await boxStatus
+    .filter({ hasText: /REVIEW LOOP\s+low · waiting on the review$/ })
+    .waitFor();
+  await boxRounds.getByText("m1 under review again").waitFor();
+  assert.equal(await boxRounds.locator("li").count(), 1, "Still round m1");
+  await capture("44-box-back", boxLoops, {
+    narrow: inspectorNarrow(boxLoops),
+    restore: selectBoxer,
+  });
+  boxRelease(2);
+  await until(
+    () => !boxer().loop && boxer().last_loop,
+    "The box's review loop never ended",
+    60000,
+  );
+  assert.equal(boxer().last_loop.outcome, "clean");
+  await announced("boxer's review loop ended: clean");
+  await boxLoops.getByText("Last review loop: clean").waitFor();
+  await boxLoops.getByRole("button", { name: "Open report" }).click();
+  const boxReport = page.getByRole("dialog", {
+    name: "Review loop report · boxer",
+  });
+  await boxReport.waitFor();
+  await boxReport
+    .getByText("m1: 0 findings; failed run: box lab disconnected")
+    .waitFor();
+  await ariaOf("45-box-report", boxReport);
+  await capture("45-box-report", null, { narrow: false });
+  await page.keyboard.press("Escape");
+  await boxReport.waitFor({ state: "hidden" });
+  console.log(
+    "PASS: the runner back, the loop goes on from round m1 without a reload, ends clean and its report says the run that failed",
+  );
+
+  // An implementation loop on the box thread, sent from its composer, on the saved settings.
+  // Its commit names the box thread's repository.
+  writeFileSync(
+    join(templates, "impl-report.md"),
+    '!sleep 4000\nBuilt the CSV export.\n{{commit}}\n```twr-commit\n{"commits": [{"repo": "box-repo", "sha": "abc1234"}]}\n```\n',
+  );
+  await selectBoxer();
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  const boxerBox = page.getByRole("textbox", {
+    name: "Message boxer directly",
+  });
+  await boxerBox.waitFor();
+  await page.getByText("Loading conversation…").waitFor({ state: "hidden" });
+  await boxerBox.fill("add a CSV export to the reports page");
+  await page.getByRole("button", { name: "More ways to send" }).click();
+  await page
+    .getByRole("button", { name: "Send as implementation loop", exact: true })
+    .click();
+  await until(
+    () => boxer().loop?.kind === "implement",
+    "The box's implementation loop never started",
+  );
+  await sidebar();
+  await boxChip
+    .locator(".loop-badge")
+    .filter({ hasText: "IMPLEMENT LOOP" })
+    .waitFor();
+  await until(
+    () => boxer().loop?.phase === "report",
+    "The box's implementation loop never reached its report",
+    90000,
+  );
+  // Only the loop's work: the review's change before it is the baseline, not its to commit.
+  commitIn(boxer().worktree, "Add the CSV export", ["feature.rs"]);
+  await until(
+    () => !boxer().loop && boxer().last_loop?.kind === "implement",
+    "The box's implementation loop never ended",
+    60000,
+  );
+  const boxLast = boxer().last_loop;
+  assert.equal(boxLast.outcome, "clean");
+  assert.equal(boxLast.commits?.length, 1, JSON.stringify(boxLast));
+  const boxSha = boxLast.commits[0].sha.slice(0, 7);
+  await announced(
+    `boxer's implementation loop ended: clean; committed ${boxSha}`,
+  );
+  await boxerCard()
+    .locator(".loop-ended")
+    .filter({ hasText: `committed ${boxSha}` })
+    .waitFor();
+  await selectBoxer();
+  await boxLoops.getByText("Last implementation loop: clean").waitFor();
+  writeFileSync(
+    join(templates, "impl-report.md"),
+    '!sleep 4000\nBuilt the CSV export.\n{{commit}}\n```twr-commit\n{"commits": [{"repo": "demo", "sha": "abc1234"}]}\n```\n',
+  );
+  console.log(
+    "PASS: an implementation loop on the box thread, sent from its composer, plans, implements, reviews on the box and commits",
+  );
+
+  // The box away with no loop running: nothing offers to start one (the hub refuses it).
+  await stopRunner();
+  await until(() => boxer().box_online === false, "Box lab never went offline");
+  await selectBoxer();
+  const startWhy = boxLoops.locator(".loop-start-why");
+  await startWhy
+    .filter({ hasText: "Box lab is away: a loop can start once it is back." })
+    .waitFor();
+  for (const name of ["Review loop", "Implementation loop…"])
+    assert(
+      await boxLoops.getByRole("button", { name, exact: true }).isDisabled(),
+      `${name} is disabled while the box is away`,
+    );
+  await readsInBoth(startWhy, "Why no loop can start");
+  await ariaOf("46-box-offline-start", boxLoops);
+  await capture("46-box-offline-start", boxLoops, { narrow: false });
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  await boxerBox.fill("another task");
+  await page.getByRole("button", { name: "More ways to send" }).click();
+  const awayChoice = page.getByRole("button", {
+    name: "Send as implementation loop",
+    exact: true,
+  });
+  assert(await awayChoice.isDisabled(), "Send as implementation loop waits");
+  await page
+    .locator(".send-loop-panel small")
+    .filter({ hasText: "Box lab is away: a loop can start once it is back." })
+    .waitFor();
+  // The choice can't be made: the focus goes to its panel, which says why, and Escape
+  // closes it, giving the focus back to the caret (not leaving the conversation).
+  assert(
+    await page
+      .locator(".send-loop-panel")
+      .evaluate((n) => n === document.activeElement),
+    "The panel that says why has the focus",
+  );
+  await page.keyboard.press("Escape");
+  await page.locator(".send-loop-panel").waitFor({ state: "hidden" });
+  assert.equal((await focused()).text, "More ways to send");
+  await boxerBox.fill("");
+  console.log(
+    "PASS: with the box away, Review loop, Implementation loop… and Send as implementation loop say why they wait",
+  );
+
+  // ---------------------------------------------------------------------------------
+  // 12. An ACP preset as the reviewer: the pickers list every preset, the one that can't
+  //     review disabled and named with why; the card says what its read-only rests on; a
+  //     loop on it runs to its end; the preset removed from the config, the card says so.
+  // ---------------------------------------------------------------------------------
+  const acpHold = (n) => writeFileSync(join(acpState, `hold.${n}`), "");
+  const acpRelease = (n) =>
+    rmSync(join(acpState, `hold.${n}`), { force: true });
+  await page.evaluate(async () => {
+    await window.twr.rpc("loop.settings.reset", {});
+    await window.twr.rpc("thread.new", {
+      project: "demo",
+      name: "acpw",
+      runtime: "fake",
+      mode: "auto",
+    });
+    await window.twr.rpc("thread.send", {
+      thread: "acpw",
+      prompt: "!write lib.rs pub fn g() { todo!() }\nWrote it.",
+    });
+  });
+  await until(
+    () =>
+      thread("acpw")?.status === "done" &&
+      Number(thread("acpw").git?.dirty_files) > 0,
+    "acpw's turn never ended with changes",
+  );
+  const acpCard = () =>
+    page.locator(".thread-list .thread-item").filter({ hasText: "acpw" });
+  const selectAcp = async () => {
+    await sidebar();
+    await acpCard().locator(".thread-card").click();
+    await inspector.waitFor();
+    await inspector.getByRole("heading", { name: "acpw" }).waitFor();
+  };
+  const acpLoops = inspector.locator(".inspector-loops");
+  /** The editor's reviewer and implementer pickers in `where`, as a person finds them. */
+  const pickers = async (where, label) => {
+    const reviewer = where
+      .getByRole("group", { name: "Reviewer" })
+      .getByRole("combobox", { name: "Runtime" });
+    const implementer = where.getByRole("combobox", {
+      name: "Implementer",
+      exact: true,
+    });
+    const options = await optionsOf(reviewer);
+    const named = (value) => options.find((o) => o.value === value);
+    assert.deepEqual(named("ex"), {
+      value: "ex",
+      text: "ex (acp, read-only mode)",
+      disabled: false,
+    });
+    assert.deepEqual(named("bare"), {
+      value: "bare",
+      text: "bare (acp preset bare names no read-only mode)",
+      disabled: true,
+    });
+    assert.deepEqual(named("loose"), {
+      value: "loose",
+      text: `loose (acp preset loose's review mode "default" is not read-only: twr knows it as a mode that lets the agent act)`,
+      disabled: true,
+    });
+    assert.deepEqual(
+      (await optionsOf(implementer))
+        .map((o) => o.value)
+        .filter((v) => ["ex", "bare", "loose"].includes(v)),
+      [],
+      `${label}: no ACP preset is offered as the implementer`,
+    );
+    const skipped = where.locator(".loop-editor-skipped");
+    assert.equal(
+      await skipped.innerText(),
+      `Can't review: grok-build (not installed); bare (acp preset bare names no read-only mode); loose (acp preset loose's review mode "default" is not read-only: twr knows it as a mode that lets the agent act)`,
+    );
+    await readsInBoth(skipped, `${label}: the reviewers that can't review`);
+    // A screen reader hears the reasons with the picker.
+    const described = await reviewer.evaluate((n) =>
+      (n.getAttribute("aria-describedby") || "")
+        .split(" ")
+        .map((id) => document.getElementById(id)?.textContent || "")
+        .join(" "),
+    );
+    assert.match(described, /Can't review: grok-build/);
+    return reviewer;
+  };
+  // The setup card's editor.
+  await selectAcp();
+  await acpLoops
+    .getByRole("button", { name: "Review loop", exact: true })
+    .click();
+  const acpSetup = setupIn(inspector);
+  await acpSetup.waitFor({ timeout: 15000 });
+  await armed(acpSetup);
+  await acpSetup.getByRole("button", { name: "Change…" }).click();
+  const acpEditor = page.getByRole("dialog", { name: "Loop settings · acpw" });
+  await acpEditor.waitFor();
+  await acpEditor
+    .getByText("Loading loop settings…")
+    .waitFor({ state: "hidden" });
+  const cardReviewer = await pickers(acpEditor, "The card's editor");
+  await cardReviewer.focus();
+  await cardReviewer.selectOption("ex");
+  const acpModel = acpEditor
+    .getByRole("group", { name: "Reviewer" })
+    .getByRole("combobox", { name: "Model" });
+  assert.equal(await acpModel.inputValue(), "m-large");
+  assert.deepEqual(
+    (await optionsOf(acpModel))
+      .map((o) => o.value)
+      .filter((v) => v.startsWith("m-")),
+    ["m-large", "m-small"],
+  );
+  const acpNote = acpEditor.locator(".loop-editor-acp");
+  assert.equal(
+    await acpNote.innerText(),
+    'ex is an ACP agent: it reviews in its own "read-only" mode, at the efforts medium, xhigh, which every round of the profile must use.',
+  );
+  await readsInBoth(acpNote, "The ACP reviewer's note");
+  await ariaOf("50-acp-editor", acpEditor);
+  await capture("50-acp-editor", null, { narrow: false });
+  await acpEditor.getByRole("button", { name: "Save to the card" }).click();
+  await acpEditor.waitFor({ state: "hidden" });
+  await acpSetup
+    .getByText(
+      `acp reviewer: read-only rests on the agent's own "read-only" mode`,
+    )
+    .waitFor();
+  assert.match(
+    await acpSetup.locator(".loop-setup-rows").innerText(),
+    /Reviewer\s+ex · m-large · medium → xhigh/,
+  );
+  await ariaOf("51-acp-card", acpSetup);
+  await capture("51-acp-card", null, {
+    narrow: inspectorNarrow(acpSetup),
+    restore: selectAcp,
+  });
+  console.log(
+    "PASS: the card's editor lists the ACP presets (the one that reviews with its mode, models and efforts; the others disabled, with why, in words); none as implementer; the card warns what read-only rests on",
+  );
+  // Start and save: the loop runs on the ACP reviewer to its end.
+  acpHold(1);
+  await armed(acpSetup);
+  await acpSetup.getByRole("button", { name: "Start and save" }).click();
+  await until(
+    () => thread("acpw").loop?.waiting_on === "review",
+    "The ACP review run never started",
+    60000,
+  );
+  await sidebar();
+  await acpCard()
+    .locator(".thread-card")
+    .filter({ hasText: "reviewer ex m-large medium" })
+    .waitFor({ timeout: 15000 });
+  await selectAcp();
+  assert.match(
+    await acpLoops.locator(".loop-facts").first().innerText(),
+    /Reviewer\s+ex · m-large · medium/,
+  );
+  await capture("52-acp-running", acpLoops, {
+    narrow: inspectorNarrow(acpLoops),
+    restore: selectAcp,
+  });
+  acpRelease(1);
+  await until(
+    () => !thread("acpw").loop && thread("acpw").last_loop,
+    "The ACP review loop never ended",
+    90000,
+  );
+  assert.equal(thread("acpw").last_loop.outcome, "clean");
+  await acpLoops.getByText("Last review loop: clean").waitFor();
+  await acpLoops.getByRole("button", { name: "Open report" }).click();
+  const acpReport = page.getByRole("dialog", {
+    name: "Review loop report · acpw",
+  });
+  await acpReport.waitFor();
+  await acpReport.getByText("Reviewer: ex m-large").waitFor();
+  await page.keyboard.press("Escape");
+  await acpReport.waitFor({ state: "hidden" });
+  console.log(
+    "PASS: a review loop on the ACP reviewer runs to its end, the reviewer named on the card, in the inspector and in the report",
+  );
+  // Settings › Loops and one project's editor list the same.
+  await sidebar();
+  await page
+    .locator(".sidebar")
+    .getByRole("button", { name: "Settings", exact: true })
+    .first()
+    .click();
+  const loopsPanel = page
+    .locator(".settings-section")
+    .filter({ has: page.getByRole("heading", { name: "Loops", exact: true }) });
+  await loopsPanel.waitFor();
+  await loopsPanel
+    .getByRole("group", { name: "Reviewer" })
+    .waitFor({ timeout: 15000 });
+  const panelReviewer = await pickers(loopsPanel, "Settings › Loops");
+  assert.equal(await panelReviewer.inputValue(), "ex", "The saved reviewer");
+  await loopsPanel.locator(".loop-editor-acp").waitFor();
+  await loopsPanel.scrollIntoViewIfNeeded();
+  await capture("53-acp-settings", loopsPanel, { narrow: false });
+  await selectAcp();
+  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  const acpBox = page.getByRole("textbox", { name: "Message acpw directly" });
+  await acpBox.waitFor();
+  await acpBox.fill("/loop settings --project demo");
+  await acpBox.press("Enter");
+  const demoEditor = page.getByRole("dialog", { name: "Loop settings · demo" });
+  await demoEditor.waitFor();
+  await demoEditor
+    .getByText("Loading loop settings…")
+    .waitFor({ state: "hidden" });
+  await pickers(demoEditor, "A project's editor");
+  await capture("54-acp-project", demoEditor, { narrow: false });
+  await page.keyboard.press("Escape");
+  await demoEditor.waitFor({ state: "hidden" });
+  console.log(
+    "PASS: Settings › Loops and a project's editor list the ACP presets the same way",
+  );
+  // The preset removed from the config while it is the saved reviewer: the next loop's
+  // card says it is no preset any more and reviews with the replacement.
+  await restartHub(remoteConfig(false));
+  await selectAcp();
+  await acpLoops
+    .getByRole("button", { name: "Review loop", exact: true })
+    .click();
+  await acpSetup.waitFor({ timeout: 15000 });
+  await acpSetup
+    .getByText(
+      "ex is no reviewer: neither a built-in one (claude-code, codex, grok-build) nor an acp preset in the config: reviewing with claude-code · claude-opus-5-5 instead",
+    )
+    .waitFor();
+  assert.match(
+    await acpSetup.locator(".loop-setup-rows").innerText(),
+    /Reviewer\s+claude-code · claude-opus-5-5 · medium → xhigh/,
+  );
+  await ariaOf("55-acp-removed", acpSetup);
+  await capture("55-acp-removed", null, {
+    narrow: inspectorNarrow(acpSetup),
+    restore: selectAcp,
+  });
+  await armed(acpSetup);
+  await acpSetup.getByRole("button", { name: "Cancel" }).click();
+  await acpSetup.waitFor({ state: "hidden" });
+  console.log(
+    "PASS: the saved ACP reviewer removed from the config: the next card says so and offers the replacement",
+  );
+
   if (errors.length) throw new Error(errors.join("\n"));
   console.log(
     "PASS: review and implementation loops in the desktop app against a real hub",
@@ -2104,6 +2959,7 @@ try {
       .catch(() => {});
   }
   console.error("Hub log:", hubLog.slice(-4000));
+  if (runnerLog) console.error("Box runner log:", runnerLog.slice(-3000));
   process.exitCode = 1;
 } finally {
   if (application)
@@ -2123,7 +2979,13 @@ try {
       new Promise((resolve) => hub.once("exit", resolve)),
       new Promise((resolve) => setTimeout(resolve, 5000)),
     ]);
+  if (runner && runner.exitCode === null) runner.kill("SIGKILL");
   stopFixture(join(bin, "twr"), env, { workspaces: [] });
+  stopFixture(
+    join(bin, "twr"),
+    { ...env, TWR_HOME: boxHome },
+    { workspaces: [] },
+  );
   rmSync(home, {
     recursive: true,
     force: true,

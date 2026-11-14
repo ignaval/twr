@@ -145,6 +145,12 @@ export interface LoopState {
   paused: boolean;
   stuck?: string | null;
   waiting_on: "thread" | "review" | "user";
+  /** The thread's remote box, while the loop waits for it to come back (`loop.box`): it
+   * went away while the loop needed it for a run of the hub's. */
+  box_away?: string | null;
+  /** The current round's review run failed once: the run in flight (or the next) is its
+   * retry. */
+  retried?: boolean;
   reviewer: { runtime: string; model: string; effort?: string | null };
   review_started_at?: string | null;
   outcome?: string | null;
@@ -215,6 +221,8 @@ export function offersReview(
   if (["parked", "attached"].includes(thread.status)) return false;
   if (thread.loop) return false;
   if (stoppedBySomeone(thread)) return false;
+  // The hub refuses a loop on a box that is away (`box_offline`).
+  if (boxAway(thread)) return false;
   if (thread.current_turn != null) return false;
   const lastTurn = Number(thread.last_turn?.turn);
   if (!Number.isFinite(lastTurn) || lastTurn <= 0) return false;
@@ -499,9 +507,16 @@ export function skippedPhases(state: LoopState): string[] {
 /** What a running loop waits for, in words. */
 export function waitingWords(
   l: Pick<LoopState, "waiting_on" | "paused" | "stuck"> &
-    Partial<Pick<LoopState, "wait">>,
+    Partial<Pick<LoopState, "wait" | "box_away">>,
 ) {
   if (l.stuck) return `stuck: ${l.stuck}`;
+  // Its thread's remote box went away while the loop needed it: the hub starts nothing
+  // there until it is back, and then goes on from where the loop was. (Short, as the loop
+  // line says it: the round's line says what runs again.)
+  if (l.box_away)
+    return l.paused
+      ? `paused, waiting on box ${l.box_away}`
+      : `waiting on box ${l.box_away}`;
   if (l.waiting_on === "review" && l.wait?.step === "audits")
     // Paused, the audits in flight finish; none starts until Resume.
     return l.paused
@@ -519,14 +534,21 @@ export function waitingWords(
 
 /** A round's line in the inspector. The round whose review run is in flight (the last one,
  * while the loop waits on the review) has found nothing yet: it says so, rather than "0
- * findings", which reads as a clean round. */
+ * findings", which reads as a clean round. A round whose run failed is run once more: while
+ * that retry runs it is under review again, and while it waits for the thread's box to come
+ * back it says so. */
 export function roundWords(
   round: LoopState["rounds"][number],
-  l: Pick<LoopState, "rounds" | "waiting_on">,
+  l: Pick<LoopState, "rounds" | "waiting_on"> &
+    Partial<Pick<LoopState, "box_away" | "review_started_at">>,
 ) {
-  if (round.failed) return "review run failed";
-  if (l.waiting_on === "review" && l.rounds.at(-1)?.id === round.id)
-    return "under review";
+  const current = l.waiting_on === "review" && l.rounds.at(-1)?.id === round.id;
+  if (round.failed) {
+    if (!current) return "review run failed";
+    if (l.box_away) return `waits for box ${l.box_away}`;
+    return l.review_started_at ? "under review again" : "review run failed";
+  }
+  if (current) return "under review";
   return `${round.findings} finding${round.findings === 1 ? "" : "s"} · ${round.new_class} new class`;
 }
 
@@ -730,6 +752,65 @@ export function endedLoops(
     );
   }
   return { said, known: next };
+}
+
+/**
+ * The loops that started or stopped waiting on their thread's remote box since `known`
+ * (thread id → the box its loop waits on, `""` for none, as last seen), as the words a screen
+ * reader hears (`api's review loop waits on box devbox: it goes on when the box is back`;
+ * `api's review loop goes on: box devbox is back`), and the new `known`. Said once per
+ * change. A thread seen for the first time is known, not news: a loop that already waited
+ * when the app opened shows it, and is not said.
+ */
+export function boxWaits(
+  known: Map<string, string> | undefined,
+  threads: { id: string; name: string; loop?: Json }[],
+): { said: string[]; known: Map<string, string> } {
+  const next = new Map<string, string>();
+  const said: string[] = [];
+  for (const t of threads) {
+    const l = t.loop as LoopState | undefined | null;
+    const away = (l && typeof l.box_away === "string" && l.box_away) || "";
+    next.set(t.id, away);
+    if (!known || !known.has(t.id)) continue;
+    const was = known.get(t.id) || "";
+    if (was === away) continue;
+    const kind = l?.kind === "implement" ? "implementation" : "review";
+    if (away)
+      said.push(
+        `${t.name}'s ${kind} loop waits on box ${away}: it goes on when the box is back`,
+      );
+    // Back while the loop still runs (a loop that ended is said as ended).
+    else if (l)
+      said.push(`${t.name}'s ${kind} loop goes on: box ${was} is back`);
+  }
+  return { said, known: next };
+}
+
+/** The thread's remote box, when it is away (`box_online: false`); else undefined. */
+export function boxAway(thread: Thread | undefined): string | undefined {
+  if (!thread || thread.box_online !== false) return undefined;
+  const name = typeof thread.box_name === "string" ? thread.box_name : "";
+  return name && name !== "local" ? name : undefined;
+}
+
+/**
+ * What a device may do to start a loop on `thread`: what `access` allows, and not while the
+ * thread's remote box is away (the hub refuses it, `box_offline`). A running loop's controls
+ * still work then: the hub holds them, not the box.
+ */
+export function startAccess(
+  access: LoopAccess,
+  thread: Thread | undefined,
+): LoopAccess {
+  if (!access.act) return access;
+  const away = boxAway(thread);
+  return away
+    ? {
+        act: false,
+        why: `Box ${away} is away: a loop can start once it is back.`,
+      }
+    : access;
 }
 
 /** A loop that started, as a screen reader hears it and the notice says it. */
@@ -1353,6 +1434,43 @@ export function reviewerUsable(r: RuntimeInfo | undefined): {
   const u = runtimeUsable(r);
   if (!r?.acp || !u.usable) return u;
   return { usable: true, note: `acp, ${r.review_mode || "read-only"} mode` };
+}
+
+/**
+ * The reviewers the picker lists that can't be picked, with why, as a line the editor shows
+ * under it (a disabled option's reason shows only while its list is open, and dimmed):
+ * `Can't review on box devbox: codex (not installed); bare (acp preset bare names no
+ * read-only mode)`. Undefined when every one can.
+ */
+export function reviewersSkipped(
+  runtimes: RuntimeInfo[],
+  box?: string | null,
+): string | undefined {
+  const out = runtimes.flatMap((r) => {
+    const u = reviewerUsable(r);
+    return u.usable ? [] : [`${r.runtime} (${u.why})`];
+  });
+  return out.length
+    ? `Can't review${box ? ` on box ${box}` : ""}: ${out.join("; ")}`
+    : undefined;
+}
+
+/**
+ * What the editor says of an ACP preset picked as the reviewer: the mode its read-only rests
+ * on and the efforts it takes, which every round of the profile must use (none listed: its
+ * agent picks its own). Undefined for any other reviewer.
+ */
+export function acpReviewerNote(
+  r: RuntimeInfo | undefined,
+): string | undefined {
+  if (!r?.acp || r.cannot_review) return undefined;
+  const efforts = r.efforts || [];
+  const mode = r.review_mode || "read-only";
+  return `${r.runtime} is an ACP agent: it reviews in its own "${mode}" mode, ${
+    efforts.length
+      ? `at the efforts ${efforts.join(", ")}, which every round of the profile must use`
+      : "at the effort its agent picks (its preset lists none)"
+  }.`;
 }
 
 /** The runtimes a role's picker lists: the implementer's never holds an ACP preset. */

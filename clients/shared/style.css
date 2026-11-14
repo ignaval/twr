@@ -2248,6 +2248,11 @@ meter::-webkit-meter-optimum-value {
   border-bottom: 1px solid var(--border);
   color: var(--muted);
 }
+/* A round with something to show (findings, a failed run's reason) is a disclosure row: as
+ * tall as a plain round's row, so a round that fails or answers moves nothing below it. */
+:root:not([data-mobile="true"]) .loop-rounds > li > details > summary {
+  padding-block: 0;
+}
 .loop-rounds b {
   color: var(--text);
   font-weight: 600;

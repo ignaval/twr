@@ -905,6 +905,15 @@ select {
   padding-block: max(0px, calc((44px - 1.5em) / 2));
   line-height: 1.5;
 }
+/* A loop's rounds: a plain round's row as tall as a disclosure row (44 points), so a round
+ * that fails or answers moves nothing below it. */
+[data-mobile="true"] .loop-rounds > li {
+  min-height: 44px;
+  padding-block: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
 /* A model picker's switch back to its list. */
 [data-mobile="true"] .input-with-button > button {
   min-width: 44px;

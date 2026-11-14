@@ -830,6 +830,27 @@ async fn stopping_the_loop_kills_its_acp_reviewer() {
     .await
     .expect("the held agent's pids");
     assert!(alive(pids.0) && alive(pids.1));
+    // The card's activity names the preset with its model: an ACP agent's model ids are
+    // its own, and do not say who reviews.
+    until(&hub, "the review task", |h| {
+        h.thread_view(&t)
+            .is_ok_and(|v| !v.background_tasks.is_empty())
+    })
+    .await;
+    let j = hub.get_thread(&t).unwrap();
+    let task = j["background_tasks"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert!(
+        task["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("reviewer ex m-large medium · 0m"),
+        "{task}"
+    );
     hub.loop_control(
         twr_hub::hub::LoopControlParams {
             thread: t.clone(),

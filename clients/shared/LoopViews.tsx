@@ -9,6 +9,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -56,6 +57,9 @@ import {
   skippedPhases,
   startedWords,
   reviewerUsable,
+  reviewersSkipped,
+  acpReviewerNote,
+  startAccess,
   runtimeUsable,
   runtimesFor,
   setupCardState,
@@ -391,6 +395,8 @@ export function LoopsSection({
     onFocused?.();
   }, [focus]);
   const act = loops.access.act;
+  // Starting one also needs the thread's box: the hub refuses a loop on a box that is away.
+  const start = startAccess(loops.access, thread);
   const run = (what: string, job: () => Promise<unknown>) => {
     setBusy(what);
     void job().finally(() => setBusy(""));
@@ -423,8 +429,11 @@ export function LoopsSection({
           <div className="loop-starts">
             <button
               type="button"
-              disabled={!act || !!busy}
-              title={loops.access.why}
+              disabled={!start.act || !!busy}
+              title={start.why}
+              aria-describedby={
+                start.why && act ? `${headingId}-start-why` : undefined
+              }
               onClick={() => run("review", () => loops.startReview(thread.id))}
             >
               {busy === "review" ? (
@@ -437,9 +446,12 @@ export function LoopsSection({
             <button
               type="button"
               ref={implementOpener}
-              disabled={!act || !!busy}
+              disabled={!start.act || !!busy}
+              aria-describedby={
+                start.why && act ? `${headingId}-start-why` : undefined
+              }
               title={
-                loops.access.why ||
+                start.why ||
                 "Plan, build and review a task: the thread plans and implements it, a reviewer model checks the work round by round, and the loop commits at the end."
               }
               aria-haspopup="dialog"
@@ -453,6 +465,11 @@ export function LoopsSection({
               Implementation loop…
             </button>
           </div>
+          {start.why && act && (
+            <p className="muted loop-start-why" id={`${headingId}-start-why`}>
+              {start.why}
+            </p>
+          )}
           <LoopSettingsLine
             project={thread.project}
             connected={connected}
@@ -1105,8 +1122,22 @@ const commitModeWords = (mode: string | undefined) =>
 // The setup card
 // ---------------------------------------------------------------------------------------
 
-/** Setup cards whose sheet is open, by attention id. */
-const openSheets = new Set<string>();
+/**
+ * Setup cards whose sheet is open, by attention id, with where it was opened: a card shows in
+ * several places at once (Needs you, the inspector, the conversation), and only the copy it
+ * was opened from opens it again when the card is raised again at a new revision. `place`
+ * is undefined for a sheet whose place can't be told (opened, then turned sideways); either
+ * way the first copy raised again there takes it (`revision`), never two.
+ */
+const openSheets = new Map<string, { place?: string; revision?: number }>();
+
+/** Where a setup card's row is: in the inspector, the conversation, or a list. */
+function placeOf(node: Element | null | undefined): string | undefined {
+  if (!node) return undefined;
+  if (node.closest("#twr-inspector")) return "inspector";
+  if (node.closest(".conversation-attention")) return "conversation";
+  return "list";
+}
 
 /** Whether the app is laid out for a phone: the mobile app in a window narrower than 800. */
 export const isPhone = () =>
@@ -1135,14 +1166,36 @@ export function LoopSetupCard({
   onRespond: (item: Attention, answer: string) => Promise<void>;
 }) {
   // The hub raises the card again at a new revision when its editor saves, and lists key
-  // a card by revision: an open sheet stays open across that remount.
-  const [sheet, setSheetState] = useState(() => openSheets.has(item.attn_id));
+  // a card by revision: an open sheet stays open across that remount, in the copy of the
+  // card it was opened from only (two sheets would each make the other inert).
+  const [sheet, setSheetState] = useState(false);
   const opener = useRef<HTMLButtonElement>(null);
+  const row = useRef<HTMLElement>(null);
   const setSheet = (open: boolean) => {
-    if (open) openSheets.add(item.attn_id);
+    if (open)
+      openSheets.set(item.attn_id, {
+        place: placeOf(row.current),
+        revision: item.revision,
+      });
     else openSheets.delete(item.attn_id);
     setSheetState(open);
   };
+  useLayoutEffect(() => {
+    const open = openSheets.get(item.attn_id);
+    if (!open) return;
+    // The copy that holds it, not remounted, keeps it at the new revision.
+    if (sheet) {
+      open.revision = item.revision;
+      return;
+    }
+    const here = placeOf(row.current);
+    // Its place (when both can be told), and the first copy there raised again: a place
+    // can hold the card twice (two lists), and only one copy opens it.
+    const there = !open.place || !here || open.place === here;
+    if (!there || open.revision === item.revision) return;
+    open.revision = item.revision;
+    setSheetState(true);
+  }, [item.attn_id, item.revision]);
   const { parsed, kind } = setupCardState(item);
   const heading = setupHeading(kind);
   const phone = isPhone();
@@ -1175,6 +1228,7 @@ export function LoopSetupCard({
   return (
     <>
       <article
+        ref={row}
         className="attention-card attention-loop-setup loop-setup-row"
         aria-label={`${heading} for ${thread?.name || "a thread"}`}
       >
@@ -1451,7 +1505,12 @@ export function SendAsLoop({
   const panel = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
-    panel.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    // Focus goes into the choice, or, when it can't be made, to the panel that says why:
+    // a disabled button takes no focus, and Escape must still reach the panel to close it.
+    const choice = Array.from(
+      panel.current?.querySelectorAll<HTMLButtonElement>("button") || [],
+    ).find((b) => !b.disabled);
+    (choice || panel.current)?.focus();
     const away = (event: MouseEvent) => {
       const target = event.target as Node;
       if (!panel.current?.contains(target) && !opener.current?.contains(target))
@@ -1464,7 +1523,9 @@ export function SendAsLoop({
     setOpen(false);
     opener.current?.focus();
   };
-  const why = loops.access.why;
+  // A loop on a thread whose box is away can't start: the choice says so.
+  const access = startAccess(loops.access, thread);
+  const why = access.why;
   return (
     <div className={`send-as-loop ${phone ? "phone" : ""}`}>
       <button
@@ -1496,6 +1557,8 @@ export function SendAsLoop({
           ref={panel}
           role="group"
           aria-label="Send as"
+          tabIndex={-1}
+          aria-describedby={access.act ? undefined : `${ids}-what`}
           onKeyDown={(e) => {
             if (e.key === "Escape") {
               e.preventDefault();
@@ -1506,7 +1569,7 @@ export function SendAsLoop({
         >
           <button
             type="button"
-            disabled={!loops.access.act}
+            disabled={!access.act}
             aria-describedby={`${ids}-what`}
             onClick={() => {
               setOpen(false);
@@ -1801,6 +1864,10 @@ export function LoopSettingsForm({
     implementerRuntime ||
     runtimes.find((r) => hasSubagents(r.runtime, runtimes))?.runtime;
   const reviewerAccounts = runtimeOf(s.reviewer.runtime)?.accounts || [];
+  // The reviewers that can't be picked, with why, in words under the picker: a disabled
+  // option's reason shows only while the list is open, and dimmed.
+  const skippedReviewers = reviewersSkipped(runtimes, got.box);
+  const acpNote = acpReviewerNote(runtimeOf(s.reviewer.runtime));
   const preset = matchingPreset(s, got.presets || []);
   const warnings = card ? card.warnings || [] : got.warnings || [];
   const problems = card ? card.problems || [] : got.problems || [];
@@ -1982,6 +2049,12 @@ export function LoopSettingsForm({
             <span>Runtime</span>
             <select
               id={`${ids}-rev`}
+              aria-describedby={[
+                acpNote ? `${ids}-rev-acp` : "",
+                skippedReviewers ? `${ids}-rev-skipped` : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
               value={s.reviewer.runtime}
               onChange={(e) =>
                 change({ kind: "reviewer", runtime: e.target.value })
@@ -2028,6 +2101,19 @@ export function LoopSettingsForm({
           Its effort is each round's, from the profile. An ACP agent reviews
           only in the read-only mode its preset names.
         </small>
+        {acpNote && (
+          <small className="muted loop-editor-acp" id={`${ids}-rev-acp`}>
+            {acpNote}
+          </small>
+        )}
+        {skippedReviewers && (
+          <small
+            className="muted loop-editor-skipped"
+            id={`${ids}-rev-skipped`}
+          >
+            {skippedReviewers}
+          </small>
+        )}
       </div>
       <div className="loop-editor-row">
         <label className="field" htmlFor={`${ids}-profile`}>

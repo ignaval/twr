@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  acpReviewerNote,
   editSettings,
+  reviewersSkipped,
   reviewerUsable,
   runtimesFor,
   type LoopSettings,
@@ -100,5 +102,31 @@ describe("ACP reviewers in the settings editor", () => {
       runtime: "ex",
       model: "ex-large",
     });
+  });
+});
+
+describe("the reviewer picker's notes", () => {
+  it("names every reviewer that can't be picked, with why, in words", () => {
+    // A disabled option's reason shows only while its list is open, and dimmed.
+    expect(reviewersSkipped(runtimes)).toBe(
+      "Can't review: bare (acp preset bare names no read-only mode); gone (not installed)",
+    );
+    expect(reviewersSkipped(runtimes, "devbox")).toMatch(
+      /^Can't review on box devbox: bare /,
+    );
+    expect(reviewersSkipped(runtimes.slice(0, 2))).toBeUndefined();
+  });
+
+  it("says what an ACP reviewer's read-only rests on and the efforts it takes", () => {
+    const ex = { ...runtimes[1], efforts: ["medium", "xhigh"] };
+    expect(acpReviewerNote(ex)).toBe(
+      'ex is an ACP agent: it reviews in its own "read-only" mode, at the efforts medium, xhigh, which every round of the profile must use.',
+    );
+    expect(acpReviewerNote(runtimes[1])).toBe(
+      'ex is an ACP agent: it reviews in its own "read-only" mode, at the effort its agent picks (its preset lists none).',
+    );
+    // Nothing for a built-in reviewer or a preset that can't review.
+    expect(acpReviewerNote(runtimes[0])).toBeUndefined();
+    expect(acpReviewerNote(runtimes[2])).toBeUndefined();
   });
 });

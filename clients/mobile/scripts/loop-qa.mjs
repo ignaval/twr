@@ -21,8 +21,9 @@ import {
   existsSync,
 } from "node:fs";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { join, resolve } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { createServer } from "node:net";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -2306,3 +2307,867 @@ export const IOS_ACCEPT_CONFIRM = `async () => {
   };
   return true;
 }`;
+
+// ---------------------------------------------------------------------------------------
+// Loops on a remote box and ACP reviewers (docs/design/loops.md, "Milestone 4")
+// ---------------------------------------------------------------------------------------
+
+/** A free TCP port on loopback. */
+const freePort = () =>
+  new Promise((done, fail) => {
+    const server = createServer();
+    server.once("error", fail);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => done(port));
+    });
+  });
+/** What the live regions say, kept on the page (they clear after a few seconds). */
+const LISTEN = `async () => {
+  window.__said = [];
+  new MutationObserver(() => {
+    for (const node of document.querySelectorAll("[data-twr-live]"))
+      if (node.textContent && window.__said.at(-1) !== node.textContent) window.__said.push(node.textContent);
+  }).observe(document.body, { subtree: true, childList: true, characterData: true });
+  return true;
+}`;
+/** A thread's card in the Threads tab, and its loop chip's line. */
+const CARD = `async (a, lq) => {
+  const item = lq.all('.thread-item').find((i) => lq.text(i.querySelector('.thread-card')).startsWith(a.name));
+  if (!item) return false;
+  return { text: lq.text(item), chip: lq.text(item.querySelector('.loop-chip .loop-line')), ended: lq.text(item.querySelector('.loop-ended')) };
+}`;
+/** The inspector's Loops section, as a person reads it. */
+const LOOPS = `async (a, lq) => {
+  const s = document.querySelector('.inspector-loops');
+  if (!s || !lq.visible(s)) return false;
+  const pause = lq.find('.loop-controls button', { re: '^(Pause|Resume)$' }, s);
+  return {
+    status: lq.text(s.querySelector('.loop-status')),
+    rounds: lq.all('.loop-rounds > li', s).map(lq.text),
+    facts: lq.text(s.querySelector('.loop-facts')),
+    why: lq.text(s.querySelector('.loop-start-why')),
+    starts: lq.all('.loop-starts button', s).map((b) => ({ name: lq.nameOf(b), disabled: b.disabled })),
+    last: lq.text(s.querySelector('.loop-last')),
+    pauseTop: pause ? pause.getBoundingClientRect().top - s.getBoundingClientRect().top : null,
+  };
+}`;
+/** The reviewer and implementer pickers and the reviewer's notes of the editor in `root`
+ * (the top dialog, or Settings › Loops). */
+const PICKERS = `async (a, lq) => {
+  const root = a.root === 'dialog' ? [...document.querySelectorAll('[role=dialog]')].at(-1) : lq.all('.settings-section').find((s) => lq.text(s.querySelector('h2')) === 'Loops');
+  const group = [...root.querySelectorAll('.loop-editor-group')].find((g) => lq.text(g.querySelector('.loop-editor-heading')) === 'Reviewer');
+  if (!group) return false;
+  const [runtime, model] = group.querySelectorAll('select');
+  const impl = [...root.querySelectorAll('label.field')].find((l) => lq.text(l.querySelector('span')) === 'Implementer')?.querySelector('select');
+  const options = (s) => [...(s?.options || [])].map((o) => ({ value: o.value, text: o.textContent, disabled: o.disabled }));
+  if (a.pick && runtime.value !== a.pick) {
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(runtime, a.pick);
+    runtime.dispatchEvent(new Event('change', { bubbles: true }));
+    await lq.settle();
+    await lq.sleep(300);
+  }
+  const described = (runtime.getAttribute('aria-describedby') || '').split(' ').map((id) => lq.text(document.getElementById(id))).join(' ');
+  return {
+    reviewer: options(runtime),
+    value: runtime.value,
+    models: options(group.querySelectorAll('select')[1]).map((o) => o.value),
+    model: group.querySelectorAll('select')[1]?.value,
+    implementer: options(impl).map((o) => o.value),
+    skipped: lq.text(root.querySelector('.loop-editor-skipped')),
+    acp: lq.text(root.querySelector('.loop-editor-acp')),
+    box: lq.text(root.querySelector('.loop-editor-box')),
+    described,
+  };
+}`;
+
+/**
+ * Loops on a thread on a remote box, and an ACP preset as the reviewer, on an `operate`
+ * phone (docs/design/loops.md, "Milestone 4 implementation notes"). The hub restarts with a
+ * runner listener, box `lab`'s token and three ACP presets on the scripted ACP reviewer of
+ * the hub's tests; box `lab` is a dial-in `twr runner` on this machine (its own home) with
+ * its own fake Codex and Claude Code, which its agent probe finds. Then, each audited in
+ * light and dark: the setup card naming the box when its reviewer is not installed there;
+ * a reviewer account that is not the box's own login coming back on the card; a review loop
+ * whose runner is stopped during its run, waiting on its box in words and said once, after
+ * a reload and the app's own reconnect too, and going on from the same round once the
+ * runner is back; an implementation loop on the box; nothing offering a start while the box
+ * is away; the reviewer pickers listing the ACP presets (the one that reviews with its mode,
+ * models and efforts, the others disabled with why), the card's ACP warning, a loop on the
+ * ACP reviewer, and the preset removed from the config.
+ *
+ * The driver adds: `home` (the hub's TWR_HOME), `bin`, `env` (the hub's environment) and
+ * `restartHub(extraConfig)`.
+ */
+export async function remoteLoopQA(driver, fixture, options) {
+  const run = new Run(driver, fixture, options);
+  run.step = options.step || 80;
+  const d = driver;
+  const f = fixture;
+  const owner = (method, params) => d.owner(method, params);
+  const twr = (...args) =>
+    execFileSync(join(d.bin, "twr"), args, {
+      env: d.env,
+      encoding: "utf8",
+      stdio: "pipe",
+    });
+  const home = d.home;
+  const port = await freePort();
+  const token = twr("runner", "token").trim();
+  const boxHome = join(home, "box");
+  mkdirSync(boxHome, { recursive: true });
+  writeFileSync(join(boxHome, "lab.token"), token + "\n", { mode: 0o600 });
+  const revs = join(home, "box-reviewers");
+  mkdirSync(revs, { recursive: true });
+  const codex = join(revs, "codex");
+  writeFileSync(
+    codex,
+    `#!/bin/sh
+here=$(dirname "$0")
+case "$1" in --version) echo "codex-cli 0.99.0"; exit 0;; login) exit 0;; esac
+n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$here/count"
+cat > /dev/null
+while [ -f "$here/hold.$n" ]; do sleep 0.05; done
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+printf '%s' '{"findings": []}' > "$out"
+echo '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}'
+`,
+  );
+  chmodSync(codex, 0o755);
+  const claude = join(revs, "claude");
+  writeFileSync(
+    claude,
+    `#!/bin/sh
+case "$1" in --version) echo "2.0.0 (Claude Code)"; exit 0;; auth) echo '{"loggedIn": true, "authMethod": "claude.ai"}'; exit 0;; esac
+exit 1
+`,
+  );
+  chmodSync(claude, 0o755);
+  const boxRuns = () =>
+    existsSync(join(revs, "count"))
+      ? Number(readFileSync(join(revs, "count"), "utf8").trim()) || 0
+      : 0;
+  const boxHold = (n) => writeFileSync(join(revs, `hold.${n}`), "");
+  const boxRelease = (n) => rmSync(join(revs, `hold.${n}`), { force: true });
+  const acpState = join(home, "acp");
+  mkdirSync(acpState, { recursive: true });
+  const acpHold = (n) => writeFileSync(join(acpState, `hold.${n}`), "");
+  const acpRelease = (n) =>
+    rmSync(join(acpState, `hold.${n}`), { force: true });
+  const agent = `python3 ${resolve("../crates/twr-hub/tests/fixtures/acp/reviewer_agent.py")} ${acpState}`;
+  const work = join(home, "accounts", "codex-work");
+  mkdirSync(work, { recursive: true, mode: 0o700 });
+  const extra = (withEx) =>
+    `[hub]\nlisten = "127.0.0.1:${port}"\n[boxes.lab]\ntoken = "${token}"\n[accounts.codex.work]\ndir = ${JSON.stringify(work)}\n` +
+    (withEx
+      ? `[runtimes.ex]\nacp = ${JSON.stringify(agent)}\n[runtimes.ex.review]\nmode = "read-only"\nmodels = ["m-large", "m-small"]\nefforts = ["medium", "xhigh"]\n`
+      : "") +
+    `[runtimes.bare]\nacp = ${JSON.stringify(agent)}\n[runtimes.loose]\nacp = ${JSON.stringify(agent)}\n[runtimes.loose.review]\nmode = "default"\n`;
+  /** After a hub restart, the app's connection is back. */
+  const reconnected = () =>
+    run.until(
+      "async () => { try { return !!(await window.twr.rpc('hub.info')).pid; } catch { return false; } }",
+      {},
+      { what: "the app reconnected", timeout: 90000 },
+    );
+  let runner;
+  const startRunner = async (withCodex = true) => {
+    const env = {
+      ...d.env,
+      TWR_HOME: boxHome,
+      TWR_TEST_USER_TOKEN_FILE: join(boxHome, "user.token"),
+      TWR_BOX_PROBE: "on",
+      TWR_CODEX_BIN: withCodex ? codex : join(revs, "no-codex"),
+      TWR_CLAUDE_BIN: claude,
+      TWR_GROK_BIN: join(revs, "no-grok"),
+      XDG_STATE_HOME: join(boxHome, "state"),
+    };
+    delete env.TWR_TEST_AGENTS;
+    runner = spawn(
+      join(d.bin, "twr"),
+      [
+        "runner",
+        "--hub",
+        `ws://127.0.0.1:${port}`,
+        "--box=lab",
+        `--token-file=${join(boxHome, "lab.token")}`,
+        `--data-dir=${join(boxHome, "data")}`,
+      ],
+      { env, stdio: "ignore" },
+    );
+    await poll(() => {
+      try {
+        return JSON.parse(twr("box", "status", "lab", "--json")).state ===
+          "online"
+          ? true
+          : false;
+      } catch {
+        return false;
+      }
+    }, "box lab online");
+  };
+  const stopRunner = async () => {
+    if (!runner || runner.exitCode !== null) return;
+    const exited = new Promise((r) => runner.once("exit", r));
+    runner.kill("SIGTERM");
+    await exited;
+  };
+  /** The hub has the box's agents as its runner found them (Codex there or not). */
+  const boxAgents = (found) =>
+    poll(async () => {
+      const got = await owner("loop.settings.get", { thread: "boxer" });
+      const c = got.runtimes.find((r) => r.runtime === "codex");
+      return got.box === "lab" && c?.probed && c.found === found;
+    }, "box lab's agents");
+  const git = (dir, ...args) =>
+    execFileSync(
+      "git",
+      [
+        "-C",
+        dir,
+        "-c",
+        "user.name=QA",
+        "-c",
+        "user.email=qa@example.invalid",
+        ...args,
+      ],
+      { stdio: "ignore" },
+    );
+  /** The keyboard put away (a composer just used takes the focus back, and while the
+   * keyboard is up the tab bar is hidden). */
+  const keyboardAway = () =>
+    run.ev(
+      "async (a, lq) => { document.activeElement?.blur(); await window.Capacitor?.Plugins?.Keyboard?.hide?.().catch?.(() => {}); await lq.sleep(400); return true; }",
+    );
+  /** The thread's inspector, from its card on the Threads tab. */
+  const inspect = async (name) => {
+    await keyboardAway();
+    await run.tab("Threads");
+    await run.until(
+      "async (a, lq) => !!lq.find('.thread-card', { re: '^' + a.name })",
+      { name },
+      { what: `${name}'s card` },
+    );
+    await run.tap(".thread-card", { re: `^${name}` });
+    await run.until(LOOPS, {}, { what: `${name}'s Loops section` });
+  };
+  /** The setup card raised in the inspector, opened as its sheet, armed: its text. */
+  const setupSheet = async () => {
+    await run.until(
+      "async (a, lq) => !!lq.find('.inspector .loop-setup-row button', 'Review setup')",
+      {},
+      { what: "the setup card's row" },
+    );
+    await run.tap(".inspector .loop-setup-row button", "Review setup");
+    await run.until(
+      "async (a, lq) => !!lq.find('[role=dialog] .attention-loop-setup') && lq.find('[role=dialog] .attention-options')?.dataset.armed === 'true'",
+      {},
+      { what: "the setup card's sheet, armed" },
+    );
+    return run.ev(
+      "async (a, lq) => lq.text(document.querySelector('[role=dialog] .attention-loop-setup'))",
+    );
+  };
+  const said = () => run.ev("async () => (window.__said || []).join(' | ')");
+  // The settings the loop QA saved, given back at the end: the steps after this one start
+  // loops on them.
+  const before = (await owner("loop.settings.get", {})).settings;
+  try {
+    await d.restartHub(extra(true));
+    await reconnected();
+    await run.ev(LISTEN);
+    await startRunner(false);
+    const repo = join(home, "box-repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main", repo]);
+    writeFileSync(join(repo, "lib.rs"), "pub fn f() {}\n");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-q", "-m", "Initial");
+    twr(
+      "thread",
+      "new",
+      repo,
+      "--box",
+      "lab",
+      "--runtime",
+      "fake",
+      "--name",
+      "boxer",
+      "--mode",
+      "auto",
+    );
+    const boxer = () => threadView(d, "boxer");
+    const worktree = await poll(
+      async () => (await boxer()).worktree,
+      "boxer's worktree",
+    );
+    writeFileSync(join(worktree, "lib.rs"), "fn parse(s: &str) {}\n");
+    await boxAgents(false);
+    await owner("loop.settings.reset", {});
+
+    // 1. The box's runner found no Codex: the card reviews with Claude Code, naming the box.
+    await inspect("boxer");
+    await run.tap(".inspector-loops .loop-starts button", "Review loop");
+    const notInstalled = await setupSheet();
+    assert(
+      notInstalled.includes(
+        "codex isn't installed on box lab: reviewing with claude-code · claude-opus-5-5 instead",
+      ),
+      notInstalled,
+    );
+    await run.shots("box-not-installed", { root: "[role=dialog]" });
+    await run.tap("[role=dialog] .attention-options button", "Change…");
+    await run.until(
+      "async (a, lq) => !!lq.find('[role=dialog] .loop-presets')",
+    );
+    const boxEditor = await run.until(PICKERS, { root: "dialog" });
+    assert.equal(
+      boxEditor.box,
+      "Runtimes as found on box lab: its reviewer runs there.",
+    );
+    assert.equal(
+      boxEditor.skipped,
+      `Can't review on box lab: codex (not installed); grok-build (not installed); bare (acp preset bare names no read-only mode); loose (acp preset loose's review mode "default" is not read-only: twr knows it as a mode that lets the agent act)`,
+    );
+    assert.match(boxEditor.described, /Can't review on box lab/);
+    await run.shots("box-editor", { root: "[role=dialog]" });
+    await run.tap("[role=dialog] button", "Cancel");
+    await delay(700);
+    await run.tap("[role=dialog] .attention-options button", "Cancel");
+    await run.until(
+      "async (a, lq) => !lq.find('.attention-loop-setup')",
+      {},
+      { what: "the card goes on Cancel" },
+    );
+    run.pass(
+      "a box thread's card names the box its reviewer is not installed on; the editor says what can't review there",
+    );
+
+    // 2. Saved settings on Codex's account `work`: on the box, which runs every runtime on
+    //    its own login, they do not hold; the card comes back on the default account.
+    await stopRunner();
+    await startRunner(true);
+    await boxAgents(true);
+    await owner("loop.settings.set", {
+      settings: {
+        profile: "low",
+        implementer: null,
+        workers: { model: "claude-opus-5-5", effort: "high" },
+        reviewer: { runtime: "codex", account: "work", model: "gpt-6.1-sol" },
+      },
+    });
+    boxHold(1);
+    await inspect("boxer");
+    await run.tap(".inspector-loops .loop-starts button", "Review loop");
+    const account = await setupSheet();
+    assert(
+      account.includes(
+        "box lab runs codex on its own login, not account work: using its default account",
+      ),
+      account,
+    );
+    assert.match(account, /a saved setting no longer holds/);
+    assert.match(account, /Reviewer codex · gpt-6\.1-sol · medium/);
+    await run.shots("box-account", { root: "[role=dialog]" });
+    run.pass(
+      "a reviewer account other than the box's own login comes back on the card, on the default account, saying why",
+    );
+
+    // 3. Start and save; the review run on the box is held; the runner stops.
+    await run.tap("[role=dialog] .attention-options button", "Start and save");
+    await poll(() => boxRuns() >= 1, "the box's review run starts");
+    const chipOf =
+      "async (a, lq) => { const c = await (" +
+      CARD +
+      ")(a, lq); return c && c.chip === a.chip && c; }";
+    await run.tab("Threads");
+    await run.until(
+      chipOf,
+      { name: "boxer", chip: "low · ladder m1" },
+      { what: "boxer's chip" },
+    );
+    await inspect("boxer");
+    const running = await run.until(
+      "async (a, lq) => { const l = await (" +
+        LOOPS +
+        ")(a, lq); return l && /waiting on the review$/.test(l.status) && l; }",
+      {},
+      { what: "the loop waits on its review" },
+    );
+    await stopRunner();
+    await poll(
+      async () => (await boxer()).loop?.box_away === "lab",
+      "the loop waits on its box",
+    );
+    const away = await run.until(
+      "async (a, lq) => { const l = await (" +
+        LOOPS +
+        ")(a, lq); return l && /^REVIEW LOOP low · waiting on box lab$/.test(l.status) && l.rounds[0] === 'm1 waits for box lab' && l; }",
+      {},
+      { what: "the inspector says the loop waits on box lab" },
+    );
+    // (Within a pixel: a position on a fractional pixel may round either way.)
+    assert(
+      Math.abs(away.pauseTop - running.pauseTop) <= 1,
+      `The Loops section's controls stay where they were: ${running.pauseTop} then ${away.pauseTop}`,
+    );
+    await run.until(
+      'async () => (window.__said || []).some((s) => s.includes("boxer\'s review loop waits on box lab: it goes on when the box is back"))',
+      {},
+      { what: "the wait announced" },
+    );
+    await run.shots("box-away", { root: ".inspector" });
+    await d.textSize("largest");
+    await run.until(
+      "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) >= 24",
+      {},
+      { what: "the largest text size", timeout: 20000 },
+    );
+    await run.ev(
+      "async (a, lq) => { document.querySelector('.inspector-loops .loop-status')?.scrollIntoView({ block: 'start' }); await lq.settle(); return true; }",
+    );
+    await run.shots("box-away-largest-text", {
+      root: ".inspector",
+      modes: ["dark"],
+    });
+    await d.textSize("default");
+    await run.until(
+      "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) < 20",
+      {},
+      { what: "the default text size", timeout: 20000 },
+    );
+    // Its controls work while the box is away.
+    await run.tap(".inspector-loops .loop-controls button", "Pause");
+    await run.until(
+      "async (a, lq) => lq.text(document.querySelector('.inspector-loops .loop-status')).endsWith('paused, waiting on box lab')",
+      {},
+      { what: "paused while away" },
+    );
+    await run.tap(".inspector-loops .loop-controls button", "Resume");
+    await run.until(
+      "async (a, lq) => lq.text(document.querySelector('.inspector-loops .loop-status')).endsWith('· waiting on box lab')",
+      {},
+      { what: "resumed while away" },
+    );
+    const once = (await said())
+      .split(" | ")
+      .filter((s) => s.includes("waits on box lab")).length;
+    assert.equal(once, 1, "The wait is said once: " + (await said()));
+    await run.tab("Threads");
+    const chipAway = await run.until(
+      chipOf,
+      { name: "boxer", chip: "low · ladder m1 · waiting on box lab" },
+      { what: "boxer's chip says it waits on box lab" },
+    );
+    await run.shots("box-away-card", { root: ".thread-grid" });
+    run.pass(
+      "the runner stopped during a review run: the inspector and the chip say the loop waits on box lab, said once; its controls work",
+      { status: away.status, rounds: away.rounds, chip: chipAway?.chip },
+    );
+
+    // 4. The app's own connection drops and comes back, then it is opened again (a reload):
+    //    the wait shows from the hub's snapshot, and is not said again.
+    await d.offline(true);
+    await delay(3000);
+    await d.offline(false);
+    await reconnected();
+    await inspect("boxer");
+    await run.until(
+      "async (a, lq) => lq.text(document.querySelector('.inspector-loops .loop-status')).endsWith('waiting on box lab')",
+      {},
+      { what: "the wait after a reconnect" },
+    );
+    await run.ev(
+      "async () => { setTimeout(() => location.reload(), 100); return true; }",
+    );
+    await delay(3000);
+    await reconnected();
+    await run.ev(LISTEN);
+    await inspect("boxer");
+    const reopened = await run.until(
+      "async (a, lq) => { const l = await (" +
+        LOOPS +
+        ")(a, lq); return l && l.status.endsWith('waiting on box lab') && l; }",
+      {},
+      { what: "the wait after a reload", timeout: 60000 },
+    );
+    await delay(1500);
+    assert(
+      !(await said()).includes("waits on box lab"),
+      "A wait the app opened on is shown, not said",
+    );
+    await run.shots("box-away-reopened", { root: ".inspector" });
+    run.pass(
+      "reconnected, and opened again, while the loop waits: the wait shows from the snapshot",
+      reopened,
+    );
+
+    // 5. The runner back: the loop goes on from round m1, without a reload.
+    boxRelease(1);
+    boxHold(2);
+    await startRunner(true);
+    await poll(() => boxRuns() >= 2, "the round's retry starts");
+    await run.until(
+      'async () => (window.__said || []).some((s) => s.includes("boxer\'s review loop goes on: box lab is back"))',
+      {},
+      { what: "the box back, announced" },
+    );
+    const back = await run.until(
+      "async (a, lq) => { const l = await (" +
+        LOOPS +
+        ")(a, lq); return l && /waiting on the review$/.test(l.status) && l.rounds.length === 1 && l.rounds[0] === 'm1 under review again' && l; }",
+      {},
+      { what: "the loop goes on from m1" },
+    );
+    await run.shots("box-back", { root: ".inspector" });
+    boxRelease(2);
+    await poll(async () => {
+      const t = await boxer();
+      return !t.loop && t.last_loop?.outcome === "clean";
+    }, "the box's review loop ends clean");
+    await run.until(
+      "async (a, lq) => !!lq.find('.inspector-loops button', 'Open report')",
+      {},
+      { what: "Open report", timeout: 30000 },
+    );
+    await run.tap(".inspector-loops button", "Open report");
+    const report = await run.until(
+      "async (a, lq) => { const t = lq.text(document.querySelector('[role=dialog] .loop-report-body')); return t.includes('failed run: box lab disconnected') && t; }",
+      {},
+      { what: "the report says the run that failed", timeout: 30000 },
+    );
+    await run.shots("box-report", { root: "[role=dialog]" });
+    await run.tap("button[aria-label='Close dialog']");
+    run.pass(
+      "the runner back, the loop goes on from round m1 without a reload, ends clean, and its report says the run that failed",
+      { back: back.rounds, report: report.slice(0, 200) },
+    );
+
+    // 6. An implementation loop on the box thread, sent from its composer (the ↻ button).
+    f.template(
+      "impl-report",
+      '!sleep 8000\nBuilt the CSV export.\n{{commit}}\n```twr-commit\n{"commits": [{"repo": "box-repo", "sha": "abc1234"}]}\n```\n',
+    );
+    await openConversation(run, "boxer");
+    await typeTask(run, "boxer", TASK);
+    const choice = await openSendAsLoop(run, "boxer");
+    assert.equal(choice.disabled, false, JSON.stringify(choice));
+    await run.tap(".send-loop-panel button", "Send as implementation loop");
+    await poll(
+      async () => (await runningLoop(d, "boxer"))?.kind === "implement",
+      "the box's implementation loop starts",
+    );
+    await poll(
+      async () => (await runningLoop(d, "boxer"))?.phase === "report",
+      "the box's implementation loop reports",
+      120000,
+    );
+    git(worktree, "add", "feature.rs");
+    git(worktree, "commit", "-q", "-m", "Add the CSV export");
+    const ended = await poll(async () => {
+      const t = await boxer();
+      return !t.loop && t.last_loop?.kind === "implement" && t.last_loop;
+    }, "the box's implementation loop ends");
+    assert.equal(ended.outcome, "clean", JSON.stringify(ended));
+    assert.equal(ended.commits?.length, 1, JSON.stringify(ended));
+    const sha = ended.commits[0].sha.slice(0, 7);
+    await keyboardAway();
+    await run.tab("Threads");
+    await run.until(
+      "async (a, lq) => { const c = await (" +
+        CARD +
+        ")(a, lq); return c && c.ended.includes('committed ' + a.sha); }",
+      { name: "boxer", sha },
+      { what: "boxer's card says what the loop committed" },
+    );
+    await run.shots("box-implement-ended", { root: ".thread-grid" });
+    f.template(
+      "impl-report",
+      '!sleep 8000\nBuilt the CSV export.\n{{commit}}\n```twr-commit\n{"commits": [{"repo": "demo", "sha": "abc1234"}]}\n```\n',
+    );
+    run.pass(
+      "an implementation loop on the box thread, sent with the ↻ button, reviews on the box and commits",
+      { sha },
+    );
+
+    // 7. The box away with no loop running: nothing offers a start the hub would refuse.
+    await stopRunner();
+    await poll(
+      async () => (await boxer()).box_online === false,
+      "box lab offline",
+    );
+    await inspect("boxer");
+    const gated = await run.until(
+      "async (a, lq) => { const l = await (" +
+        LOOPS +
+        ")(a, lq); return l && l.why === 'Box lab is away: a loop can start once it is back.' && l; }",
+      {},
+      { what: "why no loop can start" },
+    );
+    assert(
+      gated.starts.every((s) => s.disabled),
+      JSON.stringify(gated.starts),
+    );
+    await run.shots("box-offline-start", { root: ".inspector" });
+    await keyboardAway();
+    await openConversation(run, "boxer");
+    const away2 = await openSendAsLoop(run, "boxer");
+    assert.equal(away2.disabled, true);
+    assert.equal(
+      away2.what,
+      "Box lab is away: a loop can start once it is back.",
+    );
+    const escape = await run.ev(`async (a, lq) => {
+      const panel = document.querySelector('.send-loop-panel');
+      const focused = document.activeElement === panel;
+      document.activeElement.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      await lq.sleep(300);
+      return { focused, closed: !document.querySelector('.send-loop-panel'), back: lq.nameOf(document.activeElement) };
+    }`);
+    assert.deepEqual(escape, {
+      focused: true,
+      closed: true,
+      back: "Send as implementation loop to boxer…",
+    });
+    await typeTask(run, "boxer", "");
+    run.pass(
+      "with the box away, Review loop, Implementation loop… and ↻ say why they wait; the panel takes the focus and Escape closes it",
+      { why: gated.why, escape },
+    );
+    // The box back for the rest.
+    await startRunner(true);
+
+    // 8. An ACP preset as the reviewer.
+    await owner("loop.settings.reset", {});
+    await owner("thread.new", {
+      project: "demo",
+      name: "acpw",
+      runtime: "fake",
+      mode: "auto",
+    });
+    await owner("thread.send", {
+      thread: "acpw",
+      prompt: "!write lib.rs pub fn g() { todo!() }",
+    });
+    await poll(async () => {
+      const t = await threadView(d, "acpw");
+      return (
+        t.current_turn == null &&
+        Number(t.last_turn?.turn) > 0 &&
+        Number(t.git?.dirty_files) > 0
+      );
+    }, "acpw's turn ends with changes");
+    await inspect("acpw");
+    await run.tap(".inspector-loops .loop-starts button", "Review loop");
+    await setupSheet();
+    await run.tap("[role=dialog] .attention-options button", "Change…");
+    await run.until(
+      "async (a, lq) => !!lq.find('[role=dialog] .loop-presets')",
+    );
+    const checkPickers = (p, where) => {
+      const named = (v) => p.reviewer.find((o) => o.value === v);
+      assert.deepEqual(named("ex"), {
+        value: "ex",
+        text: "ex (acp, read-only mode)",
+        disabled: false,
+      });
+      assert.deepEqual(named("bare"), {
+        value: "bare",
+        text: "bare (acp preset bare names no read-only mode)",
+        disabled: true,
+      });
+      assert.equal(named("loose")?.disabled, true);
+      assert.deepEqual(
+        p.implementer.filter((v) => ["ex", "bare", "loose"].includes(v)),
+        [],
+        `${where}: no ACP preset as the implementer`,
+      );
+      assert.equal(
+        p.skipped,
+        `Can't review: grok-build (not installed); bare (acp preset bare names no read-only mode); loose (acp preset loose's review mode "default" is not read-only: twr knows it as a mode that lets the agent act)`,
+      );
+      assert.match(p.described, /Can't review: grok-build/);
+    };
+    checkPickers(await run.until(PICKERS, { root: "dialog" }), "the card");
+    const picked = await run.ev(PICKERS, { root: "dialog", pick: "ex" });
+    assert.equal(picked.value, "ex");
+    assert.equal(picked.model, "m-large");
+    assert.deepEqual(
+      picked.models.filter((m) => m.startsWith("m-")),
+      ["m-large", "m-small"],
+    );
+    assert.equal(
+      picked.acp,
+      'ex is an ACP agent: it reviews in its own "read-only" mode, at the efforts medium, xhigh, which every round of the profile must use.',
+    );
+    await run.shots("acp-editor", { root: "[role=dialog]" });
+    await d.textSize("largest");
+    await run.until(
+      "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) >= 24",
+      {},
+      { what: "the largest text size", timeout: 20000 },
+    );
+    await run.ev(
+      "async (a, lq) => { [...document.querySelectorAll('[role=dialog]')].at(-1).querySelector('.loop-editor-skipped')?.scrollIntoView({ block: 'center' }); await lq.settle(); return true; }",
+    );
+    await run.shots("acp-editor-largest-text", {
+      root: "[role=dialog]",
+      modes: ["dark"],
+    });
+    await d.textSize("default");
+    await run.until(
+      "async () => parseFloat(getComputedStyle(document.documentElement).fontSize) < 20",
+      {},
+      { what: "the default text size", timeout: 20000 },
+    );
+    await run.tap("[role=dialog] button", "Save to the card");
+    // The card is raised again at a new revision: one sheet, the one it was opened from,
+    // and it can be used (two sheets would each make the other inert).
+    const sheets = await run.until(
+      "async (a, lq) => { const d = [...document.querySelectorAll('[role=dialog]')]; return d.length === 1 && !!d[0].querySelector('.attention-loop-setup') && !d[0].closest('[inert]') && d.length; }",
+      {},
+      { what: "one setup sheet after the editor saved" },
+    );
+    assert.equal(sheets, 1);
+    const acpCard = await run.until(
+      "async (a, lq) => { if (lq.find('[role=dialog] .loop-presets')) return false; return lq.all('[role=dialog] .attention-loop-setup').map(lq.text).find((t) => t.includes('Reviewer ex · m-large')) || false; }",
+      {},
+      { what: "the card on the ACP reviewer" },
+    );
+    assert(
+      acpCard.includes(
+        `acp reviewer: read-only rests on the agent's own "read-only" mode`,
+      ),
+      acpCard,
+    );
+    await run.shots("acp-card", { root: "[role=dialog]" });
+    run.pass(
+      "the card's editor lists the ACP presets (the one that reviews with its mode, models and efforts; the others disabled, with why, in words); none as implementer; the card warns what read-only rests on",
+    );
+    acpHold(1);
+    await delay(700);
+    await run.tap("[role=dialog] .attention-options button", "Start and save");
+    await poll(
+      async () => (await runningLoop(d, "acpw"))?.waiting_on === "review",
+      "the ACP review run starts",
+    );
+    await keyboardAway();
+    await run.tab("Threads");
+    await run.until(
+      "async (a, lq) => { const c = await (" +
+        CARD +
+        ")(a, lq); return c && c.text.includes('reviewer ex m-large medium'); }",
+      { name: "acpw" },
+      { what: "acpw's card names the ACP reviewer" },
+    );
+    await run.shots("acp-running", { root: ".thread-grid" });
+    acpRelease(1);
+    await poll(
+      async () => {
+        const t = await threadView(d, "acpw");
+        return !t.loop && t.last_loop?.outcome === "clean";
+      },
+      "the ACP review loop ends clean",
+      120000,
+    );
+    await inspect("acpw");
+    await run.until(
+      "async (a, lq) => !!lq.find('.inspector-loops button', 'Open report')",
+      {},
+      { what: "Open report", timeout: 30000 },
+    );
+    await run.tap(".inspector-loops button", "Open report");
+    await run.until(
+      "async (a, lq) => lq.text(document.querySelector('[role=dialog] .loop-report-body')).includes('Reviewer: ex m-large')",
+      {},
+      { what: "the report names the ACP reviewer", timeout: 30000 },
+    );
+    await run.tap("button[aria-label='Close dialog']");
+    run.pass(
+      "a review loop on the ACP reviewer runs to its end, the reviewer named on the card and in the report",
+    );
+    // Settings › Loops and a project's editor.
+    await keyboardAway();
+    await openSettingsLoops(run);
+    const panel = await run.until(PICKERS, { root: "settings" });
+    checkPickers(panel, "Settings › Loops");
+    assert.equal(panel.value, "ex", "The saved reviewer");
+    await run.shots("acp-settings", {
+      root: ".settings-section:has(.loop-editor)",
+    });
+    await openConversation(run, "acpw");
+    await typeTask(run, "acpw", "/loop settings --project demo");
+    await run.tap("button", "Send message");
+    await run.until(
+      "async (a, lq) => { const d = [...document.querySelectorAll('[role=dialog]')].at(-1); return !!d && lq.text(d.querySelector('h2')) === 'Loop settings · demo' && !!d.querySelector('.loop-presets'); }",
+      {},
+      { what: "demo's settings editor" },
+    );
+    checkPickers(await run.until(PICKERS, { root: "dialog" }), "demo's editor");
+    await run.shots("acp-project", { root: "[role=dialog]" });
+    await run.tap("[role=dialog] button", { re: "^(Cancel|Close)$" });
+    run.pass(
+      "Settings › Loops and a project's editor list the ACP presets the same way",
+    );
+    // The preset removed from the config while it is the saved reviewer.
+    await d.restartHub(extra(false));
+    await reconnected();
+    await inspect("acpw");
+    // The app's own connection is live again: Review loop can be pressed.
+    await run.until(
+      "async (a, lq) => { const b = lq.find('.inspector-loops .loop-starts button', 'Review loop'); return !!b && !b.disabled; }",
+      {},
+      { what: "Review loop enabled after the hub restarted", timeout: 90000 },
+    );
+    await run.tap(".inspector-loops .loop-starts button", "Review loop");
+    const removed = await setupSheet().catch(async (error) => {
+      const items = await owner("attention.list", { all: true }).catch((e) =>
+        String(e),
+      );
+      console.log("LOOP_QA_ATTENTION", JSON.stringify(items).slice(0, 3000));
+      throw error;
+    });
+    assert(
+      removed.includes(
+        "ex is no reviewer: neither a built-in one (claude-code, codex, grok-build) nor an acp preset in the config: reviewing with claude-code · claude-opus-5-5 instead",
+      ),
+      removed,
+    );
+    assert.match(removed, /Reviewer claude-code · claude-opus-5-5/);
+    await run.shots("acp-removed", { root: "[role=dialog]" });
+    await run.tap("[role=dialog] .attention-options button", "Cancel");
+    await run.until(
+      "async (a, lq) => !lq.find('.attention-loop-setup')",
+      {},
+      { what: "the card goes on Cancel" },
+    );
+    run.pass(
+      "the saved ACP reviewer removed from the config: the next card says so and offers the replacement",
+    );
+    const errors = await run.ev("async () => window.__loopErrors || []");
+    assert.deepEqual(errors, [], "No page errors");
+    await keyboardAway();
+    await run.tab("Chat");
+    run.audited();
+    return run.report;
+  } finally {
+    await (
+      before
+        ? owner("loop.settings.set", { settings: before })
+        : owner("loop.settings.reset", {})
+    ).catch(() => {});
+    boxRelease(1);
+    boxRelease(2);
+    acpRelease(1);
+    await stopRunner().catch(() => {});
+    try {
+      execFileSync(join(d.bin, "twr"), ["runner", "stop"], {
+        env: { ...d.env, TWR_HOME: boxHome },
+        stdio: "ignore",
+        timeout: 15000,
+      });
+    } catch {}
+  }
+}

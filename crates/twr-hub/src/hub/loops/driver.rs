@@ -98,13 +98,26 @@ pub(in crate::hub) struct LoopRun {
     run: String,
     /// Its loop.
     loop_id: String,
-    /// The reviewer's model and the round's effort, as its task says them.
+    /// The reviewer ([`reviewer_words`]) and the round's effort, as its task says them.
     model: String,
     effort: String,
     /// When it began.
     began: Instant,
     /// Ends it, with the reason.
     cancel: tokio::sync::watch::Sender<Option<String>>,
+}
+
+/// The reviewer as a run's description names it (a thread's card shows it): its model
+/// (`gpt-6.1-sol`), which names a built-in reviewer; for an ACP preset, whose model ids are its
+/// agent's own, the preset first (`ex m-large`).
+pub(super) fn reviewer_words(hub: &Inner, runtime: &str, model: &str) -> String {
+    if hub.config.runtimes.contains_key(runtime)
+        && !twr_core::loops::config::REVIEWER_RUNTIMES.contains(&runtime)
+    {
+        format!("{runtime} {model}")
+    } else {
+        model.to_string()
+    }
 }
 
 /// The review runs this hub runs now, by thread, and whether loops are driven yet (not before
@@ -2219,7 +2232,7 @@ impl Core {
             LoopRun {
                 run: run.clone(),
                 loop_id: state.id.clone(),
-                model: state.reviewer.model.clone(),
+                model: reviewer_words(hub, &state.reviewer.runtime, &state.reviewer.model),
                 effort: state.reviewer.effort.clone().unwrap_or_default(),
                 began: Instant::now(),
                 cancel: tx,
@@ -2432,7 +2445,10 @@ impl Core {
             loop_id: id.to_string(),
             place: place.clone(),
             task,
-            description: format!("reviewer {} {effort}", reviewer.model),
+            description: format!(
+                "reviewer {} {effort}",
+                reviewer_words(hub, &reviewer.runtime, &reviewer.model)
+            ),
             call: review::Call {
                 runtime: reviewer.runtime.clone(),
                 bin: hub.reviewer_bin(&reviewer.runtime),

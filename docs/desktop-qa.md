@@ -75,11 +75,13 @@ build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](des
 | Speech | A selected message reaches a real speaker process using a silent custom command engine |
 | CLI forms | Invalid-argument preflight keeps input, leading-dash values, subprocess arguments, remote workspace defaults |
 | Terminals | Native keyboard input, attach, login fixture, reload restoration, completed sessions do not consume active limit |
+| Loops | Review and implementation loops with a fake reviewer (`scripts/loops-integration.mjs`); on a dial-in runner box on the same machine: the card's warnings naming the box, a reviewer account the box does not use, the runner stopped during a review run (the wait said once, shown after a reload and a reconnect) and started again, an implementation loop that commits, no start while the box is away; an ACP preset as the reviewer (the scripted ACP agent of the hub's tests): the pickers, the card's warning, a loop to its end, the preset removed |
 
 ## Verification limits
 
-Real Anthropic/OpenAI/Grok authentication and paid turns, live SSH/container/dial-in hosts,
-and audible platform speech have not been tested end to end in this pass. Their existing
+Real Anthropic/OpenAI/Grok authentication and paid turns, live SSH/container/dial-in hosts on
+other machines, and audible platform speech have not been tested end to end in this pass
+(loops run through the app on a dial-in runner on the same machine, above). Their existing
 CLI implementations are bundled and reachable; the above fixtures validate the desktop
 bridge and UI rather than those external services. An installed Ubuntu 22.04 Debian package passed every CLI form workflow of the integration
 suite with the default Chromium sandbox enabled. Its native terminal module was built against

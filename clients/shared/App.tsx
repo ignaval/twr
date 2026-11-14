@@ -136,6 +136,7 @@ import {
   endedLately,
   auditingWords,
   endedLoops,
+  boxWaits,
   endedWords,
   implementRequest,
   loopAccess,
@@ -1435,6 +1436,22 @@ export default function App({
       view.threads,
     );
     knownLoops.current = { workspace, ids };
+    for (const words of said.slice(0, 3)) announce(words);
+  }, [view.threads, connected, workspace]);
+  // A loop that starts or stops waiting on its thread's remote box is said once, in any
+  // thread: the loop line and the inspector show it, in words.
+  const knownBoxWaits = useRef<{
+    workspace: string;
+    ids: Map<string, string>;
+  }>(undefined);
+  useEffect(() => {
+    if (!connected) return;
+    const known = knownBoxWaits.current;
+    const { said, known: ids } = boxWaits(
+      known?.workspace === workspace ? known.ids : undefined,
+      view.threads,
+    );
+    knownBoxWaits.current = { workspace, ids };
     for (const words of said.slice(0, 3)) announce(words);
   }, [view.threads, connected, workspace]);
   const turnBaseline = useRef<{ thread?: string; end?: string }>({});

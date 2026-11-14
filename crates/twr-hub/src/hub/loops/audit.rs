@@ -178,7 +178,11 @@ impl Core {
                     loop_id: state.id.clone(),
                     rule: a.rule,
                     name: a.name.clone(),
-                    model: state.reviewer.model.clone(),
+                    model: super::driver::reviewer_words(
+                        hub,
+                        &state.reviewer.runtime,
+                        &state.reviewer.model,
+                    ),
                     effort: state.plan.audit_effort.clone(),
                     began: Instant::now(),
                     cancel: tx,
