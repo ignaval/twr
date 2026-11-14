@@ -180,6 +180,15 @@ The agents' CLIs and their logins live in the container. Install them in the ima
 
 `terminal_command` is used by `twr box login` and `twr box project --clone`. Without one, both are refused, saying how to set it. A `docker exec -t` client can go away while what it ran goes on: Docker's detach keys (Ctrl-P Ctrl-Q) end the client, and so does killing it.
 
+For the Lima example above, the terminal command is the same words with `-t` after the `-i`, its environment as you need it (the `-e` words of a secret stay out of both):
+
+```toml
+command = ["limactl", "shell", "--workdir", "/", "dev-vm", "nerdctl", "exec", "-i", "-u", "box", "-e", "HOME=/home/box", "-e", "SHELL=/bin/bash", "-w", "/home/box", "twr-sandbox"]
+terminal_command = ["limactl", "shell", "--workdir", "/", "dev-vm", "nerdctl", "exec", "-i", "-t", "-u", "box", "-e", "HOME=/home/box", "-e", "SHELL=/bin/bash", "-w", "/home/box", "twr-sandbox"]
+```
+
+`limactl shell` gives the VM a terminal only when its own input and output are terminals, so twr runs both commands with your terminal as their input and a terminal as their output (for `--clone`, a pseudo-terminal whose output twr shows as it comes). `-e SHELL=/bin/bash` lets the box's runner read the login shell's `PATH` ([The login shell's PATH](#the-login-shells-path)), so an agent installed in `~/.local/bin` is found.
+
 - Detaching from `twr box login` leaves the login running in the container. It holds no twr state. Run `twr box login` again, or end it with `docker exec twr-sandbox pkill -f 'claude.*login'`.
 - A clone whose client went away runs to its end in the container. If it fails, it removes its folder, as always. If it succeeds, the folder stays, unrecorded, and `twr box project <box> <project>` finds it (or record it with `--path`). Ctrl-C in your terminal still stops the clone and removes the folder.
 
@@ -440,6 +449,17 @@ What crosses the connection: the hub sends the box the git reads to make, the fi
 
 **A box that goes away** during a review run fails that run (`box gpu disconnected`): the runner ends the reviewer when its connection to the hub ends, and the hub runs the round again, once, when the box is back, never before: the loop line says `waiting on box gpu` meanwhile. The commit's check waits for the box too. A thread's own turn on the box goes on while it is away, as any turn does, and the loop takes its answer when the box replays it. A hub restart ends the box's review runs the same way (the connection ends), and the next hub runs them again.
 
+### Codex reviewers on Linux
+
+Codex runs its shell under bubblewrap on Linux, and its read-only reviewer can read the repository only when `bwrap` can make its namespaces there. Codex looks for `bwrap` on the `PATH`, then next to its own executable (OpenAI's `codex-package` archive and npm package ship one; the bare `codex` binary of a release has none). What twr found with Codex 0.169.0:
+
+- **Ubuntu 24.04 and later** allow unprivileged user namespaces only to programs with an AppArmor profile. The `bwrap` Codex ships has none and fails (`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`); Ubuntu's `bubblewrap` package has one. Install it (`sudo apt install bubblewrap`) on an Ubuntu box.
+- **A rootless container** (Docker or nerdctl rootless, a default Docker container) gives no unprivileged user namespaces, with Codex's `bwrap` or the distribution's: `bwrap: No permissions to create new namespace`. Codex's read-only reviewer then runs no command at all.
+
+A Codex review run in which a command failed because `bwrap` could not start fails, whatever the reviewer answered: `codex's read-only sandbox could not start here, so the reviewer ran no command and read no file (bwrap: …)`. The round is run again once, and the loop then sticks with that reason, instead of ending `clean` on a review that read nothing. twr never runs the reviewer without its sandbox. Where the sandbox can't start, review with Claude Code (its read-only reviewer has no shell) or run the box elsewhere. `codex sandbox -- true` on the box tells you whether it starts.
+
+The same sandbox holds a Codex **thread** in `auto` mode: in a container where it can't start, each of the thread's commands fails in it and asks to run outside it, and Codex's own auto review (twr's `auto`) approves the routine ones. The thread then works unsandboxed inside the container, which is the boundary there.
+
 **Versions.** Loops need a runner that knows the loop operations (a twr newer than 0.4.0; the runner protocol is still 8). An older runner works for everything else; a loop on its box is refused with `box gpu runs twr <version>, whose runner can't run loops: update twr on the box`: `twr box install gpu` for an SSH or container box, `twr update` and a runner restart on a dial-in box ([Versions and updates](#versions-and-updates)).
 
 ## Projects on a box
@@ -474,6 +494,19 @@ That match is by text, a limit to know. The host is compared as written, not as 
 Recording writes `[boxes.<box>.projects.<project>] repo = "<path>"` to `boxes.toml`, under its lock, and only while the box's settings and that entry are what they were when the command started: when another command changed either meanwhile, it refuses, and you run it again. For a box you configured in `config.toml`, it prints the lines to add there. Then the running hub reads the box's projects again (`box.projects`), and the next `twr thread new api --box gpu` uses the repository: the command says `recorded and active` when the hub's repository for the project is the one it wrote. When the hub has another one (the file changed again before the hub read it: another `twr box project`, an edit), it says `recorded`, what the hub has, and why. `recorded` alone means no hub runs (a hub reads it when it starts) or the hub didn't take it, and says why; when the box's ssh destination changed in the files since the hub added the box, restart the hub. `--remove` takes the entry out the same way.
 
 Only you can run it: an agent's `twr box project` is refused, and so is one in a named workspace. `twr box add` ends by naming `twr box project <box> <project>` for each project configured with `box = "<box>"`.
+
+### Commits made on a box
+
+A thread on an SSH, container or dial-in box commits in its worktree on the box, on its branch (`twr/<namespace>/<thread>`), and an implementation loop's commit lands there too. twr does not bring them to the hub's machine: `twr thread pull` is for [linked runners](runner-links.md#threads-and-committed-results), and on another box it says where the commits are. Bring them over with git:
+
+```sh
+# an SSH box: fetch the branch from the thread's worktree on the box, over ssh
+git -C ~/code/api fetch gpu:/home/me/.local/share/twr/box-daemons/<id>-gpu/worktrees/api/fix twr/<namespace>/fix:refs/remotes/gpu/fix
+# any box: push it from the box to the project's origin, with the box's own credentials, and fetch it here
+git -C <the thread's worktree on the box> push origin twr/<namespace>/fix:refs/heads/fix
+```
+
+`twr thread list --json` shows the worktree, and `twr thread pull <thread>` names it with the branch. Neither changes your checkout. A container box usually has no ssh server, so push from it.
 
 ## When the connection drops
 

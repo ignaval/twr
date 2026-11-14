@@ -888,6 +888,37 @@ async fn stopping_the_loop_kills_its_acp_reviewer() {
     hub.shutdown().await;
 }
 
+/// What the agent's tools start in a session of their own (Claude Code's Bash tool runs each
+/// command so) leaves the run's process group, so the group's kill misses it: the run then
+/// ends the agent's descendants outside its group (read while the agent still ran: macOS 27
+/// shows no marker in `/bin/sleep`'s environment) and every process that carries its marker,
+/// and its log says so.
+#[tokio::test]
+async fn a_review_run_ends_what_its_agent_started_outside_its_group() {
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    let env = Env::new();
+    std::fs::write(env.state().join("detach.1"), "").unwrap();
+    let hub = env.hub().await;
+    let t = looping(&env, &hub, "api", settings("low", "ex/m-large")).await;
+    let last = ended(&hub, &t).await;
+    assert_eq!(last.outcome, twr_core::loops::Outcome::Clean);
+    let pid: i32 = env.agent_file("detached.1").trim().parse().unwrap();
+    timeout(WAIT, async {
+        while alive(pid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the agent's detached command outlived its review run");
+    let g = get(&hub, &t);
+    let log = std::fs::read_to_string(g["rounds"][0]["files"]["log"].as_str().unwrap()).unwrap();
+    assert!(
+        log.contains("twr: ended what the agent left running outside its process group"),
+        "{log}"
+    );
+    hub.shutdown().await;
+}
+
 /// A preset that names no read-only mode, or one twr knows lets the agent act, can't be
 /// saved as the reviewer; a saved ACP reviewer whose preset stops qualifying brings the card
 /// back, with the reviewer replaced and the reason.

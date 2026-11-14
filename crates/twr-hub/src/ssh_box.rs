@@ -1286,8 +1286,11 @@ pub fn upload_answer(out: &str) -> (Option<String>, Option<String>) {
 /// The script (for `sh`) that stops the daemon of box `name` for hub key `hub_key` with build
 /// `id` (`twr runner --stdio --stop`) under the box's data directory, found as the probe finds
 /// it ([`probe_script`]): what `twr box remove` prints for the user to run (one line; each
-/// part quoted only when it needs it, so it reads plainly once quoted again). An error for an
-/// `id` that is no build id or a `name` that is no box name.
+/// part quoted only when it needs it, so it reads plainly once quoted again). When build `id`
+/// is not on the box (twr was rebuilt or updated on the hub's machine since the box got its
+/// build, and no hub said which one the box runs), the newest build there runs it: `--stop`
+/// finds the daemon by hub key and box, whatever build it runs. An error for an `id` that is no
+/// build id or a `name` that is no box name.
 pub fn stop_script(id: &str, name: &str, hub_key: &str) -> Result<String, String> {
     if !twr_core::valid_build_id(id) {
         return Err(format!("{id:?} is not a build id"));
@@ -1295,7 +1298,9 @@ pub fn stop_script(id: &str, name: &str, hub_key: &str) -> Result<String, String
     twr_core::runner::validate_box_name(name).map_err(|e| e.to_string())?;
     Ok(format!(
         "case ${{XDG_DATA_HOME:-}} in /*) d=$XDG_DATA_HOME ;; *) d=$HOME/.local/share ;; esac; \
-         exec \"$d\"/twr/runner/builds/{} runner --stdio {} --hub-key {} --stop",
+         b=\"$d\"/twr/runner/builds/{}; [ -x \"$b\" ] || \
+         b=$(ls -t \"$d\"/twr/runner/builds/*/twr 2>/dev/null | head -n 1); \
+         exec \"$b\" runner --stdio {} --hub-key {} --stop",
         twr_core::paths::sh_word(&format!("{id}/twr")),
         twr_core::paths::sh_word(&format!("--box={name}")),
         twr_core::paths::sh_word(hub_key)

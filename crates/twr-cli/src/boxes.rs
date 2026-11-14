@@ -3464,19 +3464,41 @@ mod tests {
         assert!(!stop.contains('\n'), "one line to paste: {stop}");
         assert!(stop.contains(" -o ClearAllForwardings=yes "), "{stop}");
         assert!(stop.contains(" me@host -a -x -k -- "), "{stop}");
-        // The remote script, run here: the data directory as the probe finds it.
+        // The remote script, run here: the data directory as the probe finds it, and the
+        // build named when the box has it.
         let script = ssh_box::stop_script("0123456789abcdef", "gpu", "ab").unwrap();
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script.replace("exec ", "printf '%s\\n' "))
-            .env("HOME", "/home/u")
-            .env_remove("XDG_DATA_HOME")
-            .output()
-            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let builds = home.path().join(".local/share/twr/runner/builds");
+        let build = |id: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(builds.join(id)).unwrap();
+            let f = builds.join(id).join("twr");
+            std::fs::write(&f, "").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script.replace("exec ", "printf '%s\\n' "))
+                .env("HOME", home.path())
+                .env_remove("XDG_DATA_HOME")
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let words = "\nrunner\n--stdio\n--box=gpu\n--hub-key\nab\n--stop\n";
+        // A box with only another build (twr was rebuilt on the hub's machine since the box
+        // got its build): that build stops the daemon, which `--stop` finds by hub key and
+        // box. (The named one printed before, and the command failed: not there.)
+        build("fedcba9876543210");
         assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            "/home/u/.local/share/twr/runner/builds/0123456789abcdef/twr\nrunner\n--stdio\n\
-             --box=gpu\n--hub-key\nab\n--stop\n"
+            run(),
+            format!("{}{words}", builds.join("fedcba9876543210/twr").display())
+        );
+        build("0123456789abcdef");
+        assert_eq!(
+            run(),
+            format!("{}{words}", builds.join("0123456789abcdef/twr").display())
         );
         // Words that would forward something are refused here too, and a build that is no
         // build id (what the hub or the files said) or a name that is no box name.

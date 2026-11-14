@@ -333,14 +333,17 @@ impl Hub {
         }
         let thread = self.get_thread(query)?;
         let name = thread["box_name"].as_str().unwrap_or("local");
-        if !self
-            .inner
-            .remote(name)
-            .is_some_and(|b| b.transport() == BoxTransport::Link)
-        {
+        let transport = self.inner.remote(name).map(|b| b.transport());
+        if transport != Some(BoxTransport::Link) {
             return Err(RpcError::new(
                 codes::UNSUPPORTED,
-                "thread pull is for linked runners",
+                pull_refusal(
+                    thread["name"].as_str().unwrap_or(query),
+                    name,
+                    transport,
+                    thread["worktree"].as_str(),
+                    thread["git"]["branch"].as_str(),
+                ),
             ));
         }
         let project = thread["project"]
@@ -450,5 +453,82 @@ impl Hub {
             }
         }
         false
+    }
+}
+
+/// Why `thread pull` refuses thread `thread` of box `box_name` (reached by `transport`;
+/// `None`: this machine), and how its commits come to the hub's machine instead: a thread of
+/// this machine has them in its worktree already; an SSH, container or dial-in box keeps them
+/// in the thread's worktree on the box, on its branch, where git fetches them over ssh, or the
+/// box pushes them to the project's origin (docs/runners.md, "Commits made on a box").
+pub(crate) fn pull_refusal(
+    thread: &str,
+    box_name: &str,
+    transport: Option<twr_core::config::BoxTransport>,
+    worktree: Option<&str>,
+    branch: Option<&str>,
+) -> String {
+    use twr_core::config::BoxTransport;
+    let worktree = worktree.unwrap_or("its worktree");
+    let branch = branch.map_or_else(|| "its branch".to_string(), |b| format!("branch {b}"));
+    let Some(transport) = transport else {
+        return format!(
+            "thread pull is for linked runners: thread {thread} runs on this machine, and its \
+             commits are already in {worktree} ({branch})"
+        );
+    };
+    let kind = match transport {
+        BoxTransport::Ssh => "an SSH box",
+        BoxTransport::Command => "a container box",
+        _ => "a dial-in box",
+    };
+    let fetch = if transport == BoxTransport::Command {
+        String::new()
+    } else {
+        format!(" fetch them over ssh (`git fetch <box>:{worktree} <branch>`), or")
+    };
+    format!(
+        "thread pull is for linked runners, and box {box_name} is {kind}: thread {thread}'s \
+         commits stay on the box, in {worktree} ({branch}). To bring them here,{fetch} push \
+         them from the box to the project's origin (with the box's own git credentials) and \
+         fetch them from there"
+    )
+}
+
+#[cfg(test)]
+mod pull_tests {
+    use super::pull_refusal;
+    use twr_core::config::BoxTransport;
+
+    /// `thread pull` on a box that isn't a linked runner says where the thread's commits are
+    /// and how to bring them to the hub's machine, instead of only refusing.
+    #[test]
+    fn a_pull_from_a_box_that_is_no_linked_runner_says_where_the_commits_are() {
+        let ssh = pull_refusal(
+            "api",
+            "gpu",
+            Some(BoxTransport::Ssh),
+            Some("/home/me/wt/api"),
+            Some("twr/api"),
+        );
+        assert!(ssh.contains("box gpu is an SSH box"), "{ssh}");
+        assert!(ssh.contains("in /home/me/wt/api (branch twr/api)"), "{ssh}");
+        assert!(
+            ssh.contains("`git fetch <box>:/home/me/wt/api <branch>`"),
+            "{ssh}"
+        );
+        assert!(
+            ssh.contains("push them from the box to the project's origin"),
+            "{ssh}"
+        );
+        let ctr = pull_refusal("api", "sandbox", Some(BoxTransport::Command), None, None);
+        assert!(ctr.contains("is a container box"), "{ctr}");
+        assert!(!ctr.contains("git fetch"), "{ctr}");
+        let here = pull_refusal("api", "local", None, Some("/w/api"), Some("twr/api"));
+        assert!(here.contains("runs on this machine"), "{here}");
+        assert!(
+            here.contains("already in /w/api (branch twr/api)"),
+            "{here}"
+        );
     }
 }

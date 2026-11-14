@@ -211,6 +211,19 @@ mod sys {
         )
     }
 
+    /// Every process with its status (no environments). `None` when `/proc` cannot be listed.
+    pub fn all() -> Option<Vec<(u32, ProcStat)>> {
+        let dir = list().ok()?;
+        Some(
+            dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter_map(|pid| match stat(pid) {
+                    Lookup::Found(s) => Some((pid, s)),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
     /// Every process of group `pgid` with its status. `None` when `/proc` cannot be listed.
     pub fn group(pgid: i64) -> Option<Vec<(u32, ProcStat)>> {
         let dir = list().ok()?;
@@ -577,7 +590,8 @@ pub fn reap_marked(thread: &str, min_start: u64, gen: Option<&str>) -> bool {
 /// Kills every live process whose [`AGENT_ENV`] is one of `markers` (never this one):
 /// SIGTERM, a bounded wait, SIGKILL for those still themselves, another bounded wait; rescanned
 /// until none is left (at most [`GROUP_SWEEPS`] times, as they may fork meanwhile). For what a
-/// stopped hub left running under markers only it gave out, such as its jobs'. Returns whether
+/// stopped hub left running under markers only it gave out, such as its jobs', and for what a
+/// review run's agent left outside its process group when the run ends. Returns whether
 /// anything was signalled. Blocks; call off the async runtime.
 pub fn reap_agent_marked(markers: &[String]) -> bool {
     let me = std::process::id();
@@ -603,7 +617,7 @@ pub fn reap_agent_marked(markers: &[String]) -> bool {
             return signalled;
         }
         signalled = true;
-        tracing::warn!(pids = ?marked.iter().map(|m| m.0).collect::<Vec<_>>(), "killing processes a stopped hub left running");
+        tracing::warn!(pids = ?marked.iter().map(|m| m.0).collect::<Vec<_>>(), "killing processes left running under a twr agent marker");
         // Each still the process that was matched (its start time), checked right before it
         // is signalled: a pid reused meanwhile is someone else's.
         let signal_same = |pid: u32, start: u64, sig: &str| {
@@ -623,6 +637,49 @@ pub fn reap_agent_marked(markers: &[String]) -> bool {
             signal_same(pid, start, "KILL");
         }
         wait_all_gone(&left, KILL_GRACE);
+    }
+    signalled
+}
+
+/// Every live descendant of process `root` by parent links, whatever session or group it moved
+/// to, with its start time and process group (never this process): what a one-shot call's
+/// agent started, read before the call's group is killed. An agent's tool may start a command
+/// in a session of its own (Claude Code's Bash tool does), which the group's kill misses and
+/// which, once its parent is gone, no parent link leads to. A process table that cannot be
+/// read gives `None`. Blocks (reads the process table).
+pub fn descendants(root: u32) -> Option<Vec<(u32, u64, i64)>> {
+    let me = std::process::id();
+    #[cfg(all(target_os = "linux", not(twr_ps)))]
+    let table = sys::all()?;
+    #[cfg(any(not(target_os = "linux"), twr_ps))]
+    let table: Vec<(u32, ProcStat)> = ps::table()?.into_iter().collect();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, stat) in &table {
+            if stat.ppid == parent
+                && *pid != me
+                && !matches!(stat.state, 'Z' | 'X' | 'x')
+                && seen.insert(*pid)
+            {
+                out.push((*pid, stat.start_time, stat.pgrp));
+                frontier.push(*pid);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Kills (SIGKILL) each of `procs` (pid and start time) that is still that process, checked
+/// right before its signal: a pid reused meanwhile is someone else's. Whether any was
+/// signalled. Blocks.
+pub fn kill_each(procs: &[(u32, u64)]) -> bool {
+    let mut signalled = false;
+    for &(pid, start) in procs {
+        if liveness(pid, start) == Alive::Yes {
+            signalled |= signal(pid, false, "KILL");
+        }
     }
     signalled
 }

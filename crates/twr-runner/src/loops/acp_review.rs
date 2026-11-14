@@ -33,7 +33,9 @@
 //! - **Usage** is what the agent's prompt results report (summed over the two prompts: input
 //!   with its cached part, output, and the cost when the agent reports one), or nothing.
 //! - **Process.** As every review run (`crate::one_shot`): a session and process group of its
-//!   own, killed when the run ends however it ends (an answer, the round's timeout, a cancel);
+//!   own, killed when the run ends however it ends (an answer, the round's timeout, a cancel),
+//!   with what it started outside that group (`one_shot::end_call`: what its tools ran in
+//!   sessions of their own, as Claude Code's Bash tool does);
 //!   twr's tokens and markers scrubbed from its environment, `TWR_AGENT=<thread>:loop-<id>` in
 //!   their place. What the agent said and did goes to `round-<round>.log` for people,
 //!   starting with what its session reported (`ext.acp` of `thread.started`: version, model,
@@ -52,7 +54,7 @@ use twr_core::event::{EventBody, TurnResult, Usage};
 use twr_core::loops::contract::{findings_in_text, Finding, FINDINGS_SCHEMA, MAX_ANSWER_BYTES};
 
 use super::review::{span, Call, Ended};
-use crate::one_shot::{kill_group, scrubbed_names, Group};
+use crate::one_shot::{call_tree, end_call, scrubbed_names, Group, REAPED_LINE};
 
 /// How long the agent has to exit once its session is stopped, before its group is killed.
 const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -226,7 +228,9 @@ pub async fn run(
         ))),
         why = cancelled => Err(Ended::Cancelled(why)),
     };
-    // The session ends; what it started goes with it, whatever way the run ended.
+    // The session ends; what it started goes with it, whatever way the run ended. What its
+    // tools started in sessions of their own is read first, while the agent still runs.
+    let tree = call_tree(group.0).await;
     let _ = handle.stop();
     let _ = tokio::time::timeout(STOP_GRACE, async {
         while let Some(ev) = events.recv().await {
@@ -236,8 +240,11 @@ pub async fn run(
         }
     })
     .await;
-    if let Some(pgid) = group.0.take() {
-        kill_group(pgid);
+    // Its group and what it started outside it (Claude Code's Bash tool runs each command in a
+    // session of its own), before the tree is read again: nothing of the run may write there
+    // afterwards.
+    if end_call(group.0.take(), &call.marker, tree).await {
+        log.line(REAPED_LINE);
     }
     // Read-only rests on the agent's mode; whether the tree stayed as it was, twr can see.
     if let Some(before) = &before {

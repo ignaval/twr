@@ -39,7 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use twr_core::event::Usage;
 use twr_core::loops::contract::{parse_findings, Finding, FINDINGS_SCHEMA, MAX_ANSWER_BYTES};
 
-use crate::one_shot::{kill_group, scrub_env, Group};
+use crate::one_shot::{call_tree, end_call, scrub_env, Group, REAPED_LINE};
 
 /// The most of a CLI's result object (Claude Code's, Grok Build's stdout) read, in bytes.
 const RESULT_MAX: u64 = 8 << 20;
@@ -337,9 +337,17 @@ pub async fn run(
         ))),
         why = cancelled => Err(Ended::Cancelled(why)),
     };
-    // What it started goes with it, whatever way it ended.
-    if let Some(pgid) = group.0.take() {
-        kill_group(pgid);
+    // What it started goes with it, whatever way it ended: its group, and what left the group
+    // (a tool's command in a session of its own).
+    let tree = call_tree(group.0).await;
+    if end_call(group.0.take(), &call.marker, tree).await {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&call.log_file)
+        {
+            let _ = writeln!(f, "{REAPED_LINE}");
+        }
     }
     let (out, status) = match outcome {
         Ok(r) => r,
@@ -359,6 +367,11 @@ pub async fn run(
         Err(e) => return Ended::Failed(format!("cannot wait for it: {e}")),
     };
     if codex {
+        // A reviewer whose sandbox could not start ran no command, so it read no file: its
+        // answer (often an empty list) is not a review.
+        if let Some(why) = codex_sandbox_failure(&call.log_file) {
+            return Ended::Failed(why);
+        }
         if !status.success() {
             return Ended::Failed(format!(
                 "codex exited with {status}{}",
@@ -500,6 +513,44 @@ fn codex_usage(log: &Path) -> Option<Usage> {
     })
 }
 
+/// How much of a Codex run's log [`codex_sandbox_failure`] reads (its end).
+const SANDBOX_TAIL: u64 = 8 * 1024 * 1024;
+
+/// Why a Codex review run's answer can't stand when its read-only sandbox could not start:
+/// Codex on Linux runs every shell command under bubblewrap, and where `bwrap` can't make its
+/// namespaces (a rootless container; an AppArmor-restricted kernel without a profile for it)
+/// or isn't there, each command fails before it runs. The reviewer then read nothing, yet may
+/// answer, even with an empty list. Read from the run's JSON stream: a `command_execution`
+/// whose output starts with bubblewrap's own `bwrap: ` prefix, or Codex's own `bubblewrap is
+/// unavailable` (no `bwrap` found). `None` when no command failed so.
+fn codex_sandbox_failure(log: &Path) -> Option<String> {
+    let t = tail(log, SANDBOX_TAIL);
+    let found = t.lines().find_map(|l| {
+        if l.contains("bubblewrap is unavailable") && serde_json::from_str::<Value>(l).is_err() {
+            return Some(l.trim().to_string());
+        }
+        let v = serde_json::from_str::<Value>(l).ok()?;
+        let item = &v["item"];
+        if v["type"] != "item.completed" || item["type"] != "command_execution" {
+            return None;
+        }
+        let first = item["aggregated_output"].as_str()?.lines().next()?.trim();
+        (first.starts_with("bwrap: ") || first.contains("bubblewrap is unavailable"))
+            .then(|| first.to_string())
+    })?;
+    let mut said: String = found.chars().take(200).collect();
+    if said.len() < found.len() {
+        said.push('…');
+    }
+    Some(format!(
+        "codex's read-only sandbox could not start here, so the reviewer ran no command and \
+         read no file ({said}); its answer is not used. Codex on Linux runs its shell under \
+         bubblewrap, which needs unprivileged user namespaces: a rootless container usually \
+         has none, and Ubuntu 24.04 and later allow them only to a bwrap with an AppArmor \
+         profile (Ubuntu's bubblewrap package)"
+    ))
+}
+
 /// What a Claude Code or Grok Build run spent, from its result object: its input tokens with
 /// the cache's reads and writes, its output tokens, and its cost.
 fn result_usage(v: &Value) -> Option<Usage> {
@@ -527,6 +578,59 @@ pub fn span(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Codex review run whose sandbox could not start (each command failed in bubblewrap)
+    /// fails, whatever it answered: the reviewer read nothing (seen with Codex 0.169.0 in a
+    /// rootless nerdctl container, where it then answered an empty list).
+    #[tokio::test]
+    async fn a_codex_run_whose_sandbox_could_not_start_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("codex");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+cat > /dev/null
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc pwd","aggregated_output":"bwrap: No permissions to create new namespace, likely because the kernel does not allow non-privileged user namespaces.\n","exit_code":1,"status":"failed"}}'
+printf '%s' '{"findings": []}' > "$out"
+echo '{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = call("codex");
+        c.bin = bin;
+        c.cwd = dir.path().to_path_buf();
+        c.folder = dir.path().to_path_buf();
+        c.schema_file = dir.path().join("findings.schema.json");
+        c.answer_file = dir.path().join("round-m1.answer.json");
+        c.log_file = dir.path().join("round-m1.log");
+        c.marker = String::new();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        match run(c.clone(), |_| {}, rx).await {
+            Ended::Failed(why) => {
+                assert!(
+                    why.starts_with("codex's read-only sandbox could not start here"),
+                    "{why}"
+                );
+                assert!(
+                    why.contains("bwrap: No permissions to create new namespace"),
+                    "{why}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // A command that failed otherwise is the reviewer's business, not the sandbox's.
+        let log = dir.path().join("other.log");
+        std::fs::write(
+            &log,
+            r#"{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"cat: x: No such file or directory\n","exit_code":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_sandbox_failure(&log), None);
+    }
 
     fn call(runtime: &str) -> Call {
         Call {

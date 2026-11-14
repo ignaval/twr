@@ -992,43 +992,135 @@ fn clone_args(
 }
 
 /// Runs `program` with `args` (a terminal on the box) with this terminal as its stdin and
-/// stderr, its stdout (the box's terminal) copied here as it comes, as it is: its exit status
-/// and the last [`CLONE_TAIL_MAX`] bytes of that output.
+/// stderr, and a pseudo-terminal of its own as its stdout, whose output is copied here as it
+/// comes, as it is: its exit status and the last [`CLONE_TAIL_MAX`] bytes of that output.
+///
+/// The stdout is a terminal, not a pipe, because a client may give the box a terminal only
+/// when its own stdout is one: `limactl shell` allocates none when its stdout is a pipe, and
+/// `nerdctl exec -t` in the VM then fails (`provided file is not a console`). The pty is raw
+/// (bytes pass as they are) and takes this terminal's size. Without a pty (`openpty` failed),
+/// the stdout is a pipe, as before.
 async fn run_in_terminal(
     program: &std::ffi::OsStr,
     args: &[String],
 ) -> anyhow::Result<(std::process::ExitStatus, Vec<u8>)> {
-    use tokio::io::AsyncReadExt;
     let shown = Path::new(program).display().to_string();
-    let mut child = tokio::process::Command::new(program)
-        .args(args)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("running {shown}"))?;
-    let mut from = child.stdout.take().expect("piped");
+        .kill_on_drop(true);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let mut child = match open_pty() {
+        Ok((master, slave)) => {
+            cmd.stdout(Stdio::from(slave));
+            let child = cmd.spawn().with_context(|| format!("running {shown}"))?;
+            // The slave's last copy here goes with the command, so the master reads the end
+            // once the program (and whatever it left holding the slave) is done.
+            drop(cmd);
+            // A thread, not a blocking task: it may block on a slave something on the box's
+            // side left open, and must not hold the runtime's shutdown.
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut f = std::fs::File::from(master);
+                let mut buf = vec![0u8; 8192];
+                // EIO once no slave is left open (Linux), 0 elsewhere: the end either way.
+                while let Ok(n) = f.read(&mut buf) {
+                    if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+            child
+        }
+        Err(_) => {
+            cmd.stdout(Stdio::piped());
+            let mut child = cmd.spawn().with_context(|| format!("running {shown}"))?;
+            let mut from = child.stdout.take().expect("piped");
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 8192];
+                while let Ok(n) = from.read(&mut buf).await {
+                    if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+            child
+        }
+    };
     let mut out = std::io::stdout();
     let mut tail: Vec<u8> = Vec::new();
-    let mut buf = vec![0u8; 8192];
-    loop {
-        let n = match from.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
+    let mut take = |chunk: &[u8]| {
         // (This terminal gone: the clone goes on; its path is still read.)
-        let _ = out.write_all(&buf[..n]).and_then(|()| out.flush());
-        tail.extend_from_slice(&buf[..n]);
+        let _ = out.write_all(chunk).and_then(|()| out.flush());
+        tail.extend_from_slice(chunk);
         if tail.len() > 2 * CLONE_TAIL_MAX {
             tail.drain(..tail.len() - CLONE_TAIL_MAX);
         }
+    };
+    let status = loop {
+        tokio::select! {
+            chunk = rx.recv() => match chunk {
+                Some(c) => take(&c),
+                None => break child.wait().await.with_context(|| format!("running {shown}"))?,
+            },
+            status = child.wait() => break status.with_context(|| format!("running {shown}"))?,
+        }
+    };
+    // What it wrote before it exited: until the end, or a moment without output (something
+    // it left behind may hold the pty open).
+    while let Ok(Some(c)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+        take(&c);
     }
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("running {shown}"))?;
     Ok((status, tail))
+}
+
+/// A raw pseudo-terminal pair (master, slave) the size of this process's stdout (80x24 when
+/// that is no terminal).
+fn open_pty() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut size = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCGWINSZ writes a winsize into `here`, which is one; a failure leaves it unset.
+    let mut here: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut here) } == 0
+        && here.ws_row > 0
+        && here.ws_col > 0
+    {
+        size = here;
+    }
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty writes two descriptors it opened; no name buffer, default termios.
+    let r = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both were just opened by openpty and are owned by nothing else.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // Raw: the box's terminal already did its line handling; no `\n` -> `\r\n` again here.
+    // SAFETY: tcgetattr fills `t`, cfmakeraw edits it, tcsetattr reads it; `slave` is open.
+    unsafe {
+        use std::os::fd::AsRawFd;
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave.as_raw_fd(), &mut t) == 0 {
+            libc::cfmakeraw(&mut t);
+            libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &t);
+        }
+    }
+    Ok((master, slave))
 }
 
 /// The path in the last `twr-clone-path <path>` line of `out` ([`CLONE_PATH_MARK`]): an
@@ -1329,6 +1421,33 @@ async fn reload(socket: &Path, name: &str) -> Result<Option<Value>, String> {
 mod tests {
     use super::*;
     use twr_core::config::BoxTransport;
+
+    /// The clone's command gets a terminal as its stdout, not a pipe: `limactl shell` gives
+    /// the box a terminal only when its stdout is one (`nerdctl exec -t` failed with
+    /// `provided file is not a console`). Its output still reaches the clone's path.
+    #[tokio::test]
+    async fn the_clones_command_writes_to_a_terminal() {
+        let (status, tail) = run_in_terminal(
+            std::ffi::OsStr::new("sh"),
+            &[
+                "-c".to_string(),
+                "if [ -t 1 ]; then echo stdout-is-a-terminal; else echo stdout-is-not; fi; \
+                 printf 'line\\n'; echo twr-clone-path /home/box/code/api"
+                    .to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(status.success());
+        let text = String::from_utf8_lossy(&tail);
+        assert!(text.contains("stdout-is-a-terminal"), "{text:?}");
+        // Raw: a newline stays a newline.
+        assert!(text.contains("line\n"), "{text:?}");
+        assert_eq!(
+            clone_path(&tail, "api").as_deref(),
+            Some("/home/box/code/api")
+        );
+    }
 
     #[test]
     fn the_home_mapped_path_is_the_same_place_under_the_boxs_home() {

@@ -18,6 +18,8 @@ prompt.<n>, its working directory to cwd.<n> and its environment to env.<n>, the
   tool.<n>    -> runs a shell tool unasked first, announced as claude-agent-acp 0.107.0 does:
                  `tool_call` "Terminal" with an empty rawInput, the command (the file's text)
                  in a later `tool_call_update`, then its completion
+  detach.<n>  -> starts `sleep 600` in a session of its own (as Claude Code's Bash tool runs
+                 each command), its pid in detached.<n>, and leaves it running
   write.<n>   -> writes the file's text to REVIEWED.md in its working directory, unasked (an
                  agent whose read-only mode did not hold)
   perm.<n>    -> asks session/request_permission first (allow_once, allow_always, reject_once,
@@ -155,6 +157,10 @@ def prompt(msg):
         ]:
             send({"jsonrpc": "2.0", "method": "session/update",
                   "params": dict(base, update=update)})
+    if os.path.exists(here("detach")):
+        import subprocess
+        child = subprocess.Popen(["sleep", "600"], start_new_session=True)
+        open(here("detached"), "w").write(str(child.pid))
     if os.path.exists(here("write")):
         with open("REVIEWED.md", "w") as f:
             f.write(open(here("write")).read())
