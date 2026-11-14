@@ -184,6 +184,8 @@ struct Report {
     build: Option<(String, BuildSource)>,
     agents: Option<Vec<AgentInfo>>,
     login_path: Option<LoginPathReport>,
+    /// A container box: the box's commands come through its command, not ssh.
+    command: bool,
 }
 
 impl Report {
@@ -195,6 +197,16 @@ impl Report {
             build: None,
             agents: None,
             login_path: None,
+            command: false,
+        }
+    }
+
+    /// How the box's commands reach it, in words: `ssh` or `the box's command`.
+    fn via(&self) -> &'static str {
+        if self.command {
+            "the box's command"
+        } else {
+            "ssh"
         }
     }
 
@@ -665,6 +677,7 @@ pub(super) async fn doctor(
     // What it prints, an agent may read: never a command's words ([`link_shown`]).
     let agent = caller_is_agent();
     let mut r = Report::new(name, json);
+    r.command = matches!(link, Some(BoxLink::Command { .. }));
     if !json {
         outln!(
             "box {name}: {}",
@@ -2122,35 +2135,47 @@ fn login_word(l: AgentLogin) -> &'static str {
 /// How asking the box's login shell for its `PATH` went (`twr runner --agents`).
 fn login_shell_check(r: &mut Report, lp: &LoginPathReport) {
     let shell = lp.shell.as_deref().unwrap_or("-");
+    let via = r.via();
     match (lp.entries, &lp.error) {
         (Some(n), _) => r.add(
             "login_shell",
             Mark::Ok,
             format!(
                 "{shell} gave its PATH ({n} entries): the box's agents are looked up on it, \
-                 then on the PATH ssh gives"
+                 then on the PATH {via} gives"
             ),
             None,
         ),
         (None, why) => {
             let why = why.as_deref().unwrap_or("it gave none");
             let fix = if why.starts_with(twr_runner::BOX_PROBE_ENV) {
-                "TWR_BOX_PROBE=off in ssh's commands on the box turns the login shell's PATH \
-                 off: unset it there"
+                format!(
+                    "TWR_BOX_PROBE=off in {via}'s commands on the box turns the login shell's \
+                     PATH off: unset it there"
+                )
+            } else if lp.shell.is_none() && r.command {
+                "SHELL is not set in the container's environment: set it (`-e SHELL=/bin/bash` \
+                 in the box's command, or the image's ENV), or put the agents on the PATH the \
+                 box's command gives (or name each with TWR_CLAUDE_BIN, TWR_CODEX_BIN, \
+                 TWR_GROK_BIN)"
+                    .to_string()
             } else if lp.shell.is_none() {
                 "SHELL is not set in ssh's commands on the box: set it, or put the agents on \
                  the PATH ssh gives (or name each with TWR_CLAUDE_BIN, TWR_CODEX_BIN, \
                  TWR_GROK_BIN)"
+                    .to_string()
             } else {
-                "twr asks sh, bash, zsh, ksh and fish (csh and tcsh are not asked): put the \
-                 agents on the PATH ssh gives, or name each with TWR_CLAUDE_BIN, TWR_CODEX_BIN, \
-                 TWR_GROK_BIN"
+                format!(
+                    "twr asks sh, bash, zsh, ksh and fish (csh and tcsh are not asked): put the \
+                     agents on the PATH {via} gives, or name each with TWR_CLAUDE_BIN, \
+                     TWR_CODEX_BIN, TWR_GROK_BIN"
+                )
             };
             r.add(
                 "login_shell",
                 Mark::Warn,
-                format!("the login shell's PATH was not read ({why}): the box's agents are looked up on the PATH ssh gives"),
-                Some(fix.into()),
+                format!("the login shell's PATH was not read ({why}): the box's agents are looked up on the PATH {via} gives"),
+                Some(fix),
             );
         }
     }
@@ -2588,6 +2613,39 @@ mod tests {
 
     /// A hub that did not say which build it runs has no build here (not this twr's): the
     /// box's configured build, else its newest, runs the checks, and the report says why.
+    /// A container box's commands come through its command, not ssh: the login shell check
+    /// says so, and how to give the container a `SHELL`.
+    #[test]
+    fn a_container_boxs_login_shell_check_names_its_command() {
+        let lp = LoginPathReport {
+            shell: None,
+            entries: None,
+            error: Some("SHELL is not set".into()),
+        };
+        let mut r = Report::new("ctr", true);
+        r.command = true;
+        login_shell_check(&mut r, &lp);
+        let c = r.checks.pop().unwrap();
+        assert!(!c.message.contains("ssh"), "{}", c.message);
+        assert!(
+            c.message.contains("the PATH the box's command gives"),
+            "{}",
+            c.message
+        );
+        let fix = c.fix.unwrap();
+        assert!(!fix.contains("ssh"), "{fix}");
+        assert!(fix.contains("-e SHELL=/bin/bash"), "{fix}");
+        // An SSH box's, as before.
+        let mut r = Report::new("gpu", true);
+        login_shell_check(&mut r, &lp);
+        let c = r.checks.pop().unwrap();
+        assert!(c.message.contains("the PATH ssh gives"), "{}", c.message);
+        assert!(c
+            .fix
+            .unwrap()
+            .contains("SHELL is not set in ssh's commands"));
+    }
+
     #[test]
     fn an_unknown_hub_build_is_not_this_twrs() {
         let hub = HubBuild::own(Some("it did not answer within 5 s".into()));

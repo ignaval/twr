@@ -272,6 +272,11 @@ pub(super) enum LoopSettingsCmd {
         /// reviewer call per rule).
         #[arg(long, value_parser = ["thread", "runs"])]
         sweep: Option<String>,
+        /// Check them against this box's agent CLIs (`local`: the hub's own machine) instead
+        /// of the project's box (`[projects.<name>] box`), else the hub's own machine. A loop
+        /// checks its thread's box whatever was saved.
+        #[arg(long = "box", value_name = "BOX")]
+        box_name: Option<String>,
         /// Print `loop.settings.set`'s answer as JSON.
         #[arg(long)]
         json: bool,
@@ -589,6 +594,7 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
                     implementation_commit,
                     plan_check,
                     sweep,
+                    box_name,
                     json,
                 }),
             ..
@@ -604,6 +610,7 @@ pub(super) async fn run(cmd: LoopCmd, socket: &Path) -> anyhow::Result<ExitCode>
                 implementation_commit,
                 plan_check,
                 sweep,
+                box_name,
             };
             settings_set(socket, project, changes, json).await?;
             Ok(ExitCode::SUCCESS)
@@ -1032,6 +1039,8 @@ struct Changes {
     implementation_commit: Option<String>,
     plan_check: Option<String>,
     sweep: Option<String>,
+    /// The box they are checked against (`loop.settings.set`'s `box`).
+    box_name: Option<String>,
 }
 
 /// The settings `twr loop settings set` and `--edit` start from: those that apply to
@@ -1099,6 +1108,9 @@ async fn settings_set(
     let mut params = json!({ "settings": s });
     if let Some(p) = &project {
         params["project"] = json!(p);
+    }
+    if let Some(b) = &ch.box_name {
+        params["box"] = json!(b);
     }
     let r = c.call("loop.settings.set", params).await?;
     if json {
@@ -1809,6 +1821,9 @@ fn list_text(list: &Value) -> String {
             let mut waiting = str_of(&l["waiting_on"]).to_string();
             if !l["stuck"].is_null() {
                 waiting.push_str(" (stuck)");
+            } else if let Some(b) = l["box_away"].as_str() {
+                // As the loop line says it: the run or check waits for the box to be back.
+                waiting = format!("box {b} (away)");
             } else if l["paused"] == true {
                 waiting.push_str(" (paused)");
             }
@@ -2810,6 +2825,15 @@ mod tests {
              api     review  high     ladder  m3     2       review\n"
         );
         assert_eq!(list_text(&json!([])), "no loop is running\n");
+        // A loop whose remote box is away waits on the box, not on the review it will run.
+        let away = json!([{"thread_name": "api", "kind": "review", "profile": "low",
+            "phase": "ladder", "round": "m1", "ledger": 0, "paused": false, "stuck": null,
+            "waiting_on": "review", "box_away": "gpu"}]);
+        assert_eq!(
+            list_text(&away),
+            "THREAD  KIND    PROFILE  PHASE   ROUND  LEDGER  WAITING ON\n\
+             api     review  low      ladder  m1     0       box gpu (away)\n"
+        );
         let detail = json!({
             "thread_name": "api", "id": "L1", "kind": "review", "running": false,
             "outcome": "clean",

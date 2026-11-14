@@ -351,6 +351,7 @@ async fn save(hub: &Hub, project: Option<&str>, settings: LoopSettings) -> Value
         LoopSettingsSet {
             project: project.map(str::to_string),
             settings,
+            ..Default::default()
         },
         &user(),
     )
@@ -843,6 +844,7 @@ async fn saved_settings_that_no_longer_hold_bring_the_card_back() {
             LoopSettingsSet {
                 project: None,
                 settings: first_card(),
+                ..Default::default()
             },
             &user(),
         )
@@ -1144,7 +1146,8 @@ async fn only_the_user_starts_loops_and_answers_their_cards() {
         hub.loop_settings_set(
             LoopSettingsSet {
                 project: None,
-                settings: first_card()
+                settings: first_card(),
+                ..Default::default()
             },
             &orch
         )
@@ -2768,6 +2771,7 @@ async fn the_card_is_read_and_accounts_are_checked() {
             LoopSettingsSet {
                 project: None,
                 settings: bad,
+                ..Default::default()
             },
             &user(),
         )

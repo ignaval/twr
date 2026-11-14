@@ -306,6 +306,11 @@ pub struct SettingsSet {
     pub project: Option<String>,
     /// The settings, whole.
     pub settings: LoopSettings,
+    /// The box whose agent CLIs the settings are checked against (`local`, or a remote box
+    /// the hub has). None: the project's `box` when it has one, else the hub's own machine.
+    /// A loop checks its thread's box anyway; this only decides what is refused here.
+    #[serde(rename = "box")]
+    pub box_name: Option<String>,
 }
 
 /// `loop.get`.
@@ -1439,12 +1444,42 @@ impl Hub {
         self.loop_agents().await;
         let mut core = self.inner.core();
         let project = core.loop_project(&self.inner, p.project.as_deref())?;
-        let avail = availability(&self.inner, &core.accounts, None);
+        let box_name = match p
+            .box_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        {
+            Some(b) if b == LOCAL_BOX => LOCAL_BOX.to_string(),
+            Some(b) => {
+                if self.inner.remote(b).is_none() {
+                    return Err(rpc(codes::NOT_FOUND, format!("no box {b}")));
+                }
+                b.to_string()
+            }
+            None => project
+                .as_deref()
+                .and_then(|p| self.inner.config.projects.get(p))
+                .and_then(|p| p.box_name.clone())
+                .filter(|b| self.inner.remote(b).is_some())
+                .unwrap_or_else(|| LOCAL_BOX.to_string()),
+        };
+        let avail = availability_on(&self.inner, &core.accounts, None, &box_name);
         let problems = validate(&p.settings, &avail, &self.inner.config.loops);
         if !problems.is_empty() {
+            // Where it looked, when that may not be where the loops run.
+            let hint = if box_name == LOCAL_BOX && !self.inner.remotes_list().is_empty() {
+                " (checked against the hub's own machine; to check them against a box's agent \
+                 CLIs instead, name the box: `twr loop settings set --box <box>`)"
+            } else {
+                ""
+            };
             return Err(rpc(
                 codes::BAD_REQUEST,
-                format!("these settings do not hold: {}", problem_words(&problems)),
+                format!(
+                    "these settings do not hold: {}{hint}",
+                    problem_words(&problems)
+                ),
             ));
         }
         let id = new_id();

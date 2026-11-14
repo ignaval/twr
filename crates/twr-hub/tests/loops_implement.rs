@@ -606,6 +606,7 @@ async fn save(hub: &Hub, settings: LoopSettings) {
         LoopSettingsSet {
             project: None,
             settings,
+            ..Default::default()
         },
         &user(),
     )

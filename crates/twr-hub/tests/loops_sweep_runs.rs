@@ -487,6 +487,7 @@ async fn looping(env: &Env, hub: &Hub, name: &str, settings: LoopSettings) -> St
         LoopSettingsSet {
             project: None,
             settings,
+            ..Default::default()
         },
         &user(),
     )

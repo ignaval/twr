@@ -1640,8 +1640,8 @@ fn reader_result(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyho
     }
 }
 
-/// Reads hub messages: applies acks, answers pings and runs commands (session commands in
-/// arrival order, the others concurrently).
+/// Reads hub messages: applies acks, answers pings and runs commands (session commands and a
+/// loop's file writes in arrival order, the others concurrently).
 async fn read_loop<S: HubStream>(
     mut stream: futures::stream::SplitStream<WebSocketStream<S>>,
     lbox: LocalBox,
@@ -1673,7 +1673,10 @@ async fn read_loop<S: HubStream>(
                 lbox.outbox_notify().notify_waiters();
             }
             HubMsg::Cmd { cmd_id, op } => {
-                if op.is_session_op() {
+                // A loop step's files (`loop_files`) are written before the commands that
+                // follow them, as session commands are run: the hub issues them ahead of the
+                // step's prompt (a `send`), which must not find them missing.
+                if op.is_session_op() || matches!(op, twr_core::runner::Op::LoopFiles { .. }) {
                     let r = lbox.handle_cmd(&cmd_id, op).await;
                     let _ = out.send(RunnerMsg::CmdResult(r));
                 } else {

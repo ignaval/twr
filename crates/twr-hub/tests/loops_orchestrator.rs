@@ -400,6 +400,7 @@ async fn save(hub: &Hub, project: Option<&str>, settings: LoopSettings) {
         LoopSettingsSet {
             project: project.map(str::to_string),
             settings,
+            ..Default::default()
         },
         &user(),
     )
@@ -753,6 +754,7 @@ async fn the_card_the_settings_and_the_other_controls_stay_the_users() {
                 LoopSettingsSet {
                     project: None,
                     settings: settings("low", "codex/gpt-6.1-sol"),
+                    ..Default::default()
                 },
                 &orch()
             )

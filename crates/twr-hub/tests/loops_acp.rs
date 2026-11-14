@@ -233,6 +233,7 @@ async fn save(hub: &Hub, settings: LoopSettings) -> Result<Value, twr_core::prot
         LoopSettingsSet {
             project: None,
             settings,
+            ..Default::default()
         },
         &user(),
     )

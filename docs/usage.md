@@ -311,11 +311,12 @@ twr loop settings --edit                     # change the workspace's in your ed
 twr loop settings --edit --project api       # give api its own
 twr loop settings set --preset claude --profile medium   # change named settings, no editor
 twr loop settings set --sweep runs                       # the hub audits the sweep: one reviewer run per rule
+twr loop settings set --box gpu --reviewer codex/gpt-6.1-sol   # checked against box gpu's agents
 twr loop settings --reset --project api      # api uses the workspace's again
 twr loop settings --reset                    # forget every saved set: the next loop shows the card
 ```
 
-`--edit` opens the TOML document of the card's `2 change…` (without the card's own `save_for` and `scope`), on a private temporary copy: if saving fails, the copy is kept and its path printed. `set` takes `--profile`, `--implementer`, `--workers`, `--reviewer`, `--commit` (a review loop's), `--implementation-commit`, `--plan-check` (`profile` for the profile's) and `--preset` (`claude-codex`: Claude Code implements and Codex reviews, the default; `claude`, `codex`, `grok`: all on one runtime), and saves the others as they apply now. `--reset` asks y/N on a terminal; without one, pass `--yes`. Only you save settings, from a client of yours: the orchestrator and the threads' agents cannot, and `[loops]` in the config file only sets what the first card shows ([configuration.md](configuration.md#notes-on-some-keys)).
+`--edit` opens the TOML document of the card's `2 change…` (without the card's own `save_for` and `scope`), on a private temporary copy: if saving fails, the copy is kept and its path printed. `set` takes `--profile`, `--implementer`, `--workers`, `--reviewer`, `--commit` (a review loop's), `--implementation-commit`, `--plan-check` (`profile` for the profile's) and `--preset` (`claude-codex`: Claude Code implements and Codex reviews, the default; `claude`, `codex`, `grok`: all on one runtime), and saves the others as they apply now. `set` checks the settings against the agent CLIs of the hub's own machine, or of the project's box for `--project` with `[projects.<name>] box`; `--box <box>` checks them against that box's instead. So when your loops run on a box and the hub's machine lacks their reviewer, save them with `--box` (a loop always checks its thread's box, and brings the card back when they don't hold there). `--reset` asks y/N on a terminal; without one, pass `--yes`. Only you save settings, from a client of yours: the orchestrator and the threads' agents cannot, and `[loops]` in the config file only sets what the first card shows ([configuration.md](configuration.md#notes-on-some-keys)).
 
 ### Pause, stop, skip
 
@@ -323,7 +324,7 @@ twr loop settings --reset                    # forget every saved set: the next 
 
 A step that fails (a review run that fails twice, a turn that fails, a triage block refused twice) makes the loop stuck: it raises an item on the thread's card with **resume**, which asks for that step again, and **stop**. Only you answer it. A loop survives a hub restart and goes on where it was.
 
-`twr loop list` lists the running loops, `twr loop show <thread>` the thread's running loop, else its last: its settings and where they came from, each phase, each round with its findings and the thread's verdicts, the ledger, the transition, and how it ended. An implementation loop's adds its task and baseline, each plan (its revision, contract risk and path), each implement turn (its status and gates), the plan check's round `p1`, each commit check with its notes, and the commits and `not committed: …`. Pause, resume, stop and skip work on either kind; skip is refused before an implementation loop's ladder (nothing is built to verify yet).
+`twr loop list` lists the running loops, with what each waits on (`box gpu (away)` while its box is away), `twr loop show <thread>` the thread's running loop, else its last: its settings and where they came from, each phase, each round with its findings and the thread's verdicts, the ledger, the transition, and how it ended. An implementation loop's adds its task and baseline, each plan (its revision, contract risk and path), each implement turn (its status and gates), the plan check's round `p1`, each commit check with its notes, and the commits and `not committed: …`. Pause, resume, stop and skip work on either kind; skip is refused before an implementation loop's ladder (nothing is built to verify yet).
 
 ### Asking the orchestrator for a loop
 

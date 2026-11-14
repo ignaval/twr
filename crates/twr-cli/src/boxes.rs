@@ -1192,7 +1192,7 @@ async fn add(
         ),
     }
     if probe.os == "Darwin" {
-        for l in mac_needs(name, &hub.version) {
+        for l in mac_needs(name, &hub.version, same) {
             outln!("{l}");
         }
     }
@@ -1283,32 +1283,35 @@ fn reach_lines(name: &str, link: &BoxLink) -> Vec<String> {
 
 /// What `twr box add` says a Mac (box `name`) needs, the hub running twr `version`: someone
 /// logged in at its screen (the box daemon runs in that GUI session, where Claude Code can
-/// read its keychain login), a twr build of the hub's commit for macOS, and the agents logged
-/// in at the Mac itself.
-fn mac_needs(name: &str, version: &str) -> Vec<String> {
+/// read its keychain login), a twr build of the hub's commit for macOS unless the hub installs
+/// its own (`same`: the Mac has the hub's OS and CPU), and the agents logged in at the Mac
+/// itself.
+fn mac_needs(name: &str, version: &str, same: bool) -> Vec<String> {
     let build = match dev_commit(version) {
-        Some(commit) => format!(
+        _ if same => None,
+        Some(commit) => Some(format!(
             "  - a twr build of the hub's commit ({commit}) for macOS: the hub runs a development \
              build, so build it on the Mac (docs/tools/dev-install.sh in a checkout of that \
              commit), then `twr box install {name} --from-box <its absolute path on the Mac>`;"
-        ),
-        None => format!(
+        )),
+        None => Some(format!(
             "  - a twr build for macOS: `twr box install {name}` downloads release v{version}'s \
              for the Mac and installs it there;"
-        ),
+        )),
     };
-    vec![
+    let mut needs = vec![
         "- The box is a Mac. It needs:".to_string(),
         "  - someone logged in at the Mac's screen: the box daemon runs as a launchd job in \
          that GUI session, where Claude Code can read its keychain login (from ssh alone it \
          can't). Turn on automatic login if the Mac may restart with no one there;"
             .to_string(),
-        build,
-        format!(
-            "  - its agents logged in at the Mac itself (Claude Code keeps its login in the \
-             keychain); `twr box doctor {name}` checks all of this once the box is added."
-        ),
-    ]
+    ];
+    needs.extend(build);
+    needs.push(format!(
+        "  - its agents logged in at the Mac itself (Claude Code keeps its login in the \
+         keychain); `twr box doctor {name}` checks all of this once the box is added."
+    ));
+    needs
 }
 
 /// What `twr box add` says of the projects configured for box `name` (`[projects.<p>] box`):
@@ -3858,7 +3861,7 @@ mod tests {
     /// What `twr box add` says a Mac needs, for a release hub and a development one.
     #[test]
     fn a_mac_box_is_told_what_it_needs() {
-        let release = mac_needs("mac", "0.2.0").join("\n");
+        let release = mac_needs("mac", "0.2.0", false).join("\n");
         assert!(
             release.contains("logged in at the Mac's screen"),
             "{release}"
@@ -3869,10 +3872,17 @@ mod tests {
             "{release}"
         );
         assert!(release.contains("logged in at the Mac itself"), "{release}");
-        let dev = mac_needs("mac", "0.2.0+dev.abc1234").join("\n");
+        let dev = mac_needs("mac", "0.2.0+dev.abc1234", false).join("\n");
         assert!(dev.contains("docs/tools/dev-install.sh"), "{dev}");
         assert!(dev.contains("`twr box install mac --from-box "), "{dev}");
         assert!(dev.contains("(abc1234)"), "{dev}");
+        // A Mac of the hub's own OS and CPU gets the hub's build: nothing to install there.
+        for version in ["0.2.0", "0.2.0+dev.abc1234"] {
+            let same = mac_needs("mac", version, true).join("\n");
+            assert!(!same.contains("twr box install"), "{same}");
+            assert!(same.contains("logged in at the Mac's screen"), "{same}");
+            assert!(same.contains("logged in at the Mac itself"), "{same}");
+        }
     }
 
     /// `--from-box` takes an absolute path of the box's, and warns about one under this

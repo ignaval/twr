@@ -26,7 +26,9 @@ use twr_core::loops::settings::LoopSettings;
 use twr_core::loops::Outcome;
 use twr_core::runner::{AgentInfo, Secret};
 use twr_core::testkit::git as tg;
-use twr_hub::hub::{AgentProbe, LoopGet, LoopRequest, LoopSettingsFor, LoopSetupUpdate};
+use twr_hub::hub::{
+    AgentProbe, LoopGet, LoopRequest, LoopSettingsFor, LoopSettingsSet, LoopSetupUpdate,
+};
 use twr_hub::listener::{RunnerListener, RunnerServer};
 use twr_hub::{Caller, Hub, HubOptions, NewThread};
 use twr_runner::{BoxEnv, LocalBox, LocalBoxOptions, RunnerOptions};
@@ -90,11 +92,30 @@ struct Brain {
     /// The rules a `sweep = "runs"` loop names.
     rules: Vec<String>,
     seen: Vec<String>,
+    /// The loop folder's files a prompt named that were not on the box when it came.
+    missing: Vec<String>,
 }
 
 impl Brain {
     fn reply(&mut self, prompt: &str) -> Option<String> {
         self.seen.push(prompt.to_string());
+        // What the step reads must be in the box's folder before its prompt comes (the plan
+        // step's names `plan.md` as where its plan goes).
+        let step = prompt.lines().next().unwrap_or_default().to_string();
+        for word in prompt.split_whitespace() {
+            let path = word
+                .trim_start_matches(['(', '`'])
+                .trim_end_matches(['.', ',', ')', ':', ';', '`']);
+            if path.contains("/loops/")
+                && ["/plan.md", "/ledger.md", "/goal.md", "/task.md"]
+                    .iter()
+                    .any(|f| path.ends_with(f))
+                && !Path::new(path).is_file()
+                && !(step.ends_with(" plan]") && path.ends_with("/plan.md"))
+            {
+                self.missing.push(format!("{step} {path}"));
+            }
+        }
         let first = prompt.lines().next().unwrap_or_default().to_string();
         if let Some(i) = self
             .replies
@@ -964,6 +985,13 @@ async fn a_review_loop_runs_on_a_box() {
     let log = std::fs::read_to_string(hub_folder.join("round-m1.log")).unwrap();
     assert!(log.contains("fake reviewer run 1"), "{log}");
     assert!(hub_folder.join("diff-api-m1.patch").is_file());
+    // The report turn was told the report goes into the box's folder: it is there, the
+    // hub's own, for the thread's later turns to read.
+    let report = std::fs::read(hub_folder.join("report.md")).unwrap();
+    until("report.md in the box's folder", || {
+        std::fs::read(folder.join("report.md")).is_ok_and(|r| r == report)
+    })
+    .await;
     // With the box away, the report and `loop.get` still read.
     runner.shutdown().await;
     let r = h
@@ -1018,6 +1046,10 @@ async fn an_implementation_loop_runs_on_a_box_and_commits_there() {
         implement.contains(&folder.join("plan.md").display().to_string()),
         "{implement}"
     );
+    // It was there when the implement turn's prompt came (no review run between the plan and
+    // the implement turn: the plan check was skipped), as was everything else a prompt named.
+    let missing = env.brain.lock().unwrap().missing.clone();
+    assert!(missing.is_empty(), "named but not on the box: {missing:?}");
     // The reviewer (Claude Code, on the box) read the plan by its path there.
     let review = env.run_file(1, "stdin");
     assert!(
@@ -1516,6 +1548,125 @@ async fn a_hub_killed_during_a_thread_turn_takes_its_answer_once() {
         .collect();
     assert_eq!(goals.len(), 1);
     assert_eq!(env.seen(" scope]").len(), 1);
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// `loop.settings.set` (the editor, `twr loop settings set`) checks the hub's own machine by
+/// default, and says so when it refuses; with `box` it checks that box's agent CLIs instead:
+/// settings a box thread's card saved can then be changed without the hub's machine having the
+/// box's reviewer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_saved_for_a_box_are_checked_against_its_agents() {
+    let mut env = Env::new().await;
+    env.on_box = vec!["claude-code"];
+    let h = env.hub().await;
+    let runner = env.runner();
+    online(&h).await;
+    let t = box_thread(&env, &h, "api").await;
+    // The box's agents reported (Claude Code there, no Codex).
+    let mut reported = false;
+    for _ in 0..200 {
+        let tt = t.clone();
+        let got = h
+            .run(|hub| async move {
+                hub.loop_settings_get(LoopSettingsFor {
+                    project: None,
+                    thread: Some(tt),
+                })
+                .await
+            })
+            .await
+            .unwrap();
+        let found = |rt: &str| {
+            got["runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["runtime"] == rt && r["found"] == true)
+        };
+        if found("claude-code") && !found("codex") {
+            reported = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(reported, "the box never reported its agents");
+    let hr = &h;
+    let set = |s: LoopSettings, b: Option<&str>| {
+        let p = LoopSettingsSet {
+            project: None,
+            settings: s,
+            box_name: b.map(str::to_string),
+        };
+        async move {
+            hr.run(|hub| async move { hub.loop_settings_set(p, &user()).await })
+                .await
+        }
+    };
+    let claude = settings("low", "claude-code/claude-opus-5-5");
+    // The hub's own machine has no reviewer: refused, saying where it looked.
+    let e = set(claude.clone(), None).await.unwrap_err();
+    assert_eq!(e.code, "bad_request", "{e:?}");
+    assert!(e.message.contains("hub's own machine"), "{}", e.message);
+    assert!(e.message.contains("--box"), "{}", e.message);
+    // Checked against the box: it holds there.
+    set(claude, Some(BOX)).await.unwrap();
+    // A reviewer the box lacks is refused for the box, by name.
+    let e = set(settings("low", "codex/gpt-6.1-sol"), Some(BOX))
+        .await
+        .unwrap_err();
+    assert!(
+        e.message.contains("codex isn't installed on box gpu"),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("--box"), "{}", e.message);
+    // A box the hub does not have.
+    let e = set(settings("low", "codex/gpt-6.1-sol"), Some("nope"))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "not_found", "{e:?}");
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// A thread's next loop removes its previous loop's folder from the box when it first writes
+/// its own, also when the hub restarted in between (it knows the previous loop from the
+/// thread's record, not from what it wrote itself); deleting the thread with the box connected
+/// removes the last one's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_loop_removes_the_previous_loops_folder_from_the_box() {
+    let env = Env::new().await;
+    let h = env.hub().await;
+    let runner = env.runner();
+    online(&h).await;
+    let t = box_thread(&env, &h, "api").await;
+    let wt = PathBuf::from(h.hub().thread_view(&t).unwrap().worktree.unwrap());
+    std::fs::write(wt.join("lib.rs"), "fn changed() {}\n").unwrap();
+    start(&h, &t, "review", None, settings("low", "codex/gpt-6.1-sol")).await;
+    let first = loop_id(&h, &t);
+    ended(&h, &t).await;
+    // Kept after the end, for the thread's later turns.
+    assert!(box_folder(&env, &first).join("report.md").is_file());
+    h.shutdown().await;
+    let h = env.hub().await;
+    online(&h).await;
+    // The next loop starts on the saved settings.
+    let req: LoopRequest = serde_json::from_value(json!({"thread": t, "kind": "review"})).unwrap();
+    let r = h
+        .run(|hub| async move { hub.loop_request(req, &user()).await })
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "started", "{r}");
+    let second = loop_id(&h, &t);
+    assert_ne!(second, first);
+    until("the previous loop's folder gone from the box", || {
+        !box_folder(&env, &first).exists()
+    })
+    .await;
+    ended(&h, &t).await;
+    assert!(box_folder(&env, &second).is_dir());
     runner.shutdown().await;
     h.shutdown().await;
 }
