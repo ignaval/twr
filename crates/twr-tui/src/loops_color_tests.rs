@@ -1810,6 +1810,34 @@ struct Reading {
     short: Vec<String>,
 }
 
+/// Whether `symbol` is only a border or a rule: box-drawing and block characters.
+fn border(symbol: &str) -> bool {
+    symbol
+        .chars()
+        .all(|c| ('\u{2500}'..='\u{259f}').contains(&c))
+}
+
+/// The contrast text cell `was` (as drawn in full color), shown as `sh` on terminal `v`,
+/// needs ([`needed`]): a thread's color on the terminal's own background 2:1 on white, as the
+/// palette is made to (docs/tui.md, "Colors").
+fn needed_for(was: &Cell, sh: Shown, v: Variant) -> f64 {
+    let thread = crate::color::THREAD_COLORS.contains(&was.fg)
+        && was.bg == Color::Reset
+        && !was.modifier.contains(Modifier::REVERSED);
+    if thread && v.light && v.depth == Depth::Full {
+        2.0
+    } else {
+        needed(sh)
+    }
+}
+
+/// Up to a few cells of text around `x` on row `y` of `r`: where a cell is.
+fn near(buf: &Buffer, r: Rect, x: u16, y: u16) -> String {
+    let from = x.saturating_sub(8).max(r.left());
+    let to = (x + 12).min(r.right());
+    (from..to).map(|x| sym(buf, x, y)).collect::<String>()
+}
+
 fn read(s: &Surface, v: Variant) -> Reading {
     let mut buf = s.buf.clone();
     degrade(&mut buf, v.depth);
@@ -1817,26 +1845,27 @@ fn read(s: &Surface, v: Variant) -> Reading {
     let mut short = Vec::new();
     for r in &s.cells {
         for y in r.top()..r.bottom() {
-            let row: String = (r.left()..r.right()).map(|x| sym(&buf, x, y)).collect();
             for x in r.left()..r.right() {
                 let cell = &buf[(x, y)];
-                if cell.symbol().trim().is_empty() {
+                let was = &s.buf[(x, y)];
+                if cell.symbol().trim().is_empty()
+                    || (border(cell.symbol()) && was.fg != crate::icon::ACCENT)
+                {
                     continue;
                 }
                 let sh = shown(cell, v);
                 let c = contrast(sh.fg, sh.bg);
-                let was = &s.buf[(x, y)];
+                let need = needed_for(was, sh, v);
                 lowest = lowest.min(c);
-                if c < needed(sh) {
+                if c < need {
                     let what = format!(
-                        "{:?} on {:?} {:?} (drawn {:?} on {:?}): {c:.2} < {} in {:?}",
+                        "{:?} on {:?} {:?} (drawn {:?} on {:?}): {c:.2} < {need} in {:?}",
                         was.fg,
                         was.bg,
                         was.modifier,
                         cell.fg,
                         cell.bg,
-                        needed(sh),
-                        row.trim()
+                        near(&buf, *r, x, y).trim()
                     );
                     if !short.contains(&what) {
                         short.push(what);
@@ -2008,6 +2037,9 @@ fn the_loop_badges_keep_fills_of_their_own_and_say_what_they_are() {
     );
 }
 
+#[path = "frame_color_tests.rs"]
+mod frames;
+
 // ---------------------------------------------------------------------------------------------
 // Pages for a human
 // ---------------------------------------------------------------------------------------------
@@ -2124,7 +2156,8 @@ fn loop_ui_shots() {
         return;
     };
     let dir = std::path::PathBuf::from(dir);
-    let all = surfaces();
+    let mut all = surfaces();
+    all.extend(frames::frames());
     let mut top = String::from(
         "<h1>twr TUI: the loop UI's surfaces, option keys, activity text, states, bands and code</h1>\n<ul>\n",
     );

@@ -12,16 +12,18 @@
 //! magenta, the selection's yellow, red errors, done's blue, the muted and dark greys), the
 //! alarming ones (red, yellow) least of all: its warm colors are pinks, a brown and muted
 //! roses. The meaning colors that read on black and on white alike ([`RUNNING`], [`WAITING`],
-//! [`WORKING`], [`CODE`]) are mid-tones, where the palette has colors too: each is the
-//! farthest from them its hue allows.
+//! [`WORKING`], [`CODE`], [`SUCCESS`], [`WARN`], [`LABEL`]) are mid-tones, where the palette has
+//! colors too: each is the farthest from them its hue allows. On a dark grey band, or as a
+//! selected text's fill, a mid-tone is drawn in its bright form ([`bright`]).
 //!
 //! `[tui] colors` ([`ColorMode`]) says how deep the colors go, resolved once at start
 //! ([`resolve`]: `auto` from `NO_COLOR`, `COLORTERM` and `TERM`) into a [`Depth`]. The view is
 //! drawn in full color and then brought down to that depth in one pass over the frame
 //! ([`degrade`]): with 16 colors, a thread's color is the old dark grey (a fill the old
-//! magenta), the state words, the working icon and the dark grey bands are drawn their own way
-//! ([`special`]), and other colors the nearest named one of their kind ([`basic`]), a text that
-//! would come down to its fill's color taking one that reads on it ([`apart`]); with none,
+//! magenta), the state words, the working icon, a success, a warning, a label and the dark
+//! grey bands are drawn their own way ([`special`]), and other colors the nearest named one of
+//! their kind ([`basic`]), a text that would come down to its fill's color taking one that
+//! reads on it ([`apart`]), black or white on a fill it no longer reads on the other; with none,
 //! every cell is in the terminal's own colors, a filled cell drawn in reverse video.
 
 use ratatui::buffer::{Buffer, Cell};
@@ -102,6 +104,46 @@ pub const WORKING: Color = Color::Indexed(166);
 /// Code in a reply ([`crate::md`]), inline and in blocks: a steel blue (`#5f87af`), 5.6:1 on
 /// black and 3.8:1 on white; light blue with 16 colors (4.4:1 and 4.7:1).
 pub const CODE: Color = Color::Indexed(67);
+/// What went well: the `✓` of a tool call that succeeded, of an answered request, of a `!`
+/// command that exited 0 and of a hub update, a report's `● success`, `installed` in the
+/// orchestrator picker. A green (`#5f8700`), 5.0:1 on black and 4.2:1 on white. With 16
+/// colors the terminal's own text color in bold: no green reads on both, and the `✓` says it.
+pub const SUCCESS: Color = Color::Indexed(64);
+/// A `!` command's text: the `!` of its entry and the input box's title while the line is one
+/// (its border and its ` ! shell ` badge stay [`crate::ui::SHELL_COLOR`]). [`SUCCESS`]'s green.
+pub const SHELL: Color = SUCCESS;
+/// What warns: a warning or a note, a turn interrupted, a `!` command running or stopped, a
+/// request's `!` in a hub update, a usage window near its limit, a busy machine, a git line
+/// with changes, `twr asks` and what the orchestrator needs, and a selected box's title (its
+/// frame in the selection's yellow). An amber (`#af875f`), 6.5:1 on black and 3.3:1 on white, beside
+/// [`WAITING`]'s. With 16 colors the terminal's own text color in bold: no yellow reads on
+/// both, and the words say it.
+pub const WARN: Color = Color::Indexed(137);
+/// A label of the TUI's own, in its cyan: the tab strip's `≡`, `[pin]`, a command in the
+/// completions, the help's keys, the trash's ids, a dialog's title, the decisions' filter, a
+/// clean git line, and the orchestrator's text (its card's name, the input box's title). A
+/// teal (`#008787`), 4.8:1 on black and 4.4:1 on white. With 16 colors the terminal's own
+/// text color in bold.
+pub const LABEL: Color = Color::Indexed(30);
+
+/// The colors [`degrade`] draws in the terminal's own text color in bold with 16 colors, on the
+/// terminal's own background: the working icon, and the texts whose hue no named color keeps
+/// on both a dark and a light terminal.
+const OWN_TEXT: [Color; 4] = [WORKING, SUCCESS, WARN, LABEL];
+
+/// A mid-tone's bright form: what a dark grey band ([`crate::ui::on_band`]) draws a text of
+/// that color in, and the fill of a selected text of that color ([`crate::ui::lit`]). A light
+/// green for [`SUCCESS`], the selection's yellow for [`WARN`] and the orchestrator's light cyan
+/// for [`LABEL`] (`#5fd75f`, `#ffd700`, `#5fd7d7`), each 4.5:1 at least on every band and
+/// under black text; any other color as it is.
+pub fn bright(c: Color) -> Color {
+    match c {
+        SUCCESS => Color::Indexed(77),
+        WARN => Color::Indexed(220),
+        LABEL => Color::Indexed(80),
+        c => c,
+    }
+}
 
 // The fills the TUI draws in dark greys, and what is drawn on them. A text on one reads at
 // 4.5:1 at least against it. With 16 colors a dark grey fill can't carry light text at 4.5:1
@@ -206,11 +248,13 @@ pub fn resolve_env(mode: ColorMode) -> Depth {
 /// it was before threads had colors) and every other color as one of the 16 named ones
 /// ([`basic`]); a cell whose text and fill differ but come down to the same named color (a
 /// dimmed grey on a grey band: both dark grey) has its text in one that reads on the fill
-/// ([`apart`]). Some colors that mean something are drawn their own way ([`special`]): a
-/// state word in [`RUNNING`], [`WAITING`] or [`DONE`] as a fill of its named color under
-/// black or white text, the working icon ([`WORKING`]) in the terminal's own text color in
-/// bold, and the dark grey bands ([`BAND`], [`BAND_ALT`], [`PROMPT_BAND`]) in black or blue
-/// with text that reads on them.
+/// ([`apart`]), and a black or white text on a fill it no longer reads on at 4.5:1 (black on a
+/// thread's color, now magenta) is the other. Some colors that mean something are drawn their
+/// own way ([`special`]): a state word in [`RUNNING`], [`WAITING`] or [`DONE`] as a fill of its
+/// named color under black or white text, the working icon ([`WORKING`]), and a success
+/// ([`SUCCESS`]), a warning ([`WARN`]) or a label ([`LABEL`]) on the terminal's own
+/// background, in the terminal's own text color in bold, and the dark grey bands ([`BAND`],
+/// [`BAND_ALT`], [`PROMPT_BAND`]) in black or blue with text that reads on them.
 /// [`Depth::None`] puts every cell in the terminal's own colors and reverses the video of
 /// each cell that had a fill (a band, a user message, a request's badge), so fills stay
 /// seen; a cell already reversed on a fill (the mouse selection over a band) is drawn plain.
@@ -227,6 +271,10 @@ pub fn degrade(buf: &mut Buffer, depth: Depth) {
                 let (fg, bg) = (basic(cell.fg, false), basic(cell.bg, true));
                 cell.fg = if fg == bg && cell.fg != cell.bg {
                     apart(bg)
+                } else if matches!(fg, Color::Black | Color::White) && !reads(fg, bg) {
+                    // Black or white on a fill that came down to one they don't read on (black
+                    // on a thread's color, now magenta): the other.
+                    named_text_on(bg)
                 } else {
                     fg
                 };
@@ -283,7 +331,9 @@ fn basic(c: Color, bg: bool) -> Color {
 
 /// Brings `cell` down to 16 colors when it is drawn in one of the colors that have a way of
 /// their own there ([`degrade`]), and says whether it did:
-/// - the working icon ([`WORKING`]): the terminal's own text color, in bold;
+/// - the working icon ([`WORKING`]), and on the terminal's own background a success
+///   ([`SUCCESS`]), a warning ([`WARN`]) or a label ([`LABEL`]): the terminal's own text
+///   color, in bold;
 /// - a state word ([`STATE_FILLS`]) on the terminal's own background, not reversed: a fill of
 ///   its named color over the cells it takes, its text black or white, whichever reads better
 ///   ([`named_text_on`]);
@@ -291,7 +341,7 @@ fn basic(c: Color, bg: bool) -> Color {
 ///   named one ([`basic`]; white for the terminal's own) unless that reads under 4.5:1 on the
 ///   fill, then black or white.
 fn special(cell: &mut Cell) -> bool {
-    if cell.fg == WORKING {
+    if cell.fg == WORKING || (OWN_TEXT.contains(&cell.fg) && cell.bg == Color::Reset) {
         cell.fg = Color::Reset;
         cell.bg = basic(cell.bg, true);
         cell.modifier.insert(Modifier::BOLD);
@@ -309,15 +359,25 @@ fn special(cell: &mut Cell) -> bool {
             Color::Reset => Color::White,
             c => basic(c, false),
         };
-        let reads = |fg: Color| match (rgb(fg), rgb(fill)) {
-            (Some(a), Some(b)) => contrast(a, b) >= 4.5,
-            _ => false,
+        cell.fg = if reads(fg, fill) {
+            fg
+        } else {
+            named_text_on(fill)
         };
-        cell.fg = if reads(fg) { fg } else { named_text_on(fill) };
         cell.bg = fill;
         return true;
     }
     false
+}
+
+/// Whether text `fg` reads on fill `bg` at 4.5:1 at least with xterm's values (true on the
+/// terminal's own background, which the text was drawn for).
+fn reads(fg: Color, bg: Color) -> bool {
+    match (rgb(fg), rgb(bg)) {
+        (Some(a), Some(b)) => contrast(a, b) >= 4.5,
+        (_, None) => true,
+        _ => false,
+    }
 }
 
 /// Black or white, whichever reads better on named fill `bg` with xterm's values.
@@ -489,11 +549,11 @@ mod tests {
     }
 
     /// No thread's color is near a color that alarms: red (an error, a permission), yellow (a
-    /// question, a selection): 0.12 at least in OKLab. The working icon's orange and the
-    /// waiting amber are mid-tones that read on black and on white, a part of the cube the
-    /// palette fills too: 0.06 at least (they are 0.075 from the brown 130 and 0.065 from the
-    /// olive 100; a just noticeable difference is about 0.02). Nor is any thread's color a
-    /// grey: every one has a hue.
+    /// question, a selection): 0.12 at least in OKLab. The working icon's orange, the waiting
+    /// amber and the warning's are mid-tones that read on black and on white, a part of the
+    /// cube the palette fills too: 0.06 at least (they are 0.075 from the brown 130, 0.065
+    /// from the olive 100 and 0.104 from the rose 131; a just noticeable difference is about
+    /// 0.02). Nor is any thread's color a grey: every one has a hue.
     #[test]
     fn no_thread_color_is_near_an_alarm_or_a_grey() {
         let alarm = [
@@ -504,7 +564,7 @@ mod tests {
             Color::LightYellow,
             Color::Indexed(220),
         ];
-        let mid_tones = [WORKING, WAITING];
+        let mid_tones = [WORKING, WAITING, WARN];
         for c in THREAD_COLORS {
             for m in alarm {
                 assert!(distance(c, m) >= 0.12, "{c:?} near {m:?}");
@@ -519,14 +579,19 @@ mod tests {
 
     /// A thread's color is far from every color that means something (0.08 in OKLab), and
     /// from the other threads' colors (0.07: a just noticeable difference is about 0.02). The
-    /// state, working and code colors that must read on black and on white alike are mid-tones
-    /// of the cube, where the palette's colors are too: each is the farthest from them of the
-    /// mid-tones of its hue, and 0.055 at least (running's green 0.061 from 29, waiting's amber
-    /// 0.065 from 100, the working orange 0.075 from 130, code's blue 0.058 from 31).
+    /// state, working, code, success, warning and label colors that must read on black and on
+    /// white alike are mid-tones of the cube, where the palette's colors are too: each is the
+    /// farthest from them of the mid-tones of its hue, and 0.055 at least (running's green
+    /// 0.061 from 29, waiting's amber 0.065 from 100, the working orange 0.075 from 130, code's
+    /// blue 0.058 from 31, success's green 0.056 from 100, the warning's amber 0.104 from 131,
+    /// the label's teal 0.062 from 29). The mid-tones' bright forms on a band are meaning
+    /// colors too (the label's 80 and the warning's 220 are already, success's 77 is 0.106
+    /// from 106).
     #[test]
     fn thread_colors_are_apart_from_the_meaning_colors_and_each_other() {
         let meaning = [
             Color::Indexed(80),
+            Color::Indexed(77),
             Color::Cyan,
             Color::Magenta,
             Color::Indexed(176),
@@ -543,7 +608,7 @@ mod tests {
             Color::Indexed(246),
             Color::DarkGray,
         ];
-        let mid_tones = [RUNNING, WAITING, WORKING, CODE];
+        let mid_tones = [RUNNING, WAITING, WORKING, CODE, SUCCESS, WARN, LABEL];
         for c in THREAD_COLORS {
             for m in meaning {
                 assert!(distance(c, m) >= 0.08, "{c:?} near {m:?}");
@@ -598,20 +663,34 @@ mod tests {
     }
 
     /// The colors that mean something read on a dark terminal and a light one: a state word,
-    /// the working icon and code at 3:1 at least on black and on white; a band's text, plain
-    /// or dim, at 4.5:1 at least on each band.
+    /// the working icon, code, a success, a warning and a label at 3:1 at least on black and on
+    /// white; a band's text, plain or dim, and a mid-tone's bright form at 4.5:1 at least on
+    /// each band; black or white at 4.5:1 at least on a bright form, a selected text's fill.
     #[test]
     fn the_meaning_colors_read_on_black_and_on_white() {
-        for c in [RUNNING, WAITING, DONE, IDLE, WORKING, CODE] {
+        for c in [
+            RUNNING, WAITING, DONE, IDLE, WORKING, CODE, SUCCESS, WARN, LABEL,
+        ] {
             let v = rgb(c).unwrap();
             assert!(contrast(v, BLACK) >= 3.0, "{c:?} on black");
             assert!(contrast(v, WHITE) >= 3.0, "{c:?} on white");
         }
         for band in [BAND, BAND_ALT, PROMPT_BAND] {
-            for text in [BAND_TEXT, BAND_DIM] {
+            for text in [
+                BAND_TEXT,
+                BAND_DIM,
+                bright(SUCCESS),
+                bright(WARN),
+                bright(LABEL),
+            ] {
                 let ratio = contrast(rgb(text).unwrap(), rgb(band).unwrap());
                 assert!(ratio >= 4.5, "{text:?} on {band:?}: {ratio}");
             }
+        }
+        for c in [SUCCESS, WARN, LABEL] {
+            let fill = rgb(bright(c)).unwrap();
+            let ratio = contrast(rgb(text_on(bright(c))).unwrap(), fill);
+            assert!(ratio >= 4.5, "{c:?}'s fill: {ratio}");
         }
     }
 
@@ -626,8 +705,20 @@ mod tests {
             include_str!("sidebar.rs"),
             include_str!("loops.rs"),
             include_str!("settings.rs"),
+            include_str!("select.rs"),
         ];
-        for c in [RUNNING, WAITING, DONE, WORKING, BAND, BAND_ALT, PROMPT_BAND] {
+        for c in [
+            RUNNING,
+            WAITING,
+            DONE,
+            WORKING,
+            BAND,
+            BAND_ALT,
+            PROMPT_BAND,
+            SUCCESS,
+            WARN,
+            LABEL,
+        ] {
             let Color::Indexed(n) = c else {
                 panic!("{c:?}");
             };
@@ -726,7 +817,8 @@ mod tests {
             [
                 (Color::DarkGray, Color::Magenta),
                 (Color::Black, Color::Cyan),
-                (Color::White, Color::LightYellow),
+                // (White doesn't read on light yellow: black does.)
+                (Color::Black, Color::LightYellow),
                 (Color::LightRed, Color::Reset),
                 (Color::Yellow, Color::Blue),
                 (Color::Blue, Color::DarkGray),
@@ -761,9 +853,10 @@ mod tests {
     /// With 16 colors the colors that have a way of their own are drawn so: a state word in
     /// running's, waiting's or done's color is a fill of green, yellow or blue under black or
     /// white text (reversed, it is left as any color); idle's grey is dark grey; the working
-    /// icon is the terminal's own text color in bold; a band is black or blue, a text on it
-    /// white or light grey, or a named color that reads on it at 4.5:1; a key cap keeps its
-    /// own fill.
+    /// icon, a success, a warning and a label are the terminal's own text color in bold; a
+    /// band is black or blue, a text on it white or light grey, or a named color that reads on
+    /// it at 4.5:1; a key cap keeps its own fill; black on a fill where it no longer reads is
+    /// white.
     #[test]
     fn sixteen_colors_draw_states_the_icon_and_bands_their_own_way() {
         let (r, bold, rev) = (Color::Reset, Modifier::BOLD, Modifier::REVERSED);
@@ -775,6 +868,16 @@ mod tests {
             ((IDLE, r, bold), (Color::DarkGray, r, bold)),
             ((RUNNING, r, rev), (Color::Green, r, rev)),
             ((WORKING, r, none), (r, r, bold)),
+            ((SUCCESS, r, none), (r, r, bold)),
+            ((WARN, r, bold), (r, r, bold)),
+            ((LABEL, r, none), (r, r, bold)),
+            // A label on a band is the band's way: cyan reads on blue.
+            ((LABEL, BAND_ALT, none), (Color::Cyan, Color::Blue, none)),
+            // Black on a thread's color, which comes down to magenta: white reads there.
+            (
+                (Color::Indexed(16), THREAD_COLORS[1], bold),
+                (Color::White, Color::Magenta, bold),
+            ),
             ((BAND_TEXT, BAND, none), (Color::White, Color::Black, none)),
             ((BAND_DIM, BAND_ALT, none), (Color::Gray, Color::Blue, none)),
             ((r, BAND_ALT, none), (Color::White, Color::Blue, none)),
@@ -834,8 +937,10 @@ mod tests {
         let full = buf.clone();
         degrade(&mut buf, Depth::Basic);
         for (was, cell) in full.content.iter().zip(&buf.content) {
-            // (The working icon is in the terminal's own colors, which read.)
-            if was.fg != was.bg && was.fg != WORKING {
+            // (The working icon, and a success, a warning or a label on the terminal's own
+            // background, are in the terminal's own colors, which read.)
+            let own = was.fg == WORKING || (OWN_TEXT.contains(&was.fg) && was.bg == Color::Reset);
+            if was.fg != was.bg && !own {
                 assert_ne!(cell.fg, cell.bg, "{:?} on {:?}", was.fg, was.bg);
             }
         }
