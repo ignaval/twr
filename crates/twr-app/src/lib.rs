@@ -342,6 +342,52 @@ mod tests {
         assert!(thread("web").get("loop_badge").is_none());
         assert!(thread("web").get("loop_line").is_none());
     }
+    /// A thread whose remote box's runner stopped (and stopped its agent) is presented as
+    /// stopped by no one (`stopped_by_hub`, `box_stopped`: the apps keep offering a loop on
+    /// it), with nothing to answer; a thread someone stopped is not.
+    #[test]
+    fn a_thread_stopped_with_its_box_is_stopped_by_no_one() {
+        use twr_core::event::{EventBody, SessionPayload, BOX_STOPPED_REASON};
+        let mut fold = ClientFold::default();
+        let mut api = twr_core::testkit::ThreadScript::new("t1");
+        let mut web = twr_core::testkit::ThreadScript::new("t2");
+        let with_box = SessionPayload {
+            ext: json!({"twr": {"reason": BOX_STOPPED_REASON}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        };
+        for ev in [
+            api.created("api"),
+            web.created("web"),
+            api.started("s1"),
+            web.started("s2"),
+            api.event(EventBody::ThreadStopped(with_box)),
+            web.stopped(),
+        ] {
+            fold.apply(&ev, None);
+        }
+        let out = Presentation::default().project(&fold);
+        let thread = |name: &str| {
+            out["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        let api = thread("api");
+        assert_eq!(
+            (&api["stopped"], &api["stopped_by_hub"], &api["box_stopped"]),
+            (&json!(true), &json!(true), &json!(true)),
+            "{api}"
+        );
+        let web = thread("web");
+        assert_eq!(web["stopped"], true);
+        assert!(web.get("stopped_by_hub").is_none() && web.get("box_stopped").is_none());
+        assert_eq!(out["attention"], json!([]));
+    }
     /// A thread on a remote box is presented with whether its box is online: as `hub.info`
     /// said when the connection opened, then as its runner connects and leaves. A thread on
     /// the hub's own box, or on a box nothing has said of yet, has no `box_online`.

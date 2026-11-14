@@ -2117,9 +2117,14 @@ fn container_box_from_add_to_removal() {
         (s["state"] == "online" && s["epoch"].as_u64().unwrap() > epoch).then_some(())
     });
     assert_eq!(ctr.pgrep("runner --daemon").len(), 1);
-    // Its runtime was lost with the container's processes: a crash card.
-    poll("the thread's crash card", || {
-        (t.count("inbox", "thread.crashed") == 1).then_some(())
+    // Its runtime ended with the container's processes: a crash card when the daemon was
+    // killed with them (it could not stop it), or a stop with the box's runner
+    // (`box_stopped`, no crash) when it was stopped first and stopped the runtime itself.
+    poll("the thread's runtime ended", || {
+        let with_box = t.events("inbox").iter().any(|e| {
+            e["kind"] == "thread.stopped" && e["data"]["ext"]["twr"]["reason"] == "box_stopped"
+        });
+        (t.count("inbox", "thread.crashed") + usize::from(with_box) == 1).then_some(())
     });
     t.turn("inbox", "after the restart", 2);
 

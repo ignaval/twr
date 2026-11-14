@@ -1660,6 +1660,20 @@ impl Core {
             Wait::Ended => {}
             Wait::WriteReport => staged.write_report = true,
             _ => {
+                // A step of the thread's own runtime while its remote box is away and no turn
+                // runs there (its runner stopped, and the runtime with it): the loop waits on
+                // the box, saying so (`loop.box`), and the step's prompt waits in the queue
+                // until the box is back. (A turn that runs on while only the connection is
+                // down is no wait on the box: its answer comes once the box is back.)
+                if !state.held
+                    && state.box_away.is_none()
+                    && self
+                        .registry
+                        .get(thread)
+                        .is_some_and(|v| v.current_turn.is_none())
+                {
+                    self.box_gate(hub, thread);
+                }
                 let tag = step_tag(&state).unwrap_or_default();
                 if !state.held {
                     if startup {

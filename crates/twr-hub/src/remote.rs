@@ -1287,6 +1287,20 @@ impl RemoteBox {
         ids
     }
 
+    /// Connection `epoch`'s runner said it is stopping (an `exited` frame of a runtime it
+    /// stopped as it stops, [`twr_core::runner::EXIT_RUNNER_STOPPED`]): the box is no longer
+    /// ready, so nothing new goes out on that connection (commands wait for the box's next
+    /// one, as while it is offline), while the connection stays up to deliver the runner's
+    /// last frames. Returns whether `epoch` was the current connection and ready.
+    pub fn going_away(&self, epoch: u64) -> bool {
+        let mut st = self.state();
+        if !st.conn.as_ref().is_some_and(|c| c.epoch == epoch) || !st.ready {
+            return false;
+        }
+        st.ready = false;
+        true
+    }
+
     /// Connection `epoch` is gone. Returns whether it was the current one (the box is then
     /// offline).
     pub fn disconnect(&self, epoch: u64) -> bool {

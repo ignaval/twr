@@ -138,9 +138,11 @@
 //! key, whatever its build, and starts a new one under its start lock. Once the channel to the
 //! new daemon is open, the restarts asked for until that attempt began are carried out; one
 //! asked for during it is carried out by the next. Nothing races the supervisor: the restart
-//! is its own next connection. The daemon's runtimes end with it, as with any runner restart:
-//! the reconciliation of the next connection closes the threads whose runtime is gone as
-//! crashed (`hub::runners`), and each one's next prompt resumes its session. During a drain
+//! is its own next connection. The daemon stops its runtimes as it stops, as any runner does
+//! (`exited` `runner_stopped`), and the next daemon replays their exits: their threads close
+//! as stopped with their box (`box_stopped`, no crash; one the old daemon could not stop in
+//! time, or whose exit it lost, is closed as crashed by the next connection's reconciliation,
+//! `hub::runners`), and each one's next prompt resumes its session. During a drain
 //! (above) a restart cuts it short instead: the hub stops the box's runtimes for the upgrade at
 //! once (running turns cut), and the drain ends the session once they have exited (or at once,
 //! the stops only recorded, when the box is not ready); the next attempt restarts the daemon,

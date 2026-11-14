@@ -1674,3 +1674,55 @@ async fn the_next_loop_removes_the_previous_loops_folder_from_the_box() {
     runner.shutdown().await;
     h.shutdown().await;
 }
+
+/// The box's runner is stopped on purpose during a triage turn (`twr runner stop`): the
+/// runtime ends with it (`thread.stopped` `box_stopped`), which is no failure of the step. The
+/// loop is not stuck and asks for nothing the box cannot do while away: it waits on its box
+/// (`loop.box`, its line says so), its step asked again in the queue, and once a runner is
+/// back the step runs again and the loop ends as it would have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runner_stopped_during_a_triage_turn_waits_for_the_box_and_goes_on() {
+    let env = Env::new().await;
+    env.set(|b| b.replies.push((" triage m1]".into(), "@slow 3000".into())));
+    let h = env.hub().await;
+    let runner = env.runner();
+    online(&h).await;
+    let t = box_thread(&env, &h, "api").await;
+    let wt = PathBuf::from(h.hub().thread_view(&t).unwrap().worktree.unwrap());
+    std::fs::write(wt.join("lib.rs"), "fn changed() {}\n").unwrap();
+    env.answer(1, findings(1));
+    start(&h, &t, "review", None, settings("low", "codex/gpt-6.1-sol")).await;
+    until("the triage turn", || !env.seen(" triage m1]").is_empty()).await;
+    runner.shutdown().await;
+    let hub = h.hub().clone();
+    let t2 = t.clone();
+    until("the loop waiting on the box", move || {
+        hub.thread_view(&t2)
+            .ok()
+            .and_then(|v| v.r#loop)
+            .is_some_and(|l| l.box_away.as_deref() == Some(BOX))
+    })
+    .await;
+    let l = running(&h, &t).unwrap();
+    assert!(l.stuck.is_none(), "{:?}", l.stuck);
+    assert!(twr_core::loops::line(&l).contains("waiting on box gpu"));
+    let v = h.hub().thread_view(&t).unwrap();
+    assert!(v.box_stopped && !v.crashed, "{v:?}");
+    let no_error_items = |h: &TestHub| {
+        assert!(of_kind(h, &t, "attention.raised").iter().all(|e| !matches!(
+            &e.body,
+            EventBody::AttentionRaised(a) if a.reason == AttentionReason::Error
+        )));
+        assert!(h.hub().attention_list(false).is_empty());
+    };
+    assert!(of_kind(&h, &t, "thread.crashed").is_empty());
+    no_error_items(&h);
+    // Back: the triage runs again, and the loop ends clean.
+    let runner = env.runner();
+    let last = ended(&h, &t).await;
+    assert_eq!(last.outcome, Outcome::Clean);
+    assert_eq!(env.seen(" triage m1]").len(), 2);
+    no_error_items(&h);
+    runner.shutdown().await;
+    h.shutdown().await;
+}

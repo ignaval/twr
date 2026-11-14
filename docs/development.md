@@ -16,6 +16,25 @@ The reap, attach and agent tests start `sleep` and `sh` with marker variables an
 
 Tests that compare paths twr reports resolved with the temporary directories they make resolve those first: macOS's `$TMPDIR` is under `/var`, a link to `/private/var`. CI's macOS job also points `TMPDIR` at a directory with no links in its path.
 
+## Tests keep to temporary directories
+
+A test writes only under directories it made for itself (`tempfile`), never in your own: twr's state, data and config directories (`~/.local/state/twr`, `~/.local/share/twr`, `~/.config/twr`, `~/Library/Application Support/twr*`) belong to the hub and desktop app you run. The code under test gets its directories from the test:
+
+- A hub in a test gets its data directory and config in `HubOptions`, and a CLI test runs `twr` with a temporary `TWR_HOME`, which moves everything of twr's there: config, data, socket, and a `twr runner`'s machine lock (`$TWR_HOME/runner-locks/`).
+- The runner library never finds a path in your directories by itself. A box's machine lock is `RunnerOptions::machine_lock`, which `twr runner` sets to the one in your state directory (`twr_runner::client::machine_lock_path`), and which is `None` in the options a test builds, so a test's runner takes no machine lock unless it names one under its own directory (`twr_runner::client::machine_lock_in`). A test checks that options built as tests build them take none. Before this, each run of the runner tests left an empty `gpu-<hash>.lock` in `~/.local/state/twr/runner-locks/`, one per test hub's port.
+- Resolving the standard locations from the environment (`twr_core::paths::Paths::from_env`, `machine_lock_path`) is for the binaries; a test passes its own environment to the `_in` / `resolve` variants instead of setting process-wide variables, which would race with the tests running beside it.
+
+To check a change against this, run the whole suite with a throwaway home and look at what appears there:
+
+```sh
+mkdir -p /tmp/twr-home-check
+CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup GIT_CONFIG_GLOBAL=$HOME/.gitconfig HOME=/tmp/twr-home-check \
+  cargo test --workspace --locked --no-fail-fast
+find /tmp/twr-home-check
+```
+
+Nothing of twr's should be there. On macOS the Command Line Tools' `python3`, which some tests run as a fake agent, keeps its own bytecode cache in `~/Library/Caches/com.apple.python`; that is Python's, not twr's.
+
 ## Disk usage
 
 Each twr worktree builds into its own `target/`, so several threads working on twr at once can fill a disk. Measured on Linux with Rust 1.98, a full `cargo test --workspace --no-run` followed by one edit-and-rebuild of `twr-hub` (what an agent does all day):

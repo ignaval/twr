@@ -19,11 +19,16 @@ export interface Thread {
   repo?: string;
   report?: Json;
   git?: Json;
-  /** Stopped (`thread.stopped`): by someone, or only by the hub's own shutdown. */
+  /** Stopped (`thread.stopped`): by someone, or only by the hub's own shutdown or its box's
+   * runner stopping. */
   stopped?: boolean;
-  /** Stopped only by the hub's own shutdown (only while `stopped`): the thread goes on, and
-   * a loop may start on it, as soon as it is sent something. */
+  /** Stopped only by the hub's own shutdown, or by its remote box's runner as the runner
+   * stopped (only while `stopped`): the thread goes on, and a loop may start on it, as soon
+   * as it is sent something (once its box is back). */
   stopped_by_hub?: boolean;
+  /** Stopped with its remote box's runner (`thread.stopped` `box_stopped`; only with
+   * `stopped_by_hub`): no crash, and no one stopped it. */
+  box_stopped?: boolean;
   [key: string]: Json;
 }
 export interface Attention {

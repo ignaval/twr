@@ -485,6 +485,7 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
             stderr_tail: string(rng),
             run: opt(rng, string),
             at_ms: opt(rng, number),
+            reason: opt(rng, string),
         },
         6 => RunnerMsg::Synced,
         7 => RunnerMsg::CmdResult(CmdResult::new(

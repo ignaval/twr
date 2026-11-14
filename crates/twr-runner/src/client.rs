@@ -444,6 +444,12 @@ pub struct RunnerOptions {
     /// read again, and watched while the runner waits, so a new token installed there is used
     /// at once ([`dial_loop`]).
     pub token_file: Option<PathBuf>,
+    /// The box's machine lock when it dials a hub ([`LocalBoxOptions::machine_lock`]): one
+    /// runner of the hub and box on the machine. `twr runner` sets it
+    /// ([`machine_lock_path`]); `None` takes no machine lock, which is what tests do (they
+    /// keep to their temporary directories: the library never derives a path in the user's
+    /// own directories itself). A daemon's is its [`DaemonOptions::lock`] instead.
+    pub machine_lock: Option<PathBuf>,
     /// The runner protocol its hello names: [`PROTOCOL_VERSION`]. Tests only: a hub test
     /// makes a running runner say it speaks an older protocol from its next connection on (a
     /// hub then drains it, `twr_hub::hub`). A runner that names an older protocol only gets
@@ -479,6 +485,7 @@ impl RunnerOptions {
             allow_insecure: false,
             daemon: None,
             token_file: None,
+            machine_lock: None,
             hello_protocol: Arc::new(AtomicU32::new(PROTOCOL_VERSION)),
         }
     }
@@ -497,15 +504,15 @@ impl RunnerOptions {
     }
 
     /// The box options these runner options imply (built-in adapters, the box's machine
-    /// lock: [`machine_lock_path`], or a daemon's [`DaemonOptions::lock`], which its relay
-    /// resolved; the user's login shell asked for its `PATH` and the agents probed:
+    /// lock: [`RunnerOptions::machine_lock`], or a daemon's [`DaemonOptions::lock`], which its
+    /// relay resolved; the user's login shell asked for its `PATH` and the agents probed:
     /// [`crate::BoxEnv::user`]).
     pub fn box_options(&self) -> LocalBoxOptions {
         let mut o = LocalBoxOptions::new(&self.data_dir, &self.box_name);
         o.managed = self.managed.clone();
         o.machine_lock = match &self.daemon {
             Some(d) => Some(d.lock.clone()),
-            None => machine_lock_path(&self.hub_url, &self.box_name),
+            None => self.machine_lock.clone(),
         };
         o.spool_max_bytes = self.spool_max_bytes;
         if let Some(w) = &self.worktrees_dir {
@@ -568,11 +575,10 @@ pub fn check_guided_hub_url(url: &str) -> anyhow::Result<()> {
 }
 
 /// The lock file of box `box_name` of the hub at `hub_url` on this machine
-/// ([`LocalBoxOptions::machine_lock`]): `<dir>/runner-locks/<box>-<hash>.lock`, where `<dir>`
-/// is `$XDG_STATE_HOME/twr`, else `~/.local/state/twr` (neither of which a runner option
-/// moves), and `<hash>` the first 16 hex digits of the SHA-256 of the hub URL (lowercase, no
-/// trailing `/`) and the box name. `None` without `HOME` or `XDG_STATE_HOME`. Two spellings of
-/// one hub's address (`localhost` and `127.0.0.1`) are two keys.
+/// ([`LocalBoxOptions::machine_lock`]): `<dir>/runner-locks/<box>-<hash>.lock`
+/// ([`machine_lock_in`]), where `<dir>` is `$XDG_STATE_HOME/twr`, else `~/.local/state/twr`
+/// (neither of which a runner option moves). `None` without `HOME` or `XDG_STATE_HOME`. Two
+/// spellings of one hub's address (`localhost` and `127.0.0.1`) are two keys.
 ///
 /// Not `$XDG_RUNTIME_DIR`: logind removes it when the user's last session ends, while a
 /// runner started from it keeps running (holding a lock on a file no longer there), and a
@@ -588,11 +594,18 @@ pub(crate) fn machine_lock_path_in(
     box_name: &str,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    use sha2::Digest;
     let var = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     let dir = var("XDG_STATE_HOME")
         .or_else(|| var("HOME").map(|h| h.join(".local/state")))?
         .join("twr");
+    Some(machine_lock_in(&dir, hub_url, box_name))
+}
+
+/// The lock file of box `box_name` of the hub at `hub_url` under state directory `dir`:
+/// `<dir>/runner-locks/<box>-<hash>.lock`, `<hash>` the first 16 hex digits of the SHA-256 of
+/// the hub URL (lowercase, no trailing `/`) and the box name.
+pub fn machine_lock_in(dir: &std::path::Path, hub_url: &str, box_name: &str) -> PathBuf {
+    use sha2::Digest;
     let url = hub_url.trim().trim_end_matches('/').to_ascii_lowercase();
     let mut h = sha2::Sha256::new();
     h.update(url.as_bytes());
@@ -602,10 +615,8 @@ pub(crate) fn machine_lock_path_in(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    Some(
-        dir.join("runner-locks")
-            .join(format!("{box_name}-{hash}.lock")),
-    )
+    dir.join("runner-locks")
+        .join(format!("{box_name}-{hash}.lock"))
 }
 
 /// The host of the hub URL `url`, as the WebSocket client connects to it (parsed the same way,

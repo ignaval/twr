@@ -193,7 +193,7 @@ use twr_core::config::BoxTransport;
 use twr_core::event::*;
 use twr_core::runner::{
     cmd_errors, drainable, hub_errors, new_nonce, valid_nonce, CmdError, Hello, HubMsg, Inventory,
-    Op, RunnerMsg, Secret, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
+    Op, RunnerMsg, Secret, EXIT_RUNNER_STOPPED, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
 use super::supervisor::{close_exited, give_up_runtime, persist, supervise, sync_wal, Closed};
@@ -1403,6 +1403,18 @@ fn connection_ended(
     }
 }
 
+/// The runner of `conn` is stopping (it said so with an exit,
+/// [`EXIT_RUNNER_STOPPED`]): its box is offline for everything new from now on
+/// ([`RemoteBox::going_away`]; `box_offline`, prompts wait), though the connection stays up to
+/// deliver its last frames. `runner.disconnected` is recorded when the connection ends.
+fn runner_going_away(hub: &Arc<Inner>, conn: &Conn) {
+    let mut core = hub.core();
+    if conn.fence().holds() && conn.rbox.going_away(conn.epoch) {
+        tracing::info!(box_name = %conn.box_name(), epoch = conn.epoch, "the box's runner is stopping: the box is offline for anything new");
+        core.online_boxes.remove(conn.box_name());
+    }
+}
+
 /// Token box `rbox` takes `token` (empty: none, revoked), in one step under the core lock
 /// (`box.token`): [`RemoteBox::set_token`] stores it and removes the connection that proved
 /// the old one, the runtimes that exits its connections brought took are put back
@@ -1548,8 +1560,18 @@ async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(),
             stderr_tail,
             run,
             at_ms,
+            reason,
         } => {
             let at = capture_time(at_ms);
+            // The runner stopped this runtime as it stops itself. Live (after `synced`), its
+            // box is going away: nothing new goes out on this connection from here on (a prompt
+            // queued meanwhile, a loop's step asked again, waits for the box's next connection),
+            // while the runner's last frames still come in. (Before `synced` the frame is a
+            // replay of what an earlier runner of the box spooled: this one stays.)
+            let runner_stopped = reason.as_deref() == Some(EXIT_RUNNER_STOPPED);
+            if runner_stopped && conn.synced {
+                runner_going_away(hub, conn);
+            }
             let ack = RunnerAck {
                 box_name: conn.box_name().to_string(),
                 thread: thread.clone(),
@@ -1559,7 +1581,14 @@ async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(),
             exit_settled(hub, &thread).await;
             let r = persist(hub, &thread, "recording a runner frame", |core| {
                 core.deferring_sync(|core| {
-                    core.ingest_exit(hub, &ack, &fence, (code, stderr_tail.clone()), run.as_deref(), at)
+                    core.ingest_exit(
+                        hub,
+                        &ack,
+                        &fence,
+                        (code, stderr_tail.clone(), runner_stopped),
+                        run.as_deref(),
+                        at,
+                    )
                 })
             })
             .await
@@ -2426,7 +2455,7 @@ impl Core {
         hub: &Inner,
         ack: &RunnerAck,
         fence: &Fence,
-        (code, stderr_tail): (Option<i32>, String),
+        (code, stderr_tail, runner_stopped): (Option<i32>, String, bool),
         run: Option<&str>,
         at: Option<DateTime<Utc>>,
     ) -> anyhow::Result<Exited> {
@@ -2462,8 +2491,9 @@ impl Core {
                 (None, _) => true,
             })
             .map(|l| l.generation);
-        let exit =
-            generation.and_then(|g| self.begin_exit_on(&ack.thread, g, code, stderr_tail, fence));
+        let exit = generation.and_then(|g| {
+            self.begin_runner_exit(&ack.thread, g, (code, stderr_tail), fence, runner_stopped)
+        });
         match exit {
             Some(mut exit) => {
                 exit.runner_ack = Some(ack.clone());
@@ -3199,6 +3229,7 @@ mod tests {
                 stderr_tail: String::new(),
                 run: None,
                 at_ms: None,
+                reason: None,
             };
             assert!(handle(&inner, &mut conn, exited).await.is_err(), "{bad:?}");
         }
@@ -3413,6 +3444,7 @@ mod tests {
             stderr_tail: "gone".into(),
             run: None,
             at_ms: None,
+            reason: None,
         };
         let mut first = test_conn(&rbox, go_online(&inner, &rbox), true);
         token_change_before_close(&inner, &rbox, t);
@@ -3548,6 +3580,7 @@ mod tests {
             stderr_tail: "gone".into(),
             run: None,
             at_ms: None,
+            reason: None,
         };
         let r = handle(&inner, &mut first, exited).await;
         assert!(BEFORE_CLOSE.with(|h| h.borrow().is_none()), "the hook ran");

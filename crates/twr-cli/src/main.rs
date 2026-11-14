@@ -1963,6 +1963,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
             opts.ca_file = ca;
             opts.allow_insecure = allow_insecure;
+            opts.machine_lock = runner_machine_lock(&opts.hub_url, &opts.box_name);
             run_runner(opts, token_file, default_token).await?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -4830,6 +4831,20 @@ async fn prewarm_installed(new_exe: &Path) {
     }
 }
 
+/// The machine lock of `twr runner --hub <hub_url> --box <box_name>`: in `$TWR_HOME` when it is
+/// set (`$TWR_HOME/runner-locks/`, as everything else of twr's moves there), else in the
+/// user's state directory ([`twr_runner::client::machine_lock_path`]).
+fn runner_machine_lock(hub_url: &str, box_name: &str) -> Option<PathBuf> {
+    match std::env::var_os("TWR_HOME").filter(|h| !h.is_empty()) {
+        Some(home) => Some(twr_runner::client::machine_lock_in(
+            Path::new(&home),
+            hub_url,
+            box_name,
+        )),
+        None => twr_runner::client::machine_lock_path(hub_url, box_name),
+    }
+}
+
 /// `twr runner`: serves the hub from this box until SIGINT / SIGTERM, with `opts` but their
 /// token, which comes from `--token-file` (mode 0600), `$TWR_RUNNER_TOKEN` or the box's
 /// default file `default_token` ([`dial_in::runner_token`]) and is never logged; the variable
@@ -7386,6 +7401,9 @@ fn wait_line(t: &Value, state: WaitState) -> String {
         WaitState::Failed => {
             let why = if t["parked"].as_bool() == Some(true) {
                 "is parked".to_string()
+            } else if t["box_stopped"].as_bool() == Some(true) {
+                "stopped with its box's runner (the next message resumes it once the box is back)"
+                    .to_string()
             } else if t["stopped"].as_bool() == Some(true) {
                 "was stopped".to_string()
             } else {
@@ -9449,6 +9467,28 @@ mod tests {
         card["attention"] = json!([{"attn_id": "a", "loop_setup": true}]);
         assert_eq!(wait_state(&card).0, WaitState::Waiting);
         assert!(wait_line(&card, WaitState::Waiting).contains("settings card"));
+    }
+
+    /// A thread stopped with its box's runner (`box_stopped`): `twr wait` says so, not that
+    /// someone stopped it, and `twr show` prints the hub's words for it.
+    #[test]
+    fn a_thread_stopped_with_its_box_says_so() {
+        let t = json!({"name": "api", "status": "done", "stopped": true, "box_stopped": true,
+            "stopped_by_hub": true, "activity": twr_core::activity::BOX_STOPPED,
+            "last_turn": {"turn": 2, "result": "completed"}});
+        assert_eq!(wait_state(&t), (WaitState::Failed, false));
+        assert_eq!(
+            wait_line(&t, WaitState::Failed),
+            "api: stopped with its box's runner (the next message resumes it once the box is \
+             back)"
+        );
+        assert!(show_text(&t).starts_with(
+            "api (done): stopped with its box's runner: the next message resumes it once the \
+             box is back"
+        ));
+        let mut plain = t.clone();
+        plain["box_stopped"] = json!(false);
+        assert_eq!(wait_line(&plain, WaitState::Failed), "api: was stopped");
     }
 
     fn unreported_orch(done: &Value) {

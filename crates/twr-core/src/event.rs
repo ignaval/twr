@@ -783,6 +783,52 @@ pub const BOX_UPGRADE_REASON: &str = "box_upgrade";
 /// Idle resumable runtime retired to free a machine-wide runner slot.
 pub const BOX_CAPACITY_REASON: &str = "box_capacity";
 
+/// `ext.twr.reason` of the `thread.stopped` that closes a remote box's runtime its runner
+/// stopped because the runner itself was stopping (`twr runner stop`, `twr box restart`, a
+/// service or the machine shutting down: [`crate::runner::EXIT_RUNNER_STOPPED`]). The runtime
+/// ended cleanly with its runner; no one stopped the thread. Like the hub's own shutdown
+/// ([`crate::reduce::HUB_SHUTDOWN_REASON`]) the thread counts as stopped, not by anyone
+/// ([`crate::reduce::ThreadView::stopped_by_hub`]): its loop goes on, and the next message
+/// resumes its session once the box is back. A client that does not know the reason reads it
+/// as a plain stop.
+pub const BOX_STOPPED_REASON: &str = "box_stopped";
+
+/// How a runtime's exit reads in what the hub and its clients say of a crash
+/// (`thread.crashed` `exit_code` and the last line of its `stderr_tail`): `exit code 3` for a
+/// non-zero code; `exit code 0` said as such (the runtime ended on its own, without an
+/// error, where twr did not expect it to); `killed by a signal` when there is no code and
+/// nothing of twr's explains the end; nothing when the last line is twr's own explanation (a
+/// runner or the hub that recorded the end without a code: `twr: ...`, `twr runner: ...`).
+pub fn exit_words(exit_code: Option<i32>, stderr_tail: &str) -> Option<String> {
+    match exit_code {
+        Some(c) => Some(format!("exit code {c}")),
+        None if last_line(stderr_tail).is_some_and(|l| l.starts_with("twr")) => None,
+        None => Some("killed by a signal".into()),
+    }
+}
+
+/// What a thread's crash item says (`attention.raised` `summary` with `thread.crashed`): its
+/// name and how its runtime ended ([`exit_words`]), then the last line of the runtime's stderr
+/// when there is one. An exit code 0 is no crash of the process: the runtime exited on its own.
+pub fn crash_summary(name: &str, exit_code: Option<i32>, stderr_tail: &str) -> String {
+    let what = match exit_code {
+        Some(0) => ": its agent exited on its own (exit code 0)".to_string(),
+        _ => match exit_words(exit_code, stderr_tail) {
+            Some(w) => format!(" crashed ({w})"),
+            None => " crashed".to_string(),
+        },
+    };
+    match last_line(stderr_tail) {
+        Some(l) => format!("{name}{what}: {l}"),
+        None => format!("{name}{what}"),
+    }
+}
+
+/// The last line of `s` that is not blank, trimmed.
+fn last_line(s: &str) -> Option<&str> {
+    s.lines().rev().map(str::trim).find(|l| !l.is_empty())
+}
+
 /// `task.updated` `task_id` prefix of a job (`twr job run`, the hub's `job.start`): a command
 /// the hub runs for a thread, recorded as one of its background tasks by the hub
 /// (`Source::Hub`). Unlike a runtime's own tasks, it outlives the runtime that was up when it
@@ -3092,6 +3138,35 @@ impl<'de> Deserialize<'de> for EventBody {
 
 #[cfg(test)]
 mod tests {
+    /// A crash item says how the runtime ended in words: an exit code as one (0 as the
+    /// runtime exiting on its own), a signal only when nothing of twr's explains the end.
+    #[test]
+    fn crash_words() {
+        use super::{crash_summary, exit_words};
+        assert_eq!(exit_words(Some(3), ""), Some("exit code 3".into()));
+        assert_eq!(exit_words(Some(0), ""), Some("exit code 0".into()));
+        assert_eq!(
+            exit_words(None, "boom\n"),
+            Some("killed by a signal".into())
+        );
+        assert_eq!(exit_words(None, "x\ntwr runner: gone\n\n"), None);
+        assert_eq!(
+            crash_summary("api", Some(0), ""),
+            "api: its agent exited on its own (exit code 0)"
+        );
+        assert_eq!(
+            crash_summary("api", Some(2), "a\n panic: x \n"),
+            "api crashed (exit code 2): panic: x"
+        );
+        assert_eq!(
+            crash_summary("api", None, "twr: the runner of box gpu lost it"),
+            "api crashed: twr: the runner of box gpu lost it"
+        );
+        assert_eq!(
+            crash_summary("api", None, ""),
+            "api crashed (killed by a signal)"
+        );
+    }
 
     #[test]
     fn ids_are_monotonic_within_the_process() {

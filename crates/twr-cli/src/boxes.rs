@@ -2141,10 +2141,10 @@ fn restart_says(name: &str, drained: bool) -> String {
         )
     } else {
         format!(
-            "This stops box {name}'s daemon and the agents it runs, and starts a new one. Its \
-             threads' runtimes end as when a box's runner restarts: each such thread shows a \
-             crash, a turn running then is cut short, and the thread's next prompt resumes its \
-             session."
+            "This stops box {name}'s daemon and the agents it runs, and starts a new one. The \
+             daemon stops its agents as it stops: each such thread shows it stopped with its \
+             box's runner (no crash), a turn running then is cut short, and the thread's next \
+             prompt resumes its session."
         )
     }
 }
@@ -3817,12 +3817,16 @@ mod tests {
         assert!(!status_text(&none, false, &hub).contains("drain:"));
     }
 
-    /// `twr box restart` says the restart is clean during a drain, and crashes the agents'
-    /// threads otherwise.
+    /// `twr box restart` says the restart stops the agents cleanly, during a drain (for the
+    /// upgrade) or not (with the old daemon).
     #[test]
-    fn a_restart_during_a_drain_says_it_stops_cleanly() {
+    fn a_restart_says_it_stops_cleanly() {
         assert!(restart_says("gpu", true).contains("no crash"));
-        assert!(restart_says("gpu", false).contains("shows a crash"));
+        let plain = restart_says("gpu", false);
+        assert!(
+            plain.contains("stopped with its box's runner (no crash)"),
+            "{plain}"
+        );
     }
 
     /// A restart is over once the box is online on a newer connection with none pending.

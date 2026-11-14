@@ -102,7 +102,7 @@ use twr_core::event::{EventBody, ACP_COMMAND_KEY};
 use twr_core::git::{GitOps, WorktreeSpec};
 use twr_core::runner::{
     cmd_errors, AttachInfo, CmdError, CmdResult, Op, RunnerMsg, RunningSession, WireRemoveOutcome,
-    WireWorktreeCreated, MAX_FRAME_BYTES,
+    WireWorktreeCreated, EXIT_RUNNER_STOPPED, MAX_FRAME_BYTES,
 };
 
 use crate::agents::{BoxAgents, BoxEnv};
@@ -253,6 +253,10 @@ struct Live {
     process: Option<StaleProcess>,
     /// Its use of where it runs (its spawn `cwd`): never removed under it.
     _workdir: Option<WorkdirUse>,
+    /// The runner stopped it because the runner itself is stopping ([`LocalBox::stop_all`]):
+    /// its `exited` frame says so ([`EXIT_RUNNER_STOPPED`]), so the hub records a clean end
+    /// with the box's runner, not a crash.
+    runner_stopped: bool,
 }
 
 /// State the pumps share with the box. Pumps hold it weakly: dropping the box closes the
@@ -1409,6 +1413,7 @@ impl LocalBox {
                 overflow: None,
                 process: None,
                 _workdir: workdir,
+                runner_stopped: false,
             },
         );
         tracing::info!(thread, runtime, "runtime started");
@@ -1420,10 +1425,12 @@ impl LocalBox {
         self.inner.shared.sessions().len()
     }
 
-    /// Asks every runtime to stop (their exits are spooled as they happen).
+    /// Asks every runtime to stop because the runner is stopping (their exits are spooled as
+    /// they happen, each saying it ended with the runner: [`EXIT_RUNNER_STOPPED`]).
     pub fn stop_all(&self) {
-        for (thread, live) in self.inner.shared.sessions().iter() {
+        for (thread, live) in self.inner.shared.sessions().iter_mut() {
             tracing::info!(thread = %thread, "stopping runtime");
+            live.runner_stopped = true;
             let _ = live.cmd.send(AdapterCmd::Stop);
         }
     }
@@ -1463,15 +1470,17 @@ impl LocalBox {
                 tracing::error!(thread = %thread, "runtime still runs after being killed; leaving it to the next runner start");
                 continue;
             }
-            // A runtime stopped for a spool overflow ends for that reason.
+            // A runtime stopped for a spool overflow ends for that reason; any other ended with
+            // the runner, which stopped it.
+            let reason = (overflow.is_none() && live.runner_stopped).then_some(EXIT_RUNNER_STOPPED);
             let tail = overflow
                 .unwrap_or_else(|| "twr runner: shut down before the runtime exited".into());
             spool_exit(
                 shared,
                 thread,
-                None,
-                &tail,
+                (None, &tail),
                 Some(&run),
+                reason,
                 RuntimeChange::Ended,
             )
             .await;
@@ -1498,13 +1507,13 @@ fn mark(cfg: &mut SpawnConfig, run: &str) {
         .push((reap::RUNTIME_GEN_ENV.to_string(), run.to_string()));
 }
 
-/// The `exited` frame text.
+/// The `exited` frame text (`reason`: [`RunnerMsg::Exited`]'s).
 fn exit_frame(
     thread: &str,
     rseq: u64,
-    code: Option<i32>,
-    stderr_tail: &str,
+    (code, stderr_tail): (Option<i32>, &str),
     run: Option<&str>,
+    reason: Option<&str>,
 ) -> String {
     serde_json::to_string(&RunnerMsg::Exited {
         thread: thread.to_string(),
@@ -1513,6 +1522,7 @@ fn exit_frame(
         stderr_tail: stderr_tail.to_string(),
         run: run.map(str::to_string),
         at_ms: now_ms(),
+        reason: reason.map(str::to_string),
     })
     .unwrap_or_default()
 }
@@ -1532,9 +1542,9 @@ fn now_ms() -> Option<u64> {
 async fn spool_exit(
     shared: &Shared,
     thread: &str,
-    code: Option<i32>,
-    stderr_tail: &str,
+    (code, stderr_tail): (Option<i32>, &str),
     run: Option<&str>,
+    reason: Option<&str>,
     change: RuntimeChange,
 ) -> bool {
     let mut delays = SPOOL_RETRY.iter();
@@ -1542,7 +1552,7 @@ async fn spool_exit(
         let r = shared.spool.append_with(
             thread,
             true,
-            |rseq| exit_frame(thread, rseq, code, stderr_tail, run),
+            |rseq| exit_frame(thread, rseq, (code, stderr_tail), run, reason),
             change.clone(),
         );
         let e = match r {
@@ -1671,7 +1681,7 @@ fn recover_runtimes(spool: &Spool) -> anyhow::Result<()> {
         spool.append_with(
             &i.thread,
             true,
-            |rseq| exit_frame(&i.thread, rseq, None, tail, None),
+            |rseq| exit_frame(&i.thread, rseq, (None, tail), None, None),
             RuntimeChange::Ended,
         )?;
     }
@@ -1708,7 +1718,7 @@ fn recover_runtimes(spool: &Spool) -> anyhow::Result<()> {
         spool.append_with(
             &r.thread,
             true,
-            |rseq| exit_frame(&r.thread, rseq, None, &tail, None),
+            |rseq| exit_frame(&r.thread, rseq, (None, &tail), None, None),
             RuntimeChange::Ended,
         )?;
     }
@@ -1929,15 +1939,23 @@ async fn finish_session(
     (gen, run): (u64, &str),
     code: Option<i32>,
     tail: &str,
+    overflowed: bool,
 ) {
     let mut delays = SPOOL_RETRY.iter();
     loop {
         let e = {
             let mut sessions = shared.sessions();
+            // Stopped by the runner as it stops (and not for an overflow): it ended with the
+            // runner ([`EXIT_RUNNER_STOPPED`]).
+            let reason = (!overflowed
+                && sessions
+                    .get(thread)
+                    .is_some_and(|l| l.gen == gen && l.runner_stopped))
+            .then_some(EXIT_RUNNER_STOPPED);
             let r = shared.spool.append_with(
                 thread,
                 true,
-                |rseq| exit_frame(thread, rseq, code, tail, Some(run)),
+                |rseq| exit_frame(thread, rseq, (code, tail), Some(run), reason),
                 RuntimeChange::Ended,
             );
             match r {
@@ -2284,13 +2302,14 @@ async fn pump(
                 )
             }
         };
+        let overflow = overflowed.is_some();
         let (code, tail) = match overflowed {
             // Stopped for the overflow: that is why it ended (its own tail follows).
             Some(why) if tail.trim().is_empty() => (None, why),
             Some(why) => (None, format!("{why}\n{tail}")),
             None => (code, tail),
         };
-        finish_session(&shared, &thread, (gen, &run), code, &tail).await;
+        finish_session(&shared, &thread, (gen, &run), code, &tail, overflow).await;
     }
     tracing::info!(thread = %thread, "runtime exited");
     shared.notify.notify_waiters();

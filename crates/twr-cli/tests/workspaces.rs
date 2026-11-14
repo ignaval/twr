@@ -1611,6 +1611,17 @@ fn a_runner_keeps_its_data_in_the_root() {
         assert!(!made(&a.data_dir), "in workspace a's data");
         made(&root.data_dir).then_some(())
     });
+    // Its machine lock is in `TWR_HOME` too, not in the user's state directory: a test's
+    // runner writes nothing outside its own directories.
+    let lock = twr_runner::client::machine_lock_in(home, "ws://127.0.0.1:9", "gpu");
+    assert!(
+        lock.starts_with(home.join("runner-locks")),
+        "{}",
+        lock.display()
+    );
+    poll("the runner's lock in TWR_HOME", || {
+        lock.is_file().then_some(())
+    });
     // Stopped as a user stops it (SIGTERM), not killed: it ends what it started, then exits
     // (it starts no shell or agent CLI here: `TWR_BOX_PROBE=off`). A runner that has not
     // listened for the signal yet (just started) ends by it.

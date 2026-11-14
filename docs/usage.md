@@ -402,6 +402,8 @@ When a Claude Code worker's prompt cache has expired and its context is large, t
 
 `park` refuses while a turn or background work runs, unless you pass `--force`. Prompts sent to a parked thread wait for `resume`. [worktrees.md](worktrees.md) has the rules for what parking removes.
 
+A thread's runtime can also end without you: it crashes, or it stops with its box. A crash (the agent exits with an error code, is killed by a signal, or exits with code 0 on its own where twr didn't expect it to) shows `crashed`, and an error card says how it ended (`api crashed (exit code 3): …`, `api crashed (killed by a signal)`, `api: its agent exited on its own (exit code 0)`). A thread on a remote box whose runner was stopped (`twr runner stop`, `twr box restart`, a service or the machine shutting down) did not crash: its runner stopped the agent as it went, and the thread shows `stopped with its box's runner: the next message resumes it once the box is back`, with no card to answer. A message sent meanwhile waits for the box, and a loop on the thread waits on its box. [runners.md](runners.md#when-the-runner-stops) says what each case looks like, a runner that was killed included.
+
 ## Delete threads
 
 ```sh

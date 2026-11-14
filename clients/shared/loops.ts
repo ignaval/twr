@@ -206,7 +206,8 @@ export interface CommitCheck {
  *
  * A thread someone stopped (`stopped` and not `stopped_by_hub`) is not: the hub refuses a
  * loop there (`send it a message to start it again first`). A thread stopped only by the
- * hub's own shutdown is: it goes on (and a loop with it) as soon as it is sent something.
+ * hub's own shutdown, or with its box's runner (`box_stopped`), is: it goes on (and a loop
+ * with it) as soon as it is sent something.
  */
 export function offersReview(
   thread: Thread | undefined,
@@ -236,8 +237,8 @@ export function offersReview(
 }
 
 /** Whether a thread counts as stopped because someone stopped it, not only the hub's own
- * shutdown: the hub refuses to start a loop on it (`loop.request`) until it is sent
- * something. */
+ * shutdown or its box's runner stopping: the hub refuses to start a loop on it
+ * (`loop.request`) until it is sent something. */
 export const stoppedBySomeone = (thread: Thread | undefined) =>
   !!thread?.stopped && !thread.stopped_by_hub;
 

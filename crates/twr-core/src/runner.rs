@@ -161,6 +161,13 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// a daemon at once, its runtimes recorded as stopped for the upgrade).
 pub const DRAINABLE_PROTOCOLS: &[u32] = &[7, 6];
 
+/// [`RunnerMsg::Exited`] `reason` of a runtime its runner stopped because the runner itself
+/// was stopping (`twr runner stop`, SIGTERM or SIGINT, a box daemon's `stop` request, a
+/// service or the machine shutting down): the runtime ended cleanly with its runner, it did
+/// not crash. The hub records `thread.stopped` with `ext.twr.reason`
+/// [`crate::event::BOX_STOPPED_REASON`] for it.
+pub const EXIT_RUNNER_STOPPED: &str = "runner_stopped";
+
 /// Whether the hub serves a runner of protocol `p` drain-only ([`DRAINABLE_PROTOCOLS`]).
 pub fn drainable(p: u32) -> bool {
     DRAINABLE_PROTOCOLS.contains(&p)
@@ -925,6 +932,12 @@ pub enum RunnerMsg {
         /// When the runner recorded the exit (Unix milliseconds; see [`RunnerMsg::Event`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at_ms: Option<u64>,
+        /// Why the runtime ended, when the runner knows it was not the runtime's own doing:
+        /// [`EXIT_RUNNER_STOPPED`] (the runner was stopping and stopped it). Absent from older
+        /// runners, and for every other exit (the hub's stop, the runtime's own end, a crash).
+        /// Additive: a hub that does not know it reads the exit as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Sent once per connection, after the replay of the spool: every frame spooled before
     /// the welcome has been sent. The hub can reconcile sessions from here on.
@@ -1995,6 +2008,16 @@ mod tests {
             stderr_tail: "boom".into(),
             run: Some("r1".into()),
             at_ms: None,
+            reason: None,
+        });
+        round_trip_runner(RunnerMsg::Exited {
+            thread: "t1".into(),
+            rseq: 5,
+            code: Some(0),
+            stderr_tail: String::new(),
+            run: Some("r1".into()),
+            at_ms: Some(1),
+            reason: Some(EXIT_RUNNER_STOPPED.into()),
         });
         round_trip_runner(RunnerMsg::Synced);
         round_trip_runner(RunnerMsg::CmdResult(CmdResult::new("c1", Ok(json!(true)))));

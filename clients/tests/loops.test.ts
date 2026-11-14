@@ -103,6 +103,14 @@ describe("the Review loop offer", () => {
       stoppedBySomeone(worker({ stopped: true, stopped_by_hub: true })),
     ).toBe(false);
     expect(stoppedBySomeone(worker())).toBe(false);
+    // Its box's runner stopped (and stopped its agent): no one stopped it.
+    const withBox = worker({
+      stopped: true,
+      stopped_by_hub: true,
+      box_stopped: true,
+    });
+    expect(stoppedBySomeone(withBox)).toBe(false);
+    expect(offersReview(withBox, true)).toBe(true);
   });
 
   it("needs a finished turn and changes in its git state", () => {
