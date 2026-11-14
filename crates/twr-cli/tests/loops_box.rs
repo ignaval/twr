@@ -31,8 +31,10 @@ const NO_AGENTS: &str = r#"[{"runtime": "codex", "found": false, "login": "unkno
 /// goes (its pid in `pid.<n>`, the child's in `child.<n>`).
 const FAKE_CODEX: &str = r#"#!/bin/sh
 here=$(dirname "$0")
+until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
+rmdir "$here/count.lock"
 pwd > "$here/cwd.$n"
 cat > "$here/stdin.$n"
 if [ -f "$here/hold.$n" ]; then

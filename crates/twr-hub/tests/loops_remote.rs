@@ -53,8 +53,10 @@ here=$(dirname "$0")
 case "$1" in --version) echo "fake 1.0"; exit 0;; esac
 if [ "$1 $2" = "login status" ]; then echo "Logged in"; exit 0; fi
 if [ "$1 $2" = "auth status" ]; then echo '{"loggedIn": true, "authMethod": "claude.ai"}'; exit 0; fi
+until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
+rmdir "$here/count.lock"
 : > "$here/argv.$n"
 for a in "$@"; do printf '%s\n' "$a" >> "$here/argv.$n"; done
 env > "$here/env.$n"
@@ -1647,8 +1649,10 @@ async fn the_next_loop_removes_the_previous_loops_folder_from_the_box() {
     start(&h, &t, "review", None, settings("low", "codex/gpt-6.1-sol")).await;
     let first = loop_id(&h, &t);
     ended(&h, &t).await;
-    // Kept after the end, for the thread's later turns.
-    assert!(box_folder(&env, &first).join("report.md").is_file());
+    // Kept after the end, for the thread's later turns (its report reaches the box once the
+    // loop has ended: written after the end is recorded).
+    let report = box_folder(&env, &first).join("report.md");
+    until("report.md in the box's folder", || report.is_file()).await;
     h.shutdown().await;
     let h = env.hub().await;
     online(&h).await;
