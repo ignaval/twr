@@ -464,6 +464,14 @@ scrolls to their buttons as a person would. It runs against the debug build only
 fixtures use the existing debug-only user token inside their own private `TWR_HOME`; release
 builds ignore that token. No real account or existing workspace is used.
 
+The hub the app starts for the main suite's second workspace (`side`) doesn't take that
+token: like a real hub, it tells the app from an agent by its processes
+([security-model.md](security-model.md#agents)). So the suite first asks its own hub,
+without the token, whether it counts the suite's processes as yours, and stops with the hub's
+reason when it doesn't. On macOS 27 that happens when the suite runs as a background job of
+a shell that has already exited (`( npm run test:integration ) &`). Run it from a shell that
+stays open until it ends.
+
 `npm run test:qa:mac` exercises the packaged app through LaunchServices. It adds manager
 navigation, slash-command target/flag checks, queue take-back, jobs and cancellation, memory
 and context editing, park/resume, workspace switching, deletion/restoration, orchestrator

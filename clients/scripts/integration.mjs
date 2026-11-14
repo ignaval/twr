@@ -140,6 +140,28 @@ try {
       await new Promise((r) => setTimeout(r, 100));
     }
   }
+  // The app starts the side workspace's hub itself, and that hub, unlike this one, does not
+  // take the test's user token: it tells the app from an agent by its processes alone. Ask
+  // this hub the same question without the token, so that a run that hub would refuse stops
+  // here and says why, rather than timing out at that step.
+  if (!process.env.TWR_DESKTOP_EXECUTABLE) {
+    const { TWR_TEST_USER_TOKEN_FILE: _, ...untrusted } = env;
+    const seen = JSON.parse(
+      execFileSync(join(bin, "twr"), ["info", "--json"], {
+        env: untrusted,
+        encoding: "utf8",
+      }),
+    );
+    if (!String(seen.identity).startsWith("user:"))
+      throw new Error(
+        `A twr hub counts this run's processes as an agent's (${seen.identity}${seen.why ? `: ${seen.why}` : ""}), ` +
+          "so the hub the app starts for the side workspace, which does not take the test token, " +
+          "would refuse the app. Run the suite from a shell that stays open until it ends. " +
+          "A background job of a shell that exits first, such as `( npm run test:integration ) &`, " +
+          "is left under launchd below a shell whose environment macOS hides, and twr cannot tell " +
+          "that from an agent's.",
+      );
+  }
   if (process.env.TWR_DESKTOP_EXECUTABLE) {
     const port = await new Promise((resolve, reject) => {
       const server = createServer();
@@ -1400,6 +1422,14 @@ try {
         .innerText()
         .catch(() => "<unavailable>"),
     );
+    // Why the hub the app started refused or failed it, if it did: it logs each connection it
+    // counts as an agent's, with the process and the reason.
+    const sideLog = join(home, "data", "workspaces", "side", "hub.log");
+    if (existsSync(sideLog))
+      console.error(
+        "Side workspace hub log:",
+        readFileSync(sideLog, "utf8").slice(-8192),
+      );
     mkdirSync("test-results", { recursive: true });
     await page
       .screenshot({ path: "test-results/integration-failure.png" })
