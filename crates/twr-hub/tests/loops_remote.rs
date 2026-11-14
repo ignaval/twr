@@ -44,7 +44,8 @@ const TASK: &str = "add a CSV export";
 // ---------------------------------------------------------------------------------------------
 
 /// A fake reviewer CLI on the box (`codex`, `claude` or `grok`, by the name it runs as). The
-/// box's agent probe gets a version and a signed-in status; every other call is a review run
+/// box's agent probe gets a version, a signed-in status and, on Linux, a sandbox that starts
+/// (`codex sandbox`); every other call is a review run
 /// `n` (from 1, `count`), which writes its argv, environment, stdin and working directory to
 /// `<kind>.<n>`; with `hold.<n>` it starts a child (`child.<n>`, itself in `pid.<n>`) and
 /// waits until the file goes. It answers `answers/<n>.json`, else no findings.
@@ -52,6 +53,8 @@ const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
 case "$1" in --version) echo "fake 1.0"; exit 0;; esac
 if [ "$1 $2" = "login status" ]; then echo "Logged in"; exit 0; fi
+# The probe's check of Codex's sandbox on Linux (`codex sandbox ... -- true`): it starts.
+case "$1" in sandbox) exit 0;; esac
 if [ "$1 $2" = "auth status" ]; then echo '{"loggedIn": true, "authMethod": "claude.ai"}'; exit 0; fi
 until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
