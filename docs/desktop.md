@@ -565,7 +565,9 @@ secrets, which pull-request runs can read):
   `APPLE_TEAM_ID`: a Developer ID certificate (base64 `.p12`) and notarization
   credentials. With them, the Mac app is signed, notarized and stapled, and
   `latest-mac.yml` is published so Macs update themselves. Without them, the release
-  carries the ad hoc review disk image only.
+  carries the ad hoc review disk image only. Notarization usually takes minutes, but a
+  new team's first submissions can wait hours at Apple, so the release's Mac job allows
+  five.
 - `AUR_SSH_PRIVATE_KEY`: the key registered on the
   `twr-desktop-bin` AUR account. With it, the release pushes the new PKGBUILD to the AUR.
   Otherwise, push the `twr-desktop-aur` workflow artifact by hand.
