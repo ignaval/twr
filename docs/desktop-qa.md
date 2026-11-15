@@ -89,7 +89,7 @@ Ubuntu 22.04 headers and verified with baud-rate changes, input, resize and exit
 The portable bundle passes an ELF symbol-version gate; a clean Ubuntu base with
 only declared runtime dependencies has no unresolved libraries. This Ubuntu
 userspace runs on the Arch VM kernel, so it does not certify an Ubuntu kernel.
-An installed x86_64 Arch package also passed the integration suite under Cage/Wayland in that VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers use ad hoc signatures for testing. Developer ID signing and notarization remain release steps that require the owner’s Apple credentials.
+An installed x86_64 Arch package also passed the integration suite under Cage/Wayland in that VM. Both the installed Arch package and AppImage pass the full suite on native Hyprland 0.57.1 with 125% scaling, a stable `tools.twr.desktop` class and `xwayland: false`. Physical Omarchy GPU and IME behavior remain unverified. CI also includes Arch installation and Wayland tests. Local Mac installers use ad hoc signatures for testing. Releases are signed with the maintainer's Developer ID and notarized; a locally signed, notarized 0.4.0 build passed Gatekeeper (`spctl`, `syspolicy_check distribution`, a quarantined copy from the disk image), `install.sh --desktop` and the packaged QA before the first signed release.
 
 The frontend suite (`npm test`) includes engine cleanup with real live processes,
 conservative handling of inaccessible engine identities, normal Linux session processes

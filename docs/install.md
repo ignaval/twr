@@ -127,8 +127,9 @@ and `TWR_REQUIRE_SIGNATURE` as for the CLI, and two more:
   install script or the Arch package.
 - **macOS, from Homebrew:** `brew install --cask ignaval/twr/twr` installs the app, which
   then updates itself, and `brew install ignaval/twr/twr` the `twr` command, which
-  `brew upgrade` updates (`twr update` leaves a Homebrew install alone). The tap,
-  `ignaval/homebrew-twr`, is not published yet.
+  `brew upgrade` updates (`twr update` leaves a Homebrew install alone). The tap is
+  [ignaval/homebrew-twr](https://github.com/ignaval/homebrew-twr), which each stable release
+  updates. A twr.app installed another way stops the cask; `--force` replaces it.
 
 #### By hand
 
@@ -148,20 +149,18 @@ itself or tells you how to, depending on how it was installed. See
 
 #### The Mac app
 
-The Mac disk image is signed ad hoc, not with an Apple Developer ID, and not notarized
-(releases will be, once the maintainer has the Apple credentials:
-[desktop.md](desktop.md#releases)). So:
+Since v0.5.0 the app is signed with a Developer ID (`Developer ID Application: CGIS LLC
+(2Y7V6VN3NL)`) and notarized by Apple, with the ticket stapled, so it opens without
+Gatekeeper's warnings however you downloaded it: macOS asks only whether to open an app
+from the internet. It updates itself: it downloads a new release in the background and
+installs it when you choose **Restart to update** or quit ([desktop updates](desktop.md#updates)).
 
-- Gatekeeper blocks the app the first time you open it, if you downloaded the disk image with
-  a browser. Open it once, then choose **Open Anyway** in System Settings › Privacy &
-  Security, or remove the quarantine flag after copying the app to Applications:
-  `xattr -dr com.apple.quarantine /Applications/twr.app`. The install script needs neither:
-  curl, wget and gh set no quarantine flag.
-- It doesn't update itself: macOS only swaps in updates signed by the same Developer ID. It
-  tells you when a new release is out and links its disk image; install that the same way, or
-  run the install script again.
-- Each such build has a signature of its own, so after a manual update macOS may ask again
-  for the microphone (voice mode) and the other permissions you gave it.
+v0.4.0 and older were signed ad hoc. Those don't update themselves, and Gatekeeper blocks
+one downloaded with a browser until you choose **Open Anyway** in System Settings › Privacy &
+Security. To move from one, install the new release once with the install script or the disk
+image. The signature changes, so macOS asks again for the microphone (voice mode) and the
+other permissions you gave the app, and may ask once to let twr use its `twr Safe Storage`
+keychain item: choose **Always Allow**.
 
 ### Checking the signature
 

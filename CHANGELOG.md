@@ -4,6 +4,12 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-15
+
+Review and implementation loops: a thread's work reviewed round by round, read-only, by Codex, Claude Code, Grok Build or an ACP agent until it comes back clean, or planned, implemented and then reviewed, started from the TUI, the command line, the apps or the orchestrator, on the hub's machine or a remote box. The desktop app installs in one command (`install.sh --desktop`) or from a Homebrew tap, and the Mac app is signed with a Developer ID and notarized, so it opens without Gatekeeper's warnings and updates itself. Also store builds of the phone apps, and contrast fixes across the apps' and the TUI's themes.
+
+Upgrading: the runner and client protocols (8 and 2), the database schema and the checkpoint format are those of 0.4.0, so 0.4.0 boxes and clients keep working with a 0.5.0 hub. A loop runs on a remote box only once that box runs 0.5.0; the hub refuses it before, saying to update twr there. On a Mac, the 0.4.0 desktop app is signed ad hoc and can't update itself to this one: install 0.5.0 once, with `install.sh --desktop` or the disk image, and it updates itself from then on. Its signature changes, so macOS asks again for the microphone and the other permissions you gave it, and may ask once to let twr use its `twr Safe Storage` keychain item (choose **Always Allow**).
+
 ### Added
 
 - Store builds of the iOS and Android apps: `npm run mobile:release:android` and `npm run mobile:release:ios` make them (application id `tools.twr.mobile`, a build number made from the version, Android signed with your upload key, iOS archived and signed for your team), and the `mobile-release.yml` workflow makes both from `main` and sends the iOS build to TestFlight. A store build has no remote push and shows no **Enable remote push**. Development builds keep `tools.twr.mobile.dev`, so both install on one phone. See [mobile.md](docs/mobile.md#publishing).
