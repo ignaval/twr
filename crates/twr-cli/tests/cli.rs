@@ -2697,6 +2697,608 @@ fn install_sh_checks_the_p256_signature_of_the_checksums() {
     );
 }
 
+/// install.sh with its key blocks replaced: the Ed25519 block holds `ed25519` (the public key
+/// PEM and the probe's signature) or no probe signature, so that no openssl finds it usable; the
+/// P-256 block holds `p256` (the PEM and the probe's signature) or nothing.
+fn install_sh_with_keys(ed25519: Option<(&str, &str)>, p256: Option<(&str, &str)>) -> String {
+    let original = std::fs::read_to_string(install_sh()).unwrap();
+    let ed25519 = match ed25519 {
+        Some((pem, probe)) => format!(
+            "RELEASE_KEY='{pem}'\nPROBE_MESSAGE='twr signature probe'\nPROBE_SIGNATURE='{probe}'\n"
+        ),
+        None => {
+            let block = original
+                .split_once("# --- release key ---\n")
+                .and_then(|(_, rest)| rest.split_once("# --- end release key ---\n"))
+                .expect("install.sh has a release key block")
+                .0;
+            block
+                .lines()
+                .filter(|l| !l.starts_with("PROBE_SIGNATURE="))
+                .map(|l| format!("{l}\n"))
+                .chain(["PROBE_SIGNATURE=''\n".to_string()])
+                .collect()
+        }
+    };
+    let text = replace_block(
+        &original,
+        "# --- release key ---",
+        "# --- end release key ---",
+        &ed25519,
+    );
+    let p256 = match p256 {
+        Some((pem, probe)) => format!("RELEASE_KEY_P256='{pem}'\nPROBE_SIGNATURE_P256='{probe}'\n"),
+        None => "RELEASE_KEY_P256=''\nPROBE_SIGNATURE_P256=''\n".to_string(),
+    };
+    replace_block(
+        &text,
+        "# --- release key p256 ---",
+        "# --- end release key p256 ---",
+        &p256,
+    )
+}
+
+/// The desktop files of a fake release v9.9.9 in `dir`, `files` (name, contents), and the
+/// desktop-sha256sums.txt that lists them under `header` (`# twr desktop release v9.9.9` as the
+/// release workflow writes it). Returns the list.
+fn fake_desktop_release(dir: &Path, header: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    std::fs::create_dir_all(dir).unwrap();
+    let mut sums = format!("{header}\n");
+    for (name, data) in files {
+        std::fs::write(dir.join(name), data).unwrap();
+        sums.push_str(&format!("{}  {name}\n", sha256_hex(data)));
+    }
+    std::fs::write(dir.join("desktop-sha256sums.txt"), &sums).unwrap();
+    sums.into_bytes()
+}
+
+/// An AppImage stand-in: its runtime's `--appimage-extract` writes the icon the release
+/// AppImage holds; run any other way it prints a line.
+const FAKE_APPIMAGE: &str = "#!/bin/sh\nif [ \"$1\" = --appimage-extract ]; then\n  \
+     d=squashfs-root/usr/share/icons/hicolor/1024x1024/apps\n  mkdir -p \"$d\" && \
+     printf 'icon' > \"$d/twr-desktop.png\"\n  exit 0\nfi\necho 'twr app'\n";
+
+/// `install.sh --desktop` checks desktop-sha256sums.txt as it checks the CLI's sha256sums.txt
+/// (here the P-256 signature, which any openssl checks, and the Ed25519 one where openssl can),
+/// refuses a list of another release, one that names no desktop release, a file it doesn't list
+/// and a file that doesn't match it, and installs nothing then. The AppImage goes to
+/// TWR_DESKTOP_DIR as `twr-desktop`, with its icon and a launcher entry whose Exec holds its
+/// path quoted as the desktop entry specification asks; an entry it did not write is left alone.
+#[test]
+fn install_sh_desktop_checks_the_signed_list_and_installs_the_appimage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key, pem) = p256_key();
+    let script = tmp.path().join("install.sh");
+    std::fs::write(
+        &script,
+        install_sh_with_keys(None, Some((&pem, &p256_sign(&key, b"twr signature probe")))),
+    )
+    .unwrap();
+    let release = tmp.path().join("release");
+    let appimage = FAKE_APPIMAGE.as_bytes();
+    let good_sums = fake_desktop_release(
+        &release,
+        "# twr desktop release v9.9.9",
+        &[
+            ("twr-9.9.9.AppImage", appimage),
+            ("twr-9.9.9-arm64.dmg", b"dmg"),
+        ],
+    );
+    let sums = release.join("desktop-sha256sums.txt");
+    let sig = release.join("desktop-sha256sums.txt.p256.sig");
+    let sign = |data: &[u8]| std::fs::write(&sig, p256_sign(&key, data)).unwrap();
+    sign(&good_sums);
+    let reset = || {
+        std::fs::write(&sums, &good_sums).unwrap();
+        sign(&good_sums);
+        std::fs::write(release.join("twr-9.9.9.AppImage"), appimage).unwrap();
+    };
+
+    // A directory whose name needs quoting in a desktop entry.
+    let apps = tmp.path().join(r#"my apps "x" $HOME `id` 100%"#);
+    let data = tmp.path().join("data");
+    let entry = data.join("applications/tools.twr.desktop.desktop");
+    let run = |script: &Path, env: &[(&str, &str)]| {
+        let _ = std::fs::remove_dir_all(&apps);
+        let mut cmd = Command::new("sh");
+        cmd.arg(script)
+            .arg("--desktop")
+            .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", &data)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("TWR_VERSION", "v9.9.9")
+            .env("TWR_DESKTOP_PACKAGE", "appimage")
+            .env("TWR_DESKTOP_DIR", &apps)
+            .env("TWR_DOWNLOAD_URL", format!("file://{}", release.display()));
+        for k in ["TWR_REQUIRE_SIGNATURE", "TWR_SHA256SUMS_FILE", "TWR_UPDATE"] {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let installed = apps.join("twr-desktop").exists();
+        assert_eq!(out.status.success(), installed, "{env:?}: {out:?}");
+        (
+            installed,
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    // Installed, executable, with its icon and a launcher entry.
+    let (installed, stdout, stderr) = run(&script, &[]);
+    assert!(installed, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert!(
+        stdout.contains("Installed twr 9.9.9 to") && stdout.contains("It updates itself."),
+        "{stdout}"
+    );
+    let ran = Command::new(apps.join("twr-desktop")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "twr app\n");
+    assert_eq!(
+        std::fs::read(data.join("icons/hicolor/512x512/apps/tools.twr.desktop.png")).unwrap(),
+        b"icon"
+    );
+    let text = std::fs::read_to_string(&entry).unwrap();
+    let path = apps.join("twr-desktop");
+    let quoted: String = path
+        .to_str()
+        .unwrap()
+        .chars()
+        .flat_map(|c| match c {
+            '"' | '`' | '$' | '\\' => vec!['\\', c],
+            c => vec![c],
+        })
+        .collect();
+    let exec = format!("\"{quoted}\"")
+        .replace('\\', "\\\\")
+        .replace('%', "%%");
+    assert!(
+        text.lines().any(|l| l == format!("Exec={exec} %U")),
+        "{text}"
+    );
+    for line in [
+        "Icon=tools.twr.desktop",
+        "StartupWMClass=tools.twr.desktop",
+        "X-twr-Installer=install.sh",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{text}");
+    }
+    // The latest release: the list names it.
+    let (installed, _, stderr) = run(&script, &[("TWR_VERSION", "")]);
+    assert!(installed, "{stderr}");
+
+    // An entry this script did not write stays as it is.
+    std::fs::write(&entry, "[Desktop Entry]\nName=mine\n").unwrap();
+    let (installed, _, stderr) = run(&script, &[]);
+    assert!(installed, "{stderr}");
+    assert!(
+        stderr.contains("was not written by this script"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&entry).unwrap(),
+        "[Desktop Entry]\nName=mine\n"
+    );
+
+    // Refused, with nothing installed: a changed list, a missing or foreign signature, ...
+    let mut more = good_sums.clone();
+    more.extend_from_slice(format!("{}  other.deb\n", "1".repeat(64)).as_bytes());
+    std::fs::write(&sums, &more).unwrap();
+    let (installed, _, stderr) = run(&script, &[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("the P-256 signature of desktop-sha256sums.txt does not verify")
+            && stderr.contains("nothing was installed"),
+        "{stderr}"
+    );
+    reset();
+    let (other, _) = p256_key();
+    std::fs::write(&sig, p256_sign(&other, &good_sums)).unwrap();
+    let (installed, _, stderr) = run(&script, &[]);
+    assert!(!installed);
+    assert!(stderr.contains("does not verify"), "{stderr}");
+    std::fs::remove_file(&sig).unwrap();
+    let (installed, _, stderr) = run(&script, &[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("could not download desktop-sha256sums.txt.p256.sig")
+            && stderr.contains("releases after v0.4.0"),
+        "{stderr}"
+    );
+    reset();
+    // ... another release's list, or one that doesn't name a desktop release ...
+    let (installed, _, stderr) = run(&script, &[("TWR_VERSION", "9.9.8")]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("desktop-sha256sums.txt is the checksums of v9.9.9, not of v9.9.8"),
+        "{stderr}"
+    );
+    let cli_header = String::from_utf8(good_sums.clone())
+        .unwrap()
+        .replace("# twr desktop release ", "# twr release ");
+    std::fs::write(&sums, &cli_header).unwrap();
+    sign(cli_header.as_bytes());
+    let (installed, _, stderr) = run(&script, &[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains(
+            "desktop-sha256sums.txt does not name one release (a '# twr desktop release <tag>' line)"
+        ),
+        "{stderr}"
+    );
+    reset();
+    // ... a file the list doesn't have, or one that doesn't match it.
+    let without = String::from_utf8(good_sums.clone())
+        .unwrap()
+        .lines()
+        .filter(|l| !l.ends_with(".AppImage"))
+        .map(|l| format!("{l}\n"))
+        .collect::<String>();
+    std::fs::write(&sums, &without).unwrap();
+    sign(without.as_bytes());
+    let (installed, _, stderr) = run(&script, &[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("v9.9.9 has no twr-9.9.9.AppImage"),
+        "{stderr}"
+    );
+    reset();
+    std::fs::write(
+        release.join("twr-9.9.9.AppImage"),
+        "#!/bin/sh\necho changed\n",
+    )
+    .unwrap();
+    let (installed, _, stderr) = run(&script, &[]);
+    assert!(!installed);
+    assert!(
+        stderr.contains("checksum mismatch for twr-9.9.9.AppImage"),
+        "{stderr}"
+    );
+    reset();
+
+    // No openssl that checks either signature: a warning, unless a signature is required.
+    let no_openssl = tmp.path().join("no-openssl");
+    install(&no_openssl.join("openssl"), "#!/bin/sh\nexit 1\n");
+    let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", no_openssl.display());
+    let (installed, _, stderr) = run(&script, &[("PATH", &path)]);
+    assert!(installed, "{stderr}");
+    assert!(stderr.contains("were not signature-checked"), "{stderr}");
+    let (installed, _, stderr) = run(&script, &[("PATH", &path), ("TWR_REQUIRE_SIGNATURE", "1")]);
+    assert!(!installed);
+    assert!(stderr.contains("TWR_REQUIRE_SIGNATURE=1"), "{stderr}");
+
+    // The Ed25519 signature, where openssl here checks it (OpenSSL 3).
+    let ed_script = tmp.path().join("install-ed25519.sh");
+    let pub_pem = std::fs::read_to_string(signing_fixture("test-key.pub")).unwrap();
+    let probe = std::fs::read_to_string(signing_fixture("probe.sig")).unwrap();
+    std::fs::write(
+        &ed_script,
+        install_sh_with_keys(Some((pub_pem.trim_end(), probe.trim())), None),
+    )
+    .unwrap();
+    let ed25519_here = Command::new("sh")
+        .arg("-c")
+        .arg(
+            "printf 'twr signature probe' > \"$1/msg\" && \
+             openssl base64 -d -A -in \"$2\" -out \"$1/sig\" && \
+             openssl pkeyutl -verify -rawin -pubin -inkey \"$3\" -sigfile \"$1/sig\" -in \"$1/msg\"",
+        )
+        .arg("probe")
+        .arg(tmp.path())
+        .arg(signing_fixture("probe.sig"))
+        .arg(signing_fixture("test-key.pub"))
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if ed25519_here {
+        sign_file(&test_signer(), &sums);
+        let (installed, _, stderr) = run(&ed_script, &[]);
+        assert!(installed, "{stderr}");
+        std::fs::write(&sums, &more).unwrap();
+        let (installed, _, stderr) = run(&ed_script, &[]);
+        assert!(!installed);
+        assert!(
+            stderr.contains("the signature of desktop-sha256sums.txt does not verify"),
+            "{stderr}"
+        );
+    } else {
+        eprintln!("skipped the Ed25519 part: /usr/bin/openssl here does not verify Ed25519");
+    }
+}
+
+/// `install.sh --desktop` installs the Arch and Debian packages as root, with the package
+/// manager reading the terminal (or, without one, not asking), after checking them like any
+/// desktop file; it leaves an AUR install to the AUR helper, and refuses an unknown package
+/// kind and `--desktop` with `--pair`.
+#[test]
+fn install_sh_desktop_installs_the_arch_and_debian_packages_as_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key, pem) = p256_key();
+    let script = tmp.path().join("install.sh");
+    std::fs::write(
+        &script,
+        install_sh_with_keys(None, Some((&pem, &p256_sign(&key, b"twr signature probe")))),
+    )
+    .unwrap();
+    let release = tmp.path().join("release");
+    let sums = fake_desktop_release(
+        &release,
+        "# twr desktop release v9.9.9",
+        &[
+            ("twr-desktop-9.9.9-1-x86_64.pkg.tar.zst", b"arch package"),
+            ("twr-desktop_9.9.9_amd64.deb", b"debian package"),
+        ],
+    );
+    std::fs::write(
+        release.join("desktop-sha256sums.txt.p256.sig"),
+        p256_sign(&key, &sums),
+    )
+    .unwrap();
+    // sudo, pacman and apt-get stand-ins: the package managers record their arguments and the
+    // package they were given.
+    let fake = tmp.path().join("fake");
+    let log = tmp.path().join("log");
+    install(&fake.join("sudo"), "#!/bin/sh\nexec \"$@\"\n");
+    let manager = "#!/bin/sh\ncase \"$1\" in -Qq) [ -n \"$TWR_TEST_AUR\" ]; exit;; esac\n\
+                   printf '%s\\n' \"$@\" > \"$TWR_TEST_LOG\"\n\
+                   for a; do last=$a; done\ncp \"$last\" \"$TWR_TEST_LOG.pkg\"\n";
+    install(&fake.join("pacman"), manager);
+    install(&fake.join("apt-get"), manager);
+    let run = |kind: &str, args: &[&str], env: &[(&str, &str)]| {
+        let _ = std::fs::remove_file(&log);
+        let mut cmd = Command::new("sh");
+        cmd.arg(&script)
+            .args(args)
+            .env("HOME", tmp.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", fake.display()),
+            )
+            .env("TWR_VERSION", "v9.9.9")
+            .env("TWR_DESKTOP_PACKAGE", kind)
+            .env("TWR_TEST_LOG", &log)
+            .env("TWR_DOWNLOAD_URL", format!("file://{}", release.display()));
+        for k in ["TWR_REQUIRE_SIGNATURE", "TWR_DESKTOP_DIR", "TWR_TEST_AUR"] {
+            cmd.env_remove(k);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    for (kind, command, package, contents, flag) in [
+        (
+            "pacman",
+            "sudo pacman -U",
+            "twr-desktop-9.9.9-1-x86_64.pkg.tar.zst",
+            &b"arch package"[..],
+            "--noconfirm",
+        ),
+        (
+            "deb",
+            "sudo apt-get install",
+            "twr-desktop_9.9.9_amd64.deb",
+            &b"debian package"[..],
+            "-y",
+        ),
+    ] {
+        let (ok, stdout, stderr) = run(kind, &["--desktop"], &[]);
+        assert!(ok, "{kind}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains(&format!("needs root: running {command} {package}")),
+            "{stdout}"
+        );
+        assert!(stdout.contains("Installed twr 9.9.9."), "{stdout}");
+        let args = std::fs::read_to_string(&log).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        assert!(
+            args.last().unwrap().ends_with(&format!("/{package}")),
+            "{args:?}"
+        );
+        // Without a terminal the manager must not ask; with one it asks there.
+        let terminal = std::fs::File::open("/dev/tty").is_ok();
+        assert_eq!(args.contains(&flag), !terminal, "{args:?}");
+        if kind == "pacman" {
+            assert!(
+                args.contains(&"-U") && args.contains(&"--needed"),
+                "{args:?}"
+            );
+        } else {
+            assert_eq!(args[0], "install", "{args:?}");
+        }
+        assert_eq!(std::fs::read(tmp.path().join("log.pkg")).unwrap(), contents);
+        // A changed package is refused before the package manager runs.
+        std::fs::write(release.join(package), b"changed").unwrap();
+        let (ok, _, stderr) = run(kind, &["--desktop"], &[]);
+        assert!(!ok);
+        assert!(
+            stderr.contains(&format!("checksum mismatch for {package}")),
+            "{stderr}"
+        );
+        assert!(!log.exists());
+        std::fs::write(release.join(package), contents).unwrap();
+    }
+
+    // The AUR package is the AUR helper's to update.
+    let (ok, _, stderr) = run("pacman", &["--desktop"], &[("TWR_TEST_AUR", "1")]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("twr-desktop-bin, the AUR package, is installed")
+            && stderr.contains("yay -Syu twr-desktop-bin"),
+        "{stderr}"
+    );
+    assert!(!log.exists());
+
+    let (ok, _, stderr) = run("rpm", &["--desktop"], &[]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("TWR_DESKTOP_PACKAGE=rpm is not dmg, pacman, deb or appimage"),
+        "{stderr}"
+    );
+    let (ok, _, stderr) = run("deb", &["--desktop", "--pair"], &[]);
+    assert!(!ok);
+    assert!(
+        stderr.contains("usage: install.sh [--pair | --desktop]"),
+        "{stderr}"
+    );
+}
+
+/// On macOS, `install.sh --desktop` copies twr.app out of the release's disk image into
+/// TWR_DESKTOP_DIR, replacing the app there only once the new one is copied and its signature
+/// verifies, and leaves no staging directory or mounted image behind. It refuses while that app
+/// runs.
+#[test]
+#[cfg(target_os = "macos")]
+fn install_sh_desktop_installs_the_mac_app_from_the_disk_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (key, pem) = p256_key();
+    let script = tmp.path().join("install.sh");
+    std::fs::write(
+        &script,
+        install_sh_with_keys(None, Some((&pem, &p256_sign(&key, b"twr signature probe")))),
+    )
+    .unwrap();
+    // A disk image holding an ad hoc signed twr.app, as the release's does.
+    let stage = tmp.path().join("stage");
+    let app = stage.join("twr.app/Contents");
+    std::fs::create_dir_all(app.join("MacOS")).unwrap();
+    std::fs::write(
+        app.join("Info.plist"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST \
+         1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\
+         <dict><key>CFBundleExecutable</key><string>twr</string><key>CFBundleIdentifier</key>\
+         <string>tools.twr.test</string><key>CFBundleShortVersionString</key><string>9.9.9\
+         </string></dict></plist>\n",
+    )
+    .unwrap();
+    install(&app.join("MacOS/twr"), "#!/bin/sh\necho 'twr app 9.9.9'\n");
+    let signed = Command::new("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(stage.join("twr.app"))
+        .output()
+        .unwrap();
+    assert!(signed.status.success(), "{signed:?}");
+    let release = tmp.path().join("release");
+    std::fs::create_dir_all(&release).unwrap();
+    let made = Command::new("hdiutil")
+        .args([
+            "create",
+            "-quiet",
+            "-fs",
+            "HFS+",
+            "-format",
+            "UDZO",
+            "-volname",
+            "twr",
+            "-srcfolder",
+        ])
+        .arg(&stage)
+        .arg(release.join("twr-9.9.9-arm64.dmg"))
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    let dmg = std::fs::read(release.join("twr-9.9.9-arm64.dmg")).unwrap();
+    let sums = fake_desktop_release(
+        &release,
+        "# twr desktop release v9.9.9",
+        &[("twr-9.9.9-arm64.dmg", &dmg)],
+    );
+    std::fs::write(
+        release.join("desktop-sha256sums.txt.p256.sig"),
+        p256_sign(&key, &sums),
+    )
+    .unwrap();
+
+    let apps = tmp.path().join("Applications");
+    // The app installed before, which the new one replaces.
+    std::fs::create_dir_all(apps.join("twr.app/Contents")).unwrap();
+    std::fs::write(apps.join("twr.app/Contents/old"), "0.1.0").unwrap();
+    let run = || {
+        Command::new("sh")
+            .arg(&script)
+            .arg("--desktop")
+            .env("HOME", tmp.path())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("TWR_VERSION", "v9.9.9")
+            .env("TWR_DESKTOP_PACKAGE", "dmg")
+            .env("TWR_DESKTOP_DIR", &apps)
+            .env("TWR_DOWNLOAD_URL", format!("file://{}", release.display()))
+            .env_remove("TWR_REQUIRE_SIGNATURE")
+            .output()
+            .unwrap()
+    };
+    let out = run();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stdout.contains(&format!(
+            "Installed twr 9.9.9 to {}",
+            apps.join("twr.app").display()
+        )),
+        "{stdout}"
+    );
+    // Ad hoc, like the release's until it has a Developer ID: it says how to update.
+    assert!(stdout.contains("can't update itself"), "{stdout}");
+    assert!(!apps.join("twr.app/Contents/old").exists());
+    let ran = Command::new(apps.join("twr.app/Contents/MacOS/twr"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "twr app 9.9.9\n");
+    let left: Vec<_> = std::fs::read_dir(&apps)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["twr.app"], "{left:?}");
+    let mounts = Command::new("hdiutil").arg("info").output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&mounts.stdout).contains(&tmp.path().display().to_string()),
+        "the disk image is still mounted"
+    );
+
+    // While the installed app runs, nothing is replaced. (A compiled stand-in: a script would
+    // run as `/bin/sh <path>`, and the app runs as its own executable.)
+    let exe = apps.join("twr.app/Contents/MacOS/twr");
+    std::fs::remove_file(&exe).unwrap();
+    let mut cc = Command::new("cc")
+        .args(["-x", "c", "-o"])
+        .arg(&exe)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    let built = cc.as_mut().is_ok_and(|cc| {
+        use std::io::Write;
+        cc.stdin
+            .take()
+            .unwrap()
+            .write_all(b"#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n")
+            .is_ok()
+            && cc.wait().is_ok_and(|s| s.success())
+    });
+    if !built {
+        eprintln!("skipped the running-app check: no C compiler here");
+        return;
+    }
+    let mut running = Command::new(&exe).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let out = run();
+    let _ = running.kill();
+    let _ = running.wait();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("twr is running from"),
+        "{out:?}"
+    );
+}
+
 /// A thread whose runtime failed to start keeps the rest of its queue held, but a prompt held
 /// for it with `--after` still goes out by itself once the thread it waits for finishes, and
 /// its dispatch releases that queue: `twr wait` waits (here until its timeout) instead of

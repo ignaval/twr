@@ -44,7 +44,9 @@ jobs:
   mac:
     name: Apple Silicon application
     runs-on: macos-latest
-    timeout-minutes: 90
+    # A release waits for Apple's notarization, which usually takes minutes but took over
+    # two hours for a new team's first submissions; 300 stays under the hosted runners' 360.
+    timeout-minutes: ${{ inputs.release && 300 || 90 }}
     # Apple credentials live in the protected `release` environment (tags and
     # main only), so pull requests and branch pushes can never read them.
     environment: ${{ inputs.release && 'release' || '' }}
