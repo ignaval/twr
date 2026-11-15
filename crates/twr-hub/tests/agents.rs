@@ -1271,13 +1271,24 @@ async fn a_background_job_that_left_its_shell_only_reads() {
         ])
         .await;
     assert_eq!(resps[0]["result"]["identity"], "agent:w1", "{}", resps[0]);
+    // `hello` says why, in the words of the refusals that follow.
+    let why = resps[0]["result"]["why"].as_str().unwrap();
+    assert!(
+        why.starts_with(&format!(
+            "w1's agent (pid {client}, which carries TWR_AGENT"
+        )),
+        "{why}"
+    );
     assert!(resps[1].get("error").is_none(), "{}", resps[1]);
     assert_refused_by_marker(&resps[2], "w1", client);
     assert_refused_by_marker(&resps[3], "w1", client);
+    let refusal = resps[2]["error"]["message"].as_str().unwrap();
+    assert!(refusal.contains(why), "{refusal}");
     let t2 = c.call("thread.get", json!({"thread": "t2"})).await.unwrap();
     assert_eq!(t2["turns"], 0, "{t2}");
     let info = c.call("hub.info", Value::Null).await.unwrap();
     assert_eq!(info["identity"], "user:itest");
+    assert!(info.get("why").is_none(), "{info}");
     th.stop().await;
 }
 
@@ -1922,6 +1933,72 @@ async fn a_process_under_another_hub_is_an_agent() {
     };
     assert!(msg.contains(why), "{msg}");
     assert!(parent.wait().unwrap().success());
+    th.stop().await;
+}
+
+/// On macOS 27, which hides the environment of Apple's own programs (`/bin/zsh`) from every
+/// other process, a process of the user's below such a shell is the user while the process
+/// above the shell shows that the shell carries no marker: here this test, the shell's
+/// parent. Once that parent has exited (the shell was a background job of a shell that
+/// exited first, `( cmd ) &`), launchd is the shell's parent and nothing tells it from a shell
+/// an agent's runtime left behind: the process below it is an agent of no thread, and `hello`
+/// and `hub.info` say why. A desktop suite started that way once had the app refused by the
+/// hub the app started (which, unlike the suite's own hub, does not take the test's token).
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn a_process_under_a_hidden_shell_left_under_launchd_is_an_agent() {
+    if twr_runner::reap::test_environs_hidden().is_none() {
+        eprintln!(
+            "skipping a_process_under_a_hidden_shell_left_under_launchd_is_an_agent: this \
+             machine shows the environment of Apple's own programs"
+        );
+        return;
+    }
+    let th = start(None, tempfile::tempdir().unwrap()).await;
+    let kept = AgentClient::new(th.dir.path(), "kept", &th.socket);
+    let left = AgentClient::new(th.dir.path(), "left", &th.socket);
+    // The shell stays the client's parent (`true` follows it), and this test the shell's.
+    let mut shell = std::process::Command::new("/bin/zsh")
+        .args(["-c", &format!("{}; true", kept.command())])
+        .env_remove("TWR_AGENT")
+        .spawn()
+        .unwrap();
+    // The same shell as a background job of a shell that exits at once.
+    let mut outer = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("/bin/zsh -c '{}; true' &", left.command())])
+        .env_remove("TWR_AGENT")
+        .spawn()
+        .unwrap();
+    let outer_pid = outer.id();
+    assert!(outer.wait().unwrap().success());
+    let client = left.orphaned_from(u64::from(outer_pid)).await;
+    let a = twr_runner::reap::ancestry(client);
+    assert_eq!(a.end, twr_runner::reap::AncestryEnd::Init, "{a:?}");
+    assert_eq!(a.chain.len(), 2, "{a:?}");
+    let hidden = a.chain[1].pid;
+    let requests = [
+        json!({"id": 1, "method": "hello", "params": {"client": "desktop"}}),
+        json!({"id": 2, "method": "hub.info"}),
+    ];
+    let kept_resps = kept.run(&requests).await;
+    let left_resps = left.run(&requests).await;
+    assert!(shell.wait().unwrap().success());
+    // Unless this test itself runs as a thread's agent (its marker then decides).
+    if std::env::var_os("TWR_AGENT").is_none() {
+        assert_eq!(
+            kept_resps[0]["result"]["identity"], "user:desktop",
+            "{kept_resps:?}"
+        );
+        assert!(kept_resps[0]["result"].get("why").is_none());
+    }
+    let why = format!(
+        "a process twr cannot trace (pid {client}: the environment of pid {hidden}, of its \
+         ancestry, which would show TWR_AGENT, cannot be read), which counts as an agent"
+    );
+    for resp in &left_resps {
+        assert_eq!(resp["result"]["identity"], "agent:unknown", "{resp}");
+        assert_eq!(resp["result"]["why"], why, "{resp}");
+    }
     th.stop().await;
 }
 

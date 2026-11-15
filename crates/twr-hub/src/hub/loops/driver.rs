@@ -288,6 +288,55 @@ pub(super) fn shown_folder(hub: &Inner, log: &LoopLog, id: &str) -> PathBuf {
         .unwrap_or_else(|| folder_of(hub, log, id))
 }
 
+/// Before another run of `stem` (`round-m1`, `audit-s2`) after its `failures`-th failed run:
+/// that run's files (`<stem>.prompt.md`, `.answer.json`, `.log`) are kept as
+/// `<stem>.try<failures>.*` ([`loop_report::failed_run_name`]), so that the next run, the one
+/// that counts, writes the usual names and the failed one's log stays the evidence of why it
+/// failed. On a remote box the box's log and answer are read back first (a hub that stopped
+/// while the run ran never read them), and the kept files are written into the box's copy of
+/// the folder too. Nothing to keep (no failure yet, a run that failed before it wrote anything)
+/// changes nothing; files already kept under that number are never replaced.
+pub(super) async fn keep_failed_run(
+    place: &Place,
+    loop_id: &str,
+    record: &Path,
+    stem: &str,
+    failures: usize,
+) {
+    if failures == 0 {
+        return;
+    }
+    let kept = |suffix: &str| loop_report::failed_run_name(stem, failures, suffix);
+    if loop_report::RUN_FILES
+        .iter()
+        .any(|s| record.join(kept(s)).exists())
+    {
+        return;
+    }
+    if place.is_remote() {
+        let back: Vec<String> = ["log", "answer.json"]
+            .iter()
+            .map(|s| format!("{stem}.{s}"))
+            .collect();
+        let _ = place.fetch(loop_id, record, &back, LOG_BACK_MAX).await;
+    }
+    let mut moved = Vec::new();
+    for suffix in loop_report::RUN_FILES {
+        let from = record.join(format!("{stem}.{suffix}"));
+        if from.is_file() && std::fs::rename(&from, record.join(kept(suffix))).is_ok() {
+            moved.push(kept(suffix));
+        }
+    }
+    if !moved.is_empty() {
+        // (Best effort: the hub's folder is the record.)
+        let _ = place.sync(loop_id, record, &moved).await;
+    }
+}
+
+/// The most of a failed run's log read back from a remote box before it is kept
+/// ([`keep_failed_run`]): as much as its end reads.
+const LOG_BACK_MAX: u64 = 8 << 20;
+
 /// The files of the loop folder a thread's step or a reviewer may read, as the hub's
 /// `record` has them: what a remote box's copy is given before they read it
 /// ([`Place::sync`]).
@@ -1660,6 +1709,20 @@ impl Core {
             Wait::Ended => {}
             Wait::WriteReport => staged.write_report = true,
             _ => {
+                // A step of the thread's own runtime while its remote box is away and no turn
+                // runs there (its runner stopped, and the runtime with it): the loop waits on
+                // the box, saying so (`loop.box`), and the step's prompt waits in the queue
+                // until the box is back. (A turn that runs on while only the connection is
+                // down is no wait on the box: its answer comes once the box is back.)
+                if !state.held
+                    && state.box_away.is_none()
+                    && self
+                        .registry
+                        .get(thread)
+                        .is_some_and(|v| v.current_turn.is_none())
+                {
+                    self.box_gate(hub, thread);
+                }
                 let tag = step_tag(&state).unwrap_or_default();
                 if !state.held {
                     if startup {
@@ -2689,6 +2752,21 @@ async fn run_review(
             return;
         }
     };
+    // A run after a failed one: the failed one's files are kept under their own names.
+    let failures = prep
+        .log
+        .rounds
+        .iter()
+        .find(|r| r.id == round)
+        .map_or(0, |r| r.failures.len());
+    keep_failed_run(
+        &prep.place,
+        &prep.loop_id,
+        &prep.folder,
+        &format!("round-{round}"),
+        failures,
+    )
+    .await;
     let prompt = review_prompt(&hub, &prep, &diffs, &truncated);
     let prompt_name = format!("round-{round}.prompt.md");
     let prompt_file = prep.folder.join(&prompt_name);

@@ -83,6 +83,19 @@ pub fn summary(ev: &Event) -> String {
             }
             s
         }
+        // Stopped with its box's runner (`box_stopped`): no one's stop, no crash.
+        EventBody::ThreadStopped(p)
+            if p.ext
+                .as_ref()
+                .and_then(|e| e.get("twr")?.get("reason")?.as_str())
+                == Some(twr_core::event::BOX_STOPPED_REASON) =>
+        {
+            format!(
+                "session={} (its box's runner stopped, and the agent with it; the next message \
+                 resumes the session once the box is back)",
+                p.session_id.as_deref().unwrap_or("-")
+            )
+        }
         EventBody::ThreadStopped(p) if twr_core::event::is_settings_restart(p) => {
             let reason = p
                 .ext
@@ -217,8 +230,9 @@ pub fn summary(ev: &Event) -> String {
             s
         }
         EventBody::ThreadCrashed(p) => format!(
-            "exit={} {}",
-            p.exit_code.map_or("signal".to_string(), |c| c.to_string()),
+            "{} {}",
+            twr_core::event::exit_words(p.exit_code, &p.stderr_tail)
+                .unwrap_or_else(|| "ended".into()),
             short(p.stderr_tail.lines().last().unwrap_or_default())
         ),
         EventBody::ThreadAttached(p) | EventBody::ThreadDetached(p) => {
@@ -656,8 +670,36 @@ mod tests {
             "session=s1 (restarting on the box's new twr build; the next prompt resumes the \
              session)"
         );
+        assert_eq!(
+            stop(Some(twr_core::event::BOX_STOPPED_REASON)),
+            "session=s1 (its box's runner stopped, and the agent with it; the next message \
+             resumes the session once the box is back)"
+        );
         assert_eq!(stop(Some("hub_shutdown")), "session=s1");
         assert_eq!(stop(None), "session=s1");
+    }
+
+    /// A crash says how its runtime ended in words: an exit code as one (0 included), a
+    /// signal only when twr's own words do not explain the end.
+    #[test]
+    fn crashes_say_how_the_runtime_ended() {
+        let crash = |exit_code, tail: &str| {
+            summary(&Event::new(
+                "t1",
+                3,
+                None,
+                Source::Hub,
+                EventBody::ThreadCrashed(twr_core::event::ThreadCrashed {
+                    exit_code,
+                    stderr_tail: tail.into(),
+                    ..Default::default()
+                }),
+            ))
+        };
+        assert_eq!(crash(Some(0), ""), "exit code 0 ");
+        assert_eq!(crash(Some(2), "boom"), "exit code 2 boom");
+        assert_eq!(crash(None, "boom"), "killed by a signal boom");
+        assert_eq!(crash(None, "twr: lost it"), "ended twr: lost it");
     }
 
     #[test]

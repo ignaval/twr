@@ -105,8 +105,10 @@ export type TextToken = (typeof TEXT_TOKENS)[number];
 
 /** Every background text in `token` is drawn on, for a palette with these colours: the
  * surfaces and soft tints, and a dived card (a thread colour at 8% over the panel) for all;
- * the "To:" chip in the composer (the accent or a thread colour at 12% over the panel) for
- * the words beside the name; a success pill (success at 12% over a surface) for success. */
+ * the "To:" chip in the composer (the accent, a thread colour, or in shell mode the warning
+ * colour, at 12% over the panel) for the words beside the name, and the shell-mode chip for
+ * the warning-coloured name in it; a success pill (success at 12% over a surface) for
+ * success. */
 export function textBackgrounds(
   token: TextToken,
   t: {
@@ -122,6 +124,7 @@ export function textBackgrounds(
     dangerSoft: RGB;
     loopSoft: RGB;
     accent: RGB;
+    warning: RGB;
     success: RGB;
   },
 ): RGB[] {
@@ -141,10 +144,11 @@ export function textBackgrounds(
   const threads = THREAD_COLORS.map((c) => parseHex(c)!);
   for (const color of threads) out.push(over(color, 0.08, t.panel));
   if (token === "text" || token === "muted" || token === "faint") {
-    out.push(over(t.accent, 0.12, t.panel));
+    out.push(over(t.accent, 0.12, t.panel), over(t.warning, 0.12, t.panel));
     for (const color of threads) out.push(over(color, 0.12, t.panel));
   }
   if (token === "accent") out.push(over(t.accent, 0.12, t.panel));
+  if (token === "warning") out.push(over(t.warning, 0.12, t.panel));
   if (token === "success")
     for (const base of [t.bg, t.panel, t.raised, t.overlay])
       out.push(over(t.success, 0.12, base));
@@ -340,6 +344,7 @@ function derive(
     dangerSoft: mix(bg, 0.9, c.danger),
     loopSoft: mix(bg, 0.88, c.loop),
     accent: c.accent,
+    warning: c.warning,
     success: c.success,
   };
 }

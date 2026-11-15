@@ -70,6 +70,40 @@ describe("the message field's height", () => {
     fitToText(short.element as never);
     expect(short.element.style.height).toBe("");
   });
+  it("stops where the composer's buttons are still in view", () => {
+    // A short window at the largest text size, with a notice above the conversation: the
+    // column that clips the composer ends at 560 px; the composer starts at 300 px, with
+    // 60 px of label and buttons around the field and a 24 px margin under it.
+    const { element, box } = field({ lines: 12 });
+    const column = { parentElement: null };
+    const styles = new Map<object, object>([
+      [column, { overflowY: "clip" }],
+      [box, { overflowY: "visible", marginBottom: "24px" }],
+    ]);
+    Object.assign(box, {
+      parentElement: column,
+      getBoundingClientRect: () => ({
+        height: 180.5,
+        bottom: 300 + element.offsetHeight + 60,
+      }),
+    });
+    Object.assign(column, { getBoundingClientRect: () => ({ bottom: 560 }) });
+    Object.assign(element, {
+      ownerDocument: {
+        defaultView: { getComputedStyle: (node: object) => styles.get(node) },
+      },
+    });
+    fitToText(element as never);
+    expect(element.style.height).toBe("176px");
+    const rect = box.getBoundingClientRect as unknown as () => {
+      bottom: number;
+    };
+    expect(rect().bottom + 24).toBe(560);
+    // With room enough, the field is as tall as its text.
+    Object.assign(column, { getBoundingClientRect: () => ({ bottom: 900 }) });
+    fitToText(element as never);
+    expect(element.style.height).toBe("260px");
+  });
   it("leaves a field that is not on screen alone", () => {
     const { element } = field({ lines: 6 });
     element.isConnected = false;

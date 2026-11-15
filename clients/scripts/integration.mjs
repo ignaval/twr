@@ -140,6 +140,28 @@ try {
       await new Promise((r) => setTimeout(r, 100));
     }
   }
+  // The app starts the side workspace's hub itself, and that hub, unlike this one, does not
+  // take the test's user token: it tells the app from an agent by its processes alone. Ask
+  // this hub the same question without the token, so that a run that hub would refuse stops
+  // here and says why, rather than timing out at that step.
+  if (!process.env.TWR_DESKTOP_EXECUTABLE) {
+    const { TWR_TEST_USER_TOKEN_FILE: _, ...untrusted } = env;
+    const seen = JSON.parse(
+      execFileSync(join(bin, "twr"), ["info", "--json"], {
+        env: untrusted,
+        encoding: "utf8",
+      }),
+    );
+    if (!String(seen.identity).startsWith("user:"))
+      throw new Error(
+        `A twr hub counts this run's processes as an agent's (${seen.identity}${seen.why ? `: ${seen.why}` : ""}), ` +
+          "so the hub the app starts for the side workspace, which does not take the test token, " +
+          "would refuse the app. Run the suite from a shell that stays open until it ends. " +
+          "A background job of a shell that exits first, such as `( npm run test:integration ) &`, " +
+          "is left under launchd below a shell whose environment macOS hides, and twr cannot tell " +
+          "that from an agent's.",
+      );
+  }
   if (process.env.TWR_DESKTOP_EXECUTABLE) {
     const port = await new Promise((resolve, reject) => {
       const server = createServer();
@@ -758,7 +780,8 @@ try {
     "Small-model disclosure, provider stub, placeholder suggestion, Tab and → acceptance and explicit send boundary passed",
   );
   // The message field grows with its text, wrapped lines included, at the largest text
-  // size, in a full window and a phone-width one: up to its cap, then it scrolls inside;
+  // size, in a full window and a phone-width one: up to its cap (or the room the window
+  // has), then it scrolls inside;
   // it shrinks again when the text goes, and Send, the microphone and Upload stay on
   // screen.
   await page
@@ -788,9 +811,17 @@ try {
           ".composer-bottom button, .composer-bottom label",
         ),
       ].map((e) => e.getBoundingClientRect());
+      const composer = field.parentElement;
       return {
         height: field.getBoundingClientRect().height,
         cap: parseFloat(style.maxHeight),
+        // Where the composer (with its margin) ends, and the column that clips it.
+        composerBottom:
+          composer.getBoundingClientRect().bottom +
+          parseFloat(getComputedStyle(composer).marginBottom),
+        columnBottom: composer
+          .closest(".content-column")
+          .getBoundingClientRect().bottom,
         lineHeight: parseFloat(style.lineHeight),
         hidden: field.scrollHeight - field.clientHeight,
         controls: controls.length,
@@ -826,9 +857,14 @@ try {
       some.height > empty.height + some.lineHeight / 2 && some.hidden <= 1,
       `${where}: a wrapped message must make the field taller and show all of it: ${JSON.stringify(some)}`,
     );
+    // To its cap, or, in a window with less room, to where the composer meets the
+    // column's bottom with its buttons in view.
     assert(
-      Math.abs(long.height - long.cap) <= 1 && long.hidden > 0,
-      `${where}: a long message grows the field to its cap, then scrolls inside: ${JSON.stringify(long)}`,
+      (Math.abs(long.height - long.cap) <= 1 ||
+        (long.height > some.height &&
+          Math.abs(long.composerBottom - long.columnBottom) <= 1)) &&
+        long.hidden > 0,
+      `${where}: a long message grows the field to its cap or the window's room, then scrolls inside: ${JSON.stringify(long)}`,
     );
     assert(
       Math.abs(cleared.height - empty.height) <= 1,
@@ -1400,6 +1436,14 @@ try {
         .innerText()
         .catch(() => "<unavailable>"),
     );
+    // Why the hub the app started refused or failed it, if it did: it logs each connection it
+    // counts as an agent's, with the process and the reason.
+    const sideLog = join(home, "data", "workspaces", "side", "hub.log");
+    if (existsSync(sideLog))
+      console.error(
+        "Side workspace hub log:",
+        readFileSync(sideLog, "utf8").slice(-8192),
+      );
     mkdirSync("test-results", { recursive: true });
     await page
       .screenshot({ path: "test-results/integration-failure.png" })

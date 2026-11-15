@@ -44,8 +44,7 @@ async fn client(socket: &std::path::Path) -> Result<Client> {
     }
     let hello = c.hello(params).await?;
     // Never disguise an agent-launched process as a user. The hub remains authoritative.
-    anyhow::ensure!(hello["identity"].as_str().is_some_and(|s| s.starts_with("user:")),
-        "The hub did not recognize this desktop process as your user. Open twr from your desktop launcher.");
+    twr_app::runtime::ensure_user(&hello)?;
     Ok(c)
 }
 

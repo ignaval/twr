@@ -23,6 +23,12 @@
 //!   during the review run (<paths>): ...`. twr leaves the change where it is (it never
 //!   reverts work) and says so in the round's log. A directory that is no git repository is
 //!   not checked (the log says so).
+//! - **A sandbox that can't start.** A tool call that failed with the sandbox's own error
+//!   ([`sandbox_error`]: `bwrap: ...`, Codex's `bubblewrap is unavailable: ...`) fails the run,
+//!   whatever the agent answered: its command never ran, so the reviewer read nothing
+//!   (codex-acp's `read-only` mode in a rootless container answered an empty list so). The
+//!   words are the built-in Codex reviewer's (`review::sandbox_failed`). A command that failed
+//!   otherwise is the agent's business.
 //! - **The answer.** The prompt is the round's, with [`OUTPUT_CONTRACT`] after it: the
 //!   findings in one fenced `json` block matching `findings.schema.json`. The hub reads the
 //!   LAST such block of the reply (`contract::findings_in_text`, the same `parse_findings` the
@@ -33,7 +39,9 @@
 //! - **Usage** is what the agent's prompt results report (summed over the two prompts: input
 //!   with its cached part, output, and the cost when the agent reports one), or nothing.
 //! - **Process.** As every review run (`crate::one_shot`): a session and process group of its
-//!   own, killed when the run ends however it ends (an answer, the round's timeout, a cancel);
+//!   own, killed when the run ends however it ends (an answer, the round's timeout, a cancel),
+//!   with what it started outside that group (`one_shot::end_call`: what its tools ran in
+//!   sessions of their own, as Claude Code's Bash tool does);
 //!   twr's tokens and markers scrubbed from its environment, `TWR_AGENT=<thread>:loop-<id>` in
 //!   their place. What the agent said and did goes to `round-<round>.log` for people,
 //!   starting with what its session reported (`ext.acp` of `thread.started`: version, model,
@@ -52,7 +60,7 @@ use twr_core::event::{EventBody, TurnResult, Usage};
 use twr_core::loops::contract::{findings_in_text, Finding, FINDINGS_SCHEMA, MAX_ANSWER_BYTES};
 
 use super::review::{span, Call, Ended};
-use crate::one_shot::{kill_group, scrubbed_names, Group};
+use crate::one_shot::{call_tree, end_call, scrubbed_names, Group, LiveCall, REAPED_LINE};
 
 /// How long the agent has to exit once its session is stopped, before its group is killed.
 const STOP_GRACE: Duration = Duration::from_secs(2);
@@ -106,15 +114,34 @@ pub fn read_only_mode(reported: &str, asked: &str) -> bool {
         && (reported == asked.trim() || mode_level(reported) == Some(ModeLevel::Restricted))
 }
 
-/// The round's log, appended to (for people; never read to judge the round).
-struct Log(Option<std::fs::File>);
+/// The round's log, appended to (for people; never read to judge the round), and the one fact
+/// the run takes from what it logs: a tool call that failed because the agent's sandbox could
+/// not start ([`sandbox_error`]).
+struct Log {
+    file: Option<std::fs::File>,
+    /// The first such failure's error line.
+    sandbox: Option<String>,
+}
 
 impl Log {
     fn line(&mut self, text: &str) {
-        if let Some(f) = &mut self.0 {
+        if let Some(f) = &mut self.file {
             let _ = writeln!(f, "{text}");
         }
     }
+}
+
+/// The sandbox's own error at the start of a failed tool call's output (`bwrap: ...`, or
+/// Codex's `bubblewrap is unavailable: ...` when it finds no bwrap): the agent's command never
+/// ran, since its sandbox could not start. Any other failure is the agent's business.
+pub fn sandbox_error(output: &str) -> Option<&str> {
+    let output = output.trim_start();
+    if output.starts_with("bwrap: ") {
+        return Some(output);
+    }
+    output
+        .find("bubblewrap is unavailable")
+        .map(|i| &output[i..])
 }
 
 /// Runs `call` on `acp` (module docs); `spawned` is told the agent's process group.
@@ -124,6 +151,7 @@ pub async fn run(
     spawned: impl FnOnce(u32),
     mut cancel: tokio::sync::watch::Receiver<Option<String>>,
 ) -> Ended {
+    let live = LiveCall::new(&call.marker);
     // A previous run's answer is never taken for this one's.
     let _ = std::fs::remove_file(&call.answer_file);
     let mut log = match std::fs::OpenOptions::new()
@@ -132,7 +160,10 @@ pub async fn run(
         .truncate(true)
         .open(&call.log_file)
     {
-        Ok(f) => Log(Some(f)),
+        Ok(f) => Log {
+            file: Some(f),
+            sandbox: None,
+        },
         Err(e) => return Ended::Failed(format!("cannot open {}: {e}", call.log_file.display())),
     };
     if !super::review::plain(&call.model) {
@@ -226,7 +257,9 @@ pub async fn run(
         ))),
         why = cancelled => Err(Ended::Cancelled(why)),
     };
-    // The session ends; what it started goes with it, whatever way the run ended.
+    // The session ends; what it started goes with it, whatever way the run ended. What its
+    // tools started in sessions of their own is read first, while the agent still runs.
+    let tree = call_tree(group.0).await;
     let _ = handle.stop();
     let _ = tokio::time::timeout(STOP_GRACE, async {
         while let Some(ev) = events.recv().await {
@@ -236,8 +269,11 @@ pub async fn run(
         }
     })
     .await;
-    if let Some(pgid) = group.0.take() {
-        kill_group(pgid);
+    // Its group and what it started outside it (Claude Code's Bash tool runs each command in a
+    // session of its own), before the tree is read again: nothing of the run may write there
+    // afterwards.
+    if end_call(group.0.take(), &call.marker, tree, live).await {
+        log.line(REAPED_LINE);
     }
     // Read-only rests on the agent's mode; whether the tree stayed as it was, twr can see.
     if let Some(before) = &before {
@@ -261,6 +297,17 @@ pub async fn run(
             }
             return Ended::Failed(why);
         }
+    }
+    // A command that failed because the agent's sandbox could not start: the reviewer read
+    // nothing, whatever it answered (often an empty list) or however its turn ended.
+    if let Some(line) = log.sandbox.clone() {
+        if let Err(Ended::Cancelled(why)) = outcome {
+            log.line(&format!("twr: the run was cancelled: {why}"));
+            return Ended::Cancelled(why);
+        }
+        let why = super::review::sandbox_failed(&format!("acp preset {}", acp.preset), &line);
+        log.line(&format!("twr: {why}"));
+        return Ended::Failed(why);
     }
     let (body, findings, usage) = match outcome {
         Ok(r) => r,
@@ -437,6 +484,9 @@ async fn next(
                 if r.ok { "done" } else { "failed" },
                 r.output_summary
             ));
+            if !r.ok && log.sandbox.is_none() {
+                log.sandbox = sandbox_error(&r.output_summary).map(str::to_string);
+            }
             Next::Other
         }
         EventBody::AttentionRaised(p) => {

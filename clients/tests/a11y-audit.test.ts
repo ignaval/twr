@@ -6,6 +6,7 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { Dialog, FieldInput } from "../shared/ui";
 import { MessageBody } from "../shared/MessageBody";
+import { controlPairs, failing, themeScope } from "./css-contrast";
 
 /* A dependency-free accessibility lint over the shared React UI: it parses the
  * TSX with the TypeScript compiler already used by the build, and checks theme
@@ -264,6 +265,65 @@ describe("theme contrast", () => {
       expect(contrast(theme["accent-fg"], theme.accent)).toBeGreaterThan(4.5);
       expect(contrast(theme["danger-fg"], theme.danger)).toBeGreaterThan(4.5);
       expect(failures).toEqual([]);
+    });
+
+  // Warning text on the tints it sits on: Needs you's count (warning-soft) on the selected
+  // sidebar row (accent-soft over the panel), and the composer's "To:" chip in shell mode
+  // (warning at 12% over the panel). The app's own palettes are what an unusable Omarchy
+  // theme falls back to; both pairs were under 4.5:1 in the light one (4.01:1, 4.48:1).
+  const tints = (start: number) => {
+    const block = css.slice(start, css.indexOf("}", start));
+    return Object.fromEntries(
+      [
+        ...block.matchAll(
+          /--([a-z-]+):\s*rgb\((\d+) (\d+) (\d+) \/ ([\d.]+)%\);/g,
+        ),
+      ].map((m) => [m[1], { rgb: [+m[2], +m[3], +m[4]], alpha: +m[5] / 100 }]),
+    );
+  };
+  const over = (top: number[], alpha: number, bottom: number[]) =>
+    top.map((v, i) => v * alpha + bottom[i] * (1 - alpha));
+  const toHex = (rgb: number[]) =>
+    "#" + rgb.map((v) => Math.round(v).toString(16).padStart(2, "0")).join("");
+  for (const [name, theme, start] of [
+    ["dark", dark, 0],
+    ["light", light, lightStart],
+  ] as const)
+    it(`reads warning text on its tints in the ${name} theme`, () => {
+      const soft = tints(start);
+      const panel = hex(theme.panel);
+      const row = over(
+        soft["accent-soft"].rgb,
+        soft["accent-soft"].alpha,
+        panel,
+      );
+      const count = over(
+        soft["warning-soft"].rgb,
+        soft["warning-soft"].alpha,
+        row,
+      );
+      const chip = over(hex(theme.warning), 0.12, panel);
+      expect(
+        contrast(theme.warning, toHex(count)),
+        "the Needs you count on the selected row",
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(
+        contrast(theme.warning, toHex(chip)),
+        "the shell-mode chip",
+      ).toBeGreaterThanOrEqual(4.5);
+    });
+});
+
+describe("control contrast", () => {
+  // Every control's edge and state indicator (WCAG 2.2 1.4.11), resolved from the real
+  // stylesheets: fields, the composer, checkboxes and switches, sliders, the selected
+  // segment, tab, thread card and list item, pressed toggles and the focus ring, on every
+  // surface and tint they sit on (tests/css-contrast.ts).
+  for (const theme of ["dark", "light"] as const)
+    it(`reads at 3:1 for every control edge and state in the ${theme} theme`, () => {
+      const list = controlPairs(themeScope(theme));
+      expect(list.length).toBeGreaterThan(80);
+      expect(failing(list)).toEqual([]);
     });
 });
 

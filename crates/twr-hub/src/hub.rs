@@ -1440,6 +1440,10 @@ struct Live {
 #[derive(Clone)]
 enum Exit {
     Stopped,
+    /// Stopped by its remote box's runner as the runner stopped
+    /// ([`twr_core::runner::EXIT_RUNNER_STOPPED`]): `thread.stopped` with `ext.twr.reason`
+    /// [`twr_core::event::BOX_STOPPED_REASON`], no crash.
+    BoxStopped,
     Crashed {
         exit_code: Option<i32>,
         stderr_tail: String,

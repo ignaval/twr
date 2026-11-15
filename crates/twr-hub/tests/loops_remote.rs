@@ -44,7 +44,8 @@ const TASK: &str = "add a CSV export";
 // ---------------------------------------------------------------------------------------------
 
 /// A fake reviewer CLI on the box (`codex`, `claude` or `grok`, by the name it runs as). The
-/// box's agent probe gets a version and a signed-in status; every other call is a review run
+/// box's agent probe gets a version, a signed-in status and, on Linux, a sandbox that starts
+/// (`codex sandbox`); every other call is a review run
 /// `n` (from 1, `count`), which writes its argv, environment, stdin and working directory to
 /// `<kind>.<n>`; with `hold.<n>` it starts a child (`child.<n>`, itself in `pid.<n>`) and
 /// waits until the file goes. It answers `answers/<n>.json`, else no findings.
@@ -52,6 +53,8 @@ const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
 case "$1" in --version) echo "fake 1.0"; exit 0;; esac
 if [ "$1 $2" = "login status" ]; then echo "Logged in"; exit 0; fi
+# The probe's check of Codex's sandbox on Linux (`codex sandbox ... -- true`): it starts.
+case "$1" in sandbox) exit 0;; esac
 if [ "$1 $2" = "auth status" ]; then echo '{"loggedIn": true, "authMethod": "claude.ai"}'; exit 0; fi
 until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
@@ -1364,6 +1367,25 @@ async fn a_box_that_goes_away_during_a_review_run_fails_it_and_retries_once_back
     assert!(of_kind(&h, &t, "attention.raised").iter().all(
         |e| !matches!(&e.body, EventBody::AttentionRaised(a) if a.reason == AttentionReason::Error)
     ));
+    // The failed run's log, which the hub never read back (the box was away when it ended),
+    // is kept on both sides under its own name; the retry's has the round's.
+    let id = loop_id(&h, &t);
+    let hub_folder = PathBuf::from(get(&h, &t)["folder"].as_str().unwrap());
+    for folder in [hub_folder.clone(), box_folder(&env, &id)] {
+        let read = |n: &str| std::fs::read_to_string(folder.join(n)).unwrap_or_default();
+        assert!(
+            read("round-m1.try1.log").contains("fake reviewer run 1"),
+            "{}",
+            folder.display()
+        );
+        assert!(read("round-m1.log").contains("fake reviewer run 2"));
+        assert!(!read("round-m1.log").contains("fake reviewer run 1"));
+        assert!(folder.join("round-m1.try1.prompt.md").is_file());
+    }
+    assert_eq!(
+        std::fs::read(hub_folder.join("round-m1.try1.log")).unwrap(),
+        std::fs::read(box_folder(&env, &id).join("round-m1.try1.log")).unwrap()
+    );
     runner.shutdown().await;
     h.shutdown().await;
 }
@@ -1671,6 +1693,58 @@ async fn the_next_loop_removes_the_previous_loops_folder_from_the_box() {
     .await;
     ended(&h, &t).await;
     assert!(box_folder(&env, &second).is_dir());
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// The box's runner is stopped on purpose during a triage turn (`twr runner stop`): the
+/// runtime ends with it (`thread.stopped` `box_stopped`), which is no failure of the step. The
+/// loop is not stuck and asks for nothing the box cannot do while away: it waits on its box
+/// (`loop.box`, its line says so), its step asked again in the queue, and once a runner is
+/// back the step runs again and the loop ends as it would have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_runner_stopped_during_a_triage_turn_waits_for_the_box_and_goes_on() {
+    let env = Env::new().await;
+    env.set(|b| b.replies.push((" triage m1]".into(), "@slow 3000".into())));
+    let h = env.hub().await;
+    let runner = env.runner();
+    online(&h).await;
+    let t = box_thread(&env, &h, "api").await;
+    let wt = PathBuf::from(h.hub().thread_view(&t).unwrap().worktree.unwrap());
+    std::fs::write(wt.join("lib.rs"), "fn changed() {}\n").unwrap();
+    env.answer(1, findings(1));
+    start(&h, &t, "review", None, settings("low", "codex/gpt-6.1-sol")).await;
+    until("the triage turn", || !env.seen(" triage m1]").is_empty()).await;
+    runner.shutdown().await;
+    let hub = h.hub().clone();
+    let t2 = t.clone();
+    until("the loop waiting on the box", move || {
+        hub.thread_view(&t2)
+            .ok()
+            .and_then(|v| v.r#loop)
+            .is_some_and(|l| l.box_away.as_deref() == Some(BOX))
+    })
+    .await;
+    let l = running(&h, &t).unwrap();
+    assert!(l.stuck.is_none(), "{:?}", l.stuck);
+    assert!(twr_core::loops::line(&l).contains("waiting on box gpu"));
+    let v = h.hub().thread_view(&t).unwrap();
+    assert!(v.box_stopped && !v.crashed, "{v:?}");
+    let no_error_items = |h: &TestHub| {
+        assert!(of_kind(h, &t, "attention.raised").iter().all(|e| !matches!(
+            &e.body,
+            EventBody::AttentionRaised(a) if a.reason == AttentionReason::Error
+        )));
+        assert!(h.hub().attention_list(false).is_empty());
+    };
+    assert!(of_kind(&h, &t, "thread.crashed").is_empty());
+    no_error_items(&h);
+    // Back: the triage runs again, and the loop ends clean.
+    let runner = env.runner();
+    let last = ended(&h, &t).await;
+    assert_eq!(last.outcome, Outcome::Clean);
+    assert_eq!(env.seen(" triage m1]").len(), 2);
+    no_error_items(&h);
     runner.shutdown().await;
     h.shutdown().await;
 }

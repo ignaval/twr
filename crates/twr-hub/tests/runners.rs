@@ -736,11 +736,13 @@ async fn spawn_send_permission_and_respond_through_a_runner() {
         hub.boxes().iter().any(|(_, online, _)| !online)
     })
     .await;
-    // The graceful runner stop ended the session: the exit was delivered first.
+    // The graceful runner stop ended the session, with the runner (no crash): the exit was
+    // delivered first.
     let all = log(h.hub(), &t);
+    assert_eq!(count(&all, "thread.crashed"), 0);
     assert_eq!(
-        count(&all, "thread.crashed") + count(&all, "thread.stopped"),
-        1
+        stop_reasons(h.hub(), &t),
+        [Some(BOX_STOPPED_REASON.to_string())]
     );
     assert_eq!(count(&log(h.hub(), HUB_THREAD), "runner.disconnected"), 1);
     let s = h.sync(|hub| {
@@ -2899,6 +2901,16 @@ async fn a_runner_restart_that_lost_the_process_closes_the_turn() {
         "{}",
         c.stderr_tail
     );
+    // A crash: the runner died without stopping it. Its item says so in twr's words, with no
+    // signal or exit code the runtime never gave.
+    let summary = h
+        .hub()
+        .attention_list(true)
+        .into_iter()
+        .find(|i| i["reason"] == "error")
+        .and_then(|i| i["summary"].as_str().map(str::to_string))
+        .unwrap();
+    assert!(summary.starts_with("lost crashed: twr"), "{summary}");
     h.online().await;
     // The thread works again: a fresh (resumed) session on the new runner.
     h.send(&t, "after");
@@ -3084,6 +3096,7 @@ async fn a_runner_cannot_touch_the_threads_of_other_boxes() {
         stderr_tail: String::new(),
         run: Some("r-evil".into()),
         at_ms: None,
+        reason: None,
     };
     cmds.extend(raw_frame(&mut ws, exit).await);
     assert_eq!(h.hub().box_rejected_frames(BOX), 2);
@@ -3490,6 +3503,7 @@ async fn an_exit_in_the_replay_is_no_stray_and_its_replacement_is_never_stopped(
         stderr_tail: String::new(),
         run: Some(run_id(&t, "r1")),
         at_ms: None,
+        reason: None,
     };
     raw_frame(&mut ws, exited).await;
     raw_send(&mut ws, &RunnerMsg::Synced).await;
@@ -3639,6 +3653,7 @@ fn exited(thread: &str, rseq: u64, code: Option<i32>, run: Option<&str>) -> Runn
         stderr_tail: "gone".into(),
         run: run.map(|r| run_id(thread, r)),
         at_ms: None,
+        reason: None,
     }
 }
 
@@ -7366,4 +7381,190 @@ async fn a_turn_whose_end_the_runner_forgot_is_closed_and_the_next_prompt_resume
         assert!(v["current_turn"].is_null(), "{v}");
         h.shutdown().await;
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// The box's runner stopped on purpose, killed, or only its connection gone
+// ------------------------------------------------------------------------------------------
+
+/// The runner is stopped on purpose (`twr runner stop`, a service or the machine shutting
+/// down): it stops its runtimes and says each ended with it (`exited` `reason`
+/// `runner_stopped`). Their threads close as stopped with the box's runner (`box_stopped`), an
+/// idle one and one in the middle of a turn alike: no crash, no error item, nothing to answer
+/// while the box is away. The box is offline for anything new from the first such exit on, a
+/// prompt waits for it, and once a runner is back the next message resumes the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_stopped_on_purpose_ends_its_threads_with_it_not_as_crashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let rdir = dir.path().join("r");
+    let runner = Runner::start(runner_opts(&h.url, &rdir), open_box(&rdir));
+    h.online().await;
+    let idle = h.new_thread(&project(dir.path()), "idle").await;
+    let mut sub = h.hub().subscribe_thread(&idle, 0).unwrap();
+    h.send(&idle, "hi");
+    until(&mut sub, |e| e.kind() == "report.ready").await;
+    let session = h.hub().thread_view(&idle).unwrap().session_id;
+    let busy = h.new_thread(&project(dir.path()), "busy").await;
+    let mut bsub = h.hub().subscribe_thread(&busy, 0).unwrap();
+    h.send(&busy, "!sleep 60000");
+    until(&mut bsub, |e| e.kind() == "thread.started").await;
+
+    runner.shutdown().await;
+    let hub = h.hub().clone();
+    wait_for("offline", move || {
+        hub.boxes().iter().any(|(_, online, _)| !online)
+    })
+    .await;
+    for t in [&idle, &busy] {
+        let all = log(h.hub(), t);
+        assert_eq!(count(&all, "thread.crashed"), 0, "{:?}", kinds(&all));
+        assert_eq!(
+            stop_reasons(h.hub(), t),
+            [Some(BOX_STOPPED_REASON.to_string())]
+        );
+        let v = h.hub().thread_view(t).unwrap();
+        assert!(
+            v.stopped && v.stopped_by_hub && v.box_stopped && !v.crashed,
+            "{v:?}"
+        );
+        let got = h.hub().get_thread(t).unwrap();
+        assert_eq!(got["activity"], twr_core::activity::BOX_STOPPED, "{got}");
+        assert_eq!(got["attention"], json!([]), "{got}");
+    }
+    // The turn that ran was cut: interrupted, not failed.
+    let ends = turn_ends(h.hub(), &busy, 1);
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0].result, TurnResult::Interrupted);
+    assert!(h.hub().attention_list(true).is_empty());
+    // Away: a prompt waits for the box.
+    let s = h.sync(|hub| {
+        hub.send(&idle, "later", TurnFrom::User, Source::User("test".into()))
+            .unwrap()
+    });
+    assert_eq!((s.turn, s.pending), (None, 1));
+    // Back: the prompt runs, on the same session.
+    let runner = Runner::start(runner_opts(&h.url, &rdir), open_box(&rdir));
+    until(&mut sub, |e| {
+        e.kind() == "report.ready" && e.turn == Some(2)
+    })
+    .await;
+    let v = h.hub().thread_view(&idle).unwrap();
+    assert_eq!(v.session_id, session);
+    assert!(!v.stopped && !v.box_stopped);
+    assert!(h.hub().attention_list(true).is_empty());
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// Only the connection goes: the runner and its runtime live on, so the thread carries on
+/// (its turn keeps running on the box and its events wait in the spool). Nothing says the
+/// runtime ended, at any point: no crash, no stop, no error item; the turn's end comes once
+/// the box is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_connection_ends_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let proxy = Proxy::start(&h.url).await;
+    let rdir = dir.path().join("r");
+    let runner = Runner::start(runner_opts(&proxy.url, &rdir), open_box(&rdir));
+    h.online().await;
+    let t = h.new_thread(&project(dir.path()), "cut").await;
+    let mut sub = h.hub().subscribe_thread(&t, 0).unwrap();
+    h.send(&t, "!sleep 1500\nfinished");
+    until(&mut sub, |e| e.kind() == "thread.started").await;
+    proxy.st().cut_now = true;
+    let hub = h.hub().clone();
+    wait_for("offline", move || {
+        hub.boxes().iter().any(|(_, online, _)| !online)
+    })
+    .await;
+    let quiet = |h: &TestHub| {
+        let all = log(h.hub(), &t);
+        assert_eq!(count(&all, "thread.crashed"), 0, "{:?}", kinds(&all));
+        assert_eq!(count(&all, "thread.stopped"), 0, "{:?}", kinds(&all));
+        assert!(h.hub().attention_list(true).is_empty());
+    };
+    quiet(&h);
+    assert_eq!(h.hub().get_thread(&t).unwrap()["status"], "running");
+    until(&mut sub, |e| e.kind() == "report.ready").await;
+    quiet(&h);
+    assert_eq!(turn_ends(h.hub(), &t, 1)[0].result, TurnResult::Completed);
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// The `exited` frame (exit code 0) of run `run` of `thread` that its runner stopped as it
+/// stopped itself.
+fn runner_stopped(thread: &str, rseq: u64, run: &str) -> RunnerMsg {
+    let mut m = exited(thread, rseq, Some(0), Some(run));
+    if let RunnerMsg::Exited { reason, .. } = &mut m {
+        *reason = Some(twr_core::runner::EXIT_RUNNER_STOPPED.into());
+    }
+    m
+}
+
+/// The box's machine shut down with its network already gone: the runner stopped its agent
+/// and kept the exit (`runner_stopped`) in its spool. When the box is back, its next runner
+/// replays it before `synced`: the thread closes as stopped with its box (no crash), the new
+/// connection is not taken for a runner going away (the box comes online), and the prompt
+/// that waited resumes the session. Live, after `synced`, such an exit takes the box offline
+/// for anything new at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_runner_stop_closes_the_thread_and_the_box_comes_online() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let mut ws = raw_online(&h, vec![]).await;
+    let t = h.raw_session(&mut ws, dir.path(), "replay").await;
+    let ended = EventBody::TurnEnded(TurnEnded {
+        result: TurnResult::Completed,
+        ..Default::default()
+    });
+    raw_frame(&mut ws, frame(&t, 2, Some(1), ended)).await;
+    drop(ws);
+    let hub = h.hub().clone();
+    wait_for("offline", move || !hub.boxes()[0].1).await;
+    h.send(&t, "next");
+    // A new runner process: it runs nothing, and replays the exit its predecessor spooled.
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, hello(TOKEN)).await;
+    let Some(HubMsg::Welcome { .. }) = raw_expect(&mut ws).await else {
+        panic!("no welcome")
+    };
+    raw_frame(&mut ws, runner_stopped(&t, 3, "r1")).await;
+    raw_send(&mut ws, &RunnerMsg::Synced).await;
+    // The prompt resumes the session on the new runner.
+    let (cmd_id, op) = raw_cmd(&mut ws).await;
+    assert!(
+        matches!(&op, Op::Resume { thread, .. } if thread == &t),
+        "{op:?}"
+    );
+    raw_ok(&mut ws, cmd_id).await;
+    let (cmd_id, op) = raw_cmd(&mut ws).await;
+    assert!(matches!(&op, Op::Send { turn: 2, .. }), "{op:?}");
+    raw_ok(&mut ws, cmd_id).await;
+    assert!(h.hub().boxes()[0].1, "the box is online");
+    assert_eq!(count(&log(h.hub(), &t), "thread.crashed"), 0);
+    assert_eq!(
+        stop_reasons(h.hub(), &t),
+        [Some(BOX_STOPPED_REASON.to_string())]
+    );
+    assert!(h.hub().attention_list(true).is_empty());
+    // Live: the runner stops again (its agent is told to stop as it goes, and says so). The box
+    // is offline for anything new from that frame on, before the connection ends: a prompt
+    // waits, and nothing more goes out.
+    raw_frame(&mut ws, runner_stopped(&t, 4, "r2")).await;
+    let hub = h.hub().clone();
+    wait_for("offline while still connected", move || !hub.boxes()[0].1).await;
+    assert_eq!(
+        stop_reasons(h.hub(), &t),
+        [
+            Some(BOX_STOPPED_REASON.to_string()),
+            Some(BOX_STOPPED_REASON.to_string())
+        ]
+    );
+    h.send(&t, "after");
+    no_cmd(&mut ws, 700).await;
+    assert_eq!(h.hub().get_thread(&t).unwrap()["pending"], 1);
+    h.shutdown().await;
 }

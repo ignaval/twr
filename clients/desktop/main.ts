@@ -46,7 +46,7 @@ import {
   workspaceSchema,
 } from "./validation";
 import type { DesktopAppearance, DesktopEvent } from "../shared/types";
-import { parseOmarchyColors } from "../shared/omarchy";
+import { readOmarchyTheme, watchOmarchyTheme } from "./omarchy-theme";
 import { ENGINE_BINARIES, cleanupEngines, stageEngines } from "./engines";
 import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
@@ -441,17 +441,7 @@ function openNotices() {
   });
 }
 function omarchyTheme(): Record<string, string> | null {
-  if (process.platform !== "linux") return null;
-  try {
-    return parseOmarchyColors(
-      readFileSync(
-        join(homedir(), ".config/omarchy/current/theme/colors.toml"),
-        "utf8",
-      ),
-    );
-  } catch {
-    return null;
-  }
+  return process.platform === "linux" ? readOmarchyTheme(homedir()) : null;
 }
 function register() {
   services!.register(handle, (channel, callback) =>
@@ -1356,17 +1346,10 @@ else {
       );
       register();
       if (process.platform === "linux") {
-        let previous = JSON.stringify(omarchyTheme());
-        const timer = setInterval(() => {
-          const theme = omarchyTheme();
-          const next = JSON.stringify(theme);
-          if (next !== previous) {
-            previous = next;
-            emit({ type: "theme", theme });
-          }
-        }, 5000);
-        timer.unref();
-        app.on("will-quit", () => clearInterval(timer));
+        const stop = watchOmarchyTheme(omarchyTheme, (theme) =>
+          emit({ type: "theme", theme }),
+        );
+        app.on("will-quit", stop);
       }
       Menu.setApplicationMenu(
         Menu.buildFromTemplate([

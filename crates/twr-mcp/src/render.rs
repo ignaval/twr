@@ -10,8 +10,9 @@
 
 use serde_json::Value;
 use twr_core::event::{
-    ACCOUNT_DIR_KEY, ACCOUNT_KEY, ACCOUNT_RESTART_REASON, BOX_UPGRADE_REASON, MODEL_RESTART_REASON,
-    MODE_RESTART_REASON, RESUME_DROPPED_KEY, RESUME_DROPPED_WHY_KEY, RUNTIME_RESTART_REASON,
+    ACCOUNT_DIR_KEY, ACCOUNT_KEY, ACCOUNT_RESTART_REASON, BOX_STOPPED_REASON, BOX_UPGRADE_REASON,
+    MODEL_RESTART_REASON, MODE_RESTART_REASON, RESUME_DROPPED_KEY, RESUME_DROPPED_WHY_KEY,
+    RUNTIME_RESTART_REASON,
 };
 
 /// Output cap for one tool result, in bytes.
@@ -487,11 +488,16 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
             let code = d
                 .get("exit_code")
                 .and_then(Value::as_i64)
-                .map_or_else(|| "?".to_string(), |c| c.to_string());
-            format!(
-                "thread crashed (exit {code}): {}",
-                clip.field(&d, "stderr_tail", SHORT_CAP)
-            )
+                .and_then(|c| i32::try_from(c).ok());
+            let tail = str_of(&d, "stderr_tail").to_string();
+            let what = match code {
+                Some(0) => "the agent exited on its own (exit code 0)".to_string(),
+                _ => match twr_core::event::exit_words(code, &tail) {
+                    Some(w) => format!("thread crashed ({w})"),
+                    None => "thread crashed".to_string(),
+                },
+            };
+            format!("{what}: {}", clip.field(&d, "stderr_tail", SHORT_CAP))
         }
         "thread.mode_changed" if str_of(&d, "previous") == str_of(&d, "mode") => format!(
             "permission mode kept at {} by {} (chosen explicitly)",
@@ -518,6 +524,11 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
         "thread.stopped" if restart_reason(&d) == Some(ACCOUNT_RESTART_REASON) => {
             "previous session stopped for the move to another account; the next turn continues \
              on that account"
+                .to_string()
+        }
+        "thread.stopped" if restart_reason(&d) == Some(BOX_STOPPED_REASON) => {
+            "its box's runner stopped, and the agent with it; the next message resumes the \
+             session once the box is back"
                 .to_string()
         }
         "thread.stopped" if restart_reason(&d) == Some(BOX_UPGRADE_REASON) => {
@@ -2399,6 +2410,17 @@ mod tests {
         assert!(stop(MODEL_RESTART_REASON).contains("new model / effort"));
         assert!(stop(MODE_RESTART_REASON).contains("new permission mode"));
         assert!(stop(BOX_UPGRADE_REASON).contains("box's new twr build"));
+        assert!(stop(BOX_STOPPED_REASON).contains("box's runner stopped"));
+        let crash = |code: Value, tail: &str| {
+            line(&ev(
+                "thread.crashed",
+                json!({"exit_code": code, "stderr_tail": tail}),
+            ))
+        };
+        assert!(crash(json!(0), "").starts_with("the agent exited on its own (exit code 0)"));
+        assert!(crash(json!(3), "x").starts_with("thread crashed (exit code 3): x"));
+        assert!(crash(json!(null), "x").starts_with("thread crashed (killed by a signal): x"));
+        assert!(crash(json!(null), "twr: gone").starts_with("thread crashed: twr: gone"));
         assert_eq!(
             line(&ev(
                 "thread.deleted",

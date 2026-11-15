@@ -320,7 +320,7 @@ impl Core {
             },
             ThreadStatus::Error if v.crashed => "crashed".into(),
             ThreadStatus::Error => "idle · the last turn failed".into(),
-            ThreadStatus::Done if v.stopped => "stopped".into(),
+            ThreadStatus::Done if v.stopped => activity::fallback(v).into(),
             ThreadStatus::Done | ThreadStatus::Idle => {
                 let interrupted = v
                     .last_turn
@@ -378,7 +378,10 @@ impl Core {
                         .unwrap_or(&why)
                         .to_string();
                     let lower = why.to_lowercase();
-                    if ["fail", "crash", "error"].iter().any(|w| lower.contains(w)) {
+                    if ["fail", "crash", "error", "exited"]
+                        .iter()
+                        .any(|w| lower.contains(w))
+                    {
                         why
                     } else {
                         format!("{}: {why}", activity::fallback(v))

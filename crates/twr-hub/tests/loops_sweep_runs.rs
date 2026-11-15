@@ -762,6 +762,26 @@ async fn failed_audits_are_retried_then_reported_not_run() {
         "{report}"
     );
     assert!(report.contains("nobody audited it"));
+    // Each failed audit run's files are kept, and `loop.get` and the report point at them.
+    let folder = PathBuf::from(g["folder"].as_str().unwrap());
+    let read = |n: &str| std::fs::read_to_string(folder.join(n)).unwrap_or_default();
+    assert!(read("audit-s1.try1.log").contains("boom: rule flaky failed once"));
+    assert!(!read("audit-s1.log").contains("boom"));
+    assert!(read("audit-s2.try1.log").contains("boom: rule broken failed"));
+    assert!(read("audit-s2.log").contains("boom: rule broken failed"));
+    assert_eq!(
+        rules[0]["audit"]["files"]["failed_runs"][0]["log"],
+        json!(folder.join("audit-s1.try1.log"))
+    );
+    assert_eq!(
+        rules[1]["audit"]["files"]["log"],
+        json!(folder.join("audit-s2.log"))
+    );
+    assert!(report.contains("(audit-s1.try1.log)"), "{report}");
+    assert!(
+        report.contains("(audit-s2.try1.log); ") && report.contains("(audit-s2.log)"),
+        "{report}"
+    );
     let lines = conversation_lines(&hub);
     assert!(
         lines

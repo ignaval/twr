@@ -64,7 +64,7 @@ build can skip the Rust part with `TWR_NOTICES_WITHOUT_RUST=1` ([desktop.md](des
 | --- | --- |
 | Packaged startup | Production user authentication, bundled engine startup, native PTY, hub survives app quit |
 | Native interface | All manager pages, New menu, thread selection, orchestrator and direct-worker destinations |
-| Appearance | Dark first launch, persisted Light/Dark/System, native window/menu colors, Omarchy light/dark palette and contrast |
+| Appearance | Dark first launch, persisted Light/Dark/System, native window/menu colors, Omarchy light/dark palette and contrast; on Hyprland, every Omarchy v4.5.0 stock theme switched live by `omarchy-theme-set` and measured on the main screens, and broken themes ([below](#omarchy-themes-in-a-real-hyprland-session)) |
 | Responsive UI | Narrow panes, long-message disclosure, errors above form fields, sticky composer, a message field that grows with wrapped text at 22 px in full and 390 px windows and shrinks back, 44 px mobile controls |
 | Slash commands | Model/effort/runtime, account-add routing, multi-delete targets, boolean flags, unknown workspace safety |
 | Messages | Streaming, question/permission responses, revision checks, queued message take-back |
@@ -119,11 +119,77 @@ thread menu and keyboard/toast layout. iOS records application snapshots as XCTe
 attachments, with friendly PNG copies when the local export succeeds.
 
 `node scripts/native-appearance-qa.mjs` checks native Mac appearance persistence and
-validated IPC. `node scripts/omarchy-qa.mjs`, run inside a Hyprland session, checks
-actual theme-file changes, text contrast and native Linux window colors. These are
-focused local checks in addition to the packaged functional suites.
+validated IPC. `node scripts/omarchy-qa.mjs`, run inside a Hyprland session after
+`npm run build` and a debug `cargo build -p twr-cli -p twr-app`, checks actual theme-file
+changes, the Light/Dark/System preferences and native Linux window colours. It then puts
+Omarchy v4.5.0 in its disposable home as Omarchy's installer does (the repository at
+`~/.local/share/omarchy`; it clones it, or uses `TWR_OMARCHY_SOURCE`), switches the running
+app through every stock theme with Omarchy's own `omarchy-theme-set` in its headless mode,
+then back to the first, and for each one checks that the app followed without a restart and
+without passing through an unreadable or partial state, that it applied exactly the palette
+`shared/omarchy.ts` derives, that the native window background followed, and measures in the
+renderer the colours it draws on its main screens (`scripts/omarchy-audit.mjs`): the thread
+list, the orchestrator's conversation with code, a thread's inspector with its Loops section,
+a request card, a loop's setup card and its settings editor, Needs you, Settings, the New
+thread dialog, an error notice and the composer, focused, for the orchestrator, a thread and
+a shell command. Every text pair must read at 4.5:1 (3:1 for large text), every field edge
+and focus ring at 3:1, and every thread colour's name at 4.5:1 on each surface. Last come
+broken themes (foreground equal to background, missing keys, invalid colour strings, no
+`colors.toml`) and no theme at all. It writes `test-results/omarchy-themes.json` (the lowest
+pair of each theme and where it is), and in `test-results/omarchy-themes/` every measured
+pair and a screenshot of each theme, one right after each switch and one of the whole output
+with `grim` when it is installed. These are focused local checks in addition to the packaged
+functional suites.
 `tests/omarchy-contrast.test.ts` (part of `npm test`) runs on any machine: it resolves
 `style.css` with the palette the app derives for each stock Omarchy theme (their colours
-are fixtures in `tests/omarchy-themes.ts`, from Omarchy v4.5.0) and for broken themes, and
-checks every text, fill, selection, field-edge, focus-ring and thread-name pair the app
-draws.
+are fixtures in `tests/omarchy-themes.ts`, from Omarchy v4.5.0; `omarchy-qa.mjs` checks them
+against the release) and for broken themes, and checks every text, fill, selection,
+field-edge, focus-ring and thread-name pair the app draws, and that no field's own rule
+draws its edge in an unchecked colour.
+
+### Omarchy themes in a real Hyprland session
+
+Checked on 2026-11-14 on commit 6850a84 with the fixes below, in the Arch Linux x86_64 QEMU
+VM (kernel 7.3.4, software rendering on the virtio GPU, 1280×800 at 125%): Hyprland 0.57.2,
+Electron 45.2.3, the app built from the commit in the VM and a debug `twr` cross-built for
+x86_64 Linux. The VM has no Omarchy: Omarchy v4.5.0's repository (commit `ac2690cd`) stands
+in for it in the script's disposable home, and its own `omarchy-theme-set` switches themes in
+headless mode, which skips what needs the Omarchy shell (wallpaper, bar, terminals, other
+apps' retints). The unchanged script also passed against the CI build of 6850a84
+(`desktop.yml` run 43621526223, the Linux bundle's engines).
+
+- Omarchy 4 keeps the selected theme in `~/.local/state/omarchy/current/theme`; the app read
+  only `~/.config/omarchy/current/theme`, so it never followed a theme Omarchy 4 set. Fixed.
+- All 23 stock themes, the 5 light ones included, then the first again: every text pair at
+  4.51:1 or more (Retro-82's `waiting` label on the selected thread card is the lowest; most
+  themes' lowest is the composer's "To:" name at 4.58:1 to 5.56:1), field edges 3.41:1 to
+  3.78:1, focus rings 5.28:1 or more, thread names 4.60:1 or more. The app followed each
+  switch in 0.6 to 4.7 seconds (it checks every 5), straight from the old palette to the new.
+- The live measurement found three pairs under the line that the unit test did not model:
+  the request card's note field (its own rule drew the edge in `--border`, about 1.4:1), the
+  composer's "To:" name in shell mode (warning on its warning-tinted chip, 4.44:1 on three
+  themes) and the composer's edge while focused (mixed from a thread's raw colour, down to
+  2.1:1). All three are fixed and now in `tests/omarchy-contrast.test.ts`.
+- The Linux menu bar stays light Adwaita on every dark theme: Electron 45 draws it from the
+  GTK theme it started with, and neither `nativeTheme`, GNOME's colour scheme nor the desktop
+  portal changes it, at launch or later ([desktop.md](desktop.md#workflows-and-cli-coverage)).
+  The window background follows.
+- Broken themes and none, each set with `omarchy-theme-set` as a theme of the user's: a
+  foreground equal to the background and a theme with only `background` and `foreground`
+  keep the theme and read at 4.59:1 and 4.58:1 or more; invalid colour strings, a theme
+  without `colors.toml` and no theme at all fall back to the app's own colours (Light here,
+  as GTK is light), which read at 4.51:1 or more once its warning colour was darkened (the
+  Needs you count on the selected row was 4.01:1). The native window follows each time. The
+  app logged nothing about themes; its only messages were that this VM has no unlocked
+  keyring for saved hubs.
+
+- The message field, in the same session at 22 px (the system sans-serif here is Adwaita
+  Sans): in the 982×570 window Hyprland gave the app, with the keyring notice above the
+  conversation, a long message grew the field to its 40% cap and pushed Send, the microphone
+  and Upload 28 px below the window. Fixed: the field now stops where the composer fits (149
+  px there), and at 390×844 it reaches its 240 px cap. The integration suite's check of this
+  accepts either. The whole suite could not run here: under emulation the fixture hub took
+  longer than the suite's 30-second wait to connect, so its message field part ran alone.
+
+Not covered: a physical GPU, an input method and fractional scaling on real hardware, and a
+real Omarchy session with its shell and retints.

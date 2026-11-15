@@ -2424,7 +2424,7 @@ export async function remoteLoopQA(driver, fixture, options) {
     codex,
     `#!/bin/sh
 here=$(dirname "$0")
-case "$1" in --version) echo "codex-cli 0.99.0"; exit 0;; login) exit 0;; esac
+case "$1" in --version) echo "codex-cli 0.99.0"; exit 0;; login) exit 0;; sandbox) exit 0;; esac
 n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$here/count"
 cat > /dev/null

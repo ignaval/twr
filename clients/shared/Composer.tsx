@@ -26,6 +26,11 @@ import type { DesktopAPI, Json, Thread } from "./types";
  * `min-height` (its `rows`), at most its CSS `max-height`, past which the text scrolls
  * inside it. The composer's own box keeps its height while the field is measured, so the
  * conversation above it does not move (one scrolled to its end stays there).
+ *
+ * Nor does it grow past the bottom of what clips the composer (the window's content
+ * column): when the window has less room than the cap allows for (a short window, the
+ * largest text size, a notice above the conversation), it stops where the composer's
+ * buttons are still in view, and the text scrolls inside it.
  */
 export function fitToText(field: HTMLTextAreaElement | null) {
   if (!field?.isConnected) return;
@@ -38,6 +43,18 @@ export function fitToText(field: HTMLTextAreaElement | null) {
   if (needed > field.offsetHeight)
     field.style.height = `${Math.ceil(needed)}px`;
   if (box) box.style.height = held;
+  const view = field.ownerDocument?.defaultView;
+  if (!box || !field.style.height || !view) return;
+  let clip = box.parentElement;
+  while (clip && !/clip|hidden/.test(view.getComputedStyle(clip).overflowY))
+    clip = clip.parentElement;
+  if (!clip) return;
+  const over =
+    box.getBoundingClientRect().bottom +
+    (parseFloat(view.getComputedStyle(box).marginBottom) || 0) -
+    clip.getBoundingClientRect().bottom;
+  if (over > 0.5)
+    field.style.height = `${Math.max(0, Math.floor(field.offsetHeight - over))}px`;
 }
 
 /**
@@ -200,9 +217,12 @@ export function Composer({
     });
     resized.observe(field);
     window.addEventListener("twr:typography", refit);
+    // A window made shorter leaves the field less room.
+    window.addEventListener("resize", refit);
     return () => {
       resized.disconnect();
       window.removeEventListener("twr:typography", refit);
+      window.removeEventListener("resize", refit);
     };
   }, [input]);
   useEffect(() => {

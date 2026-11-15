@@ -445,11 +445,18 @@ pub struct ThreadView {
     /// model or effort change, [`is_settings_restart`]).
     pub stopped: bool,
     /// Stopped by the hub's own shutdown (`thread.stopped` `ext.twr.reason`
-    /// [`HUB_SHUTDOWN_REASON`]), not by anyone: the thread goes on, and so does its loop, as
-    /// soon as it is sent something, and a loop may start on it (`loop.request` refuses a
-    /// thread someone stopped). Only while `stopped`.
+    /// [`HUB_SHUTDOWN_REASON`]) or with its remote box's runner ([`BOX_STOPPED_REASON`]), not
+    /// by anyone: the thread goes on, and so does its loop, as soon as it is sent something
+    /// (once its box is back), and a loop may start on it (`loop.request` refuses a thread
+    /// someone stopped). Only while `stopped`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stopped_by_hub: bool,
+    /// Stopped with its remote box's runner (`thread.stopped` `ext.twr.reason`
+    /// [`BOX_STOPPED_REASON`]): the runner was stopped (`twr runner stop`, `twr box restart`, a
+    /// service or the machine shutting down) and stopped the runtime as it went. Only while
+    /// `stopped` (and then `stopped_by_hub` too).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub box_stopped: bool,
     /// Crashed since the last turn started.
     pub crashed: bool,
     /// The turn the latest crash took down: the turn open at `thread.crashed`, or, when the hub
@@ -704,6 +711,7 @@ impl ThreadView {
                 self.set_session(&p.session_id);
                 self.stopped = false;
                 self.stopped_by_hub = false;
+                self.box_stopped = false;
                 self.actual_model = reported_model(p.ext.as_ref()).map(str::to_string);
             }
             EventBody::ThreadResumed(p) => {
@@ -713,6 +721,7 @@ impl ThreadView {
                 self.parked = false;
                 self.stopped = false;
                 self.stopped_by_hub = false;
+                self.box_stopped = false;
             }
             EventBody::ThreadParked(p) => {
                 self.set_session(&p.session_id);
@@ -725,9 +734,10 @@ impl ThreadView {
                 // A runtime the hub restarts in new settings (mode, model, effort) was not
                 // stopped by anyone: the thread keeps its status while its runtime starts again.
                 if !is_settings_restart(p) {
+                    let reason = twr_str(p.ext.as_ref(), "reason");
                     self.stopped = true;
-                    self.stopped_by_hub =
-                        twr_str(p.ext.as_ref(), "reason") == Some(HUB_SHUTDOWN_REASON);
+                    self.box_stopped = reason == Some(BOX_STOPPED_REASON);
+                    self.stopped_by_hub = reason == Some(HUB_SHUTDOWN_REASON) || self.box_stopped;
                     if !self.stopped_by_hub {
                         self.end_loop(Some(crate::loops::Outcome::Stopped));
                     }
@@ -836,6 +846,7 @@ impl ThreadView {
                 // (A crash before it stays the thread's failure: `crashed`, `crashed_turn`.)
                 self.stopped = false;
                 self.stopped_by_hub = false;
+                self.box_stopped = false;
                 self.parked = false;
             }
             EventBody::TurnStarted(p) => {
@@ -880,6 +891,7 @@ impl ThreadView {
                 self.crashed_turn = None;
                 self.stopped = false;
                 self.stopped_by_hub = false;
+                self.box_stopped = false;
                 self.parked = false;
                 self.reported = false;
             }
@@ -5368,6 +5380,7 @@ mod tests {
             (EventBody::ThreadStopped(SessionPayload::default()), false),
             (EventBody::ThreadParked(SessionPayload::default()), false),
             (EventBody::ThreadStopped(reason(HUB_SHUTDOWN_REASON)), true),
+            (EventBody::ThreadStopped(reason(BOX_STOPPED_REASON)), true),
             (EventBody::ThreadStopped(reason(MODEL_RESTART_REASON)), true),
             (EventBody::ThreadCrashed(ThreadCrashed::default()), true),
         ] {
@@ -5375,16 +5388,23 @@ mod tests {
             v.apply(&started(&mut t));
             assert!(v.r#loop.is_some());
             let kind = body.kind().to_string();
-            let by_hub = matches!(&body, EventBody::ThreadStopped(p)
-                if twr_str(p.ext.as_ref(), "reason") == Some(HUB_SHUTDOWN_REASON));
+            let why = match &body {
+                EventBody::ThreadStopped(p) => twr_str(p.ext.as_ref(), "reason"),
+                _ => None,
+            };
+            let by_hub = matches!(why, Some(HUB_SHUTDOWN_REASON | BOX_STOPPED_REASON));
+            let with_box = why == Some(BOX_STOPPED_REASON);
             v.apply(&t.event(body));
             assert_eq!(v.r#loop.is_some(), keeps, "{kind}");
-            // Who stopped it: the hub's shutdown only for its own reason; started again, no one.
+            // Who stopped it: the hub's shutdown, or the box's runner, only for their own
+            // reasons; started again, no one.
             assert_eq!(v.stopped_by_hub, by_hub, "{kind}");
+            assert_eq!(v.box_stopped, with_box, "{kind}");
             if by_hub {
                 assert!(v.stopped);
+                assert_eq!(v.status(), ThreadStatus::Done);
                 v.apply(&t.event(EventBody::ThreadStarted(SessionPayload::default())));
-                assert!(!v.stopped && !v.stopped_by_hub);
+                assert!(!v.stopped && !v.stopped_by_hub && !v.box_stopped);
             }
             if !keeps {
                 assert_eq!(

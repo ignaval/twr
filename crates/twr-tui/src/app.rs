@@ -2049,17 +2049,24 @@ impl Transcript {
                         "restarting on the box's new twr build; the next prompt resumes the \
                          session"
                     }
+                    Some(twr_core::event::BOX_STOPPED_REASON) => {
+                        "its box's runner stopped, and the agent with it; the next message \
+                         resumes the session once the box is back"
+                    }
                     _ => "thread stopped",
                 };
                 self.notice(NoticeLevel::Info, text.into());
             }
             EventBody::ThreadCrashed(p) => {
                 self.close_text();
-                let code = p
-                    .exit_code
-                    .map(|c| format!(" (exit {c})"))
-                    .unwrap_or_default();
-                self.notice(NoticeLevel::Error, format!("thread crashed{code}"));
+                let text = match p.exit_code {
+                    Some(0) => "the agent exited on its own (exit code 0)".to_string(),
+                    _ => match twr_core::event::exit_words(p.exit_code, &p.stderr_tail) {
+                        Some(w) => format!("thread crashed ({w})"),
+                        None => "thread crashed".to_string(),
+                    },
+                };
+                self.notice(NoticeLevel::Error, text);
             }
             EventBody::ThreadModelChanged(p) => {
                 if let Some(r) = &p.runtime {
@@ -14680,6 +14687,10 @@ pub(crate) mod tests {
             (
                 Some(twr_core::event::BOX_UPGRADE_REASON),
                 "restarting on the box's new twr build; the next prompt resumes the session",
+            ),
+            (
+                Some(twr_core::event::BOX_STOPPED_REASON),
+                "its box's runner stopped, and the agent with it; the next message resumes the session once the box is back",
             ),
             (Some("hub_shutdown"), "thread stopped"),
             (None, "thread stopped"),

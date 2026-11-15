@@ -3764,6 +3764,7 @@ async fn an_exit_being_recorded_is_not_recorded_again_after_a_reconnect() {
         stderr_tail: String::new(),
         run: Some(r1.clone()),
         at_ms: None,
+        reason: None,
     };
     raw_send(&mut ws1, &exited).await;
     let hub = h.hub().clone();

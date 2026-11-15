@@ -459,6 +459,7 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
                 login: twr_core::runner::AgentLogin::LoggedIn,
                 method: opt(rng, string),
                 note: opt(rng, string),
+                sandbox: None,
             }],
             launch: opt(rng, string),
             spool: opt(rng, |r| twr_core::runner::SpoolStamp {
@@ -485,6 +486,7 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
             stderr_tail: string(rng),
             run: opt(rng, string),
             at_ms: opt(rng, number),
+            reason: opt(rng, string),
         },
         6 => RunnerMsg::Synced,
         7 => RunnerMsg::CmdResult(CmdResult::new(

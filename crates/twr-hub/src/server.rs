@@ -4,8 +4,8 @@
 //!
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
-//! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, accounts, client, identity, warnings}` (`accounts`: every runtime's, without directories, `hub::accounts`; the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace, why?}` (`why`: for an agent's connection, why it counts as one, [`Conn::why`]) |
+//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, accounts, client, identity, why?, warnings}` (`why`: as `hello`'s; `accounts`: every runtime's, without directories, `hub::accounts`; the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
 //! | `hub.glance`        | -                                                   | `{workspace, threads, running, permissions, questions, active, orchestrator: {id, name, status, preview, preview_seq} \| null}`: the hub's counts in one call, for the TUI's workspace sidebar (`hub::glance`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
@@ -119,7 +119,9 @@
 //! `job.start` only while the thread's mode may run commands (`manual` or wider, `hub::jobs`;
 //! else `relay_forbidden`). Anything else is
 //! `unauthorized` ("this request comes from <name>'s agent (pid N, ...)"), and its `hello` and `hub.info` say
-//! `identity: agent:<name>`. The orchestrator token is accepted only from a peer whose
+//! `identity: agent:<name>` and, in `why`, the same reason (which process, and what the hub
+//! could not read or found), so a client that expected to be the user can say why it is not.
+//! The orchestrator token is accepted only from a peer whose
 //! ancestry contains the recorded process of the orchestrator runtime the token belongs to
 //! (its MCP server), walked again at the `hello` and at every request after it
 //! (a process of an earlier orchestrator runtime that outlived a restart is refused
@@ -682,6 +684,15 @@ impl Conn {
             Some(a) => format!("agent:{}", a.thread_name),
             None => caller.source().to_string(),
         }
+    }
+
+    /// Why a restricted connection counts as an agent's ([`AgentPeer::detail`]: the process,
+    /// and what of its ancestry or environment made it one), for `hello` and `hub.info` to say
+    /// next to its identity. The same words every request it is refused carries
+    /// ([`agent_refused`]), so they tell an agent nothing new; a client that expected to be the
+    /// user (the desktop app's companion) shows them. `None` for any other connection.
+    fn why(&self) -> Option<String> {
+        self.restricted().map(AgentPeer::detail)
     }
 
     fn caller(&self, hub: &Hub) -> Result<Caller, RpcError> {
@@ -2741,7 +2752,11 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = None;
             let identity = conn.identity(&Caller::user(conn.client.clone()));
-            Ok(json!({ "client": conn.client, "identity": identity, "workspace": hub.workspace() }))
+            let mut out = json!({ "client": conn.client, "identity": identity, "workspace": hub.workspace() });
+            if let Some(why) = conn.why() {
+                out["why"] = json!(why);
+            }
+            Ok(out)
         }
     }
 }
@@ -3031,6 +3046,9 @@ fn call(
             let mut info = hub.info_for(box_view(conn, caller));
             info["client"] = json!(client);
             info["identity"] = json!(conn.identity(caller));
+            if let Some(why) = conn.why() {
+                info["why"] = json!(why);
+            }
             Ok(info)
         }
         "hub.shutdown" => Ok(json!({ "ok": true })),

@@ -87,7 +87,7 @@
 //! | `session/update` `agent_message_chunk` (text)        | `agent.text{delta}`; the run of chunks → `agent.text{final}` at the next boundary |
 //! | `session/update` `agent_thought_chunk`               | one `agent.thinking` per run (only with `thinking`) |
 //! | `session/update` `tool_call`                         | `agent.tool_call` (+ `agent.tool_result` if already completed/failed) |
-//! | `session/update` `tool_call_update` completed/failed | `agent.tool_result` (once per call); a call announced with no input (claude-agent-acp's) carries the input a later update gave as `ext.<dialect>.input` |
+//! | `session/update` `tool_call_update` completed/failed | `agent.tool_result` (once per call); a call announced with no input (claude-agent-acp's) carries the input a later update gave as `ext.<dialect>.input`; its output is its `content`, else what its updates sent as terminal output (`_meta.terminal_output_delta` / `_meta.terminal_output` `data`, codex-acp's for a client without terminals), else its `rawOutput` |
 //! | `session/update` `current_mode_update` / `config_option_update` | the mode check above        |
 //! | `session/request_permission` (agent → client request) | `attention.raised{permission}`, options `allow`/`deny` |
 //! | a dialect's question / plan-approval request         | `attention.raised{question}` per question / `attention.raised{permission}` |
@@ -617,7 +617,16 @@ pub(crate) struct ToolState {
     /// The latest input an update of the call carried, once announced bare: it goes on the
     /// result as `ext.<dialect>.input`.
     input: Option<String>,
+    /// The start of what its updates sent as terminal output (`_meta.terminal_output_delta`
+    /// or `_meta.terminal_output` `data`): codex-acp sends a command's output only so to a
+    /// client without terminals, with `rawOutput` just its exit code. At most
+    /// [`TERMINAL_KEEP`] bytes.
+    terminal: String,
 }
+
+/// The most of a tool call's terminal output kept for its result ([`ToolState::terminal`]):
+/// more than its summary shows.
+const TERMINAL_KEEP: usize = 4 * OUTPUT_SUMMARY_MAX;
 
 /// Stateful ACP ↔ twr translator for one agent process.
 #[derive(Debug)]
@@ -2357,6 +2366,24 @@ impl<D: Dialect> Translator<D> {
             }
         }
         let state = self.tools.get_mut(&id).expect("inserted above");
+        if !state.done {
+            for key in ["terminal_output_delta", "terminal_output"] {
+                let Some(data) = u
+                    .get("_meta")
+                    .and_then(|m| m.get(key))
+                    .and_then(|t| t.get("data"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let room = TERMINAL_KEEP.saturating_sub(state.terminal.len());
+                let mut end = data.len().min(room);
+                while !data.is_char_boundary(end) {
+                    end -= 1;
+                }
+                state.terminal.push_str(&data[..end]);
+            }
+        }
         if state.announced_bare && !state.done {
             if let Some(i) = u
                 .get("rawInput")
@@ -2368,6 +2395,7 @@ impl<D: Dialect> Translator<D> {
         if matches!(status, "completed" | "failed") && !state.done {
             state.done = true;
             let input = state.input.take();
+            let terminal = std::mem::take(&mut state.terminal);
             let mut ours = Map::new();
             if let Some(i) = input {
                 ours.insert("input".into(), json!(one_line(&i, INPUT_SUMMARY_MAX)));
@@ -2379,7 +2407,7 @@ impl<D: Dialect> Translator<D> {
                     ok: status == "completed",
                     output_summary: match self.dialect.tool_output(u) {
                         Some(text) => one_line(&text, OUTPUT_SUMMARY_MAX),
-                        None => tool_output_summary(u),
+                        None => tool_output_summary(u, &terminal),
                     },
                     output_ref: None,
                     ext,
@@ -3024,8 +3052,8 @@ fn content_text(c: &Value) -> String {
 }
 
 /// First ~[`OUTPUT_SUMMARY_MAX`] chars of a tool call's `content` (text blocks, diffs,
-/// terminals) or, without content, its `rawOutput`.
-fn tool_output_summary(u: &Value) -> String {
+/// terminals), else of what it sent as terminal output (`terminal`), else of its `rawOutput`.
+fn tool_output_summary(u: &Value, terminal: &str) -> String {
     let mut parts = Vec::new();
     if let Some(items) = u.get("content").and_then(Value::as_array) {
         for it in items {
@@ -3038,6 +3066,9 @@ fn tool_output_summary(u: &Value) -> String {
         }
     }
     let mut text = parts.join("\n");
+    if text.trim().is_empty() && !terminal.trim().is_empty() {
+        text = terminal.to_string();
+    }
     if text.trim().is_empty() {
         text = match u.get("rawOutput") {
             Some(Value::String(s)) => s.clone(),

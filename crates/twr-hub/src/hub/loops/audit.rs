@@ -572,6 +572,22 @@ async fn run_audit(
         Ok(d) => d,
         Err(t) => return end(Some(&prep), Err(NoRun::Failed(t.message().to_string()))),
     };
+    // A run after a failed one: the failed one's files are kept under their own names.
+    let failures = prep
+        .log
+        .audits
+        .iter()
+        .flatten()
+        .find(|a| a.id == audit_id(rule))
+        .map_or(0, |a| a.failures.len());
+    driver::keep_failed_run(
+        &prep.place,
+        &prep.loop_id,
+        &prep.folder,
+        &format!("audit-{}", audit_id(rule)),
+        failures,
+    )
+    .await;
     let prompt = audit_prompt(&hub, &prep, &the_rule, &diffs, &truncated);
     let prompt_name = format!("audit-{}.prompt.md", audit_id(rule));
     let prompt_file = prep.folder.join(&prompt_name);

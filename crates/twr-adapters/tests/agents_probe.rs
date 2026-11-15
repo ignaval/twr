@@ -106,6 +106,7 @@ async fn signed_in_agents_and_nothing_more() {
             login: AgentLogin::LoggedIn,
             method: Some("claude.ai".into()),
             note: None,
+            sandbox: None,
         }
     );
     let codex = by_runtime(&agents, "codex");
@@ -477,4 +478,60 @@ async fn an_account_probe_runs_with_the_accounts_environment() {
         by_runtime(&agents, "claude-code").login,
         AgentLogin::LoggedOut
     );
+}
+
+/// Codex's sandbox on Linux: the probe runs `codex sandbox -c sandbox_mode="read-only" --
+/// true` and reads the sandbox's own error from its stderr; whether Codex's own bwrap is next
+/// to it (`codex-resources/bwrap`, the package layout) and one is on the PATH. Elsewhere, and
+/// for the other agents, nothing is checked.
+#[tokio::test]
+async fn codex_sandbox_is_checked_on_linux() {
+    let dir = tempfile::tempdir().unwrap();
+    // The package layout: bin/codex, codex-resources/bwrap.
+    let bin = dir.path().join("pkg/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(dir.path().join("pkg/codex-resources")).unwrap();
+    install(
+        &dir.path().join("pkg/codex-resources/bwrap"),
+        "#!/bin/sh\nexit 1\n",
+    );
+    cli(
+        &bin,
+        "codex",
+        "codex-cli 0.166.0",
+        "[ \"$1 $2\" = 'login status' ] && exit 0\n\
+         if [ \"$1 $2 $3 $4 $5\" = 'sandbox -c sandbox_mode=\"read-only\" -- true' ]; then\n\
+           echo 'bwrap: No permissions to create a new namespace, likely because the kernel \
+         does not allow non-privileged user namespaces.' >&2; exit 1\n\
+         fi\nexit 9",
+    );
+    cli(&bin, "claude", "2.1.302 (Claude Code)", "exit 9");
+    let agents = probe_with(&env_of(&bin), no_var, COMMAND_TIMEOUT).await;
+    let codex = by_runtime(&agents, "codex");
+    assert_eq!(by_runtime(&agents, "claude-code").sandbox, None);
+    if !cfg!(target_os = "linux") {
+        assert_eq!(codex.sandbox, None);
+        return;
+    }
+    let c = codex.sandbox.as_ref().expect("codex's sandbox checked");
+    assert_eq!(c.state, twr_core::runner::SandboxState::NoNamespaces);
+    assert!(c.bundled_bwrap);
+    assert!(!c.system_bwrap);
+    assert!(c
+        .said
+        .as_deref()
+        .unwrap()
+        .starts_with("bwrap: No permissions to create a new namespace"));
+    // It starts: a bwrap on the PATH, and `true` ran.
+    install(&bin.join("bwrap"), "#!/bin/sh\nexit 0\n");
+    cli(
+        &bin,
+        "codex",
+        "codex-cli 0.166.0",
+        "[ \"$1 $2\" = 'login status' ] && exit 0\n[ \"$1\" = sandbox ] && exit 0\nexit 9",
+    );
+    let agents = probe_with(&env_of(&bin), no_var, COMMAND_TIMEOUT).await;
+    let c = by_runtime(&agents, "codex").sandbox.clone().unwrap();
+    assert_eq!(c.state, twr_core::runner::SandboxState::Works);
+    assert!(c.system_bwrap && c.bundled_bwrap);
 }

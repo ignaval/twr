@@ -2141,10 +2141,10 @@ fn restart_says(name: &str, drained: bool) -> String {
         )
     } else {
         format!(
-            "This stops box {name}'s daemon and the agents it runs, and starts a new one. Its \
-             threads' runtimes end as when a box's runner restarts: each such thread shows a \
-             crash, a turn running then is cut short, and the thread's next prompt resumes its \
-             session."
+            "This stops box {name}'s daemon and the agents it runs, and starts a new one. The \
+             daemon stops its agents as it stops: each such thread shows it stopped with its \
+             box's runner (no crash), a turn running then is cut short, and the thread's next \
+             prompt resumes its session."
         )
     }
 }
@@ -3464,19 +3464,41 @@ mod tests {
         assert!(!stop.contains('\n'), "one line to paste: {stop}");
         assert!(stop.contains(" -o ClearAllForwardings=yes "), "{stop}");
         assert!(stop.contains(" me@host -a -x -k -- "), "{stop}");
-        // The remote script, run here: the data directory as the probe finds it.
+        // The remote script, run here: the data directory as the probe finds it, and the
+        // build named when the box has it.
         let script = ssh_box::stop_script("0123456789abcdef", "gpu", "ab").unwrap();
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script.replace("exec ", "printf '%s\\n' "))
-            .env("HOME", "/home/u")
-            .env_remove("XDG_DATA_HOME")
-            .output()
-            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let builds = home.path().join(".local/share/twr/runner/builds");
+        let build = |id: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(builds.join(id)).unwrap();
+            let f = builds.join(id).join("twr");
+            std::fs::write(&f, "").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script.replace("exec ", "printf '%s\\n' "))
+                .env("HOME", home.path())
+                .env_remove("XDG_DATA_HOME")
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let words = "\nrunner\n--stdio\n--box=gpu\n--hub-key\nab\n--stop\n";
+        // A box with only another build (twr was rebuilt on the hub's machine since the box
+        // got its build): that build stops the daemon, which `--stop` finds by hub key and
+        // box. (The named one printed before, and the command failed: not there.)
+        build("fedcba9876543210");
         assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            "/home/u/.local/share/twr/runner/builds/0123456789abcdef/twr\nrunner\n--stdio\n\
-             --box=gpu\n--hub-key\nab\n--stop\n"
+            run(),
+            format!("{}{words}", builds.join("fedcba9876543210/twr").display())
+        );
+        build("0123456789abcdef");
+        assert_eq!(
+            run(),
+            format!("{}{words}", builds.join("0123456789abcdef/twr").display())
         );
         // Words that would forward something are refused here too, and a build that is no
         // build id (what the hub or the files said) or a name that is no box name.
@@ -3795,12 +3817,16 @@ mod tests {
         assert!(!status_text(&none, false, &hub).contains("drain:"));
     }
 
-    /// `twr box restart` says the restart is clean during a drain, and crashes the agents'
-    /// threads otherwise.
+    /// `twr box restart` says the restart stops the agents cleanly, during a drain (for the
+    /// upgrade) or not (with the old daemon).
     #[test]
-    fn a_restart_during_a_drain_says_it_stops_cleanly() {
+    fn a_restart_says_it_stops_cleanly() {
         assert!(restart_says("gpu", true).contains("no crash"));
-        assert!(restart_says("gpu", false).contains("shows a crash"));
+        let plain = restart_says("gpu", false);
+        assert!(
+            plain.contains("stopped with its box's runner (no crash)"),
+            "{plain}"
+        );
     }
 
     /// A restart is over once the box is online on a newer connection with none pending.

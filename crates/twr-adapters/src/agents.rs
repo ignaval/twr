@@ -23,7 +23,9 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
-use twr_core::runner::{AgentInfo, AgentLogin, AgentsReport, LoginPathReport};
+use twr_core::runner::{
+    AgentInfo, AgentLogin, AgentsReport, LoginPathReport, SandboxCheck, SandboxState,
+};
 
 use crate::process::{self, Bounded};
 use crate::resolve::{self, LoginPath, Resolved, BUILTIN_AGENTS};
@@ -306,7 +308,15 @@ async fn probe_one(
             ),
         }
     };
-    let (version, (login, method, note)) = tokio::join!(version, status);
+    // Codex on Linux: whether its read-only sandbox starts here.
+    let sandbox = async {
+        if runtime != crate::codex::NAME || !cfg!(target_os = "linux") {
+            return None;
+        }
+        Some(codex_sandbox(&found, r.path.as_deref(), extra, remove, limit).await)
+    };
+    let (version, (login, method, note), sandbox) = tokio::join!(version, status, sandbox);
+    info.sandbox = sandbox;
     info.version = match version {
         Bounded::Exited(Some(0), out) => first_line(&out),
         _ => None,
@@ -321,6 +331,133 @@ async fn probe_one(
         "probed an agent CLI"
     );
     info
+}
+
+/// What Codex runs to check its sandbox: its read-only sandbox (named, so that a user config
+/// with another `sandbox_mode` can't turn it off) around `true`.
+pub const SANDBOX_ARGS: &[&str] = &["sandbox", "-c", "sandbox_mode=\"read-only\"", "--", "true"];
+
+/// The longest [`SandboxCheck::said`] kept, in bytes.
+const MAX_SAID: usize = 200;
+
+/// Whether Codex's read-only sandbox starts on this (Linux) machine ([`SandboxCheck`]):
+/// `codex` (`found`) runs [`SANDBOX_ARGS`] with the `PATH` its runtime gets (`path`, else the
+/// runner's), `extra` set and `remove` removed, its stderr read with its stdout (through
+/// `/bin/sh`), for at most `limit`; then which `bwrap`s are there.
+async fn codex_sandbox(
+    found: &Path,
+    path: Option<&std::ffi::OsStr>,
+    extra: &[(String, String)],
+    remove: &[String],
+    limit: Duration,
+) -> SandboxCheck {
+    let mut cmd = tokio::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("exec \"$0\" \"$@\" 2>&1")
+        .arg(found)
+        .args(SANDBOX_ARGS)
+        .envs(extra.iter().cloned());
+    if let Some(p) = path {
+        cmd.env("PATH", p);
+    }
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    let ran = process::run_bounded(cmd, limit, MAX_OUTPUT, |_| false).await;
+    let search = path
+        .map(std::ffi::OsStr::to_os_string)
+        .or_else(|| std::env::var_os("PATH"));
+    let system_bwrap =
+        process::find_program(Path::new("bwrap"), search.as_deref(), Path::new("/")).is_some();
+    let bundled_bwrap = bundled_bwrap(found);
+    let restricts =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .is_ok_and(|v| v.trim() == "1");
+    let (state, said) = match &ran {
+        Bounded::Exited(Some(code), out) => {
+            sandbox_state(*code, &String::from_utf8_lossy(out), restricts)
+        }
+        _ => (SandboxState::Unknown, None),
+    };
+    tracing::debug!(
+        ?state,
+        system_bwrap,
+        bundled_bwrap,
+        "probed codex's sandbox"
+    );
+    SandboxCheck {
+        state,
+        system_bwrap,
+        bundled_bwrap,
+        said,
+    }
+}
+
+/// What Codex's sandbox around `true` exiting `code` with `output` (stdout and stderr) says
+/// ([`SandboxState`]), and the sandbox's own error line when it failed. `restricts`: the
+/// kernel lets only programs with an AppArmor profile make user namespaces
+/// (`kernel.apparmor_restrict_unprivileged_userns = 1`, Ubuntu 24.04 and later).
+pub fn sandbox_state(code: i32, output: &str, restricts: bool) -> (SandboxState, Option<String>) {
+    if code == 0 {
+        return (SandboxState::Works, None);
+    }
+    let Some(line) = output.lines().map(str::trim).find(|l| sandbox_line(l)) else {
+        return (SandboxState::Unknown, None);
+    };
+    let said = Some(printable(line, MAX_SAID));
+    let state = if line.contains("bubblewrap is unavailable") {
+        SandboxState::NoBwrap
+    } else if line.contains("No permissions to create") && line.contains("namespace") {
+        SandboxState::NoNamespaces
+    } else if restricts
+        && (line.contains("Operation not permitted") || line.contains("Permission denied"))
+    {
+        SandboxState::Apparmor
+    } else {
+        SandboxState::Fails
+    };
+    (state, said)
+}
+
+/// Whether `line` is the sandbox's own error: bubblewrap's (`bwrap: ...`) or Codex's when it
+/// finds none (`bubblewrap is unavailable: ...`).
+pub fn sandbox_line(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("bwrap: ") || line.starts_with("bubblewrap is unavailable")
+}
+
+/// Whether Codex's own `bwrap` is next to its executable `found`, where Codex looks for it
+/// (`codex-resources/bwrap`): the `codex-package` layout (`bin/codex` and
+/// `codex-resources/`), and the npm package's (`@openai/codex/bin/codex.js` starting
+/// `@openai/codex-linux-<cpu>/vendor/<target>/bin/codex`).
+fn bundled_bwrap(found: &Path) -> bool {
+    let exe = std::fs::canonicalize(found).unwrap_or_else(|_| found.to_path_buf());
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let mut candidates = vec![
+        dir.join("codex-resources/bwrap"),
+        dir.join("../codex-resources/bwrap"),
+    ];
+    // npm: <node_modules>/@openai/codex/bin/codex.js, the binary in a sibling package (or one
+    // nested under it).
+    if let Some(pkg) = dir.parent().filter(|_| dir.ends_with("bin")) {
+        for scope in [pkg.join("node_modules/@openai"), pkg.join("..")] {
+            for e in std::fs::read_dir(&scope).into_iter().flatten().flatten() {
+                if !e.file_name().to_string_lossy().starts_with("codex-linux-") {
+                    continue;
+                }
+                for t in std::fs::read_dir(e.path().join("vendor"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    candidates.push(t.path().join("codex-resources/bwrap"));
+                }
+            }
+        }
+    }
+    candidates.iter().any(|c| c.is_file())
 }
 
 /// The login state `claude auth status` gave (`out`): its JSON's `loggedIn`, and how
@@ -448,7 +585,8 @@ pub fn is_probe_note(note: &str) -> bool {
 /// (its first entry); a sign-in method only for Claude Code and only as [`claude_method`]
 /// keeps it (`other` for anything else, an email included); a note only when it is one the
 /// probe makes ([`is_probe_note`]), else [`OTHER_NOTE`]; the path and version printable and
-/// as short as the probe keeps them.
+/// as short as the probe keeps them; a sandbox check only for Codex, its line only when it is
+/// the sandbox's own error ([`sandbox_line`]), printable and short.
 pub fn kept_report(agents: Vec<AgentInfo>) -> Vec<AgentInfo> {
     let mut kept: Vec<AgentInfo> = Vec::new();
     for mut a in agents {
@@ -476,6 +614,17 @@ pub fn kept_report(agents: Vec<AgentInfo>) -> Vec<AgentInfo> {
                 true => n,
                 false => OTHER_NOTE.to_string(),
             });
+        // Only Codex's sandbox is checked, and only its own error line is kept of it.
+        a.sandbox = match *runtime {
+            crate::codex::NAME => a.sandbox.map(|mut c| {
+                c.said = c
+                    .said
+                    .map(|l| printable(&l, MAX_SAID))
+                    .filter(|l| sandbox_line(l));
+                c
+            }),
+            _ => None,
+        };
         kept.push(a);
     }
     kept
@@ -500,6 +649,110 @@ pub fn printable(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// What Codex's sandbox around `true` printed, as Codex 0.166.0 printed it on Ubuntu 26.04
+    /// arm64 (its own bwrap, without the bubblewrap package; the bare release binary) and in a
+    /// rootless nerdctl container there, read into a state and the sandbox's own line.
+    #[test]
+    fn codex_sandbox_states_from_what_it_printed() {
+        let bare = "\nthread 'main' (28725) panicked at linux-sandbox/src/launcher.rs:60:13:\n\
+            bubblewrap is unavailable: no system bwrap was found on PATH and no bundled \
+            codex-resources/bwrap binary was found next to the Codex executable\n\
+            note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        let (state, said) = sandbox_state(101, bare, true);
+        assert_eq!(state, SandboxState::NoBwrap);
+        assert!(said
+            .unwrap()
+            .starts_with("bubblewrap is unavailable: no system bwrap"));
+        let apparmor = "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n";
+        assert_eq!(sandbox_state(1, apparmor, true).0, SandboxState::Apparmor);
+        // The same words where AppArmor restricts nothing: some other failure.
+        assert_eq!(sandbox_state(1, apparmor, false).0, SandboxState::Fails);
+        assert_eq!(
+            sandbox_state(1, "bwrap: setting up uid map: Permission denied\n", true).0,
+            SandboxState::Apparmor
+        );
+        let rootless = "bwrap: No permissions to create a new namespace, likely because the \
+            kernel does not allow non-privileged user namespaces. On e.g. debian this can be \
+            enabled with 'sysctl kernel.unprivileged_userns_clone=1'.\n";
+        let (state, said) = sandbox_state(1, rootless, true);
+        assert_eq!(state, SandboxState::NoNamespaces);
+        assert_eq!(said.unwrap().len(), MAX_SAID);
+        // Debian's wording.
+        assert_eq!(
+            sandbox_state(
+                1,
+                "bwrap: No permissions to create new namespace, likely ...",
+                false
+            )
+            .0,
+            SandboxState::NoNamespaces
+        );
+        assert_eq!(sandbox_state(0, "", true), (SandboxState::Works, None));
+        // Anything that is not the sandbox's own error says nothing of it: a Codex without
+        // `codex sandbox`, a command that failed in it.
+        for out in [
+            "error: unrecognized subcommand 'sandbox'\n\nUsage: codex [OPTIONS]\n",
+            "true: command not found\n",
+            "",
+        ] {
+            assert_eq!(
+                sandbox_state(2, out, true),
+                (SandboxState::Unknown, None),
+                "{out}"
+            );
+        }
+    }
+
+    /// A box's sandbox check is kept for Codex only, its line only when it is the sandbox's
+    /// own error, printable and short.
+    #[test]
+    fn a_boxs_sandbox_check_is_kept_for_codex_and_cleaned() {
+        let with = |runtime: &str, said: &str| AgentInfo {
+            runtime: runtime.into(),
+            found: true,
+            sandbox: Some(SandboxCheck {
+                state: SandboxState::NoNamespaces,
+                said: Some(said.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let kept = kept_report(vec![
+            with(
+                "codex",
+                "bwrap: No permissions\u{1b}[2J to create a new namespace",
+            ),
+            with("claude-code", "bwrap: x"),
+        ]);
+        let c = kept[0].sandbox.as_ref().unwrap();
+        assert_eq!(c.state, SandboxState::NoNamespaces);
+        assert_eq!(
+            c.said.as_deref(),
+            Some("bwrap: No permissions[2J to create a new namespace")
+        );
+        assert_eq!(kept[1].sandbox, None);
+        let kept = kept_report(vec![with("codex", "you@example.com said hi")]);
+        assert_eq!(kept[0].sandbox.as_ref().unwrap().said, None);
+        let long = format!("bwrap: {}", "x".repeat(5000));
+        let kept = kept_report(vec![with("codex", &long)]);
+        assert_eq!(
+            kept[0]
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .said
+                .as_ref()
+                .unwrap()
+                .len(),
+            MAX_SAID
+        );
+        // A state a newer box sends that this build does not know.
+        let v: AgentInfo = serde_json::from_value(json!({"runtime": "codex",
+            "sandbox": {"state": "something_new"}}))
+        .unwrap();
+        assert_eq!(v.sandbox.unwrap().state, SandboxState::Unknown);
+    }
 
     /// The login command runs what the runtime runs: `TWR_*_BIN` first, else the command on
     /// the login shell's PATH, with that PATH; an agent that is not there is said so.
@@ -743,6 +996,7 @@ mod tests {
             login: AgentLogin::Unknown,
             method: None,
             note: Some(huge),
+            sandbox: None,
         };
         assert_eq!(kept_report(vec![long])[0].note.as_deref(), Some(OTHER_NOTE));
         let one = |runtime: &str, method: Option<&str>, note: Option<&str>| AgentInfo {
@@ -753,6 +1007,7 @@ mod tests {
             login: AgentLogin::LoggedIn,
             method: method.map(str::to_string),
             note: note.map(str::to_string),
+            sandbox: None,
         };
         let kept = kept_report(vec![
             one("evil\u{1b}]0;x\u{7}", None, None),
