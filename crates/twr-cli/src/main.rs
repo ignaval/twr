@@ -5,6 +5,7 @@ mod term;
 mod accounts;
 mod boxes;
 mod dial_in;
+mod loops;
 mod pretty;
 mod runner_link;
 mod runner_update;
@@ -422,6 +423,17 @@ enum Cmd {
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
+    },
+    /// Review and implementation loops: an adversarial reviewer (another model, read-only)
+    /// reviews a thread's work round after round while the thread verifies and fixes or
+    /// dismisses each finding, until the reviewer has nothing left. `twr loop review <thread>`
+    /// starts a review loop; `twr loop implement <thread> <task>` plans, implements, reviews
+    /// and commits a task (the first time, on a settings card you answer); `list`, `show`,
+    /// `report` read them; `pause`, `resume`, `stop`, `skip` control one; `settings` shows and
+    /// changes the saved settings.
+    Loop {
+        #[command(subcommand)]
+        cmd: loops::LoopCmd,
     },
     /// Reading aloud, the hub machine's end (docs/read-aloud.md).
     Speech {
@@ -1284,7 +1296,10 @@ enum MemoryCmd {
 enum ThreadCmd {
     /// Pull committed runner results into a separate ref, preserving your checkout.
     Pull { thread: String },
-    /// Create a thread on a project (a configured project name or a directory).
+    /// Create a thread on a project (a configured project name or a directory). With --loop
+    /// implement, the words after the project are a task the new thread runs as an
+    /// implementation loop (its first prompt): it starts on your saved loop settings, or its
+    /// settings card comes first, as for `twr loop implement`.
     New {
         /// Project name from the config, or a path.
         project: String,
@@ -1335,6 +1350,8 @@ enum ThreadCmd {
         /// HEAD).
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+        #[command(flatten)]
+        new_loop: loops::NewLoopArgs,
     },
     /// List threads. Parked threads are left out (a footer names them) unless --all.
     List {
@@ -1946,6 +1963,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
             opts.ca_file = ca;
             opts.allow_insecure = allow_insecure;
+            opts.machine_lock = runner_machine_lock(&opts.hub_url, &opts.box_name);
             run_runner(opts, token_file, default_token).await?;
             return Ok(ExitCode::SUCCESS);
         }
@@ -2131,6 +2149,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Boxes { cmd } => boxes::run(cmd, &config, &paths, &socket).await,
+        Cmd::Loop { cmd } => loops::run(cmd, &socket).await,
+        Cmd::Thread {
+            cmd: cmd @ ThreadCmd::New { .. },
+        } => thread_new(cmd, &config, &socket).await,
         Cmd::Account { cmd } => accounts::run(cmd, &paths, &socket)
             .await
             .map(|()| ExitCode::SUCCESS),
@@ -2151,18 +2173,111 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        cmd => run_simple(cmd, &config, paths, socket)
+        cmd => run_simple(cmd, paths, socket)
             .await
             .map(|()| ExitCode::SUCCESS),
     }
 }
 
-async fn run_simple(
-    cmd: Cmd,
-    config: &Config,
-    paths: Paths,
-    socket: PathBuf,
-) -> anyhow::Result<()> {
+/// `twr thread new`: `thread.new`, then what it made; with `--loop implement`, the loop it
+/// asked for, or its card ([`loops::after_new_thread`]).
+async fn thread_new(cmd: ThreadCmd, config: &Config, socket: &Path) -> anyhow::Result<ExitCode> {
+    let ThreadCmd::New {
+        project,
+        runtime,
+        account,
+        outside_pin,
+        box_name,
+        name,
+        mode,
+        model,
+        effort,
+        aliases,
+        no_worktree,
+        worktree,
+        base,
+        new_loop,
+    } = cmd
+    else {
+        unreachable!("thread_new takes `thread new`")
+    };
+    check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
+    let project = project_param(config, &project, box_name.as_deref())?;
+    let mut params = json!({ "project": project, "aliases": aliases });
+    if no_worktree {
+        params["no_worktree"] = json!(true);
+    }
+    if worktree {
+        params["worktree"] = json!(true);
+    }
+    if outside_pin {
+        params["outside_pin"] = json!(true);
+    }
+    for (k, v) in [
+        ("runtime", runtime),
+        ("account", account),
+        ("box", box_name),
+        ("name", name),
+        ("mode", mode),
+        ("model", model),
+        ("effort", effort),
+        ("base", base),
+    ] {
+        if let Some(v) = v {
+            params[k] = json!(v);
+        }
+    }
+    let json = new_loop.json;
+    let mut stdin = false;
+    if new_loop.kind.is_some() {
+        refuse_agent_action("start a loop")?;
+        let (l, read_stdin) = loops::new_thread_loop_param(new_loop)?;
+        params["loop"] = l;
+        stdin = read_stdin;
+    }
+    let t = connect(socket).await?.call("thread.new", params).await?;
+    if !json {
+        let mut model = format!(
+            " model={}",
+            t["model"].as_str().unwrap_or("(runtime default)")
+        );
+        if let Some(e) = t["effort"].as_str() {
+            model.push_str(&format!(" effort={e}"));
+        }
+        let command = match t["pty_command"].as_array().or(t["acp_command"].as_array()) {
+            Some(argv) => format!(" command={}", Value::Array(argv.clone())),
+            None => String::new(),
+        };
+        outln!(
+            "created {} ({}) runtime={}{command}{model} worktree={}",
+            str_of(&t["name"]),
+            str_of(&t["id"]),
+            accounts::runtime_label(&t),
+            str_of(&t["worktree"])
+        );
+        if let Some(repo) = t["project_found"]["repo"].as_str() {
+            outln!("found {} at {repo}", str_of(&t["project_found"]["name"]));
+        }
+        if let Some(w) = result_warning(&t) {
+            errln!("{w}");
+        }
+    }
+    if t["loop"].is_null() {
+        if json {
+            outln!("{}", serde_json::to_string_pretty(&t)?);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut ask = ask_on_stderr;
+    let consent = if json || stdin {
+        Consent::NoTerminal
+    } else {
+        consent(false, &mut ask)
+    };
+    loops::after_new_thread(socket, t, json, consent).await
+}
+
+async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     match cmd {
         Cmd::Attach { .. }
         | Cmd::Wait { .. }
@@ -2171,6 +2286,7 @@ async fn run_simple(
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
+        | Cmd::Loop { .. }
         | Cmd::Speech { .. }
         | Cmd::Speak { .. }
         | Cmd::Voice { .. }
@@ -2178,6 +2294,9 @@ async fn run_simple(
         | Cmd::TerminalSetup { .. }
         | Cmd::Completions { .. }
         | Cmd::Account { .. }
+        | Cmd::Thread {
+            cmd: ThreadCmd::New { .. },
+        }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
         }
@@ -2277,78 +2396,6 @@ async fn run_simple(
         Cmd::Thread {
             cmd: ThreadCmd::Show { thread, json },
         } => thread_show(&socket, &thread, json).await,
-        Cmd::Thread {
-            cmd:
-                ThreadCmd::New {
-                    project,
-                    runtime,
-                    account,
-                    outside_pin,
-                    box_name,
-                    name,
-                    mode,
-                    model,
-                    effort,
-                    aliases,
-                    no_worktree,
-                    worktree,
-                    base,
-                },
-        } => {
-            check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
-            let project = project_param(config, &project, box_name.as_deref())?;
-            let mut c = connect(&socket).await?;
-            let mut params = json!({ "project": project, "aliases": aliases });
-            if no_worktree {
-                params["no_worktree"] = json!(true);
-            }
-            if worktree {
-                params["worktree"] = json!(true);
-            }
-            if outside_pin {
-                params["outside_pin"] = json!(true);
-            }
-            for (k, v) in [
-                ("runtime", runtime),
-                ("account", account),
-                ("box", box_name),
-                ("name", name),
-                ("mode", mode),
-                ("model", model),
-                ("effort", effort),
-                ("base", base),
-            ] {
-                if let Some(v) = v {
-                    params[k] = json!(v);
-                }
-            }
-            let t = c.call("thread.new", params).await?;
-            let mut model = format!(
-                " model={}",
-                t["model"].as_str().unwrap_or("(runtime default)")
-            );
-            if let Some(e) = t["effort"].as_str() {
-                model.push_str(&format!(" effort={e}"));
-            }
-            let command = match t["pty_command"].as_array().or(t["acp_command"].as_array()) {
-                Some(argv) => format!(" command={}", Value::Array(argv.clone())),
-                None => String::new(),
-            };
-            outln!(
-                "created {} ({}) runtime={}{command}{model} worktree={}",
-                str_of(&t["name"]),
-                str_of(&t["id"]),
-                accounts::runtime_label(&t),
-                str_of(&t["worktree"])
-            );
-            if let Some(repo) = t["project_found"]["repo"].as_str() {
-                outln!("found {} at {repo}", str_of(&t["project_found"]["name"]));
-            }
-            if let Some(w) = result_warning(&t) {
-                errln!("{w}");
-            }
-            Ok(())
-        }
         Cmd::Send {
             cancel: Some(id), ..
         } => {
@@ -3374,9 +3421,24 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         // The accounts' logins too (`account.status`), on the same terms.
         opts.account_probe = Some(twr_hub::hub::own_account_probe());
     }
+    // A test's throwaway hub may be told what it found instead ([`TEST_AGENTS_ENV`]).
+    if let Some(agents) = test_agents(trusted) {
+        opts.agent_probe = Some(std::sync::Arc::new(move || {
+            let agents = agents.clone();
+            Box::pin(async move { agents })
+        }));
+    }
     // Named accounts without a `dir` of their own: the home's root's, every workspace's.
     opts.accounts_root = Some(paths.accounts_dir());
     opts.worktree_namespace = paths.worktree_namespace();
+    // A loop's record held at a gate, for a test that kills the hub there.
+    if let Some((at, gate)) = loop_gate(trusted) {
+        opts.loop_record_hook = Some(std::sync::Arc::new(move |point: &str| {
+            if point.starts_with(&at) {
+                test_gate(&gate, LOOP_GATE_ENV);
+            }
+        }));
+    }
     if trusted && std::env::var_os(HUB_STOP_GATE_ENV).is_some() {
         opts.socket_removed_hook = Some(std::sync::Arc::new(|| {
             Box::pin(async {
@@ -3440,7 +3502,28 @@ fn hub_test_gate(env: &str) {
     let Some(gate) = std::env::var_os(env).filter(|_| test_token_trusted()) else {
         return;
     };
-    let gate = PathBuf::from(gate);
+    test_gate(Path::new(&gate), env);
+}
+
+/// `TWR_TEST_LOOP_GATE=<point>=<file>`, for tests of a hub killed in the middle of a loop:
+/// right before the hub commits what a loop records at a point whose name starts with
+/// `<point>` (`findings m1`, `answer triage m1`, `failed scope`, `checked report`, `report
+/// written`:
+/// [`twr_hub::HubOptions::loop_record_hook`]), it waits at the gate `<file>` ([`test_gate`]),
+/// under its lock. Only in a test's throwaway hub ([`test_token_trusted`]).
+const LOOP_GATE_ENV: &str = "TWR_TEST_LOOP_GATE";
+
+/// The point and the gate [`LOOP_GATE_ENV`] names, in a test's throwaway hub (`trusted`).
+fn loop_gate(trusted: bool) -> Option<(String, PathBuf)> {
+    let raw = std::env::var(LOOP_GATE_ENV).ok().filter(|_| trusted)?;
+    let (at, file) = raw.split_once('=')?;
+    Some((at.to_string(), PathBuf::from(file)))
+}
+
+/// The test gate `gate` (of `env`): creates `<gate>.reached` and waits while `gate` exists
+/// (at most a minute).
+fn test_gate(gate: &Path, env: &str) {
+    let gate = gate.to_path_buf();
     let mut reached = gate.clone().into_os_string();
     reached.push(".reached");
     if let Err(e) = std::fs::write(&reached, b"") {
@@ -3451,6 +3534,22 @@ fn hub_test_gate(env: &str) {
     while gate.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// `TWR_TEST_AGENTS=<json>`, for tests of review loops: in a test's throwaway hub only
+/// ([`test_token_trusted`]: a debug build under `TWR_HOME`, which no installed twr is), the
+/// hub's own agent CLIs are the list it gives, as `twr runner --agents` reports them
+/// (`[{"runtime": "codex", "found": true, "login": "logged_in"}]`), and none is probed. The
+/// reviewer CLI a loop runs is then the runtime's `TWR_*_BIN` (`TWR_CODEX_BIN`), as anywhere.
+const TEST_AGENTS_ENV: &str = "TWR_TEST_AGENTS";
+
+/// The agents [`TEST_AGENTS_ENV`] lists, in a test's throwaway hub (`trusted`); a list that
+/// does not read is logged and ignored.
+fn test_agents(trusted: bool) -> Option<Vec<twr_core::runner::AgentInfo>> {
+    let raw = std::env::var(TEST_AGENTS_ENV).ok().filter(|_| trusted)?;
+    serde_json::from_str(&raw)
+        .inspect_err(|e| tracing::warn!(error = %e, "{TEST_AGENTS_ENV} does not read"))
+        .ok()
 }
 
 /// `TWR_AGENT_PROBE`: `off` keeps the hub from probing its own box's agent CLIs (no
@@ -4501,8 +4600,9 @@ impl Drop for PrivateDir {
 
 /// The directory `twr update` installs into: the one holding this executable `exe` (resolved,
 /// so the real file is replaced, not a symlink to it). Refused when it is one of cargo's bin
-/// directories `cargo_bins` (installing over a binary cargo manages confuses cargo), or when
-/// the executable is not named `twr` (the installer writes `<dir>/twr`, which would not replace
+/// directories `cargo_bins` (installing over a binary cargo manages confuses cargo), when it is
+/// in Homebrew's `Cellar/twr` (Homebrew's formula, which `brew upgrade` updates), or when the
+/// executable is not named `twr` (the installer writes `<dir>/twr`, which would not replace
 /// it).
 fn install_dir(exe: &Path, cargo_bins: &[PathBuf]) -> anyhow::Result<PathBuf> {
     let dir = exe
@@ -4515,6 +4615,14 @@ fn install_dir(exe: &Path, cargo_bins: &[PathBuf]) -> anyhow::Result<PathBuf> {
              with `curl -fsSL https://twr.tools/install.sh | sh`",
             exe.display(),
             dir.join("twr").display()
+        );
+    }
+    let parts: Vec<&std::ffi::OsStr> = dir.components().map(|c| c.as_os_str()).collect();
+    if parts.windows(2).any(|w| w[0] == "Cellar" && w[1] == "twr") {
+        bail!(
+            "{} was installed by Homebrew, and `twr update` does not replace a binary Homebrew \
+             manages. Update it with `brew upgrade twr`",
+            exe.display()
         );
     }
     if cargo_bins.iter().any(|c| c == dir) {
@@ -4729,6 +4837,20 @@ async fn prewarm_installed(new_exe: &Path) {
         outln!(
             "(no checkpoint was written for the new build: a hub's first start on it folds the whole log)"
         );
+    }
+}
+
+/// The machine lock of `twr runner --hub <hub_url> --box <box_name>`: in `$TWR_HOME` when it is
+/// set (`$TWR_HOME/runner-locks/`, as everything else of twr's moves there), else in the
+/// user's state directory ([`twr_runner::client::machine_lock_path`]).
+fn runner_machine_lock(hub_url: &str, box_name: &str) -> Option<PathBuf> {
+    match std::env::var_os("TWR_HOME").filter(|h| !h.is_empty()) {
+        Some(home) => Some(twr_runner::client::machine_lock_in(
+            Path::new(&home),
+            hub_url,
+            box_name,
+        )),
+        None => twr_runner::client::machine_lock_path(hub_url, box_name),
     }
 }
 
@@ -6960,6 +7082,13 @@ fn show_text(t: &Value) -> String {
             a => format!(": {a}"),
         }
     )];
+    if let Ok(l) = serde_json::from_value::<twr_core::loops::LoopView>(t["loop"].clone()) {
+        out.push(format!(
+            "  {}  {}",
+            twr_core::loops::badge(l.kind),
+            twr_core::loops::line(&l)
+        ));
+    }
     match serde_json::from_value::<twr_core::work::Work>(t["work"].clone()) {
         Ok(w) => out.extend(w.lines().into_iter().map(|l| format!("  {l}"))),
         Err(_) => out.push("  (this hub does not say what the thread has in flight)".into()),
@@ -7157,6 +7286,26 @@ fn wait_state(t: &Value) -> (WaitState, bool) {
     if status == "waiting" {
         return (WaitState::Waiting, false);
     }
+    // A running loop goes on by itself: each of its steps' reports is interim, until its last
+    // one (the loop is over then). It waits on the user when it is stuck or paused with
+    // nothing running.
+    if let Some(l) = t["loop"].as_object() {
+        let on_user = !l.get("stuck").is_none_or(Value::is_null)
+            || (l.get("paused") == Some(&json!(true))
+                && l.get("waiting_on").and_then(Value::as_str) == Some("user"));
+        return if on_user {
+            (WaitState::Waiting, false)
+        } else {
+            (WaitState::Busy, false)
+        };
+    }
+    // A loop's settings card waits on the user too.
+    if t["attention"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|i| i["loop_setup"] == true))
+    {
+        return (WaitState::Waiting, false);
+    }
     if matches!(status, "running" | "background" | "attached") {
         return (WaitState::Busy, false);
     }
@@ -7228,6 +7377,32 @@ fn wait_line(t: &Value, state: WaitState) -> String {
                 (None, _) => format!("{name} is idle"),
             }
         }
+        WaitState::Waiting if t["status"] != "waiting" && t["loop"]["stuck"].is_string() => {
+            format!(
+                "{name}'s loop is stuck ({}): `twr{w} loop resume {name}` asks for that step \
+                 again, `twr{w} loop stop {name}` ends it",
+                t["loop"]["stuck"].as_str().unwrap_or_default(),
+                w = workspace_hint()
+            )
+        }
+        WaitState::Waiting if t["status"] != "waiting" && t["loop"]["paused"] == true => {
+            format!(
+                "{name}'s loop is paused: `twr{w} loop resume {name}` goes on",
+                w = workspace_hint()
+            )
+        }
+        WaitState::Waiting
+            if t["status"] != "waiting"
+                && t["attention"]
+                    .as_array()
+                    .is_some_and(|i| i.iter().any(|i| i["loop_setup"] == true)) =>
+        {
+            format!(
+                "{name}'s loop waits for its settings card: `twr{w} attention --all` shows it \
+                 and the `twr{w} respond` line that answers it",
+                w = workspace_hint()
+            )
+        }
         WaitState::Waiting => format!(
             "{name} waits on you: `twr{w} attention` shows what",
             w = workspace_hint()
@@ -7235,6 +7410,9 @@ fn wait_line(t: &Value, state: WaitState) -> String {
         WaitState::Failed => {
             let why = if t["parked"].as_bool() == Some(true) {
                 "is parked".to_string()
+            } else if t["box_stopped"].as_bool() == Some(true) {
+                "stopped with its box's runner (the next message resumes it once the box is back)"
+                    .to_string()
             } else if t["stopped"].as_bool() == Some(true) {
                 "was stopped".to_string()
             } else {
@@ -9255,6 +9433,71 @@ mod tests {
         assert_eq!(t(failed.clone()), (WaitState::Busy, false));
         failed["queued_after"] = json!([]);
         assert_eq!(t(failed).0, WaitState::Failed);
+    }
+
+    /// A running loop goes on by itself: an idle thread whose last report is one of its steps'
+    /// is still busy, until the loop ends (its report is the thread's last); a stuck loop, a
+    /// paused one with nothing running and a loop's settings card wait on the user.
+    #[test]
+    fn wait_waits_through_a_loop() {
+        let done = json!({"status": "idle", "pending": 0, "reported": true, "box_online": true,
+            "last_turn": {"turn": 2, "result": "completed"},
+            "last_report": {"turn": 2, "ext": {"twr": {"loop": {"id": "L", "step": "scope"}}}}});
+        let mut running = done.clone();
+        running["loop"] = json!({"id": "L", "phase": "ladder", "paused": false, "stuck": null,
+            "waiting_on": "review"});
+        assert_eq!(wait_state(&running), (WaitState::Busy, false));
+        // Paused while a review still runs: it finishes first.
+        let mut paused = running.clone();
+        paused["loop"]["paused"] = json!(true);
+        assert_eq!(wait_state(&paused).0, WaitState::Busy);
+        paused["loop"]["waiting_on"] = json!("user");
+        assert_eq!(wait_state(&paused).0, WaitState::Waiting);
+        assert!(wait_line(&paused, WaitState::Waiting).contains("loop is paused"));
+        let mut stuck = running.clone();
+        stuck["loop"]["stuck"] = json!("review round m1 failed twice");
+        stuck["loop"]["waiting_on"] = json!("user");
+        assert_eq!(wait_state(&stuck).0, WaitState::Waiting);
+        assert!(
+            wait_line(&stuck, WaitState::Waiting).contains("loop is stuck (review round m1"),
+            "{}",
+            wait_line(&stuck, WaitState::Waiting)
+        );
+        // A permission of the thread's, in a loop: that is what it waits on.
+        let mut asking = running.clone();
+        asking["status"] = json!("waiting");
+        assert_eq!(wait_state(&asking).0, WaitState::Waiting);
+        assert!(wait_line(&asking, WaitState::Waiting).contains("`twr"));
+        // Ended: its last report is the thread's.
+        let mut ended = done.clone();
+        ended["last_report"]["ext"]["twr"]["loop"]["step"] = json!("report");
+        assert_eq!(wait_state(&ended).0, WaitState::Done);
+        let mut card = done;
+        card["attention"] = json!([{"attn_id": "a", "loop_setup": true}]);
+        assert_eq!(wait_state(&card).0, WaitState::Waiting);
+        assert!(wait_line(&card, WaitState::Waiting).contains("settings card"));
+    }
+
+    /// A thread stopped with its box's runner (`box_stopped`): `twr wait` says so, not that
+    /// someone stopped it, and `twr show` prints the hub's words for it.
+    #[test]
+    fn a_thread_stopped_with_its_box_says_so() {
+        let t = json!({"name": "api", "status": "done", "stopped": true, "box_stopped": true,
+            "stopped_by_hub": true, "activity": twr_core::activity::BOX_STOPPED,
+            "last_turn": {"turn": 2, "result": "completed"}});
+        assert_eq!(wait_state(&t), (WaitState::Failed, false));
+        assert_eq!(
+            wait_line(&t, WaitState::Failed),
+            "api: stopped with its box's runner (the next message resumes it once the box is \
+             back)"
+        );
+        assert!(show_text(&t).starts_with(
+            "api (done): stopped with its box's runner: the next message resumes it once the \
+             box is back"
+        ));
+        let mut plain = t.clone();
+        plain["box_stopped"] = json!(false);
+        assert_eq!(wait_line(&plain, WaitState::Failed), "api: was stopped");
     }
 
     fn unreported_orch(done: &Value) {
@@ -11941,7 +12184,7 @@ mod tests {
     }
 
     /// `twr update` installs into the executable's own directory, and refuses cargo's bin
-    /// directories and an executable the installer would not replace.
+    /// directories, Homebrew's formula and an executable the installer would not replace.
     #[test]
     fn update_installs_next_to_the_executable_but_not_over_cargo() {
         let cargo = vec![
@@ -11958,6 +12201,19 @@ mod tests {
             assert!(e.contains("cargo install --path crates/twr-cli"), "{e}");
             assert!(e.contains("cargo uninstall twr-cli"), "{e}");
         }
+        for exe in [
+            "/opt/homebrew/Cellar/twr/0.4.0/bin/twr",
+            "/home/linuxbrew/.linuxbrew/Cellar/twr/0.4.0/bin/twr",
+        ] {
+            let e = install_dir(Path::new(exe), &cargo).unwrap_err().to_string();
+            assert!(e.contains("installed by Homebrew"), "{e}");
+            assert!(e.contains("brew upgrade twr"), "{e}");
+        }
+        // Another formula's Cellar, or a directory merely named Cellar, is not twr's.
+        assert_eq!(
+            install_dir(Path::new("/home/u/Cellar/bin/twr"), &cargo).unwrap(),
+            PathBuf::from("/home/u/Cellar/bin")
+        );
         let e = install_dir(Path::new("/usr/local/bin/twr-dev"), &cargo)
             .unwrap_err()
             .to_string();
@@ -12326,9 +12582,12 @@ mod tests {
         assert!(workflow.contains(
             r#"echo "$(sha256sum dist/install.sh | awk '{ print $1 }')  install.sh" >> sha256sums.txt"#
         ));
+        // install.sh's check_release reads the same line by default (the desktop checksums
+        // pass their own), at the start of a line, and takes the tag after it.
         let script = include_str!("../../../install.sh");
-        assert!(script.contains(&format!(r#"index($0, "{RELEASE_LINE}") == 1"#)));
-        assert!(script.contains(&format!("substr($0, {})", RELEASE_LINE.len() + 1)));
+        assert!(script.contains(&format!("prefix=${{3:-{RELEASE_LINE}}}")));
+        assert!(script.contains("index($0, p) == 1"));
+        assert!(script.contains("substr($0, length(p) + 1)"));
     }
 
     /// The release is resolved once: an explicit version names the GitHub release directly

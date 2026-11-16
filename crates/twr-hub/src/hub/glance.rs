@@ -22,7 +22,7 @@ impl Hub {
     /// `threads` counts the worker threads (every thread whose role is not `orchestrator`,
     /// as `thread.list` lists them), `running` those of them running or in the background,
     /// `permissions` and `questions` the open items of those reasons (every one, as
-    /// `attention.list {all: true}`). `active`: the current orchestrator or a worker that is
+    /// `attention.list {all: true}`; a loop's setup card counts as a question). `active`: the current orchestrator or a worker that is
     /// not parked is at work ([`working`]); retired orchestrators count as no work.
     /// `orchestrator` is null without one, else `{id,
     /// name, status, preview, preview_seq}`: `preview` is its latest final `agent.text` of any
@@ -46,7 +46,18 @@ impl Hub {
             .filter(|v| matches!(v.status(), ThreadStatus::Running | ThreadStatus::Background))
             .count();
         let items = core.attention.ordered(&HashSet::new());
-        let of = |reason: AttentionReason| items.iter().filter(|i| i.reason == reason).count();
+        let of = |reason: AttentionReason| {
+            items
+                .iter()
+                .filter(|i| {
+                    // A loop's setup card needs the user as a question does (`hub::loops`).
+                    match i.loop_setup {
+                        true => reason == AttentionReason::Question,
+                        false => i.reason == reason,
+                    }
+                })
+                .count()
+        };
         let active = views
             .iter()
             .any(|v| !v.retired && (orch == Some(v.id.as_str()) || !v.parked) && working(v));

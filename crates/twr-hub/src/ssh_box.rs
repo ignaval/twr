@@ -138,9 +138,11 @@
 //! key, whatever its build, and starts a new one under its start lock. Once the channel to the
 //! new daemon is open, the restarts asked for until that attempt began are carried out; one
 //! asked for during it is carried out by the next. Nothing races the supervisor: the restart
-//! is its own next connection. The daemon's runtimes end with it, as with any runner restart:
-//! the reconciliation of the next connection closes the threads whose runtime is gone as
-//! crashed (`hub::runners`), and each one's next prompt resumes its session. During a drain
+//! is its own next connection. The daemon stops its runtimes as it stops, as any runner does
+//! (`exited` `runner_stopped`), and the next daemon replays their exits: their threads close
+//! as stopped with their box (`box_stopped`, no crash; one the old daemon could not stop in
+//! time, or whose exit it lost, is closed as crashed by the next connection's reconciliation,
+//! `hub::runners`), and each one's next prompt resumes its session. During a drain
 //! (above) a restart cuts it short instead: the hub stops the box's runtimes for the upgrade at
 //! once (running turns cut), and the drain ends the session once they have exited (or at once,
 //! the stops only recorded, when the box is not ready); the next attempt restarts the daemon,
@@ -1286,8 +1288,11 @@ pub fn upload_answer(out: &str) -> (Option<String>, Option<String>) {
 /// The script (for `sh`) that stops the daemon of box `name` for hub key `hub_key` with build
 /// `id` (`twr runner --stdio --stop`) under the box's data directory, found as the probe finds
 /// it ([`probe_script`]): what `twr box remove` prints for the user to run (one line; each
-/// part quoted only when it needs it, so it reads plainly once quoted again). An error for an
-/// `id` that is no build id or a `name` that is no box name.
+/// part quoted only when it needs it, so it reads plainly once quoted again). When build `id`
+/// is not on the box (twr was rebuilt or updated on the hub's machine since the box got its
+/// build, and no hub said which one the box runs), the newest build there runs it: `--stop`
+/// finds the daemon by hub key and box, whatever build it runs. An error for an `id` that is no
+/// build id or a `name` that is no box name.
 pub fn stop_script(id: &str, name: &str, hub_key: &str) -> Result<String, String> {
     if !twr_core::valid_build_id(id) {
         return Err(format!("{id:?} is not a build id"));
@@ -1295,7 +1300,9 @@ pub fn stop_script(id: &str, name: &str, hub_key: &str) -> Result<String, String
     twr_core::runner::validate_box_name(name).map_err(|e| e.to_string())?;
     Ok(format!(
         "case ${{XDG_DATA_HOME:-}} in /*) d=$XDG_DATA_HOME ;; *) d=$HOME/.local/share ;; esac; \
-         exec \"$d\"/twr/runner/builds/{} runner --stdio {} --hub-key {} --stop",
+         b=\"$d\"/twr/runner/builds/{}; [ -x \"$b\" ] || \
+         b=$(ls -t \"$d\"/twr/runner/builds/*/twr 2>/dev/null | head -n 1); \
+         exec \"$b\" runner --stdio {} --hub-key {} --stop",
         twr_core::paths::sh_word(&format!("{id}/twr")),
         twr_core::paths::sh_word(&format!("--box={name}")),
         twr_core::paths::sh_word(hub_key)

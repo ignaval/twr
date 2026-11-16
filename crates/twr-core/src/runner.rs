@@ -161,6 +161,13 @@ pub const PROTOCOL_VERSION: u32 = 8;
 /// a daemon at once, its runtimes recorded as stopped for the upgrade).
 pub const DRAINABLE_PROTOCOLS: &[u32] = &[7, 6];
 
+/// [`RunnerMsg::Exited`] `reason` of a runtime its runner stopped because the runner itself
+/// was stopping (`twr runner stop`, SIGTERM or SIGINT, a box daemon's `stop` request, a
+/// service or the machine shutting down): the runtime ended cleanly with its runner, it did
+/// not crash. The hub records `thread.stopped` with `ext.twr.reason`
+/// [`crate::event::BOX_STOPPED_REASON`] for it.
+pub const EXIT_RUNNER_STOPPED: &str = "runner_stopped";
+
 /// Whether the hub serves a runner of protocol `p` drain-only ([`DRAINABLE_PROTOCOLS`]).
 pub fn drainable(p: u32) -> bool {
     DRAINABLE_PROTOCOLS.contains(&p)
@@ -518,7 +525,215 @@ pub struct Inventory {
     /// when that says to); absent from an older runner, and ignored by an older hub.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spool: Option<SpoolStamp>,
+    /// What the runner can do for loops ([`LoopsSupport`]): the loop ops it takes and where it
+    /// keeps loop folders. Absent from an older runner (the hub then runs no loop on its box,
+    /// saying to update it), and ignored by an older hub. Additive within protocol 8.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loops: Option<LoopsSupport>,
 }
+
+/// The loop ops ([`Op::LoopGit`], [`Op::LoopFiles`], [`Op::LoopRun`], [`Op::LoopRunWait`],
+/// [`Op::LoopRunCancel`], [`Op::LoopForget`]) a runner takes, as [`Inventory::loops`] says:
+/// the hub sends them only to a runner whose inventory names this version or a later one.
+pub const LOOPS_VERSION: u32 = 1;
+
+/// What a runner can do for loops ([`Inventory::loops`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopsSupport {
+    /// The loop ops' version it takes ([`LOOPS_VERSION`]).
+    pub version: u32,
+    /// Where it keeps loop folders (`<runner data>/loops`): loop `<id>`'s is `<dir>/<id>`.
+    pub dir: PathBuf,
+}
+
+/// Whether `id` can name a loop on a box ([`Op::LoopFiles`] `loop_id`, a folder under
+/// [`LoopsSupport::dir`]): 1 to 64 ASCII letters, digits, `-` or `_` (a hub's are ULIDs).
+pub fn valid_loop_id(id: &str) -> bool {
+    valid_run_id(id)
+}
+
+/// Whether `name` can name a file of a loop's folder on a box ([`LoopFile::name`]): 1 to 128
+/// ASCII letters, digits, `.`, `-` or `_`, not starting with `.` (no path, no hidden file).
+pub fn valid_loop_file(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// The most bytes of file data one [`Op::LoopFiles`] carries (before base64): its frame stays
+/// well below [`MAX_FRAME_BYTES`].
+pub const LOOP_FILES_MAX: usize = 10 << 20;
+
+/// One file of a loop's folder on a box ([`Op::LoopFiles`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopFile {
+    /// Its name in the folder ([`valid_loop_file`]).
+    pub name: String,
+    /// The digest of its content ([`crate::blob::blob_ref`]).
+    pub digest: String,
+    /// Its content (base64, [`crate::b64`]): written when given; without, the box only says
+    /// whether it has the file with this digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+/// A file a loop op writes into a loop's folder on the box ([`LoopGitQuery::Diff`] `save`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopFileName {
+    /// The loop ([`valid_loop_id`]).
+    pub loop_id: String,
+    /// The file ([`valid_loop_file`]).
+    pub name: String,
+}
+
+/// A git read of a loop's thread on the box ([`Op::LoopGit`]); each runs the box's own
+/// `twr_runner::loops::git`, as the hub's own box does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "query", rename_all = "snake_case")]
+pub enum LoopGitQuery {
+    /// What a review loop's scope covers (`scope`: the request's, else the default rule's).
+    Scope {
+        /// The thread's working directory.
+        dir: PathBuf,
+        /// The thread's name (for messages).
+        name: String,
+        /// The ref its work merges back into.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_ref: Option<String>,
+        /// The scope asked for.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<crate::loops::settings::Scope>,
+    },
+    /// An implementation loop's baseline: `HEAD`, the worktree's patch, its paths' digests.
+    Baseline {
+        /// The thread's working directory.
+        dir: PathBuf,
+        /// The thread's name (for messages).
+        name: String,
+    },
+    /// A round's diff of `repo` from `base`, leaving out the `baseline` paths the loop has not
+    /// touched since; written to `save` in the loop's folder when given.
+    Diff {
+        /// The repository.
+        repo: PathBuf,
+        /// The loop's base commit.
+        base: String,
+        /// The baseline's paths with their digests (none for a review loop).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        baseline: BTreeMap<String, Option<String>>,
+        /// Where the box keeps the patch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        save: Option<LoopFileName>,
+        /// Answer its digest and size only, not the patch.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        digest_only: bool,
+    },
+    /// A commit check's read of `repo` (`twr_core::loops::contract::RepoAfter`).
+    After {
+        /// The repository.
+        repo: PathBuf,
+        /// `HEAD` the commit is measured from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        /// The baseline's paths with their digests.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        baseline: BTreeMap<String, Option<String>>,
+        /// The loop left work there to commit.
+        #[serde(default)]
+        work: bool,
+    },
+}
+
+/// What a review run on a box runs ([`Op::LoopRun`]): the box resolves the reviewer's CLI
+/// itself, and runs it on its own login. Nothing in it is a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopRunSpec {
+    /// The reviewer's runtime (`codex`, `claude-code`, `grok-build`, or an ACP preset's name).
+    pub runtime: String,
+    /// The model.
+    pub model: String,
+    /// The effort.
+    pub effort: String,
+    /// The thread's working directory on the box.
+    pub cwd: PathBuf,
+    /// The stem of the run's files in the loop's folder (`round-m3`, `audit-s2`): its prompt
+    /// is `<stem>.prompt.md` there, its answer `<stem>.answer.json`, its log `<stem>.log`.
+    pub stem: String,
+    /// Its `TWR_AGENT` marker.
+    pub marker: String,
+    /// The round's timeout, in seconds.
+    pub timeout_secs: u64,
+    /// An ACP preset's agent, sent as plain data from the hub's config (as a thread on the
+    /// preset gets it): its argv, read-only mode and whether a round's effort is passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp: Option<LoopAcp>,
+}
+
+/// An ACP reviewer's agent ([`LoopRunSpec::acp`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopAcp {
+    /// The preset's name.
+    pub preset: String,
+    /// The agent's argv.
+    pub argv: Vec<String>,
+    /// Its read-only mode.
+    pub mode: String,
+    /// Whether a round's effort is passed.
+    pub efforts: bool,
+}
+
+/// How a review run on a box stands ([`Op::LoopRun`], [`Op::LoopRunWait`],
+/// [`Op::LoopRunCancel`]).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoopRunStatus {
+    /// The run.
+    pub run: String,
+    /// The box knows no such run (never started, or forgotten: its runner restarted).
+    pub unknown: bool,
+    /// It still runs.
+    pub running: bool,
+    /// How it ended, once it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended: Option<LoopRunEnd>,
+}
+
+/// How a review run on a box ended ([`LoopRunStatus::ended`]). The hub reads the answer
+/// itself (`twr_core::loops::contract::parse_findings`), as it reads its own box's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "how", rename_all = "snake_case")]
+pub enum LoopRunEnd {
+    /// It answered: the answer file's text, and what it spent when its CLI said.
+    Answered {
+        /// The answer file (at most `twr_core::loops::contract::MAX_ANSWER_BYTES`).
+        answer: String,
+        /// What it spent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<crate::event::Usage>,
+    },
+    /// A failed run: why.
+    Failed {
+        /// Why.
+        reason: String,
+    },
+    /// Cancelled: why.
+    Cancelled {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// The longest a [`Op::LoopRunWait`] waits, in milliseconds: well below the hub's request
+/// timeout.
+pub const LOOP_WAIT_MAX_MS: u64 = 30_000;
 
 /// What a runner's spool was written under ([`Inventory::spool`]): the box generation of the
 /// last welcome it took ([`HubMsg::Welcome`] `generation`).
@@ -630,6 +845,67 @@ pub struct AgentInfo {
     /// status` took longer than 10s").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Codex on a Linux box: whether its read-only sandbox starts there ([`SandboxCheck`]).
+    /// `None` for the other agents, on another OS, or from a box whose twr does not check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxCheck>,
+}
+
+/// Whether Codex's read-only sandbox starts on a Linux box, as the agent probe found it
+/// (`twr_adapters::agents`: `codex sandbox -c sandbox_mode="read-only" -- true`, Codex's own
+/// sandbox around `true`). Codex runs every shell command there under bubblewrap, which needs
+/// unprivileged user namespaces; where it can't start, each command fails before it runs, and
+/// a Codex reviewer reads no file.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SandboxCheck {
+    /// What the probe found.
+    pub state: SandboxState,
+    /// A `bwrap` is on the `PATH` Codex gets (Codex prefers it to its own).
+    pub system_bwrap: bool,
+    /// Codex's own `bwrap` is next to its executable (`codex-resources/bwrap`, as its npm
+    /// package and `codex-package` archive ship it; the bare release binary has none).
+    pub bundled_bwrap: bool,
+    /// The line of the sandbox's own error, when it failed (`bwrap: ...`, `bubblewrap is
+    /// unavailable: ...`): printable, short, and only such a line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub said: Option<String>,
+}
+
+/// What [`SandboxCheck`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxState {
+    /// The sandbox started (`true` ran in it).
+    Works,
+    /// Codex found no `bwrap`: none on the `PATH` and none next to its executable.
+    NoBwrap,
+    /// The kernel restricts unprivileged user namespaces with AppArmor (Ubuntu 24.04 and
+    /// later) and the `bwrap` Codex ran has no profile for them (Codex's own).
+    Apparmor,
+    /// No `bwrap` can make a namespace here (`No permissions to create a new namespace`): a
+    /// rootless container, or a kernel that allows none.
+    NoNamespaces,
+    /// It failed otherwise ([`SandboxCheck::said`]).
+    Fails,
+    /// Not known: the probe could not run it, or it said nothing twr can read (a Codex without
+    /// `codex sandbox`). Also any value a newer box sends that this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl SandboxState {
+    /// Whether a Codex review run on the box would read no file (its sandbox can't start).
+    pub fn blocks_review(self) -> bool {
+        matches!(
+            self,
+            SandboxState::NoBwrap
+                | SandboxState::Apparmor
+                | SandboxState::NoNamespaces
+                | SandboxState::Fails
+        )
+    }
 }
 
 /// What `twr runner --agents` prints (one JSON object): the box's agents as its runner would
@@ -717,6 +993,12 @@ pub enum RunnerMsg {
         /// When the runner recorded the exit (Unix milliseconds; see [`RunnerMsg::Event`]).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at_ms: Option<u64>,
+        /// Why the runtime ended, when the runner knows it was not the runtime's own doing:
+        /// [`EXIT_RUNNER_STOPPED`] (the runner was stopping and stopped it). Absent from older
+        /// runners, and for every other exit (the hub's stop, the runtime's own end, a crash).
+        /// Additive: a hub that does not know it reads the exit as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Sent once per connection, after the replay of the spool: every frame spooled before
     /// the welcome has been sent. The hub can reconcile sessions from here on.
@@ -835,6 +1117,12 @@ pub mod hub_errors {
 /// | `disk_usage` | [`crate::git::DiskReading`] |
 /// | `agents` | `[`[`AgentInfo`]`]` |
 /// | `upload` | attachment ID, verified offset/prefix SHA-256, committed path when ready |
+/// | `loop_git` | `twr_runner::loops` git answer of the query |
+/// | `loop_files` | `{dir, missing: [name], read: [{name, data, bytes, truncated}]}` |
+/// | `loop_run`, `loop_run_wait`, `loop_run_cancel` | [`LoopRunStatus`] |
+/// | `loop_forget` | `null` |
+///
+/// The `loop_*` ops go only to a runner whose [`Inventory::loops`] names them.
 ///
 /// `git_common_dir`, `worktree_trash`, `branch_only_commits`, `worktree_inventory` and the
 /// `trash_*` ops came with protocol 3 ([`PROTOCOL_VERSION`]): a runner from before them is refused at its hello, so it is never
@@ -1052,6 +1340,60 @@ pub enum Op {
         #[serde(default)]
         refresh: bool,
     },
+    /// A git read of a loop's thread ([`LoopGitQuery`]; [`Inventory::loops`] version 1).
+    LoopGit {
+        /// What to read.
+        query: LoopGitQuery,
+    },
+    /// Writes files into loop `loop_id`'s folder on the box (made private when missing), and
+    /// says which of the others it lacks with that digest; then reads back `read` (each at
+    /// most `max` bytes, its end when longer).
+    LoopFiles {
+        /// The loop ([`valid_loop_id`]).
+        loop_id: String,
+        /// Files to write (with `data`) or check (without).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<LoopFile>,
+        /// Files to read back.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        read: Vec<String>,
+        /// The most bytes of each read file sent back (its end).
+        #[serde(default)]
+        max: u64,
+    },
+    /// Starts review run `run` of loop `loop_id` on the box, in the background; a run of that
+    /// id the box has already is reported instead (never started twice). A run of the same
+    /// loop and stem still running is ended first.
+    LoopRun {
+        /// The loop ([`valid_loop_id`]).
+        loop_id: String,
+        /// The run ([`valid_run_id`]).
+        run: String,
+        /// What it runs.
+        spec: LoopRunSpec,
+    },
+    /// Waits up to `wait_ms` (at most [`LOOP_WAIT_MAX_MS`]) for run `run` to end, then says how
+    /// it stands.
+    LoopRunWait {
+        /// The run.
+        run: String,
+        /// How long to wait.
+        #[serde(default)]
+        wait_ms: u64,
+    },
+    /// Ends run `run` (its process group killed) with `why`.
+    LoopRunCancel {
+        /// The run.
+        run: String,
+        /// Why.
+        #[serde(default)]
+        why: String,
+    },
+    /// Ends loop `loop_id`'s runs on the box and removes its folder there.
+    LoopForget {
+        /// The loop ([`valid_loop_id`]).
+        loop_id: String,
+    },
 }
 
 impl Op {
@@ -1133,6 +1475,12 @@ impl Op {
             Op::DiskUsage { .. } => "disk_usage",
             Op::Agents { .. } => "agents",
             Op::Upload { .. } => "upload",
+            Op::LoopGit { .. } => "loop_git",
+            Op::LoopFiles { .. } => "loop_files",
+            Op::LoopRun { .. } => "loop_run",
+            Op::LoopRunWait { .. } => "loop_run_wait",
+            Op::LoopRunCancel { .. } => "loop_run_cancel",
+            Op::LoopForget { .. } => "loop_forget",
         }
     }
 
@@ -1671,10 +2019,15 @@ mod tests {
                 login: AgentLogin::LoggedIn,
                 method: Some("claude.ai".into()),
                 note: None,
+                sandbox: None,
             }],
             launch: Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d".into()),
             spool: Some(SpoolStamp {
                 generation: Some("0123456789abcdef0123456789abcdef".into()),
+            }),
+            loops: Some(LoopsSupport {
+                version: LOOPS_VERSION,
+                dir: "/data/loops".into(),
             }),
         }));
         round_trip_runner(RunnerMsg::Event {
@@ -1717,6 +2070,16 @@ mod tests {
             stderr_tail: "boom".into(),
             run: Some("r1".into()),
             at_ms: None,
+            reason: None,
+        });
+        round_trip_runner(RunnerMsg::Exited {
+            thread: "t1".into(),
+            rseq: 5,
+            code: Some(0),
+            stderr_tail: String::new(),
+            run: Some("r1".into()),
+            at_ms: Some(1),
+            reason: Some(EXIT_RUNNER_STOPPED.into()),
         });
         round_trip_runner(RunnerMsg::Synced);
         round_trip_runner(RunnerMsg::CmdResult(CmdResult::new("c1", Ok(json!(true)))));

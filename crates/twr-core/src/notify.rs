@@ -262,6 +262,10 @@ impl Policy {
                 }
                 let event = if is_confirm_card(&ev.thread, &p.ext) {
                     NotifyEvent::Confirm
+                } else if item.loop_setup {
+                    // A loop's setup card needs the user as a question does (its reason only
+                    // keeps it from blocking its thread).
+                    NotifyEvent::Question
                 } else {
                     match p.reason {
                         AttentionReason::Permission => NotifyEvent::Permission,
@@ -752,6 +756,36 @@ mod tests {
         }
         f.push(retry);
         assert!(!still_due(&c, &f.registry, &f.attention));
+    }
+
+    /// A loop's setup card (reason `review`, so it blocks nothing) needs the user as a
+    /// question does, also where reviews are not notified; and the stack orders it with the
+    /// questions, ahead of an older error.
+    #[test]
+    fn a_loop_setup_card_needs_the_user() {
+        let mut f = Feed::new(&[NotifyEvent::Question]);
+        let mut api = ThreadScript::new("t1");
+        f.push(api.created("api"));
+        let err = api.raise("e1", AttentionReason::Error);
+        let mut card = api.raise("s1", AttentionReason::Review);
+        card.source = Source::Hub;
+        if let EventBody::AttentionRaised(p) = &mut card.body {
+            p.ext = serde_json::json!({"twr": {"loop_setup": {"first_run": true}}})
+                .as_object()
+                .cloned();
+        }
+        f.push(err);
+        let c = f.push(card).unwrap();
+        assert_eq!(c.event, NotifyEvent::Question);
+        let order: Vec<&str> = f
+            .attention
+            .ordered(&Default::default())
+            .into_iter()
+            .map(|i| i.attn_id.as_str())
+            .collect();
+        assert_eq!(order, ["s1", "e1"]);
+        assert!(f.attention.get("s1").unwrap().loop_setup);
+        assert!(!f.registry.get("t1").unwrap().is_blocked());
     }
 
     #[test]

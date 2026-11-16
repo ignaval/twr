@@ -18,6 +18,11 @@
 //! - [`gone`]: noticing that the twr home a long-lived process serves is gone, and ending.
 //! - [`relay`]: what the hub's `ssh` runs on an SSH box (`twr runner --stdio`): starts the
 //!   daemon when needed, then relays bytes between ssh and the daemon's socket.
+//! - [`loops`]: what a loop does on the box its thread runs on (git reads, the box's copy of
+//!   the loop folder, review runs), shared with the hub's own box (`Op::LoopGit` and the other
+//!   `loop_*` ops).
+//! - [`one_shot`]: what one-shot agent CLI calls share (a process group of their own, a
+//!   scrubbed environment).
 //! - [`repos`]: a box's side of `twr box project`: finding a project's repository on the box
 //!   (`twr runner --find-repo`) and cloning one there in the user's terminal (`--clone-repo`).
 //!
@@ -29,7 +34,9 @@ pub mod daemon;
 pub mod gone;
 pub mod lbox;
 pub mod local;
+pub mod loops;
 pub mod managed;
+pub mod one_shot;
 pub mod reap;
 pub mod relay;
 pub mod repos;

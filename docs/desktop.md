@@ -71,6 +71,9 @@ only once its options have been on screen for 600 ms: from when the card appears
 into view or the window is shown again, and from zero for a request raised again. Until then
 they show dimmed and a click or key does nothing, so the second click of a double click, or a
 key pressed as one card replaces another, can't answer the request that slid into place.
+In a conversation, its requests take at most about a third of its height and scroll in their
+own area, so the composer stays in view; while a request goes on below that area's edge
+(its buttons, in a short window), the edge fades out, and Tab brings each button into view.
 After an answer is accepted the card shows **Sent** and its buttons stay disabled until it
 goes away. Answers need a live connection to the hub. Orchestrator messages use `say` with
 the displayed control position, matching the TUI's relay semantics.
@@ -88,6 +91,7 @@ as code with a copy button instead of a link that does nothing.
 | New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
 | Stop, park/resume, compact, trim, delete | Inspector actions; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
+| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Send as implementation loop, the Review loop button on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |
 | Attach, PTY fallback, arbitrary shell | Embedded xterm.js terminals using the matching real CLI or login shell |
 | Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
@@ -135,8 +139,154 @@ the sidebar; Ctrl/Cmd-G toggles the grid. The focus filter is Cmd-Shift-F on mac
 and Ctrl-Shift-F on Linux, preserving normal text-editing Control keys. Narrow windows expose Chat / Needs you / Threads / More;
 all manager pages remain accessible through More. In short windows, expanding a terminal
 temporarily gives it the main area. Dark is the default. Light and System are available in Appearance; System follows
-the selected Omarchy theme on Linux. Native menus and window backgrounds follow
-the client preference, which is restored on the next launch.
+the selected Omarchy theme on Linux. In every theme, every control's edge and state reads
+at 3:1 against what is beside it: the edges of fields, search boxes, the message field,
+checkboxes and switches; a slider's track and thumb; a checkbox's check; the selected
+segment, tab, thread card and list item; a pressed toggle; and the focus ring. The app draws
+checkboxes, switches and sliders itself for this, the same in every engine. Lines that only
+separate or frame content (dividers, card and dialog outlines) stay light. On Omarchy the app
+reads the theme's `colors.toml` (its `background`, `foreground`, `accent`, `selection`,
+`red`, `yellow` and `mode`) from `~/.local/state/omarchy/current/theme`, where Omarchy 4
+keeps it, or from `~/.config/omarchy/current/theme` on an older Omarchy, and derives every
+colour it draws from them. It checks the file every 5 seconds and follows a theme switch
+without a restart; the moment in a switch when `omarchy-theme-set` has removed the old theme
+and not yet moved the new one in is not taken for "no theme". Text in every colour reads at
+4.5:1 on every background it sits on, and the controls at 3:1 as above: a colour that
+already does is used exactly as the theme gives it, and one that does not keeps its hue and
+moves its lightness only as far as it takes. Thread names in their own colour get an ink
+for the theme's surfaces the same way. A theme without a valid `background` and
+`foreground` leaves the app's own colours in place. Disabled controls are dimmed below
+these ratios, which WCAG allows for inactive controls. Native menus and window backgrounds follow
+the client preference, which is restored on the next launch. On Linux the menu bar is the
+exception: Electron draws it from the GTK theme the app started with, whatever the
+preference or the Omarchy theme, so under the default GTK theme it stays light over a dark
+theme.
+
+The message field grows with what you write, wrapped lines included, at every text size,
+up to 240 px or 40% of the window, then scrolls inside. In a window with less room than
+that (a short one at a large text size, or with a notice above the conversation) it stops
+where the composer still fits, so Send, the microphone and Upload stay in view. It shrinks
+again when the text is deleted or sent.
+
+### Loops
+
+A review loop has a reviewer model check a thread's changes round by round while the thread
+fixes what holds up. An implementation loop gives a thread a task: it plans it, implements it,
+the same review runs on its work, and the loop commits it at the end ([the
+design](design/loops.md)). The app starts and follows both kinds in threads on the hub's own
+machine.
+
+- **Send as implementation loop.** When you talk to a thread, Send has a caret (a `↻`
+  button beside Send on a phone) with **Send as implementation loop**: what you wrote is the
+  loop's task. Sent with nothing written, it asks first, since the task is then what your
+  conversation with the thread already settled. It needs a live connection, like every loop
+  action: without one, or on a read-only device, the choice says why and nothing is saved
+  for later.
+- **Start one.** Select a thread: its inspector has a **Loops** section with **Review
+  loop** and **Implementation loop…** (which asks for the task, empty meaning what the
+  conversation settled) and, under them, the settings a loop would run on (profile,
+  implementer, reviewer, and whether they are this project's) or `first run: you will be
+  asked to choose models`, with **Change…**. When a thread's turn ends with changes in its worktree (files not committed, or
+  commits ahead of its base) and no loop has reviewed them, its sidebar card, its
+  conversation and the orchestrator's **Latest thread reports** also show a **Review loop**
+  button (the grid's tiles do too in a narrow window such as a phone's, where the grid is
+  the thread list).
+  `[loops] offer_review = false` turns that button off, and it hides while the thread's setup
+  card is open and on a thread someone stopped (send it a message first; a thread stopped
+  only because the hub shut down keeps the button). `/review` in the composer does the same for the thread you talk to or have
+  selected, and takes the CLI's options (`--setup`, `--scope`, `--profile`, `--reviewer`,
+  `--implementer`, `--workers`, `--commit`). `/implement` starts an implementation loop with
+  the same rule as the terminal UI: in a thread's conversation every word is the task;
+  elsewhere a first word that names a thread is the thread, else the selected one, and the
+  rest is the task (`--setup`, `--profile`, `--reviewer`, `--implementer`, `--workers`,
+  `--commit`, `--plan-check`; after `--` every word is the task's). `/loop` only controls a
+  running loop and opens the settings; `/loop implement` says to use `/implement` or
+  `/review`.
+- **A new thread with a loop.** The New thread form has a **First prompt** and, under it, a
+  **Run as an implementation loop** switch with the settings line and **Change…**. On, the
+  first prompt is the loop's task, and required (**Show the loop's setup card first** asks
+  for the card even with saved settings); off, the first prompt is sent to the thread once
+  it exists. `/new <project> --implement <task>` opens the form with the switch on.
+- **The setup card.** The first loop of either kind, a loop you ask to check
+  (`/review --setup`, `/implement --setup`), or one whose saved settings no longer hold,
+  raises a setup card instead of starting. It shows in Needs you, in the thread's
+  conversation and in its inspector, ordered with questions, titled for its kind
+  (**Implementation loop setup**). It lists what the loop would run on (an implementation
+  loop's card adds its plan check and commit rows; there is no Workers row when the
+  implementer's runtime runs no subagents), the hub's warnings, and anything to change
+  first. An implementation loop's card holds its task, whole, in a box that scrolls
+  inside the card. **Start and save** starts the loop and saves its settings; it waits while
+  the card lists something to change first. **Change…** opens the settings editor on the
+  card; saving there raises the card again with the new values. A card that holds a task has
+  **Run without a loop**, which sends the task to the thread as an ordinary message and
+  saves nothing. **Cancel** starts and saves nothing (a held task is dropped). Every answer
+  applies to the revision shown, under the same 600 ms rule as other requests. The card has
+  no Dismiss. On a phone it opens as a sheet.
+- **While it runs.** The thread's sidebar card (and in a narrow window its grid tile) shows the hub's loop badge and line
+  (`REVIEW LOOP high · ladder m3 · ledger 2`, `IMPLEMENT LOOP high · plan`, wrapping on a
+  narrow card rather than cut);
+  a click on it opens the inspector at its Loops section. There you see every phase with
+  the current one marked (and a plan check, sweep or verification the loop passed over as
+  skipped), what it runs on and whose settings they are, each round's findings and
+  new-class count (the round whose review still runs reads `under review`; open a round for
+  its findings and the thread's verdicts; an implementation loop's plan check is round
+  `p1`), the ledger, and whether it waits on the thread, the review or you. A sweep the hub
+  audits (`sweep = "runs"`) lists its rules like rounds, each with what its audit found
+  (`2 findings`, `no place breaks it`, `auditing`, `waiting for a slot`, `not run: …`) and
+  the thread's verdict, open for the audit's findings; while they run the card reads
+  `auditing 3 of 5 rules` and the loop line `sweep · auditing 2/5`. An
+  implementation loop also shows its plan (revision, contract risk yes or no with the reason,
+  and where `plan.md` is), its implement turn's result and gates, and what it commits.
+  **Pause** or **Resume**, **Skip to verify** and **Stop** (after a confirmation) control
+  it, as do `/loop pause|resume|skip|stop`; Skip to verify waits for the ladder in an
+  implementation loop, which has built nothing to verify before it, and says so. A stuck
+  loop raises a card with **Resume** and **Stop**. A loop started from the app says what it
+  runs on (`api started a review loop: low · implementer … · reviewer … (saved
+  settings)`), and a screen reader hears a setup card, a stuck loop and a loop that ends
+  (`api's review loop ended: clean`; `api's implementation loop ended: clean; committed
+  abc1234`, `not committed: …`, or both when some repositories were committed and others
+  not), in any thread.
+  Once it ended, the inspector shows how, an implementation loop's commits (a short sha per
+  repository), then why any other repository was not committed, and what the last commit
+  check noted that is no problem (the thread wrote no `twr-commit` block, say) in quiet
+  text. **Open report** reads the loop's `report.md` through the hub and shows it in a
+  dialog (a sheet on a phone), with where the hub wrote it, small, and a copy button; a
+  report over 256 KiB ends with the hub's marker line, and a running loop's says it is not
+  written yet. A `read` device can open it. While the loop's turn is the thread's last, its
+  sidebar card and **Latest thread reports** show the same in a line (`IMPLEMENT LOOP
+  clean · committed abc1234`, `clean · committed abc1234 · not committed: …`).
+- **On a remote box.** A loop in a thread on a remote box runs as on the hub's own. Its
+  setup card checks what the box has and names it (`codex isn't installed on box devbox:
+  reviewing with claude-code · claude-opus-5-5 instead`), and the editor says `Runtimes as
+  found on box devbox`. The box runs every runtime on its own login, so a saved reviewer
+  account other than that brings the card back on the default account and says why (`box
+  devbox runs codex on its own login, not account work`). When the box goes away during a
+  review run, the loop line says `waiting on box devbox`, the inspector `waiting on box
+  devbox` and the round `m1 waits for box devbox`, and a screen reader hears it once; the
+  loop's controls still work. When the box is back the round runs again (`m1 under review
+  again`) and the loop goes on, and that is said once too. While a box is away nothing
+  offers to start a loop on its threads: the buttons wait and say `Box devbox is away: a
+  loop can start once it is back.`
+- **Settings.** **Change…** in the Loops section and `/loop settings` open the editor:
+  the four presets, the implementer (the thread's own, or a runtime, model and effort), its
+  workers where its runtime has subagents, the reviewer (runtime, model, and account where
+  it has several), the profile, an implementation loop's plan check and commits, what a
+  review loop commits, **Sweep** (the thread audits the rules, or a reviewer run per rule:
+  one reviewer call per rule, the hint under it says), and **Save for** (all projects
+  or this project). Only runtimes that are installed and logged in can be chosen; the
+  others show why not. The reviewer's list also has the ACP presets: one that names its
+  read-only mode reads `ex (acp, read-only mode)`, and one that doesn't is disabled with the
+  reason ([usage.md](usage.md#acp-reviewers)); the implementer's list has none. A line
+  under the reviewer's picker names every reviewer that can't be picked, with why (`Can't
+  review: bare (acp preset bare names no read-only mode)`), and an ACP preset picked says
+  the mode its read-only rests on and the efforts every round of the profile must use; a
+  screen reader hears both with the picker. A hub that does not check its agent CLIs (`TWR_AGENT_PROBE=off`)
+  can't say, so every runtime can be chosen, marked `not checked`. **Settings › Loops** shows the same editor, the projects with their
+  own settings (open or remove them) and **Reset all**.
+
+Starting, controlling, answering a setup card and saving settings need a live connection
+and, on a paired device, the `operate` scope: none of them goes to the outbox. A read-only
+device sees the chip, the progress and the report path, with the actions disabled.
 
 ## Tray, login and background mode
 
@@ -160,9 +310,9 @@ Settings › Application has four switches:
   GNOME and KDE start at login. AppImages are started through the image itself. twr
   only removes an autostart entry that it created.
 - **Show in menu bar / Show tray icon.**
-- **Notify me of new requests** (on by default). A new permission or question, or a
-  confirm or delete card, in any workspace posts a system notification while twr's window
-  isn't in front: hidden in background mode, minimized, or behind another app. It names the
+- **Notify me of new requests** (on by default). A new permission or question, a confirm
+  or delete card, or a loop's setup card or stuck loop, in any workspace posts a system
+  notification while twr's window isn't in front: hidden in background mode, minimized, or behind another app. It names the
   thread and the workspace (`api · client-x`, *Asks for permission*) and, for the hub's
   cards, what kind of card it is (`twr · client-x`, *Asks you to confirm what the
   orchestrator proposed*, or *Asks you to confirm a deletion*), never what is asked or which
@@ -176,8 +326,13 @@ Settings › Application has four switches:
   macOS asks whether twr may notify the first time it does (System Settings ›
   Notifications changes the answer later); a build macOS won't let notify, such as some
   ad hoc signed ones, shows nothing. The diagnostics log records the first notification
-  posted, a system without notification support and notifications that failed. How this relates to the hub's `[notify]`
-  command and the TUI's notifications: [notifications.md](notifications.md#the-desktop-app).
+  posted, a system without notification support and notifications that failed. A loop that
+  ends notifies once too, with how it ended (`api · client-x`, *Review loop clean after 6
+  rounds*; an implementation loop adds *committed abc1234*, *not committed: …*, or both), under the
+  same rules: not when it ended while you looked or before twr connected, and more than three
+  at once as one (*4 loops ended*); it goes when clicked or when the window comes to the
+  front. How this relates to the hub's `[notify]` command and the TUI's notifications:
+  [notifications.md](notifications.md#the-desktop-app).
 - **Keep running when the window is closed.** Closing the window hides it instead,
   so terminals, the hub connection and the badge stay live. A login launch then starts
   hidden on Linux. macOS 13 and later do not always tell an app it was opened at login, so
@@ -189,11 +344,12 @@ Settings › Application has four switches:
 
 | Install | How it updates |
 |---|---|
-| macOS, Developer ID signed | Downloads in the background; **Restart to update**, or it installs when you quit |
-| macOS, ad hoc review build | Notifies and links the new disk image (macOS only swaps in signed updates) |
+| macOS, Developer ID signed (also from Homebrew's cask) | Downloads in the background; **Restart to update**, or it installs when you quit |
+| macOS, ad hoc review build | Notifies and links the new disk image (macOS only swaps in signed updates); or run `install.sh --desktop` again |
 | AppImage | Downloads in the background and replaces the AppImage file |
-| Debian/Ubuntu package | Notifies with the `sudo apt install ./…deb` command and a download link |
-| Arch package, or AUR (`twr-desktop-bin`) once published | Notifies; update with `pacman -U` and the new package, or your AUR helper (`yay -Syu twr-desktop-bin`) |
+| Debian/Ubuntu package | Notifies with the `sudo apt install ./…deb` command and a download link; or run `install.sh --desktop` again |
+| Arch package | Notifies; update with `pacman -U` and the new package, or run `install.sh --desktop` again |
+| AUR (`twr-desktop-bin`) | Your AUR helper updates it with the system (`yay -Syu`, Omarchy's **Update**); the app also notifies |
 
 The app checks the latest GitHub release 45 seconds after launch and then every six
 hours. Turn this off, or check by hand, in Settings › Updates or Help › Check for Updates.
@@ -291,9 +447,40 @@ Integration launches **real Electron and a real temporary hub**, with twr's dete
 fake adapter and a disposable login executable. It covers request revisions, streaming,
 first-turn streaming, small-model disclosure and suggestion acceptance,
 terminal input and attach, terminal keys/reload, interactive account login, config conflicts,
-memory, renderer boundaries, narrow navigation, and the independent hub lifetime. Debug
+memory, renderer boundaries, narrow navigation, and the independent hub lifetime. Its second
+script, `scripts/loops-integration.mjs`, drives a review loop through the app with a fake
+reviewer: the Review loop offer and `[loops] offer_review`, the setup card and its 600 ms
+rule, the editor, the chip, the inspector's progress and controls, the loop's end, a second
+run from `/review`, `/loop`, a stuck loop, the notifications, Settings › Loops, and the
+keyboard and screen-reader text of each. Then an implementation loop: Send as
+implementation loop with no saved settings raises the card holding the task, **Run without
+a loop** sends it as a message, **Start and save** runs the plan, the implement turn, the
+review rounds, the report and the commit (the script commits for the fake thread), its end
+notifies, and the New thread form's switch starts one that ends `not committed`. Then loops
+on a remote box: a dial-in `twr runner` of box `lab` on the same machine, with its own fake
+Codex and Claude Code, which its agent probe finds. The setup card names the box when its
+reviewer is not installed there, and comes back on the default account for a saved reviewer
+account; the runner stopped during a review run makes the loop wait on its box, said once,
+with its controls working and its wait shown again after a reload and a reconnect; started
+again, the loop goes on from the same round and ends; an implementation loop on the box
+commits; with the box away no start is offered. Then an ACP preset as the reviewer (the
+hub tests' scripted ACP agent, beside a preset with no review mode and one whose mode is
+`default`): the pickers of the setup card, Settings › Loops and a project's editor, the
+card's warning, a loop on it to its end, and the preset removed from the config. With `TWR_LOOPS_SHOTS=<dir>` it also saves each
+step in both themes, at the default size and the minimum width, with its accessibility tree.
+`TWR_LOOPS_WINDOW=<width>x<height>` runs it in a window of that size, such as a CI runner's
+`1024x674`, where the requests in the conversation scroll in their own area and the script
+scrolls to their buttons as a person would. It runs against the debug build only. Debug
 fixtures use the existing debug-only user token inside their own private `TWR_HOME`; release
 builds ignore that token. No real account or existing workspace is used.
+
+The hub the app starts for the main suite's second workspace (`side`) doesn't take that
+token: like a real hub, it tells the app from an agent by its processes
+([security-model.md](security-model.md#agents)). So the suite first asks its own hub,
+without the token, whether it counts the suite's processes as yours, and stops with the hub's
+reason when it doesn't. On macOS 27 that happens when the suite runs as a background job of
+a shell that has already exited (`( npm run test:integration ) &`). Run it from a shell that
+stays open until it ends.
 
 `npm run test:qa:mac` exercises the packaged app through LaunchServices. It adds manager
 navigation, slash-command target/flag checks, queue take-back, jobs and cancellation, memory
@@ -342,12 +529,29 @@ so a system Electron upgrade cannot change the app's ABI. The Arch package reuse
 the portable producer's native terminal module without recompiling it. Its launcher uses the stable
 `tools.twr.desktop` class for Hyprland rules. Chromium's sandbox stays enabled.
 
-The AUR package `twr-desktop-bin` is not on the AUR yet: each release builds and checks it,
-and pushes it once the repository has the AUR key (`AUR_SSH_PRIVATE_KEY`, below). It installs
-the same files from the release's
+The AUR package `twr-desktop-bin` installs the same files from the release's
 `twr-desktop-<version>-linux-x64.tar.gz`. `node scripts/aur.mjs <archive>` writes its
 `PKGBUILD` and `.SRCINFO`. CI builds that package from the identical archive, checks
-`.SRCINFO` against `makepkg --printsrcinfo`, and installs it over the release package.
+`.SRCINFO` against `makepkg --printsrcinfo`, and installs it over the release package; each
+release pushes it to the AUR when the release environment has the AUR key
+(`AUR_SSH_PRIVATE_KEY`, below). It is not on the AUR yet. Its dependencies are what namcap
+finds the bundle's ELF files link (with `libgcc` and `libstdc++`, not the `gcc-libs` group),
+plus `git`, which twr runs, `libsecret`, which Chromium loads for the keyring, and
+`hicolor-icon-theme`, whose folder holds the icon. namcap's remaining reports are expected:
+ELF files under `/opt` (the self-contained bundle), the setuid `chrome-sandbox`, and `git`
+and `libsecret` as possibly unneeded. The packaged app leaves out node-pty's Windows-only
+sources (`deps/`, `src/` and the `win32` prebuilds), which namcap would otherwise read as a
+dependency on Python.
+
+`release/omarchy-pkgs/` holds a recipe for the same archive in Omarchy's own package
+repository (omacom/omarchy-pkgs), with the steps to submit it; it has not been submitted.
+
+`install.sh --desktop` installs the release's Arch package, `.deb`, AppImage or Mac app, checked
+against the signed `desktop-sha256sums.txt` ([install.md](install.md#desktop-app)). The Homebrew
+tap `ignaval/homebrew-twr` has a formula for the CLI (`twr`, the release archives) and a cask for
+the app (`twr`, the disk image), written for each release by `release/homebrew/render.py` from
+the release's checksums; the cask needs a Developer ID signed, notarized app, because Homebrew
+quarantines what a cask installs.
 
 ### Releases
 
@@ -361,10 +565,20 @@ secrets, which pull-request runs can read):
   `APPLE_TEAM_ID`: a Developer ID certificate (base64 `.p12`) and notarization
   credentials. With them, the Mac app is signed, notarized and stapled, and
   `latest-mac.yml` is published so Macs update themselves. Without them, the release
-  carries the ad hoc review disk image only.
+  carries the ad hoc review disk image only. Notarization usually takes minutes, but a
+  new team's first submissions can wait hours at Apple, so the release's Mac job allows
+  five.
 - `AUR_SSH_PRIVATE_KEY`: the key registered on the
   `twr-desktop-bin` AUR account. With it, the release pushes the new PKGBUILD to the AUR.
   Otherwise, push the `twr-desktop-aur` workflow artifact by hand.
+- `HOMEBREW_TAP_DEPLOY_KEY`: a deploy key with write access to `ignaval/homebrew-twr`. With
+  it, the release pushes `Formula/twr.rb` and, when the Mac app is Developer ID signed (the
+  release has `latest-mac.yml`), `Casks/twr.rb`, after checking the signatures of the
+  checksums they come from. Otherwise they are in the `twr-homebrew` workflow artifact.
+
+`TWR_RELEASE_SIGNING_KEY_P256`, which signs `sha256sums.txt.p256.sig`
+([development.md](development.md)), also signs `desktop-sha256sums.txt.p256.sig`, the signature
+`install.sh --desktop` checks on a Mac.
 
 macOS packaging supports normal electron-builder signing/notarization credentials when
 provided by the release environment. After packaging on macOS, `npm run test:packaged:mac` launches the actual app through
@@ -377,6 +591,18 @@ Review builds select the ad hoc identity in pull-request CI. Before uploading th
 installer, CI verifies the complete app signature and checks that it is ad hoc,
 with no signing team. These signatures require no Apple account; Developer ID
 signing and notarization remain the distribution path for public releases.
+
+With the hardened runtime, electron-builder signs every Mach-O file in the bundle: the app with
+`packaging/entitlements.mac.plist` (JIT and the microphone), and the Electron helpers, the
+three engines in `Resources/bin` (`twr`, `twr-desktop-bridge`, `twr-mobile-gateway`) and
+node-pty's `pty.node` and `spawn-helper` with electron-builder's inherited entitlements (JIT,
+unsigned executable memory, no library validation), each with a secure timestamp. electron-builder
+notarizes and staples the app before it makes the disk image and the update zip, so both hold
+the stapled app. The packaged QA drives a copy of the app with the QA marker added: for a
+Developer ID build that copy is signed again ad hoc, without the hardened runtime, because
+macOS checks a notarized app's seal on its first launch even when it isn't quarantined. The
+copy's update policy is therefore the ad hoc one; the release app's own signature is checked
+by `codesign`, `spctl` and `stapler` in `desktop.yml`.
 
 
 ### Needs you across workspaces

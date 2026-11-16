@@ -555,6 +555,12 @@ jobs:
           \`twr-<target>.tar.gz\` below, check it against \`sha256sums.txt\`, and put \`twr\` on
           your PATH.
 
+          The desktop app (macOS on Apple silicon, x86_64 Linux), once its installers are attached:
+
+          \`\`\`sh
+          curl -fsSL https://twr.tools/install.sh | sh -s -- --desktop
+          \`\`\`
+
           ## Verify
 
           \`twr update\` checks \`sha256sums.txt.sig\`, the signature of the checksums, with
@@ -695,14 +701,49 @@ jobs:
             exit 1
           fi
 
+      # desktop-sha256sums.txt.p256.sig: the ECDSA P-256 signature of the desktop checksums
+      # (base64 of the DER signature), which `install.sh --desktop` checks where openssl can't
+      # check Ed25519 (macOS's LibreSSL), made and checked as the release job does for
+      # sha256sums.txt.p256.sig.
+      - name: Sign the desktop checksums with the P-256 key
+        shell: bash
+        env:
+          TWR_RELEASE_SIGNING_KEY_P256: ${{ secrets.TWR_RELEASE_SIGNING_KEY_P256 }}
+        run: |
+          pub=src/release/signing-key-p256.pub
+          if [ -z "$TWR_RELEASE_SIGNING_KEY_P256" ]; then
+            if [ -e "$pub" ]; then
+              echo "::error::$pub is committed, but the release environment has no TWR_RELEASE_SIGNING_KEY_P256 secret: install.sh --desktop would refuse this release where openssl can't check Ed25519"
+              exit 1
+            fi
+            echo "::notice::no P-256 release key yet: desktop-sha256sums.txt has no P-256 signature"
+            exit 0
+          fi
+          if [ ! -f "$pub" ]; then
+            echo "::error::TWR_RELEASE_SIGNING_KEY_P256 is set, but the tagged commit has no ${pub#src/}"
+            exit 1
+          fi
+          # In the directory the Ed25519 step made, which the cleanup step removes.
+          key="$TWR_SIGNING_DIR/key-p256.pem"
+          (umask 077 && set -C && printf '%s\n' "$TWR_RELEASE_SIGNING_KEY_P256" > "$key")
+          f=desktop/desktop-sha256sums.txt
+          openssl dgst -sha256 -sign "$key" -out "$RUNNER_TEMP/desktop-sha256sums.p256.sig.bin" "$f"
+          base64 -w0 "$RUNNER_TEMP/desktop-sha256sums.p256.sig.bin" > "$f.p256.sig"
+          if ! openssl dgst -sha256 -verify "$pub" -signature "$RUNNER_TEMP/desktop-sha256sums.p256.sig.bin" "$f"; then
+            echo "::error::the P-256 signature of $f does not verify with ${pub#src/}: TWR_RELEASE_SIGNING_KEY_P256 is not the key's private half"
+            exit 1
+          fi
+
       - name: Remove the signing key
         if: always()
         run: |
           # Only the directory the signing step made (empty when it didn't get that far).
           if [ -n "${TWR_SIGNING_DIR:-}" ] && [ -d "$TWR_SIGNING_DIR" ] && [ ! -L "$TWR_SIGNING_DIR" ]; then
-            if [ -f "$TWR_SIGNING_DIR/key.pem" ] && [ ! -L "$TWR_SIGNING_DIR/key.pem" ]; then
-              shred -u "$TWR_SIGNING_DIR/key.pem" || rm -f "$TWR_SIGNING_DIR/key.pem"
-            fi
+            for k in key.pem key-p256.pem; do
+              if [ -f "$TWR_SIGNING_DIR/$k" ] && [ ! -L "$TWR_SIGNING_DIR/$k" ]; then
+                shred -u "$TWR_SIGNING_DIR/$k" || rm -f "$TWR_SIGNING_DIR/$k"
+              fi
+            done
             rm -rf "$TWR_SIGNING_DIR"
           fi
 
@@ -750,6 +791,7 @@ jobs:
           test -f "$pkgbuild" && test -f "$srcinfo"
           grep -qx "pkgver=${TAG#v}" "$pkgbuild"
           keydir=$(mktemp -d "$RUNNER_TEMP/aur.XXXXXXXX")
+          trap 'rm -rf "$keydir"' EXIT
           (umask 077 && printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$keydir/key")
           # The AUR's published host key (https://wiki.archlinux.org/title/AUR_submission_guidelines).
           echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > "$keydir/known_hosts"
@@ -766,6 +808,89 @@ jobs:
             git commit -m "Update to ${TAG#v}"
             git push origin HEAD:master
           fi
-          rm -rf "$keydir"
       - if: env.HAS_AUR_KEY != 'true'
         run: echo "::notice::no AUR_SSH_PRIVATE_KEY; push the twr-desktop-aur artifact's PKGBUILD and .SRCINFO to the AUR by hand"
+
+  # Updates the Homebrew tap, ignaval/homebrew-twr: Formula/twr.rb (the CLI) and, once the Mac app
+  # is Developer ID signed and notarized, Casks/twr.rb (the desktop app), written by
+  # release/homebrew/render.py from the release's checksums after their signatures check out. It
+  # pushes only when the release environment has HOMEBREW_TAP_DEPLOY_KEY (a deploy key with write
+  # access to the tap repository alone); otherwise the files stay in the twr-homebrew artifact.
+  homebrew:
+    name: update the Homebrew tap
+    needs: [resolve, desktop-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    env:
+      HAS_TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY != '' }}
+    steps:
+      # The tagged commit, for the templates and the public key the checksums are checked against.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: src
+          persist-credentials: false
+      - name: Check that the checkout is the tagged commit
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          head=$(git -C src rev-parse HEAD)
+          if [ -z "$SHA" ] || [ "$head" != "$SHA" ]; then
+            echo "::error::checked out $head, but refs/tags/$TAG is ${SHA:-unresolved}"
+            exit 1
+          fi
+      - name: Download the release's checksums and check their signatures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir sums
+          gh release download "$TAG" -D sums -p sha256sums.txt -p sha256sums.txt.sig \
+            -p desktop-sha256sums.txt -p desktop-sha256sums.txt.sig
+          for f in sha256sums.txt desktop-sha256sums.txt; do
+            base64 -d "sums/$f.sig" > "$RUNNER_TEMP/$f.sig.bin"
+            if ! openssl pkeyutl -verify -rawin -pubin -inkey src/release/signing-key.pub \
+              -sigfile "$RUNNER_TEMP/$f.sig.bin" -in "sums/$f"; then
+              echo "::error::the signature of $f does not verify with release/signing-key.pub"
+              exit 1
+            fi
+          done
+      - name: Write the formula and the cask
+        run: |
+          python3 -I src/release/homebrew/render.py sums/sha256sums.txt sums/desktop-sha256sums.txt tap
+          for f in tap/Formula/twr.rb tap/Casks/twr.rb; do
+            if [ -f "$f" ]; then ruby -c "$f"; fi
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: twr-homebrew
+          path: tap/
+          if-no-files-found: error
+      - name: Push to the tap
+        if: env.HAS_TAP_KEY == 'true'
+        env:
+          HOMEBREW_TAP_DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          keydir=$(mktemp -d "$RUNNER_TEMP/tap.XXXXXXXX")
+          trap 'rm -rf "$keydir"' EXIT
+          (umask 077 && printf '%s\n' "$HOMEBREW_TAP_DEPLOY_KEY" > "$keydir/key")
+          # GitHub's published host key (https://api.github.com/meta, ssh_keys).
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$keydir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $keydir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$keydir/known_hosts -o StrictHostKeyChecking=yes"
+          git clone git@github.com:ignaval/homebrew-twr.git tap-repo
+          mkdir -p tap-repo/Formula tap-repo/Casks
+          cp tap/Formula/twr.rb tap-repo/Formula/
+          if [ -f tap/Casks/twr.rb ]; then cp tap/Casks/twr.rb tap-repo/Casks/; fi
+          cd tap-repo
+          git config user.name "twr release"
+          git config user.email "releases@twr.tools"
+          git add Formula Casks
+          if git diff --cached --quiet; then
+            echo "the tap already has $TAG"
+          else
+            git commit -m "twr ${TAG#v}"
+            git push origin HEAD
+          fi
+      - if: env.HAS_TAP_KEY != 'true'
+        run: echo "::notice::no HOMEBREW_TAP_DEPLOY_KEY; the formula and cask are in the twr-homebrew artifact"

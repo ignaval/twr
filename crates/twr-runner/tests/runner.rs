@@ -2246,31 +2246,38 @@ async fn an_unrelated_process_hiding_its_environment_does_not_keep_the_box_close
 
 /// The box's machine lock does not move with the data directory: it is keyed by the hub and
 /// the box alone, so a second runner of the box with another `--data-dir` (and so other
-/// default worktrees) is refused while the first is open.
+/// default worktrees) is refused while the first is open. (In a state directory of the test's
+/// own, as `twr runner` passes the user's: the library derives none itself.)
 #[test]
 fn a_second_runner_with_another_data_dir_is_refused() {
+    use twr_runner::client::machine_lock_in;
     init_logs();
     let dir = tempfile::tempdir().unwrap();
-    // A hub address of this test run only (the lock lives in the user's runtime directory).
-    let url = format!("ws://127.0.0.1:1/{}", new_nonce().unwrap());
-    let opts =
-        |d: &str| RunnerOptions::new(url.clone(), Secret::new(TOKEN), BOX, dir.path().join(d));
+    let state = dir.path().join("state");
+    let url = "ws://127.0.0.1:1/";
+    let opts = |d: &str| {
+        let mut o = RunnerOptions::new(url, Secret::new(TOKEN), BOX, dir.path().join(d));
+        o.machine_lock = Some(machine_lock_in(&state, url, BOX));
+        o
+    };
     let (a, b) = (opts("a").box_options(), opts("b").box_options());
     assert_ne!(a.spool_path, b.spool_path);
     assert_ne!(a.worktrees, b.worktrees);
     assert_eq!(a.machine_lock, b.machine_lock);
     let lock = a.machine_lock.clone().expect("a machine lock");
-    assert!(!lock.starts_with(dir.path()), "{}", lock.display());
-    // Another box, or another hub, is another key.
-    let other = RunnerOptions::new(url.clone(), Secret::new(TOKEN), "cpu", dir.path());
-    assert_ne!(other.box_options().machine_lock, a.machine_lock);
-    let elsewhere = RunnerOptions::new(
-        "ws://127.0.0.1:2/",
-        Secret::new(TOKEN),
-        BOX,
-        dir.path().join("a"),
+    assert!(
+        lock.starts_with(state.join("runner-locks")),
+        "{}",
+        lock.display()
     );
-    assert_ne!(elsewhere.box_options().machine_lock, a.machine_lock);
+    // Another box, or another hub, is another key; a spelling of the same URL is the same.
+    assert_ne!(machine_lock_in(&state, url, "cpu"), lock);
+    assert_ne!(machine_lock_in(&state, "ws://127.0.0.1:2/", BOX), lock);
+    assert_eq!(machine_lock_in(&state, "WS://127.0.0.1:1", BOX), lock);
+    // Without one set, a runner's options take no lock (nothing outside the test's
+    // directories).
+    let none = RunnerOptions::new(url, Secret::new(TOKEN), BOX, dir.path().join("c"));
+    assert_eq!(none.box_options().machine_lock, None);
     let first = LocalBox::open(with_fake(a)).unwrap();
     let e = LocalBox::open(with_fake(b.clone()))
         .unwrap_err()
@@ -2282,7 +2289,6 @@ fn a_second_runner_with_another_data_dir_is_refused() {
     assert!(e.contains(&lock.display().to_string()), "{e}");
     drop(first);
     drop(LocalBox::open(with_fake(b)).unwrap());
-    let _ = std::fs::remove_file(lock);
 }
 
 /// Everything any test here logs.

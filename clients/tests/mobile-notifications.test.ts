@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const sdk = vi.hoisted(() => ({
   listeners: new Map<string, Set<(value: any) => void>>(),
   register: vi.fn(),
@@ -47,6 +47,7 @@ import {
   notificationListeners,
   clearDeliveredNotifications,
   pushPreferenceKey,
+  remotePushBuilt,
 } from "../mobile/src/notifications";
 import type { RemoteHost } from "../mobile/src/transport";
 const emit = (value: string) => {
@@ -71,6 +72,9 @@ beforeEach(() => {
   sdk.permission.mockResolvedValue({ receive: "granted" });
   sdk.prompt.mockResolvedValue({ receive: "granted" });
   sdk.register.mockImplementation(async () => emit("initial-token"));
+});
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 describe("push token lifecycle", () => {
   it("disables push after an in-flight registration and leaves opt-in cleared", async () => {
@@ -182,6 +186,22 @@ describe("push token lifecycle", () => {
     expect(opened).toEqual([{ workspace: "default" }, { event: "test" }]);
     expect(sdk.clearPush).toHaveBeenCalledTimes(2);
     stop();
+  });
+  it("a store build never registers for remote push, even for a hub opted in before", async () => {
+    vi.stubEnv("VITE_TWR_REMOTE_PUSH", "0");
+    expect(remotePushBuilt()).toBe(false);
+    const remote = host();
+    localStorage.setItem(pushPreferenceKey("hub-a"), "true");
+    await refreshPush(remote, "hub-a");
+    await expect(enablePush(remote, "hub-a")).rejects.toThrow(
+      "This build of twr has no remote push.",
+    );
+    expect(remote.request).not.toHaveBeenCalled();
+    expect(sdk.permission).not.toHaveBeenCalled();
+    expect(sdk.register).not.toHaveBeenCalled();
+  });
+  it("a development build offers remote push", () => {
+    expect(remotePushBuilt()).toBe(true);
   });
   it("clears delivered notifications even when one platform refuses", async () => {
     sdk.clearPush.mockRejectedValueOnce(new Error("not implemented"));

@@ -87,7 +87,7 @@
 //! | `session/update` `agent_message_chunk` (text)        | `agent.text{delta}`; the run of chunks → `agent.text{final}` at the next boundary |
 //! | `session/update` `agent_thought_chunk`               | one `agent.thinking` per run (only with `thinking`) |
 //! | `session/update` `tool_call`                         | `agent.tool_call` (+ `agent.tool_result` if already completed/failed) |
-//! | `session/update` `tool_call_update` completed/failed | `agent.tool_result` (once per call)     |
+//! | `session/update` `tool_call_update` completed/failed | `agent.tool_result` (once per call); a call announced with no input (claude-agent-acp's) carries the input a later update gave as `ext.<dialect>.input`; its output is its `content`, else what its updates sent as terminal output (`_meta.terminal_output_delta` / `_meta.terminal_output` `data`, codex-acp's for a client without terminals), else its `rawOutput` |
 //! | `session/update` `current_mode_update` / `config_option_update` | the mode check above        |
 //! | `session/request_permission` (agent → client request) | `attention.raised{permission}`, options `allow`/`deny` |
 //! | a dialect's question / plan-approval request         | `attention.raised{question}` per question / `attention.raised{permission}` |
@@ -102,6 +102,13 @@
 //! [`twr_core::usage::REFRESH_AFTER`] old, with ids of their own (from 2^50: the prompt ids
 //! stay those of the recordings); its answer becomes `runtime.limits` (`source: read`,
 //! [`Dialect::usage_windows`]) and an error stops the reads.
+//!
+//! Spend: a prompt result's `usage` (or `_meta.usage`) becomes `turn.ended` `usage`: `input` is
+//! `inputTokens` plus `cachedReadTokens` and `cachedWriteTokens` (ACP's `inputTokens` leaves the
+//! cached input out: claude-agent-acp 0.107.0 and codex-acp 2.6.0 report a real review round's
+//! input as a handful of tokens beside tens of thousands cached), `output` is `outputTokens`
+//! (thought tokens are part of it). The cost is the session's cumulative `usage_update` `cost`
+//! in USD, charged to the turn as what it rose by since the turn before ([`Translator::turn_cost`]).
 //!
 //! Other `session/update` kinds (`plan`, `user_message_chunk`, `available_commands_update`,
 //! `session_info_update`, vendor kinds) and notifications are ignored, except what the
@@ -604,7 +611,22 @@ struct QuestionSet {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolState {
     done: bool,
+    /// The call was announced without an input (claude-agent-acp 0.107.0 sends `tool_call`
+    /// with an empty `rawInput` and the command or path in a later `tool_call_update`).
+    announced_bare: bool,
+    /// The latest input an update of the call carried, once announced bare: it goes on the
+    /// result as `ext.<dialect>.input`.
+    input: Option<String>,
+    /// The start of what its updates sent as terminal output (`_meta.terminal_output_delta`
+    /// or `_meta.terminal_output` `data`): codex-acp sends a command's output only so to a
+    /// client without terminals, with `rawOutput` just its exit code. At most
+    /// [`TERMINAL_KEEP`] bytes.
+    terminal: String,
 }
+
+/// The most of a tool call's terminal output kept for its result ([`ToolState::terminal`]):
+/// more than its summary shows.
+const TERMINAL_KEEP: usize = 4 * OUTPUT_SUMMARY_MAX;
 
 /// Stateful ACP ↔ twr translator for one agent process.
 #[derive(Debug)]
@@ -688,6 +710,10 @@ pub struct Translator<D: Dialect> {
     /// the window a compaction's start reported.
     context: Option<u64>,
     reported_window: Option<u64>,
+    /// The session's cumulative cost in USD, as its latest `usage_update` reported it.
+    session_cost: Option<f64>,
+    /// The cumulative cost already charged to ended turns ([`Translator::turn_cost`]).
+    cost_charged: f64,
 }
 
 /// `ext.<dialect>.mode_note` of the turn in which the session left plan mode with consent.
@@ -741,6 +767,8 @@ impl<D: Dialect> Translator<D> {
             compacting: None,
             context: None,
             reported_window: None,
+            session_cost: None,
+            cost_charged: 0.0,
         }
     }
 
@@ -1978,11 +2006,22 @@ impl<D: Dialect> Translator<D> {
                     .unwrap_or(0)
             };
             Usage {
-                input: tok(&["inputTokens", "input_tokens"]),
+                input: tok(&["inputTokens", "input_tokens"])
+                    + tok(&["cachedReadTokens", "cached_read_tokens"])
+                    + tok(&["cachedWriteTokens", "cached_write_tokens"]),
                 output: tok(&["outputTokens", "output_tokens"]),
                 cost: None,
             }
         });
+        let cost = self.turn_cost();
+        let usage = match (usage, cost) {
+            (Some(u), cost) => Some(Usage { cost, ..u }),
+            (None, Some(c)) => Some(Usage {
+                cost: Some(c),
+                ..Default::default()
+            }),
+            (None, None) => None,
+        };
         if let Some(u) = u {
             ours.insert("usage".into(), u.clone());
         }
@@ -2048,6 +2087,16 @@ impl<D: Dialect> Translator<D> {
     }
 
     // --- notifications -----------------------------------------------------------------------
+
+    /// What the session's cost rose by since the last turn ended (its latest `usage_update`
+    /// `cost`, cumulative), now charged to the turn ending; None when the agent reports no
+    /// cost.
+    fn turn_cost(&mut self) -> Option<f64> {
+        let total = self.session_cost?;
+        let rose = (total - self.cost_charged).max(0.0);
+        self.cost_charged = self.cost_charged.max(total);
+        Some(rose)
+    }
 
     fn turn(&self) -> Option<u64> {
         self.in_flight.map(|(_, t)| t)
@@ -2182,6 +2231,19 @@ impl<D: Dialect> Translator<D> {
             // model is recorded on the next `turn.ended`); other options are the agent's
             // business.
             "config_option_update" if self.apply_config(u) => self.on_mode_report(line, out),
+            // The session's cumulative cost (ACP `usage_update` `cost`), in USD only.
+            "usage_update" => {
+                let c = &u["cost"];
+                if let Some(amount) = c["amount"].as_f64().filter(|a| a.is_finite() && *a >= 0.0) {
+                    if c["currency"]
+                        .as_str()
+                        .unwrap_or("USD")
+                        .eq_ignore_ascii_case("USD")
+                    {
+                        self.session_cost = Some(amount);
+                    }
+                }
+            }
             // plan, user_message_chunk, available_commands_update, session_info_update, ...:
             // nothing to show.
             _ => {}
@@ -2208,7 +2270,6 @@ impl<D: Dialect> Translator<D> {
             if str_at(u, "sessionUpdate") == "tool_call" {
                 self.tasks.reopen(&format!("tool:{id}"));
             }
-            self.tools.insert(id.clone(), ToolState::default());
             let meta = self.dialect.tool_meta(u);
             let kind = match str_at(u, "kind") {
                 "" => meta.kind.unwrap_or("other"),
@@ -2246,6 +2307,13 @@ impl<D: Dialect> Translator<D> {
                 other => other.to_string(),
             };
             let input_text = text_of(&input);
+            self.tools.insert(
+                id.clone(),
+                ToolState {
+                    announced_bare: input_text.is_empty() && meta.mcp_call.is_none(),
+                    ..Default::default()
+                },
+            );
             let summary = if let Some((mcp_tool, mcp_input)) = &meta.mcp_call {
                 // The MCP tool, then its own input: the wrapper's input names the tool after
                 // its input (keys sort), so a long input would cut the name off the summary.
@@ -2298,17 +2366,51 @@ impl<D: Dialect> Translator<D> {
             }
         }
         let state = self.tools.get_mut(&id).expect("inserted above");
+        if !state.done {
+            for key in ["terminal_output_delta", "terminal_output"] {
+                let Some(data) = u
+                    .get("_meta")
+                    .and_then(|m| m.get(key))
+                    .and_then(|t| t.get("data"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let room = TERMINAL_KEEP.saturating_sub(state.terminal.len());
+                let mut end = data.len().min(room);
+                while !data.is_char_boundary(end) {
+                    end -= 1;
+                }
+                state.terminal.push_str(&data[..end]);
+            }
+        }
+        if state.announced_bare && !state.done {
+            if let Some(i) = u
+                .get("rawInput")
+                .filter(|i| i.as_object().is_some_and(|m| !m.is_empty()))
+            {
+                state.input = Some(i.to_string());
+            }
+        }
         if matches!(status, "completed" | "failed") && !state.done {
             state.done = true;
+            let input = state.input.take();
+            let terminal = std::mem::take(&mut state.terminal);
+            let mut ours = Map::new();
+            if let Some(i) = input {
+                ours.insert("input".into(), json!(one_line(&i, INPUT_SUMMARY_MAX)));
+            }
+            let ext = self.ext_of(ours);
             out.events.push(Emitted {
                 body: EventBody::AgentToolResult(AgentToolResult {
                     call_id: id,
                     ok: status == "completed",
                     output_summary: match self.dialect.tool_output(u) {
                         Some(text) => one_line(&text, OUTPUT_SUMMARY_MAX),
-                        None => tool_output_summary(u),
+                        None => tool_output_summary(u, &terminal),
                     },
                     output_ref: None,
+                    ext,
                     ..Default::default()
                 }),
                 turn,
@@ -2780,20 +2882,23 @@ pub const KNOWN_RESTRICTED: &[&str] = &["plan", "dontAsk", "read-only"];
 pub const KNOWN_ASK: &[&str] = &["default", "ask", "manual"];
 
 /// Mode ids that accept file edits without asking: Claude Code / grok `acceptEdits`, Gemini
-/// CLI / qwen-code `autoEdit`.
-pub const KNOWN_ACCEPT_EDITS: &[&str] = &["acceptEdits", "autoEdit"];
+/// CLI / qwen-code `autoEdit`, codex-acp `workspace-write` (2.6.0: "edit workspace files; ask
+/// before writing outside the workspace or accessing the network").
+pub const KNOWN_ACCEPT_EDITS: &[&str] = &["acceptEdits", "autoEdit", "workspace-write"];
 
-/// Mode ids that decide on their own what to ask: Claude Code / grok / codex-acp `auto`.
-pub const KNOWN_AUTO: &[&str] = &["auto"];
+/// Mode ids that decide on their own what to ask: Claude Code / grok / codex-acp `auto`, and
+/// codex-acp 2.6.0's `agent` ("only ask for actions detected as potentially unsafe").
+pub const KNOWN_AUTO: &[&str] = &["auto", "agent"];
 
 /// Mode ids that ask nothing: Claude Code / grok `bypassPermissions`, Gemini CLI / qwen-code
-/// `yolo`, grok `always-approve`, codex-acp `full-access`, codex `danger-full-access`, and the
-/// usual CLI flag names.
+/// `yolo`, grok `always-approve`, codex-acp `agent-full-access` (2.6.0; `full-access` before),
+/// codex `danger-full-access`, and the usual CLI flag names.
 pub const KNOWN_BYPASS: &[&str] = &[
     "bypassPermissions",
     "yolo",
     "always-approve",
     "always-allow",
+    "agent-full-access",
     "full-access",
     "danger-full-access",
     "dangerously-skip-permissions",
@@ -2947,8 +3052,8 @@ fn content_text(c: &Value) -> String {
 }
 
 /// First ~[`OUTPUT_SUMMARY_MAX`] chars of a tool call's `content` (text blocks, diffs,
-/// terminals) or, without content, its `rawOutput`.
-fn tool_output_summary(u: &Value) -> String {
+/// terminals), else of what it sent as terminal output (`terminal`), else of its `rawOutput`.
+fn tool_output_summary(u: &Value, terminal: &str) -> String {
     let mut parts = Vec::new();
     if let Some(items) = u.get("content").and_then(Value::as_array) {
         for it in items {
@@ -2961,6 +3066,9 @@ fn tool_output_summary(u: &Value) -> String {
         }
     }
     let mut text = parts.join("\n");
+    if text.trim().is_empty() && !terminal.trim().is_empty() {
+        text = terminal.to_string();
+    }
     if text.trim().is_empty() {
         text = match u.get("rawOutput") {
             Some(Value::String(s)) => s.clone(),

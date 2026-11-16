@@ -8,7 +8,8 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [usage.md](usage.md) | a session from start to end: threads, `say` and `send`, answering cards, reports, attach, park, standing context, the event log |
 | [tui.md](tui.md) | the stack, grid and decision views, keys, slash commands, notifications |
 | [desktop.md](desktop.md) | the macOS and Linux client, CLI workflows, shared architecture and packaging |
-| [mobile.md](mobile.md) | iOS, Android, remote hubs, pairing, uploads and notification configuration |
+| [mobile.md](mobile.md) | iOS, Android, remote hubs, pairing, uploads, notification configuration and the store builds |
+| [privacy.md](privacy.md) | what the apps do with your data: where it goes, each permission, voice, notifications |
 | [desktop-qa.md](desktop-qa.md) | tested desktop workflows, visual checks and feature-parity limits |
 | [performance.md](performance.md) | application performance measurements, improvements and reproduction |
 | [read-aloud.md](read-aloud.md) | reading the orchestrator's messages aloud: `/read`, speakers, `twr speak` and `twr remote` over SSH and mosh, engines |

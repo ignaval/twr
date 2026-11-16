@@ -1,6 +1,6 @@
 {
   "name": "twr-desktop",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "description": "One conversation for all your coding agents",
   "author": "twr contributors",
@@ -13,7 +13,7 @@
     "build:rust": "node scripts/build-rust.mjs",
     "start": "electron .",
     "test": "vitest run",
-    "test:integration": "node scripts/integration.mjs",
+    "test:integration": "node scripts/integration.mjs && node scripts/loops-integration.mjs",
     "test:voice": "node scripts/voice-qa.mjs",
     "package": "npm run build:rust && npm run build && node scripts/notices.mjs && electron-builder --publish never",
     "package:mac": "npm run package -- --mac --arm64 --config.mac.identity=- --config.mac.hardenedRuntime=false",
@@ -26,6 +26,9 @@
     "test:packaged:mac": "node scripts/packaged-smoke.mjs",
     "test:qa:mac": "TWR_DESKTOP_EXTENDED_QA=1 node scripts/packaged-smoke.mjs",
     "mobile:build": "tsc --noEmit && vite build --config mobile/vite.config.ts && cap sync",
+    "mobile:build:store": "TWR_MOBILE_APP_ID=tools.twr.mobile VITE_TWR_REMOTE_PUSH=0 npm run mobile:build",
+    "mobile:release:android": "npm run mobile:build:store && cd mobile/android && ./gradlew bundleRelease",
+    "mobile:release:ios": "npm run mobile:build:store && node mobile/scripts/ios-release.mjs",
     "mobile:android": "npm run mobile:build && cd mobile/android && ./gradlew assembleDebug",
     "mobile:ios": "npm run mobile:build && node mobile/scripts/ios-build.mjs",
     "mobile:dev": "vite --config mobile/vite.config.ts",
@@ -94,7 +97,10 @@
     "files": [
       "dist/**",
       "dist-host/**",
-      "package.json"
+      "package.json",
+      "!node_modules/node-pty/deps/**",
+      "!node_modules/node-pty/src/**",
+      "!node_modules/node-pty/prebuilds/win32-*/**"
     ],
     "asarUnpack": [
       "node_modules/node-pty/**"

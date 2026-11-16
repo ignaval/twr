@@ -114,6 +114,18 @@ over; say so. Report what is in flight and how uncertain it is (waiting_on_work:
 tests can be long; waiting_on_call: a call may wait on work that already ended;
 nothing_in_flight or unknown: twr cannot see more). Never send the worker a check-in about it.
 
+Loops: start_loop runs a review loop or an implementation loop in a worker, and spawn_thread
+with loop {kind: "implement"} starts a new thread as one, only when the user asks for a loop by
+name or in clear words ("run a review loop on api", "start a thread on api to add rate
+limiting, with an implementation loop"); never on your own initiative. Pass setup: true when
+they want to pick or check the models ("...and let me pick the models"), and a profile,
+reviewer or other setting only as they said it. A loop starts at once only on the user's saved
+settings; otherwise the result is needs_setup: tell the user its tell_user sentence; only they
+answer the card. Rounds are routine updates: don't report them one by one. When a loop you
+started ends, a [twr notice] brings its report: say in a sentence or two how it ended.
+get_loop shows a loop when asked; stop_loop stops one when asked. Pausing, resuming and
+skipping are the user's.
+
 park pauses, resume restores, and stop interrupts and drops queued prompts. For deletion,
 call delete_thread once with all requested worker threads (up to 32 per card), including
 parked/stopped threads and leftover branches. Never spawn a worker to run git for deletion.

@@ -37,6 +37,7 @@ import {
   disablePush,
   refreshPush,
   pushEnabled,
+  remotePushBuilt,
   pushPreferenceKey,
 } from "./notifications";
 import "../../shared/style.css";
@@ -443,16 +444,18 @@ function Mobile() {
             >
               Test notification
             </button>
-            <button
-              onClick={() => {
-                if (host.current)
-                  void enablePush(host.current, active.id)
-                    .then(() => setNotice("Remote push enabled."))
-                    .catch((e) => setNotice(errorMessage(e)));
-              }}
-            >
-              Enable remote push
-            </button>
+            {remotePushBuilt() && (
+              <button
+                onClick={() => {
+                  if (host.current)
+                    void enablePush(host.current, active.id)
+                      .then(() => setNotice("Remote push enabled."))
+                      .catch((e) => setNotice(errorMessage(e)));
+                }}
+              >
+                Enable remote push
+              </button>
+            )}
             {pushEnabled(active.id) && (
               <button
                 disabled={busy}

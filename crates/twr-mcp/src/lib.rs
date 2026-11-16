@@ -46,6 +46,14 @@
 //! `memory_list`, `memory_read`, `memory_save` and `memory_forget` are the orchestrator's
 //! memory (`memory.*`, the hub's `hub::memory`): notes it keeps across sessions and runtimes.
 //!
+//! `start_loop`, `get_loop` and `stop_loop` are the orchestrator's loops (`loop.request`,
+//! `loop.get`, `loop.control stop`; `hub::loops`, docs/design/loops.md milestone 3), and
+//! `spawn_thread`'s `loop` is `thread.new`'s with the prompt as its task. The hub decides
+//! whether a loop starts: only on the user's saved settings with nothing the orchestrator named
+//! differing from them, else the setup card goes to the user and the result says what to tell
+//! them (`tell_user`, `render::loop_request`). The results are rendered compactly
+//! (`render::loop_state`).
+//!
 //! The MCP server name is `twr`, so a Claude orchestrator configured with
 //! `{"mcpServers":{"twr":{...}}}` sees the tools as `mcp__twr__<tool>`.
 
@@ -157,6 +165,22 @@ macro_rules! report_rule {
     };
 }
 
+/// The loop rule, stated in the `start_loop` and `spawn_thread` descriptions.
+macro_rules! loop_rule {
+    () => {
+        "A loop runs only on settings the user chose: it starts at once only on the user's \
+         saved loop settings, and only when you name nothing that differs from them (pass \
+         profile, reviewer, implementer, workers, commit or plan_check only as the user said \
+         them). Otherwise, or with setup: true (\"let me pick the models\"), nothing starts \
+         yet: the hub shows the user the loop's setup card and returns status needs_setup with \
+         tell_user, a sentence to pass on (\"I've asked you to choose the loop's models on \
+         api's card.\"). Only the user answers that card: never answer or annotate it, and \
+         never ask again with other settings. The loop's rounds are routine updates: do not \
+         report them one by one. When a loop you started ends, the hub wakes you with its \
+         report: tell the user how it ended in a sentence or two."
+    };
+}
+
 /// The relay rule text.
 pub const RELAY_RULE: &str = relay_rule!();
 
@@ -165,6 +189,9 @@ pub const MODE_RULE: &str = mode_rule!();
 
 /// The report rule text.
 pub const REPORT_RULE: &str = report_rule!();
+
+/// The loop rule text.
+pub const LOOP_RULE: &str = loop_rule!();
 
 /// Server instructions shown to the orchestrator's runtime.
 pub const INSTRUCTIONS: &str = "Coordinate worker threads with the twr tools, and answer questions about twr yourself from read_docs. The hub enforces permission and mode provenance. Use the orchestrator system prompt for policy. Routine hub updates require no model turn; to act when a worker finishes, set a watch with watch_thread. Inspect transcripts or standing context only when needed. Tool results are bounded; use their cursors for more. Independent calls may run concurrently.";
@@ -219,6 +246,91 @@ pub struct SpawnThreadParams {
     /// Retry key. Reuse this id and identical parameters after a lost response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
+    /// Run the thread as an implementation loop, only when the user asks for one: `prompt`
+    /// (required then) is the loop's task, never sent as an ordinary prompt.
+    #[serde(default, rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub loop_: Option<SpawnLoopParams>,
+}
+
+/// The settings a loop request may name, each only as the user said it: what differs from
+/// the user's saved settings goes on the setup card for the user, and starts nothing.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct LoopSettingsParams {
+    /// Show the user the setup card even when saved settings would do: when the user asks to
+    /// pick or check the loop's models or settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<bool>,
+    /// A profile the user named: `low`, `medium`, `high` or one of theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// A reviewer the user named: `runtime[:account]/model` (e.g. `codex/gpt-6.1-sol`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    /// An implementer the user named: `thread` (the thread's own model) or
+    /// `runtime[:account]/model[:effort]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer: Option<String>,
+    /// The implementer's subagents' model the user named: `model[:effort]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<String>,
+    /// What the loop commits, as the user said: `end`, `per-round` or `none` (implementation),
+    /// `match` or `none` (review).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// An implementation loop's plan check, as the user said: `contracts`, `always` or `never`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_check: Option<String>,
+}
+
+impl LoopSettingsParams {
+    /// `loop.request`'s and `thread.new`'s `overrides`.
+    fn overrides(&self) -> Value {
+        let mut o = serde_json::Map::new();
+        for (k, v) in [
+            ("profile", &self.profile),
+            ("reviewer", &self.reviewer),
+            ("implementer", &self.implementer),
+            ("workers", &self.workers),
+            ("commit", &self.commit),
+            ("plan_check", &self.plan_check),
+        ] {
+            if let Some(v) = v {
+                o.insert(k.into(), json!(v));
+            }
+        }
+        Value::Object(o)
+    }
+}
+
+/// `spawn_thread`'s `loop`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct SpawnLoopParams {
+    /// `implement`: a new thread has nothing to review yet.
+    pub kind: String,
+    #[serde(flatten)]
+    pub settings: LoopSettingsParams,
+}
+
+/// `start_loop` parameters.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct StartLoopParams {
+    /// Thread id, name, alias or unique id prefix (a worker thread).
+    pub thread: String,
+    /// `review` (review the thread's work) or `implement` (implement a task).
+    pub kind: String,
+    /// An implementation loop's task, as the user gave it; omit when the task is what the
+    /// thread's conversation already settled. Not for a review loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// A review loop's scope, only when the user names one: `branch`, `uncommitted`,
+    /// `since <ref>` or `last <n>`. Default: the thread's branch, else its uncommitted work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(flatten)]
+    pub settings: LoopSettingsParams,
 }
 
 /// Durable spawn status lookup.
@@ -830,9 +942,21 @@ fn spawn_result(result: &Value) -> Result<String, String> {
     {
         let mut thread = thread.clone();
         thread_view(&mut thread);
+        // A loop asked for with the thread: what `start_loop` would say of it.
+        let asked = match thread.get("loop").filter(|l| l.get("status").is_some()) {
+            Some(l) => {
+                let v = render::loop_request(l, AboutThread::name_of(&thread));
+                thread.as_object_mut().map(|t| t.remove("loop"));
+                Some(v)
+            }
+            None => None,
+        };
         let mut rest = AboutThread::rest(result.as_object().unwrap());
         if let Some(send) = thread.get("send") {
             rest.insert("send", send);
+        }
+        if let Some(l) = &asked {
+            rest.insert("loop", l);
         }
         Ok(AboutThread {
             thread_name: Some(AboutThread::name_of(&thread)),
@@ -1130,7 +1254,7 @@ impl TwrMcp {
     }
 
     #[tool(
-        description = "Create a worker thread in a project and, if `prompt` is given, send \
+        description = concat!("Create a worker thread in a project and, if `prompt` is given, send \
                           it as the first turn. Always pass `name`: a short kebab-case name \
                           (2-4 words) saying what the thread does, unique among the threads, \
                           such as notifications-design or review-last-3 (letters, digits, \
@@ -1164,8 +1288,14 @@ impl TwrMcp {
                           Without one the thread gets the project's account, else the \
                           runtime's own login. A project pinned to accounts keeps its threads \
                           on them: the hub refuses another one, and you cannot override that \
-                          (tell the user, who can)."
-    )]
+                          (tell the user, who can). ",
+        "With `loop: {kind: \"implement\", setup?, profile?, ...}`, only when the user asks ",
+        "for an implementation loop (\"start a thread on api to add rate limiting, with an ",
+        "implementation loop\"), the thread runs `prompt` as an implementation loop's task ",
+        "instead of an ordinary prompt; the result's `loop` is start_loop's. The thread is ",
+        "made either way, and stays if the user cancels the loop's card. ",
+        loop_rule!()
+    ))]
     async fn spawn_thread(
         &self,
         Parameters(p): Parameters<SpawnThreadParams>,
@@ -1177,8 +1307,25 @@ impl TwrMcp {
         let mut request = to_params(&p)?;
         request.as_object_mut().unwrap().remove("prompt");
         request.as_object_mut().unwrap().remove("operation_id");
+        // A loop's task is the prompt: it goes with the loop, never as an ordinary prompt.
+        let mut prompt = p.prompt.clone();
+        if let Some(l) = &p.loop_ {
+            let task = prompt
+                .take()
+                .filter(|t| !t.trim().is_empty())
+                .ok_or("a thread with a loop needs its task: give it as `prompt`")?;
+            let mut req = json!({"kind": l.kind, "task": task});
+            if l.settings.setup == Some(true) {
+                req["setup"] = json!(true);
+            }
+            let overrides = l.settings.overrides();
+            if overrides.as_object().is_some_and(|o| !o.is_empty()) {
+                req["overrides"] = overrides;
+            }
+            request["loop"] = req;
+        }
         let mut result = self.call("thread.spawn", json!({"operation_id":operation_id,
-            "request":request, "prompt":p.prompt})).await.map_err(|e|
+            "request":request, "prompt":prompt})).await.map_err(|e|
                 format!("{e}; operation_id={operation_id}; check get_spawn before retrying with this id"))?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while result["status"] == "pending" && tokio::time::Instant::now() < deadline {
@@ -1479,6 +1626,76 @@ impl TwrMcp {
     )]
     async fn stop(&self, Parameters(p): Parameters<ThreadParam>) -> Result<String, String> {
         self.call_thread("thread.stop", to_params(&p)?).await
+    }
+
+    #[tool(description = concat!(
+        "Start a review loop (kind review: an adversarial reviewer model reviews the thread's ",
+        "work round after round, and the thread verifies and fixes each finding) or an ",
+        "implementation loop (kind implement: the thread plans, implements, then the same ",
+        "review rounds, and commits at the end) in a worker thread, only when the user asks ",
+        "for one, by name or in clear words (\"run a review loop on api\"). Never on your own ",
+        "initiative. ",
+        loop_rule!(),
+        " Returns {thread_name, thread, status: \"started\", loop, kind, line, settings, ",
+        "settings_of?} or {thread_name, thread, status: \"needs_setup\", attn_id, why, ",
+        "existing?, tell_user}."
+    ))]
+    async fn start_loop(
+        &self,
+        Parameters(p): Parameters<StartLoopParams>,
+    ) -> Result<String, String> {
+        let mut req = json!({"thread": p.thread, "kind": p.kind});
+        if let Some(task) = &p.task {
+            req["task"] = json!(task);
+        }
+        if let Some(scope) = &p.scope {
+            req["scope"] = json!(scope);
+        }
+        if p.settings.setup == Some(true) {
+            req["setup"] = json!(true);
+        }
+        let overrides = p.settings.overrides();
+        if overrides.as_object().is_some_and(|o| !o.is_empty()) {
+            req["overrides"] = overrides;
+        }
+        let r = self.call("loop.request", req).await?;
+        let name = r["thread_name"].as_str().unwrap_or(&p.thread).to_string();
+        let mut out = render::loop_request(&r, &name);
+        out["thread_name"] = json!(name);
+        out["thread"] = r["thread"].clone();
+        Ok(AboutThread::result(&out))
+    }
+
+    #[tool(
+        description = "A worker thread's loop: its running one, else the last one it ran. \
+                       Says the kind, phase, round, each round with its findings, the ledger \
+                       (dismissed findings), what it waits on (the thread's turn, a review run, \
+                       or the user: a stuck loop or a paused one), the settings it runs on, who \
+                       asked for it, how the last one ended (outcome, its commits or `not \
+                       committed`) and its report's path. Read only. Rounds are routine: \
+                       check a loop when the user asks how it is going, not after each round.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_loop(&self, Parameters(p): Parameters<ThreadParam>) -> Result<String, String> {
+        self.call("loop.get", json!({"thread": p.thread}))
+            .await
+            .map(|r| render::loop_state(&r))
+    }
+
+    #[tool(
+        description = "Stop a worker thread's running loop when the user asks: the loop ends \
+                       (outcome stopped; nothing is committed) and the thread and its work stay \
+                       as they are. You cannot pause, resume or skip a loop: tell the user to \
+                       (`/loop <thread> pause|resume|skip-to-verify`, or `twr loop`). Returns \
+                       {thread_name, thread, loop, running: false, outcome}."
+    )]
+    async fn stop_loop(&self, Parameters(p): Parameters<ThreadParam>) -> Result<String, String> {
+        self.call(
+            "loop.control",
+            json!({"thread": p.thread, "action": "stop"}),
+        )
+        .await
+        .map(|r| AboutThread::result(&render::loop_stopped(&r)))
     }
 
     #[tool(

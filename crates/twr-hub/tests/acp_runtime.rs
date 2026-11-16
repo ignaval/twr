@@ -54,6 +54,7 @@ fn opts(dir: &Path) -> HubOptions {
         RuntimePreset {
             acp: format!("python3 {} {}", stub(), state(dir).display()),
             attach: Some("stub-cli --resume {session}".into()),
+            review: None,
         },
     );
     // An agent that takes a model and an effort, attached by a command that hands neither
@@ -74,6 +75,7 @@ fn opts(dir: &Path) -> HubOptions {
                     state(dir).display()
                 ),
                 attach: Some(attach.into()),
+                review: None,
             },
         );
     }
@@ -82,6 +84,7 @@ fn opts(dir: &Path) -> HubOptions {
         RuntimePreset {
             acp: format!("python3 {} {}", stub(), state_b(dir).display()),
             attach: None,
+            review: None,
         },
     );
     let config = Config {
@@ -561,6 +564,7 @@ async fn a_lone_model_placeholder_in_an_attach_template_is_refused() {
         RuntimePreset {
             acp: format!("python3 {} {}", stub(), state(dir.path()).display()),
             attach: Some("stub-cli --resume {session} -m {model}".into()),
+            review: None,
         },
     );
     let hub = Hub::open(o).await.unwrap();

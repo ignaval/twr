@@ -4,8 +4,8 @@
 //!
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
-//! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, accounts, client, identity, warnings}` (`accounts`: every runtime's, without directories, `hub::accounts`; the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace, why?}` (`why`: for an agent's connection, why it counts as one, [`Conn::why`]) |
+//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, accounts, client, identity, why?, warnings}` (`why`: as `hello`'s; `accounts`: every runtime's, without directories, `hub::accounts`; the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
 //! | `hub.glance`        | -                                                   | `{workspace, threads, running, permissions, questions, active, orchestrator: {id, name, status, preview, preview_seq} \| null}`: the hub's counts in one call, for the TUI's workspace sidebar (`hub::glance`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
@@ -80,6 +80,15 @@
 //! | `account.add`       | `{runtime, account, dir?, share?, native?, dry_run?, after_native_name?}` (users only) | `{runtime, account, native, dir, share, source, config, existing, recorded}`: records `account.added` unless config.toml declares it or a live record says the same; `dry_run` records nothing; `after_native_name` (a named account's dry run only) answers as if the native account were named that first, that rename checked too |
 //! | `account.remove`    | `{runtime, account, move_to?, force?}` (users only)  | `{runtime, account, native, dir, removed, config, threads, moved, running, message, dispatch_error?}`: records `account.removed`; refused for a config account without a record, and while threads run on it unless `move_to` or `force`; `running`: `[{thread, thread_name}]` whose runtime process still runs on the removed login (their thread objects say `runtime_account_removed` `{runtime, account, dir?}` until it stops; `dir`, the directory it was started in, for users only) |
 //! | `account.status`    | `{runtime?, account?, refresh?}` (users only)        | as `account.list`, after checking the logins again with `refresh` |
+//! | `loop.request`      | `{thread, kind, task?, setup?, scope?, overrides?: {profile?, implementer?, workers?, reviewer?, commit?, plan_check?}}` | `{status: "started", thread, thread_name, loop, settings, settings_of}` or `{status: "needs_setup", thread, thread_name, attn_id, revision, why, existing?}`: the hub alone decides which (`hub::loops`): a loop starts at once only on saved settings that still hold, without `setup`, and, for the orchestrator, with no override that differs from them (`existing`: the orchestrator's request found the thread's card open, and left it as it is); otherwise the thread's setup card is raised (again, as a new revision, when it has one open). Refused: an unknown thread (`not_found`), the orchestrator thread (`bad_request`), a remote box's thread or no git workspace (`unsupported`), a stopped, parked or deleting thread, a mode that can't edit, a loop already running (`conflict`) |
+//! | `loop.setup.get`    | `{attn_id}` (users only)                             | `{attn_id, revision, thread, thread_name, setup, summary, options}`: the open setup card as last raised, read only (`not_found` when `attn_id` is no open setup card) |
+//! | `loop.setup.update` | `{attn_id, revision, settings?, save_for?: "all" \| "project", scope?}` (users only) | `{attn_id, revision, setup, summary, options}`: the setup card raised again with the new values (`conflict` when `revision` is not its current one) |
+//! | `loop.settings.get` | `{project?, thread?}`                                | `{settings, id, source: "project" \| "workspace" \| null, first_card, projects, presets, profiles, runtimes: [{runtime, found, login, models, efforts, subagents, accounts}], warnings, problems, box}` |
+//! | `loop.settings.set` | `{project?, settings}` (users only)                  | `{id}` (`loop.settings_saved`; `bad_request` naming each setting that does not hold) |
+//! | `loop.settings.reset` | `{project?}` (users only)                          | `{ok, reset}` (`loop.settings_reset`) |
+//! | `loop.get`          | `{thread}` or `{id}`                                 | `{thread, thread_name, id, kind, running, state, line, last, started, phases, rounds: [{id, tier, effort, runs, findings, triage, failed?, reason?, answer_path?, usage?, files: {diffs, prompt?, answer?, log?}}], ledger, transition, controls, ended, folder, files: {goal?, ledger?, schema?, report?}, report_path, outcome}` |
+//! | `loop.list`         | -                                                   | `[{thread, thread_name, id, kind, profile, phase, round, ledger, paused, stuck, waiting_on, line}]`: the running loops |
+//! | `loop.control`      | `{thread, action: "pause" \| "resume" \| "stop" \| "skip_to_verify"}` (users only, but `stop`, which the orchestrator may) | the loop: `{thread, thread_name, id, running, phase, paused, stuck, waiting_on, line, state}`, or once it ended `{thread, thread_name, id, running: false, last}` (`conflict` when it runs none, or the action does nothing now) |
 //!
 //! Identity: a connection is `user:<client>` (source of what it does; its
 //! turns are `from: user`, whatever `thread.send` `from` says) unless its `hello` carried the
@@ -110,7 +119,9 @@
 //! `job.start` only while the thread's mode may run commands (`manual` or wider, `hub::jobs`;
 //! else `relay_forbidden`). Anything else is
 //! `unauthorized` ("this request comes from <name>'s agent (pid N, ...)"), and its `hello` and `hub.info` say
-//! `identity: agent:<name>`. The orchestrator token is accepted only from a peer whose
+//! `identity: agent:<name>` and, in `why`, the same reason (which process, and what the hub
+//! could not read or found), so a client that expected to be the user can say why it is not.
+//! The orchestrator token is accepted only from a peer whose
 //! ancestry contains the recorded process of the orchestrator runtime the token belongs to
 //! (its MCP server), walked again at the `hello` and at every request after it
 //! (a process of an earlier orchestrator runtime that outlived a restart is refused
@@ -139,6 +150,18 @@
 //! stalled) as `by: user, answer: cancel`, routing nothing; a runtime's permission or question
 //! is refused (`bad_request`: answer it or stop the thread), and so is the orchestrator
 //! (`relay_forbidden`).
+//! The `loop.*` methods are the user's (none is in `AGENT_METHODS`), but for what the
+//! orchestrator may do with loops (`ORCHESTRATOR_METHODS`: `loop.request`, which starts a loop
+//! only on the user's saved settings and otherwise raises the card for the user; `loop.get`,
+//! `loop.list`; `loop.control` with `stop` alone; `thread.new` with `loop`): the hub refuses it
+//! the rest (`relay_forbidden`), the settings methods and the setup card's included. A loop's
+//! setup card (an `attention.raised` with `ext.twr.loop_setup`, reason `review`, options `start
+//! and save these settings`, `run without a loop` when it holds a task, and `cancel`) is answered with `attention.respond` by the user
+//! alone (`relay_forbidden` for the orchestrator, which may not annotate it either; a
+//! dismissal is a cancel), and its `change…` is `loop.setup.update` (`hub::loops`). A stuck
+//! loop's item (`ext.twr.loop_stuck`, reason `error`, options `resume` and `stop`) is the
+//! user's alone the same way: `resume` and `stop` control the loop with the answer, a
+//! dismissal leaves it paused (`hub::loops::driver`).
 //! `report.write` writes the report of a worker's finished turn (default: its last) as the
 //! caller (`written_by` `orchestrator` or `user:<client>`); `gave_up` / `needs_verification`
 //! raise a review unless the hub already raised one for that turn.
@@ -270,7 +293,8 @@ use twr_core::proto::{
 use twr_runner::reap::{self, AncestryEnd, ProcessId};
 
 use crate::hub::{
-    wait_state, AgentPeer, AgentWhy, BoxView, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
+    wait_state, AgentPeer, AgentWhy, BoxView, Caller, Hub, HubState, LoopControlParams,
+    LoopRequest, LoopSettingsSet, LoopSetupGet, LoopSetupUpdate, NewThread, PeerWalk, ReadTool,
     SayOrigin, StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
 };
 
@@ -662,6 +686,15 @@ impl Conn {
         }
     }
 
+    /// Why a restricted connection counts as an agent's ([`AgentPeer::detail`]: the process,
+    /// and what of its ancestry or environment made it one), for `hello` and `hub.info` to say
+    /// next to its identity. The same words every request it is refused carries
+    /// ([`agent_refused`]), so they tell an agent nothing new; a client that expected to be the
+    /// user (the desktop app's companion) shows them. `None` for any other connection.
+    fn why(&self) -> Option<String> {
+        self.restricted().map(AgentPeer::detail)
+    }
+
     fn caller(&self, hub: &Hub) -> Result<Caller, RpcError> {
         match &self.token {
             None => Ok(Caller::user(self.client.clone())),
@@ -781,6 +814,16 @@ pub const METHODS: &[&str] = &[
     "job.cancel",
     "job.list",
     "job.log",
+    "loop.request",
+    "loop.setup.get",
+    "loop.setup.update",
+    "loop.settings.get",
+    "loop.settings.set",
+    "loop.settings.reset",
+    "loop.get",
+    "loop.report",
+    "loop.list",
+    "loop.control",
 ];
 
 /// Methods the orchestrator's connection may call (it may not shut the hub down, attach, or
@@ -836,6 +879,12 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "orchestrator.watch",
     "orchestrator.unwatch",
     "orchestrator.watches",
+    // Loops (`hub::loops`): asked for (started only on the user's saved settings, else the
+    // setup card goes to the user), read, and stopped (`stop` alone).
+    "loop.request",
+    "loop.get",
+    "loop.list",
+    "loop.control",
 ];
 
 /// The [`ORCHESTRATOR_METHODS`] that change something: each one marks the orchestrator's turn
@@ -859,6 +908,8 @@ const ORCHESTRATOR_CHANGES: &[&str] = &[
     "context.set",
     "orchestrator.watch",
     "orchestrator.unwatch",
+    "loop.request",
+    "loop.control",
 ];
 
 /// The [`ORCHESTRATOR_METHODS`] that change the orchestrator's own memory (`hub::memory`):
@@ -1281,7 +1332,8 @@ async fn connection(
             | "box.restart" | "runner.manage" | "runner.status" | "runner.connect"
             | "runner.recover" | "runner.revoke" | "runner.forget" | "box.projects"
             | "box.token" | "account.status" | "account.remove" | "thread.set_model"
-            | "speech.request" | "speech.control" => {
+            | "speech.request" | "speech.control" | "loop.request" | "loop.setup.update"
+            | "loop.settings.get" | "loop.settings.set" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -2295,6 +2347,20 @@ async fn call_async(
             let out = hub.resume_thread(&p.thread, caller).await?;
             serde_json::to_value(out).map_err(internal)
         }
+        // Review loops (`hub::loops`): git and the hub's agent probe are awaited.
+        "loop.request" => {
+            let p: LoopRequest = required_params(p)?;
+            hub.loop_request(p, caller).await
+        }
+        "loop.setup.update" => {
+            let p: LoopSetupUpdate = required_params(p)?;
+            hub.loop_setup_update(p, caller).await
+        }
+        "loop.settings.get" => hub.loop_settings_get(params(p)?).await,
+        "loop.settings.set" => {
+            let p: LoopSettingsSet = required_params(p)?;
+            hub.loop_settings_set(p, caller).await
+        }
         "thread.trim" => {
             let p: ThreadRef = params(p)?;
             hub.trim_thread(&p.thread, caller).await
@@ -2686,7 +2752,11 @@ async fn hello(hub: &Hub, conn: &mut Conn, p: Value) -> Result<Value, RpcError> 
             conn.client = p.client;
             conn.token = None;
             let identity = conn.identity(&Caller::user(conn.client.clone()));
-            Ok(json!({ "client": conn.client, "identity": identity, "workspace": hub.workspace() }))
+            let mut out = json!({ "client": conn.client, "identity": identity, "workspace": hub.workspace() });
+            if let Some(why) = conn.why() {
+                out["why"] = json!(why);
+            }
+            Ok(out)
         }
     }
 }
@@ -2976,6 +3046,9 @@ fn call(
             let mut info = hub.info_for(box_view(conn, caller));
             info["client"] = json!(client);
             info["identity"] = json!(conn.identity(caller));
+            if let Some(why) = conn.why() {
+                info["why"] = json!(why);
+            }
             Ok(info)
         }
         "hub.shutdown" => Ok(json!({ "ok": true })),
@@ -3149,6 +3222,18 @@ fn call(
             hub.unwatch(&p.watch, caller)
         }
         "orchestrator.watches" => Ok(hub.watches()),
+        "loop.setup.get" => {
+            let p: LoopSetupGet = required_params(p)?;
+            hub.loop_setup_get(p, caller)
+        }
+        "loop.settings.reset" => hub.loop_settings_reset(params(p)?, caller),
+        "loop.get" => hub.loop_get(params(p)?),
+        "loop.report" => hub.loop_report(params(p)?),
+        "loop.list" => Ok(hub.loop_list()),
+        "loop.control" => {
+            let p: LoopControlParams = required_params(p)?;
+            hub.loop_control(p, caller)
+        }
         "attention.list" => {
             let p: AttentionListParams = params(p)?;
             Ok(Value::Array(hub.attention_list(p.all)))

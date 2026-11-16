@@ -22,9 +22,10 @@ pub const FRAMES: [char; 12] = ['_', '▁', '▂', '▃', '▄', '▅', '▆', '
 /// How long each frame shows (a breath is [`FRAMES`] long: 1.5 s).
 pub const FRAME_INTERVAL: Duration = Duration::from_millis(125);
 
-/// The cursor's color: the landing page's orange (`#e88a4f`), as the 256-color palette has
-/// it (`#d7875f`), which reads on dark and light backgrounds alike.
-pub const ACCENT: Color = Color::Indexed(173);
+/// The cursor's color: an orange of the landing page's hue (`#e88a4f`) dark enough to read on
+/// a light terminal as on a dark one, [`crate::color::WORKING`] (`#d75f00`: 5.5:1 on black,
+/// 3.8:1 on white). With 16 colors the cursor is the terminal's own text color in bold.
+pub const ACCENT: Color = crate::color::WORKING;
 
 /// Cells the icon takes: the cursor's one.
 pub const WIDTH: u16 = 1;

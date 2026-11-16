@@ -331,6 +331,19 @@ export class FakeElement extends FakeNode {
     this.tagName = this.nodeName =
       namespace === XHTML ? name.toUpperCase() : name;
     this.namespaceURI = namespace;
+    // An option's value is its attribute, else its text (what react-dom reads of a select's
+    // options to mark the selected one).
+    if (this.localName === "option")
+      Object.defineProperty(this, "value", {
+        get: () => this.getAttribute("value") ?? this.textContent,
+        set: (value: string) => this.setAttribute("value", value),
+      });
+  }
+  /** A select's options, in order (react-dom marks the selected one). */
+  get options(): FakeElement[] | undefined {
+    return this.localName === "select"
+      ? this.querySelectorAll("option")
+      : undefined;
   }
   setAttribute(name: string, value: unknown) {
     this.attributeValues.set(name.toLowerCase(), String(value));
@@ -398,6 +411,9 @@ export class FakeElement extends FakeNode {
   get tabIndex() {
     const value = this.getAttribute("tabindex");
     return value == null ? 0 : Number(value);
+  }
+  set tabIndex(value: number) {
+    this.setAttribute("tabindex", String(value));
   }
   get children() {
     return this.childNodes.filter(

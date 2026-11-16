@@ -81,15 +81,25 @@ impl Core {
                     ..Default::default()
                 }),
             }),
-            Exit::Park { source, keep } => plan.push_back(Planned {
-                turn: None,
-                source,
-                body: EventBody::ThreadParked(SessionPayload {
-                    session_id: view.session_id.clone(),
-                    ext: twr_ext_map(json!({ "keep": keep })),
-                    ..Default::default()
-                }),
-            }),
+            Exit::Park { source, keep } => {
+                // Its loop ends, and its setup card goes, with the park (`hub::loops`).
+                for body in self.loop_closing(thread, "parked") {
+                    plan.push_back(Planned {
+                        turn: None,
+                        source: Source::Hub,
+                        body,
+                    });
+                }
+                plan.push_back(Planned {
+                    turn: None,
+                    source,
+                    body: EventBody::ThreadParked(SessionPayload {
+                        session_id: view.session_id.clone(),
+                        ext: twr_ext_map(json!({ "keep": keep })),
+                        ..Default::default()
+                    }),
+                })
+            }
             // The log needs the stop (the process is gone); one the hub's shutdown asked for,
             // not the user, says so (`ext.twr.reason`), so viewers can fold those away, and so
             // does one the hub asked for to restart the runtime in new settings (`hub::restart`:
@@ -108,6 +118,17 @@ impl Core {
                     .and_then(|r| r.restart_reason)
                     .map(|why| moved_away.unwrap_or(why))
                     .or(shutdown.then_some(HUB_SHUTDOWN));
+                // Stopped by someone (not a restart in new settings, nor the hub's own
+                // shutdown): its loop ends, and its setup card goes, with it (`hub::loops`).
+                if reason.is_none() {
+                    for body in self.loop_closing(thread, "stopped") {
+                        plan.push_back(Planned {
+                            turn: None,
+                            source: Source::Hub,
+                            body,
+                        });
+                    }
+                }
                 plan.push_back(Planned {
                     turn: None,
                     source: Source::Hub,
@@ -118,17 +139,24 @@ impl Core {
                     }),
                 })
             }
+            // Its box's runner stopped it as the runner stopped: a clean end, no one's stop, no
+            // crash. Its loop goes on (it asks its step again once the box is back), and the
+            // next message resumes the session then.
+            Exit::BoxStopped => plan.push_back(Planned {
+                turn: None,
+                source: Source::Hub,
+                body: EventBody::ThreadStopped(SessionPayload {
+                    session_id: view.session_id.clone(),
+                    ext: twr_ext_map(json!({ "reason": BOX_STOPPED_REASON })),
+                    ..Default::default()
+                }),
+            }),
             Exit::Crashed {
                 exit_code,
                 stderr_tail,
             } => {
                 let tail = tail_utf8(&stderr_tail, STDERR_TAIL_MAX).to_string();
-                let code = exit_code.map_or("signal".to_string(), |c| format!("exit {c}"));
-                let last_line = tail.lines().rev().find(|l| !l.trim().is_empty());
-                let summary = match last_line {
-                    Some(l) => format!("{} crashed ({code}): {}", view.name, l.trim()),
-                    None => format!("{} crashed ({code})", view.name),
-                };
+                let summary = crash_summary(&view.name, exit_code, &tail);
                 plan.push_back(Planned {
                     turn: None,
                     source: Source::Hub,
@@ -306,7 +334,7 @@ impl Core {
         exit_code: Option<i32>,
         stderr_tail: String,
     ) -> Option<PendingExit> {
-        self.begin_exit_keeping(thread, generation, exit_code, stderr_tail, None)
+        self.begin_exit_keeping(thread, generation, (exit_code, stderr_tail), None, false)
     }
 
     /// [`Core::begin_exit`] of an exit a runner connection brought (its `exited` frame, or a
@@ -323,7 +351,28 @@ impl Core {
         stderr_tail: String,
         fence: &Fence,
     ) -> Option<PendingExit> {
-        self.begin_exit_keeping(thread, generation, exit_code, stderr_tail, Some(fence))
+        self.begin_exit_keeping(
+            thread,
+            generation,
+            (exit_code, stderr_tail),
+            Some(fence),
+            false,
+        )
+    }
+
+    /// [`Core::begin_exit_on`] of an `exited` frame: `runner_stopped` when the box's runner
+    /// says it stopped the runtime as it stopped itself
+    /// ([`twr_core::runner::EXIT_RUNNER_STOPPED`]). Such an exit that no one asked for (no
+    /// stop, park or attach) closes as [`Exit::BoxStopped`], not as a crash.
+    pub(super) fn begin_runner_exit(
+        &mut self,
+        thread: &str,
+        generation: u64,
+        exit: (Option<i32>, String),
+        fence: &Fence,
+        runner_stopped: bool,
+    ) -> Option<PendingExit> {
+        self.begin_exit_keeping(thread, generation, exit, Some(fence), runner_stopped)
     }
 
     /// Puts back the runtimes of the exits whose connection proved a token its box no longer
@@ -353,9 +402,9 @@ impl Core {
         &mut self,
         thread: &str,
         generation: u64,
-        exit_code: Option<i32>,
-        stderr_tail: String,
+        (exit_code, stderr_tail): (Option<i32>, String),
         fence: Option<&Fence>,
+        runner_stopped: bool,
     ) -> Option<PendingExit> {
         let continue_after_compaction = self
             .registry
@@ -379,13 +428,17 @@ impl Core {
             None
         };
         let parking = park.is_some();
-        let crash = attach_client.is_none() && !parking && !stopped;
+        // Ended with its box's runner, which stopped it: no crash (unless the hub had given up
+        // on it: that is its own failure).
+        let with_box = runner_stopped && given_up.is_none();
+        let crash = attach_client.is_none() && !parking && !stopped && !with_box;
         let exit = match (&attach_client, park) {
             (Some(client), _) => Exit::Attach {
                 client: client.clone(),
             },
             (None, Some(park)) => park,
             (None, None) if stopped => Exit::Stopped,
+            (None, None) if with_box => Exit::BoxStopped,
             (None, None) => Exit::Crashed {
                 exit_code,
                 stderr_tail: given_up.clone().unwrap_or(stderr_tail),
@@ -429,7 +482,12 @@ impl Core {
         if self.runtime_gen(thread) != exit.log_runtime {
             return None;
         }
-        if exit.crash && self.rt.get(thread).is_some_and(|r| r.stop_requested) {
+        let stop_requested = self.rt.get(thread).is_some_and(|r| r.stop_requested);
+        if stop_requested && matches!(exit.exit, Exit::BoxStopped) {
+            exit.exit = Exit::Stopped;
+            exit.stopped = true;
+        }
+        if exit.crash && stop_requested {
             exit.exit = Exit::Stopped;
             exit.crash = false;
             exit.stopped = true;

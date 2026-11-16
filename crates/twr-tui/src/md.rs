@@ -14,8 +14,9 @@ use ratatui::text::{Line, Span};
 use crate::edit::{cluster_width, clusters};
 use crate::select::Join;
 
-/// Inline code and the text of code blocks.
-pub const CODE: Color = Color::Indexed(153);
+/// Inline code and the text of code blocks: a steel blue that reads on a dark terminal and a
+/// light one ([`crate::color::CODE`]).
+pub const CODE: Color = crate::color::CODE;
 
 /// Dim text: rules, quote bars, link targets.
 const DIM: Color = Color::DarkGray;

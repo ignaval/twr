@@ -102,7 +102,7 @@ use twr_core::event::{EventBody, ACP_COMMAND_KEY};
 use twr_core::git::{GitOps, WorktreeSpec};
 use twr_core::runner::{
     cmd_errors, AttachInfo, CmdError, CmdResult, Op, RunnerMsg, RunningSession, WireRemoveOutcome,
-    WireWorktreeCreated, MAX_FRAME_BYTES,
+    WireWorktreeCreated, EXIT_RUNNER_STOPPED, MAX_FRAME_BYTES,
 };
 
 use crate::agents::{BoxAgents, BoxEnv};
@@ -116,6 +116,19 @@ use crate::workdirs::WorkdirUse;
 
 /// Looks an adapter up by runtime name.
 pub type AdapterLookup = Arc<dyn Fn(&str) -> Option<Arc<dyn Adapter>> + Send + Sync>;
+
+/// Whether `op` is one of the loop ops ([`crate::loops`]).
+fn is_loop_op(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::LoopGit { .. }
+            | Op::LoopFiles { .. }
+            | Op::LoopRun { .. }
+            | Op::LoopRunWait { .. }
+            | Op::LoopRunCancel { .. }
+            | Op::LoopForget { .. }
+    )
+}
 
 /// Room left in a frame for the `rseq` digits and framing.
 const FRAME_MARGIN: usize = 64;
@@ -176,6 +189,9 @@ pub struct LocalBoxOptions {
     /// agent CLIs: [`crate::agents`]); none by default, a runner's asks both
     /// ([`crate::RunnerOptions::box_options`]).
     pub env: BoxEnv,
+    /// Where the box keeps its copies of loop folders (`<data_dir>/loops`,
+    /// [`crate::loops::folder`]).
+    pub loops: PathBuf,
 }
 
 impl std::fmt::Debug for LocalBoxOptions {
@@ -213,6 +229,7 @@ impl LocalBoxOptions {
             git: LocalGit::default(),
             machine_lock: None,
             env: BoxEnv::none(),
+            loops: data_dir.join("loops"),
         }
     }
 }
@@ -236,6 +253,10 @@ struct Live {
     process: Option<StaleProcess>,
     /// Its use of where it runs (its spawn `cwd`): never removed under it.
     _workdir: Option<WorkdirUse>,
+    /// The runner stopped it because the runner itself is stopping ([`LocalBox::stop_all`]):
+    /// its `exited` frame says so ([`EXIT_RUNNER_STOPPED`]), so the hub records a clean end
+    /// with the box's runner, not a crash.
+    runner_stopped: bool,
 }
 
 /// State the pumps share with the box. Pumps hold it weakly: dropping the box closes the
@@ -322,6 +343,8 @@ struct Inner {
     receipt_hold: Mutex<Option<std::sync::mpsc::Sender<ChangeReceiptPause>>>,
     /// The login shell's `PATH` and the agents ([`crate::agents`]).
     agents: BoxAgents,
+    /// The loops' review runs on this box ([`crate::loops::runs`]).
+    loop_runs: crate::loops::runs::BoxRuns,
 }
 
 /// A repository change paused by [`LocalBox::hold_change_receipts`] (tests) as the
@@ -432,6 +455,9 @@ impl LocalBox {
         )?;
         let spool = Arc::new(Spool::open(&opts.spool_path, opts.spool_max_bytes)?);
         recover_runtimes(&spool)?;
+        // Review runs a runner that died left behind, and loop folders no hub used for long.
+        crate::loops::runs::reap_left(&opts.loops);
+        crate::loops::folder::prune(&opts.loops);
         let start_time = reap::own_start_time();
         Ok(LocalBox {
             inner: Arc::new(Inner {
@@ -469,6 +495,7 @@ impl LocalBox {
                 changes: watch::Sender::new(0),
                 receipt_hold: Mutex::new(None),
                 agents: BoxAgents::new(opts.env),
+                loop_runs: crate::loops::runs::BoxRuns::new(opts.loops),
             }),
         })
     }
@@ -477,6 +504,20 @@ impl LocalBox {
     /// answer; `None` when the box asks none or the shell gave none.
     pub async fn login_path(&self) -> Option<Arc<twr_adapters::resolve::LoginPath>> {
         self.inner.agents.login_path().await
+    }
+
+    /// What the box can do for loops, for the inventory ([`twr_core::runner::LoopsSupport`]).
+    pub fn loops_support(&self) -> twr_core::runner::LoopsSupport {
+        twr_core::runner::LoopsSupport {
+            version: twr_core::runner::LOOPS_VERSION,
+            dir: self.inner.loop_runs.loops().to_path_buf(),
+        }
+    }
+
+    /// The loops' review runs on this box ([`crate::loops::runs`]): a connection to the hub
+    /// numbers itself with them, and ends its runs when it is over.
+    pub fn loop_runs(&self) -> &crate::loops::runs::BoxRuns {
+        &self.inner.loop_runs
     }
 
     /// The box's agents as last probed (none before the first probe ended, or when the box
@@ -660,6 +701,20 @@ impl LocalBox {
             // Upload IDs, exact chunk offsets/data and terminal receipts provide their own
             // idempotence. Streaming chunks must not evict ordinary durable command results.
             let _permit = self.inner.upload_permits.acquire().await.ok();
+            return CmdResult::new(cmd_id, self.execute(op).await);
+        }
+        // The loop ops are reads, writes of whole files, and runs named by the hub's own run
+        // id ([`crate::loops`]): none is recorded (a repeat does what the first did, or reports
+        // the same run), so a large diff or log never lands in the spool. Git reads take an
+        // ordinary slot. File writes take none: the connection's reader runs them in order,
+        // ahead of the prompt that follows them, and must not wait behind the box's git. A
+        // wait for a run, its start and its end take none either, so runs waited for never
+        // hold up the box's git.
+        if is_loop_op(&op) {
+            let _permit = match &op {
+                Op::LoopGit { .. } => self.inner.op_permits.acquire().await.ok(),
+                _ => None,
+            };
             return CmdResult::new(cmd_id, self.execute(op).await);
         }
 
@@ -1117,6 +1172,59 @@ impl LocalBox {
                 })
             }
             // As last probed, unless asked for a fresh look (or none was made yet).
+            Op::LoopGit { query } => {
+                crate::loops::git_answer(git, self.inner.loop_runs.loops(), query).await
+            }
+            Op::LoopFiles {
+                loop_id,
+                files,
+                read,
+                max,
+            } => crate::loops::folder::files(
+                self.inner.loop_runs.loops(),
+                &loop_id,
+                &files,
+                &read,
+                max,
+            ),
+            Op::LoopRun { loop_id, run, spec } => {
+                let login = self.login_path().await;
+                let agents = &self.inner.agents;
+                let cwd = spec.cwd.clone();
+                let resolve = |runtime: &str| {
+                    let program =
+                        twr_adapters::resolve::runtime_program(runtime, |k| agents.bin_var(k));
+                    let path = twr_adapters::resolve::runtime_path(&[], login.as_deref());
+                    match program {
+                        Some(program) => {
+                            let r = twr_adapters::resolve::resolve(
+                                &program,
+                                &[],
+                                login.as_deref(),
+                                &cwd,
+                            );
+                            (Some(r.found.unwrap_or(program)), r.path)
+                        }
+                        None => (None, path),
+                    }
+                };
+                self.inner
+                    .loop_runs
+                    .start(&loop_id, &run, spec.clone(), &resolve)
+                    .map(|s| json!(s))
+            }
+            Op::LoopRunWait { run, wait_ms } => {
+                Ok(json!(self.inner.loop_runs.wait(&run, wait_ms).await))
+            }
+            Op::LoopRunCancel { run, why } => {
+                Ok(json!(self.inner.loop_runs.cancel(&run, &why).await))
+            }
+            Op::LoopForget { loop_id } => self
+                .inner
+                .loop_runs
+                .forget(&loop_id)
+                .await
+                .map(|()| Value::Null),
             Op::Agents { refresh } => {
                 let agents = if refresh || !self.inner.agents.probed() {
                     self.probe_agents().await
@@ -1305,6 +1413,7 @@ impl LocalBox {
                 overflow: None,
                 process: None,
                 _workdir: workdir,
+                runner_stopped: false,
             },
         );
         tracing::info!(thread, runtime, "runtime started");
@@ -1316,10 +1425,12 @@ impl LocalBox {
         self.inner.shared.sessions().len()
     }
 
-    /// Asks every runtime to stop (their exits are spooled as they happen).
+    /// Asks every runtime to stop because the runner is stopping (their exits are spooled as
+    /// they happen, each saying it ended with the runner: [`EXIT_RUNNER_STOPPED`]).
     pub fn stop_all(&self) {
-        for (thread, live) in self.inner.shared.sessions().iter() {
+        for (thread, live) in self.inner.shared.sessions().iter_mut() {
             tracing::info!(thread = %thread, "stopping runtime");
+            live.runner_stopped = true;
             let _ = live.cmd.send(AdapterCmd::Stop);
         }
     }
@@ -1359,15 +1470,17 @@ impl LocalBox {
                 tracing::error!(thread = %thread, "runtime still runs after being killed; leaving it to the next runner start");
                 continue;
             }
-            // A runtime stopped for a spool overflow ends for that reason.
+            // A runtime stopped for a spool overflow ends for that reason; any other ended with
+            // the runner, which stopped it.
+            let reason = (overflow.is_none() && live.runner_stopped).then_some(EXIT_RUNNER_STOPPED);
             let tail = overflow
                 .unwrap_or_else(|| "twr runner: shut down before the runtime exited".into());
             spool_exit(
                 shared,
                 thread,
-                None,
-                &tail,
+                (None, &tail),
                 Some(&run),
+                reason,
                 RuntimeChange::Ended,
             )
             .await;
@@ -1394,13 +1507,13 @@ fn mark(cfg: &mut SpawnConfig, run: &str) {
         .push((reap::RUNTIME_GEN_ENV.to_string(), run.to_string()));
 }
 
-/// The `exited` frame text.
+/// The `exited` frame text (`reason`: [`RunnerMsg::Exited`]'s).
 fn exit_frame(
     thread: &str,
     rseq: u64,
-    code: Option<i32>,
-    stderr_tail: &str,
+    (code, stderr_tail): (Option<i32>, &str),
     run: Option<&str>,
+    reason: Option<&str>,
 ) -> String {
     serde_json::to_string(&RunnerMsg::Exited {
         thread: thread.to_string(),
@@ -1409,6 +1522,7 @@ fn exit_frame(
         stderr_tail: stderr_tail.to_string(),
         run: run.map(str::to_string),
         at_ms: now_ms(),
+        reason: reason.map(str::to_string),
     })
     .unwrap_or_default()
 }
@@ -1428,9 +1542,9 @@ fn now_ms() -> Option<u64> {
 async fn spool_exit(
     shared: &Shared,
     thread: &str,
-    code: Option<i32>,
-    stderr_tail: &str,
+    (code, stderr_tail): (Option<i32>, &str),
     run: Option<&str>,
+    reason: Option<&str>,
     change: RuntimeChange,
 ) -> bool {
     let mut delays = SPOOL_RETRY.iter();
@@ -1438,7 +1552,7 @@ async fn spool_exit(
         let r = shared.spool.append_with(
             thread,
             true,
-            |rseq| exit_frame(thread, rseq, code, stderr_tail, run),
+            |rseq| exit_frame(thread, rseq, (code, stderr_tail), run, reason),
             change.clone(),
         );
         let e = match r {
@@ -1567,7 +1681,7 @@ fn recover_runtimes(spool: &Spool) -> anyhow::Result<()> {
         spool.append_with(
             &i.thread,
             true,
-            |rseq| exit_frame(&i.thread, rseq, None, tail, None),
+            |rseq| exit_frame(&i.thread, rseq, (None, tail), None, None),
             RuntimeChange::Ended,
         )?;
     }
@@ -1604,7 +1718,7 @@ fn recover_runtimes(spool: &Spool) -> anyhow::Result<()> {
         spool.append_with(
             &r.thread,
             true,
-            |rseq| exit_frame(&r.thread, rseq, None, &tail, None),
+            |rseq| exit_frame(&r.thread, rseq, (None, &tail), None, None),
             RuntimeChange::Ended,
         )?;
     }
@@ -1825,15 +1939,23 @@ async fn finish_session(
     (gen, run): (u64, &str),
     code: Option<i32>,
     tail: &str,
+    overflowed: bool,
 ) {
     let mut delays = SPOOL_RETRY.iter();
     loop {
         let e = {
             let mut sessions = shared.sessions();
+            // Stopped by the runner as it stops (and not for an overflow): it ended with the
+            // runner ([`EXIT_RUNNER_STOPPED`]).
+            let reason = (!overflowed
+                && sessions
+                    .get(thread)
+                    .is_some_and(|l| l.gen == gen && l.runner_stopped))
+            .then_some(EXIT_RUNNER_STOPPED);
             let r = shared.spool.append_with(
                 thread,
                 true,
-                |rseq| exit_frame(thread, rseq, code, tail, Some(run)),
+                |rseq| exit_frame(thread, rseq, (code, tail), Some(run), reason),
                 RuntimeChange::Ended,
             );
             match r {
@@ -2180,13 +2302,14 @@ async fn pump(
                 )
             }
         };
+        let overflow = overflowed.is_some();
         let (code, tail) = match overflowed {
             // Stopped for the overflow: that is why it ended (its own tail follows).
             Some(why) if tail.trim().is_empty() => (None, why),
             Some(why) => (None, format!("{why}\n{tail}")),
             None => (code, tail),
         };
-        finish_session(&shared, &thread, (gen, &run), code, &tail).await;
+        finish_session(&shared, &thread, (gen, &run), code, &tail, overflow).await;
     }
     tracing::info!(thread = %thread, "runtime exited");
     shared.notify.notify_waiters();

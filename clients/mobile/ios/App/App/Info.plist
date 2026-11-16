@@ -62,6 +62,10 @@
 	</array>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
+	<!-- Export compliance: the app's only encryption is the system's (HTTPS, the Keychain,
+	     CryptoKit's AES-GCM for its own files), which is exempt. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSCameraUsageDescription</key>
 	<string>Scan a one-use hub invitation or attach a photo or video to a thread.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

@@ -5,6 +5,27 @@ use serde_json::{json, Value};
 use std::{path::Path, process::Stdio, time::Duration};
 use twr_core::{client::Client, paths::Paths};
 
+/// Refuses a hub connection whose `hello` answer did not make it the user's (`identity` is
+/// `user:...`). The hub stays authoritative: an agent-launched process is never disguised as a
+/// user. The error says why the hub counts it as an agent when the hub says so (`why`, the
+/// process and what of its ancestry made it one), else the identity it gave, so a refusal can
+/// be understood from the app's own message.
+pub fn ensure_user(hello: &Value) -> Result<()> {
+    let identity = hello["identity"].as_str().unwrap_or_default();
+    if identity.starts_with("user:") {
+        return Ok(());
+    }
+    let why = match (hello["why"].as_str(), identity) {
+        (Some(why), _) => format!(": it is {why}"),
+        (None, "") => String::new(),
+        (None, identity) => format!(" (it says {identity})"),
+    };
+    anyhow::bail!(
+        "The hub did not recognize this desktop process as your user{why}. Open twr from your \
+         desktop launcher."
+    )
+}
+
 enum Probe {
     Ready(Value),
     Absent,
@@ -43,12 +64,7 @@ async fn probe_inner(socket: &Path, connected: &mut bool) -> Result<Probe> {
     let result = async {
         let hello = c.hello(json!({"client":"desktop"})).await?;
         twr_core::trace::mark("desktop: hub probe authenticated");
-        anyhow::ensure!(
-            hello["identity"]
-                .as_str()
-                .is_some_and(|s| s.starts_with("user:")),
-            "Open twr from your desktop launcher; this process is not recognized as your user"
-        );
+        ensure_user(&hello)?;
         c.call("hub.info", json!({})).await
     }
     .await;
@@ -147,6 +163,33 @@ mod tests {
     use super::*;
     use tokio::{io::BufReader, net::UnixListener};
     use twr_core::proto::{read_frame, write_frame, Request, Response};
+
+    /// A `hello` that is not the user's is refused with the hub's reason, when it gives one,
+    /// else with the identity it gave; the user's passes.
+    #[test]
+    fn a_hello_that_is_not_the_users_is_refused_with_the_hubs_reason() {
+        assert!(ensure_user(&json!({"identity": "user:desktop"})).is_ok());
+        let why = "a process twr cannot trace (pid 7: the environment of pid 3, of its \
+                   ancestry, which would show TWR_AGENT, cannot be read), which counts as an agent";
+        let refused = |hello: Value| ensure_user(&hello).unwrap_err().to_string();
+        assert_eq!(
+            refused(json!({"identity": "agent:unknown", "why": why})),
+            format!(
+                "The hub did not recognize this desktop process as your user: it is {why}. \
+                 Open twr from your desktop launcher."
+            )
+        );
+        assert_eq!(
+            refused(json!({"identity": "agent:w1"})),
+            "The hub did not recognize this desktop process as your user (it says agent:w1). \
+             Open twr from your desktop launcher."
+        );
+        assert_eq!(
+            refused(json!({})),
+            "The hub did not recognize this desktop process as your user. Open twr from your \
+             desktop launcher."
+        );
+    }
 
     #[tokio::test]
     async fn running_hub_with_a_slow_greeting_is_not_mistaken_for_startup() {

@@ -27,6 +27,11 @@ pub mod icon;
 pub mod keys;
 #[cfg(test)]
 mod long_card_tests;
+pub mod loops;
+#[cfg(test)]
+mod loops_acp_tests;
+#[cfg(test)]
+mod loops_tests;
 pub mod md;
 pub mod notify;
 pub mod order;
@@ -459,7 +464,9 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         | Action::SettingsFile
         | Action::TerminalSetup { .. } => None,
         Action::ConfigShow => Some(("config.show", Value::Null)),
-        Action::Speech { method, params } => Some((*method, params.clone())),
+        Action::Speech { method, params } | Action::Loop { method, params } => {
+            Some((*method, params.clone()))
+        }
         // The revision of the card on screen: an item raised again since (it may ask
         // something else now) is not answered by this key (`conflict`).
         Action::Respond {
@@ -594,6 +601,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             name,
             account,
             outside_pin,
+            implement,
         } => {
             let mut p = json!({ "project": project_param(project) });
             if let Some(r) = runtime {
@@ -607,6 +615,14 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             if *outside_pin {
                 p["outside_pin"] = json!(true);
+            }
+            // `/new … --implement [--setup] <task>`: the task is the thread's first prompt, run
+            // as an implementation loop (`loop {kind, task, setup?}`).
+            if let Some(l) = implement {
+                p["loop"] = json!({ "kind": "implement", "task": l.task });
+                if l.setup {
+                    p["loop"]["setup"] = json!(true);
+                }
             }
             Some(("thread.new", p))
         }
@@ -2300,8 +2316,9 @@ async fn serve_calls(
         let named = params["ref"].clone();
         let named_job = params["job"].clone();
         // What a `speech.*` call asked goes with its answer: the words for what it did need
-        // it ([`speech::SpeechView::answered`]).
+        // it ([`speech::SpeechView::answered`]). So does a `loop.*` call's.
         let asked = method.starts_with("speech.").then(|| params.clone());
+        let loop_asked = method.starts_with("loop.").then(|| params.clone());
         let answer = calls.call(method, params).await;
         if let (Some(n), Ok(r)) = (launch, &answer) {
             if !r["job"].is_null() {
@@ -2310,6 +2327,19 @@ async fn serve_calls(
                     launched.pop_front();
                 }
             }
+        }
+        // A loop call's answer, or its failure, is the view's to tell
+        // ([`AppState::loop_result`]): the status bar, the editor, the card to select.
+        if let Some(asked) = loop_asked {
+            let said = results.view.send((method, loop_answer(asked, &answer)));
+            // The view that asked is gone: a failure is said where the TUI is now (not the
+            // profiles' read, which nobody asked for).
+            if let (Err(_), Err(e)) = (said, &answer) {
+                if method != "loop.settings.get" {
+                    status.send((error_status(method, &format!("{e:#}")), false));
+                }
+            }
+            continue;
         }
         if let Some(asked) = asked {
             let said = results.view.send((method, speech::answer(asked, &answer)));
@@ -2379,6 +2409,23 @@ async fn serve_calls(
         }
     }
     launched
+}
+
+/// A `loop.*` call's answer for the view ([`AppState::loop_result`]): what it asked (`asked`)
+/// with its `result`, or, failed, `failed`, the hub's error `code` and its message (`error`).
+fn loop_answer(asked: Value, answer: &anyhow::Result<Value>) -> Value {
+    match answer {
+        Ok(r) => json!({ "asked": asked, "result": r }),
+        Err(e) => {
+            let rpc = e.downcast_ref::<twr_core::proto::RpcError>();
+            json!({
+                "asked": asked,
+                "failed": true,
+                "code": rpc.map(|r| r.code.clone()),
+                "error": rpc.map_or_else(|| format!("{e:#}"), |r| r.message.clone()),
+            })
+        }
+    }
 }
 
 /// Why [`drive`] returned.
@@ -3246,6 +3293,16 @@ where
                     _ => Value::Null,
                 };
                 let _ = call_tx.send((method, params));
+            }
+            // The loop profiles, once per connection and after the saved settings changed;
+            // and what a loop answer asked for (a setup card read again).
+            if let Some(params) = state.loop_settings_call() {
+                let _ = call_tx.send(("loop.settings.get", params));
+            }
+            for action in state.take_loop_calls() {
+                if let Some(req) = action_request(&action) {
+                    let _ = call_tx.send(req);
+                }
             }
             for (attn, revision, raise) in state.hydration_due(std::time::Instant::now()) {
                 let (socket, tx) = (socket.clone(), hyd_tx.clone());
@@ -6016,6 +6073,7 @@ mod tests {
             name: Some("api2".into()),
             account: None,
             outside_pin: false,
+            implement: None,
         })
         .unwrap();
         assert_eq!(

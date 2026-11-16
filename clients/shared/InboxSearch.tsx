@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowDown, ArrowUp, Search } from "lucide-react";
 import type { Attention, HubEvent, InboxSource, Json, Thread } from "./types";
 import { Dialog, Empty, Markdown, Spinner } from "./ui";
+import { requestLine } from "./loops";
 import { errorMessage } from "./errors";
 import { announce, scrollBehavior } from "./a11y";
 import "./inbox-search.css";
@@ -9,6 +10,8 @@ import "./inbox-search.css";
 export type InboxFilter =
   "all" | "permission" | "question" | "completion" | "other";
 export function inboxCategory(item: Attention): Exclude<InboxFilter, "all"> {
+  // A loop's setup card and a stuck loop's item ask the user to choose, as questions do.
+  if (item.loop_setup || item.loop_stuck) return "question";
   if (item.reason === "permission" || item.reason === "question")
     return item.reason;
   return item.reason === "review" ? "completion" : "other";
@@ -256,7 +259,7 @@ export function NeedsYouInbox({
                         </b>
                         <span className="visually-hidden">, </span>
                         <span>
-                          {inboxCategory(item)} · {item.summary}
+                          {inboxCategory(item)} · {requestLine(item)}
                         </span>
                         <span className="visually-hidden">. </span>
                         <small>Open {group.workspace}</small>

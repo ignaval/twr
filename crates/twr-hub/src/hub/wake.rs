@@ -199,6 +199,9 @@ impl Core {
     /// Wake bookkeeping for one applied event (live and on replay); see the module docs.
     pub(super) fn track_wake(&mut self, ev: &Event) {
         match &ev.body {
+            // A loop's review run is the loop's: its end asks the thread itself
+            // (`hub::loops`), so it wakes nothing, nor waits.
+            EventBody::TaskUpdated(p) if p.task_id.starts_with(LOOP_TASK_PREFIX) => {}
             EventBody::TaskUpdated(p) if !p.running => {
                 if is_shell_job(p) {
                     return;

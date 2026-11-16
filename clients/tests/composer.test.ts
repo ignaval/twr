@@ -731,3 +731,156 @@ describe("the message box, at its edges", () => {
     expect(saved()?.["default:orchestrator"]).toBe("queued and more");
   });
 });
+
+/* Send as implementation loop and /implement (docs/design/loops.md › Desktop and mobile):
+ * the message box's other way to send, while its destination is a thread. */
+describe("implementation loops from the message box", () => {
+  /** What the hub was asked for, by method. */
+  const asked: { method: string; params: Json }[] = [];
+  let answer: Json = { status: "started", loop: { line: "high · plan" } };
+  const loopHost = async () =>
+    mount({
+      rpc: (method, params) => {
+        if (method === "loop.request") {
+          asked.push({ method, params });
+          return Promise.resolve(answer);
+        }
+        if (method === "loop.get")
+          return Promise.resolve({ started: null, id: "l1" });
+        if (method === "desktop.parse_slash") {
+          const words = String(params.line).trim().split(/\s+/);
+          if (words[0] === "/implement")
+            return Promise.resolve({
+              kind: "Implement",
+              args: { words: words.slice(1), setup: false },
+            });
+          if (words[0] === "/loop")
+            return Promise.reject(
+              new Error(
+                "/loop never starts a loop: use /implement <task> or /review",
+              ),
+            );
+        }
+        return undefined;
+      },
+    });
+  beforeEach(async () => {
+    vi.resetModules();
+    asked.length = 0;
+    answer = { status: "started", loop: { line: "high · plan" } };
+    mounted = await loopHost();
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const sendAsLoop = async () => {
+    await app().click(app().find(".send-caret"));
+    await app().click(
+      app().find(".send-loop-panel button", "Send as implementation loop"),
+    );
+  };
+
+  it("offers it only when the message goes to a thread", async () => {
+    expect(app().all(".send-caret")).toHaveLength(0);
+    await app().talkTo("builder");
+    const caret = app().find(".send-caret");
+    expect(caret.getAttribute("aria-label")).toBe("More ways to send");
+    expect(caret.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("sends the message as the task of a loop on that thread, live", async () => {
+    await app().talkTo("builder");
+    await app().type("add a CSV export");
+    await sendAsLoop();
+    expect(asked).toEqual([
+      {
+        method: "loop.request",
+        params: { thread: "w1", kind: "implement", task: "add a CSV export" },
+      },
+    ]);
+    // Never an ordinary message, never the outbox.
+    expect(app().host.sent).toEqual([]);
+    expect(app().box().value).toBe("");
+    expect(app().find(".notice-toast").textContent).toContain(
+      "builder started an implementation loop: high · plan.",
+    );
+  });
+
+  it("keeps the message while the loop's setup card holds it", async () => {
+    answer = { status: "needs_setup", attn_id: "a1", revision: 1 };
+    await app().talkTo("builder");
+    await app().type("add a CSV export");
+    await sendAsLoop();
+    expect(asked).toHaveLength(1);
+    expect(app().find(".notice-toast").textContent).toContain(
+      "Choose builder's loop settings on its setup card: it holds your task",
+    );
+  });
+
+  it("asks before starting on an empty message, whose task is the conversation's", async () => {
+    await app().talkTo("builder");
+    await sendAsLoop();
+    expect(asked).toEqual([]);
+    const dialog = app().find("[role=dialog]");
+    expect(dialog.textContent).toContain(
+      "Start an implementation loop on builder with no task?",
+    );
+    await app().click(app().find("[role=dialog] button", "Start loop"));
+    expect(asked).toEqual([
+      { method: "loop.request", params: { thread: "w1", kind: "implement" } },
+    ]);
+  });
+
+  it("can't be chosen without a live connection, and says why", async () => {
+    await app().talkTo("builder");
+    await app().type("add a CSV export");
+    await app().connection(false);
+    await app().click(app().find(".send-caret"));
+    const choice = app().find(
+      ".send-loop-panel button",
+      "Send as implementation loop",
+    );
+    expect(choice.hasAttribute("disabled")).toBe(true);
+    expect(app().find(".send-loop-panel small").textContent).toContain(
+      "Loop actions need a live connection",
+    );
+    expect(asked).toEqual([]);
+    expect(app().box().value).toBe("add a CSV export");
+  });
+
+  it("runs /implement in a thread's conversation with every word as the task", async () => {
+    await app().talkTo("builder");
+    await app().type("/implement tester pages faster");
+    await app().press("Enter");
+    expect(asked).toEqual([
+      {
+        method: "loop.request",
+        params: {
+          thread: "w1",
+          kind: "implement",
+          task: "tester pages faster",
+        },
+      },
+    ]);
+  });
+
+  it("runs /implement elsewhere on the thread its first word names", async () => {
+    await app().type("/implement tester pages faster");
+    await app().press("Enter");
+    expect(asked).toEqual([
+      {
+        method: "loop.request",
+        params: { thread: "w2", kind: "implement", task: "pages faster" },
+      },
+    ]);
+  });
+
+  it("shows the core's message for /loop that does nothing", async () => {
+    await app().type("/loop implement");
+    await app().press("Enter");
+    expect(asked).toEqual([]);
+    expect(app().find("[role=alert]").textContent).toContain(
+      "use /implement <task> or /review",
+    );
+  });
+});

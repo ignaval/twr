@@ -16,6 +16,25 @@ The reap, attach and agent tests start `sleep` and `sh` with marker variables an
 
 Tests that compare paths twr reports resolved with the temporary directories they make resolve those first: macOS's `$TMPDIR` is under `/var`, a link to `/private/var`. CI's macOS job also points `TMPDIR` at a directory with no links in its path.
 
+## Tests keep to temporary directories
+
+A test writes only under directories it made for itself (`tempfile`), never in your own: twr's state, data and config directories (`~/.local/state/twr`, `~/.local/share/twr`, `~/.config/twr`, `~/Library/Application Support/twr*`) belong to the hub and desktop app you run. The code under test gets its directories from the test:
+
+- A hub in a test gets its data directory and config in `HubOptions`, and a CLI test runs `twr` with a temporary `TWR_HOME`, which moves everything of twr's there: config, data, socket, and a `twr runner`'s machine lock (`$TWR_HOME/runner-locks/`).
+- The runner library never finds a path in your directories by itself. A box's machine lock is `RunnerOptions::machine_lock`, which `twr runner` sets to the one in your state directory (`twr_runner::client::machine_lock_path`), and which is `None` in the options a test builds, so a test's runner takes no machine lock unless it names one under its own directory (`twr_runner::client::machine_lock_in`). A test checks that options built as tests build them take none. Before this, each run of the runner tests left an empty `gpu-<hash>.lock` in `~/.local/state/twr/runner-locks/`, one per test hub's port.
+- Resolving the standard locations from the environment (`twr_core::paths::Paths::from_env`, `machine_lock_path`) is for the binaries; a test passes its own environment to the `_in` / `resolve` variants instead of setting process-wide variables, which would race with the tests running beside it.
+
+To check a change against this, run the whole suite with a throwaway home and look at what appears there:
+
+```sh
+mkdir -p /tmp/twr-home-check
+CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup GIT_CONFIG_GLOBAL=$HOME/.gitconfig HOME=/tmp/twr-home-check \
+  cargo test --workspace --locked --no-fail-fast
+find /tmp/twr-home-check
+```
+
+Nothing of twr's should be there. On macOS the Command Line Tools' `python3`, which some tests run as a fake agent, keeps its own bytecode cache in `~/Library/Caches/com.apple.python`; that is Python's, not twr's.
+
 ## Disk usage
 
 Each twr worktree builds into its own `target/`, so several threads working on twr at once can fill a disk. Measured on Linux with Rust 1.98, a full `cargo test --workspace --no-run` followed by one edit-and-rebuild of `twr-hub` (what an agent does all day):
@@ -201,6 +220,8 @@ Work lands on `dev` through pull requests. `main` moves through pull requests fr
 4. The workflow builds static musl binaries for Linux x86_64 and aarch64 with cargo-zigbuild, and macOS builds for Apple silicon and Intel with a deployment target of 11.0.
 5. Each archive holds `twr`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES.html` (generated with cargo-about from the dependency graph), `README.md` and `docs/` without `docs/tools/`.
 6. The release job writes `sha256sums.txt` (a line naming the release, `# twr release <tag>`, then the checksums of the archives and of the tagged commit's `install.sh`) and signs it and that `install.sh` with the release key (the `release` environment's secret `TWR_RELEASE_SIGNING_KEY`; without it the release fails), signs `sha256sums.txt` with the P-256 key too when there is one ([A P-256 release key](#a-p-256-release-key)), adds build provenance attestations for the four archives (`actions/attest-build-provenance`), and publishes a GitHub Release with `twr-<target>.tar.gz` for each target, `sha256sums.txt`, `install.sh`, their `.sig` files and install instructions, verification included. For a stable release, `desktop.yml` then builds the desktop installers from the same commit, without restoring any cache, and the `desktop-release` job checks them, writes `desktop-sha256sums.txt` (`# twr desktop release <tag>`, then their checksums), signs it with the same key into `desktop-sha256sums.txt.sig`, adds a build provenance attestation for every installer it lists, and attaches them all to the release.
+
+The phone apps are not part of this: their store builds are made and uploaded separately, from `main`, with `.github/workflows/mobile-release.yml` ([mobile.md](mobile.md#publishing)).
 
 A tag with a `-`, such as `v0.2.0-rc.1`, makes a prerelease, which `install.sh` skips unless `TWR_VERSION` names it. Running the workflow by hand with an existing tag rebuilds it and replaces the release's files; a draft release that an interrupted run left behind is published then. That only works when it's started from `main`. A run started from any other branch fails, because a branch could carry a modified workflow.
 

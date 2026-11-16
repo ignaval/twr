@@ -727,7 +727,7 @@ fn render_buttons(frame: &mut Frame, buttons: Rect, panes: &mut Panes, selected:
         let style = if selected == Some(&row) {
             crate::ui::selected_fill()
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(crate::color::LABEL)
         };
         let label = format!(" {text}");
         let pad = width.saturating_sub(crate::edit::width(&label));
@@ -802,9 +802,18 @@ fn card_rows(
     if let TabHub::Running { running, .. } = hub {
         let waiting = hub.waiting();
         if waiting > 0 {
+            // Waiting on you: the state's amber; a fill on the current card's reverse video;
+            // the selection's black on its yellow.
+            let waits = name_style.fg(crate::color::WAITING);
             badges.push(Span::styled(
                 format!(" ⚠{waiting}"),
-                name_style.fg(Color::Yellow),
+                if selected {
+                    name_style
+                } else if current {
+                    crate::ui::lit(waits)
+                } else {
+                    waits
+                },
             ));
         }
         if running > 0 {
@@ -887,7 +896,8 @@ fn worker_rows(state: &AppState, tab: &Tab, width: usize, max: usize) -> Vec<Lin
                         .fg(crate::color::color_of(w.color, &w.id))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" · {word}"), style),
+                Span::styled(" · ", dim),
+                Span::styled(word, style),
             ];
             Line::from(crate::ui::cut_spans(spans, width))
         })
@@ -925,7 +935,7 @@ fn status_word(s: ThreadStatus) -> (&'static str, Style) {
         ThreadStatus::Waiting => (
             "waiting on you",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(crate::color::WAITING)
                 .add_modifier(Modifier::BOLD),
         ),
         ThreadStatus::Error => ("failed", Style::default().fg(Color::Red)),
@@ -1187,7 +1197,7 @@ fn render_phone_buttons(
     };
     let off = Style::default()
         .fg(Color::Indexed(252))
-        .bg(Color::Indexed(238));
+        .bg(crate::color::BAND_ALT);
     for (area, row, text, target) in [
         (new, WsRow::New, "+ New workspace", Target::NewWorkspace),
         (settings, WsRow::Settings, "⚙ Settings", Target::Settings),
@@ -1235,7 +1245,7 @@ pub fn status_text(hub: TabHub, glance: Option<&Glance>) -> (String, Style) {
         return (
             with_work("waiting on you"),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(crate::color::WAITING)
                 .add_modifier(Modifier::BOLD),
         );
     }
@@ -1248,7 +1258,7 @@ pub fn status_text(hub: TabHub, glance: Option<&Glance>) -> (String, Style) {
             Some(ThreadStatus::Background) => "running in the background",
             _ => "working",
         };
-        return (text.into(), Style::default().fg(Color::Green));
+        return (text.into(), Style::default().fg(crate::color::RUNNING));
     }
     match status {
         Some(ThreadStatus::Attached) => ("attached".into(), Style::default()),
@@ -1393,6 +1403,7 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(crate::color::LABEL))
         .title(" new workspace ")
         .title(crate::ui::close_title());
     let inner = block.inner(rect);
@@ -1694,17 +1705,17 @@ pub(crate) mod tests {
             workers: None,
         };
         for (status, want, color) in [
-            (ThreadStatus::Idle, "working", Color::Green),
-            (ThreadStatus::Running, "running", Color::Green),
+            (ThreadStatus::Idle, "working", crate::color::RUNNING),
+            (ThreadStatus::Running, "running", crate::color::RUNNING),
             (
                 ThreadStatus::Background,
                 "running in the background",
-                Color::Green,
+                crate::color::RUNNING,
             ),
             (
                 ThreadStatus::Waiting,
                 "working · waiting on you",
-                Color::Yellow,
+                crate::color::WAITING,
             ),
             (ThreadStatus::Error, "working · failed", Color::Red),
         ] {

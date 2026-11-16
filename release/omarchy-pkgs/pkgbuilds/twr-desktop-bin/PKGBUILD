@@ -1,0 +1,52 @@
+# Maintainer: Ignacio Valdivieso
+
+# twr publishes this archive with every stable release: the Electron app, its
+# native terminal module and the twr engines, built on the Ubuntu 22.04 ABI. It
+# is the archive twr's own Arch package and its AUR recipe install, so the
+# files match theirs and the app never uses a system Electron.
+
+pkgname=twr-desktop-bin
+pkgver=0.4.0
+pkgrel=1
+pkgdesc='One conversation for all your coding agents (desktop app)'
+arch=('x86_64')
+url='https://github.com/ignaval/twr'
+license=('Apache-2.0')
+depends=(
+  'alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'expat' 'git' 'glib2' 'glibc'
+  'gtk3' 'hicolor-icon-theme' 'libcups' 'libgcc' 'libsecret' 'libstdc++'
+  'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext' 'libxfixes'
+  'libxkbcommon' 'libxrandr' 'mesa' 'nspr' 'nss' 'pango' 'systemd-libs'
+)
+optdepends=(
+  'gnome-keyring: encrypted saved hubs and offline history'
+  'kwallet: alternative secret service'
+  'openssh: remote boxes'
+  'speech-dispatcher: Linux read aloud'
+  'xdg-utils: open links in your browser'
+)
+provides=('twr-desktop')
+conflicts=('twr-desktop')
+options=('!strip' '!debug')
+source=("twr-desktop-${pkgver}-linux-x64.tar.gz::https://github.com/ignaval/twr/releases/download/v${pkgver}/twr-desktop-${pkgver}-linux-x64.tar.gz")
+noextract=("twr-desktop-${pkgver}-linux-x64.tar.gz")
+sha256sums=('0d06b5f3eb1ebafed2a7e291c467d7e856e2c98f3316da01c2fc881726c38c68')
+
+package() {
+  install -dm755 "$pkgdir/opt" "$pkgdir/usr/bin"
+  bsdtar --no-same-owner -xf "twr-desktop-${pkgver}-linux-x64.tar.gz" -C "$pkgdir/opt"
+  local app="$pkgdir/opt/twr-desktop"
+  # Chromium's sandbox stays on: its helper is setuid root, as Chromium requires.
+  chmod 4755 "$app/chrome-sandbox"
+  # The launcher passes the window class Hyprland rules match: tools.twr.desktop.
+  install -Dm755 "$app/packaging/twr-desktop" "$pkgdir/usr/bin/twr-desktop"
+  ln -s /opt/twr-desktop/resources/bin/twr-mobile-gateway "$pkgdir/usr/bin/twr-mobile-gateway"
+  install -Dm644 "$app/packaging/tools.twr.desktop.desktop" \
+    "$pkgdir/usr/share/applications/tools.twr.desktop.desktop"
+  install -Dm644 "$app/packaging/icon.svg" \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/tools.twr.desktop.svg"
+  install -Dm644 "$app/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$app/NOTICE" "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
+  install -Dm644 "$app/resources/THIRD-PARTY-LICENSES.html" \
+    "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-LICENSES.html"
+}

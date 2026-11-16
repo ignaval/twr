@@ -40,6 +40,9 @@ impl AppState {
             went_on,
             delete_cards,
             capped,
+            // (The saved loop settings: the loop settings editor asks the hub for them,
+            // `loop.settings.get`, with what the runtimes offer.)
+            loop_settings: _,
             last_gseq: _,
         } = fold;
         self.registry = registry;

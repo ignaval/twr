@@ -23,6 +23,8 @@ export interface Field {
   description?: string;
   initial?: any;
   advanced?: boolean;
+  /** A `boolean` field drawn as a switch (`role="switch"`): it turns a mode on. */
+  switch?: boolean;
 }
 export interface Command {
   id: string;
@@ -120,6 +122,21 @@ export const commands: Command[] = [
         placeholder: "Project name or /path/to/repository",
       }),
       f("name", "Name", { placeholder: "e.g. api-health-check" }),
+      f("prompt", "First prompt", {
+        type: "textarea",
+        placeholder: "What the thread should do first (optional)",
+        description:
+          "Sent to the thread once it exists. With Run as an implementation loop on, it is the loop's task, and required.",
+      }),
+      f("implement", "Run as an implementation loop", {
+        type: "boolean",
+        switch: true,
+      }),
+      f("loop_setup", "Show the loop's setup card first", {
+        type: "boolean",
+        description:
+          "Check or change the models before the loop starts, even with saved settings.",
+      }),
       { ...runtime, required: false },
       f("box", "Box", { placeholder: "local" }),
       f("model", "Model", { type: "model" }),

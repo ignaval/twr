@@ -1,0 +1,212 @@
+//! What one-shot agent CLI calls share, on the hub (next-message suggestions, `hub::suggest`)
+//! and on every box (a loop's review runs, [`crate::loops::review`], and an ACP agent's,
+//! [`crate::loops::acp_review`]). Each runs an agent's CLI once, in a session and process group
+//! of its own that is killed with everything it started when the call ends, however it ends
+//! ([`Group`], and [`end_call`] for what left the group), and with an environment scrubbed
+//! of twr's tokens and markers, a `TWR_AGENT` marker of its own in their place ([`scrub_env`]).
+
+/// Kills process group `pgid` (SIGKILL): what is left of a one-shot call.
+pub fn kill_group(pgid: u32) {
+    if let Ok(pgid) = i32::try_from(pgid) {
+        if pgid <= 1 {
+            return;
+        }
+        // SAFETY: kill(2) with a negative pid signals that process group; no memory is shared.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+/// What a one-shot call whose process group is `group` (its leader's pid) started, read while
+/// its leader still runs, for [`end_call`]: the leader's descendants by parent links, with
+/// their start times and groups ([`crate::reap::descendants`]). Empty when it can't be read.
+pub async fn call_tree(group: Option<u32>) -> Vec<(u32, u64, i64)> {
+    match group {
+        Some(pgid) => tokio::task::spawn_blocking(move || crate::reap::descendants(pgid))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        None => Vec::new(),
+    }
+}
+
+/// Ends a one-shot call whose process group is `group` (its leader's pid; `None` once the
+/// leader was reaped) and whose `TWR_AGENT` marker is `marker`: its group (SIGKILL), and what
+/// it started outside the group, which an agent's tool may do (Claude Code's Bash tool runs
+/// each command in a session of its own, so a test suite or a server it started outlives the
+/// group's kill, reparented to init):
+///
+/// - `tree` ([`call_tree`], read before the leader was asked to stop), each process killed
+///   while it is still that process, whatever environment it shows (macOS 27 shows none of
+///   Apple's own programs', `/bin/sh` and `/bin/zsh` among them);
+/// - then every process that still carries the call's marker, exactly that marker (another
+///   call's, such as a concurrent audit run's, is never touched), and that this process no
+///   longer leads to by parent links ([`crate::reap::reap_agent_marked_orphans`]): what left
+///   the tree before it was read (its parent exited first). A step's next run carries the
+///   same marker and may already run while the run it replaces ends here: it still descends
+///   from this process and is left alone, and while such a call is counted (`live`,
+///   [`LiveCall`]) nothing at all is reaped by marker here.
+///
+/// Whether anything outside the group was signalled. Reads the process table (`ps` off
+/// Linux) off the async runtime.
+pub async fn end_call(
+    group: Option<u32>,
+    marker: &str,
+    tree: Vec<(u32, u64, i64)>,
+    live: LiveCall,
+) -> bool {
+    if let Some(pgid) = group {
+        kill_group(pgid);
+    }
+    // While another call under this marker runs in this process (a step's next run), nothing
+    // is reaped by marker here: that call's own end does it.
+    let alone = live.alone();
+    let outside: Vec<(u32, u64)> = tree
+        .into_iter()
+        .filter(|&(_, _, pgrp)| Some(pgrp) != group.map(i64::from))
+        .map(|(pid, start, _)| (pid, start))
+        .collect();
+    let markers = if marker.is_empty() || !alone {
+        Vec::new()
+    } else {
+        vec![marker.to_string()]
+    };
+    let ended = tokio::task::spawn_blocking(move || {
+        let killed = !outside.is_empty() && crate::reap::kill_each(&outside);
+        let reaped = !markers.is_empty() && crate::reap::reap_agent_marked_orphans(&markers);
+        killed || reaped
+    })
+    .await
+    .unwrap_or(false);
+    drop(live);
+    ended
+}
+
+/// How many one-shot calls run now in this process under each `TWR_AGENT` marker.
+static LIVE_CALLS: std::sync::Mutex<Option<std::collections::HashMap<String, usize>>> =
+    std::sync::Mutex::new(None);
+
+/// A one-shot call that runs now, counted under its marker from before its process starts
+/// until [`end_call`] is done with it (or it is dropped: a call that never started one).
+/// A step's next run has the marker of the run it replaces and may start while that one is
+/// still ending; the ending one then reaps nothing by marker ([`LiveCall::alone`]).
+pub struct LiveCall(String);
+
+impl LiveCall {
+    pub fn new(marker: &str) -> LiveCall {
+        if !marker.is_empty() {
+            let mut live = LIVE_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+            *live
+                .get_or_insert_with(Default::default)
+                .entry(marker.to_string())
+                .or_insert(0) += 1;
+        }
+        LiveCall(marker.to_string())
+    }
+
+    /// Whether no other call under this one's marker runs now in this process.
+    fn alone(&self) -> bool {
+        let live = LIVE_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        live.as_ref()
+            .and_then(|l| l.get(&self.0))
+            .is_none_or(|n| *n <= 1)
+    }
+}
+
+impl Drop for LiveCall {
+    fn drop(&mut self) {
+        if self.0.is_empty() {
+            return;
+        }
+        let mut live = LIVE_CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = live.as_mut() {
+            if let Some(n) = l.get_mut(&self.0) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    l.remove(&self.0);
+                }
+            }
+        }
+    }
+}
+
+/// What [`end_call`] adds to a run's log when it ended anything outside the run's group.
+pub const REAPED_LINE: &str = "twr: ended what the agent left running outside its process \
+     group (a command its tool started in a session of its own)";
+
+/// A one-shot call's process group, killed when the call ends any other way (a timeout, an
+/// error, the caller's future dropped); `kill_on_drop` alone reaches only its leader. Set the
+/// group to `None` once the leader was reaped: its id may name another group by then.
+pub struct Group(pub Option<u32>);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            kill_group(pgid);
+        }
+    }
+}
+
+/// Removes from `cmd`'s environment what makes a one-shot call anything but a program of the
+/// user's own: twr's secrets and markers (a `TWR_AGENT` marker `marker` instead), and every
+/// variable whose name starts with one of `prefixes` (an API key, token, endpoint or
+/// provider, the hub's own session of the runtime), but `keep`.
+pub fn scrub_env(
+    cmd: &mut tokio::process::Command,
+    marker: &str,
+    prefixes: &[&str],
+    keep: &[&str],
+) {
+    twr_adapters::process::scrub(cmd);
+    for (k, _) in std::env::vars_os() {
+        let k8 = k.to_string_lossy();
+        if prefixes.iter().any(|p| k8.starts_with(p)) && !keep.contains(&k8.as_ref()) {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env_remove(crate::reap::RUNTIME_GEN_ENV);
+    cmd.env(crate::reap::AGENT_ENV, marker);
+}
+
+/// The names [`scrub_env`] removes of this process's environment (every variable whose name
+/// starts with one of `prefixes`, but `keep`, and the runtime generation), for a one-shot
+/// call an adapter starts with a list of names to remove (`SpawnConfig::env_remove`) instead
+/// of a command; the adapter removes twr's secrets itself.
+pub fn scrubbed_names(prefixes: &[&str], keep: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = std::env::vars_os()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .filter(|k| prefixes.iter().any(|p| k.starts_with(p)) && !keep.contains(&k.as_str()))
+        .collect();
+    let gen = crate::reap::RUNTIME_GEN_ENV.to_string();
+    if !out.contains(&gen) && !keep.contains(&gen.as_str()) {
+        out.push(gen);
+    }
+    out
+}
+
+#[cfg(test)]
+mod live_call_tests {
+    use super::LiveCall;
+
+    /// A call is alone under its marker until another under the same one runs, and again once
+    /// that one is done; another marker's calls don't count, and a call without a marker is
+    /// never counted.
+    #[test]
+    fn a_call_is_alone_until_another_under_its_marker_runs() {
+        let marker = format!("live-call-test-{}", std::process::id());
+        let first = LiveCall::new(&marker);
+        assert!(first.alone());
+        let second = LiveCall::new(&marker);
+        assert!(!first.alone());
+        assert!(!second.alone());
+        let other = LiveCall::new(&format!("{marker}-other"));
+        assert!(other.alone());
+        drop(first);
+        assert!(second.alone());
+        drop(second);
+        assert!(LiveCall::new(&marker).alone());
+        assert!(LiveCall::new("").alone());
+    }
+}

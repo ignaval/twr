@@ -101,6 +101,12 @@ pub trait ThreadHost: Send + Sync {
     /// The box's git (worktrees and snapshots of repositories on this box).
     fn git(&self) -> Arc<dyn GitOps>;
 
+    /// The hub's own box's git itself, for the hub's reads outside [`GitOps`] (a review loop's
+    /// scope, `hub::loops`): `None` for any other box (its git is its runner's).
+    fn local_git(&self) -> Option<Arc<LocalGit>> {
+        None
+    }
+
     /// A runtime of thread `holder` is about to start in `dir`: its use of the directory
     /// ([`twr_runner::workdirs`]), which the caller keeps for as long as the runtime lives, so
     /// that no worktree change of this box removes it underneath. An error (the directory's
@@ -391,6 +397,10 @@ impl ThreadHost for LocalHost {
 
     fn git(&self) -> Arc<dyn GitOps> {
         self.git.clone()
+    }
+
+    fn local_git(&self) -> Option<Arc<LocalGit>> {
+        Some(self.git.clone())
     }
 
     fn use_workdir(&self, dir: &Path, holder: &str) -> anyhow::Result<Option<WorkdirUse>> {

@@ -80,6 +80,7 @@ use twr_core::proto::{codes, RpcError};
 
 use twr_core::config::SuggestModels;
 
+use super::one_shot::{kill_group, scrub_env, Group};
 use super::{internal, rpc, Caller, Hub, Inner};
 use crate::store;
 
@@ -457,28 +458,6 @@ impl super::Core {
     }
 }
 
-/// Kills process group `pgid` (SIGKILL), what is left of a suggestion call.
-fn kill_group(pgid: u32) {
-    if let Ok(pgid) = i32::try_from(pgid) {
-        // SAFETY: kill(2) with a negative pid signals that process group; no memory is shared.
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-    }
-}
-
-/// A suggestion call's process group, killed when the call ends any other way (a timeout, an
-/// error, the hub's request dropped); `kill_on_drop` alone reaches only its leader.
-struct Group(Option<u32>);
-
-impl Drop for Group {
-    fn drop(&mut self) {
-        if let Some(pgid) = self.0 {
-            kill_group(pgid);
-        }
-    }
-}
-
 /// Runs `cmd` (`bin`, a CLI named `what` in messages) once on `input`, in a session and
 /// process group of its own killed with all it started when the call ends, whatever way
 /// ([`Group`]): its output (at most [`OUTPUT_MAX`] bytes) and how it exited. `watch` reads
@@ -547,22 +526,6 @@ async fn run_cli(
         }
         Err(_) => Err(format!("timed out after {}s", SUGGEST_TIMEOUT.as_secs())),
     }
-}
-
-/// Removes from `cmd`'s environment what would make a suggestion call anything but a call of
-/// the user's own login, nobody's session: twr's secrets and markers (a `TWR_AGENT` marker
-/// `marker` instead), and every variable whose name starts with one of `prefixes` (an API
-/// key, token, endpoint or provider, the hub's own session of the runtime), but `keep`.
-fn scrub_env(cmd: &mut tokio::process::Command, marker: &str, prefixes: &[&str], keep: &[&str]) {
-    twr_adapters::process::scrub(cmd);
-    for (k, _) in std::env::vars_os() {
-        let k8 = k.to_string_lossy();
-        if prefixes.iter().any(|p| k8.starts_with(p)) && !keep.contains(&k8.as_ref()) {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env_remove(twr_runner::reap::RUNTIME_GEN_ENV);
-    cmd.env(super::AGENT_ENV, marker);
 }
 
 /// Asks Claude Code's CLI once in print mode (see the module docs), in `dir`, with `system` as

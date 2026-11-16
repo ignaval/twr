@@ -1,5 +1,7 @@
 //! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`,
-//! `/account`, `/accounts`, `/rename`, `/orch`, `/new`, `/park`, `/resume`, `/compact-context`,
+//! `/account`, `/accounts`, `/rename`, `/orch`, `/new`, `/review`, `/implement`, `/loop`,
+//! `/park`, `/resume`,
+//! `/compact-context`,
 //! `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
 //! `/parked`, `/sidebar`, `/spaces`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/read`, `/ws`,
 //! `/settings`, `/help`, `/quit`. Pure parsing, the
@@ -99,8 +101,9 @@ pub enum Slash {
     },
     /// `/orch` without arguments: pick the runtime to switch the orchestrator to.
     OrchPick,
-    /// `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]]`: a new
-    /// thread.
+    /// `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]] [--implement
+    /// [--setup] <task>]`: a new thread; with `--implement`, one whose first prompt is the task,
+    /// run as an implementation loop (`thread.new {loop: {kind: implement, setup?}}`).
     New {
         /// A configured project name or a path.
         project: String,
@@ -113,6 +116,71 @@ pub enum Slash {
         account: Option<String>,
         /// Open it on `account` although the project's pin leaves it out (`outside_pin`).
         outside_pin: bool,
+        /// Run the task as an implementation loop (`--implement`).
+        implement: bool,
+        /// With `implement`: show the setup card first (`--setup`).
+        setup: bool,
+        /// With `implement`: the task, the words after the project (required).
+        task: Option<String>,
+    },
+    /// `/review [thread] [--setup] [--scope s] [--profile p] [--reviewer r] [--implementer m]
+    /// [--workers w] [--commit c]`: start a review loop on a thread's work (`loop.request
+    /// {kind: review}`). The hub decides whether it starts on the saved settings or raises the
+    /// setup card; every value is checked here with the loop settings' own parsers, so a typo
+    /// is a usage error.
+    Review {
+        /// The thread; `None` = the one dived into, else the selected one.
+        thread: Option<String>,
+        /// Show the setup card first, even with saved settings that hold.
+        setup: bool,
+        /// The scope, as [`crate::loops::settings::Scope`] writes it (`branch`,
+        /// `uncommitted`, `since <ref>`, `last <n>`).
+        scope: Option<String>,
+        /// This run's profile.
+        profile: Option<String>,
+        /// This run's reviewer (`runtime[:account]/model`).
+        reviewer: Option<String>,
+        /// This run's implementer (`thread` or `runtime[:account]/model[:effort]`).
+        implementer: Option<String>,
+        /// This run's workers (`model[:effort]`).
+        workers: Option<String>,
+        /// This run's commit (`match` or `none`).
+        commit: Option<String>,
+    },
+    /// `/implement [thread] [--setup] [--profile p] [--reviewer r] [--implementer m]
+    /// [--workers w] [--commit c] [--plan-check v] [task…]`: start an implementation loop on a
+    /// thread (`loop.request {kind: implement, task?}`). The parser can't know which words
+    /// name a thread: it keeps them, as typed, for [`implement_target`] to split into the
+    /// thread and the task. Every flag value is checked with the loop settings' own parsers.
+    /// After `--`, every word is the task's.
+    Implement {
+        /// The words that are no flag, in order: a thread first, perhaps, then the task.
+        words: Vec<String>,
+        /// Show the setup card first, even with saved settings that hold.
+        setup: bool,
+        /// This run's profile.
+        profile: Option<String>,
+        /// This run's reviewer (`runtime[:account]/model`).
+        reviewer: Option<String>,
+        /// This run's implementer (`thread` or `runtime[:account]/model[:effort]`).
+        implementer: Option<String>,
+        /// This run's workers (`model[:effort]`).
+        workers: Option<String>,
+        /// This run's commit (`end`, `per-round` or `none`).
+        commit: Option<String>,
+        /// This run's plan check (`contracts`, `always` or `never`).
+        plan_check: Option<String>,
+    },
+    /// `/loop [thread] [status|pause|resume|stop|skip]`, `/loop settings [--project p]`: a
+    /// thread's loop (`loop.get`, `loop.control`), or the saved loop settings (bare `/loop` is
+    /// `status`). It never starts a loop: `/review` and `/implement` do.
+    Loop {
+        /// The thread; `None` = the one dived into, else the selected one (`settings`: none).
+        thread: Option<String>,
+        /// What to do.
+        action: LoopAction,
+        /// `settings` of one project (`--project`).
+        project: Option<String>,
     },
     /// `/park [thread]`.
     Park(Option<String>),
@@ -330,6 +398,423 @@ fn parse_read(args: &[String], usage: &str) -> Result<Slash, String> {
     Ok(Slash::Read { cmd, on })
 }
 
+/// What `/loop` does ([`Slash::Loop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopAction {
+    /// Where the thread's loop is (`loop.get`).
+    Status,
+    /// `loop.control pause`.
+    Pause,
+    /// `loop.control resume`.
+    Resume,
+    /// `loop.control stop`.
+    Stop,
+    /// `loop.control skip_to_verify` (typed `skip`).
+    SkipToVerify,
+    /// The saved loop settings: show or change them.
+    Settings,
+}
+
+/// `/loop`'s words, with what each does: its popup rows and Tab completion.
+pub const LOOP_WORDS: &[(&str, &str)] = &[
+    ("status", "where the thread's loop is: phase, round, ledger"),
+    ("pause", "hold the loop's next step; what runs finishes"),
+    ("resume", "go on; after a stuck step, ask for it again"),
+    (
+        "stop",
+        "end the loop; the thread and its work stay as they are",
+    ),
+    (
+        "skip",
+        "end the ladder after this round and go to verification",
+    ),
+    (
+        "settings",
+        "the saved loop settings: see or change them (--project p: one project's)",
+    ),
+];
+
+/// `/review`'s flags, with what each does: its popup rows.
+pub const REVIEW_FLAGS: &[(&str, &str)] = &[
+    (
+        "--setup",
+        "show the settings card first; start and save from it",
+    ),
+    (
+        "--scope",
+        "what to review: branch, uncommitted, since <ref> or last <n>",
+    ),
+    (
+        "--profile",
+        "this run's profile: low, medium, high or one of yours",
+    ),
+    ("--reviewer", "this run's reviewer: runtime[:account]/model"),
+    (
+        "--implementer",
+        "this run's implementer: thread, or runtime[:account]/model[:effort]",
+    ),
+    ("--workers", "this run's workers: model[:effort]"),
+    (
+        "--commit",
+        "this run's commit: match (as the thread does) or none",
+    ),
+];
+
+/// `/implement`'s flags, with what each does: its popup rows.
+pub const IMPLEMENT_FLAGS: &[(&str, &str)] = &[
+    (
+        "--setup",
+        "show the settings card first; start and save from it",
+    ),
+    (
+        "--profile",
+        "this run's profile: low, medium, high or one of yours",
+    ),
+    ("--reviewer", "this run's reviewer: runtime[:account]/model"),
+    (
+        "--implementer",
+        "this run's implementer: thread, or runtime[:account]/model[:effort]",
+    ),
+    ("--workers", "this run's workers: model[:effort]"),
+    (
+        "--commit",
+        "this run's commit: end (one at the end), per-round or none",
+    ),
+    (
+        "--plan-check",
+        "this run's plan check: contracts (when the plan says so), always or never",
+    ),
+];
+
+/// `/implement --commit`'s values, with what each does: its popup rows.
+pub const IMPLEMENT_COMMITS: &[(&str, &str)] = &[
+    ("end", "one commit of the loop's work at the end"),
+    (
+        "per-round",
+        "commit after implementing and after every round that fixed something",
+    ),
+    ("none", "leave the work uncommitted"),
+];
+
+/// `/implement --plan-check`'s values, with what each does: its popup rows.
+pub const PLAN_CHECKS: &[(&str, &str)] = &[
+    (
+        "contracts",
+        "a review of the plan when it touches money, schemas or cross-repo contracts",
+    ),
+    ("always", "a review of the plan, always"),
+    ("never", "no review of the plan"),
+];
+
+/// What `/loop` says to a word that is no action of its: it never starts a loop.
+pub const LOOP_STARTS_NONE: &str =
+    "/loop controls a running loop and opens the settings; it starts none: /implement <task> \
+     starts an implementation loop, /review a review loop";
+
+/// `--scope`'s first words, with what each reviews: its popup rows.
+pub const SCOPE_WORDS: &[(&str, &str)] = &[
+    (
+        "branch",
+        "the thread's branch since it left its base, and its working tree",
+    ),
+    ("uncommitted", "what is not committed yet"),
+    ("since", "since <ref>: everything after a ref"),
+    ("last", "last <n>: the last n commits"),
+];
+
+/// What `--scope` takes, for its errors.
+pub const SCOPE_FORMS: &str = "branch, uncommitted, since <ref> or last <n> (also \"since <ref>\" \
+                               quoted, since=<ref> and since:<ref>)";
+
+/// A `--scope` value given as one word, as [`crate::loops::settings::Scope`] writes it:
+/// `branch`, `uncommitted`, `since <ref>` (also `since=<ref>`, `since:<ref>`), `last <n>` (also
+/// `last=<n>`, `last:<n>`). The error says what it takes. `twr loop review --scope` reads its
+/// value with it; `/review` too, once it joined `since <ref>` typed as two words.
+pub fn scope_value(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    let value = match value.split_once(':') {
+        Some((w @ ("since" | "last"), rest)) => format!("{w} {rest}"),
+        _ => value.to_string(),
+    };
+    value
+        .parse::<crate::loops::settings::Scope>()
+        .map(|s| s.to_string())
+        .map_err(|e| format!("{e}; it takes {SCOPE_FORMS}"))
+}
+
+/// Parses `/review`'s arguments (`usage` for the errors). `--scope since <ref>` and `--scope
+/// last <n>` take the next word too; `--scope "since main"`, `--scope=since=main` and
+/// `--scope=since:main` say the same.
+fn parse_review(args: &[String], usage: &str) -> Result<Slash, String> {
+    use crate::loops::config::{
+        check_profile_name, parse_implementer, ReviewCommit, ReviewerChoice, WorkersChoice,
+    };
+    let bad = || format!("usage: {usage}");
+    let (mut thread, mut setup) = (None, false);
+    let (mut scope, mut profile, mut reviewer, mut implementer, mut workers, mut commit) =
+        (None, None, None, None, None, None);
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let slot = match flag {
+            "--setup" if inline.is_none() => {
+                setup = true;
+                continue;
+            }
+            "--setup" => return Err(format!("--setup takes no value; {}", bad())),
+            "--scope" => &mut scope,
+            "--profile" => &mut profile,
+            "--reviewer" => &mut reviewer,
+            "--implementer" => &mut implementer,
+            "--workers" => &mut workers,
+            "--commit" => &mut commit,
+            f if f.starts_with("--") => return Err(format!("unknown option {f}; {}", bad())),
+            _ if thread.is_none() => {
+                thread = Some(a.clone());
+                continue;
+            }
+            _ => return Err(bad()),
+        };
+        if slot.is_some() {
+            return Err(format!("{flag} is given twice; {}", bad()));
+        }
+        let mut value = match inline.or_else(|| it.next().cloned()) {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => return Err(format!("{flag} takes a value; {}", bad())),
+        };
+        if flag == "--scope" {
+            // `since main`, `last 3` as two words.
+            if matches!(value.as_str(), "since" | "last") {
+                match it.next_if(|next| !next.starts_with("--")) {
+                    Some(next) => value = format!("{value} {next}"),
+                    None => {
+                        return Err(format!(
+                            "--scope {value} takes {}; --scope takes {SCOPE_FORMS}",
+                            if value == "since" {
+                                "a ref"
+                            } else {
+                                "a number"
+                            }
+                        ))
+                    }
+                }
+            }
+            value = scope_value(&value).map_err(|e| format!("--scope: {e}"))?;
+        }
+        let check = match flag {
+            "--profile" => check_profile_name(&value),
+            "--reviewer" => ReviewerChoice::parse(&value).map(drop),
+            "--implementer" => parse_implementer(&value).map(drop),
+            "--workers" => WorkersChoice::parse(&value).map(drop),
+            "--commit" => ReviewCommit::parse(&value).map(drop),
+            _ => Ok(()),
+        };
+        check.map_err(|e| format!("{flag}: {e}"))?;
+        *slot = Some(value);
+    }
+    Ok(Slash::Review {
+        thread,
+        setup,
+        scope,
+        profile,
+        reviewer,
+        implementer,
+        workers,
+        commit,
+    })
+}
+
+/// Parses `/implement`'s arguments (`usage` for the errors): flags anywhere (`--flag value` or
+/// `--flag=value`), every other word kept in order for [`implement_target`]; after `--`, every
+/// word is a word of the task, even one that starts with `--`.
+fn parse_implement(args: &[String], usage: &str) -> Result<Slash, String> {
+    use crate::loops::config::{
+        check_profile_name, parse_implementer, ImplCommit, PlanCheck, ReviewerChoice, WorkersChoice,
+    };
+    let bad = || format!("usage: {usage}");
+    let (mut words, mut setup) = (Vec::new(), false);
+    let (mut profile, mut reviewer, mut implementer, mut workers, mut commit, mut plan_check) =
+        (None, None, None, None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            words.extend(it.by_ref().cloned());
+            break;
+        }
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        let slot =
+            match flag {
+                "--setup" if inline.is_none() => {
+                    setup = true;
+                    continue;
+                }
+                "--setup" => return Err(format!("--setup takes no value; {}", bad())),
+                "--profile" => &mut profile,
+                "--reviewer" => &mut reviewer,
+                "--implementer" => &mut implementer,
+                "--workers" => &mut workers,
+                "--commit" => &mut commit,
+                "--plan-check" => &mut plan_check,
+                "--scope" => return Err(
+                    "an implementation loop has no scope: what the worktree holds when it starts \
+                     is its baseline (--scope is /review's)"
+                        .into(),
+                ),
+                f if f.starts_with("--") => {
+                    return Err(format!(
+                    "unknown option {f}; {} (a task with words that start with -- goes after --)",
+                    bad()
+                ))
+                }
+                _ => {
+                    words.push(a.clone());
+                    continue;
+                }
+            };
+        if slot.is_some() {
+            return Err(format!("{flag} is given twice; {}", bad()));
+        }
+        let value = match inline.or_else(|| it.next().cloned()) {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => return Err(format!("{flag} takes a value; {}", bad())),
+        };
+        let check = match flag {
+            "--profile" => check_profile_name(&value),
+            "--reviewer" => ReviewerChoice::parse(&value).map(drop),
+            "--implementer" => parse_implementer(&value).map(drop),
+            "--workers" => WorkersChoice::parse(&value).map(drop),
+            "--commit" => ImplCommit::parse(&value).map(drop),
+            _ => PlanCheck::parse(&value).map(drop),
+        };
+        check.map_err(|e| format!("{flag}: {e}"))?;
+        *slot = Some(value);
+    }
+    let task_len: usize = words.iter().map(|w| w.len() + 1).sum();
+    if task_len > crate::loops::settings::MAX_TASK_BYTES {
+        return Err(format!(
+            "the task is longer than {} bytes: put the details in a file and name it",
+            crate::loops::settings::MAX_TASK_BYTES
+        ));
+    }
+    Ok(Slash::Implement {
+        words,
+        setup,
+        profile,
+        reviewer,
+        implementer,
+        workers,
+        commit,
+        plan_check,
+    })
+}
+
+/// Where `/implement`'s words go ([`Slash::Implement`]), the same for every client: in a dive
+/// (`dive`), the thread is that one and every word is the task's; elsewhere the first word is
+/// the thread when it names a live thread (`names_live_thread`: a name, alias or id of a thread
+/// that is not stopped, parked or deleted), else the thread is the selected card's, and the
+/// other words are the task. Returns the thread named (`None`: the one dived into, or the
+/// selected one) and the task, its words joined by single spaces (`None`: no words, so the
+/// task is what the conversation already settled).
+pub fn implement_target(
+    words: &[String],
+    dive: bool,
+    names_live_thread: impl Fn(&str) -> bool,
+) -> (Option<String>, Option<String>) {
+    let (thread, task) = match words.split_first() {
+        Some((first, rest)) if !dive && names_live_thread(first) => (Some(first.clone()), rest),
+        _ => (None, words),
+    };
+    let task = task
+        .iter()
+        .map(|w| w.trim())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (thread, (!task.is_empty()).then_some(task))
+}
+
+/// The `/loop` action word `w` names: one of [`LOOP_WORDS`] (`skip` also as
+/// `skip-to-verify` or `skip_to_verify`).
+fn loop_action(w: &str) -> Option<LoopAction> {
+    Some(match w {
+        "status" => LoopAction::Status,
+        "pause" => LoopAction::Pause,
+        "resume" => LoopAction::Resume,
+        "stop" => LoopAction::Stop,
+        "skip" | "skip-to-verify" | "skip_to_verify" => LoopAction::SkipToVerify,
+        "settings" => LoopAction::Settings,
+        _ => return None,
+    })
+}
+
+/// Parses `/loop`'s arguments (`usage` for the errors): `[thread] [action]`, one word being
+/// the action if it is one, else the thread (its `status`); `--project` only with `settings`.
+fn parse_loop(args: &[String], usage: &str) -> Result<Slash, String> {
+    let bad = || format!("usage: {usage}");
+    let (mut words, mut project) = (Vec::new(), None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let (flag, inline) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a.as_str(), None),
+        };
+        match flag {
+            "--project" if project.is_some() => {
+                return Err(format!("--project is given twice; {}", bad()))
+            }
+            "--project" => match inline.or_else(|| it.next().cloned()) {
+                Some(p) if !p.trim().is_empty() => project = Some(p.trim().to_string()),
+                _ => return Err(format!("--project takes a project; {}", bad())),
+            },
+            f if f.starts_with("--") => return Err(format!("unknown option {f}; {}", bad())),
+            _ => words.push(a.as_str()),
+        }
+    }
+    // (`review` and `implement` are what one may type to start a loop: never a thread here.)
+    let starts = |w: &str| matches!(w, "review" | "implement" | "start");
+    let (thread, action) = match words.as_slice() {
+        [] => (None, LoopAction::Status),
+        [w] if starts(w) => return Err(LOOP_STARTS_NONE.into()),
+        [w] => match loop_action(w) {
+            Some(a) => (None, a),
+            None => (Some(w.to_string()), LoopAction::Status),
+        },
+        [t, w] => match loop_action(w) {
+            Some(a) if !starts(t) => (Some(t.to_string()), a),
+            Some(_) => return Err(LOOP_STARTS_NONE.into()),
+            None => {
+                return Err(format!(
+                    "{w:?} is nothing /loop does (status, pause, resume, stop, skip, settings); \
+                     {LOOP_STARTS_NONE}"
+                ))
+            }
+        },
+        _ => return Err(format!("{LOOP_STARTS_NONE}; {}", bad())),
+    };
+    if action == LoopAction::Settings && thread.is_some() {
+        return Err(
+            "/loop settings takes no thread: they are the workspace's, or a project's with \
+             --project <p>"
+                .into(),
+        );
+    }
+    if action != LoopAction::Settings && project.is_some() {
+        return Err("--project goes with /loop settings: /loop settings --project <p>".into());
+    }
+    Ok(Slash::Loop {
+        thread,
+        action,
+        project,
+    })
+}
+
 /// What an argument of a command completes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgKind {
@@ -353,6 +838,17 @@ pub enum ArgKind {
     AccountOrThread,
     /// `/read`'s first word ([`READ_WORDS`]).
     Read,
+    /// `/review`'s arguments: a thread, then its flags ([`REVIEW_FLAGS`]) and their values
+    /// (`--scope`: [`SCOPE_WORDS`]; `--profile`: [`Pools::profiles`]; `--commit`: `match`,
+    /// `none`).
+    Review,
+    /// `/implement`'s arguments: a thread, then its flags ([`IMPLEMENT_FLAGS`]) and their
+    /// values (`--profile`: [`Pools::profiles`]; `--commit`: [`IMPLEMENT_COMMITS`];
+    /// `--plan-check`: [`PLAN_CHECKS`]), then the task.
+    Implement,
+    /// `/loop`'s arguments: an action ([`LOOP_WORDS`]) or a thread, then an action; `--project`
+    /// after `settings`.
+    Loop,
     /// Nothing to complete.
     Free,
 }
@@ -430,9 +926,37 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     ),
     (
         "/new",
-        "/new <project> [--runtime r] [--name n] [--account a [--outside-pin]]",
-        "start a thread in a project (a configured name or a path)",
+        "/new <project> [--runtime r] [--name n] [--account a [--outside-pin]] [--implement \
+         [--setup] <task>]",
+        "start a thread in a project (a configured name or a path); --implement: its first \
+         prompt is the task, run as an implementation loop",
         &[],
+    ),
+    (
+        "/review",
+        "/review [thread] [--setup] [--scope s] [--profile p] [--reviewer r] [--implementer m] \
+         [--workers w] [--commit c]",
+        "start a review loop on a thread's work (in a dive: that thread); the first one shows \
+         its settings card; --setup shows it again; --scope is branch, uncommitted, since <ref> \
+         or last <n>; the other flags change this run only",
+        &[ArgKind::Review],
+    ),
+    (
+        "/implement",
+        "/implement [thread] [--setup] [--profile p] [--reviewer r] [--implementer m] \
+         [--workers w] [--commit c] [--plan-check v] [task…]",
+        "start an implementation loop on a thread (in a dive: that thread): plan, a review of \
+         the plan, implement, then the review ladder; no task: what the conversation settled; \
+         the first one shows its settings card; --setup shows it again; the other flags change \
+         this run only",
+        &[ArgKind::Implement],
+    ),
+    (
+        "/loop",
+        "/loop [thread] [status|pause|resume | stop|skip] | /loop settings [--project p]",
+        "a thread's loop: where it is, pause, resume, stop, skip to verification; settings: \
+         the saved loop settings (/review and /implement start loops)",
+        &[ArgKind::Loop],
     ),
     (
         "/park",
@@ -800,7 +1324,8 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         "/new" => {
             let mut project = None;
             let (mut runtime, mut name, mut account) = (None, None, None);
-            let mut outside_pin = false;
+            let (mut outside_pin, mut implement, mut setup) = (false, false, false);
+            let mut task: Vec<String> = Vec::new();
             let mut it = args.iter();
             while let Some(a) = it.next() {
                 // `--account=work` as `--account work`.
@@ -816,7 +1341,20 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                         outside_pin = true;
                         continue;
                     }
-                    "--outside-pin" => return bad(),
+                    "--implement" if inline.is_none() => {
+                        implement = true;
+                        continue;
+                    }
+                    "--setup" if inline.is_none() => {
+                        setup = true;
+                        continue;
+                    }
+                    "--outside-pin" | "--implement" | "--setup" => return bad(),
+                    // After the project, with `--implement`: the task's words.
+                    "--" if project.is_some() => {
+                        task.extend(it.by_ref().cloned());
+                        break;
+                    }
                     flag if flag.starts_with("--") => {
                         return Err(format!("unknown option {flag}; usage: {usage}"))
                     }
@@ -824,13 +1362,39 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                         project = Some(a.clone());
                         continue;
                     }
-                    _ => return bad(),
+                    _ => {
+                        task.push(a.clone());
+                        continue;
+                    }
                 };
                 match inline.map(str::to_string).or_else(|| it.next().cloned()) {
                     Some(v) if slot.is_none() => *slot = Some(v),
                     _ => return bad(),
                 }
             }
+            let task = task
+                .iter()
+                .map(|w| w.trim())
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !implement && (setup || !task.is_empty()) {
+                return bad();
+            }
+            if implement && task.is_empty() {
+                return Err(
+                    "--implement takes the task: what the new thread is to build, after the \
+                     project"
+                        .into(),
+                );
+            }
+            if task.len() > crate::loops::settings::MAX_TASK_BYTES {
+                return Err(format!(
+                    "the task is longer than {} bytes: put the details in a file and name it",
+                    crate::loops::settings::MAX_TASK_BYTES
+                ));
+            }
+            let task = (!task.is_empty()).then_some(task);
             match project {
                 // Leaving the pin is for an account given (`--account`, or the account part
                 // of `--runtime <runtime>:<account>`).
@@ -849,10 +1413,16 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                     name,
                     account,
                     outside_pin,
+                    implement,
+                    setup,
+                    task,
                 }),
                 None => bad(),
             }
         }
+        "/review" => parse_review(args, usage),
+        "/implement" => parse_implement(args, usage),
+        "/loop" => parse_loop(args, usage),
         "/park" => one(args).map(Slash::Park),
         "/resume" => one(args).map(Slash::Resume),
         "/trim" => one(args).map(Slash::Trim),
@@ -964,7 +1534,14 @@ pub fn complete(
         let modes: Vec<String> = MODES.iter().map(|m| m.to_string()).collect();
         let on_off = ["on".to_string(), "off".into()];
         let read: Vec<String> = READ_WORDS.iter().map(|w| w.0.to_string()).collect();
+        let loop_words: Vec<String> = LOOP_WORDS
+            .iter()
+            .map(|w| w.0.to_string())
+            .chain(threads.iter().cloned())
+            .collect();
         let pool = match kind {
+            ArgKind::Review | ArgKind::Implement => threads,
+            ArgKind::Loop => &loop_words[..],
             ArgKind::Runtime => runtimes,
             ArgKind::Thread
             | ArgKind::Threads
@@ -1060,6 +1637,9 @@ pub struct Pools {
     /// The threads an `@` mention can name: workers only, never an orchestrator (current or
     /// retired) or the hub, which are no relay targets.
     pub mentions: Vec<Mentionable>,
+    /// The loop profiles (`/review --profile`), with what each does (`loop.settings.get`
+    /// `profiles`; the built-in `low`, `medium`, `high` and the config file's).
+    pub profiles: Vec<(String, String)>,
 }
 
 /// A worker thread an `@` mention can name ([`mention`]).
@@ -1165,6 +1745,33 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
             };
         }
     }
+    if cmd == "/review" || cmd == "/implement" || cmd == "/loop" {
+        let (start, rows) = match cmd {
+            "/review" => review_rows(&words[1..], word, start, pools),
+            "/implement" => implement_rows(&words[1..], word, start, pools),
+            _ => loop_rows(&words[1..], word, start, pools),
+        };
+        let word = &line[start..];
+        let rows = rows
+            .into_iter()
+            .map(|(value, detail)| {
+                let row = Suggestion {
+                    label: value.clone(),
+                    value: value.clone(),
+                    detail,
+                    more: true,
+                };
+                (vec![value], row)
+            })
+            .collect();
+        return Suggestions {
+            start,
+            end: line.len(),
+            command: false,
+            mention: false,
+            items: ranked(word, rows),
+        };
+    }
     let kinds = COMMANDS
         .iter()
         .find(|c| c.0 == cmd)
@@ -1247,7 +1854,10 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
             .iter()
             .map(|(w, what)| (w.to_string(), what.to_string()))
             .collect(),
-        Some(ArgKind::Free) | None => Vec::new(),
+        // (Answered before: `review_rows`, `implement_rows`, `loop_rows`.)
+        Some(ArgKind::Review | ArgKind::Implement | ArgKind::Loop | ArgKind::Free) | None => {
+            Vec::new()
+        }
     };
     let rows = pool
         .into_iter()
@@ -1267,6 +1877,184 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
         command: false,
         mention: false,
         items: ranked(word, rows),
+    }
+}
+
+/// `rows` of `(word, what)` as popup rows.
+fn word_rows(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(w, what)| (w.to_string(), what.to_string()))
+        .collect()
+}
+
+/// `/review`'s popup rows for `word`, typed at byte `start` after the arguments `args`: the
+/// value of the flag before it (`--scope`, `--profile`, `--commit`; `--scope=…` inline), the
+/// flags not given yet while a `-` word is typed, else the threads (until one is named) and
+/// those flags. Returns where the rows' text starts and the rows.
+fn review_rows(
+    args: &[&str],
+    word: &str,
+    start: usize,
+    pools: &Pools,
+) -> (usize, Vec<(String, String)>) {
+    let values = |flag: &str| -> Option<Vec<(String, String)>> {
+        Some(match flag {
+            "--scope" => word_rows(SCOPE_WORDS),
+            "--profile" => pools.profiles.clone(),
+            "--commit" => vec![
+                (
+                    "match".into(),
+                    "commit the fixes if the thread commits its work".into(),
+                ),
+                ("none".into(), "leave the fixes uncommitted".into()),
+            ],
+            "--reviewer" | "--implementer" | "--workers" => Vec::new(),
+            _ => return None,
+        })
+    };
+    if let Some((flag, _)) = word.split_once('=') {
+        let at = start + flag.len() + 1;
+        return (at, values(flag).unwrap_or_default());
+    }
+    // A flag's value: the word after the flag (and after `--scope since|last`, a ref or a
+    // number: nothing).
+    if let Some(v) = args.last().and_then(|f| values(f)) {
+        return (start, v);
+    }
+    let mut thread = false;
+    let mut given: Vec<&str> = Vec::new();
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        let flag = a.split_once('=').map_or(*a, |(f, _)| f);
+        if flag.starts_with("--") {
+            given.push(flag);
+            if !a.contains('=') && values(flag).is_some() {
+                let v = it.next();
+                if flag == "--scope" && matches!(v, Some(&"since" | &"last")) {
+                    it.next();
+                }
+            }
+        } else {
+            thread = true;
+        }
+    }
+    if args.len() >= 2
+        && args[args.len() - 2] == "--scope"
+        && matches!(args[args.len() - 1], "since" | "last")
+    {
+        return (start, Vec::new());
+    }
+    let flags: Vec<(String, String)> = REVIEW_FLAGS
+        .iter()
+        .filter(|(f, _)| !given.contains(f))
+        .map(|(f, what)| (f.to_string(), what.to_string()))
+        .collect();
+    if word.starts_with('-') || thread {
+        return (start, flags);
+    }
+    let mut rows = pools.threads.clone();
+    rows.extend(flags);
+    (start, rows)
+}
+
+/// `/implement`'s popup rows for `word`, typed at byte `start` after the arguments `args`:
+/// the value of the flag before it (`--profile`, `--commit`, `--plan-check`; `--commit=…`
+/// inline), the flags not given yet while a `-` word is typed, the threads and those flags
+/// before any other word, and nothing once the task is being typed (or after `--`). Returns
+/// where the rows' text starts and the rows.
+fn implement_rows(
+    args: &[&str],
+    word: &str,
+    start: usize,
+    pools: &Pools,
+) -> (usize, Vec<(String, String)>) {
+    let values = |flag: &str| -> Option<Vec<(String, String)>> {
+        Some(match flag {
+            "--profile" => pools.profiles.clone(),
+            "--commit" => word_rows(IMPLEMENT_COMMITS),
+            "--plan-check" => word_rows(PLAN_CHECKS),
+            "--reviewer" | "--implementer" | "--workers" => Vec::new(),
+            _ => return None,
+        })
+    };
+    if args.contains(&"--") {
+        return (start, Vec::new());
+    }
+    if let Some((flag, _)) = word.split_once('=') {
+        let at = start + flag.len() + 1;
+        return (at, values(flag).unwrap_or_default());
+    }
+    if let Some(v) = args.last().and_then(|f| values(f)) {
+        return (start, v);
+    }
+    let mut other = false;
+    let mut given: Vec<&str> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let flag = a.split_once('=').map_or(*a, |(f, _)| f);
+        if flag.starts_with("--") {
+            given.push(flag);
+            if !a.contains('=') && values(flag).is_some() {
+                it.next();
+            }
+        } else {
+            other = true;
+        }
+    }
+    let flags: Vec<(String, String)> = IMPLEMENT_FLAGS
+        .iter()
+        .filter(|(f, _)| !given.contains(f))
+        .map(|(f, what)| (f.to_string(), what.to_string()))
+        .collect();
+    if word.starts_with('-') {
+        return (start, flags);
+    }
+    if other {
+        return (start, Vec::new());
+    }
+    let mut rows = pools.threads.clone();
+    rows.extend(flags);
+    (start, rows)
+}
+
+/// `/loop`'s popup rows for `word`, typed after the arguments `args`: the action words and
+/// the threads first, the action words after a thread, `--project` after `settings`.
+fn loop_rows(
+    args: &[&str],
+    word: &str,
+    start: usize,
+    pools: &Pools,
+) -> (usize, Vec<(String, String)>) {
+    let words: Vec<&&str> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    if args.last() == Some(&"--project") || word.starts_with("--project=") {
+        return (start, Vec::new());
+    }
+    let settings = words.iter().any(|w| **w == "settings");
+    if word.starts_with('-') || settings {
+        let rows = if settings && !args.contains(&"--project") {
+            vec![(
+                "--project".to_string(),
+                "the settings of one project, in place of the workspace's".to_string(),
+            )]
+        } else {
+            Vec::new()
+        };
+        return (start, rows);
+    }
+    match words.as_slice() {
+        [] => {
+            let mut rows = word_rows(LOOP_WORDS);
+            rows.extend(pools.threads.iter().cloned());
+            (start, rows)
+        }
+        [w] if loop_action(w).is_none() => (
+            start,
+            word_rows(LOOP_WORDS)
+                .into_iter()
+                .filter(|(w, _)| w != "settings")
+                .collect(),
+        ),
+        _ => (start, Vec::new()),
     }
 }
 
@@ -1414,6 +2202,557 @@ mod tests {
             v("/new repo --outside-pin --runtime codex --account work")["args"]["outside_pin"],
             true
         );
+        // The loop intents, as the apps read them (`desktop.parse_slash`).
+        assert_eq!(
+            v(
+                "/review api --setup --scope since main --profile low --reviewer \
+               claude-code/claude-opus-5-5 --implementer thread --workers claude-opus-5-5:high \
+               --commit none"
+            ),
+            serde_json::json!({"kind": "Review", "args": {
+                "thread": "api", "setup": true, "scope": "since main", "profile": "low",
+                "reviewer": "claude-code/claude-opus-5-5", "implementer": "thread",
+                "workers": "claude-opus-5-5:high", "commit": "none"}})
+        );
+        assert_eq!(
+            v("/review"),
+            serde_json::json!({"kind": "Review", "args": {
+                "thread": null, "setup": false, "scope": null, "profile": null,
+                "reviewer": null, "implementer": null, "workers": null, "commit": null}})
+        );
+        assert_eq!(
+            v("/loop api skip"),
+            serde_json::json!({"kind": "Loop", "args": {
+                "thread": "api", "action": "skip_to_verify", "project": null}})
+        );
+        assert_eq!(
+            v("/loop settings --project web"),
+            serde_json::json!({"kind": "Loop", "args": {
+                "thread": null, "action": "settings", "project": "web"}})
+        );
+        assert_eq!(v("/loop")["args"]["action"], "status");
+        assert_eq!(
+            v("/implement api --setup --plan-check never add it"),
+            serde_json::json!({"kind": "Implement", "args": {
+                "words": ["api", "add", "it"], "setup": true, "profile": null,
+                "reviewer": null, "implementer": null, "workers": null, "commit": null,
+                "plan_check": "never"}})
+        );
+        assert_eq!(
+            v("/new api --implement add it")["args"],
+            serde_json::json!({"project": "api", "runtime": null, "name": null,
+                "account": null, "outside_pin": false, "implement": true, "setup": false,
+                "task": "add it"})
+        );
+    }
+
+    /// `/review`: a thread, then flags anywhere; `--scope`'s two-word values in each spelling;
+    /// every value checked by the loop settings' own parsers, the error naming the flag.
+    #[test]
+    fn review_parses_and_checks_its_values() {
+        let review = |line: &str| match parse(line) {
+            Ok(Slash::Review {
+                thread,
+                setup,
+                scope,
+                profile,
+                reviewer,
+                implementer,
+                workers,
+                commit,
+            }) => (
+                thread,
+                setup,
+                scope,
+                profile,
+                reviewer,
+                implementer,
+                workers,
+                commit,
+            ),
+            other => panic!("{line}: {other:?}"),
+        };
+        let r = review("/review");
+        assert_eq!((r.0, r.1, r.2), (None, false, None));
+        let r = review("/review api --setup");
+        assert_eq!((r.0.as_deref(), r.1), (Some("api"), true));
+        let r = review("/review --setup api");
+        assert_eq!((r.0.as_deref(), r.1), (Some("api"), true));
+        for line in [
+            "/review --scope since main",
+            "/review --scope 'since main'",
+            "/review --scope=since:main",
+            "/review --scope since:main",
+            "/review --scope=since=main",
+            "/review --scope since=main",
+            "/review --scope=since main",
+        ] {
+            assert_eq!(review(line).2.as_deref(), Some("since main"), "{line}");
+        }
+        assert_eq!(
+            review("/review --scope last 3 api").2.as_deref(),
+            Some("last 3")
+        );
+        assert_eq!(
+            review("/review --scope last 3 api").0.as_deref(),
+            Some("api")
+        );
+        assert_eq!(
+            review("/review --scope=last:3").2.as_deref(),
+            Some("last 3")
+        );
+        assert_eq!(
+            review("/review --scope uncommitted").2.as_deref(),
+            Some("uncommitted")
+        );
+        assert_eq!(
+            review("/review --scope=branch").2.as_deref(),
+            Some("branch")
+        );
+        let r = review(
+            "/review --profile=low --reviewer codex/gpt-6.1-sol --implementer \
+             claude-code:work/claude-opus-5-5:high --workers claude-opus-5-5 --commit match",
+        );
+        assert_eq!(r.3.as_deref(), Some("low"));
+        assert_eq!(r.4.as_deref(), Some("codex/gpt-6.1-sol"));
+        assert_eq!(
+            r.5.as_deref(),
+            Some("claude-code:work/claude-opus-5-5:high")
+        );
+        assert_eq!(r.6.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(r.7.as_deref(), Some("match"));
+        // Usage errors, each with the parser's words.
+        let err = |line: &str| parse(line).unwrap_err();
+        assert!(err("/review --scope").contains("--scope takes a value"));
+        assert!(err("/review --scope since").contains("--scope since takes a ref"));
+        assert!(err("/review --scope last --setup").contains("--scope last takes a number"));
+        assert!(err("/review --scope everything").starts_with(
+            "--scope: \"everything\" is not a scope (branch, uncommitted, since <ref>, last <n>)"
+        ));
+        assert!(err("/review --scope last 0").contains("give a number of commits, 1 to 1000"));
+        assert!(err("/review --scope since -x").contains("is not a ref"));
+        assert!(err("/review --profile High").starts_with("--profile: \"High\" is not a profile"));
+        assert!(err("/review --reviewer codex").starts_with(
+            "--reviewer: \"codex\" is not runtime[:account]/model (codex/gpt-6.1-sol)"
+        ));
+        assert_eq!(
+            err("/review --reviewer acp/x"),
+            format!(
+                "--reviewer: {}",
+                crate::loops::config::ReviewerChoice::parse("acp/x").unwrap_err()
+            )
+        );
+        assert!(err("/review --reviewer codex/gpt-6.1-sol:high").contains("gives an effort"));
+        assert!(err("/review --implementer opus").starts_with("--implementer: "));
+        assert!(err("/review --workers codex/o5").starts_with("--workers: "));
+        assert!(err("/review --commit end")
+            .starts_with("--commit: \"end\" is not a review loop's commit (match or none)"));
+        assert!(err("/review --profile low --profile high").contains("given twice"));
+        assert!(err("/review --setup=yes").contains("--setup takes no value"));
+        assert!(err("/review --yes").starts_with("unknown option --yes"));
+        assert!(err("/review api web").starts_with("usage: /review [thread]"));
+    }
+
+    /// `/loop`: bare, a thread, an action, a thread and an action; `settings` without a thread
+    /// and with `--project`.
+    #[test]
+    fn loop_parses() {
+        let l = |line: &str| match parse(line) {
+            Ok(Slash::Loop {
+                thread,
+                action,
+                project,
+            }) => (thread, action, project),
+            other => panic!("{line}: {other:?}"),
+        };
+        assert_eq!(l("/loop"), (None, LoopAction::Status, None));
+        assert_eq!(l("/loop pause"), (None, LoopAction::Pause, None));
+        assert_eq!(
+            l("/loop api"),
+            (Some("api".into()), LoopAction::Status, None)
+        );
+        assert_eq!(
+            l("/loop api resume"),
+            (Some("api".into()), LoopAction::Resume, None)
+        );
+        assert_eq!(
+            l("/loop api stop"),
+            (Some("api".into()), LoopAction::Stop, None)
+        );
+        for skip in ["skip", "skip-to-verify", "skip_to_verify"] {
+            assert_eq!(l(&format!("/loop api {skip}")).1, LoopAction::SkipToVerify);
+        }
+        assert_eq!(l("/loop api status").1, LoopAction::Status);
+        assert_eq!(l("/loop settings"), (None, LoopAction::Settings, None));
+        assert_eq!(
+            l("/loop settings --project api"),
+            (None, LoopAction::Settings, Some("api".into()))
+        );
+        assert_eq!(
+            l("/loop --project=api settings"),
+            (None, LoopAction::Settings, Some("api".into()))
+        );
+        let err = |line: &str| parse(line).unwrap_err();
+        assert!(err("/loop api settings").starts_with("/loop settings takes no thread"));
+        assert!(err("/loop api pause --project web").starts_with("--project goes with"));
+        assert!(err("/loop api frobnicate").contains("is nothing /loop does"));
+        assert!(err("/loop a b c").starts_with(LOOP_STARTS_NONE));
+        assert!(err("/loop a b c").contains("usage: /loop"));
+        assert!(err("/loop settings --project").contains("--project takes a project"));
+        assert!(err("/loop --force").starts_with("unknown option --force"));
+    }
+
+    /// `/loop` starts no loop: words that would start one say to use `/implement` or
+    /// `/review`.
+    #[test]
+    fn loop_starts_none() {
+        for line in [
+            "/loop implement",
+            "/loop review",
+            "/loop implement add a CSV export",
+            "/loop review api --setup",
+            "/loop implement stop",
+            "/loop start",
+        ] {
+            let e = parse(line).unwrap_err();
+            assert!(
+                e.starts_with(LOOP_STARTS_NONE) || e.starts_with("unknown option"),
+                "{line}: {e}"
+            );
+            assert!(
+                e.contains("/implement") || e.starts_with("unknown option"),
+                "{line}: {e}"
+            );
+        }
+        assert!(parse("/loop api frobnicate")
+            .unwrap_err()
+            .contains("/implement <task> starts an implementation loop"));
+        // A word that is a thread is still its status.
+        assert!(matches!(
+            parse("/loop api"),
+            Ok(Slash::Loop {
+                action: LoopAction::Status,
+                ..
+            })
+        ));
+    }
+
+    /// `/implement`: flags anywhere, every other word kept in order for [`implement_target`];
+    /// `--` makes the rest the task's; each value checked by the loop settings' own parsers.
+    #[test]
+    fn implement_parses_and_checks_its_values() {
+        let imp = |line: &str| match parse(line) {
+            Ok(Slash::Implement {
+                words,
+                setup,
+                profile,
+                reviewer,
+                implementer,
+                workers,
+                commit,
+                plan_check,
+            }) => (
+                words,
+                setup,
+                [profile, reviewer, implementer, workers, commit, plan_check],
+            ),
+            other => panic!("{line}: {other:?}"),
+        };
+        let none: [Option<String>; 6] = Default::default();
+        assert_eq!(imp("/implement"), (vec![], false, none.clone()));
+        assert_eq!(
+            imp("/implement api add a \"CSV export\""),
+            (
+                vec!["api".into(), "add".into(), "a".into(), "CSV export".into()],
+                false,
+                none.clone()
+            )
+        );
+        let (words, setup, values) = imp(
+            "/implement api --setup --profile=low --reviewer codex/gpt-6.1-sol --implementer \
+             thread --workers claude-opus-5-5:high --commit per-round --plan-check always add it",
+        );
+        assert_eq!(words, ["api", "add", "it"]);
+        assert!(setup);
+        assert_eq!(
+            values,
+            [
+                Some("low".to_string()),
+                Some("codex/gpt-6.1-sol".into()),
+                Some("thread".into()),
+                Some("claude-opus-5-5:high".into()),
+                Some("per-round".into()),
+                Some("always".into())
+            ]
+        );
+        // After `--`, a word that starts with `--` is the task's.
+        assert_eq!(
+            imp("/implement --setup -- make --verbose work").0,
+            ["make", "--verbose", "work"]
+        );
+        let err = |line: &str| parse(line).unwrap_err();
+        assert!(err("/implement --commit match").starts_with("--commit: "));
+        assert!(err("/implement --plan-check sometimes").starts_with("--plan-check: "));
+        assert!(err("/implement --reviewer codex").starts_with("--reviewer: "));
+        assert!(err("/implement --profile Low").starts_with("--profile: "));
+        assert!(err("/implement --profile").contains("--profile takes a value"));
+        assert!(err("/implement --setup=yes").starts_with("--setup takes no value"));
+        assert!(err("/implement --commit end --commit none").contains("given twice"));
+        assert!(err("/implement --scope branch").starts_with("an implementation loop has no scope"));
+        assert!(err("/implement make --verbose work").contains("goes after --"));
+        let long = format!(
+            "/implement {}",
+            "x".repeat(crate::loops::settings::MAX_TASK_BYTES)
+        );
+        assert!(err(&long).contains("longer than"));
+    }
+
+    /// Where `/implement`'s words go: the dived thread takes every word as the task; elsewhere
+    /// a first word naming a live thread is the thread.
+    #[test]
+    fn implement_target_splits_the_thread_from_the_task() {
+        let w = |s: &str| -> Vec<String> {
+            s.split(' ')
+                .filter(|w| !w.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        let live = |name: &str| ["api", "web"].contains(&name);
+        assert_eq!(
+            implement_target(&w("api add a CSV export"), false, live),
+            (Some("api".into()), Some("add a CSV export".into()))
+        );
+        // Not a live thread: the selected card's, every word the task's.
+        assert_eq!(
+            implement_target(&w("add a CSV export"), false, live),
+            (None, Some("add a CSV export".into()))
+        );
+        // In a dive, a thread's name is a word of the task.
+        assert_eq!(
+            implement_target(&w("web pages render faster"), true, live),
+            (None, Some("web pages render faster".into()))
+        );
+        // The thread alone, or nothing: the task is what the conversation settled.
+        assert_eq!(
+            implement_target(&w("api"), false, live),
+            (Some("api".into()), None)
+        );
+        assert_eq!(implement_target(&[], false, live), (None, None));
+        assert_eq!(implement_target(&[], true, live), (None, None));
+        // Words are joined by single spaces; blank ones go.
+        assert_eq!(
+            implement_target(&["  add ".into(), "".into(), "it".into()], false, live),
+            (None, Some("add it".into()))
+        );
+    }
+
+    /// `/new … --implement [--setup] <task>`: the words after the project are the task, only
+    /// with `--implement`, which needs one.
+    #[test]
+    fn new_with_implement_parses() {
+        let new = |line: &str| match parse(line) {
+            Ok(Slash::New {
+                project,
+                runtime,
+                implement,
+                setup,
+                task,
+                ..
+            }) => (project, runtime, implement, setup, task),
+            other => panic!("{line}: {other:?}"),
+        };
+        assert_eq!(
+            new("/new api --implement add rate limiting"),
+            (
+                "api".into(),
+                None,
+                true,
+                false,
+                Some("add rate limiting".into())
+            )
+        );
+        assert_eq!(
+            new("/new api --runtime codex --implement --setup \"add rate limiting\""),
+            (
+                "api".into(),
+                Some("codex".into()),
+                true,
+                true,
+                Some("add rate limiting".into())
+            )
+        );
+        assert_eq!(
+            new("/new --implement api -- add --dry-run"),
+            (
+                "api".into(),
+                None,
+                true,
+                false,
+                Some("add --dry-run".into())
+            )
+        );
+        assert_eq!(new("/new api"), ("api".into(), None, false, false, None));
+        let err = |line: &str| parse(line).unwrap_err();
+        assert!(err("/new api --implement").starts_with("--implement takes the task"));
+        assert!(err("/new api add it").starts_with("usage: /new"));
+        assert!(err("/new api --setup").starts_with("usage: /new"));
+        assert!(err("/new api --implement=yes x").starts_with("usage: /new"));
+    }
+
+    /// `/implement`'s popup: threads and flags first, flag values, nothing while the task is
+    /// typed; Tab completes a thread.
+    #[test]
+    fn implement_completes() {
+        let pools = Pools {
+            threads: vec![
+                ("api".into(), "idle".into()),
+                ("web".into(), "running".into()),
+            ],
+            profiles: vec![("low".into(), "one medium round".into())],
+            ..Default::default()
+        };
+        let names = |line: &str| -> Vec<String> {
+            suggest(line, &pools)
+                .items
+                .into_iter()
+                .map(|i| i.value)
+                .collect()
+        };
+        let flags: Vec<String> = IMPLEMENT_FLAGS.iter().map(|f| f.0.to_string()).collect();
+        let mut all = vec!["api".to_string(), "web".into()];
+        all.extend(flags.iter().cloned());
+        assert_eq!(names("/implement "), all);
+        // (Prefix first, then those that contain it.)
+        assert_eq!(names("/implement a"), ["api", "--plan-check"]);
+        // After the thread: typing the task offers nothing, a `-` the flags not given.
+        assert!(names("/implement api ").is_empty());
+        assert!(names("/implement api add ").is_empty());
+        assert_eq!(names("/implement api --p"), ["--profile", "--plan-check"]);
+        assert_eq!(
+            names("/implement --setup --"),
+            flags[1..].to_vec(),
+            "flags given are not offered again"
+        );
+        assert_eq!(names("/implement --commit "), ["end", "per-round", "none"]);
+        assert_eq!(
+            names("/implement --plan-check "),
+            ["contracts", "always", "never"]
+        );
+        assert_eq!(names("/implement --profile "), ["low"]);
+        let s = suggest("/implement --commit=p", &pools);
+        assert_eq!(s.start, "/implement --commit=".len());
+        assert_eq!(s.items[0].value, "per-round");
+        assert!(names("/implement --reviewer ").is_empty());
+        // A flag's value given: threads and the other flags again.
+        let without: Vec<String> = all.iter().filter(|f| *f != "--commit").cloned().collect();
+        assert_eq!(names("/implement --commit end "), without);
+        assert!(names("/implement -- --").is_empty());
+        let threads = vec!["api".to_string(), "web".into()];
+        assert_eq!(
+            complete("/impl", &[], &threads, &[]),
+            (Some("/implement ".into()), vec![])
+        );
+        assert_eq!(
+            complete("/implement w", &[], &threads, &[]),
+            (Some("/implement web ".into()), vec![])
+        );
+        // Its row in the command popup.
+        let rows = suggest("/impl", &pools);
+        assert!(rows.command);
+        assert_eq!(rows.items[0].value, "/implement");
+        assert!(rows.items[0].label.contains("[task…]"));
+    }
+
+    /// The popup of `/review` and `/loop`: threads, then the flags; `--scope`'s words, the
+    /// profiles of `--profile`, `--commit`'s values, inline after `=` too; flags not given yet;
+    /// `/loop`'s actions with what each does, then threads; after a thread, its actions.
+    #[test]
+    fn loop_commands_complete() {
+        let pools = Pools {
+            threads: vec![
+                ("api".into(), "idle".into()),
+                ("web".into(), "running".into()),
+            ],
+            profiles: vec![
+                ("low".into(), "one medium round".into()),
+                ("high".into(), "medium, then xhigh".into()),
+                ("deep".into(), "yours".into()),
+            ],
+            ..Default::default()
+        };
+        let names = |line: &str| -> Vec<String> {
+            suggest(line, &pools)
+                .items
+                .into_iter()
+                .map(|i| i.value)
+                .collect()
+        };
+        let flags: Vec<String> = REVIEW_FLAGS.iter().map(|f| f.0.to_string()).collect();
+        let mut all = vec!["api".to_string(), "web".into()];
+        all.extend(flags.iter().cloned());
+        assert_eq!(names("/review "), all);
+        assert_eq!(names("/review a"), ["api"]);
+        assert_eq!(names("/review api "), flags);
+        assert_eq!(names("/review api --s"), ["--setup", "--scope"]);
+        assert_eq!(
+            names("/review api --setup --"),
+            flags[1..].to_vec(),
+            "flags given are not offered again"
+        );
+        assert_eq!(
+            names("/review --scope "),
+            ["branch", "uncommitted", "since", "last"]
+        );
+        assert_eq!(names("/review --scope u"), ["uncommitted"]);
+        let s = suggest("/review --scope=s", &pools);
+        assert_eq!(s.start, "/review --scope=".len());
+        assert_eq!(
+            s.items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(),
+            ["since", "last"]
+        );
+        assert!(suggest("/review --scope ", &pools).items[0]
+            .detail
+            .contains("branch since it left its base"));
+        assert!(names("/review --scope since ").is_empty());
+        let without =
+            |flag: &str| -> Vec<String> { all.iter().filter(|f| *f != flag).cloned().collect() };
+        assert_eq!(names("/review --scope since main "), without("--scope"));
+        assert_eq!(names("/review --profile "), ["low", "high", "deep"]);
+        assert_eq!(names("/review --profile=d"), ["deep"]);
+        assert_eq!(names("/review --commit "), ["match", "none"]);
+        assert!(names("/review --reviewer ").is_empty());
+        assert_eq!(names("/review --profile low "), without("--profile"));
+        // `/loop`.
+        let mut first: Vec<String> = LOOP_WORDS.iter().map(|w| w.0.to_string()).collect();
+        first.extend(["api".to_string(), "web".into()]);
+        assert_eq!(names("/loop "), first);
+        // (Prefix first, then those that contain it.)
+        assert_eq!(
+            names("/loop s"),
+            ["status", "stop", "skip", "settings", "pause", "resume"]
+        );
+        assert!(suggest("/loop ", &pools).items[1].detail.contains("hold"));
+        assert_eq!(
+            names("/loop api "),
+            ["status", "pause", "resume", "stop", "skip"]
+        );
+        assert!(names("/loop api pause ").is_empty());
+        assert_eq!(names("/loop settings "), ["--project"]);
+        assert!(names("/loop settings --project ").is_empty());
+        // Tab completion: a thread for `/review`, an action or a thread for `/loop`.
+        let threads = vec!["api".to_string(), "web".into()];
+        assert_eq!(
+            complete("/review a", &[], &threads, &[]),
+            (Some("/review api ".into()), vec![])
+        );
+        assert_eq!(
+            complete("/loop pa", &[], &threads, &[]),
+            (Some("/loop pause ".into()), vec![])
+        );
+        assert_eq!(
+            complete("/loop w", &[], &threads, &[]),
+            (Some("/loop web ".into()), vec![])
+        );
     }
 
     #[test]
@@ -1444,6 +2783,9 @@ mod tests {
                 name: Some("api2".into()),
                 account: None,
                 outside_pin: false,
+                implement: false,
+                setup: false,
+                task: None,
             })
         );
         assert_eq!(
@@ -1454,6 +2796,9 @@ mod tests {
                 name: None,
                 account: None,
                 outside_pin: false,
+                implement: false,
+                setup: false,
+                task: None,
             })
         );
         assert_eq!(parse("/park"), Ok(Slash::Park(None)));
@@ -1799,6 +3144,7 @@ mod tests {
                 "/model",
                 "/account",
                 "/accounts",
+                "/loop",
                 "/compact-context",
                 "/stop",
                 "/compact",
@@ -1817,6 +3163,8 @@ mod tests {
                 "/pin",
                 "/parked",
                 "/open",
+                "/implement",
+                "/loop",
                 "/compact-context",
                 "/stop",
                 "/spaces",
@@ -2160,6 +3508,9 @@ mod tests {
                 name: None,
                 account: Some("work".into()),
                 outside_pin: true,
+                implement: false,
+                setup: false,
+                task: None,
             })
         );
         assert_eq!(
@@ -2170,6 +3521,9 @@ mod tests {
                 name: None,
                 account: None,
                 outside_pin: false,
+                implement: false,
+                setup: false,
+                task: None,
             })
         );
         assert_eq!(
@@ -2180,6 +3534,9 @@ mod tests {
                 name: None,
                 account: None,
                 outside_pin: true,
+                implement: false,
+                setup: false,
+                task: None,
             })
         );
         assert!(parse("/new api --outside-pin").is_err());
@@ -2194,6 +3551,9 @@ mod tests {
                 name: Some("api2".into()),
                 account: Some("work".into()),
                 outside_pin: true,
+                implement: false,
+                setup: false,
+                task: None,
             })
         );
         assert!(parse("/new api --account=work --account x").is_err());

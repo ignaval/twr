@@ -17,6 +17,11 @@
   --active: rgb(255 255 255 / 7.5%);
   --border: #282e35;
   --border-strong: #3b444e;
+  /* A control's edge, 3:1 on every surface a control sits on (WCAG 1.4.11): a field's
+   * (the palette's underline too), the composer's, a checkbox's, a slider's track, a
+   * selected segment's and a selected thread card's. `--border` is for lines that
+   * identify nothing. */
+  --field-border: #6b7480;
   --text: #e6e9ec;
   --muted: #a3abb4;
   --faint: #959ea8;
@@ -29,6 +34,8 @@
   --danger-soft: rgb(240 138 132 / 12%);
   --danger-fg: #1f0907;
   --success: #7cc79a;
+  --loop: #b9a3f0;
+  --loop-soft: rgb(185 163 240 / 13%);
   --focus: var(--accent);
   --scrim: rgb(0 0 0 / 60%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 50%);
@@ -37,10 +44,14 @@
   --terminal-text: #e6e9ec;
   --terminal-muted: #a3abb4;
   --terminal-border: #323941;
+  --terminal-field-border: #68717c;
   --terminal-accent: #62c7d4;
   --terminal-selection: #29434a;
   --destination-strength: 100%;
   --destination: var(--accent);
+  /* How much of a thread's light-theme ink its name uses (shared/threadColor.ts): 0% in a
+   * dark theme, 100% in a light one. */
+  --light-share: 0%;
   --content-width: 760px;
   --header-height: 48px;
   --font-ui:
@@ -97,7 +108,7 @@ button:disabled {
 button:focus-visible,
 a:focus-visible,
 summary:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus);
   outline-offset: 3px;
 }
 /* Keyboard focus stays visible on every focusable element, including custom
@@ -114,7 +125,7 @@ input,
 textarea,
 select {
   width: 100%;
-  border: 1px solid var(--border);
+  border: 1px solid var(--field-border);
   border-radius: 6px;
   background: var(--bg);
   color: var(--text);
@@ -187,12 +198,62 @@ input::placeholder,
 textarea::placeholder {
   color: var(--faint);
 }
+/* Checkboxes (and the switches drawn as them) and sliders are drawn with the theme's tokens,
+ * so their edges read at 3:1 in every engine: the box's edge, the checked fill and its
+ * mark; the slider's track and its thumb. */
 input[type="checkbox"] {
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  flex-shrink: 0;
   min-width: 16px;
   min-height: 16px;
   width: 16px;
   height: 16px;
-  accent-color: var(--accent);
+  padding: 0;
+  border: 1px solid var(--field-border);
+  border-radius: 4px;
+  background: var(--bg);
+  cursor: pointer;
+}
+input[type="checkbox"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+input[type="checkbox"]:checked::before {
+  content: "";
+  width: 8px;
+  height: 4px;
+  border: solid var(--accent-fg);
+  border-width: 0 0 2px 2px;
+  transform: translateY(-1px) rotate(-45deg);
+}
+input[type="checkbox"]:disabled,
+input[type="range"]:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+input[type="range"] {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--field-border);
+}
+/* The thumb's ring is the page's colour: it parts the thumb from the track. */
+input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -7px;
+  border: 2px solid var(--bg);
+  border-radius: 50%;
+  background: var(--accent);
 }
 textarea {
   resize: vertical;
@@ -294,6 +355,10 @@ kbd {
   color: var(--accent);
   background: var(--accent-soft);
 }
+/* A pressed toggle (Toggle tool calls, Focus) has an edge; hovering has none. */
+.icon-button.on {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
 .primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -376,10 +441,16 @@ kbd {
   color: var(--accent);
 }
 .app {
-  --destination-ink: color-mix(
+  /* The orchestrator's accent, or (a thread's conversation) its name's ink for the theme. */
+  --destination-mix: color-mix(
     in srgb,
     var(--destination) var(--destination-strength),
     var(--text)
+  );
+  --destination-ink: color-mix(
+    in srgb,
+    var(--destination-ink-light, var(--destination-mix)) var(--light-share),
+    var(--destination-ink-dark, var(--destination-mix))
   );
   display: flex;
   height: 100dvh;
@@ -453,6 +524,7 @@ kbd {
 .primary-nav > button.active:hover {
   background: var(--accent-soft);
   color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .key-hint {
   margin-left: auto;
@@ -582,6 +654,7 @@ kbd {
 .workspace-orchestrator.active:hover {
   background: var(--accent-soft);
   color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .workspace-entry .thread-list {
   padding-left: 18px;
@@ -637,7 +710,7 @@ kbd {
   background: var(--hover);
 }
 .thread-card.selected {
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   background: var(--active);
 }
 .thread-card-title {
@@ -647,6 +720,8 @@ kbd {
   gap: 8px;
 }
 .thread-card-title > b {
+  flex-shrink: 0;
+  max-width: 65%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -654,6 +729,16 @@ kbd {
   font-size: 1rem;
   font-weight: 500;
   line-height: 1.5;
+}
+/* A thread's name (or mark) drawn in its colour: the colour's ink for the theme in use,
+ * which reads at 4.5:1 wherever a name sits (shared/threadColor.ts, threadStyle). The
+ * colour itself stays on the dots, bands and tints. */
+.thread-ink {
+  color: color-mix(
+    in srgb,
+    var(--thread-ink-light, var(--text)) var(--light-share),
+    var(--thread-ink-dark, var(--text))
+  );
 }
 .thread-color-dot {
   border-radius: 50%;
@@ -670,8 +755,18 @@ kbd {
   font-size: 0.923077rem;
   gap: 4px;
 }
+/* A long status (`background (1 bg)`, a loop's review runs) gives way before the thread's
+ * name: it keeps its icon and ends in an ellipsis, and the name keeps its letters (up to
+ * 65% of the row: a shrinking name shows an ellipsis for a fraction of a pixel). */
 .thread-card-title > .thread-status {
   margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+}
+.thread-card-title > .thread-status > .thread-status-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .status-running,
 .status-background {
@@ -842,11 +937,15 @@ kbd {
   padding: 4px 8px;
   min-height: 28px;
 }
+/* `clip`, not `hidden`: a box that clips can't be scrolled. A visually hidden label in a
+   scrolling pane is placed by the pane's positioned ancestor and overflows it, and a
+   `scrollIntoView` in the pane (the inspector's Loops section) would scroll a `hidden`
+   box by that much: the header gone, a blank strip under the composer, and no way back. */
 .work-area {
   display: flex;
   flex: 1;
   min-height: 0;
-  overflow: hidden;
+  overflow: clip;
   position: relative;
 }
 .content-column {
@@ -855,7 +954,7 @@ kbd {
   display: flex;
   flex-direction: column;
   position: relative;
-  overflow: hidden;
+  overflow: clip;
 }
 .conversation-heading {
   display: flex;
@@ -1206,15 +1305,17 @@ kbd {
   width: calc(100% - 48px);
   max-width: var(--content-width);
   margin: 0 auto 24px;
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   border-radius: 10px;
   box-shadow: none;
 }
+/* Focused, the edge takes some of the destination's ink (its readable colour), so it keeps
+ * 3:1 with any thread's colour. */
 .composer:focus-within {
   border-color: color-mix(
     in srgb,
-    var(--destination) 55%,
-    var(--border-strong)
+    var(--destination-ink) 55%,
+    var(--field-border)
   );
 }
 .composer-label {
@@ -1338,22 +1439,31 @@ kbd {
 .reports > summary > span {
   color: var(--faint);
 }
-.reports > button {
+.report-row {
   display: flex;
-  width: 100%;
+  align-items: center;
+  gap: 8px;
+}
+.report-row > button:first-child {
+  display: flex;
+  flex: 1;
+  min-width: 0;
   background: none;
   border: 0;
   justify-content: flex-start;
   padding: 6px 0;
   font-size: 0.923077rem;
 }
-.reports > button > span:first-child {
+.report-row > button:first-child > span:first-child {
   min-width: 70px;
   max-width: 110px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.reports > button > span:nth-child(2) {
+/* The summary (after the name and its visually hidden separator) ends in an ellipsis. */
+.report-row
+  > button:first-child
+  > span:not(:first-child):not(.visually-hidden) {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -1416,6 +1526,8 @@ kbd {
   overflow: auto;
   flex: 1;
   padding: 20px 16px;
+  /* Places its visually hidden labels, which then scroll and clip with it. */
+  position: relative;
 }
 .thread-runtime {
   color: var(--muted);
@@ -1517,6 +1629,7 @@ kbd {
     var(--terminal-text) 7%,
     var(--terminal-panel)
   );
+  box-shadow: inset 0 -2px 0 var(--terminal-accent);
 }
 .terminal-tab > button {
   background: none;
@@ -1545,6 +1658,11 @@ kbd {
   height: 100%;
   flex-direction: column;
 }
+/* The terminal keeps its dark palette in every theme: its focus ring is its own accent. */
+.terminal-dock,
+.terminal-session {
+  --focus: var(--terminal-accent);
+}
 .terminal-surface {
   flex: 1;
   min-height: 0;
@@ -1565,7 +1683,7 @@ kbd {
   font-size: 0.846154rem;
   background: var(--terminal-panel);
   color: var(--terminal-text);
-  border-color: var(--terminal-border);
+  border-color: var(--terminal-field-border);
   padding: 4px 8px;
   min-height: 28px;
 }
@@ -1717,7 +1835,7 @@ meter::-webkit-meter-optimum-value {
   border-top: 1px solid var(--border);
 }
 .thread-card.large.selected {
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   background: var(--active);
 }
 .thread-card.large .thread-card-title > b {
@@ -1837,7 +1955,7 @@ meter::-webkit-meter-optimum-value {
 }
 .segmented > button.active {
   background: var(--overlay);
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
   color: var(--text);
 }
 .config-editor {
@@ -1879,6 +1997,22 @@ meter::-webkit-meter-optimum-value {
 }
 .conversation-attention:empty {
   display: none;
+}
+/* A request that goes on below the area's fold fades out at its bottom edge
+   (`data-more`, shared/scrollCue.ts): in a short window its answers are further down. */
+.conversation-attention[data-more="below"]::after {
+  content: "";
+  display: block;
+  position: sticky;
+  bottom: 0;
+  height: 40px;
+  margin-top: -40px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    color-mix(in srgb, var(--bg) 92%, transparent)
+  );
 }
 .attention-card {
   border: 1px solid color-mix(in srgb, var(--warning) 28%, var(--border));
@@ -1948,13 +2082,12 @@ meter::-webkit-meter-optimum-value {
   padding: 8px 14px 14px;
 }
 .attention-response > input {
-  border-bottom: 1px solid var(--border);
   margin-bottom: 12px;
   box-shadow: none;
   font-size: 1rem;
   padding: 6px 8px;
   background: var(--bg);
-  border: 1px solid var(--border);
+  border: 1px solid var(--field-border);
   border-radius: 6px;
 }
 .attention-options {
@@ -1968,6 +2101,16 @@ meter::-webkit-meter-optimum-value {
   white-space: normal;
   font-size: 1rem;
   padding: 6px 12px;
+}
+/* A primary option (a loop setup card's Start and save) keeps its fill: the rule above
+ * would put its accent-fg label on the raised background, where it cannot be read. */
+.attention-options > button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.attention-options > button.primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 90%, var(--text));
 }
 .attention-options kbd {
   color: var(--faint);
@@ -2005,6 +2148,546 @@ meter::-webkit-meter-optimum-value {
 .inspector .attention-options > button {
   font-size: 0.923077rem;
   padding: 8px;
+}
+/* Loops (shared/LoopViews.tsx): the chip on a thread's sidebar card, the Review loop offer,
+ * the inspector's Loops section, the setup card and the settings editor. */
+.loop-chip {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  order: 1;
+  font-size: 0.846154rem;
+  line-height: 1.5;
+}
+.loop-badge {
+  flex-shrink: 0;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: var(--loop);
+  background: var(--loop-soft);
+  border: 1px solid color-mix(in srgb, var(--loop) 40%, transparent);
+  font-size: 0.769231rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* The line wraps rather than losing its tail (the ledger, the round) to an ellipsis. */
+.loop-line {
+  min-width: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.loop-chip:hover .loop-line {
+  color: var(--loop);
+}
+.loop-offer {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  min-height: 24px;
+  font-size: 0.846154rem;
+  background: none;
+  color: var(--loop);
+  border: 1px solid color-mix(in srgb, var(--loop) 35%, var(--border));
+  border-radius: 6px;
+}
+.loop-offer:hover:not(:disabled) {
+  background: var(--loop-soft);
+}
+.loop-offer:disabled {
+  opacity: 0.55;
+}
+.thread-card-offer {
+  align-self: flex-start;
+  margin: -2px 12px 6px;
+}
+/* In the grid (a narrow window's thread list) the offer sits in its tile's bottom padding,
+ * over the card rather than in it: a button can't hold a button. */
+.thread-grid > .thread-item.has-offer {
+  position: relative;
+}
+.thread-grid > .thread-item.has-offer > .thread-card {
+  padding-bottom: calc(max(44px, 1.7rem) + 28px);
+}
+.thread-grid > .thread-item > .thread-card-offer {
+  position: absolute;
+  left: 20px;
+  bottom: 16px;
+  margin: 0;
+}
+.loop-offer-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  max-width: var(--content-width);
+  margin: 4px auto 16px;
+  padding: 8px 12px;
+  border: 1px dashed color-mix(in srgb, var(--loop) 35%, var(--border));
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.inspector-loops {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+  margin: 16px 0;
+}
+.inspector-loops:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.inspector-loops h3 {
+  font-size: 0.923077rem;
+  margin-bottom: 8px;
+}
+.loop-settings-line,
+.loop-last {
+  font-size: 0.923077rem;
+  color: var(--muted);
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+.loop-settings-line .text-button {
+  display: inline;
+  font-size: inherit;
+}
+.loop-status {
+  font-size: 0.923077rem;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+.loop-phases {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 0.846154rem;
+}
+.loop-phases > li {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  color: var(--faint);
+}
+.loop-phases > li.done {
+  color: var(--muted);
+}
+.loop-phases > li.skipped {
+  border-style: dashed;
+}
+.loop-phases > li.current {
+  color: var(--loop);
+  border-color: color-mix(in srgb, var(--loop) 45%, var(--border));
+  background: var(--loop-soft);
+  font-weight: 600;
+}
+.loop-facts {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 4px 8px;
+  margin: 0 0 12px;
+  font-size: 0.923077rem;
+}
+.loop-facts dt {
+  color: var(--faint);
+}
+.loop-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.loop-rounds {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  font-size: 0.923077rem;
+}
+.loop-rounds > li {
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+/* A round with something to show (findings, a failed run's reason) is a disclosure row: as
+ * tall as a plain round's row, so a round that fails or answers moves nothing below it. */
+:root:not([data-mobile="true"]) .loop-rounds > li > details > summary {
+  padding-block: 0;
+}
+.loop-rounds b {
+  color: var(--text);
+  font-weight: 600;
+}
+.loop-finding {
+  margin: 8px 0 8px 12px;
+  overflow-wrap: anywhere;
+}
+.loop-finding p {
+  margin: 2px 0;
+}
+.loop-severity {
+  font-size: 0.846154rem;
+  color: var(--muted);
+}
+.loop-severity.blocker {
+  color: var(--danger);
+}
+.loop-severity.major {
+  color: var(--warning);
+}
+.loop-verdict {
+  color: var(--loop);
+}
+.loop-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0;
+}
+.loop-controls > button {
+  font-size: 0.923077rem;
+  padding: 4px 10px;
+}
+.loop-report {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  font-size: 0.923077rem;
+}
+.loop-path {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+}
+.loop-path code {
+  font-family: var(--font-mono);
+  font-size: 0.846154rem;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+.attention-card.attention-loop-setup {
+  border-color: color-mix(in srgb, var(--loop) 40%, var(--border));
+}
+.attention-loop-setup > header {
+  background: var(--loop-soft);
+}
+.attention-loop-setup .attention-kind {
+  color: var(--loop);
+}
+.loop-setup-title {
+  color: var(--text);
+  margin: 0 0 10px;
+}
+.loop-setup-rows {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  font-size: 0.961538rem;
+}
+.loop-setup-rows > div {
+  display: grid;
+  grid-template-columns: 100px minmax(0, 1fr);
+  gap: 8px;
+}
+.loop-setup-rows dt {
+  color: var(--faint);
+}
+.loop-setup-rows dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.loop-notes {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 0;
+  display: grid;
+  gap: 6px;
+  font-size: 0.923077rem;
+}
+.loop-notes > li {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.loop-notes > li > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.loop-warning {
+  color: var(--warning);
+  background: var(--warning-soft);
+}
+.loop-problem {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+.loop-readonly {
+  padding: 0 14px;
+}
+.loop-setup-row .attention-body > p {
+  color: var(--text);
+  margin: 0 0 10px;
+}
+.loop-editor {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.loop-editor-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.loop-editor-heading {
+  font-weight: 600;
+  font-size: 0.923077rem;
+}
+.loop-editor-row {
+  display: grid;
+  /* In rem, so a phone, or a larger text size, gets one column before a select cuts its
+   * value ("Like the thread (commit if it was)"). */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 8px 12px;
+}
+.loop-presets {
+  flex-wrap: wrap;
+  width: auto;
+}
+.loop-editor-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 640px;
+}
+.loop-projects {
+  max-width: 640px;
+}
+/* Settings › Loops: whose settings the editor under it shows. */
+.loop-settings-for {
+  font-size: 1rem;
+  margin: 8px 0 4px;
+}
+.loop-projects ul {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 14px;
+}
+.loop-projects li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.loop-projects li > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.loop-projects h3 {
+  font-size: 0.923077rem;
+}
+/* Implementation loops: the inspector's two starts, the held task on a setup card, a
+ * loop's commits and its ended line, and Send as implementation loop. */
+.loop-starts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.loop-starts > button {
+  flex: 1 1 auto;
+}
+/* A long task scrolls inside the card: the card never cuts it without a word. */
+.loop-setup-task {
+  white-space: pre-wrap;
+  max-height: 9.5em;
+  overflow: auto;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+.loop-setup-task:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.loop-commits {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 8px;
+  font-size: 0.923077rem;
+  color: var(--text);
+}
+.loop-commits > li {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+.loop-commits code {
+  font-family: var(--font-mono);
+}
+.loop-commit.loop-problem {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 0.923077rem;
+}
+.loop-commit.loop-problem > svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.loop-commit-notes {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0 8px;
+  font-size: 0.846154rem;
+  overflow-wrap: anywhere;
+}
+/* Open report: the loop's report.md, scrolling inside the dialog (a sheet on a phone). */
+.loop-report-body {
+  overflow: auto;
+  /* The text keeps some height however large the type: the title and the path (both
+   * fixed) would otherwise take all of a phone's sheet at the largest text size. */
+  min-height: min(10rem, 30dvh);
+  padding: 16px 24px 24px;
+}
+.loop-report-body:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.loop-report-footer {
+  max-height: 22dvh;
+  overflow-y: auto;
+}
+.loop-report-footer .loop-path {
+  min-width: 0;
+}
+.loop-report-footer .loop-path small {
+  min-width: 0;
+}
+.loop-implement {
+  margin-top: -4px;
+}
+.loop-implement .loop-path {
+  margin-top: 2px;
+}
+.loop-ended {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+  order: 1;
+  font-size: 0.846154rem;
+  line-height: 1.5;
+}
+.loop-ended.not-committed .loop-line,
+.loop-ended.not-committed > svg {
+  color: var(--warning);
+}
+.report-row > .loop-ended {
+  padding: 0 8px 6px;
+}
+.loop-controls > small {
+  flex-basis: 100%;
+  font-size: 0.846154rem;
+}
+.new-thread-loop {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: -6px 0 4px;
+}
+.new-thread-loop .loop-settings-line {
+  margin: 0;
+}
+.send-as-loop {
+  position: relative;
+  display: flex;
+}
+.send-caret {
+  width: 20px;
+  min-width: 20px;
+  height: 32px;
+  padding: 0;
+  margin-left: -5px;
+  border-radius: 0 6px 6px 0;
+  color: var(--muted);
+}
+.send-loop-button {
+  color: var(--loop);
+}
+.send-loop-panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 5;
+  width: min(320px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: var(--shadow-pop);
+}
+.send-loop-panel > button {
+  justify-content: flex-start;
+  color: var(--loop);
+}
+.send-loop-panel > small {
+  color: var(--muted);
+  font-size: 0.846154rem;
+  line-height: 1.4;
+}
+/* A phone's inspector shows a notice in its flow, where no toast covers its controls. */
+.inspector-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 4px 4px 12px;
+  margin-bottom: 8px;
+  border: 1px solid color-mix(in srgb, var(--success) 45%, var(--border));
+  border-radius: 8px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.inspector-notice > svg {
+  color: var(--success);
+  flex-shrink: 0;
+  margin-top: 12px;
+}
+.inspector-notice > span {
+  flex: 1;
+  padding-block: 8px;
+}
+.toast.notice-toast {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+.toast.notice-toast > svg {
+  color: var(--success);
+  flex-shrink: 0;
 }
 .connection-banner {
   display: flex;
@@ -2118,7 +2801,8 @@ meter::-webkit-meter-optimum-value {
 }
 .dialog > header p {
   color: var(--muted);
-  max-height: 100px;
+  /* Three lines at any text size before it scrolls. */
+  max-height: max(100px, 4.5em);
   overflow: auto;
   font-size: 1rem;
   line-height: 1.5;
@@ -2209,10 +2893,11 @@ meter::-webkit-meter-optimum-value {
   padding-top: 20px;
   border-top: 1px solid var(--border);
 }
+/* The palette's field has no box of its own: the line under it is its edge. */
 .palette-search {
   display: flex;
   align-items: center;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--field-border);
   color: var(--muted);
   padding: 8px 20px;
   gap: 12px;
@@ -2310,21 +2995,25 @@ meter::-webkit-meter-optimum-value {
   --active: rgb(0 0 0 / 7%);
   --border: #deded9;
   --border-strong: #c2c5c7;
+  --field-border: #868b90;
   --text: #1c1f22;
   --muted: #565d64;
   --faint: #5f666e;
   --accent: #076c7c;
   --accent-fg: #ffffff;
   --accent-soft: rgb(7 108 124 / 10%);
-  --warning: #8a5c00;
-  --warning-soft: rgb(138 92 0 / 10%);
+  --warning: #7c5300;
+  --warning-soft: rgb(124 83 0 / 10%);
   --danger: #b83a34;
   --danger-soft: rgb(184 58 52 / 9%);
   --danger-fg: #ffffff;
   --success: #2b7449;
+  --loop: #6a46b8;
+  --loop-soft: rgb(106 70 184 / 10%);
   --scrim: rgb(20 22 25 / 35%);
   --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
   --destination-strength: 45%;
+  --light-share: 100%;
 }
 @media (prefers-color-scheme: light) {
   :root[data-theme="system"] {
@@ -2338,55 +3027,78 @@ meter::-webkit-meter-optimum-value {
     --active: rgb(0 0 0 / 7%);
     --border: #deded9;
     --border-strong: #c2c5c7;
+    --field-border: #868b90;
     --text: #1c1f22;
     --muted: #565d64;
     --faint: #5f666e;
     --accent: #076c7c;
     --accent-fg: #ffffff;
     --accent-soft: rgb(7 108 124 / 10%);
-    --warning: #8a5c00;
-    --warning-soft: rgb(138 92 0 / 10%);
+    --warning: #7c5300;
+    --warning-soft: rgb(124 83 0 / 10%);
     --danger: #b83a34;
     --danger-soft: rgb(184 58 52 / 9%);
     --danger-fg: #ffffff;
     --success: #2b7449;
+    --loop: #6a46b8;
+    --loop-soft: rgb(106 70 184 / 10%);
     --scrim: rgb(20 22 25 / 35%);
     --shadow-pop: 0 12px 40px rgb(0 0 0 / 14%);
     --destination-strength: 45%;
+    --light-share: 100%;
   }
 }
 
 :root[data-platform="linux"][data-theme="system"][data-omarchy="true"] {
+  /* Every colour comes from the theme through shared/omarchy.ts, which keeps each one's
+   * hue and moves its lightness only as far as it takes to read at 4.5:1 (3:1 for a
+   * control's edge, which is `--border-strong` here) wherever the app draws it. */
   color-scheme: var(--omarchy-scheme, dark);
-  --bg: var(--omarchy-bg, #0e1013);
-  --text: var(--omarchy-fg, #e6e9ec);
-  --accent: var(--omarchy-accent, #62c7d4);
-  --accent-fg: var(--omarchy-accent-fg, #06191c);
-  --panel: color-mix(in srgb, var(--bg) 94%, var(--text));
-  --raised: color-mix(in srgb, var(--bg) 89%, var(--text));
-  --overlay: color-mix(in srgb, var(--bg) 92%, var(--text));
-  --bubble: color-mix(in srgb, var(--bg) 90%, var(--text));
-  --hover: color-mix(in srgb, var(--bg) 92%, var(--text));
-  --active: color-mix(in srgb, var(--bg) 86%, var(--text));
-  --border: color-mix(in srgb, var(--bg) 80%, var(--text));
-  --border-strong: color-mix(in srgb, var(--bg) 65%, var(--text));
-  --muted: color-mix(in srgb, var(--text) 85%, var(--bg));
-  --faint: color-mix(in srgb, var(--text) 80%, var(--bg));
-  --accent-soft: color-mix(in srgb, var(--bg) 87%, var(--accent));
-  --warning: var(
-    --omarchy-warning,
-    color-mix(in srgb, var(--text) 80%, #d6a22f)
-  );
-  --warning-soft: color-mix(in srgb, var(--bg) 90%, var(--warning));
-  --danger: var(--omarchy-danger, color-mix(in srgb, var(--text) 70%, #db4b4b));
-  --danger-soft: color-mix(in srgb, var(--bg) 90%, var(--danger));
-  --danger-fg: var(--bg);
-  --success: color-mix(in srgb, var(--text) 70%, #3b9c6e);
+  --bg: var(--omarchy-bg);
+  --panel: var(--omarchy-panel);
+  --raised: var(--omarchy-raised);
+  --overlay: var(--omarchy-overlay);
+  --bubble: var(--omarchy-bubble);
+  --hover: var(--omarchy-hover);
+  --active: var(--omarchy-active);
+  --border: var(--omarchy-border);
+  --border-strong: var(--omarchy-border-strong);
+  --field-border: var(--border-strong);
+  --text: var(--omarchy-text);
+  --muted: var(--omarchy-muted);
+  --faint: var(--omarchy-faint);
+  --accent: var(--omarchy-accent);
+  --accent-fg: var(--omarchy-accent-fg);
+  --accent-soft: var(--omarchy-accent-soft);
+  --warning: var(--omarchy-warning);
+  --warning-soft: var(--omarchy-warning-soft);
+  --danger: var(--omarchy-danger);
+  --danger-soft: var(--omarchy-danger-soft);
+  --danger-fg: var(--omarchy-danger-fg);
+  --success: var(--omarchy-success);
+  --loop: var(--omarchy-loop);
+  --loop-soft: var(--omarchy-loop-soft);
+  --selection: var(--omarchy-selection);
   --scrim: color-mix(in srgb, var(--bg) 75%, transparent);
   --shadow-color: color-mix(in srgb, var(--bg) 25%, #000);
   --shadow-pop: 0 12px 40px
     color-mix(in srgb, var(--shadow-color) 40%, transparent);
   --destination-strength: 45%;
+  --light-share: var(--omarchy-light-share, 0%);
+}
+:root[data-platform="linux"][data-theme="system"][data-omarchy="true"]
+  ::selection {
+  background: var(--selection);
+  color: var(--text);
+}
+/* A thread's name: its colour's ink for this palette (set on the root for each of the
+ * hub's colours); the orchestrator's "To:" is the accent. */
+:root[data-platform="linux"][data-theme="system"][data-omarchy="true"]
+  .thread-ink {
+  color: var(--thread-ink-omarchy, var(--text));
+}
+:root[data-platform="linux"][data-theme="system"][data-omarchy="true"] .app {
+  --destination-ink: var(--destination-ink-omarchy, var(--accent));
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2524,6 +3236,7 @@ meter::-webkit-meter-optimum-value {
 .palette-options > button.active {
   background: var(--hover);
   color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .slash-suggestions > button {
   display: flex;
@@ -2639,7 +3352,7 @@ meter::-webkit-meter-optimum-value {
 }
 
 .thread-card.dived.selected {
-  border-color: var(--border-strong);
+  border-color: var(--field-border);
 }
 
 .topbar-left > span {
@@ -2766,6 +3479,9 @@ meter::-webkit-meter-optimum-value {
   background: var(--hover);
   color: var(--text);
 }
+.manage-nav button.active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 
 .conversation-menu {
   display: none;
@@ -2814,6 +3530,16 @@ meter::-webkit-meter-optimum-value {
 
 .conversation-menu > div > button:hover {
   background: var(--hover);
+}
+/* Tool calls and Reasoning are on: a check at the row's end. */
+.conversation-menu > div > button[aria-pressed="true"]::after {
+  content: "";
+  width: 8px;
+  height: 4px;
+  margin-inline-start: auto;
+  border: solid var(--accent);
+  border-width: 0 0 2px 2px;
+  transform: translateY(-2px) rotate(-45deg);
 }
 
 /* Responsive layout keeps the same type scale; only the arrangement changes. */
@@ -2975,12 +3701,19 @@ meter::-webkit-meter-optimum-value {
   .operation-fields {
     padding: 16px 20px 20px;
   }
+  .loop-report-body {
+    padding: 16px 20px 20px;
+  }
   .dialog-footer {
     padding: 16px 20px;
   }
+  /* The hint takes what the buttons leave, on one line: wrapped into a narrow column it
+   * pushed the footer up over the dialog's fields at large text sizes. */
   .dialog-footer > span {
-    max-width: 100px;
+    flex: 1 1 0;
+    min-width: 0;
     overflow: hidden;
+    white-space: nowrap;
     text-overflow: ellipsis;
   }
   .palette-list small {
@@ -3002,7 +3735,6 @@ meter::-webkit-meter-optimum-value {
   display: none;
 }
 .dive-marker {
-  color: var(--thread-color);
   flex-shrink: 0;
 }
 .palette-list > button[data-cli="true"] b,
@@ -3314,8 +4046,9 @@ meter::-webkit-meter-optimum-value {
   border: 0;
 }
 
-/* Voice mode (shared/VoiceControl.tsx): the microphone and hands-free buttons sit beside Send;
-   what voice is doing floats just above the composer, like the mention list. */
+/* Voice mode (shared/VoiceControl.tsx): the microphone and hands-free buttons sit beside Send
+   (32 pixels on the desktop, 44 points on a phone: mobile.css); what voice is doing floats
+   just above the composer, like the mention list. */
 .voice-button {
   border-radius: 6px;
   width: 32px;

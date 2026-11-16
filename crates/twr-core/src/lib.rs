@@ -42,6 +42,7 @@ pub mod fsread;
 pub mod git;
 pub mod gitremote;
 pub mod load;
+pub mod loops;
 pub mod notify;
 pub mod palette;
 pub mod paths;

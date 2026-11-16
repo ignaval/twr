@@ -50,8 +50,8 @@ use twr_core::reduce::{AttentionStack, Registry};
 use twr_core::usage::UsageView;
 
 use super::{
-    activity, after, delete, disk, hook, idle_compact, orch, proposal, route, stall, trash, wake,
-    Core, HubState, Inner, ThreadRt,
+    activity, after, delete, disk, hook, idle_compact, loops, orch, proposal, route, stall, trash,
+    wake, Core, HubState, Inner, ThreadRt,
 };
 use crate::store::{self, CheckpointMeta, NewCheckpoint, Store};
 
@@ -112,6 +112,7 @@ pub(super) struct FoldSnapshot {
     hub_questions: HashMap<String, route::PendingRoute>,
     hub_cards: HashMap<String, proposal::Proposal>,
     delete_cards: HashMap<String, delete::DeleteCard>,
+    loops: loops::LoopsState,
     disk: disk::DiskState,
     /// The notification hook's policy (`None` without `[notify] command`).
     hook: Option<Policy>,
@@ -187,9 +188,12 @@ impl Core {
             hub_questions,
             hub_cards,
             delete_cards,
+            loops,
             disk,
             // Memory only: jobs never outlive their hub (`hub::jobs`).
             jobs: _,
+            // Memory only: nor do review runs (`hub::loops`).
+            loop_runs: _,
             hook,
             after,
             idle_offers,
@@ -245,6 +249,7 @@ impl Core {
             hub_questions,
             hub_cards,
             delete_cards,
+            loops,
             disk,
             hook: hook.map(|f| f.policy),
             after,
@@ -291,6 +296,7 @@ impl Core {
             hub_questions,
             hub_cards,
             delete_cards,
+            loops,
             disk,
             hook,
             after,
@@ -325,6 +331,7 @@ impl Core {
         core.hub_questions = hub_questions;
         core.hub_cards = hub_cards;
         core.delete_cards = delete_cards;
+        core.loops = loops;
         core.disk = disk;
         if let (Some(feed), Some(policy)) = (core.hook.as_mut(), hook) {
             feed.policy = policy;
@@ -947,6 +954,7 @@ pub(super) mod tests {
             hub_questions,
             hub_cards,
             delete_cards,
+            loops,
             disk,
             hook,
             after,
@@ -1007,6 +1015,9 @@ pub(super) mod tests {
         }
         if *delete_cards != b.delete_cards {
             out.push("delete_cards");
+        }
+        if *loops != b.loops {
+            out.push("loops");
         }
         if *disk != b.disk {
             out.push("disk");
@@ -1341,6 +1352,70 @@ pub(super) mod tests {
                     p.ext = twr(json!({"pid": 4242, "start_time": 17, "exe": "/bin/fake"}));
                 }
             });
+        }
+        // Saved loop settings, and a review loop on w2 in its ladder (it ends, stopped, when
+        // w2 does).
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            EventBody::LoopSettingsSaved(Box::new(LoopSettingsSaved {
+                id: "ls1".into(),
+                settings: twr_core::loops::settings::LoopSettings {
+                    profile: "high".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+        );
+        l.ev(
+            "t-w2",
+            hub.clone(),
+            EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "l1".into(),
+                profile: twr_core::loops::config::Profile::builtin("high").unwrap(),
+                max_rounds_per_tier: 25,
+                settings_from: twr_core::loops::settings::SettingsSource::Saved,
+                settings_id: "ls1".into(),
+                ..Default::default()
+            })),
+        );
+        for (phase, goal) in [
+            (twr_core::loops::Phase::Scope, None),
+            (
+                twr_core::loops::Phase::Ladder,
+                Some("Harden w2.".to_string()),
+            ),
+        ] {
+            l.ev(
+                "t-w2",
+                hub.clone(),
+                EventBody::LoopPhase(LoopPhaseChanged {
+                    id: "l1".into(),
+                    phase,
+                    goal,
+                    ..Default::default()
+                }),
+            );
+        }
+        // A loop's setup card on w1, raised and raised again (its revision moves; it stays
+        // open, non-blocking, through w1's turns below).
+        for first_run in [true, false] {
+            l.ev(
+                "t-w1",
+                hub.clone(),
+                EventBody::AttentionRaised(AttentionRaised {
+                    attn_id: "setup1".into(),
+                    reason: AttentionReason::Review,
+                    summary: "w1: review loop setup".into(),
+                    options: vec!["start and save these settings".into(), "cancel".into()],
+                    ext: twr(json!({ LOOP_SETUP_KEY: twr_core::event::LoopSetup {
+                        first_run,
+                        scope: Some(twr_core::loops::settings::Scope::Uncommitted),
+                        ..Default::default()
+                    } })),
+                    ..Default::default()
+                }),
+            );
         }
         // A watch on w1.
         l.ev(
@@ -2846,6 +2921,7 @@ struct NotSerialized {
             .as_f64()
             .is_some_and(|c| c > 0.29)));
         assert!(some(&|v| !v["compacting"].is_null()));
+        assert!(some(&|v| v["loop"]["phase"] == "ladder"));
         let filled = filled(&states);
         for field in [
             "registry.threads",
@@ -2875,6 +2951,7 @@ struct NotSerialized {
             "hub_questions",
             "hub_cards",
             "delete_cards",
+            "loops",
             "disk.cards",
             "hook",
             "after.pending",

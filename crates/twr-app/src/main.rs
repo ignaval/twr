@@ -44,8 +44,7 @@ async fn client(socket: &std::path::Path) -> Result<Client> {
     }
     let hello = c.hello(params).await?;
     // Never disguise an agent-launched process as a user. The hub remains authoritative.
-    anyhow::ensure!(hello["identity"].as_str().is_some_and(|s| s.starts_with("user:")),
-        "The hub did not recognize this desktop process as your user. Open twr from your desktop launcher.");
+    twr_app::runtime::ensure_user(&hello)?;
     Ok(c)
 }
 
@@ -79,6 +78,14 @@ async fn control(
             tx.send(json!({"type":"connection","connected":true}))
                 .await?;
             presentation.lock().unwrap().retry_requests.extend(fold.capped.keys().cloned());
+            // Which remote boxes are online now; their runners' events keep it after.
+            if let Ok(Ok(info)) = tokio::time::timeout(Duration::from_secs(5), async {
+                client(&socket).await?.call("hub.info", json!({})).await
+            })
+            .await
+            {
+                presentation.lock().unwrap().take_boxes(&info);
+            }
             let mut displayed = presentation.lock().unwrap().project(&fold);
             state.send_replace(displayed.clone());
             let mut hydrate = client(&socket).await?;
@@ -116,6 +123,7 @@ async fn control(
                     }
                 }
                 fold.apply(&item.event, item.gseq);
+                presentation.lock().unwrap().runner_event(&item.event);
                 displayed = presentation.lock().unwrap().project(&fold);
                 state.send_replace(displayed.clone());
                 tx.send(json!({"type":"control","event":item.event,"gseq":item.gseq}))

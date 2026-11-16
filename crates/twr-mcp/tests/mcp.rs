@@ -315,6 +315,24 @@ async fn conn(mock: Arc<Mock>, stream: UnixStream, n: usize) {
             ),
             "attention.respond" | "attention.annotate" | "context.read" | "context.set"
             | "thread.delete" | "config.show" => Ok(json!({ "ok": true, "method": req.method })),
+            // As the hub answers the orchestrator (`hub::loops`).
+            "loop.request" if p["thread"] == "api" => Ok(json!({
+                "status": "started", "thread": "T1", "thread_name": "api",
+                "loop": {"id": "L1", "kind": "review", "profile": "high", "phase": "scope",
+                         "line": "high · scope", "thread": "T1"},
+                "settings": loop_settings(), "settings_of": "api",
+            })),
+            "loop.request" => Ok(json!({
+                "status": "needs_setup", "thread": "T2", "thread_name": p["thread"],
+                "attn_id": "A9", "revision": 12,
+                "why": if p["setup"] == true { "asked" } else { "overrides" },
+            })),
+            "loop.get" => Ok(loop_detail()),
+            "loop.control" => Ok(json!({
+                "thread": "T1", "thread_name": p["thread"], "id": "L1", "running": false,
+                "last": {"id": "L1", "kind": "review", "outcome": "stopped",
+                         "requested_by": "orchestrator"},
+            })),
             "project.files" if p["project"] == "big" => Ok(json!({
                 "project": "big", "commit": "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d",
                 "branch_of": null, "path": "",
@@ -384,6 +402,44 @@ async fn conn(mock: Arc<Mock>, stream: UnixStream, n: usize) {
             return;
         }
     }
+}
+
+/// Loop settings as the hub gives them (`LoopSettings`).
+fn loop_settings() -> Value {
+    json!({
+        "profile": "high", "implementer": null,
+        "workers": {"model": "claude-opus-5-5", "effort": "high"},
+        "reviewer": {"runtime": "codex", "model": "gpt-6.1-sol"},
+        "commit": "end", "review_commit": "match", "sweep": "thread",
+    })
+}
+
+/// `loop.get` of a review loop the orchestrator asked for, in its verification.
+fn loop_detail() -> Value {
+    json!({
+        "thread": "T1", "thread_name": "api", "id": "L1", "kind": "review", "running": true,
+        "line": "high · verify 1/5 · ledger 1",
+        "state": {"id": "L1", "kind": "review", "profile": "high", "phase": "verify",
+                  "round": "v2", "verify": {"done": 1, "cap": 5}, "paused": false,
+                  "waiting_on": "review",
+                  "reviewer": {"runtime": "codex", "model": "gpt-6.1-sol", "effort": "xhigh"},
+                  "requested_by": "orchestrator"},
+        "last": null,
+        "started": {"kind": "review", "settings": loop_settings(), "settings_from": "saved",
+                    "settings_of": "workspace", "overrides": {}, "requested_by": "orchestrator"},
+        "rounds": [
+            {"id": "m1", "findings": [{}, {}, {}], "failed": false,
+             "triage": {"items": [{"verdict": "fixed"}, {"verdict": "fixed"},
+                                  {"verdict": "dismissed"}]}},
+            {"id": "m2", "findings": [], "failed": false, "triage": null},
+            {"id": "x1", "findings": [], "failed": true, "reason": "codex exited 3"},
+            {"id": "v1", "findings": [], "failed": false, "triage": null},
+            {"id": "v2", "findings": [], "triage": null},
+        ],
+        "ledger": [{"id": "L1"}],
+        "ended": null, "report_path": null, "outcome": null,
+        "folder": "/data/loops/L1",
+    })
 }
 
 struct Harness {
@@ -487,6 +543,9 @@ const TOOLS: &[&str] = &[
     "memory_read",
     "memory_save",
     "memory_forget",
+    "start_loop",
+    "get_loop",
+    "stop_loop",
 ];
 
 #[tokio::test]
@@ -547,6 +606,7 @@ async fn hello_and_tool_list() {
             "account",
             "box",
             "effort",
+            "loop",
             "model",
             "name",
             "operation_id",
@@ -1093,6 +1153,25 @@ async fn each_tool_sends_the_expected_request() {
                 json!({ "name": "short-replies", "rev": "0123456789ab" }),
             )],
         ),
+        (
+            "start_loop",
+            json!({ "thread": "api", "kind": "review", "scope": "last 3", "commit": "none" }),
+            vec![(
+                "loop.request",
+                json!({ "thread": "api", "kind": "review", "scope": "last 3",
+                        "overrides": {"commit": "none"} }),
+            )],
+        ),
+        (
+            "get_loop",
+            json!({ "thread": "api" }),
+            vec![("loop.get", json!({ "thread": "api" }))],
+        ),
+        (
+            "stop_loop",
+            json!({ "thread": "api" }),
+            vec![("loop.control", json!({ "thread": "api", "action": "stop" }))],
+        ),
     ];
     let mut seen = std::collections::BTreeSet::new();
     for (tool, args, want) in cases {
@@ -1202,6 +1281,8 @@ const ONE_THREAD_TOOLS: &[&str] = &[
     "stop",
     "write_report",
     "watch_thread",
+    "start_loop",
+    "stop_loop",
 ];
 
 /// The other tools: about no one thread, about several (`delete_thread`: its card lists them
@@ -1234,6 +1315,7 @@ const OTHER_TOOLS: &[&str] = &[
     "memory_read",
     "memory_save",
     "memory_forget",
+    "get_loop",
 ];
 
 #[tokio::test]
@@ -1257,6 +1339,7 @@ async fn every_result_about_one_thread_leads_with_its_name() {
             "rename_thread" => json!({ "thread": "w1", "name": "notifications-design" }),
             "write_report" => json!({ "thread": "w1", "summary": "Done.", "grade": "success" }),
             "watch_thread" => json!({ "thread": "w1", "note": "send its branch on" }),
+            "start_loop" => json!({ "thread": "w1", "kind": "review" }),
             _ => json!({ "thread": "w1" }),
         };
         let r = h.call(tool, args).await;
@@ -2436,4 +2519,244 @@ async fn account_events_render_on_the_control_stream() {
         assert!(r.contains(want), "{want:?} missing: {r}");
     }
     assert!(!r.contains("/secret"), "{r}");
+}
+
+/// The loop tools: their schemas, the requests they send (`loop.request` with the overrides
+/// the orchestrator named, `loop.get`, `loop.control stop`, `thread.spawn` with `loop` and the
+/// prompt as its task), and what they return (`needs_setup` with a sentence for the user; the
+/// settings a started loop runs on; the loop's state in a few lines).
+#[tokio::test]
+async fn loop_tools() {
+    let h = harness().await;
+    let tools = h.client.list_all_tools().await.unwrap();
+    let schema = |name: &str| -> Value {
+        let t = tools.iter().find(|t| t.name == name).unwrap();
+        Value::Object((*t.input_schema).clone())
+    };
+    let keys = |v: &Value, key: &str| -> Vec<String> {
+        let mut k: Vec<String> = v[key]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .or_else(|| {
+                v[key]
+                    .as_array()
+                    .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+            })
+            .unwrap_or_default();
+        k.sort();
+        k
+    };
+    let start = schema("start_loop");
+    assert_eq!(
+        keys(&start, "properties"),
+        [
+            "commit",
+            "implementer",
+            "kind",
+            "plan_check",
+            "profile",
+            "reviewer",
+            "scope",
+            "setup",
+            "task",
+            "thread",
+            "workers"
+        ]
+    );
+    assert_eq!(keys(&start, "required"), ["kind", "thread"]);
+    for tool in ["get_loop", "stop_loop"] {
+        assert_eq!(keys(&schema(tool), "properties"), ["thread"], "{tool}");
+        assert_eq!(keys(&schema(tool), "required"), ["thread"], "{tool}");
+    }
+    // spawn_thread's `loop`: the kind and the same settings.
+    let spawn = schema("spawn_thread").to_string();
+    for want in ["\"kind\"", "\"setup\"", "\"plan_check\"", "\"reviewer\""] {
+        assert!(spawn.contains(want), "{want} missing: {spawn}");
+    }
+    let desc = |name: &str| -> String {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .description
+            .clone()
+            .unwrap()
+            .to_string()
+    };
+    for tool in ["start_loop", "spawn_thread"] {
+        assert!(desc(tool).contains(twr_mcp::LOOP_RULE), "{tool}");
+    }
+    for want in [
+        "only on the user's saved loop settings",
+        "setup: true",
+        "needs_setup",
+        "tell_user",
+        "never answer or annotate it",
+        "routine updates",
+        "wakes you with its report",
+    ] {
+        assert!(twr_mcp::LOOP_RULE.contains(want), "{want:?}");
+    }
+    assert!(desc("start_loop").contains("Never on your own initiative"));
+    assert!(desc("stop_loop").contains("cannot pause, resume or skip"));
+    assert!(tools
+        .iter()
+        .find(|t| t.name == "get_loop")
+        .unwrap()
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.read_only_hint == Some(true)));
+
+    // Started on saved settings: what it runs on, in a line.
+    h.mock.clear();
+    let r = h
+        .call("start_loop", json!({"thread": "api", "kind": "review"}))
+        .await;
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        h.mock.calls(),
+        [(
+            "loop.request".to_string(),
+            json!({"thread": "api", "kind": "review"})
+        )]
+    );
+    let out = text(&r);
+    assert!(
+        out.starts_with(r#"{"thread_name":"api","thread":"T1""#),
+        "{out}"
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["status"], "started");
+    assert_eq!(v["loop"], "L1");
+    assert_eq!(v["line"], "high · scope");
+    assert_eq!(v["settings_of"], "api");
+    assert_eq!(
+        v["settings"],
+        "profile high · implementer the thread's own · workers claude-opus-5-5 high · \
+         reviewer codex gpt-6.1-sol · commit match"
+    );
+    // Overrides as named, and `setup`: the card, and what to tell the user.
+    h.mock.clear();
+    let r = h
+        .call(
+            "start_loop",
+            json!({"thread": "web", "kind": "implement", "task": "add a CSV export",
+                   "setup": true, "profile": "low", "reviewer": "codex/gpt-6.1-sol"}),
+        )
+        .await;
+    assert_eq!(
+        h.mock.calls(),
+        [(
+            "loop.request".to_string(),
+            json!({"thread": "web", "kind": "implement", "task": "add a CSV export",
+                   "setup": true,
+                   "overrides": {"profile": "low", "reviewer": "codex/gpt-6.1-sol"}})
+        )]
+    );
+    let v: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert_eq!(v["thread_name"], "web");
+    assert_eq!(v["status"], "needs_setup");
+    assert_eq!(v["attn_id"], "A9");
+    assert_eq!(v["why"], "asked");
+    assert_eq!(
+        v["tell_user"],
+        "I've asked you to choose the loop's models on web's card."
+    );
+    let r = h
+        .call("start_loop", json!({"thread": "web", "kind": "review"}))
+        .await;
+    let v: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert!(
+        v["tell_user"]
+            .as_str()
+            .unwrap()
+            .contains("the settings you named differ from your saved ones"),
+        "{v}"
+    );
+
+    // The loop's state, compactly.
+    h.mock.clear();
+    let r = h.call("get_loop", json!({"thread": "api"})).await;
+    assert_eq!(
+        h.mock.calls(),
+        [("loop.get".to_string(), json!({"thread": "api"}))]
+    );
+    assert_eq!(
+        text(&r),
+        "api: review loop L1 running: high · verify 1/5 · ledger 1\n\
+         phase verify, round v2, verify 1/5; waits on a review run (reviewer codex gpt-6.1-sol \
+         xhigh)\n\
+         settings: profile high · implementer the thread's own · workers claude-opus-5-5 high · \
+         reviewer codex gpt-6.1-sol · commit match (the user's saved settings; asked for by \
+         you)\n\
+         rounds: m1 3 findings (2 fixed, 1 dismissed) · m2 clean · x1 failed: codex exited 3 · \
+         v1 clean · v2 running\n\
+         ledger: 1 entry"
+    );
+
+    // Stopped.
+    h.mock.clear();
+    let r = h.call("stop_loop", json!({"thread": "api"})).await;
+    assert_eq!(
+        h.mock.calls(),
+        [(
+            "loop.control".to_string(),
+            json!({"thread": "api", "action": "stop"})
+        )]
+    );
+    assert_eq!(
+        text(&r),
+        r#"{"thread_name":"api","thread":"T1","loop":"L1","outcome":"stopped","running":false}"#
+    );
+
+    // spawn_thread with a loop: the prompt is the loop's task, not a prompt of its own.
+    *h.mock.spawn_result.lock().unwrap() = Some(json!({
+        "status": "complete",
+        "thread": {"id": "T9", "name": "limits", "status": "idle",
+                   "loop": {"status": "needs_setup", "thread": "T9", "thread_name": "limits",
+                            "attn_id": "A7", "revision": 3, "why": "first_run"}},
+    }));
+    h.mock.clear();
+    let r = h
+        .call(
+            "spawn_thread",
+            json!({"project": "api", "name": "limits", "prompt": "add rate limiting",
+                   "operation_id": "op-loop",
+                   "loop": {"kind": "implement", "setup": true, "plan_check": "always"}}),
+        )
+        .await;
+    assert!(!is_error(&r), "{}", text(&r));
+    assert_eq!(
+        h.mock.calls()[0],
+        (
+            "thread.spawn".to_string(),
+            json!({"operation_id": "op-loop", "prompt": null, "request": {
+                "project": "api", "name": "limits",
+                "loop": {"kind": "implement", "task": "add rate limiting", "setup": true,
+                         "overrides": {"plan_check": "always"}}}})
+        )
+    );
+    let v: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert_eq!(v["thread_name"], "limits");
+    assert!(v["thread"].get("loop").is_none(), "{v}");
+    assert_eq!(v["loop"]["status"], "needs_setup");
+    assert_eq!(v["loop"]["attn_id"], "A7");
+    assert!(
+        v["loop"]["tell_user"]
+            .as_str()
+            .unwrap()
+            .starts_with("I've asked you to choose the loop's models on limits's card"),
+        "{v}"
+    );
+    // A loop needs its task.
+    h.mock.clear();
+    let r = h
+        .call(
+            "spawn_thread",
+            json!({"project": "api", "name": "limits", "loop": {"kind": "implement"}}),
+        )
+        .await;
+    assert!(is_error(&r));
+    assert!(text(&r).contains("needs its task"), "{}", text(&r));
+    assert!(h.mock.calls().is_empty());
 }

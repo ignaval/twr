@@ -211,6 +211,19 @@ mod sys {
         )
     }
 
+    /// Every process with its status (no environments). `None` when `/proc` cannot be listed.
+    pub fn all() -> Option<Vec<(u32, ProcStat)>> {
+        let dir = list().ok()?;
+        Some(
+            dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter_map(|pid| match stat(pid) {
+                    Lookup::Found(s) => Some((pid, s)),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
     /// Every process of group `pgid` with its status. `None` when `/proc` cannot be listed.
     pub fn group(pgid: i64) -> Option<Vec<(u32, ProcStat)>> {
         let dir = list().ok()?;
@@ -577,15 +590,43 @@ pub fn reap_marked(thread: &str, min_start: u64, gen: Option<&str>) -> bool {
 /// Kills every live process whose [`AGENT_ENV`] is one of `markers` (never this one):
 /// SIGTERM, a bounded wait, SIGKILL for those still themselves, another bounded wait; rescanned
 /// until none is left (at most [`GROUP_SWEEPS`] times, as they may fork meanwhile). For what a
-/// stopped hub left running under markers only it gave out, such as its jobs'. Returns whether
+/// stopped hub left running under markers only it gave out, such as its jobs', and for what a
+/// review run's agent left outside its process group when the run ends. Returns whether
 /// anything was signalled. Blocks; call off the async runtime.
 pub fn reap_agent_marked(markers: &[String]) -> bool {
+    reap_agent_marked_where(markers, false)
+}
+
+/// [`reap_agent_marked`], but only what this process no longer leads to by parent links: what
+/// a call that just ended left behind once its group and its tree were killed (a process whose
+/// parent exited before the tree was read, now init's). A marked process that still descends
+/// from this one is another call's that runs now, under the same marker (a step's next run,
+/// started while the one it replaces was still ending), and is left alone. Kills nothing when
+/// the process table cannot be read. Blocks; call off the async runtime.
+pub fn reap_agent_marked_orphans(markers: &[String]) -> bool {
+    reap_agent_marked_where(markers, true)
+}
+
+fn reap_agent_marked_where(markers: &[String], orphans_only: bool) -> bool {
     let me = std::process::id();
     let mut signalled = false;
     if markers.is_empty() {
         return false;
     }
     for _ in 0..GROUP_SWEEPS {
+        // Read before the scan: a process forked between the two is then in neither, or only
+        // in the scan as a descendant not yet known, so it is read first and never after.
+        let ours: std::collections::HashSet<u32> = if orphans_only {
+            match descendants(me) {
+                Some(d) => d.into_iter().map(|(pid, _, _)| pid).collect(),
+                None => {
+                    tracing::warn!("cannot read the process table; killing nothing");
+                    return signalled;
+                }
+            }
+        } else {
+            Default::default()
+        };
         let Some(found) =
             sys::scan(|pid, stat| pid != me && !matches!(stat.state, 'Z' | 'X' | 'x'))
         else {
@@ -597,13 +638,18 @@ pub fn reap_agent_marked(markers: &[String]) -> bool {
             .filter(|(_, _, environ)| {
                 environ_value(environ, AGENT_ENV).is_some_and(|m| markers.contains(&m))
             })
+            .filter(|(pid, stat, _)| {
+                // (A child forked after the descendants were read is told by its parent.)
+                !orphans_only
+                    || !(ours.contains(pid) || ours.contains(&stat.ppid) || stat.ppid == me)
+            })
             .map(|(pid, stat, _)| (pid, stat.start_time))
             .collect();
         if marked.is_empty() {
             return signalled;
         }
         signalled = true;
-        tracing::warn!(pids = ?marked.iter().map(|m| m.0).collect::<Vec<_>>(), "killing processes a stopped hub left running");
+        tracing::warn!(pids = ?marked.iter().map(|m| m.0).collect::<Vec<_>>(), "killing processes left running under a twr agent marker");
         // Each still the process that was matched (its start time), checked right before it
         // is signalled: a pid reused meanwhile is someone else's.
         let signal_same = |pid: u32, start: u64, sig: &str| {
@@ -623,6 +669,49 @@ pub fn reap_agent_marked(markers: &[String]) -> bool {
             signal_same(pid, start, "KILL");
         }
         wait_all_gone(&left, KILL_GRACE);
+    }
+    signalled
+}
+
+/// Every live descendant of process `root` by parent links, whatever session or group it moved
+/// to, with its start time and process group (never this process): what a one-shot call's
+/// agent started, read before the call's group is killed. An agent's tool may start a command
+/// in a session of its own (Claude Code's Bash tool does), which the group's kill misses and
+/// which, once its parent is gone, no parent link leads to. A process table that cannot be
+/// read gives `None`. Blocks (reads the process table).
+pub fn descendants(root: u32) -> Option<Vec<(u32, u64, i64)>> {
+    let me = std::process::id();
+    #[cfg(all(target_os = "linux", not(twr_ps)))]
+    let table = sys::all()?;
+    #[cfg(any(not(target_os = "linux"), twr_ps))]
+    let table: Vec<(u32, ProcStat)> = ps::table()?.into_iter().collect();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for (pid, stat) in &table {
+            if stat.ppid == parent
+                && *pid != me
+                && !matches!(stat.state, 'Z' | 'X' | 'x')
+                && seen.insert(*pid)
+            {
+                out.push((*pid, stat.start_time, stat.pgrp));
+                frontier.push(*pid);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Kills (SIGKILL) each of `procs` (pid and start time) that is still that process, checked
+/// right before its signal: a pid reused meanwhile is someone else's. Whether any was
+/// signalled. Blocks.
+pub fn kill_each(procs: &[(u32, u64)]) -> bool {
+    let mut signalled = false;
+    for &(pid, start) in procs {
+        if liveness(pid, start) == Alive::Yes {
+            signalled |= signal(pid, false, "KILL");
+        }
     }
     signalled
 }
@@ -2651,6 +2740,74 @@ mod tests {
         assert!(runtime_running("01GENREC", Some(&p("new")), None, None));
         assert!(reap_stale(&p("new")));
         assert!(c.try_wait().unwrap().is_some());
+    }
+
+    /// The reap of what a call left behind kills a marked process that no parent link leads
+    /// to from here (its parent exited), and spares one under the same marker that this
+    /// process still leads to: a step's next run, started while the one it replaces ends.
+    #[test]
+    fn the_orphan_reap_spares_a_marked_process_this_one_still_leads_to() {
+        if skip_if_test_environs_hidden(
+            "reap::tests::the_orphan_reap_spares_a_marked_process_this_one_still_leads_to",
+        ) {
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let marker = format!("orphan-reap-test-{}", std::process::id());
+        // (See `reaps_only_the_marked_process`: a just-spawned process shows its own
+        // environment only once its exec is done.)
+        let exec_done = |pid: u32| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let cmdline = sys::cmdline(pid).unwrap_or_default();
+                if argv0_matches(&cmdline, "sleep")
+                    && sys::environ(pid).is_ok_and(|e| !e.is_empty())
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "sleep never exec'd");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // A live run's process: this process's own child, in a group of its own.
+        let mut live = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .env(AGENT_ENV, &marker)
+            .spawn()
+            .unwrap();
+        exec_done(live.id());
+        // Nothing is orphaned yet: nothing is signalled.
+        assert!(!reap_agent_marked_orphans(std::slice::from_ref(&marker)));
+        assert!(live.try_wait().unwrap().is_none());
+        // What an ended run left behind: a marked process whose parent has exited.
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 >/dev/null 2>&1 & echo $!")
+            .env(AGENT_ENV, &marker)
+            .output()
+            .unwrap();
+        let orphan: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        exec_done(orphan);
+        let start = process_start_time(orphan).unwrap();
+        assert!(reap_agent_marked_orphans(std::slice::from_ref(&marker)));
+        assert_ne!(liveness(orphan, start), Alive::Yes);
+        assert!(
+            live.try_wait().unwrap().is_none(),
+            "the live run's process was killed"
+        );
+        // The reap of everything under the marker (a hub's, after a restart) takes it too.
+        assert!(reap_agent_marked(std::slice::from_ref(&marker)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while live.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the marked child outlived the reap"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

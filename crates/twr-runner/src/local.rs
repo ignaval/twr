@@ -704,6 +704,19 @@ impl Default for LocalGit {
     }
 }
 
+/// What a git command [`LocalGit::read`] ran printed, and how it exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRead {
+    /// It exited 0.
+    pub ok: bool,
+    /// Its exit code (`None`: a signal ended it).
+    pub code: Option<i32>,
+    /// Its standard output, raw (paths are bytes).
+    pub stdout: Vec<u8>,
+    /// Its standard error, as text.
+    pub stderr: String,
+}
+
 /// A finished git command.
 #[derive(Debug)]
 struct Out {
@@ -1087,6 +1100,22 @@ impl LocalGit {
                 "git --version did not finish within 10 s",
             )),
         }
+    }
+
+    /// A read-only git command `args` in `dir` for a caller outside [`GitOps`] (the hub's
+    /// review loops, `twr-hub::hub::loops`): run as every read of this box's git is (the
+    /// module docs: [`SAFE_CONFIG`], the repository's drivers turned off where the command
+    /// could run one, no prompt, its own session and group, output capped, killed after the
+    /// read timeout). Its exit status is the caller's to judge: a non-zero exit is no error
+    /// here; a git that could not run, timed out or printed too much is.
+    pub async fn read(&self, dir: &Path, args: &[&str]) -> anyhow::Result<GitRead> {
+        let out = self.git(dir, args).await?;
+        Ok(GitRead {
+            ok: out.ok,
+            code: out.code,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
     }
 
     /// The trash directory, if set.

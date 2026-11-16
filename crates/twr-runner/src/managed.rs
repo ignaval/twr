@@ -180,6 +180,18 @@ impl Managed {
                 worktree: Some(path),
                 ..
             } => self.path(path)?,
+            Op::LoopGit { query } => match query {
+                twr_core::runner::LoopGitQuery::Scope { dir, .. }
+                | twr_core::runner::LoopGitQuery::Baseline { dir, .. } => self.path(dir)?,
+                twr_core::runner::LoopGitQuery::Diff { repo, .. }
+                | twr_core::runner::LoopGitQuery::After { repo, .. } => self.path(repo)?,
+            },
+            Op::LoopRun { spec, .. } => self.path(&spec.cwd)?,
+            // (Only the box's own loop folders: names, never paths.)
+            Op::LoopFiles { .. }
+            | Op::LoopRunWait { .. }
+            | Op::LoopRunCancel { .. }
+            | Op::LoopForget { .. } => {}
             Op::Send { .. }
             | Op::Respond { .. }
             | Op::Stop { .. }

@@ -1148,8 +1148,9 @@ async fn a_switch_that_does_not_take_is_not_tried_again() {
 /// `box.restart` (`twr box restart`): it returns at once with the epoch of the connection it
 /// replaces; the supervisor ends that session and dials again at once with a restart, which
 /// stops the daemon (its runtime ends with it) and starts a new one; the box comes back online
-/// on a newer connection with no restart pending; the idle thread's runtime ended as with any
-/// runner restart (`thread.crashed`), and its next prompt resumes its session on the new daemon. Refused: the orchestrator, a box the hub does not have, a token
+/// on a newer connection with no restart pending; the idle thread's runtime ended with the old
+/// daemon, which stopped it (`thread.stopped` `box_stopped`, no crash), and its next prompt
+/// resumes its session on the new daemon. Refused: the orchestrator, a box the hub does not have, a token
 /// box, a named workspace's hub; agents cannot call it at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_reconnects_to_a_new_daemon() {
@@ -1254,8 +1255,14 @@ async fn a_restart_reconnects_to_a_new_daemon() {
         .unwrap();
     until_turn_event(&hub, &t, "turn.ended", 2).await;
     assert_eq!(hub.get_thread(&t).unwrap()["session_id"], session);
-    // As with any runner restart, the runtime's end was a crash (the runner lost it).
-    assert_eq!(count(&hub, &t, "thread.crashed"), 1);
+    // The old daemon stopped its runtime as it stopped: it ended with the box's runner
+    // (`box_stopped`), no crash and no error item.
+    assert_eq!(count(&hub, &t, "thread.crashed"), 0);
+    assert_eq!(error_items(&hub, &t), 0);
+    assert_eq!(
+        stop_reasons(&hub, &t),
+        [Some(twr_core::event::BOX_STOPPED_REASON.to_string())]
+    );
     // Nothing more: one restart, one dial for it.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(dials.lock().unwrap().len(), 2);

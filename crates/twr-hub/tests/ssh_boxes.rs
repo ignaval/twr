@@ -1115,6 +1115,7 @@ fn agent(runtime: &str, found: bool, login: AgentLogin) -> AgentInfo {
         login,
         method: (login == AgentLogin::LoggedIn).then(|| "claude.ai".into()),
         note: (!found).then(|| "not found on PATH".into()),
+        sandbox: None,
     }
 }
 

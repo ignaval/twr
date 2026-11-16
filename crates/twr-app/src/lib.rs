@@ -1,7 +1,7 @@
 //! A presentation-independent projection of twr's existing client fold. The desktop host
 //! uses this over stdio; neither the web renderer nor Electron reimplements hub reducers.
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use twr_core::{client_state::ClientFold, config::CardOrder, reduce::stack_order};
 pub mod runtime;
 
@@ -13,8 +13,36 @@ pub struct Presentation {
     pub incomplete: HashSet<String>,
     pub card_order: CardOrder,
     shown: Option<twr_core::card_order::Shown>,
+    /// Whether each remote box is online, by name: `hub.info`'s `boxes` when the connection
+    /// opens ([`Presentation::take_boxes`]), then each `runner.connected` and
+    /// `runner.disconnected` ([`Presentation::runner_event`]), as the TUI keeps them. A
+    /// thread on a box named here is presented with `box_online`, which the apps read to say
+    /// that a loop waits on its box and to offer no start the hub would refuse.
+    pub boxes_online: HashMap<String, bool>,
 }
 impl Presentation {
+    /// Takes the boxes of `hub.info`'s answer `info`: each one's `online`. An answer without
+    /// them (an older hub) changes nothing.
+    pub fn take_boxes(&mut self, info: &Value) {
+        let Some(boxes) = info["boxes"].as_array() else {
+            return;
+        };
+        self.boxes_online = boxes
+            .iter()
+            .filter_map(|b| Some((b["name"].as_str()?.to_string(), b["online"] == true)))
+            .collect();
+    }
+    /// A box's runner connected or left: whether `ev` was one (the view then changes).
+    pub fn runner_event(&mut self, ev: &twr_core::event::Event) -> bool {
+        use twr_core::event::EventBody;
+        let (name, online) = match &ev.body {
+            EventBody::RunnerConnected(p) => (&p.box_name, true),
+            EventBody::RunnerDisconnected(p) => (&p.box_name, false),
+            _ => return false,
+        };
+        self.boxes_online.insert(name.clone(), online);
+        true
+    }
     pub fn project(&mut self, fold: &ClientFold) -> Value {
         self.incomplete = fold.capped.keys().cloned().collect();
         let target: Vec<_> =
@@ -45,6 +73,16 @@ impl Presentation {
         let mut result = view(fold);
         result["went_on"] = json!(fold.went_on);
         let threads = result["threads"].as_array_mut().expect("thread array");
+        for t in threads.iter_mut() {
+            // The hub's own box (`local`) is always there.
+            let name = t["box_name"].as_str().unwrap_or("local");
+            if name == "local" {
+                continue;
+            }
+            if let Some(online) = self.boxes_online.get(name) {
+                t["box_online"] = json!(online);
+            }
+        }
         threads.sort_by_key(|t| {
             shown
                 .layout
@@ -74,6 +112,11 @@ pub fn view(fold: &ClientFold) -> Value {
                 let (r, g, b) =
                     twr_core::palette::cube_rgb(twr_core::palette::THREAD_PALETTE[color]);
                 value["accent"] = json!(format!("#{r:02x}{g:02x}{b:02x}"));
+                // A running loop: its badge and line, as every client draws them.
+                if let Some(l) = &t.r#loop {
+                    value["loop_badge"] = json!(twr_core::loops::badge(l.kind));
+                    value["loop_line"] = json!(twr_core::loops::line(l));
+                }
                 value
             })
             .collect();
@@ -216,6 +259,16 @@ pub fn allowed_method(method: &str) -> bool {
             | "control.read"
             | "blob.get"
             | "notify.looking"
+            | "loop.request"
+            | "loop.setup.get"
+            | "loop.setup.update"
+            | "loop.settings.get"
+            | "loop.settings.set"
+            | "loop.settings.reset"
+            | "loop.get"
+            | "loop.report"
+            | "loop.list"
+            | "loop.control"
     )
 }
 
@@ -224,7 +277,10 @@ pub fn validate_call(method: &str, params: &Value) -> anyhow::Result<()> {
         allowed_method(method),
         "Unsupported desktop operation: {method}"
     );
-    if matches!(method, "attention.respond" | "attention.dismiss") {
+    if matches!(
+        method,
+        "attention.respond" | "attention.dismiss" | "loop.setup.update"
+    ) {
         anyhow::ensure!(
             params["revision"].as_u64().is_some_and(|r| r > 0),
             "Review the current request before answering it (a revision is required)"
@@ -236,6 +292,161 @@ pub fn validate_call(method: &str, params: &Value) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Every loop method goes through the desktop, and the setup card's change needs the
+    /// revision it was made on, as an answer does.
+    #[test]
+    fn loop_methods_are_allowed() {
+        for m in twr_core::devices::METHOD_SCOPES
+            .iter()
+            .flat_map(|(_, m)| m.iter())
+            .filter(|m| m.starts_with("loop."))
+        {
+            assert!(allowed_method(m), "{m}");
+        }
+        assert!(validate_call("loop.setup.update", &json!({"attn_id": "a"})).is_err());
+        assert!(
+            validate_call("loop.setup.update", &json!({"attn_id": "a", "revision": 3})).is_ok()
+        );
+    }
+    /// A thread in a loop is presented with its loop's badge and line; one without has neither.
+    #[test]
+    fn presented_threads_carry_the_loop_line() {
+        use twr_core::event::{EventBody, LoopStarted};
+        use twr_core::loops::config::Profile;
+        let mut fold = ClientFold::default();
+        let mut api = twr_core::testkit::ThreadScript::new("t1");
+        let mut web = twr_core::testkit::ThreadScript::new("t2");
+        for ev in [
+            api.created("api"),
+            web.created("web"),
+            api.event(EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "l1".into(),
+                profile: Profile::builtin("low").unwrap(),
+                ..Default::default()
+            }))),
+        ] {
+            fold.apply(&ev, None);
+        }
+        let out = Presentation::default().project(&fold);
+        let thread = |name: &str| {
+            out["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(thread("api")["loop_badge"], "REVIEW LOOP");
+        assert_eq!(thread("api")["loop_line"], "low · scope");
+        assert!(thread("web").get("loop_badge").is_none());
+        assert!(thread("web").get("loop_line").is_none());
+    }
+    /// A thread whose remote box's runner stopped (and stopped its agent) is presented as
+    /// stopped by no one (`stopped_by_hub`, `box_stopped`: the apps keep offering a loop on
+    /// it), with nothing to answer; a thread someone stopped is not.
+    #[test]
+    fn a_thread_stopped_with_its_box_is_stopped_by_no_one() {
+        use twr_core::event::{EventBody, SessionPayload, BOX_STOPPED_REASON};
+        let mut fold = ClientFold::default();
+        let mut api = twr_core::testkit::ThreadScript::new("t1");
+        let mut web = twr_core::testkit::ThreadScript::new("t2");
+        let with_box = SessionPayload {
+            ext: json!({"twr": {"reason": BOX_STOPPED_REASON}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        };
+        for ev in [
+            api.created("api"),
+            web.created("web"),
+            api.started("s1"),
+            web.started("s2"),
+            api.event(EventBody::ThreadStopped(with_box)),
+            web.stopped(),
+        ] {
+            fold.apply(&ev, None);
+        }
+        let out = Presentation::default().project(&fold);
+        let thread = |name: &str| {
+            out["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        let api = thread("api");
+        assert_eq!(
+            (&api["stopped"], &api["stopped_by_hub"], &api["box_stopped"]),
+            (&json!(true), &json!(true), &json!(true)),
+            "{api}"
+        );
+        let web = thread("web");
+        assert_eq!(web["stopped"], true);
+        assert!(web.get("stopped_by_hub").is_none() && web.get("box_stopped").is_none());
+        assert_eq!(out["attention"], json!([]));
+    }
+    /// A thread on a remote box is presented with whether its box is online: as `hub.info`
+    /// said when the connection opened, then as its runner connects and leaves. A thread on
+    /// the hub's own box, or on a box nothing has said of yet, has no `box_online`.
+    #[test]
+    fn threads_on_a_remote_box_carry_whether_it_is_online() {
+        use twr_core::event::{EventBody, RunnerPayload, ThreadCreated};
+        let mut fold = ClientFold::default();
+        let mut api = twr_core::testkit::ThreadScript::new("t1");
+        let mut web = twr_core::testkit::ThreadScript::new("t2");
+        let mut far = twr_core::testkit::ThreadScript::new("t3");
+        let on = |s: &mut twr_core::testkit::ThreadScript, name: &str, b: &str| {
+            s.event(EventBody::ThreadCreated(ThreadCreated {
+                name: name.into(),
+                box_name: b.into(),
+                runtime: "fake".into(),
+                mode: "auto".into(),
+                ..Default::default()
+            }))
+        };
+        for ev in [
+            on(&mut api, "api", "devbox"),
+            web.created("web"),
+            on(&mut far, "far", "gpu"),
+        ] {
+            fold.apply(&ev, None);
+        }
+        let mut p = Presentation::default();
+        let online = |p: &mut Presentation, name: &str| {
+            p.project(&fold)["threads"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()
+                .get("box_online")
+                .cloned()
+        };
+        assert_eq!(online(&mut p, "api"), None);
+        p.take_boxes(&json!({"boxes": [{"name": "local", "online": true},
+            {"name": "devbox", "online": true}]}));
+        assert_eq!(online(&mut p, "api"), Some(json!(true)));
+        assert_eq!(online(&mut p, "web"), None);
+        assert_eq!(online(&mut p, "far"), None);
+        let runner = |b: &str| RunnerPayload {
+            box_name: b.into(),
+            version: None,
+            ext: None,
+            extra: Default::default(),
+        };
+        let mut hub = twr_core::testkit::ThreadScript::new("hub");
+        assert!(p.runner_event(&hub.event(EventBody::RunnerDisconnected(runner("devbox")))));
+        assert_eq!(online(&mut p, "api"), Some(json!(false)));
+        assert!(p.runner_event(&hub.event(EventBody::RunnerConnected(runner("devbox")))));
+        assert_eq!(online(&mut p, "api"), Some(json!(true)));
+        assert!(!p.runner_event(&web.created("other")));
+        // An answer without boxes (an older hub) changes nothing.
+        p.take_boxes(&json!({}));
+        assert_eq!(online(&mut p, "api"), Some(json!(true)));
+    }
     #[test]
     fn snapshot_projection_keeps_stalls_resolved_while_the_app_was_closed() {
         let mut fold = ClientFold::default();

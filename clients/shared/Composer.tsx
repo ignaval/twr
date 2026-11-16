@@ -6,6 +6,7 @@
 // writes them when something else fills the box (take back, uploads, the outbox).
 import {
   useEffect,
+  useLayoutEffect,
   useState,
   useSyncExternalStore,
   type FormEvent,
@@ -17,7 +18,44 @@ import type { UploadController } from "./uploads";
 import { takesSuggestion, type useAssistance } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { Spinner } from "./ui";
+import { SendAsLoop } from "./LoopViews";
 import type { DesktopAPI, Json, Thread } from "./types";
+
+/**
+ * Makes the message field as tall as its text, wrapped lines included: at least its CSS
+ * `min-height` (its `rows`), at most its CSS `max-height`, past which the text scrolls
+ * inside it. The composer's own box keeps its height while the field is measured, so the
+ * conversation above it does not move (one scrolled to its end stays there).
+ *
+ * Nor does it grow past the bottom of what clips the composer (the window's content
+ * column): when the window has less room than the cap allows for (a short window, the
+ * largest text size, a notice above the conversation), it stops where the composer's
+ * buttons are still in view, and the text scrolls inside it.
+ */
+export function fitToText(field: HTMLTextAreaElement | null) {
+  if (!field?.isConnected) return;
+  const box = field.parentElement;
+  const held = box?.style.height ?? "";
+  if (box) box.style.height = `${box.getBoundingClientRect().height}px`;
+  field.style.height = "";
+  // The field's borders (box-sizing: border-box) on top of its text and padding.
+  const needed = field.scrollHeight + field.offsetHeight - field.clientHeight;
+  if (needed > field.offsetHeight)
+    field.style.height = `${Math.ceil(needed)}px`;
+  if (box) box.style.height = held;
+  const view = field.ownerDocument?.defaultView;
+  if (!box || !field.style.height || !view) return;
+  let clip = box.parentElement;
+  while (clip && !/clip|hidden/.test(view.getComputedStyle(clip).overflowY))
+    clip = clip.parentElement;
+  if (!clip) return;
+  const over =
+    box.getBoundingClientRect().bottom +
+    (parseFloat(view.getComputedStyle(box).marginBottom) || 0) -
+    clip.getBoundingClientRect().bottom;
+  if (over > 0.5)
+    field.style.height = `${Math.max(0, Math.floor(field.offsetHeight - over))}px`;
+}
 
 /**
  * The message drafts, one per destination: `<workspace>:orchestrator` or
@@ -112,6 +150,7 @@ export function Composer({
   onEdit,
   send,
   submitSlash,
+  sendAsLoop,
   uploads,
   submitVoice,
   voiceHint,
@@ -147,6 +186,9 @@ export function Composer({
   onEdit: () => void;
   send: (event?: FormEvent) => Promise<void>;
   submitSlash: (text: string) => Promise<void>;
+  /** Send as implementation loop: the composer's draft is the task. Only while the
+   * destination is a thread. */
+  sendAsLoop?: () => void;
   uploads: UploadController;
   submitVoice: (text: string) => Promise<Json>;
   voiceHint: string[];
@@ -159,6 +201,30 @@ export function Composer({
   const [mentionIndex, setMentionIndex] = useState(memory.mentionIndex);
   const [mentionHidden, setMentionHidden] = useState(memory.mentionHidden);
   const [slashIndex, setSlashIndex] = useState(memory.slashIndex);
+  // The field grows and shrinks with its text (fitToText): on every change of the text
+  // (typing, sending, a draft put back), of its width (a resized window, a rotated phone)
+  // and of the text size.
+  useLayoutEffect(() => fitToText(input.current), [draft, input]);
+  useEffect(() => {
+    const field = input.current;
+    if (!field || typeof ResizeObserver === "undefined") return;
+    let width = field.clientWidth;
+    const refit = () => fitToText(field);
+    const resized = new ResizeObserver(() => {
+      if (field.clientWidth === width) return;
+      width = field.clientWidth;
+      refit();
+    });
+    resized.observe(field);
+    window.addEventListener("twr:typography", refit);
+    // A window made shorter leaves the field less room.
+    window.addEventListener("resize", refit);
+    return () => {
+      resized.disconnect();
+      window.removeEventListener("twr:typography", refit);
+      window.removeEventListener("resize", refit);
+    };
+  }, [input]);
   useEffect(() => {
     Object.assign(memory, {
       slashHidden,
@@ -289,13 +355,8 @@ export function Composer({
                   ? `Message ${target?.name} directly…`
                   : "Ask your orchestrator to build something…"
           }
-          rows={Math.min(
-            6,
-            Math.max(
-              document.documentElement.dataset.mobile === "true" ? 1 : 2,
-              draft.split("\n").length,
-            ),
-          )}
+          // The empty field's height; fitToText grows it with the text.
+          rows={document.documentElement.dataset.mobile === "true" ? 1 : 2}
           disabled={(!connected && !journal) || !operate}
           onKeyDown={(e) => {
             if (e.nativeEvent.isComposing || e.keyCode === 229) return;
@@ -469,6 +530,14 @@ export function Composer({
             >
               {sending ? <Spinner /> : <ArrowUp size={18} />}
             </button>
+            {sendAsLoop && target && !target.is_orchestrator && (
+              <SendAsLoop
+                thread={target}
+                phone={document.documentElement.dataset.mobile === "true"}
+                busy={sending}
+                onSend={sendAsLoop}
+              />
+            )}
           </div>
         </div>
         {mentions.length > 0 && !mentionHidden && (

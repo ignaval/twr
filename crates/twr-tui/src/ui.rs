@@ -22,6 +22,7 @@ use crate::app::{
     grid_columns, on_remote_box, provider_label, reason_label, site_label, summary_str, AppState,
     BoxWord, DecisionRow, Entry, EscDoes, NoticeLevel, Screen, DECISIONS_CAP, PROVIDERS, TWR_TOOL,
 };
+use crate::color::{LABEL, SHELL, SUCCESS, WARN};
 use crate::edit::{cluster_width, clusters};
 use crate::icon;
 use crate::select::{
@@ -148,8 +149,14 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         render_picker(frame, body, state, &mut panes);
     } else if state.view.new_ws.is_some() {
         crate::sidebar::render_new(frame, body, state, &mut panes);
-    } else if state.view.settings.is_some() {
-        crate::settings::render(frame, body, state, &mut panes);
+    } else if state.view.settings.is_some() || state.view.loop_editor.is_some() {
+        // The loop settings editor over the settings when their Loops row opened it.
+        if state.view.settings.is_some() {
+            crate::settings::render(frame, body, state, &mut panes);
+        }
+        if state.view.loop_editor.is_some() {
+            crate::loops::render(frame, body, state, &mut panes);
+        }
     } else if let Some(panel) = &state.view.runner {
         frame.render_widget(ratatui::widgets::Clear, body);
         frame.render_widget(
@@ -294,7 +301,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     };
     // The sidebar's control: shows it ([`crate::sidebar`]).
     let menu = x;
-    x += push(&mut spans, MENU.into(), Style::default().fg(Color::Cyan));
+    x += push(&mut spans, MENU.into(), Style::default().fg(LABEL));
     panes.target(
         Rect::new(menu, area.y, x - menu, 1).intersection(area),
         Target::WsSidebar,
@@ -315,7 +322,13 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         let start = x;
         x += push(&mut spans, format!(" {name}"), base);
         if let Some(w) = waiting {
-            x += push(&mut spans, w.clone(), base.fg(Color::Yellow));
+            // Waiting on you: the state's amber, a fill on the current tab's reverse video.
+            let waits = base.fg(crate::color::WAITING);
+            x += push(
+                &mut spans,
+                w.clone(),
+                if *current { lit(waits) } else { waits },
+            );
         }
         x += push(&mut spans, format!("{badges} "), base);
         let tab = Rect::new(start, area.y, x.saturating_sub(start), 1).intersection(area);
@@ -702,7 +715,7 @@ fn help_entry(
     column: usize,
     stacked: bool,
 ) -> Vec<Line<'static>> {
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(LABEL);
     let text = wrap(what, width.saturating_sub(column).max(1));
     let indent = " ".repeat(column);
     let key_width = crate::edit::width(key);
@@ -776,6 +789,7 @@ fn render_help(frame: &mut Frame, area: Rect, scroll: u16, panes: &mut Panes) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(LABEL))
         .title(" twr help ")
         .title(close_title())
         // On the border: shown whatever the scroll.
@@ -793,7 +807,7 @@ fn render_help(frame: &mut Frame, area: Rect, scroll: u16, panes: &mut Panes) {
 pub fn trash_lines(r: &Value) -> Vec<Line<'static>> {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(Color::DarkGray);
-    let cyan = Style::default().fg(Color::Cyan);
+    let cyan = Style::default().fg(LABEL);
     let s = |v: &Value| v.as_str().unwrap_or("-").to_string();
     let time = |v: &Value| {
         let t = v.as_str().unwrap_or("-");
@@ -846,7 +860,7 @@ pub fn trash_lines(r: &Value) -> Vec<Line<'static>> {
                 s(&u["box"]),
                 s(&u["error"])
             ),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(WARN),
         )));
     }
     out.push(Line::from(""));
@@ -873,6 +887,7 @@ fn render_trash(frame: &mut Frame, area: Rect, trash: &Value, scroll: u16, panes
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(LABEL))
         .title(" twr trash ")
         .title(close_title());
     // Taller than the screen: it scrolls, and says so.
@@ -945,12 +960,8 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
         let chosen = i == p.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
-            Span::styled(
-                format!("{} ", i + 1),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            option_key(i + 1),
+            Span::raw(" "),
             Span::styled(
                 format!("{label:<name_width$}  "),
                 if chosen {
@@ -961,7 +972,7 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
             ),
         ];
         match installed {
-            Some(true) => spans.push(Span::styled("installed", Style::default().fg(Color::Green))),
+            Some(true) => spans.push(Span::styled("installed", Style::default().fg(SUCCESS))),
             Some(false) => spans.push(Span::styled(
                 "not installed",
                 Style::default().fg(Color::Red),
@@ -1041,16 +1052,12 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
         let chosen = i == m.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
-            Span::styled(
-                if i < 9 {
-                    format!("{} ", i + 1)
-                } else {
-                    "  ".to_string()
-                },
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            if i < 9 {
+                option_key(i + 1)
+            } else {
+                Span::raw(" ")
+            },
+            Span::raw(" "),
         ];
         let style = if chosen {
             Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
@@ -1244,12 +1251,35 @@ pub const TAB_BAR_ROWS: u16 = 2;
 /// back, notices, `✕ close`, buttons) is a row tall, as on a desktop.
 pub const TAP_ROWS: u16 = TAB_BAR_ROWS;
 /// The fills of a phone's menu choices drawn as bands ([`tap_band`]), neighbors alternating.
-pub(crate) const BAND: Color = Color::Indexed(236);
-pub(crate) const BAND_ALT: Color = Color::Indexed(238);
+pub(crate) const BAND: Color = crate::color::BAND;
+pub(crate) const BAND_ALT: Color = crate::color::BAND_ALT;
+
+/// `style`, a text's on band `bg`: the band's fill where the text has none of its own (a key
+/// cap keeps its own, and its text), and a text color that reads on it at 4.5:1 at least,
+/// whatever the terminal's background: [`crate::color::BAND_TEXT`] for a text in the
+/// terminal's own color, [`crate::color::BAND_DIM`] for a dim one, a mid-tone's bright form
+/// ([`crate::color::bright`]: a command's cyan, `installed`'s green), and the band's text for
+/// a color that doesn't read on it (`not installed` in red).
+pub(crate) fn on_band(style: Style, bg: Color) -> Style {
+    if style.bg.is_some_and(|b| b != Color::Reset) {
+        return style;
+    }
+    let reads = |c: Color| {
+        matches!((crate::color::rgb(c), crate::color::rgb(bg)), (Some(a), Some(b))
+            if crate::color::contrast(a, b) >= 4.5)
+    };
+    let fg = match style.fg.map(crate::color::bright) {
+        None | Some(Color::Reset) => crate::color::BAND_TEXT,
+        Some(Color::DarkGray) => crate::color::BAND_DIM,
+        Some(c) if reads(c) => c,
+        Some(_) => crate::color::BAND_TEXT,
+    };
+    style.fg(fg).bg(bg)
+}
 
 /// `lines`, a menu choice on a phone, as a band: at least [`TAP_ROWS`] rows, each filled to
-/// `width` cells with `bg` behind its text (where it has none of its own), so that its rows
-/// show as one choice.
+/// `width` cells with `bg` behind its text (where it has none of its own), its text in colors
+/// that read on it ([`on_band`]), so that its rows show as one choice.
 pub(crate) fn tap_band(
     mut lines: Vec<Line<'static>>,
     width: usize,
@@ -1262,9 +1292,7 @@ pub(crate) fn tap_band(
         let fill = width.saturating_sub(line.width());
         line.spans.push(Span::raw(" ".repeat(fill)));
         for span in &mut line.spans {
-            if span.style.bg.is_none() {
-                span.style = span.style.bg(bg);
-            }
+            span.style = on_band(span.style, bg);
         }
     }
     lines
@@ -1345,7 +1373,7 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
     } else {
         Style::default()
             .fg(Color::Indexed(252))
-            .bg(Color::Indexed(238))
+            .bg(crate::color::BAND_ALT)
     };
     let n = u32::try_from(names.len()).unwrap_or(3);
     let shares = Layout::horizontal(vec![Constraint::Ratio(1, n); names.len()]).split(bar);
@@ -1481,7 +1509,7 @@ fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
             }
         };
         let color = if item.reason.is_blocking() || item.proposal {
-            Color::Yellow
+            WARN
         } else {
             Color::Red
         };
@@ -1492,12 +1520,12 @@ fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
             .collect();
         // The hub's card (`twr asks`) in its card's yellow.
         let named = if id == twr_core::event::HUB_THREAD {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(WARN)
         } else {
             state
                 .registry
                 .get(&id)
-                .map_or(Style::default(), |t| Style::default().fg(card_color(t)))
+                .map_or(Style::default(), |t| Style::default().fg(card_text(t)))
         };
         let mut spans = vec![
             Span::styled(name, named.add_modifier(Modifier::BOLD)),
@@ -1595,7 +1623,7 @@ fn render_compact_rows(
                 let pad = width.saturating_sub(line.width());
                 line.spans.push(Span::raw(" ".repeat(pad)));
                 for span in &mut line.spans {
-                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                    span.style = lit(span.style);
                 }
             }
         }
@@ -1859,6 +1887,7 @@ pub(crate) fn card_height(
     let (rows, section) = if id == HUB_THREAD {
         let (head, attn) = hub_card_parts(state, usize::from(inner));
         let body = CardBody {
+            looping: None,
             section: Vec::new(),
             one: None,
             attn,
@@ -2059,7 +2088,8 @@ fn card_border(block: Block<'static>, look: Look, color: Color) -> Block<'static
     match look {
         Look::Selected => block
             .border_type(BorderType::Thick)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(Color::Yellow))
+            .title_style(Style::default().fg(WARN)),
         Look::Target => block
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(color)),
@@ -2089,11 +2119,11 @@ fn card_block(
     let mut name = vec![Span::styled(
         format!(" {} ", t.name),
         Style::default()
-            .fg(card_color(t))
+            .fg(card_text(t))
             .add_modifier(Modifier::BOLD),
     )];
     if pinned {
-        name.push(Span::styled("[pin] ", Style::default().fg(Color::Cyan)));
+        name.push(Span::styled("[pin] ", Style::default().fg(LABEL)));
     }
     let name_w = Line::from(name.clone()).width();
     let mode = (!t.mode.is_empty()).then(|| format!(" {} ", t.mode));
@@ -2234,9 +2264,17 @@ fn render_card(
         .first()
         .filter(|_| icon::is_working(t))
         .cloned();
+    // The status row, and its icon, come after the loop line when there is one.
+    let below = u16::from(body.looping.is_some());
     let (rows, drawn) = card_rows(body, inner.height, inner.width);
-    if let Some(cells) = shows_icon(&rows, status_row.as_ref()) {
-        note_icon(panes, state, &t.id, inner, cells);
+    let status_rows = rows.get(usize::from(below)..).unwrap_or_default();
+    if let Some(cells) = shows_icon(status_rows, status_row.as_ref()) {
+        let at = Rect {
+            y: inner.y.saturating_add(below),
+            height: inner.height.saturating_sub(below),
+            ..inner
+        };
+        note_icon(panes, state, &t.id, at, cells);
     }
     frame.render_widget(
         Paragraph::new(rows).block(block).style(parked_style(t)),
@@ -2286,6 +2324,10 @@ fn note_icon(panes: &mut Panes, state: &AppState, thread: &str, inner: Rect, cel
 /// is drawn: its status section ([`section_lines`]), its top attention item when one is open,
 /// then its git state, last. (Who runs it is in its title, [`card_block`].)
 struct CardBody {
+    /// The loop line, when the thread runs a loop (a card's, never a tile's): first, never
+    /// cut before the rows under it; and its short form, what a one-row card shows
+    /// ([`crate::loops::card_line`], [`crate::loops::short_line`]).
+    looping: Option<(Line<'static>, Line<'static>)>,
     /// The state and what it does or came to.
     section: Vec<Line<'static>>,
     /// The section on one row, cut with `…`: shown in place of its rows when it has but one.
@@ -2345,7 +2387,22 @@ fn card_body(
         (None, Some(g)) => Some(git_line(g, width)),
         (None, None) => None,
     };
+    // The loop line: on a card (stack, sidebar), not on a grid tile. Once the loop ended, how
+    // it ended and what it committed, until the thread's next turn.
+    let looping = match (&t.r#loop, crate::loops::ended_due(t)) {
+        _ if tile.is_some() => None,
+        (Some(l), _) => Some((
+            crate::loops::card_line(l, width),
+            crate::loops::short_line(l, &card_status(t), width),
+        )),
+        (None, Some(last)) => {
+            let line = crate::loops::ended_line(last, width);
+            Some((line.clone(), line))
+        }
+        (None, None) => None,
+    };
     CardBody {
+        looping,
         section,
         one: Some(one),
         attn,
@@ -2386,9 +2443,7 @@ fn section_lines(
     item: bool,
 ) -> (Vec<Line<'static>>, Line<'static>) {
     let dim = Style::default().fg(Color::DarkGray);
-    let doing = Style::default()
-        .fg(Color::Gray)
-        .add_modifier(Modifier::ITALIC);
+    let doing = ACTIVITY;
     let status = t.status();
     let status_text = card_status(t);
     let mut spans: Vec<Span<'static>> = match working_icon(state, t) {
@@ -2445,13 +2500,19 @@ fn section_lines(
             return (wrapped(spans), line);
         }
     }
-    let activity = state
-        .activity
-        .get(&t.id)
-        .map(|a| one_row(&a.activity))
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| twr_core::activity::fallback(t).to_string());
-    let activity = with_work(state, t, activity);
+    let activity = match review_activity(t) {
+        // A review loop's review run, all the thread waits on: the reviewer and how long.
+        Some(review) => review,
+        None => {
+            let activity = state
+                .activity
+                .get(&t.id)
+                .map(|a| one_row(&a.activity))
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(|| twr_core::activity::fallback(t).to_string());
+            with_work(state, t, activity)
+        }
+    };
     match after_state(&activity, &status_text, status) {
         After::Nothing => {}
         After::Joined(rest) => spans.push(Span::styled(rest, doing)),
@@ -2465,6 +2526,58 @@ fn section_lines(
         }
     }
     (lines, line)
+}
+
+/// The style of what a card says a thread does, after its state word (`· reviewer
+/// gpt-6.1-sol medium · 6m`, `· thinking`): wherever a card is drawn (the stack, a grid tile,
+/// the compact layout). A grey in italics that reads on a dark terminal and a light one alike
+/// (6.1:1 on black, 3.5:1 on white; with 16 colors, dark grey: 5.2:1 and 4.0:1), lighter than
+/// the dim grey of the report and the `·` around it.
+pub(crate) const ACTIVITY: Style = Style::new()
+    .fg(Color::Indexed(245))
+    .add_modifier(Modifier::ITALIC);
+
+/// The activity line of thread `t` while it waits, in the background, on its loop's review
+/// run alone: the run's description and how long it has run (`reviewer gpt-6.1-sol xhigh ·
+/// 6m`); on its sweep's audit runs alone, how many rules they audit of all and how long the
+/// oldest has run (`auditing 2 of 5 rules · 3m`). `None` otherwise (it works, or has other
+/// background work too).
+fn review_activity(t: &ThreadView) -> Option<String> {
+    if t.status() != ThreadStatus::Background {
+        return None;
+    }
+    // The sweep's audit runs (`sweep = "runs"`): how many rules are being audited, of all.
+    if let Some(l) = t
+        .r#loop
+        .as_ref()
+        .filter(|l| l.wait == twr_core::loops::Wait::Audits)
+    {
+        let mut tasks = t.background_tasks.values().filter(|b| b.in_background());
+        if tasks.clone().all(|b| b.review) {
+            let running = tasks.clone().count();
+            let mut out = format!("auditing {running} of {} rules", l.audits.len());
+            if let Some(at) = tasks.by_ref().filter_map(|b| b.started_at).min() {
+                let secs = (chrono::Utc::now() - at).num_seconds();
+                out.push_str(&format!(" · {}", twr_core::work::ago(secs)));
+            }
+            return Some(out);
+        }
+        return None;
+    }
+    let mut tasks = t.background_tasks.values().filter(|b| b.in_background());
+    let task = tasks.next().filter(|b| b.review)?;
+    if tasks.next().is_some() {
+        return None;
+    }
+    let mut out = one_row(&task.description);
+    if out.is_empty() {
+        out = "reviewer".into();
+    }
+    if let Some(at) = task.started_at {
+        let secs = (chrono::Utc::now() - at).num_seconds();
+        out.push_str(&format!(" · {}", twr_core::work::ago(secs)));
+    }
+    Some(out)
 }
 
 /// `activity` (a card's activity line) followed by what thread `t` has in flight while its
@@ -2567,11 +2680,12 @@ fn card_status(t: &ThreadView) -> String {
         },
         s => s.as_str().to_string(),
     };
-    // (A task a tool call of its turn waits for in the foreground is that call's.)
+    // (A task a tool call of its turn waits for in the foreground is that call's; a loop's
+    // review run is the loop's, which its activity names.)
     match t
         .background_tasks
         .values()
-        .filter(|b| b.in_background())
+        .filter(|b| b.in_background() && !b.review)
         .count()
     {
         0 => word,
@@ -2608,11 +2722,32 @@ fn card_rows_counted(
 ) -> (Vec<Line<'static>>, Option<(String, u64)>, usize) {
     let height = usize::from(height);
     let CardBody {
+        looping,
         mut section,
         one,
         attn,
         git,
     } = body;
+    // The loop line first, never cut before the rows under it: on a one-row card it is what
+    // remains, in its short form.
+    if let Some((line, short)) = looping {
+        if height == 0 {
+            return (Vec::new(), None, 0);
+        }
+        if height == 1 {
+            return (vec![short], None, 1);
+        }
+        let rest = CardBody {
+            looping: None,
+            section,
+            one,
+            attn,
+            git,
+        };
+        let (mut rows, drawn, n) = card_rows_counted(rest, (height - 1) as u16, width);
+        rows.insert(0, line);
+        return (rows, drawn, n + 1);
+    }
     // No blank row from the status section or the last report: their paragraph breaks are
     // left out here (the detail views, which show the whole text, keep them). An item keeps
     // every row, blank or only spaces: they are its content (spaces inside a quoted argument
@@ -2982,11 +3117,7 @@ fn git_line(g: &GitSnapshot, width: usize) -> Line<'static> {
 /// its end (what follows the branch does not fit even without it).
 fn fit_git(g: &GitSnapshot, width: usize) -> (Line<'static>, bool) {
     let cells = crate::edit::width;
-    let style = Style::default().fg(if g.dirty_files > 0 {
-        Color::Yellow
-    } else {
-        Color::Cyan
-    });
+    let style = Style::default().fg(if g.dirty_files > 0 { WARN } else { LABEL });
     let conflicts = conflicts_text(g);
     let branch = g.branch.as_deref().unwrap_or("(detached)");
     let changes = if g.dirty_files > 0 {
@@ -3194,7 +3325,7 @@ fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'st
 
 /// The color of a box token's word ([`box_token`]).
 fn box_word_style(word: BoxWord) -> Style {
-    let yellow = Style::default().fg(Color::Yellow);
+    let yellow = Style::default().fg(WARN);
     match word {
         BoxWord::Switching | BoxWord::Reconnecting => yellow,
         BoxWord::UpdatePending => yellow.add_modifier(Modifier::DIM),
@@ -3302,13 +3433,16 @@ pub(crate) fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'st
     out
 }
 
-/// The badge span for an attention reason.
+/// The badge span for an attention reason: its label in bold on its fill, in black or white,
+/// whichever reads better ([`crate::color::text_on`]: white on the `PERMISSION` red, black on
+/// the others), at 4.5:1 at least with 256 colors and 16.
 fn badge(reason: AttentionReason) -> Span<'static> {
+    let fill = reason_color(reason);
     Span::styled(
         format!(" {} ", reason_label(reason)),
         Style::default()
-            .fg(Color::Black)
-            .bg(reason_color(reason))
+            .fg(crate::color::text_on(fill))
+            .bg(fill)
             .add_modifier(Modifier::BOLD),
     )
 }
@@ -3409,6 +3543,8 @@ struct WrapKey {
     /// Its text is only a capped preview: loading (`Some(false)`) or not loadable
     /// (`Some(true)`).
     cut: Option<bool>,
+    /// A loop's setup card in full (the action popup's), not its compact form (a card's).
+    full: bool,
 }
 
 /// An item's rows ([`WrapCache`]): the text they were wrapped from (its badge too: an item
@@ -3556,6 +3692,23 @@ fn attention_rows(
     width: usize,
     tile: bool,
 ) -> Option<Arc<AttnRows>> {
+    attention_rows_as(state, thread, width, tile, false)
+}
+
+/// [`attention_rows`] as the action popup shows them: a loop's setup card in full
+/// ([`crate::loops::setup_rows`]), not in the compact form a card shows.
+fn attention_rows_full(state: &AppState, thread: &str, width: usize) -> Option<Arc<AttnRows>> {
+    attention_rows_as(state, thread, width, false, true)
+}
+
+/// [`attention_rows`], `full`: a loop's setup card in full.
+fn attention_rows_as(
+    state: &AppState,
+    thread: &str,
+    width: usize,
+    tile: bool,
+    full: bool,
+) -> Option<Arc<AttnRows>> {
     let items = state.card_items(thread);
     let top = *items.first()?;
     let incomplete = state.incomplete(top);
@@ -3566,15 +3719,14 @@ fn attention_rows(
         tile,
         more: items.len() - 1,
         cut: incomplete.map(|i| i.failed),
+        full: full && top.loop_setup,
     };
-    let (more, cut) = (key.more, key.cut);
+    let (more, cut, full) = (key.more, key.cut, key.full);
     let top = shown_item(state, top);
     let top = top.as_ref();
-    Some(
-        state
-            .wraps
-            .attn(key, top, || attention_rows_of(top, more, cut, width, tile)),
-    )
+    Some(state.wraps.attn(key, top, || {
+        attention_rows_of(top, more, cut, width, tile, full)
+    }))
 }
 
 /// `item` as the views show it: a delete card, whose text is the hub's own, with the commands
@@ -3608,13 +3760,23 @@ fn attention_rows_of(
     cut: Option<bool>,
     width: usize,
     tile: bool,
+    full: bool,
 ) -> AttnRows {
     let dim = Style::default().fg(Color::DarkGray);
-    let mut head = vec![
-        badge(top.reason),
-        Span::raw(" "),
-        Span::raw(top.summary.clone()),
-    ];
+    // A loop's setup card: its compact form on a card or tile (which never counts as drawn
+    // in full: the popup or the detail view shows the whole card), or its rows in full.
+    let compact = top.loop_setup && !full;
+    let mut head = if compact {
+        crate::loops::setup_compact(top)
+    } else if top.loop_setup {
+        Vec::new()
+    } else {
+        vec![
+            crate::loops::item_badge(top).unwrap_or_else(|| badge(top.reason)),
+            Span::raw(" "),
+            Span::raw(top.summary.clone()),
+        ]
+    };
     if let Some(failed) = cut {
         let why = if failed {
             " (could not load the full text)"
@@ -3631,7 +3793,15 @@ fn attention_rows_of(
     if tile && more > 0 {
         head.push(Span::styled(format!(" (+{more})"), dim));
     }
-    let mut core = wrap_line(Line::from(head), width);
+    let mut core = if top.loop_setup && !compact {
+        let mut rows = crate::loops::setup_rows(top, width);
+        if !head.is_empty() {
+            rows.extend(wrap_line(Line::from(head), width));
+        }
+        rows
+    } else {
+        wrap_line(Line::from(head), width)
+    };
     core.extend(option_rows(&top.options, width));
     let mut extra = Vec::new();
     if !tile {
@@ -3663,7 +3833,7 @@ fn attention_rows_of(
             ));
         }
     }
-    let exact = core.iter().all(|l| l.width() <= width.max(1));
+    let exact = !compact && core.iter().all(|l| l.width() <= width.max(1));
     AttnRows::new(
         (top.attn_id.clone(), top.revision),
         core,
@@ -3677,7 +3847,7 @@ fn attention_rows_of(
 /// field after its dim label (`why: ...`), wrapped.
 fn context_rows(fields: &[(&str, &str)], width: usize) -> Vec<(Line<'static>, Join)> {
     let label = Style::default().fg(Color::DarkGray);
-    let text = Style::default().fg(Color::Gray);
+    let text = Style::default();
     fields
         .iter()
         .flat_map(|(k, v)| {
@@ -3695,6 +3865,22 @@ fn context_rows(fields: &[(&str, &str)], width: usize) -> Vec<(Line<'static>, Jo
         .collect()
 }
 
+/// An option's key, the `1` of `1 allow`: its digit as a key cap, bold black on the
+/// selection's yellow ([`KEY_CAP`]). Every list of options a number key answers draws its
+/// keys with it (a card's or tile's item, the action popup, the detail view, the pickers), so
+/// they look alike everywhere. A fill of its own, as the `QUESTION` badge has: the TUI can't
+/// tell a dark terminal from a light one, and no yellow text reads on white.
+pub(crate) fn option_key(n: usize) -> Span<'static> {
+    Span::styled(n.to_string(), KEY_CAP)
+}
+
+/// The style of an option's key ([`option_key`]): black on yellow, 12:1 at 256 and at 16
+/// colors, on a dark terminal and a light one alike; with no colors, reverse video.
+pub(crate) const KEY_CAP: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Yellow)
+    .add_modifier(Modifier::BOLD);
+
 /// Every option, numbered: `1 allow  2 deny` for the first nine (their number keys answer
 /// them), then `10. label` (no key answers those, but they are part of what the item asks: an
 /// item is drawn in full only with all of them on screen), in rows of at most `width` cells:
@@ -3711,9 +3897,6 @@ fn option_rows(options: &[String], width: usize) -> Vec<Line<'static>> {
 /// one line, however they are packed into rows, so a place in them is the same text at any
 /// width (an option wrapped inside a word continues right after it).
 fn option_rows_joined(options: &[String], width: usize) -> Vec<(Line<'static>, Join)> {
-    let key = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
     let no_key = Style::default().fg(Color::DarkGray);
     let width = width.max(1);
     let mut rows = Vec::new();
@@ -3721,7 +3904,7 @@ fn option_rows_joined(options: &[String], width: usize) -> Vec<(Line<'static>, J
     let mut used = 0;
     for (n, opt) in options.iter().enumerate() {
         let number = if n < 9 {
-            Span::styled(format!("{}", n + 1), key)
+            option_key(n + 1)
         } else {
             Span::styled(format!("{}.", n + 1), no_key)
         };
@@ -3782,7 +3965,8 @@ fn render_hub_card(
             " twr asks ",
             Style::default().add_modifier(Modifier::BOLD),
         )));
-    let mut block = card_border(block, look, Color::Yellow);
+    // (Its titles in the warning amber: the border's yellow doesn't read on white.)
+    let mut block = card_border(block, look, Color::Yellow).title_style(Style::default().fg(WARN));
     if let Some(l) = more_left {
         block = block.title_bottom(Line::from(l).left_aligned());
     }
@@ -3792,6 +3976,7 @@ fn render_hub_card(
     let inner = block.inner(area);
     let (head, attn) = hub_card_parts(state, usize::from(inner.width));
     let body = CardBody {
+        looping: None,
         section: Vec::new(),
         one: None,
         attn,
@@ -3923,7 +4108,7 @@ fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         head.push(badge(item.reason));
         head.push(Span::styled(
             " the orchestrator needs you (Ctrl-G: back to the conversation)",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(WARN),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(head)), header);
@@ -4016,13 +4201,16 @@ fn tile_body(state: &AppState, t: &ThreadView, width: u16) -> CardBody {
     card_body(state, t, usize::from(width), Some((&turns, &spent)))
 }
 
+/// The color of state `s`'s word: each reads at 3:1 at least on black and on white, with 256
+/// colors and with 16 (where running, waiting and done are fills under black or white text,
+/// [`crate::color::degrade`]).
 pub(crate) fn status_color(s: ThreadStatus) -> Color {
     match s {
-        ThreadStatus::Running | ThreadStatus::Background => Color::Green,
-        ThreadStatus::Waiting => Color::Yellow,
+        ThreadStatus::Running | ThreadStatus::Background => crate::color::RUNNING,
+        ThreadStatus::Waiting => crate::color::WAITING,
         ThreadStatus::Error => Color::Red,
-        ThreadStatus::Done => Color::Blue,
-        ThreadStatus::Idle => Color::Gray,
+        ThreadStatus::Done => crate::color::DONE,
+        ThreadStatus::Idle => crate::color::IDLE,
         ThreadStatus::Parked => Color::DarkGray,
         ThreadStatus::Attached => Color::Magenta,
     }
@@ -4174,6 +4362,15 @@ pub use crate::color::{thread_color, THREAD_COLORS};
 
 /// The color of `t`'s card or tile (its border and name) and of its name in a compact list:
 /// its own ([`thread_color`]), the orchestrator's cyan for the orchestrator's.
+/// The color of a card's name ([`card_color`]): the orchestrator's in [`target_text`].
+fn card_text(t: &ThreadView) -> Color {
+    if t.is_orchestrator() {
+        target_text(None)
+    } else {
+        thread_color(t)
+    }
+}
+
 fn card_color(t: &ThreadView) -> Color {
     if t.is_orchestrator() {
         target_color(None)
@@ -4308,6 +4505,8 @@ fn block_key(entry: &Entry, index: usize, threads: &Threads) -> String {
         Entry::Tool { call_id, .. } => return format!("block:{thread}:tool:{call_id}"),
         Entry::TurnEnd { .. } => ("end", 0),
         Entry::Shell { seq, .. } => ("shell", *seq),
+        Entry::LoopRound { seq, .. } => ("loop-round", *seq),
+        Entry::LoopStep { seq, .. } => ("loop-step", *seq),
     };
     // Synthetic entries used by offscreen callers may have no event position.
     let id = if seq == 0 {
@@ -4358,7 +4557,7 @@ fn long_rows(
     }
     let selected = state.view.block.as_deref() == Some(&key);
     let frame = if selected {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(WARN)
     } else if boxed {
         rows.first()
             .and_then(|r| r.0.spans.first())
@@ -4409,7 +4608,7 @@ fn long_rows(
         }
         if selected && matches!(row.3, Edge::Top(_)) {
             for span in &mut row.0.spans {
-                span.style = span.style.fg(Color::Yellow);
+                in_selection_yellow(span);
             }
         }
     }
@@ -4853,9 +5052,16 @@ pub fn transcript_view_spans(
                     turn.map_or_else(|| format!("#{i}"), |t| t.to_string())
                 );
                 v.block(Kind::Compact);
+                // A loop's prompt (it can be long: it carries the findings) names its step.
+                let marker = crate::loops::prompt_step(prompt).map_or_else(
+                    || NOTICE_MARKER.to_string(),
+                    |(id, step)| {
+                        crate::loops::prompt_marker(&step, loop_kind(entries, threads, &id, &step))
+                    },
+                );
                 if collapse.folded(&key) {
                     let about = notice_thread(prompt);
-                    let row = marker_row(NOTICE_MARKER, about, threads, width);
+                    let row = marker_row(&marker, about, threads, width);
                     v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
                 } else {
                     let at = v.out.len();
@@ -4864,11 +5070,30 @@ pub fn transcript_view_spans(
                         2,
                         ("", dim),
                         Vec::new(),
-                        &format!("{NOTICE_MARKER}:\n{prompt}"),
+                        &format!("{marker}:\n{prompt}"),
                         dim,
                     );
                     limit_block(&mut v, at, block_key(&entries[i], i, threads), threads);
                 }
+            }
+            // A review round: one row, unless expanded ([`crate::loops::round_head`]).
+            Entry::LoopRound { loop_id, round, .. }
+                if collapse.folded(&format!("loop-round:{loop_id}:{round}")) =>
+            {
+                let key = format!("loop-round:{loop_id}:{round}");
+                v.block(Kind::Compact);
+                let row = loop_round_row(&entries[i], width);
+                v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
+            }
+            // An implementation loop's step: one row, unless expanded
+            // ([`crate::loops::step_head`]).
+            Entry::LoopStep { loop_id, seq, .. }
+                if collapse.folded(&format!("loop-step:{loop_id}:{seq}")) =>
+            {
+                let key = format!("loop-step:{loop_id}:{seq}");
+                v.block(Kind::Compact);
+                let row = loop_step_row(&entries[i], width);
+                v.out.push((row, Join::Newline, Some(key), Edge::Gutter(2)));
             }
             Entry::TurnEnd {
                 result: TurnResult::Completed,
@@ -5082,14 +5307,15 @@ impl View {
             let row = Line::from(cut_spans(vec![Span::styled(label, style)], self.width));
             self.out.push((row, Join::Skip, None, Edge::Bottom));
         }
-        // Taken back: struck out and dimmed.
+        // Taken back: struck out and dimmed. Each text reads on the band at 4.5:1 at least,
+        // on a dark terminal and a light one.
         let band = match withdrawn {
             true => Style::default()
-                .fg(Color::Indexed(245))
-                .bg(Color::Indexed(237)),
+                .fg(crate::color::BAND_DIM)
+                .bg(crate::color::PROMPT_BAND),
             false => Style::default()
-                .fg(Color::Indexed(231))
-                .bg(Color::Indexed(237)),
+                .fg(crate::color::BAND_TEXT)
+                .bg(crate::color::PROMPT_BAND),
         };
         let struck = Style::default().add_modifier(Modifier::CROSSED_OUT);
         let indent = self.indent();
@@ -5106,7 +5332,7 @@ impl View {
                 }
                 // The mark takes the first two cells; the line's own indentation stays.
                 let rest = line.spans[0].content.get(2..).unwrap_or("").to_string();
-                line.spans[0] = Span::styled("❯ ", Style::default().fg(MUTED));
+                line.spans[0] = Span::styled("❯ ", Style::default().fg(crate::color::BAND_DIM));
                 if !rest.is_empty() {
                     line.spans.insert(1, Span::raw(rest));
                 }
@@ -5166,10 +5392,8 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
                     (format!("✗ The turn failed after {t}"), Color::Red)
                 }
                 (TurnResult::Error, None) => ("✗ The turn failed".to_string(), Color::Red),
-                (TurnResult::Interrupted, Some(t)) => {
-                    (format!("! Interrupted after {t}"), Color::Yellow)
-                }
-                (TurnResult::Interrupted, None) => ("! Interrupted".to_string(), Color::Yellow),
+                (TurnResult::Interrupted, Some(t)) => (format!("! Interrupted after {t}"), WARN),
+                (TurnResult::Interrupted, None) => ("! Interrupted".to_string(), WARN),
             };
             let style = Style::default().fg(color);
             let (mark, rest) = text.split_at(text.find(' ').map_or(0, |i| i + 1));
@@ -5179,11 +5403,71 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
             v.block(Kind::Block);
             shell_rows(v, e, threads);
         }
+        Entry::LoopStep { note, .. } => {
+            v.block(Kind::Compact);
+            let dim = Style::default().fg(Color::DarkGray);
+            let color = if crate::loops::step_failed(note) {
+                Color::Red
+            } else {
+                crate::loops::LOOP_COLOR
+            };
+            v.marked(
+                0,
+                ("↻ ", Style::default().fg(color)),
+                Vec::new(),
+                &crate::loops::step_head(note),
+                Style::default().fg(MUTED),
+            );
+            for row in crate::loops::step_rows(note) {
+                v.marked(4, ("⎿ ", dim), Vec::new(), &row, dim);
+            }
+        }
+        Entry::LoopRound {
+            round,
+            reviewer,
+            findings,
+            failed,
+            triage,
+            took,
+            ..
+        } => {
+            v.block(Kind::Compact);
+            let dim = Style::default().fg(Color::DarkGray);
+            let head = crate::loops::round_head(
+                round,
+                reviewer.as_deref(),
+                took.as_deref(),
+                findings,
+                failed.as_deref(),
+                triage,
+            );
+            let color = if failed.is_some() {
+                Color::Red
+            } else {
+                crate::loops::LOOP_COLOR
+            };
+            v.marked(
+                0,
+                ("↻ ", Style::default().fg(color)),
+                Vec::new(),
+                &head,
+                Style::default().fg(MUTED),
+            );
+            if let Some(why) = failed {
+                v.marked(4, ("", dim), Vec::new(), why, dim);
+            }
+            for (finding, verdict) in crate::loops::round_rows(findings, triage) {
+                v.marked(2, ("• ", dim), Vec::new(), &finding, Style::default());
+                if let Some(verdict) = verdict {
+                    v.marked(4, ("⎿ ", dim), Vec::new(), &verdict, dim);
+                }
+            }
+        }
         Entry::Notice { level, text, .. } => {
             v.block(Kind::Compact);
             let (mark, color) = match level {
                 NoticeLevel::Info => ("· ", Color::DarkGray),
-                NoticeLevel::Attention => ("! ", Color::Yellow),
+                NoticeLevel::Attention => ("! ", WARN),
                 NoticeLevel::Error => ("✗ ", Color::Red),
             };
             let style = Style::default().fg(color);
@@ -5192,7 +5476,9 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
     }
 }
 
-/// The color of a `!` command: the input box while its line is one, the `!` of its entry.
+/// The color of a `!` command's frame: the input box's border and its ` ! shell ` badge while
+/// its line is one. Its text (the box's title, the `!` of its entry) is
+/// [`crate::color::SHELL`], which reads on a light terminal too.
 pub const SHELL_COLOR: Color = Color::Green;
 
 /// The link of a running `!` command's `■ stop` (then its job).
@@ -5222,9 +5508,7 @@ fn shell_rows(v: &mut View, e: &Entry, threads: &Threads) {
         return;
     };
     let dim = Style::default().fg(MUTED);
-    let bang = Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD);
+    let bang = Style::default().fg(SHELL).add_modifier(Modifier::BOLD);
     v.marked(
         0,
         ("! ", bang),
@@ -5243,13 +5527,13 @@ fn shell_rows(v: &mut View, e: &Entry, threads: &Threads) {
         "running"
     };
     let (mark, text, color) = match (*running, outcome.as_deref(), exit, signal) {
-        (true, ..) => ("⏵ ", running_text.to_string(), Color::Yellow),
-        (false, Some("exited"), Some(0), _) => ("✓ ", "exit 0".to_string(), Color::Green),
+        (true, ..) => ("⏵ ", running_text.to_string(), WARN),
+        (false, Some("exited"), Some(0), _) => ("✓ ", "exit 0".to_string(), SUCCESS),
         (false, Some("exited"), Some(c), _) => ("✗ ", format!("exit {c}"), Color::Red),
         (false, Some("exited"), None, Some(s)) => {
             ("✗ ", format!("killed by signal {s}"), Color::Red)
         }
-        (false, Some("cancelled"), ..) => ("■ ", "stopped".to_string(), Color::Yellow),
+        (false, Some("cancelled"), ..) => ("■ ", "stopped".to_string(), WARN),
         (false, Some("timed_out"), ..) => ("✗ ", "timed out".to_string(), Color::Red),
         (false, Some("failed_to_start"), ..) => ("✗ ", "could not start".to_string(), Color::Red),
         (false, Some("lost"), ..) => (
@@ -5309,7 +5593,8 @@ fn shell_rows(v: &mut View, e: &Entry, threads: &Threads) {
             dim,
         );
     }
-    let out = Style::default().fg(Color::Gray);
+    // What it printed, in the terminal's own text color.
+    let out = Style::default();
     for line in &lines[hidden..] {
         if line.is_empty() {
             v.out
@@ -5341,7 +5626,7 @@ fn tool_rows(v: &mut View, e: &Entry) {
     };
     let dot = match ok {
         None => Color::DarkGray,
-        Some(true) => Color::Green,
+        Some(true) => SUCCESS,
         Some(false) => Color::Red,
     };
     let name = match tool.strip_prefix(TWR_TOOL) {
@@ -5547,6 +5832,110 @@ fn routine_row(
     Line::from(cut_spans(line, width))
 }
 
+/// The row of a folded review round ([`crate::app::Entry::LoopRound`]): `↻ review round m3 ·
+/// gpt-6.1-sol medium · 2 findings (ctrl+o to expand)`, cut to `width`.
+fn loop_round_row(e: &Entry, width: usize) -> Line<'static> {
+    let Entry::LoopRound {
+        round,
+        reviewer,
+        findings,
+        failed,
+        triage,
+        took,
+        ..
+    } = e
+    else {
+        return Line::default();
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let head = crate::loops::round_head(
+        round,
+        reviewer.as_deref(),
+        took.as_deref(),
+        findings,
+        failed.as_deref(),
+        triage,
+    );
+    let color = if failed.is_some() {
+        Color::Red
+    } else {
+        crate::loops::LOOP_COLOR
+    };
+    let hint = if findings.is_empty() && failed.is_none() {
+        ""
+    } else {
+        " (ctrl+o to expand)"
+    };
+    let spans = vec![
+        Span::styled("↻ ", Style::default().fg(color)),
+        Span::styled(head, Style::default().fg(MUTED)),
+    ];
+    let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
+    line.push(Span::styled(hint, dim));
+    Line::from(cut_spans(line, width))
+}
+
+/// The row of a folded implementation loop's step ([`crate::app::Entry::LoopStep`]): `↻ plan ·
+/// revision 1 · contract risk: no (ctrl+o to expand)`, `↻ committed abc1234`, cut to `width`.
+fn loop_step_row(e: &Entry, width: usize) -> Line<'static> {
+    let Entry::LoopStep { note, .. } = e else {
+        return Line::default();
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let color = if crate::loops::step_failed(note) {
+        Color::Red
+    } else {
+        crate::loops::LOOP_COLOR
+    };
+    let hint = if crate::loops::step_rows(note).is_empty() {
+        ""
+    } else {
+        " (ctrl+o to expand)"
+    };
+    let spans = vec![
+        Span::styled("↻ ", Style::default().fg(color)),
+        Span::styled(crate::loops::step_head(note), Style::default().fg(MUTED)),
+    ];
+    let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
+    line.push(Span::styled(hint, dim));
+    Line::from(cut_spans(line, width))
+}
+
+/// The kind of loop `id` whose prompt names `step`: an implementation loop's when the step is
+/// one only it has, or the transcript has a step row of that loop's, or the thread's running
+/// or last loop is one; else a review loop's.
+fn loop_kind(
+    entries: &[Entry],
+    threads: &Threads,
+    id: &str,
+    step: &str,
+) -> twr_core::loops::LoopKind {
+    use twr_core::loops::LoopKind;
+    if crate::loops::implementation_step(step) {
+        return LoopKind::Implement;
+    }
+    // The thread's running or last loop first (a look-up per thread), then the transcript.
+    let known = threads.state.and_then(|s| {
+        s.registry.list().into_iter().find_map(|t| {
+            t.r#loop
+                .as_ref()
+                .filter(|l| l.id == id)
+                .map(|l| l.kind)
+                .or_else(|| t.last_loop.as_ref().filter(|l| l.id == id).map(|l| l.kind))
+        })
+    });
+    known.unwrap_or_else(|| {
+        if entries.iter().any(|e| {
+            matches!(e, Entry::LoopStep { loop_id, note, .. }
+                if loop_id == id && note.implementation_only())
+        }) {
+            LoopKind::Implement
+        } else {
+            LoopKind::Review
+        }
+    })
+}
+
 /// The row of a folded hub notice turn: `· hub update`, after the thread it is about.
 fn marker_row(marker: &str, about: Option<&str>, threads: &Threads, width: usize) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
@@ -5636,10 +6025,10 @@ fn outcome_words(what: &str, outcome: &str) -> (String, &'static str, Color) {
     };
     match (what, answer) {
         (_, "cancel") => ("dismissed".into(), "·", Color::DarkGray),
-        ("needs permission", "allow") => ("allowed".into(), "✓", Color::Green),
-        ("needs permission", "allow_always") => ("allowed always".into(), "✓", Color::Green),
+        ("needs permission", "allow") => ("allowed".into(), "✓", SUCCESS),
+        ("needs permission", "allow_always") => ("allowed always".into(), "✓", SUCCESS),
         ("needs permission", "deny") => ("denied".into(), "✗", Color::Red),
-        (_, other) => (format!("answered {other}"), "✓", Color::Green),
+        (_, other) => (format!("answered {other}"), "✓", SUCCESS),
     }
 }
 
@@ -5696,9 +6085,9 @@ fn hub_update_rows(v: &mut View, e: &Entry, threads: &Threads) {
             // Only a permission or a question waits for an answer; the hub writes no end for
             // the others.
             let (mark, mc) = match what {
-                "needs permission" | "asks" => ("! ", Color::Yellow),
+                "needs permission" | "asks" => ("! ", WARN),
                 "failed" => ("✗ ", Color::Red),
-                _ => ("· ", Color::Yellow),
+                _ => ("· ", WARN),
             };
             v.marked(
                 0,
@@ -5722,9 +6111,9 @@ fn hub_update_rows(v: &mut View, e: &Entry, threads: &Threads) {
         ) => {
             v.block(Kind::Block);
             let gc = match grade {
-                "success" => Color::Green,
+                "success" => SUCCESS,
                 "failure" | "failed" => Color::Red,
-                _ => Color::Yellow,
+                _ => WARN,
             };
             v.marked(
                 0,
@@ -5965,7 +6354,7 @@ fn answers_marker(run: &[&Entry], threads: &Threads, width: usize) -> Line<'stat
     let dim = Style::default().fg(MUTED);
     let (mark, mc) = match (denied, answered) {
         (true, _) => ("✗ ", Color::Red),
-        (false, true) => ("✓ ", Color::Green),
+        (false, true) => ("✓ ", SUCCESS),
         _ => ("· ", Color::DarkGray),
     };
     let how = tally
@@ -6045,8 +6434,8 @@ fn wrap_rows(text: &str, width: usize) -> Vec<(String, Join)> {
     out
 }
 
-/// The color of where a typed line goes, for the input box's border and title text: the
-/// terminal's own cyan for the orchestrator (`dive` `None`), the color of the thread dived
+/// The color of where a typed line goes, for the input box's border (its title's text is
+/// [`target_text`]) and the orchestrator's card: the terminal's own cyan for the orchestrator (`dive` `None`), the color of the thread dived
 /// into ([`thread_color`]), magenta for one that has none of its own (the hub, the
 /// orchestrator).
 pub fn target_color(dive: Option<&ThreadView>) -> Color {
@@ -6054,6 +6443,16 @@ pub fn target_color(dive: Option<&ThreadView>) -> Color {
         None => Color::Cyan,
         Some(t) if t.id == HUB_THREAD || t.is_orchestrator() => Color::Magenta,
         Some(t) => thread_color(t),
+    }
+}
+
+/// The color of a text that names where a typed line goes (`dive` as for [`target_color`]): the
+/// input box's title. [`LABEL`]'s teal for the orchestrator (the terminal's cyan doesn't read on
+/// white), else as [`target_color`].
+pub fn target_text(dive: Option<&ThreadView>) -> Color {
+    match dive {
+        None => LABEL,
+        d => target_color(d),
     }
 }
 
@@ -6372,15 +6771,18 @@ fn render_orch_banner(
         block
             .border_type(BorderType::Thick)
             .border_style(Style::default().fg(Color::Yellow))
+            .title_style(Style::default().fg(WARN))
     } else {
         block
             .border_style(Style::default().fg(Color::Yellow))
+            .title_style(Style::default().fg(WARN))
             .title_bottom(Line::from(" Tab selects it ").right_aligned())
     };
     let inner = block.inner(area);
     panes.add(PaneId::Thread(orch.to_string()), inner);
     let attn = attention_rows(state, orch, usize::from(inner.width), false);
     let body = CardBody {
+        looping: None,
         section: Vec::new(),
         one: None,
         attn,
@@ -6420,6 +6822,7 @@ fn card_detail_rows(
         tile: false,
         more,
         cut: None,
+        full: true,
     };
     state
         .wraps
@@ -6429,25 +6832,41 @@ fn card_detail_rows(
 /// [`card_detail_rows`] for `item`, wrapped now.
 fn card_detail_rows_of(item: &AttentionItem, more: usize, width: usize) -> DetailRows {
     const HEAD: &str = "From your message:";
-    let (head, rest) = match item.summary.strip_prefix(HEAD) {
-        Some(rest) => (HEAD, rest.trim_start()),
-        None => ("", item.summary.as_str()),
-    };
-    let mut rows = wrap_line(
-        Line::from(vec![
-            badge(item.reason),
-            Span::raw(" "),
-            Span::raw(head.to_string()),
-        ]),
-        width,
-    );
-    for action in rest.split(" · ").filter(|a| !a.trim().is_empty()) {
-        // A span keeps the action's line breaks (`Line::from` a string would drop them).
-        rows.extend(wrap_line(
-            Line::from(Span::raw(format!("• {}", action.trim()))),
+    let mut rows = if item.loop_setup {
+        // A loop's setup card: as the hub wrote it, its rows aligned.
+        crate::loops::setup_rows(item, width)
+    } else if item.loop_stuck {
+        // A stuck loop's item: its badge and its text.
+        wrap_line(
+            Line::from(vec![
+                crate::loops::item_badge(item).unwrap_or_else(|| badge(item.reason)),
+                Span::raw(" "),
+                Span::raw(item.summary.clone()),
+            ]),
             width,
-        ));
-    }
+        )
+    } else {
+        let (head, rest) = match item.summary.strip_prefix(HEAD) {
+            Some(rest) => (HEAD, rest.trim_start()),
+            None => ("", item.summary.as_str()),
+        };
+        let mut rows = wrap_line(
+            Line::from(vec![
+                badge(item.reason),
+                Span::raw(" "),
+                Span::raw(head.to_string()),
+            ]),
+            width,
+        );
+        for action in rest.split(" · ").filter(|a| !a.trim().is_empty()) {
+            // A span keeps the action's line breaks (`Line::from` a string would drop them).
+            rows.extend(wrap_line(
+                Line::from(Span::raw(format!("• {}", action.trim()))),
+                width,
+            ));
+        }
+        rows
+    };
     rows.push(Line::default());
     let mut tail = option_rows(&item.options, width);
     let options = rows.len()..rows.len() + tail.len();
@@ -6524,10 +6943,9 @@ fn render_card_detail(
                 } else {
                     state.registry.get(orch).map_or(orch, |t| t.name.as_str())
                 };
-                format!(
-                    " {name} · {} · Esc returns ",
-                    reason_label(item.reason).to_lowercase()
-                )
+                let label = crate::loops::item_label(item)
+                    .map_or_else(|| reason_label(item.reason).to_lowercase(), str::to_string);
+                format!(" {name} · {label} · Esc returns ")
             },
             Style::default().add_modifier(Modifier::BOLD),
         )))
@@ -6547,9 +6965,11 @@ fn render_card_detail(
         block
             .border_type(BorderType::Thick)
             .border_style(Style::default().fg(Color::Yellow))
+            .title_style(Style::default().fg(WARN))
     } else {
         block
             .border_style(Style::default().fg(Color::Yellow))
+            .title_style(Style::default().fg(WARN))
             .title_bottom(Line::from(" Tab selects it ").left_aligned())
     };
     let inner = block.inner(area);
@@ -6711,6 +7131,25 @@ pub fn selected_fill() -> Style {
         .bg(Color::Indexed(220))
 }
 
+/// `style` selected: in reverse video, but a text in a color of its own on no fill of its own
+/// is drawn as a fill of that color ([`crate::color::bright`]) under black or white text,
+/// whichever reads better ([`crate::color::text_on`]). Reversed, that text would be the
+/// terminal's own background on the color, which reads on a dark terminal or on a light one,
+/// never on both. A text in the terminal's own color, or on a fill of its own (a key cap),
+/// is reversed. With no colors, every one is reverse video.
+pub(crate) fn lit(style: Style) -> Style {
+    match (style.fg, style.bg) {
+        (Some(fg), None | Some(Color::Reset)) if fg != Color::Reset => {
+            let fill = crate::color::bright(fg);
+            style
+                .fg(crate::color::text_on(fill))
+                .bg(fill)
+                .remove_modifier(Modifier::REVERSED)
+        }
+        _ => style.add_modifier(Modifier::REVERSED),
+    }
+}
+
 /// Full request text and options from the hydrated attention stack.
 fn request_detail_rows(state: &AppState, item: &AttentionItem, width: usize) -> Arc<DetailRows> {
     let item = shown_item(state, item);
@@ -6723,6 +7162,7 @@ fn request_detail_rows(state: &AppState, item: &AttentionItem, width: usize) -> 
         tile: false,
         more: 0,
         cut,
+        full: false,
     };
     state.wraps.request(key, item, || {
         // A permission reads exactly as it runs: no space of it dropped by word wrapping.
@@ -6814,9 +7254,12 @@ fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<Trans
     for (line, ..) in &mut rows {
         for span in &mut line.spans {
             span.style = span.style.fg(color);
-            // Too narrow for a box, its title alone: reversed, selected.
+            if selected {
+                in_selection_yellow(span);
+            }
+            // Too narrow for a box, its title alone: a fill, selected.
             if selected && !boxed {
-                span.style = span.style.add_modifier(Modifier::REVERSED);
+                span.style = lit(span.style);
             }
         }
     }
@@ -6853,6 +7296,16 @@ fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<Trans
         row.2 = Some(format!("request:{}", item.attn_id));
     }
     rows
+}
+
+/// `span` of a selected box's frame in the selection's yellow: a border's lines in the yellow of
+/// a selected card's border, a title's text in [`WARN`]'s amber, which reads on white.
+fn in_selection_yellow(span: &mut Span<'static>) {
+    let lines = span
+        .content
+        .chars()
+        .all(|c| c == ' ' || ('\u{2500}'..='\u{259f}').contains(&c));
+    span.style = span.style.fg(if lines { Color::Yellow } else { WARN });
 }
 
 /// Box row `row`'s frame ([`Edge`]: a top border's ends, a text row's bars, a bottom border)
@@ -7338,9 +7791,7 @@ fn mark_read_aloud(rows: &mut [TranscriptRow], spans: &Spans, entries: &[Entry],
     } else {
         READING_MARK
     };
-    let style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let style = Style::default().fg(WARN).add_modifier(Modifier::BOLD);
     for (i, e) in entries.iter().enumerate() {
         let Entry::Text {
             final_seq: Some(seq),
@@ -7792,11 +8243,11 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
         let text = truncate_cells(&text, room);
         let pad = width.saturating_sub(crate::edit::width(&text) + crate::edit::width(hint));
         let style = if selected {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            lit(Style::default()
+                .fg(WARN)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD))
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default()
         };
         lines.push(Line::from(vec![
             Span::styled(text, style),
@@ -7845,6 +8296,12 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     // A `!` line is a shell command: the box says so, in green, with where it runs.
     let color = if shell.is_some() { SHELL_COLOR } else { color };
     let style = Style::default().fg(color);
+    // Its title's text: a color that reads on any terminal ([`target_text`], [`SHELL`]).
+    let said = Style::default().fg(if shell.is_some() {
+        SHELL
+    } else {
+        target_text(dive)
+    });
     // While the double Esc is armed, what the second Esc does, in place of what Enter does.
     let says = state.unsend_hint().unwrap_or_else(|| match &shell {
         Some(m) if m.share => format!(
@@ -7866,9 +8323,9 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
                     .bg(SHELL_COLOR)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(says, style),
+            Span::styled(says, said),
         ],
-        None => vec![Span::styled(to, label), Span::styled(says, style)],
+        None => vec![Span::styled(to, label), Span::styled(says, said)],
     };
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -7881,7 +8338,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
             block = block.title(
                 Line::from(Span::styled(
                     " ↶ take back ",
-                    style.add_modifier(Modifier::BOLD),
+                    said.add_modifier(Modifier::BOLD),
                 ))
                 .right_aligned(),
             );
@@ -7999,10 +8456,10 @@ fn render_popup(
         .skip(first)
         .take(fit)
         .flat_map(|(i, item)| {
-            let mut label_style = Style::default().fg(Color::Cyan);
+            let mut label_style = Style::default().fg(LABEL);
             let mut detail_style = Style::default().fg(Color::DarkGray);
             if i == sel {
-                label_style = label_style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                label_style = lit(label_style.add_modifier(Modifier::BOLD));
                 detail_style = Style::default().add_modifier(Modifier::REVERSED);
             }
             let lines = if stacked {
@@ -8032,6 +8489,7 @@ fn render_popup(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(LABEL))
         .title(match (s.command, s.mention) {
             (true, _) => " commands ",
             (_, true) => " threads ",
@@ -8140,28 +8598,19 @@ fn render_action_popup(
             for span in &mut line.spans {
                 span.style = style;
             }
-            // An answer's number in the color the cards give it.
-            if k == 0 && kept && !selected && matches!(row.kind, ActionKind::Answer(n) if n <= 9) {
+            // An answer's number as the cards draw it ([`option_key`]), after the row's space.
+            if let (0, true, false, ActionKind::Answer(n @ 1..=9)) = (k, kept, selected, row.kind) {
                 let text = line.spans[0].content.to_string();
-                let number: String = text.chars().take(2).collect();
                 let rest: String = text.chars().skip(2).collect();
                 line.spans[0] = Span::raw(rest);
-                line.spans.insert(
-                    0,
-                    Span::styled(
-                        number,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                );
+                line.spans.splice(0..0, [Span::raw(" "), option_key(n)]);
             }
         }
         // On a phone each row is two rows tall, in a band (alternate shades, so its rows tell
         // apart), all of it the row's ([`TAP_ROWS`]).
         if state.compact() {
             let tall = usize::from(TAP_ROWS);
-            let band = if i.is_multiple_of(2) { 236 } else { 238 };
+            let band = if i.is_multiple_of(2) { BAND } else { BAND_ALT };
             let pad = Line::from(Span::raw(" ".repeat(inner_w)));
             if lines.len() < tall {
                 lines.resize(tall, pad);
@@ -8170,14 +8619,15 @@ fn render_action_popup(
                 for line in &mut lines {
                     let fill = inner_w.saturating_sub(line.width());
                     line.spans.push(Span::raw(" ".repeat(fill)));
+                    // (An answer's key keeps its own fill.)
                     for span in &mut line.spans {
-                        span.style = span.style.bg(Color::Indexed(band));
+                        span.style = on_band(span.style, band);
                     }
                 }
             } else {
                 for line in &mut lines {
                     for span in &mut line.spans {
-                        span.style = span.style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                        span.style = lit(span.style.add_modifier(Modifier::BOLD));
                     }
                 }
             }
@@ -8376,7 +8826,7 @@ fn render_action_popup(
             let cue = truncate_cells(&cue, inner_w.saturating_sub(2));
             let rest = inner_w.saturating_sub(2 + crate::edit::width(&cue));
             let style = if end < n {
-                Style::default().fg(Color::Yellow)
+                Style::default().fg(WARN)
             } else {
                 dim
             };
@@ -8613,6 +9063,7 @@ fn render_action_popup(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
+        .title_style(Style::default().fg(LABEL))
         .title(Line::from(Span::styled(
             title,
             Style::default().add_modifier(Modifier::BOLD),
@@ -8708,6 +9159,9 @@ pub fn queued_sender(it: &crate::queue::Queued) -> &'static str {
     }
 }
 
+/// The action popup's text when nothing waits on what it is on (`target`): a queued
+/// message's rows ([`popup_queued_rows`]); for a worker's card, while its thread runs a loop,
+/// the loop's progress ([`crate::loops::progress_rows`]), else its last report (above).
 fn popup_report_rows(
     state: &AppState,
     target: &crate::app::ActionTarget,
@@ -8719,12 +9173,14 @@ fn popup_report_rows(
     let crate::app::ActionTarget::Card(id) = target else {
         return Vec::new();
     };
-    let Some(r) = state
-        .registry
-        .get(id)
-        .filter(|t| !t.is_orchestrator())
-        .and_then(|t| t.last_report.as_ref())
-    else {
+    let Some(t) = state.registry.get(id).filter(|t| !t.is_orchestrator()) else {
+        return Vec::new();
+    };
+    // A thread in a loop: the loop's progress, from its state.
+    if let Some(l) = &t.r#loop {
+        return crate::loops::progress_rows(l, width);
+    }
+    let Some(r) = t.last_report.as_ref() else {
         return Vec::new();
     };
     let dim = Style::default().fg(Color::DarkGray);
@@ -8799,7 +9255,7 @@ fn popup_item_rows(
         let d = card_detail_rows(state, item, 0, width);
         return without_options(&d, Vec::new());
     }
-    let Some(a) = attention_rows(state, card, width, false) else {
+    let Some(a) = attention_rows_full(state, card, width) else {
         return (Vec::new(), true);
     };
     let options = option_rows(&item.options, width).len();
@@ -9009,9 +9465,7 @@ fn decision_summary_line(state: &AppState) -> Line<'static> {
 fn decision_filter_line(state: &AppState) -> Line<'static> {
     let f = state.view.decision_filter;
     let dim = Style::default().fg(Color::DarkGray);
-    let on = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let on = Style::default().fg(LABEL).add_modifier(Modifier::BOLD);
     let site = f.site.map_or("all", site_label);
     let provider = f.provider.map_or("all", provider_label);
     Line::from(vec![
@@ -9422,9 +9876,9 @@ where
                     Part::Plain | Part::Age => dim,
                     Part::Reset => Style::default().fg(Color::Red),
                     Part::Window(Level::Normal, true) => dim,
-                    Part::Window(Level::Normal, false) => Style::default().fg(Color::Gray),
+                    Part::Window(Level::Normal, false) => Style::default(),
                     Part::Window(Level::Warn, stale) => {
-                        let s = Style::default().fg(Color::Yellow);
+                        let s = Style::default().fg(WARN);
                         if stale {
                             s.add_modifier(Modifier::DIM)
                         } else {
@@ -9572,11 +10026,8 @@ fn render_compact_confirm(
             ..text
         };
         frame.render_widget(
-            Paragraph::new(Line::from(truncate_cells(&more, width))).style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Paragraph::new(Line::from(truncate_cells(&more, width)))
+                .style(Style::default().fg(WARN).add_modifier(Modifier::BOLD)),
             row,
         );
         panes.target(row, Target::More(crate::select::Scrolled::Ask));
@@ -9740,7 +10191,7 @@ fn load_spans(state: &AppState) -> Vec<Span<'static>> {
     let level = load.level();
     let style = match level {
         Level::Saturated => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(WARN),
     };
     let what: Vec<String> = pressing.into_iter().map(|(text, _)| text).collect();
     vec![
@@ -11124,7 +11575,7 @@ mod tests {
 
     /// [`crate::app::tests::with_orch`] with the orchestrator in a turn, its conversation
     /// `entries`, the clock at frame 5 (`▅`).
-    fn orch_working(entries: Vec<Entry>) -> AppState {
+    pub(super) fn orch_working(entries: Vec<Entry>) -> AppState {
         use crate::app::tests::{control, with_orch};
         let mut st = crate::app::tests::without_worker_requests(with_orch());
         let mut o = ThreadScript::new("t-orch");
@@ -11136,7 +11587,7 @@ mod tests {
         st
     }
 
-    fn prompt(text: &str) -> Entry {
+    pub(super) fn prompt(text: &str) -> Entry {
         Entry::TurnStart {
             seq: 0,
             turn: Some(1),
@@ -11170,7 +11621,7 @@ mod tests {
     }
 
     /// The poll's answer: `laptop` in `state`.
-    fn speech_polled(st: &mut AppState, state: twr_core::speech::SpeechStateParams) {
+    pub(super) fn speech_polled(st: &mut AppState, state: twr_core::speech::SpeechStateParams) {
         use crate::speech::tests::{polled, speaker};
         st.apply_result("speech.status", &polled(vec![speaker("laptop", state)]));
     }
@@ -12139,7 +12590,7 @@ mod tests {
         let five = &buf[(at("5h 10%"), y)];
         assert_eq!(five.fg, Color::Red);
         assert!(five.modifier.contains(Modifier::BOLD));
-        assert_eq!(buf[(at("wk 25%"), y)].fg, Color::Yellow);
+        assert_eq!(buf[(at("wk 25%"), y)].fg, crate::color::WARN);
         assert_eq!(buf[(at("wk 58%"), y)].fg, Color::DarkGray, "stale");
         assert!(
             !row.contains("wk 25% resets"),
@@ -12193,7 +12644,7 @@ mod tests {
             assert!(!cell.modifier.contains(Modifier::BOLD), "{w}");
             let byte = row.find("25%").unwrap();
             let x = u16::try_from(row[..byte].chars().count()).unwrap();
-            assert_eq!(buf[(x, y)].fg, Color::Yellow, "{w}");
+            assert_eq!(buf[(x, y)].fg, crate::color::WARN, "{w}");
             assert!(buf[(x, y)].modifier.contains(Modifier::DIM), "{w}");
         }
 
@@ -13056,7 +13507,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(name(HUB_THREAD).content, "twr");
-        assert_eq!(name(HUB_THREAD).style.fg, Some(Color::Yellow));
+        assert_eq!(name(HUB_THREAD).style.fg, Some(crate::color::WARN));
         assert_eq!(name("t-w").style.fg, Some(color_of(&st, "t-w")));
     }
 
@@ -13153,6 +13604,7 @@ mod tests {
             let a = Arc::new(AttnRows::new(("a".into(), 1), core, extra, true, true));
             let before = copies();
             let body = CardBody {
+                looping: None,
                 section: vec![l("waiting".into())],
                 one: None,
                 attn: Some(a),
@@ -13255,6 +13707,7 @@ mod tests {
         assert_eq!(st.seen_gseq(), st.last_gseq);
         // The seam: a card one row short of the item beside its section's row cuts it.
         let body = |a: &Arc<AttnRows>| CardBody {
+            looping: None,
             section: vec![Line::from("waiting")],
             one: None,
             attn: Some(a.clone()),
@@ -13526,7 +13979,7 @@ mod tests {
 
     /// [`three_threads`] plus `rep`, done, whose report the hub wrote when reports ended with
     /// `— twr attach <name>`.
-    fn reported_thread() -> AppState {
+    pub(super) fn reported_thread() -> AppState {
         use twr_core::event::Grade;
         let mut st = three_threads();
         let mut r = ThreadScript::new("t-rep");
@@ -14373,7 +14826,7 @@ mod tests {
                 assert_eq!(rows[open].trim(), "/open [thread]", "{w}x{h}");
                 assert!(rows[open + 1].starts_with("    talk"), "{w}x{h}: {rows:?}");
             } else {
-                // The commands' longest entry is the /trash usage.
+                // The commands' longest entry is the /review usage.
                 let longest = crate::slash::COMMANDS
                     .iter()
                     .map(|c| c.1.chars().count())
@@ -14645,7 +15098,7 @@ mod tests {
 
     /// [`box_threads_working`], the boxes as `hub.info` says them when `gpu` is given, else not
     /// known yet (no `hub.info` answer).
-    fn box_threads_listed(gpu: Option<Value>, working: bool) -> AppState {
+    pub(super) fn box_threads_listed(gpu: Option<Value>, working: bool) -> AppState {
         use crate::app::tests::control;
         let mut st = AppState::new();
         let mut job = ThreadScript::new("t-job");
@@ -14690,7 +15143,7 @@ mod tests {
 
     /// A `hub.info` answer whose boxes are `entry` (none for a [`removed_box`]) and another
     /// box, `pi`, online.
-    fn box_snapshot(entry: Value) -> Value {
+    pub(super) fn box_snapshot(entry: Value) -> Value {
         let pi = crate::app::tests::info_box("pi", "online");
         if entry["removed"] == true {
             serde_json::json!({ "boxes": [pi] })
@@ -15127,7 +15580,7 @@ mod tests {
 
     /// [`model_threads`] plus `job`, a claude-code worker on account `work` like `ops`, with
     /// the accounts as `account.list` answered `list` (none: a hub older than accounts).
-    fn account_threads(list: Option<Value>) -> AppState {
+    pub(super) fn account_threads(list: Option<Value>) -> AppState {
         let mut st = model_threads();
         let mut j = ThreadScript::new("t-job");
         j.at(60);
@@ -15826,8 +16279,8 @@ mod tests {
     fn the_dive_header_colors_the_box_state() {
         for (entry, word) in box_cases().into_iter().filter(|(_, w)| !w.is_empty()) {
             let (fg, dim) = match word {
-                " switching" | " reconnecting" => (Color::Yellow, false),
-                " update pending" => (Color::Yellow, true),
+                " switching" | " reconnecting" => (crate::color::WARN, false),
+                " update pending" => (crate::color::WARN, true),
                 _ => (Color::Red, false),
             };
             for (name, width) in [("gpu", 120u16), ("gpu-workstation-01", 30)] {
@@ -16330,7 +16783,7 @@ mod tests {
         let a = st.view.panes.get(&PaneId::Transcript).unwrap().area;
         assert_eq!(buf[(a.x + 2, a.y + 2)].symbol(), "L");
         assert_eq!(buf[(a.x + 2, a.y + 2)].fg, MUTED);
-        assert_eq!(buf[(a.x + 4, a.y)].bg, Color::Indexed(237));
+        assert_eq!(buf[(a.x + 4, a.y)].bg, crate::color::PROMPT_BAND);
         // Narrow, beside the narrower sidebar: the header cut to fit the view's columns.
         let w = screen_for(&st, 60);
         let lines = draw_panes(&mut st, w, 30);
@@ -16522,7 +16975,11 @@ mod tests {
         assert!(all.ends_with("9 o9  10. o10  11. o11"), "{all}");
         let rows = option_rows(&many, 200);
         let ten = rows[0].spans.iter().find(|s| s.content == "10.").unwrap();
-        assert_ne!(ten.style.fg, Some(Color::Yellow), "no key");
+        assert_eq!(ten.style.bg, None, "no key");
+        // A key is a key cap: its digit alone, black on yellow (the space after it is not).
+        let one = &rows[0].spans[0];
+        assert_eq!((one.content.as_ref(), one.style), ("1", KEY_CAP));
+        assert_eq!(rows[0].spans[1].style.bg, None);
         // Wrapping breaks at spaces and keeps the styles.
         let line = Line::from(vec![
             Span::styled("ab", Style::default().fg(Color::Red)),
@@ -16568,6 +17025,7 @@ mod tests {
             )))
         };
         let body = || CardBody {
+            looping: None,
             section: vec![l("running · one"), l("two"), l("three")],
             one: None,
             attn: attn(&["Q", "1 a"], &["note"]),
@@ -16604,6 +17062,7 @@ mod tests {
         // No item: the section's later rows give way to the git line, its last one shown
         // ending in `…`.
         let plain = || CardBody {
+            looping: None,
             section: vec![
                 l("done ✓ · one"),
                 l("two"),
@@ -17077,14 +17536,17 @@ mod tests {
             .last()
             .unwrap()
             .contains("↑↓ pick · Tab complete · Enter run · Esc close"));
-        // The selected row is highlighted.
+        // The selected row is highlighted: its command a fill of the labels' cyan, black on it.
         let buf = crate::app::tests::draw(&mut st, 120, 30);
-        assert!(buf[(pop.x + 1, pop.y)]
-            .modifier
-            .contains(Modifier::REVERSED));
-        assert!(!buf[(pop.x + 1, pop.y + 1)]
-            .modifier
-            .contains(Modifier::REVERSED));
+        let lit = |c: &ratatui::buffer::Cell| (c.fg, c.bg);
+        assert_eq!(
+            lit(&buf[(pop.x + 1, pop.y)]),
+            (Color::Indexed(16), Color::Indexed(80))
+        );
+        assert_eq!(
+            lit(&buf[(pop.x + 1, pop.y + 1)]),
+            (crate::color::LABEL, Color::Reset)
+        );
         // Arguments: the threads with their status and mode.
         st.view.input.set("/open ");
         let s = screen(&draw_panes(&mut st, 120, 30));
@@ -17690,7 +18152,7 @@ mod tests {
 
     /// The orchestrator's conversation ([`crate::app::tests::orch_conversation`]) with a
     /// message the user took back after its replies (`stop that`).
-    fn with_taken_back() -> AppState {
+    pub(super) fn with_taken_back() -> AppState {
         use crate::app::tests::{
             orch_conversation, thread_item, with_orch, without_worker_requests,
         };
@@ -17725,10 +18187,9 @@ mod tests {
         st
     }
 
-    /// With 16 colors a message's band reads, taken back or not: the band, a taken-back
-    /// message's dimmed text and every message's mark all come down to dark grey, and the text
-    /// and the mark take a light grey on it; a message's own text stays white, brighter than a
-    /// taken-back one's.
+    /// With 16 colors a message's band reads, taken back or not: the band is blue (no dark grey
+    /// carries light text at 4.5:1), every message's mark and a taken-back message's dimmed
+    /// text light grey on it, and a message's own text white, brighter than a taken-back one's.
     #[test]
     fn sixteen_colors_keep_a_messages_text_and_mark_on_its_band() {
         let mut st = with_taken_back();
@@ -17741,7 +18202,7 @@ mod tests {
         let back = find_text(&buf, area, "❯ stop that").expect(&s);
         for (row, text) in [(sent, Color::White), (back, Color::Gray)] {
             let cell = |x: u16| &buf[(x, row.y)];
-            assert_eq!(cell(row.x).bg, Color::DarkGray, "the band: {s}");
+            assert_eq!(cell(row.x).bg, Color::Blue, "the band: {s}");
             assert_eq!(cell(row.x).fg, Color::Gray, "the mark: {s}");
             assert_eq!(cell(row.x + 2).fg, text, "the text: {s}");
             for x in row.x..area.right() {
@@ -17756,7 +18217,8 @@ mod tests {
     /// No cell of a frame drawn in 16 colors has its text in its fill's color where full color
     /// drew them apart, in the usual views: the cards with a dive and a selection, the
     /// orchestrator's conversation with a taken-back message (wide, and narrow with the cards
-    /// in a row above), the grid, the compact screens.
+    /// in a row above), the grid, the compact screens. (A cell in the terminal's own colors,
+    /// such as the working icon, reads whatever they are.)
     #[test]
     fn sixteen_colors_never_hide_a_cells_text_in_the_usual_views() {
         use crate::app::tests::draw_at;
@@ -17771,7 +18233,7 @@ mod tests {
             let s = screen(&buffer_lines(&basic));
             for (i, (f, b)) in full.content.iter().zip(&basic.content).enumerate() {
                 assert_eq!(f.symbol(), b.symbol(), "{what}: the same frame: {s}");
-                if f.fg != f.bg {
+                if f.fg != f.bg && (b.fg, b.bg) != (Color::Reset, Color::Reset) {
                     let (x, y) = (i as u16 % w, i as u16 / w);
                     assert_ne!(
                         b.fg, b.bg,
@@ -19462,3 +19924,14 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "loops_ui_tests.rs"]
+mod loops_ui_tests;
+
+#[cfg(test)]
+#[path = "loops_color_tests.rs"]
+mod loops_color_tests;
+#[cfg(test)]
+#[path = "loops_impl_tests.rs"]
+mod loops_impl_tests;

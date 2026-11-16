@@ -112,6 +112,7 @@ export function FieldInput({
         <input
           id={id}
           type="checkbox"
+          role={field.switch ? "switch" : undefined}
           checked={!!value}
           onChange={(e) => onChange(e.target.checked)}
         />

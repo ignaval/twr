@@ -24,6 +24,12 @@ pub const PHRASE_MAX: usize = 80;
 /// `context.compacted`).
 pub const COMPACTING: &str = "compacting context…";
 
+/// What a thread stopped with its remote box's runner shows
+/// ([`ThreadView::box_stopped`]): the runner was stopped, its agent ended cleanly with it,
+/// and the next message resumes the session once the box is back.
+pub const BOX_STOPPED: &str =
+    "stopped with its box's runner: the next message resumes it once the box is back";
+
 /// What `v` is doing, from its status alone: what a client shows before the hub said more.
 pub fn fallback(v: &ThreadView) -> &'static str {
     match v.status() {
@@ -34,6 +40,7 @@ pub fn fallback(v: &ThreadView) -> &'static str {
         ThreadStatus::Running => "working",
         ThreadStatus::Error if v.crashed => "crashed",
         ThreadStatus::Error => "failed",
+        ThreadStatus::Done if v.box_stopped => BOX_STOPPED,
         ThreadStatus::Done if v.stopped => "stopped",
         ThreadStatus::Done => "done",
         ThreadStatus::Idle if v.turns == 0 => "not started",

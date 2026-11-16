@@ -2359,7 +2359,13 @@ impl Core {
         }
         // An offer to compact its context before its messages go (`hub::idle_compact`).
         self.stage_idle_offer_close(&mut batch, id);
+        // Its loop, and its loop's setup card (`hub::loops`).
+        for body in self.loop_closing(id, "deleted") {
+            batch.push(id, None, Source::Hub, body);
+        }
         batch.push(id, None, source, EventBody::ThreadDeleted(deleted));
+        // Its loop's folder on a remote box goes with it (the hub's own stays: the record).
+        self.forget_box_loop(hub, id);
         self.append_batch(hub, batch)?;
         Ok(())
     }

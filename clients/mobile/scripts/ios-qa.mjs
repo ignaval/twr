@@ -20,6 +20,18 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import { qaSource } from "../../scripts/qa-source.mjs";
+import {
+  IOS_ACCEPT_CONFIRM,
+  IOS_TAP,
+  commandChannel,
+  loopFixture,
+  loopQA,
+  loopReadOnlyQA,
+  remoteLoopQA,
+  pairInApp,
+  revokeInApp,
+  surfacesQA,
+} from "./loop-qa.mjs";
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const kind = process.env.TWR_IOS_KIND?.trim() || "all";
 const defaultRuntimes = { phone: "27.0", fold: "27.1", tablet: "27.0" };
@@ -156,6 +168,11 @@ const selected = requestedKinds.map((family) => {
   return { family, template, runtime };
 });
 const bin = resolve("../target/debug");
+// TWR_IOS_LOOP_ONLY=1 runs only the review-loop QA (testReviewLoops pairs the app itself).
+const loopOnly = process.env.TWR_IOS_LOOP_ONLY === "1";
+// TWR_SURFACES_QA_ONLY=1 (with TWR_IOS_LOOP_ONLY=1) runs only the shared surfaces' audit.
+const surfacesOnly = process.env.TWR_SURFACES_QA_ONLY === "1";
+const loopShots = process.env.TWR_LOOP_QA_SHOTS || "test-results/loops";
 const execFileAsync = promisify(execFile);
 mkdirSync("test-results/ios", { recursive: true });
 for (const [
@@ -301,8 +318,13 @@ for (const [
     `default_runtime = "fake"\n[projects.demo]\nrepo = ${JSON.stringify(repo)}\n[orchestrator]\nruntime = "fake"\nautostart = false\n[tui]\nsuggest = false\nsummaries = false\n`,
     { mode: 0o600 },
   );
+  // A fake reviewer and loop templates, for the review-loop QA (loop-qa.mjs).
+  const loops = loopFixture(fixture);
+  const channel = commandChannel();
+  let offline = false;
   const env = {
     ...process.env,
+    ...loops.env,
     TWR_HOME: fixture,
     HOME: fixture,
     TWR_TEST_USER_TOKEN_FILE: token,
@@ -388,14 +410,19 @@ for (const [
     console.log(`Gateway ready after ${Date.now() - started} ms`);
     // Authenticate the fixture owner before Simulator's cold boot overloads ps.
     // Keep this socket open and create a fresh five-minute code after boot.
-    owner = connectTCP({ path: join(fixture, "hub.sock") });
     const replies = new Map();
     let nextID = 0;
-    const lines = createInterface({ input: owner });
-    lines.on("line", (line) => {
-      const response = JSON.parse(line);
-      replies.get(response.id)?.(response);
-    });
+    /** The owner's socket to the hub (again after a hub restart). */
+    const connectOwner = () => {
+      owner?.destroy();
+      owner = connectTCP({ path: join(fixture, "hub.sock") });
+      const lines = createInterface({ input: owner });
+      lines.on("line", (line) => {
+        const response = JSON.parse(line);
+        replies.get(response.id)?.(response);
+      });
+    };
+    connectOwner();
     const ownerCall = (method, params) =>
       new Promise((resolve, reject) => {
         const id = ++nextID;
@@ -411,12 +438,50 @@ for (const [
         });
         owner.write(JSON.stringify({ id, method, params }) + "\n");
       });
-    const hello = await ownerCall("hello", {
-      client: "ios-qa-owner",
-      protocol: clientProtocol,
-      user_token: readFileSync(token, "utf8").trim(),
-    });
-    assert(hello.identity.startsWith("user:"));
+    const greet = async () => {
+      const hello = await ownerCall("hello", {
+        client: "ios-qa-owner",
+        protocol: clientProtocol,
+        user_token: readFileSync(token, "utf8").trim(),
+      });
+      assert(hello.identity.startsWith("user:"));
+    };
+    await greet();
+    const baseConfig = readFileSync(join(fixture, "config.toml"), "utf8");
+    /** Restarts the fixture's hub on its first config plus `extra` (loop-qa.mjs's box and
+     * ACP presets); the owner connects again, and the app reconnects through the gateway. */
+    const restartHub = async (extra = "") => {
+      if (hub.exitCode === null && hub.signalCode === null) {
+        const stopped = new Promise((r) => hub.once("exit", r));
+        hub.kill("SIGTERM");
+        await stopped;
+      }
+      writeFileSync(join(fixture, "config.toml"), baseConfig + extra, {
+        mode: 0o600,
+      });
+      hub = spawn(join(bin, "twr"), ["hub"], {
+        env,
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      hub.stderr.on("data", (chunk) => (hubLog += chunk));
+      const deadline = Date.now() + 60000;
+      for (;;) {
+        try {
+          const info = JSON.parse(
+            execFileSync(join(bin, "twr"), ["info", "--json"], {
+              env,
+              encoding: "utf8",
+              timeout: 5000,
+            }),
+          );
+          if (info.pid === hub.pid) break;
+        } catch {}
+        assert(Date.now() < deadline, "The restarted hub never answered");
+        await delay(200);
+      }
+      connectOwner();
+      await greet();
+    };
     execFileSync("xcrun", ["simctl", "boot", device.udid], { stdio: "ignore" });
     execFileSync("xcrun", ["simctl", "bootstatus", device.udid, "-b"], {
       stdio: "inherit",
@@ -471,6 +536,7 @@ for (const [
     }
 
     server = createServer(async (req, res) => {
+      if (await channel.handle(req, res)) return;
       res.setHeader("content-type", "application/json");
       if (req.url === "/fixture") {
         try {
@@ -593,6 +659,10 @@ for (const [
     });
     await new Promise((r) => server.listen(47423, "127.0.0.1", r));
     proxy = createProxy((socket) => {
+      if (offline) {
+        socket.destroy();
+        return;
+      }
       const upstream = connectTCP(47421, "127.0.0.1");
       for (const current of [socket, upstream]) {
         proxySockets.add(current);
@@ -637,13 +707,136 @@ for (const [
         "-test-timeouts-enabled",
         "YES",
         "-maximum-test-execution-time-allowance",
-        "600",
+        "1800",
+        ...(loopOnly
+          ? ["-only-testing:AppTests/RemoteHubTests/testReviewLoops"]
+          : []),
         "CODE_SIGNING_ALLOWED=YES",
         "CODE_SIGN_IDENTITY=-",
       ],
       { stdio: "inherit" },
     );
-    const exit = await new Promise((r) => test.on("exit", r));
+    const exited = new Promise((r) => test.on("exit", r));
+    // Review loops, on the phone only: the host drives testReviewLoops (loop-qa.mjs).
+    let loopOutcome;
+    if (family === "phone") {
+      channel.enable();
+      const sim = (...args) =>
+        execFileSync("xcrun", ["simctl", ...args], { stdio: "ignore" });
+      const driver = {
+        platform: "ios",
+        evaluate: (source, arg) =>
+          channel.call("js", { source, arg: JSON.stringify(arg ?? null) }),
+        tap: (point) =>
+          channel.call("js", { source: IOS_TAP, arg: JSON.stringify(point) }),
+        shot: (file) => sim("io", device.udid, "screenshot", file),
+        appearance: (mode) => sim("ui", device.udid, "appearance", mode),
+        orientation: (value) => channel.call("orient", { value }),
+        textSize: (size) =>
+          sim(
+            "ui",
+            device.udid,
+            "content_size",
+            size === "largest"
+              ? "accessibility-extra-extra-extra-large"
+              : "large",
+          ),
+        offline(on) {
+          offline = on;
+          if (on) for (const socket of proxySockets) socket.destroy();
+        },
+        owner: ownerCall,
+        // For loops on a remote box and ACP reviewers (loop-qa.mjs `remoteLoopQA`).
+        home: fixture,
+        bin,
+        env,
+        restartHub,
+        async nativeConfirm(click) {
+          await channel.call("js", { source: IOS_ACCEPT_CONFIRM, arg: "null" });
+          await click();
+        },
+      };
+      loopOutcome = Promise.race([
+        channel.started,
+        exited.then(() => {
+          throw new Error("XCTest ended before testReviewLoops ran");
+        }),
+      ])
+        .then(async () => {
+          if (loopOnly) {
+            const { code } = await ownerCall("device.pair_begin", {
+              scopes: ["read", "operate", "admin", "terminal"],
+            });
+            await pairInApp(driver, {
+              url: "http://127.0.0.1:47424",
+              code,
+              name: "iOS loop QA",
+            });
+          }
+          const options = { shots: loopShots, label: "ios" };
+          if (!surfacesOnly) {
+            const report = await loopQA(driver, loops, options);
+            writeFileSync(
+              join(loopShots, "ios-loop-qa.json"),
+              JSON.stringify(report, null, 2),
+            );
+            console.log("PASS: review loops on an iPhone");
+            loops.releaseAll();
+            // Loops on a remote box, and an ACP preset as the reviewer.
+            const remote = await remoteLoopQA(driver, loops, options);
+            writeFileSync(
+              join(loopShots, "ios-remote-loop-qa.json"),
+              JSON.stringify(remote, null, 2),
+            );
+            console.log(
+              "PASS: loops on a remote box and ACP reviewers on an iPhone",
+            );
+          }
+          // The cards, a thread's details, the conversation's header and the composer.
+          await surfacesQA(driver, loops, options);
+          console.log("PASS: the shared surfaces' audit on an iPhone");
+          if (surfacesOnly) {
+            channel.finish();
+            return;
+          }
+          const { code } = await ownerCall("device.pair_begin", {
+            scopes: ["read"],
+          });
+          await revokeInApp(driver);
+          await pairInApp(driver, {
+            url: "http://127.0.0.1:47424",
+            code,
+            name: "iOS read only",
+          });
+          const readOnly = await loopReadOnlyQA(driver, loops, {
+            ...options,
+            step: 60,
+          });
+          writeFileSync(
+            join(loopShots, "ios-loop-qa-read.json"),
+            JSON.stringify(readOnly, null, 2),
+          );
+          console.log("PASS: review loops on a read-only iPhone");
+          channel.finish();
+        })
+        .catch((error) => {
+          channel.finish(String(error.stack || error).slice(0, 4000));
+          throw error;
+        })
+        .finally(() => {
+          loops.releaseAll();
+          offline = false;
+          for (const args of [
+            ["ui", device.udid, "content_size", "large"],
+            ["ui", device.udid, "appearance", "dark"],
+          ])
+            try {
+              sim(...args);
+            } catch {}
+        });
+      loopOutcome.catch(() => {});
+    }
+    const exit = await exited;
     if (!existsSync(screenshot)) {
       console.warn(
         "Friendly PNG export missing; native app snapshots are retained in the XCTest result bundle.",
@@ -669,6 +862,7 @@ for (const [
         }
       }
     }
+    if (loopOutcome) await loopOutcome;
     assert.equal(exit, 0, `${device.name} native integration tests must pass`);
     if (existsSync(performancePath)) {
       const report = JSON.parse(readFileSync(performancePath, "utf8"));

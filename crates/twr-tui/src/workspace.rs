@@ -859,6 +859,11 @@ impl AppState {
     /// TUI an agent runs, changes nothing and says why.
     fn change_setting(&mut self, key: crate::settings::Key, forward: bool) -> Vec<Action> {
         use crate::settings::{Change, Key};
+        // The Loops row opens the loop settings editor over the settings (read-only in a TUI
+        // an agent runs).
+        if key == Key::Loops {
+            return self.open_loop_settings(None, false);
+        }
         if let Some(agent) = &self.agent {
             self.view.status = Some(format!("this TUI runs for {agent}: it changes no setting"));
             return Vec::new();

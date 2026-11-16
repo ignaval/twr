@@ -41,6 +41,8 @@ Restart the hub, so runtimes started from then on get them. This was checked wit
 
 ## A review loop
 
+twr has review loops built in: `twr loop review api` has another model review api's work round after round, while api verifies each finding against the code and fixes or dismisses it, until the reviewer has nothing new, and writes a report ([usage.md](usage.md#loops)). The reviewer runs read-only, its findings reach the thread as data rather than as your prompt, and the hub keeps the ledger of dismissed findings and decides when the loop has converged. Use it unless you want a loop of your own design. The rest of this section builds one by hand, for those who do.
+
 A second agent that reviews each change before you look at it catches a lot, and twr has the pieces to run one without watching it: [`twr send --after`](usage.md#send-a-prompt-after-another-thread-finishes) to hand work from one thread to the next when it finishes, [jobs](usage.md#jobs) for the tests, and [`twr wait`](usage.md#wait-for-threads) to know when a step is over. Which model reviews, how many rounds and what the reviewer looks for is yours to choose.
 
 A worker that writes the code, and a reviewer on another runtime that works in the repository checkout and only reads:

@@ -24,4 +24,3 @@ Closes #
 ## Sign-off
 
 - [ ] Every commit is signed off (`git commit -s`), certifying the [Developer Certificate of Origin](https://developercertificate.org)
-- [ ] I reviewed and understand every line of this change, including any an agent wrote

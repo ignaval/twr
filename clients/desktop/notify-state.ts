@@ -1,4 +1,8 @@
-import type { AttentionSummary, AttentionSummaryItem } from "../shared/types";
+import type {
+  AttentionSummary,
+  AttentionSummaryItem,
+  LoopEndSummary,
+} from "../shared/types";
 
 /* What the desktop notifies, decided without Electron so it is tested on its own
  * (desktop/notifier.ts posts what these return). docs/notifications.md › The desktop app. */
@@ -65,6 +69,77 @@ export class AttentionWatch {
   }
 }
 
+/** One loop's end: its thread and id, in its workspace. */
+export const loopKey = (
+  end: Pick<LoopEndSummary, "workspace" | "thread" | "id">,
+) => JSON.stringify(["loop", end.workspace, end.thread, end.id]);
+
+/**
+ * Tells which loop ends of each summary are news, as {@link AttentionWatch} does requests: a
+ * loop's end is news once, the first summary to list it from a workspace whose stream is the
+ * one of the summary before, while the user is not looking at the window. What a workspace
+ * lists when its stream starts (the threads' last loops, ended before) is known.
+ */
+export class LoopWatch {
+  private streams = new Map<string, string>();
+  private seen = new Set<string>();
+  observe(summary: AttentionSummary, attended: boolean): LoopEndSummary[] {
+    const continuing = new Set<string>();
+    const streams = new Map<string, string>();
+    for (const workspace of summary.workspaces)
+      if (workspace.stream) {
+        streams.set(workspace.name, workspace.stream);
+        if (this.streams.get(workspace.name) === workspace.stream)
+          continuing.add(workspace.name);
+      }
+    this.streams = streams;
+    const news: LoopEndSummary[] = [];
+    for (const end of summary.loops || []) {
+      const key = loopKey(end);
+      if (this.seen.has(key)) continue;
+      this.seen.add(key);
+      if (this.seen.size > SEEN_LIMIT)
+        this.seen.delete(this.seen.values().next().value!);
+      if (continuing.has(end.workspace) && !attended) news.push(end);
+    }
+    return news;
+  }
+}
+
+/**
+ * The notifications for loops that ended: one each, with how it ended (`Review loop clean
+ * after 6 rounds`; an implementation loop's commits, then `not committed: …` for any
+ * repository that was not), or one for all of
+ * them past {@link BURST_MAX}. Their keys are the loops', which no answer removes: they go
+ * when clicked or when the window comes to the front.
+ */
+export function loopNotices(ends: LoopEndSummary[]): Notice[] {
+  if (ends.length > BURST_MAX) {
+    const workspaces = [...new Set(ends.map((end) => end.workspace))];
+    return [
+      {
+        title: `${ends.length} loops ended`,
+        body: list(ends.slice(0, 6).map((end) => plain(end.title, 40))),
+        keys: ends.map(loopKey),
+        target: workspaces.length === 1 ? { workspace: workspaces[0] } : {},
+      },
+    ];
+  }
+  return ends.map((end) => {
+    const words = plain(end.words, 160);
+    return {
+      title: `${plain(end.title, 80)} · ${plain(end.workspace, 40)}`,
+      body: words.charAt(0).toUpperCase() + words.slice(1),
+      keys: [loopKey(end)],
+      target: { workspace: end.workspace, thread: end.thread },
+    };
+  });
+}
+
+/** Whether a notification's keys are loop ends ({@link loopKey}): no answer removes them. */
+export const isLoopNotice = (keys: string[]) =>
+  keys.length > 0 && keys.every((key) => key.startsWith('["loop",'));
+
 /** Requests held for {@link BURST_MS} after the first, so that a burst goes out as one. */
 export class Burst {
   private items: AttentionSummaryItem[] = [];
@@ -117,13 +192,17 @@ const plain = (text: string, max = 120) => {
 export const kind = (item: Pick<AttentionSummaryItem, "reason" | "card">) =>
   item.card === "delete"
     ? "Asks you to confirm a deletion"
-    : item.card === "confirm"
-      ? "Asks you to confirm what the orchestrator proposed"
-      : item.reason === "permission"
-        ? "Asks for permission"
-        : item.reason === "question"
-          ? "Has a question for you"
-          : "Needs you";
+    : item.card === "loop_setup"
+      ? "Asks you to choose a loop's settings"
+      : item.card === "loop_stuck"
+        ? "Has a loop that is stuck"
+        : item.card === "confirm"
+          ? "Asks you to confirm what the orchestrator proposed"
+          : item.reason === "permission"
+            ? "Asks for permission"
+            : item.reason === "question"
+              ? "Has a question for you"
+              : "Needs you";
 
 const list = (words: string[]) =>
   words.length <= 1

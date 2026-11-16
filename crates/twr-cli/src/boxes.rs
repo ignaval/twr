@@ -1192,7 +1192,7 @@ async fn add(
         ),
     }
     if probe.os == "Darwin" {
-        for l in mac_needs(name, &hub.version) {
+        for l in mac_needs(name, &hub.version, same) {
             outln!("{l}");
         }
     }
@@ -1283,32 +1283,35 @@ fn reach_lines(name: &str, link: &BoxLink) -> Vec<String> {
 
 /// What `twr box add` says a Mac (box `name`) needs, the hub running twr `version`: someone
 /// logged in at its screen (the box daemon runs in that GUI session, where Claude Code can
-/// read its keychain login), a twr build of the hub's commit for macOS, and the agents logged
-/// in at the Mac itself.
-fn mac_needs(name: &str, version: &str) -> Vec<String> {
+/// read its keychain login), a twr build of the hub's commit for macOS unless the hub installs
+/// its own (`same`: the Mac has the hub's OS and CPU), and the agents logged in at the Mac
+/// itself.
+fn mac_needs(name: &str, version: &str, same: bool) -> Vec<String> {
     let build = match dev_commit(version) {
-        Some(commit) => format!(
+        _ if same => None,
+        Some(commit) => Some(format!(
             "  - a twr build of the hub's commit ({commit}) for macOS: the hub runs a development \
              build, so build it on the Mac (docs/tools/dev-install.sh in a checkout of that \
              commit), then `twr box install {name} --from-box <its absolute path on the Mac>`;"
-        ),
-        None => format!(
+        )),
+        None => Some(format!(
             "  - a twr build for macOS: `twr box install {name}` downloads release v{version}'s \
              for the Mac and installs it there;"
-        ),
+        )),
     };
-    vec![
+    let mut needs = vec![
         "- The box is a Mac. It needs:".to_string(),
         "  - someone logged in at the Mac's screen: the box daemon runs as a launchd job in \
          that GUI session, where Claude Code can read its keychain login (from ssh alone it \
          can't). Turn on automatic login if the Mac may restart with no one there;"
             .to_string(),
-        build,
-        format!(
-            "  - its agents logged in at the Mac itself (Claude Code keeps its login in the \
-             keychain); `twr box doctor {name}` checks all of this once the box is added."
-        ),
-    ]
+    ];
+    needs.extend(build);
+    needs.push(format!(
+        "  - its agents logged in at the Mac itself (Claude Code keeps its login in the \
+         keychain); `twr box doctor {name}` checks all of this once the box is added."
+    ));
+    needs
 }
 
 /// What `twr box add` says of the projects configured for box `name` (`[projects.<p>] box`):
@@ -2138,10 +2141,10 @@ fn restart_says(name: &str, drained: bool) -> String {
         )
     } else {
         format!(
-            "This stops box {name}'s daemon and the agents it runs, and starts a new one. Its \
-             threads' runtimes end as when a box's runner restarts: each such thread shows a \
-             crash, a turn running then is cut short, and the thread's next prompt resumes its \
-             session."
+            "This stops box {name}'s daemon and the agents it runs, and starts a new one. The \
+             daemon stops its agents as it stops: each such thread shows it stopped with its \
+             box's runner (no crash), a turn running then is cut short, and the thread's next \
+             prompt resumes its session."
         )
     }
 }
@@ -3461,19 +3464,41 @@ mod tests {
         assert!(!stop.contains('\n'), "one line to paste: {stop}");
         assert!(stop.contains(" -o ClearAllForwardings=yes "), "{stop}");
         assert!(stop.contains(" me@host -a -x -k -- "), "{stop}");
-        // The remote script, run here: the data directory as the probe finds it.
+        // The remote script, run here: the data directory as the probe finds it, and the
+        // build named when the box has it.
         let script = ssh_box::stop_script("0123456789abcdef", "gpu", "ab").unwrap();
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script.replace("exec ", "printf '%s\\n' "))
-            .env("HOME", "/home/u")
-            .env_remove("XDG_DATA_HOME")
-            .output()
-            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let builds = home.path().join(".local/share/twr/runner/builds");
+        let build = |id: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(builds.join(id)).unwrap();
+            let f = builds.join(id).join("twr");
+            std::fs::write(&f, "").unwrap();
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let run = || {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script.replace("exec ", "printf '%s\\n' "))
+                .env("HOME", home.path())
+                .env_remove("XDG_DATA_HOME")
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let words = "\nrunner\n--stdio\n--box=gpu\n--hub-key\nab\n--stop\n";
+        // A box with only another build (twr was rebuilt on the hub's machine since the box
+        // got its build): that build stops the daemon, which `--stop` finds by hub key and
+        // box. (The named one printed before, and the command failed: not there.)
+        build("fedcba9876543210");
         assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            "/home/u/.local/share/twr/runner/builds/0123456789abcdef/twr\nrunner\n--stdio\n\
-             --box=gpu\n--hub-key\nab\n--stop\n"
+            run(),
+            format!("{}{words}", builds.join("fedcba9876543210/twr").display())
+        );
+        build("0123456789abcdef");
+        assert_eq!(
+            run(),
+            format!("{}{words}", builds.join("0123456789abcdef/twr").display())
         );
         // Words that would forward something are refused here too, and a build that is no
         // build id (what the hub or the files said) or a name that is no box name.
@@ -3792,12 +3817,16 @@ mod tests {
         assert!(!status_text(&none, false, &hub).contains("drain:"));
     }
 
-    /// `twr box restart` says the restart is clean during a drain, and crashes the agents'
-    /// threads otherwise.
+    /// `twr box restart` says the restart stops the agents cleanly, during a drain (for the
+    /// upgrade) or not (with the old daemon).
     #[test]
-    fn a_restart_during_a_drain_says_it_stops_cleanly() {
+    fn a_restart_says_it_stops_cleanly() {
         assert!(restart_says("gpu", true).contains("no crash"));
-        assert!(restart_says("gpu", false).contains("shows a crash"));
+        let plain = restart_says("gpu", false);
+        assert!(
+            plain.contains("stopped with its box's runner (no crash)"),
+            "{plain}"
+        );
     }
 
     /// A restart is over once the box is online on a newer connection with none pending.
@@ -3858,7 +3887,7 @@ mod tests {
     /// What `twr box add` says a Mac needs, for a release hub and a development one.
     #[test]
     fn a_mac_box_is_told_what_it_needs() {
-        let release = mac_needs("mac", "0.2.0").join("\n");
+        let release = mac_needs("mac", "0.2.0", false).join("\n");
         assert!(
             release.contains("logged in at the Mac's screen"),
             "{release}"
@@ -3869,10 +3898,17 @@ mod tests {
             "{release}"
         );
         assert!(release.contains("logged in at the Mac itself"), "{release}");
-        let dev = mac_needs("mac", "0.2.0+dev.abc1234").join("\n");
+        let dev = mac_needs("mac", "0.2.0+dev.abc1234", false).join("\n");
         assert!(dev.contains("docs/tools/dev-install.sh"), "{dev}");
         assert!(dev.contains("`twr box install mac --from-box "), "{dev}");
         assert!(dev.contains("(abc1234)"), "{dev}");
+        // A Mac of the hub's own OS and CPU gets the hub's build: nothing to install there.
+        for version in ["0.2.0", "0.2.0+dev.abc1234"] {
+            let same = mac_needs("mac", version, true).join("\n");
+            assert!(!same.contains("twr box install"), "{same}");
+            assert!(same.contains("logged in at the Mac's screen"), "{same}");
+            assert!(same.contains("logged in at the Mac itself"), "{same}");
+        }
     }
 
     /// `--from-box` takes an absolute path of the box's, and warns about one under this

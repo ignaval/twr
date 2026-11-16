@@ -23,6 +23,16 @@ import { captureMobileUI } from "./ui-captures.mjs";
 import { multiHubQA } from "./multi-hub-qa.mjs";
 import { systemPickerQA } from "./system-picker-qa.mjs";
 import { shellAction } from "./native-actions.mjs";
+import {
+  adbTap,
+  loopFixture,
+  loopQA,
+  loopReadOnlyQA,
+  remoteLoopQA,
+  surfacesQA,
+} from "./loop-qa.mjs";
+// TWR_SURFACES_QA_ONLY=1 skips the review-loop QA and runs only the shared surfaces' audit.
+const surfacesOnly = process.env.TWR_SURFACES_QA_ONLY === "1";
 const adb =
   process.env.TWR_ADB ||
   join(process.env.HOME, "Library/Android/sdk/platform-tools/adb");
@@ -70,8 +80,12 @@ writeFileSync(
   `default_runtime = "fake"\n[projects.demo]\nrepo = ${JSON.stringify(repo)}\n[projects.plain]\nrepo = ${JSON.stringify(plain)}\n[orchestrator]\nruntime = "fake"\nautostart = false\n[tui]\nsuggest = false\nsummaries = false\n`,
   { mode: 0o600 },
 );
+// A fake reviewer and loop templates, for the review-loop QA (loop-qa.mjs).
+const loops = loopFixture(fixture);
+const loopShots = process.env.TWR_LOOP_QA_SHOTS || "test-results/loops";
 const env = {
   ...process.env,
+  ...loops.env,
   TWR_HOME: fixture,
   HOME: fixture,
   TWR_TEST_USER_TOKEN_FILE: token,
@@ -91,6 +105,8 @@ const gatewayPort = 47325;
 let proxy;
 let downstreamRate = 0;
 let dropDownstream = false;
+/** No route to the gateway: open sockets close and new ones are refused. */
+let offline = false;
 let legacyHealth = false;
 let legacyHealthReplies = 0;
 const proxySockets = new Set();
@@ -118,6 +134,147 @@ async function nativeConfirm() {
     String(Math.round((bounds[1] + bounds[3]) / 2)),
   ]);
   adbRun(["shell", "rm", "-f", xmlPath]);
+}
+/** The review-loop QA's view of this phone (loop-qa.mjs). */
+function loopDriver() {
+  return {
+    platform: "android",
+    evaluate: (source, arg) =>
+      page.evaluate(`(${source})(${JSON.stringify(arg)})`),
+    tap: (point) => adbTap(page, adbRun, point),
+    shot(file) {
+      const bytes = execFileSync(adb, [
+        ...adbPrefix,
+        "-s",
+        transportSerial,
+        "exec-out",
+        "screencap",
+        "-p",
+      ]);
+      const start = bytes.indexOf(Buffer.from([137, 80, 78, 71]));
+      assert(start >= 0, "screencap must contain a PNG image");
+      writeFileSync(file, bytes.subarray(start));
+    },
+    appearance: (mode) =>
+      adbRun([
+        "shell",
+        "cmd",
+        "uimode",
+        "night",
+        mode === "dark" ? "yes" : "no",
+      ]),
+    orientation(value) {
+      adbRun([
+        "shell",
+        "settings",
+        "put",
+        "system",
+        "accelerometer_rotation",
+        "0",
+      ]);
+      adbRun([
+        "shell",
+        "settings",
+        "put",
+        "system",
+        "user_rotation",
+        value === "landscape" ? "1" : "0",
+      ]);
+    },
+    textSize: (size) =>
+      adbRun([
+        "shell",
+        "settings",
+        "put",
+        "system",
+        "font_scale",
+        size === "largest" ? "2.0" : "1",
+      ]),
+    /** The screen narrowed to `points` wide (a 360-point phone), or its own size (null). */
+    width(points) {
+      if (!points) {
+        adbRun(["shell", "wm", "size", "reset"]);
+        return;
+      }
+      const density = Number(
+        adbRun(["shell", "wm", "density"]).match(/(\d+)\s*$/m)[1],
+      );
+      const physical = adbRun(["shell", "wm", "size"])
+        .match(/Physical size: (\d+)x(\d+)/)
+        .slice(1)
+        .map(Number);
+      const [, height] = [Math.min(...physical), Math.max(...physical)];
+      adbRun([
+        "shell",
+        "wm",
+        "size",
+        `${Math.round((points * density) / 160)}x${height}`,
+      ]);
+    },
+    offline(on) {
+      offline = on;
+      if (on) for (const socket of proxySockets) socket.destroy();
+    },
+    owner: ownerCall,
+    // For loops on a remote box and ACP reviewers (loop-qa.mjs `remoteLoopQA`): the hub's
+    // home, binaries and environment, and a restart on its config plus more.
+    home: fixture,
+    bin,
+    env,
+    restartHub: restartFixtureHub,
+  };
+}
+let baseConfig;
+/** Restarts the fixture's hub on its first config plus `extra`; the app reconnects
+ * through the gateway, as after any hub restart. */
+async function restartFixtureHub(extra = "") {
+  baseConfig ??= readFileSync(join(fixture, "config.toml"), "utf8");
+  if (fixtureHub.exitCode === null && fixtureHub.signalCode === null) {
+    const stopped = new Promise((resolve) => fixtureHub.once("exit", resolve));
+    fixtureHub.kill("SIGTERM");
+    await stopped;
+  }
+  writeFileSync(join(fixture, "config.toml"), baseConfig + extra, {
+    mode: 0o600,
+  });
+  const oldPid = hubPid;
+  fixtureHub = spawn(join(bin, "twr"), ["hub"], {
+    env,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  fixtureHub.stderr.on("data", (chunk) => (stderr += chunk));
+  await expect
+    .poll(
+      () => {
+        try {
+          return JSON.parse(
+            execFileSync(join(bin, "twr"), ["info", "--json"], {
+              env,
+              encoding: "utf8",
+              timeout: 5000,
+            }),
+          ).pid;
+        } catch {
+          return oldPid;
+        }
+      },
+      { timeout: 30000 },
+    )
+    .toBe(fixtureHub.pid);
+  hubPid = fixtureHub.pid;
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async () => {
+          try {
+            return (await window.twr.rpc("hub.info")).pid;
+          } catch {
+            return 0;
+          }
+        }),
+      { timeout: 60000 },
+    )
+    .toBe(hubPid);
 }
 async function ownerCall(method, params) {
   const child = spawn(join(bin, "twr-desktop-bridge"), ["default"], {
@@ -249,6 +406,10 @@ try {
     upstream.pipe(throttle).pipe(socket);
   };
   proxy = createServer((socket) => {
+    if (offline) {
+      socket.destroy();
+      return;
+    }
     if (!legacyHealth) {
       forwardSocket(socket);
       return;
@@ -1717,6 +1878,45 @@ try {
       "PASS: native pairing remains compatible with a legacy gateway health response",
     );
 
+    // Review loops on an operate device, then (below) on a read device.
+    try {
+      if (!surfacesOnly) {
+        const report = await loopQA(loopDriver(), loops, {
+          shots: loopShots,
+          label: "android",
+        });
+        writeFileSync(
+          join(loopShots, "android-loop-qa.json"),
+          JSON.stringify(report, null, 2),
+        );
+        console.log("PASS: review loops on an Android phone");
+        loops.releaseAll();
+        // Loops on a remote box, and an ACP preset as the reviewer.
+        const remote = await remoteLoopQA(loopDriver(), loops, {
+          shots: loopShots,
+          label: "android",
+        });
+        writeFileSync(
+          join(loopShots, "android-remote-loop-qa.json"),
+          JSON.stringify(remote, null, 2),
+        );
+        console.log(
+          "PASS: loops on a remote box and ACP reviewers on an Android phone",
+        );
+      }
+      // The cards, a thread's details, the conversation's header and the composer.
+      await surfacesQA(loopDriver(), loops, {
+        shots: loopShots,
+        label: "android",
+      });
+      console.log("PASS: the shared surfaces' audit on an Android phone");
+    } finally {
+      loops.releaseAll();
+      offline = false;
+      adbRun(["shell", "settings", "put", "system", "font_scale", "1"]);
+      adbRun(["shell", "settings", "put", "system", "user_rotation", "0"]);
+      adbRun(["shell", "wm", "size", "reset"]);
+    }
     const readOnlyCode = (
       await ownerCall("device.pair_begin", { scopes: ["read"] })
     ).code;
@@ -1777,6 +1977,22 @@ try {
     console.log(
       "PASS: read-only grants disable hub mutations and retain local appearance controls",
     );
+    if (!surfacesOnly)
+      try {
+        const report = await loopReadOnlyQA(loopDriver(), loops, {
+          shots: loopShots,
+          label: "android",
+          step: 60,
+        });
+        writeFileSync(
+          join(loopShots, "android-loop-qa-read.json"),
+          JSON.stringify(report, null, 2),
+        );
+      } finally {
+        loops.releaseAll();
+      }
+    if (!surfacesOnly)
+      console.log("PASS: review loops on a read-only Android device");
     const stopped = new Promise((resolve) => fixtureHub.once("exit", resolve));
     fixtureHub.kill("SIGTERM");
     await stopped;
