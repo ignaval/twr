@@ -84,11 +84,30 @@ impl Env {
         let _ = std::fs::remove_file(self.reviewers().join(format!("hold.{n}")));
     }
 
+    /// Waits until the `n`th run is held (it wrote `pid.<n>`, as `loops.rs`'s `held_pids`).
+    async fn held(&self, n: usize) {
+        let pid = self.reviewers().join(format!("pid.{n}"));
+        timeout(WAIT, async {
+            while !pid.is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the held run");
+    }
+
     fn runs(&self) -> usize {
-        std::fs::read_to_string(self.reviewers().join("count"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+        // (The `run.<n>` directories the runs claimed.)
+        std::fs::read_dir(self.reviewers())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("run."))
+            })
+            .count()
     }
 
     /// What the `n`th review run read on its standard input (its prompt).
@@ -174,14 +193,13 @@ fn user() -> Caller {
     Caller::user("test")
 }
 
-/// A fake reviewer CLI, as `loops.rs` has it: run `n` writes its argv, environment, stdin and
-/// working directory; `hold.<n>` holds it; it answers `answers/<n>.json`, else no findings.
+/// A fake reviewer CLI, as `loops.rs` has it: run `n` (its `run.<n>` directory) writes its argv,
+/// environment, stdin and working directory; `hold.<n>` holds it; it answers
+/// `answers/<n>.json`, else no findings.
 const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
-until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
-n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$here/count"
-rmdir "$here/count.lock"
+n=1
+until mkdir "$here/run.$n" 2>/dev/null; do n=$((n + 1)); done
 : > "$here/argv.$n"
 for a in "$@"; do printf '%s\n' "$a" >> "$here/argv.$n"; done
 pwd > "$here/cwd.$n"
@@ -578,6 +596,55 @@ async fn ended(hub: &Hub, t: &str) -> twr_core::reduce::LastLoop {
             .is_ok_and(|v| v.r#loop.is_none() && v.last_loop.is_some())
     })
     .await;
+    hub.thread_view(t).unwrap().last_loop.unwrap()
+}
+
+/// [`ended`], for a test that runs several cases: one that waits in vain names its case
+/// `case` and shows the loop, the thread's events and the fake reviewers' files.
+async fn ended_or_dump(env: &Env, hub: &Hub, t: &str, case: &str) -> twr_core::reduce::LastLoop {
+    let done = |h: &Hub| {
+        h.thread_view(t)
+            .is_ok_and(|v| v.r#loop.is_none() && v.last_loop.is_some())
+    };
+    let waited = timeout(WAIT, async {
+        while !done(hub) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if waited.is_err() {
+        let mut files: Vec<String> = std::fs::read_dir(env.reviewers())
+            .map(|d| {
+                d.flatten()
+                    .map(|e| {
+                        let p = e.path();
+                        let fake = ["codex", "claude", "grok"].iter().any(|b| p.ends_with(b));
+                        let text = if p.is_file() && !fake {
+                            std::fs::read_to_string(&p).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let text: String = text.chars().take(200).collect();
+                        format!("{}: {}", e.file_name().to_string_lossy(), text.trim())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort();
+        panic!(
+            "case {case:?}: waited for the loop's end in vain\n\
+             loop: {}\n\
+             reviewer files:\n{}\n\
+             events: {}",
+            hub.loop_get(LoopGet {
+                thread: Some(t.into()),
+                id: None,
+            })
+            .map_or_else(|e| format!("{e:?}"), |g| g.to_string()),
+            files.join("\n"),
+            serde_json::to_string(&events(hub, t)).unwrap_or_default(),
+        );
+    }
     hub.thread_view(t).unwrap().last_loop.unwrap()
 }
 
@@ -1588,6 +1655,8 @@ async fn implementation_loops_go_on_after_a_restart() {
                     .is_ok_and(|v| v.background_tasks.keys().any(|k| k.starts_with("loop:")))
             })
             .await;
+            // The run itself in flight, not only its task: the shutdown kills it there.
+            env.held(1).await;
             assert_eq!(
                 hub.thread_view(&t)
                     .unwrap()
@@ -1608,7 +1677,7 @@ async fn implementation_loops_go_on_after_a_restart() {
         drop(hub);
         env.release_run(1);
         let hub = env.hub().await;
-        let last = ended(&hub, &t).await;
+        let last = ended_or_dump(&env, &hub, &t, key).await;
         assert_eq!(last.outcome, Outcome::Clean, "{key}");
         assert!(
             last.commits.len() == 1 && last.commit_problem.is_none(),

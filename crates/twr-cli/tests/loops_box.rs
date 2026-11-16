@@ -26,15 +26,13 @@ const NO_AGENTS: &str = r#"[{"runtime": "codex", "found": false, "login": "unkno
     {"runtime": "claude-code", "found": false, "login": "unknown"},
     {"runtime": "grok-build", "found": false, "login": "unknown"}]"#;
 
-/// A fake `codex exec` on the box: run `n` (`count`) answers one finding on the first run and
-/// none after, to its `-o` file; with `hold.<n>` it starts a child and waits until the file
-/// goes (its pid in `pid.<n>`, the child's in `child.<n>`).
+/// A fake `codex exec` on the box: run `n` (its `run.<n>` directory) answers one finding on the
+/// first run and none after, to its `-o` file; with `hold.<n>` it starts a child and waits
+/// until the file goes (its pid in `pid.<n>`, the child's in `child.<n>`).
 const FAKE_CODEX: &str = r#"#!/bin/sh
 here=$(dirname "$0")
-until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
-n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$here/count"
-rmdir "$here/count.lock"
+n=1
+until mkdir "$here/run.$n" 2>/dev/null; do n=$((n + 1)); done
 pwd > "$here/cwd.$n"
 cat > "$here/stdin.$n"
 if [ -f "$here/hold.$n" ]; then
@@ -219,10 +217,17 @@ impl Env {
     }
 
     fn runs(&self) -> usize {
-        std::fs::read_to_string(self.root.join("reviewers").join("count"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+        // (The `run.<n>` directories the runs claimed.)
+        std::fs::read_dir(self.root.join("reviewers"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("run."))
+            })
+            .count()
     }
 
     fn pid(&self, name: &str) -> i32 {
