@@ -32,6 +32,17 @@ on:
         description: Produce release assets and update metadata
         type: boolean
         default: false
+    secrets:
+      CSC_LINK:
+        required: true
+      CSC_KEY_PASSWORD:
+        required: true
+      APPLE_ID:
+        required: true
+      APPLE_APP_SPECIFIC_PASSWORD:
+        required: true
+      APPLE_TEAM_ID:
+        required: true
 
 permissions:
   contents: read
@@ -51,10 +62,25 @@ jobs:
     # main only), so pull requests and branch pushes can never read them.
     environment: ${{ inputs.release && 'release' || '' }}
     env:
-      # Developer ID signing and notarization run only for releases, and only
-      # when the release environment has the Apple credentials (docs/desktop.md).
-      MAC_SIGNED_RELEASE: ${{ inputs.release && secrets.CSC_LINK != '' && secrets.APPLE_TEAM_ID != '' }}
+      # A release must sign and notarize; missing credentials fail the preflight
+      # below instead of silently selecting the ad hoc review build.
+      MAC_SIGNED_RELEASE: ${{ inputs.release == true }}
     steps:
+      - name: Require Apple credentials for a release
+        if: inputs.release
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::missing $name in the release environment; refusing an ad hoc release"
+              exit 1
+            fi
+          done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
@@ -176,20 +202,13 @@ jobs:
         with:
           name: twr-desktop-macos-arm64
           path: clients/release/*.dmg
-      # Self-update metadata is published only for Developer ID builds: macOS
-      # refuses to swap in an update whose signature differs from the app's.
-      - name: Note an unsigned release
-        if: inputs.release && env.MAC_SIGNED_RELEASE != 'true'
-        run: echo "::warning::the release environment has no Developer ID credentials; this release ships the ad hoc Mac disk image without self-update metadata"
+      # Every release includes the signed app and its self-update metadata.
       - name: Stage macOS release assets
         if: inputs.release
         working-directory: clients/release
         run: |
           mkdir upload
-          cp ./*.dmg upload/
-          if [ "$MAC_SIGNED_RELEASE" = true ]; then
-            cp ./*-mac.zip ./*.blockmap latest-mac.yml upload/
-          fi
+          cp ./*.dmg ./*-mac.zip ./*.blockmap latest-mac.yml upload/
           ls -l upload
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: inputs.release
