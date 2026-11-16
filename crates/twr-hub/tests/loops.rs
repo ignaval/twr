@@ -2722,7 +2722,9 @@ async fn pause_skip_and_the_users_turns() {
     let env = Env::drive();
     {
         let mut b = env.brain.lock().unwrap();
-        b.replies.push(("busy".into(), "!sleep 300\nbusy".into()));
+        // Long enough that the chat and the goal are still queued when the loop is asked for
+        // (checked below), on a slow machine too.
+        b.replies.push(("busy".into(), "!sleep 4000\nbusy".into()));
         b.replies.push(("chat".into(), "Just chatting.".into()));
         b.replies.push(("here is the goal".into(), goal_reply()));
     }
@@ -2747,10 +2749,17 @@ async fn pause_skip_and_the_users_turns() {
     )
     .unwrap();
     request(&hub, &b, json!({})).await.unwrap();
+    // What this checks needs the scope prompt queued behind both: the busy turn still runs
+    // and the thread has not seen the chat yet.
+    assert!(
+        !env.brain.lock().unwrap().seen.iter().any(|p| p == "chat"),
+        "the busy turn ended before the loop was asked for"
+    );
     assert_eq!(
         ended(&hub, &b).await.outcome,
         twr_core::loops::Outcome::Clean
     );
+    assert!(env.brain.lock().unwrap().seen.iter().any(|p| p == "chat"));
     let g = get(&hub, &b);
     assert_eq!(
         g["phases"][1]["goal"],
