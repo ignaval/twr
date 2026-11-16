@@ -114,10 +114,17 @@ impl Env {
 
     /// How many review runs started.
     fn runs(&self) -> usize {
-        std::fs::read_to_string(self.reviewers().join("count"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+        // (The `run.<n>` directories the runs claimed.)
+        std::fs::read_dir(self.reviewers())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("run."))
+            })
+            .count()
     }
 
     /// What the `n`th review run was given: `kind` is `argv`, `env`, `stdin` or `cwd`.
@@ -368,17 +375,19 @@ fn first_card() -> LoopSettings {
 // ---------------------------------------------------------------------------------------------
 
 /// A fake reviewer CLI (`codex`, `claude` or `grok`, by the name it is run as). Run `n` (from
-/// 1, counted in `count`) writes its argv, environment, stdin and working directory to
+/// 1, its `run.<n>` directory) writes its argv, environment, stdin and working directory to
 /// `<kind>.<n>`; with `fail.<n>` it exits 3; with `hold.<n>` it starts a child (`child.<n>`,
 /// itself in `pid.<n>`) and waits until the file goes. It answers `answers/<n>.json`, else no
 /// findings: Codex to its `-o` file (its usage on stdout), Claude Code and Grok Build as their
 /// result object on stdout.
+///
+/// A run takes its number with one `mkdir`, the first free `run.<n>`: a hub that kills a run
+/// at any point (its shutdown, a stop) leaves no lock behind for the next runs to wait on.
+/// The other loop suites' fakes count their runs the same way.
 const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
-until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
-n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$here/count"
-rmdir "$here/count.lock"
+n=1
+until mkdir "$here/run.$n" 2>/dev/null; do n=$((n + 1)); done
 : > "$here/argv.$n"
 for a in "$@"; do printf '%s\n' "$a" >> "$here/argv.$n"; done
 env > "$here/env.$n"

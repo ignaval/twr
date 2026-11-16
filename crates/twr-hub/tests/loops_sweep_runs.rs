@@ -124,11 +124,21 @@ impl Env {
         })
     }
 
-    /// The most audit runs that ran at once, as the runs counted it themselves.
+    /// The most audit runs that ran at once, as the runs counted it themselves (each in its
+    /// `most.<n>`).
     fn most_at_once(&self) -> usize {
-        std::fs::read_to_string(self.reviewers().join("most"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
+        std::fs::read_dir(self.reviewers())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("most."))
+            })
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|s| s.trim().parse().ok())
+            .max()
             .unwrap_or(0)
     }
 
@@ -211,20 +221,17 @@ impl Env {
 }
 
 /// A fake reviewer CLI (`codex`, `claude` or `grok`, by the name it is run as). Run `n` (from
-/// 1, counted in `count`) writes its argv and stdin to `argv.<n>` and `stdin.<n>`. An audit run
-/// (its prompt names `THE RULE (<rule>):`) marks itself live (`live-<rule>.<n>`) while it runs
-/// and counts the most live at once in `most`; with `hold-rule-<rule>` it waits until the file
-/// goes (`holding-<rule>.<n>` once it waits, out of the section it locks); with `fail-rule-<rule>` it exits 3, and with `fail-once-rule-<rule>` it exits 3 once;
+/// 1, its `run.<n>` directory) writes its argv and stdin to `argv.<n>` and `stdin.<n>`. An
+/// audit run (its prompt names `THE RULE (<rule>):`) marks itself live (`live-<rule>.<n>`)
+/// while it runs and writes how many it saw live in `most.<n>`; with `hold-rule-<rule>` it
+/// waits until the file goes (`holding-<rule>.<n>` once it waits); with `fail-rule-<rule>` it
+/// exits 3, and with `fail-once-rule-<rule>` it exits 3 once;
 /// it answers `answers/rule-<rule>.json`. Another run answers `answers/<n>.json`. Either
 /// answers no findings without its file.
 const FAKE_REVIEWER: &str = r#"#!/bin/sh
 here=$(dirname "$0")
-while ! mkdir "$here/lock" 2>/dev/null; do sleep 0.01; done
-until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
-n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$here/count"
-rmdir "$here/count.lock"
-rmdir "$here/lock"
+n=1
+until mkdir "$here/run.$n" 2>/dev/null; do n=$((n + 1)); done
 : > "$here/argv.$n"
 for a in "$@"; do printf '%s\n' "$a" >> "$here/argv.$n"; done
 cat > "$here/stdin.$n" 2>/dev/null
@@ -232,11 +239,7 @@ rule=$(cat "$here/stdin.$n" "$here/argv.$n" | sed -n 's/^THE RULE (\([a-z0-9-]*\
 ans="$here/answers/$n.json"
 if [ -n "$rule" ]; then
   : > "$here/live-$rule.$n"
-  while ! mkdir "$here/lock" 2>/dev/null; do sleep 0.01; done
-  live=$(ls "$here" | grep -c '^live-')
-  most=$(cat "$here/most" 2>/dev/null || echo 0)
-  [ "$live" -gt "$most" ] && echo "$live" > "$here/most"
-  rmdir "$here/lock"
+  ls "$here" | grep -c '^live-' > "$here/most.$n"
   [ -f "$here/hold-rule-$rule" ] && : > "$here/holding-$rule.$n"
   while [ -f "$here/hold-rule-$rule" ]; do sleep 0.05; done
   ans="$here/answers/rule-$rule.json"

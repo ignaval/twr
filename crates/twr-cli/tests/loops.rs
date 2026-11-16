@@ -61,14 +61,12 @@ const AGENTS: &str = r#"[{"runtime": "codex", "found": true, "login": "logged_in
     {"runtime": "claude-code", "found": true, "login": "logged_in"},
     {"runtime": "grok-build", "found": false, "login": "unknown"}]"#;
 
-/// A fake `codex exec`: run `n` (counted in `count`) answers one finding on the first run and
+/// A fake `codex exec`: run `n` (its `run.<n>` directory) answers one finding on the first run and
 /// none after, to its `-o` file; with `hold.<n>` it waits until the file goes.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 here=$(dirname "$0")
-until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
-n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$here/count"
-rmdir "$here/count.lock"
+n=1
+until mkdir "$here/run.$n" 2>/dev/null; do n=$((n + 1)); done
 cat > /dev/null
 while [ -f "$here/hold.$n" ]; do sleep 0.05; done
 out=""; prev=""
@@ -148,10 +146,17 @@ impl Env {
     }
 
     fn runs(&self) -> usize {
-        std::fs::read_to_string(self.home.join("reviewers").join("count"))
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(0)
+        // (The `run.<n>` directories the runs claimed.)
+        std::fs::read_dir(self.home.join("reviewers"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("run."))
+            })
+            .count()
     }
 
     fn start_hub(&self) -> HubProc {
@@ -450,16 +455,14 @@ fn a_review_loop_from_the_command_line() {
 // of a review loop, then started again on the same data.
 // ---------------------------------------------------------------------------------------------
 
-/// A fake `codex exec` for the crash tests: run `n` (counted in `count`) writes its pid to
+/// A fake `codex exec` for the crash tests: run `n` (its `run.<n>` directory) writes its pid to
 /// `pid.<n>`; with `hold.<n>` it starts a child (`child.<n>`) and waits until the file goes;
 /// with `fail.<n>` it exits 3; it answers `answers/<n>.json` to its `-o` file, else no
 /// findings.
 const CRASH_CODEX: &str = r#"#!/bin/sh
 here=$(dirname "$0")
-until mkdir "$here/count.lock" 2>/dev/null; do sleep 0.01; done
-n=$(( $(cat "$here/count" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$here/count"
-rmdir "$here/count.lock"
+n=1
+until mkdir "$here/run.$n" 2>/dev/null; do n=$((n + 1)); done
 cat > /dev/null
 out=""; prev=""
 for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
