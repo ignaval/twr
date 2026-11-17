@@ -17,6 +17,7 @@ const pending = new Map<string, (page: Json) => void>();
 let subscription = "";
 let sequence = 500;
 const withUser = new URLSearchParams(location.search).has("with-user");
+const combined = new URLSearchParams(location.search).has("combined");
 const event = (
   thread: string,
   turn: number,
@@ -40,7 +41,10 @@ function history(thread: string, turn: number) {
     }),
     ...Array.from({ length: 60 }, (_, index) =>
       event(thread, turn, turn * 100 + index + 1, "agent.text", {
-        text: `Message ${thread}:${turn}:${index}\n\n${"Variable row height. ".repeat(5 + (index % 9) * 13)}`,
+        text:
+          combined && index === 59
+            ? 'Summary before boxes.\n\n<thread name="builder">\n**Ready** with `code` and [shared reference][guide].\n</thread>\n\n<thread name="reviewer">\n- Checked Markdown\n- Checked navigation\n</thread>\n\n[guide]: https://example.com/guide'
+            : `Message ${thread}:${turn}:${index}\n\n${"Variable row height. ".repeat(5 + (index % 9) * 13)}`,
       }),
     ),
   ];
@@ -100,6 +104,19 @@ window.twr = {
               status: "idle",
               accent: "#3366ff",
             },
+            ...(combined
+              ? [
+                  {
+                    id: "builder",
+                    name: "builder",
+                    runtime: "fake",
+                    box_name: "local",
+                    mode: "default",
+                    status: "idle",
+                    accent: "#3366ff",
+                  },
+                ]
+              : []),
           ],
           attention: [],
           decisions: [],

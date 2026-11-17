@@ -50,8 +50,8 @@ all of them with one `twr ws list --json --detail`, which asks each running hub 
 never starts a stopped hub to read it.
 
 Choosing an orchestrator or a thread in another workspace switches to that workspace and
-opens it there, with no separate switch. A click selects a thread (its inspector), a
-double-click talks to it, and `+N more` opens that workspace's grid. Each workspace's
+opens it there, with no separate switch. A single click opens a thread's conversation,
+and `+N more` opens that workspace's grid. Each workspace's
 `+` starts a new thread in it. Its name collapses or expands it, and the app remembers
 that on this device. **New workspace** at the end of the list, and the folder button
 beside the heading, create or remove workspaces. Needs you and the thread grid stay at
@@ -64,8 +64,8 @@ the other layout settings (Settings › Layout & text) and restored on the next 
 
 ## Workflows and CLI coverage
 
-The orchestrator conversation is primary. Selecting a thread opens its inspector; **Talk
-to this thread** (or a double-click) deliberately changes the composer destination. The
+The orchestrator conversation is primary. Selecting a thread opens its conversation; the
+**Show thread details** button beside its heading toggles its inspector. The
 composer always names its destination. Mentions reference threads without changing it.
 Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
 

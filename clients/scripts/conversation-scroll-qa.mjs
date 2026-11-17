@@ -207,6 +207,88 @@ try {
     await page.close();
   }
 
+  // All three reviewed features together, with the real DOM and virtualizer.
+  {
+    const page = await browser.newPage({
+      viewport: { width: 1440, height: 900 },
+      reducedMotion: "reduce",
+    });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(url + "?with-user&combined");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await scrollTo(page, 1);
+    const box = page.locator('section.thread-message[aria-label="builder"]');
+    await expect(box).toBeVisible();
+    await expect(box.locator("strong")).toHaveText("Ready");
+    await expect(box.locator("code")).toHaveText("code");
+    await expect(box.locator("a")).toHaveAttribute(
+      "href",
+      "https://example.com/guide",
+    );
+    await expect(
+      page.locator('section.thread-message[aria-label="reviewer"] li'),
+    ).toHaveCount(2);
+    await page
+      .getByRole("textbox", { name: "Message orchestrator", exact: true })
+      .fill("Orchestrator draft");
+    await page
+      .locator(".sidebar .thread-card")
+      .filter({ hasText: "builder" })
+      .click();
+    const composer = page.getByRole("textbox", {
+      name: "Message builder directly",
+      exact: true,
+    });
+    await expect(composer).toBeVisible();
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task builder:4",
+    );
+    await composer.fill("Builder draft");
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
+    await expect(page.locator("#twr-inspector")).toBeVisible();
+    await expect(composer).toHaveValue("Builder draft");
+    await page.locator(".latest-user-message button").click();
+    await expect(page.locator(".block-user:focus")).toContainText(
+      "Task builder:4",
+    );
+    await page
+      .getByRole("button", { name: "Close thread details", exact: true })
+      .click();
+    await expect(
+      page.getByRole("button", { name: "Show thread details", exact: true }),
+    ).toBeFocused();
+    await expect(composer).toHaveValue("Builder draft");
+    await scrollTo(page, 1);
+    // Protocol tags belong only to orchestrator replies.
+    await expect(page.locator("section.thread-message")).toHaveCount(0);
+    await page
+      .getByRole("button", { name: "Back to orchestrator", exact: true })
+      .click();
+    await expect(
+      page.getByRole("textbox", { name: "Message orchestrator", exact: true }),
+    ).toHaveValue("Orchestrator draft");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await scrollTo(page, 1);
+    await expect(box).toBeVisible();
+    await page.locator(".latest-user-message button").click();
+    await expect(page.locator(".block-user:focus")).toContainText(
+      "Task orch:4",
+    );
+    expect(errors).toEqual([]);
+    await page.screenshot({ path: "test-results/combined-ui-jump.png" });
+    console.log(
+      "PASS combined UI: named Markdown boxes and shared references, single-click destination changes, per-thread drafts and jump targets, details toggle/focus, and orchestrator-only tag parsing",
+    );
+    await page.close();
+  }
+
   // Chromium does not generate iOS momentum. Select the real virtualizer's iOS
   // branch via navigator, then drive its touch/tail lifecycle with synthetic
   // events. Assert that a prepend really is held (indexes advance while the
