@@ -23,6 +23,11 @@ and companion from `clients/bin`, `target/debug`, or `target/release`. An explic
 `TWR_DESKTOP_BINARY_DIR` is accepted only in development. Packaged builds always use the
 three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remains useful for an independent test installation.
 
+`npm run test:conversation-scroll` checks reading position during delayed history loads
+in a browser, using a disposable host. It needs Playwright's Chromium or `TWR_CHROMIUM_PATH`.
+Synthetic touch and momentum cases select the virtualizer's iOS path and verify deferred
+prepend adjustments. They do not reproduce native WebKit or physical iOS scrolling.
+
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
 markers. A desktop app launched by a twr agent cannot turn itself into a user client.
@@ -63,6 +68,17 @@ The orchestrator conversation is primary. Selecting a thread opens its inspector
 to this thread** (or a double-click) deliberately changes the composer destination. The
 composer always names its destination. Mentions reference threads without changing it.
 Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
+
+The first line of your latest message stays above the history in the orchestrator and
+each thread's conversation, on desktop and phone. Click it (or focus it and press Enter
+or Space) to jump to that message, with a visible keyboard focus outline. Recent history
+and live updates appear first; older turns load in the background to find your message
+when automatic turns have followed it. If an older page fails, recent history stays
+available and **Load earlier turn** retries it. While offline, the line uses the history
+saved on this device.
+
+Loading older turns keeps the message you are reading at the same position, including
+when you scroll while a background or manual history request is pending.
 
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads

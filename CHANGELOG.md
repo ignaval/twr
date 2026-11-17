@@ -4,6 +4,16 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+### Added
+
+- In the desktop and phone apps, every conversation keeps the first line of your latest message above its history. Click it to jump to that message, including when automatic turns have followed it.
+
+### Fixed
+
+- Removing **Load earlier turn** during an iOS touch or momentum scroll preserves the reading position while prepend adjustments are deferred.
+- Loading older conversation history in the background preserves the message and pixel offset you are reading, including when you scroll while the request is pending.
+- Conversations show recent history and subscribe to live updates before looking for your latest message in older turns. A failed older page leaves recent history available, and switching conversations cancels the old lookup. A keyboard jump to your message now shows a visible focus outline.
+
 ## [0.5.0] - 2026-11-15
 
 Review and implementation loops: a thread's work reviewed round by round, read-only, by Codex, Claude Code, Grok Build or an ACP agent until it comes back clean, or planned, implemented and then reviewed, started from the TUI, the command line, the apps or the orchestrator, on the hub's machine or a remote box. The desktop app installs in one command (`install.sh --desktop`) or from a Homebrew tap, and the Mac app is signed with a Developer ID and notarized, so it opens without Gatekeeper's warnings and updates itself. Also store builds of the phone apps, and contrast fixes across the apps' and the TUI's themes.

@@ -472,6 +472,9 @@ export default function App({
   const [transcriptError, setTranscriptError] = useState("");
   const [earliestTurn, setEarliestTurn] = useState<number>();
   const [earlierBusy, setEarlierBusy] = useState(false);
+  const [earlierError, setEarlierError] = useState("");
+  const recentTurn = useRef<number | undefined>(undefined);
+  const earlierRequest = useRef<number | undefined>(undefined);
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
@@ -1124,7 +1127,12 @@ export default function App({
             : [],
     );
     setTranscriptError("");
-    if (!kept) setEarliestTurn(undefined);
+    setEarlierError("");
+    setEarlierBusy(false);
+    if (!kept) {
+      setEarliestTurn(undefined);
+      recentTurn.current = undefined;
+    }
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -1145,6 +1153,7 @@ export default function App({
           since_seq: last,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         const fresh: HubEvent[] = [...page.events];
         for (let pages = 1; page.more && pages < 8; pages++) {
           page = await rpc("thread.transcript", {
@@ -1183,8 +1192,9 @@ export default function App({
           limit: 500,
         });
       }
+      if (generation !== transcriptGeneration.current) return;
       const all: HubEvent[] = [...page.events];
-      let firstTurn = page.turn as number | undefined;
+      const firstTurn = page.turn as number | undefined;
       while (page.more) {
         page = await rpc("thread.transcript", {
           thread: id,
@@ -1196,36 +1206,10 @@ export default function App({
         all.push(...page.events);
       }
       const cursor = page.next || 0;
-      // Give short conversations useful context immediately. Older turns remain
-      // paged, and the virtual list asks for more when the user reaches the top.
-      for (
-        let n = 0;
-        n < 3 &&
-        firstTurn &&
-        firstTurn > 1 &&
-        blocksOf(all).reduce((sum, b) => sum + b.text.length, 0) < 3000;
-        n++
-      ) {
-        let older = await rpc("thread.transcript", {
-          thread: id,
-          turn: firstTurn - 1,
-          limit: 500,
-        });
-        const batch: HubEvent[] = [...older.events];
-        while (older.more) {
-          older = await rpc("thread.transcript", {
-            thread: id,
-            turn: firstTurn - 1,
-            since_seq: older.next,
-            limit: 500,
-          });
-          batch.push(...older.events);
-        }
-        all.unshift(...batch);
-        firstTurn--;
-        if (generation !== transcriptGeneration.current) return;
-      }
       if (generation !== transcriptGeneration.current) return;
+      // Show and subscribe to the recent turn before looking for older context
+      // or the latest user message. Older-page failures must not block live use.
+      recentTurn.current = firstTurn;
       setEarliestTurn(firstTurn);
       setEvents(all);
       liveTranscript.current = id;
@@ -1245,6 +1229,10 @@ export default function App({
         if (generation === transcriptGeneration.current)
           setTranscriptLoading(false);
       });
+    return () => {
+      // Fence both initial loading and older-page requests on switches/unmount.
+      transcriptGeneration.current++;
+    };
   }, [target?.id, connected, transcriptRefresh, rpc]);
   useEffect(() => {
     if (!target || !connected) {
@@ -2489,16 +2477,26 @@ export default function App({
   );
   const earlierTarget = target?.id;
   const earlier = useCallback(async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+    if (
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      !earlierTarget ||
+      !connected ||
+      earlierBusy
+    )
       return;
     const generation = transcriptGeneration.current;
+    if (earlierRequest.current === generation) return;
+    earlierRequest.current = generation;
     setEarlierBusy(true);
+    setEarlierError("");
     try {
       let page = await rpc("thread.transcript", {
         thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
+      if (generation !== transcriptGeneration.current) return;
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
@@ -2507,17 +2505,56 @@ export default function App({
           since_seq: page.next,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         more.push(...page.events);
       }
       if (generation !== transcriptGeneration.current) return;
       setEvents((old) => mergeEvents(old, more));
       setEarliestTurn(earliestTurn - 1);
     } catch (e) {
-      fail(e);
+      if (generation === transcriptGeneration.current)
+        setEarlierError(errorMessage(e));
     } finally {
-      setEarlierBusy(false);
+      if (generation === transcriptGeneration.current) {
+        earlierRequest.current = undefined;
+        setEarlierBusy(false);
+      }
     }
-  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  }, [earliestTurn, earlierTarget, connected, earlierBusy, rpc]);
+  useEffect(() => {
+    if (
+      !connected ||
+      transcriptLoading ||
+      transcriptError ||
+      earlierBusy ||
+      earlierError ||
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      liveTranscript.current !== earlierTarget ||
+      activeSubscription.current !== String(transcriptGeneration.current)
+    )
+      return;
+    const blocks = blocksOf(events);
+    // Continue independently until the latest user message is known. Preserve
+    // the bounded short-conversation context lookup, after subscribing as well.
+    if (
+      !blocks.some((block) => block.kind === "user") ||
+      (recentTurn.current != null &&
+        recentTurn.current - earliestTurn < 3 &&
+        blocks.reduce((sum, block) => sum + block.text.length, 0) < 3000)
+    )
+      void earlier();
+  }, [
+    connected,
+    transcriptLoading,
+    transcriptError,
+    earlierBusy,
+    earlierError,
+    earliestTurn,
+    earlierTarget,
+    events,
+    earlier,
+  ]);
   const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   useEffect(() => {
     setPaletteIndex(0);
@@ -3314,7 +3351,7 @@ export default function App({
                   showTools={showTools}
                   showThinking={showThinking}
                   loading={transcriptLoading && !presentedEvents.length}
-                  error={transcriptError}
+                  error={transcriptError || earlierError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
                   }
@@ -4977,7 +5014,9 @@ const Conversation = memo(function Conversation({
 }) {
   const hostApi = useHostAPI();
   const parent = useRef<HTMLDivElement>(null);
-  const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
+  const list = useRef<HTMLDivElement>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const [jumpTarget, setJumpTarget] = useState<string>();
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
   // Expanded messages and open tool details, by block: rows scrolled out of the virtual
@@ -5009,7 +5048,46 @@ const Conversation = memo(function Conversation({
     estimateSize: () => 120,
     overscan: 8,
     getItemKey: (index) => blocks[index].id,
+    scrollMargin,
+    // Preserve the current message and pixel offset on every prepend, including
+    // background loads and scrolling during a request. Bottom-follow stays ours.
+    anchorTo: "end",
+    followOnAppend: false,
   });
+  // Controls and loading/error notices precede the virtual rows in the scroller.
+  // Include their height when locating a message, including after a resize.
+  useLayoutEffect(() => {
+    const measure = () => {
+      const margin = list.current?.offsetTop ?? 0;
+      const delta = margin - virtual.options.scrollMargin;
+      // The last prepend removes Load earlier. Keep the reading position when
+      // that control (or a notice above the rows) changes the list's offset too.
+      // Relative scrolling includes prepend adjustments held during iOS gestures;
+      // DOM scrollTop can lag behind the virtualizer's layout position.
+      if (delta && !follow.current && parent.current)
+        virtual.scrollBy(delta, { behavior: "auto" });
+      setScrollMargin(margin);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (parent.current) observer.observe(parent.current);
+    return () => observer.disconnect();
+  }, [loading, error, earlier, earlierBusy, virtual]);
+  useLayoutEffect(() => {
+    if (!jumpTarget) return;
+    const index = blocks.findIndex((block) => block.id === jumpTarget);
+    const message = parent.current?.querySelector<HTMLElement>(
+      `[data-index="${index}"]`,
+    );
+    if (message) {
+      message.focus({ preventScroll: true });
+      setJumpTarget(undefined);
+    }
+  });
+  const latestUser = blocks.findLast((block) => block.kind === "user");
+  const latestUserLine = latestUser
+    ? latestUser.text.split(/\r\n|\r|\n/, 1)[0].trim() || "Blank first line"
+    : "";
   const totalSize = virtual.getTotalSize();
   useLayoutEffect(() => {
     const element = parent.current;
@@ -5038,30 +5116,19 @@ const Conversation = memo(function Conversation({
   const last = blocks.at(-1);
   function loadEarlier() {
     if (!earlier || earlierBusy || !parent.current) return;
-    anchor.current = {
-      height: parent.current.scrollHeight,
-      top: parent.current.scrollTop,
-    };
     follow.current = false;
     setFollowing(false);
     earlier();
   }
-  useLayoutEffect(() => {
-    if (anchor.current && parent.current) {
-      const saved = anchor.current;
-      anchor.current = undefined;
-      parent.current.scrollTop =
-        saved.top + Math.max(0, parent.current.scrollHeight - saved.height);
-    }
-  }, [blocks[0]?.id]);
   useEffect(() => {
-    if (follow.current && blocks.length)
-      requestAnimationFrame(() => {
-        if (parent.current)
-          parent.current.scrollTop = parent.current.scrollHeight;
-      });
+    if (!follow.current || !blocks.length) return;
+    const frame = requestAnimationFrame(() => {
+      if (follow.current && parent.current)
+        parent.current.scrollTop = parent.current.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [blocks.length, last?.text, totalSize]);
-  return (
+  const history = (
     <div
       className="conversation-scroll"
       ref={parent}
@@ -5137,6 +5204,7 @@ const Conversation = memo(function Conversation({
         </Empty>
       )}
       <div
+        ref={list}
         className="transcript-virtual"
         style={{ height: totalSize, position: "relative" }}
       >
@@ -5148,12 +5216,14 @@ const Conversation = memo(function Conversation({
               data-index={row.index}
               ref={virtual.measureElement}
               className={`transcript-block block-${block.kind}`}
+              tabIndex={block.kind === "user" ? -1 : undefined}
+              aria-label={block.kind === "user" ? "Your message" : undefined}
               style={{
                 position: "absolute",
                 top: 0,
                 left: 0,
                 width: "100%",
-                transform: `translateY(${row.start}px)`,
+                transform: `translateY(${row.start - scrollMargin}px)`,
               }}
             >
               <div className="message-meta">
@@ -5289,6 +5359,43 @@ const Conversation = memo(function Conversation({
         </button>
       )}
     </div>
+  );
+  return (
+    <>
+      <div className="latest-user-message">
+        {latestUser ? (
+          <button
+            type="button"
+            title={latestUserLine}
+            aria-label={`Jump to your latest message: ${latestUserLine}`}
+            onClick={() => {
+              follow.current = false;
+              setFollowing(false);
+              setJumpTarget(latestUser.id);
+              // Immediate scrolling lets the virtualizer correct measured row
+              // heights as the destination mounts, and respects reduced motion.
+              virtual.scrollToIndex(blocks.indexOf(latestUser), {
+                align: "start",
+                behavior: "auto",
+              });
+            }}
+          >
+            <ArrowUpRight size={14} aria-hidden="true" />
+            <span className="latest-user-label">You</span>
+            <span className="latest-user-preview">{latestUserLine}</span>
+          </button>
+        ) : (
+          <span className="latest-user-empty" role="status">
+            {loading || (earlier && !error)
+              ? "Loading your latest message…"
+              : error
+                ? "Latest message unavailable"
+                : "No messages from you yet"}
+          </span>
+        )}
+      </div>
+      {history}
+    </>
   );
 });
 function ContextEditor({

@@ -205,6 +205,18 @@ describe("accessibility audit of the shared UI", () => {
       ).toBe(true);
     }
   });
+
+  it("gives a keyboard jump's message target an outline above tabindex=-1 suppression", () => {
+    const css = readFileSync(join(root, "shared/style.css"), "utf8");
+    // The general suppression has specificity (0, 2, 1). The message rule's
+    // class, attribute and pseudo-class give it (0, 3, 0), so it wins the cascade.
+    const rule =
+      /\.transcript-block\[tabindex="-1"\]:focus-visible\s*\{([^}]*)\}/.exec(
+        css,
+      );
+    expect(rule?.[1]).toMatch(/outline:\s*2px solid var\(--focus\)/);
+    expect(rule?.[1]).toMatch(/outline-offset:\s*-2px/);
+  });
 });
 
 const hex = (value: string) =>

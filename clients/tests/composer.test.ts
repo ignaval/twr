@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DesktopEvent, Json, Thread } from "../shared/types";
+import type { DesktopEvent, HubEvent, Json, Thread } from "../shared/types";
 import { SUGGEST_SETTLE_MS } from "../shared/assistance";
 import {
   FakeEvent,
@@ -286,6 +286,364 @@ async function mount(
 
 let mounted: Mounted;
 const app = () => mounted;
+
+describe("the latest user message above conversation history", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: HostOptions = {}) => {
+    vi.resetModules();
+    mounted = await mount(options);
+  };
+  const prompt = (
+    turn: number,
+    text: string,
+    from = "user",
+    thread = "orch",
+  ): HubEvent => ({
+    id: `${thread}:${turn}`,
+    thread,
+    seq: turn * 10,
+    turn,
+    ts: "2026-11-17T12:00:00Z",
+    kind: "turn.started",
+    data: { from, prompt: text },
+  });
+  const preview = () => app().find(".latest-user-preview").textContent;
+  const deferredPage = () => {
+    let resolve!: (page: Json) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<Json>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    return { promise, resolve, reject };
+  };
+
+  it("shows only the latest user's first line and ignores drafts and automatic turns", async () => {
+    await start({
+      events: [
+        prompt(1, "Older request"),
+        prompt(2, "Latest request\r\nA second line"),
+        prompt(3, "Automatic prompt", "orchestrator"),
+      ],
+    });
+    expect(preview()).toBe("Latest request");
+    expect(
+      app().find(".latest-user-message button").getAttribute("aria-label"),
+    ).toBe("Jump to your latest message: Latest request");
+    expect(app().all(".conversation-scroll .latest-user-message")).toHaveLength(
+      0,
+    );
+    await app().type("Unsent draft");
+    expect(preview()).toBe("Latest request");
+    await app().connection(false);
+    expect(preview()).toBe("Latest request");
+  });
+
+  it("updates on a live user message, but keeps it through agent replies and prepended history", async () => {
+    let subscription = "";
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") subscription = params.subscription;
+        if (method === "thread.transcript")
+          return Promise.resolve({
+            events: [
+              prompt(
+                params.turn || 2,
+                "Request " + (params.turn || 2) + "x".repeat(3000),
+              ),
+            ],
+            turn: params.turn || 2,
+            more: false,
+          });
+      },
+    });
+    await app().click(app().find(".load-earlier"));
+    expect(preview()).toContain("Request 2");
+    await app().act(async () => {
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: prompt(3, "New request\nDetails"),
+      });
+    });
+    await app().wait(60);
+    expect(preview()).toBe("New request");
+    await app().act(async () => {
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: {
+          ...prompt(4, ""),
+          kind: "agent.text",
+          data: { text: "Reply", delta: true },
+        },
+      });
+    });
+    await app().wait(60);
+    expect(preview()).toBe("New request");
+  });
+
+  it("loads beyond three automatic turns and all pages to find the latest user", async () => {
+    const turns: number[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method !== "thread.transcript") return;
+        const turn = params.turn || 8;
+        turns.push(turn);
+        const paged = turn === 4 && !params.since_seq;
+        return Promise.resolve({
+          events: params.since_seq
+            ? []
+            : [
+                prompt(
+                  turn,
+                  turn === 3
+                    ? "Actual latest request\nDetails"
+                    : "x".repeat(3100),
+                  turn === 3 ? "user" : "orchestrator",
+                ),
+              ],
+          turn,
+          more: paged,
+          next: turn * 10,
+        });
+      },
+    });
+    expect(turns).toEqual([8, 7, 6, 5, 4, 4, 3]);
+    expect(preview()).toBe("Actual latest request");
+  });
+
+  it("subscribes and accepts live messages while an automatic worker's older history is pending", async () => {
+    const older = deferredPage();
+    const calls: string[] = [];
+    let subscription = "";
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") {
+          calls.push("subscribe");
+          subscription = params.subscription;
+        }
+        if (method !== "thread.transcript") return;
+        calls.push(String(params.turn || "recent"));
+        return params.turn
+          ? older.promise
+          : Promise.resolve({
+              events: [
+                prompt(100, "Automatic " + "x".repeat(3100), "orchestrator"),
+              ],
+              turn: 100,
+              more: false,
+              next: 1000,
+            });
+      },
+    });
+    expect(calls).toEqual(["recent", "subscribe", "99"]);
+    expect(app().all(".transcript-loading")).toHaveLength(0);
+    expect(
+      app().find(".conversation-scroll").getAttribute("aria-busy"),
+    ).toBeNull();
+    expect(app().find(".latest-user-empty").textContent).toBe(
+      "Loading your latest message…",
+    );
+    await app().act(async () =>
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: prompt(101, "Live user request"),
+      }),
+    );
+    await app().wait(60);
+    expect(preview()).toBe("Live user request");
+    await app().act(async () =>
+      older.resolve({
+        events: [prompt(99, "Older automatic task", "orchestrator")],
+        more: false,
+      }),
+    );
+    await app().settle();
+    expect(preview()).toBe("Live user request");
+    expect(calls).toEqual(["recent", "subscribe", "99"]);
+  });
+
+  it("retains recent history and live delivery when an older page fails, and allows retry", async () => {
+    let failOlder = true;
+    let subscription = "";
+    const turns: number[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") subscription = params.subscription;
+        if (method !== "thread.transcript") return;
+        const turn = params.turn || 100;
+        turns.push(turn);
+        if (!params.turn)
+          return Promise.resolve({
+            events: [prompt(100, "Recent user request")],
+            turn: 100,
+            more: false,
+          });
+        if (params.since_seq && failOlder)
+          return Promise.reject(new Error("Older page unavailable"));
+        return Promise.resolve({
+          events: params.since_seq
+            ? []
+            : [prompt(99, "x".repeat(3100), "orchestrator")],
+          more: !params.since_seq,
+          next: 990,
+        });
+      },
+    });
+    expect(turns).toEqual([100, 99, 99]);
+    expect(preview()).toBe("Recent user request");
+    expect(
+      app().find(".conversation-scroll .error-banner").textContent,
+    ).toContain("Older page unavailable");
+    expect(app().all(".transcript-loading")).toHaveLength(0);
+    await app().act(async () =>
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: prompt(101, "Live request after failure"),
+      }),
+    );
+    await app().wait(60);
+    expect(preview()).toBe("Live request after failure");
+    expect(turns).toEqual([100, 99, 99]); // No automatic retry loop on live updates.
+    failOlder = false;
+    await app().click(app().find(".load-earlier"));
+    expect(turns).toEqual([100, 99, 99, 99, 99]);
+    expect(app().all(".conversation-scroll .error-banner")).toHaveLength(0);
+    expect(preview()).toBe("Live request after failure");
+  });
+
+  it.each(["page", "error"])(
+    "ignores an old conversation's delayed %s without disturbing the new lookup",
+    async (result) => {
+      const oldPage = deferredPage();
+      const workerPage = deferredPage();
+      const calls: string[] = [];
+      await start({
+        rpc: (method, params) => {
+          if (method !== "thread.transcript") return;
+          calls.push(
+            `${params.thread}:${params.turn || "recent"}:${params.since_seq || 0}`,
+          );
+          if (params.turn)
+            return params.thread === "orch"
+              ? oldPage.promise
+              : workerPage.promise;
+          const turn = params.thread === "orch" ? 100 : 10;
+          return Promise.resolve({
+            events: [
+              prompt(turn, "x".repeat(3100), "orchestrator", params.thread),
+            ],
+            turn,
+            more: false,
+          });
+        },
+      });
+      await app().talkTo("builder");
+      expect(calls).toEqual([
+        "orch:recent:0",
+        "orch:99:0",
+        "w1:recent:0",
+        "w1:9:0",
+      ]);
+      await app().act(async () => {
+        if (result === "error")
+          oldPage.reject(new Error("Stale history error"));
+        else
+          oldPage.resolve({
+            events: [prompt(99, "Stale user request")],
+            more: true,
+            next: 991,
+          });
+      });
+      await app().settle();
+      expect(calls).toHaveLength(4); // No next page or duplicate worker request.
+      expect(app().all(".latest-user-preview")).toHaveLength(0);
+      expect(app().all(".conversation-scroll .error-banner")).toHaveLength(0);
+      expect(app().find(".load-earlier").disabled).toBe(true);
+      await app().act(async () =>
+        workerPage.resolve({
+          events: [prompt(9, "Worker's latest request", "user", "w1")],
+          more: false,
+        }),
+      );
+      await app().settle();
+      expect(preview()).toBe("Worker's latest request");
+      expect(app().find(".load-earlier").disabled).toBe(false);
+    },
+  );
+
+  it("keeps short-conversation context bounded to three turns after subscribing", async () => {
+    const calls: string[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") calls.push("subscribe");
+        if (method !== "thread.transcript") return;
+        const turn = params.turn || 8;
+        calls.push(String(turn));
+        return Promise.resolve({
+          events: [
+            prompt(turn, "Short context", turn === 8 ? "user" : "orchestrator"),
+          ],
+          turn,
+          more: false,
+        });
+      },
+    });
+    expect(calls).toEqual(["8", "subscribe", "7", "6", "5"]);
+  });
+
+  it("clears the previous conversation's line while a thread deep dive loads", async () => {
+    let finish: (value: Json) => void = () => {};
+    await start({
+      rpc: (method, params) => {
+        if (method !== "thread.transcript") return;
+        return params.thread === "orch"
+          ? Promise.resolve({
+              events: [prompt(1, "Orchestrator request")],
+              more: false,
+            })
+          : new Promise((resolve) => {
+              finish = resolve;
+            });
+      },
+    });
+    expect(preview()).toBe("Orchestrator request");
+    await app().talkTo("builder");
+    expect(app().all(".latest-user-preview")).toHaveLength(0);
+    expect(app().find(".latest-user-empty").textContent).toBe(
+      "Loading your latest message…",
+    );
+    await app().act(async () =>
+      finish({
+        events: [prompt(1, "Worker request", "user", "w1")],
+        more: false,
+      }),
+    );
+    await app().settle();
+    expect(preview()).toBe("Worker request");
+  });
+
+  it("has no jump action when the complete history has no user message", async () => {
+    await start({ events: [prompt(1, "Automatic", "orchestrator")] });
+    expect(app().all(".latest-user-message button")).toHaveLength(0);
+    expect(app().find(".latest-user-empty").textContent).toBe(
+      "No messages from you yet",
+    );
+  });
+
+  it("keeps a message with a blank first line reachable", async () => {
+    await start({ events: [prompt(1, "\nDetails on the next line")] });
+    expect(preview()).toBe("Blank first line");
+    expect(
+      app().find(".latest-user-message button").getAttribute("title"),
+    ).toBe("Blank first line");
+  });
+});
 
 describe("the message box", () => {
   beforeEach(async () => {
