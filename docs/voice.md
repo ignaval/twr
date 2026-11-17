@@ -159,6 +159,11 @@ machine, the app's waits, and voice mode pauses and resumes the one that speaks 
 speakers of one machine share a device id, which `twr speak --control stdio` prints first
 (`{"type": "speaker", "device", "name"}`).
 
+The local desktop conversation toolbar also attaches this speaker for its read-aloud
+button, restoring the saved live setting without enabling the microphone. Hands-free uses
+the same speaker and turns live reading on; the toolbar follows that change. Turning live
+reading off in the toolbar leaves hands-free listening under its usual rules.
+
 `twr speak --control stdio` is how any program can drive a speaker: controls on stdin, one per
 line (`pause`, `resume`, `stop`, `skip`, `quit`; anything else is ignored), and what it plays
 on stdout, one JSON object per line when it changes: `{"type": "state", "workspace", "playing",
