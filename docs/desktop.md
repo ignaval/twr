@@ -25,6 +25,8 @@ three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remain
 
 `npm run test:conversation-scroll` checks reading position during delayed history loads
 in a browser, using a disposable host. It needs Playwright's Chromium or `TWR_CHROMIUM_PATH`.
+Synthetic touch and momentum cases select the virtualizer's iOS path and verify deferred
+prepend adjustments. They do not reproduce native WebKit or physical iOS scrolling.
 
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity

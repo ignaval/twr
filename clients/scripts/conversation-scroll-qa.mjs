@@ -74,6 +74,9 @@ try {
       return {
         text: message.querySelector(".markdown p").textContent,
         offset: message.getBoundingClientRect().top - top,
+        index: Number(message.dataset.index),
+        scrollTop: scroll.scrollTop,
+        margin: scroll.querySelector(".transcript-virtual").offsetTop,
       };
     });
   const unchanged = async (page, saved) => {
@@ -201,6 +204,83 @@ try {
       `PASS ${mobile ? "phone" : "desktop"}: automatic bottom-follow remains active`,
     );
     expect(errors).toEqual([]);
+    await page.close();
+  }
+
+  // Chromium does not generate iOS momentum. Select the real virtualizer's iOS
+  // branch via navigator, then drive its touch/tail lifecycle with synthetic
+  // events. Assert that a prepend really is held (indexes advance while the
+  // DOM scroll position stays put); viewport size alone cannot cover this bug.
+  for (const gesture of ["drag", "momentum"]) {
+    const page = await browser.newPage({
+      viewport: { width: 390, height: 844 },
+      userAgent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 27_0 like Mac OS X) AppleWebKit/605.1.15 Version/27.0 Mobile/15E148 Safari/604.1",
+      hasTouch: true,
+      reducedMotion: "reduce",
+    });
+    page.setDefaultTimeout(5000);
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    const touch = (type) =>
+      page.locator(".conversation-scroll").dispatchEvent(type);
+    await page.goto(url);
+    await pending(page, 3);
+    await scrollTo(page, 1);
+    await scrollTo(page, 1);
+    await touch("touchstart");
+    await scrollTo(page, 0.6);
+    await scrollTo(page, 0.4);
+    const heldBefore = await read(page);
+    await release(page, 3);
+    await unchanged(page, heldBefore);
+    const heldAfter = await read(page);
+    expect(heldAfter.index - heldBefore.index).toBe(61);
+    expect(
+      Math.abs(heldAfter.scrollTop - heldBefore.scrollTop),
+    ).toBeLessThanOrEqual(1);
+    await touch("touchend");
+    await unchanged(page, heldBefore); // The deferred prepend also lands safely.
+    await pending(page, 2);
+    await release(page, 2);
+    await pending(page, 1);
+    await frames(page);
+
+    await touch("touchstart");
+    await scrollTo(page, 0.5);
+    await scrollTo(page, 0.35);
+    if (gesture === "momentum") {
+      await touch("touchend");
+      // A scroll frame after touchend extends the virtualizer's momentum tail.
+      await page.locator(".conversation-scroll").evaluate((node) => {
+        node.scrollTop -= 37;
+      });
+      await frames(page);
+    }
+    const before = await read(page);
+    await release(page, 1); // Removes Load earlier while the prepend is held.
+    await frames(page);
+    const after = await read(page);
+    expect(after.text).toBe(before.text);
+    expect(after.index - before.index).toBe(61);
+    expect(after.margin).toBeLessThan(before.margin);
+    // Only the control's height is written to the DOM here. The newly inserted
+    // rows' height remains held internally until the gesture/tail settles.
+    expect(
+      Math.abs(
+        after.scrollTop - before.scrollTop - (after.margin - before.margin),
+      ),
+    ).toBeLessThanOrEqual(1);
+    await unchanged(page, before);
+    if (gesture === "drag") {
+      await touch("touchend");
+      await unchanged(page, before);
+    }
+    await expect(page.locator(".load-earlier")).toHaveCount(0);
+    expect(errors).toEqual([]);
+    console.log(
+      `PASS synthetic iOS ${gesture}: verified held prepend, final-control removal, and unchanged message/pixel offset before and after gesture settlement`,
+    );
     await page.close();
   }
 } finally {

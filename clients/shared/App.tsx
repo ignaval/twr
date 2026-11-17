@@ -5062,10 +5062,10 @@ const Conversation = memo(function Conversation({
       const delta = margin - virtual.options.scrollMargin;
       // The last prepend removes Load earlier. Keep the reading position when
       // that control (or a notice above the rows) changes the list's offset too.
+      // Relative scrolling includes prepend adjustments held during iOS gestures;
+      // DOM scrollTop can lag behind the virtualizer's layout position.
       if (delta && !follow.current && parent.current)
-        virtual.scrollToOffset(parent.current.scrollTop + delta, {
-          behavior: "auto",
-        });
+        virtual.scrollBy(delta, { behavior: "auto" });
       setScrollMargin(margin);
     };
     measure();
