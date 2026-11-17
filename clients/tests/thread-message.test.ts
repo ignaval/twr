@@ -32,6 +32,110 @@ const boxes = (html: string) =>
   );
 
 describe("orchestrator thread sections", () => {
+  it("preserves a footnote definition atomically when its body contains thread tags", () => {
+    const html = render(
+      'Text[^n].\n\n[^n]: Before.\n    <thread name="a">\n    Inside.\n    </thread>\n    After.',
+    );
+    expect(boxes(html)).toHaveLength(0);
+    expect(html.match(/id="user-content-fn-n"/g)).toHaveLength(1);
+    expect(html).toContain("Before.");
+    expect(html).toContain("Inside.");
+    expect(html).toContain("After.");
+    expect(html).toContain("&lt;thread name=&quot;a&quot;&gt;");
+    expect(html).toContain("&lt;/thread&gt;");
+  });
+
+  it.each([
+    [
+      "a list within the footnote",
+      'Text[^n].\n\n[^n]: Before.\n    - Item.\n      <thread name="a">\n      Inside.\n      </thread>\n      After.',
+    ],
+    [
+      "a footnote within a list",
+      '- Text[^n].\n\n  [^n]: Before.\n      <thread name="a">\n      Inside.\n      </thread>\n      After.',
+    ],
+    [
+      "a footnote within a blockquote",
+      '> Text[^n].\n>\n> [^n]: Before.\n>     <thread name="a">\n>     Inside.\n>     </thread>\n>     After.',
+    ],
+  ])(
+    "keeps thread tags literal with %s, and still renders subsequent real boxes",
+    (_context, definition) => {
+      const html = render(
+        `${definition}\n\n<thread name="real">\nWorker update.\n</thread>`,
+      );
+      expect(boxes(html).map((box) => box.name)).toEqual(["real"]);
+      expect(boxes(html)[0].html).toContain("Worker update.");
+      for (const content of ["Before.", "Inside.", "After."]) {
+        expect(html.split(content)).toHaveLength(2);
+        expect(boxes(html)[0].html).not.toContain(content);
+      }
+      expect(html.match(/id="user-content-fn-n"/g)).toHaveLength(1);
+      expect(html).toContain("&lt;thread name=&quot;a&quot;&gt;");
+      expect(html).toContain("&lt;/thread&gt;");
+    },
+  );
+
+  it("keeps a footnote defined inside a real thread whole and renders it only in the footer", () => {
+    const html = render(
+      '<thread name="outer">\nText[^n].\n\n[^n]: Before.\n    <thread name="a">\n    Inside.\n    </thread>\n    After.\n</thread>\nOutside prose',
+    );
+    const sections = boxes(html);
+    expect(sections.map((section) => section.name)).toEqual(["outer"]);
+    expect(sections[0].html).toContain("Text");
+    expect(sections[0].html).not.toContain("Before.");
+    expect(sections[0].html).not.toContain("Inside.");
+    expect(sections[0].html).not.toContain("After.");
+    expect(html).toMatch(
+      /class="footnotes"[\s\S]*Before\.[\s\S]*Inside\.[\s\S]*After\./,
+    );
+    expect(html.match(/id="user-content-fn-n"/g)).toHaveLength(1);
+    expect(html).toMatch(
+      /<\/section>\s*<div class="markdown">\s*<p>Outside prose/,
+    );
+  });
+
+  it("shares a single complete footnote across references inside and outside a box", () => {
+    const html = render(
+      'Text[^n].\n\n<thread name="outer">\nWorker update[^n].\n</thread>\n\n[^n]: Before.\n    <thread name="a">\n    Inside.\n    </thread>\n    After.',
+    );
+    expect(boxes(html).map((box) => box.name)).toEqual(["outer"]);
+    expect(html.match(/title="#user-content-fn-n"/g)).toHaveLength(2);
+    expect(html.match(/id="user-content-fn-n"/g)).toHaveLength(1);
+    expect(html).toMatch(
+      /class="footnotes"[\s\S]*Before\.[\s\S]*Inside\.[\s\S]*After\./,
+    );
+  });
+
+  it.each(['<thread name="a', "</thr"])(
+    "preserves a partial tag %s literally inside a streaming footnote",
+    (partial) => {
+      const html = render(`Text[^n].\n\n[^n]: Before.\n    ${partial}`, {
+        streaming: true,
+      });
+      expect(boxes(html)).toHaveLength(0);
+      expect(html.match(/id="user-content-fn-n"/g)).toHaveLength(1);
+      expect(html).toContain("Before.");
+      expect(html).toContain(
+        partial.replace("<", "&lt;").replaceAll('"', "&quot;"),
+      );
+    },
+  );
+
+  it("preserves link definitions nested in an atomic footnote and resolves their references document-wide", () => {
+    const html = render(
+      'Text[^n] and [outside][d].\n\n[^n]: Before.\n    <thread name="a">\n    Inside [docs][d].\n    </thread>\n    After.\n\n    [d]: https://example.com/first "Footnote docs"\n\n[d]: https://example.com/second',
+    );
+    expect(boxes(html)).toHaveLength(0);
+    expect(html.match(/id="user-content-fn-n"/g)).toHaveLength(1);
+    expect(html.match(/href="https:\/\/example.com\/first"/g)).toHaveLength(2);
+    expect(html).not.toContain('href="https://example.com/second"');
+    expect(html).not.toContain("[docs][d]");
+    expect(html).not.toContain("[outside][d]");
+    expect(html).toContain("Before.");
+    expect(html).toContain("After.");
+  });
+
   it("ends a section at an indented closing delimiter after a list item", () => {
     const html = render(
       '<thread name="a">\n- Done\n  </thread>\nOutside prose',

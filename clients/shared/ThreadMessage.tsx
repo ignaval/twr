@@ -39,10 +39,16 @@ function delimiter(line: string, streaming: boolean): Delimiter | undefined {
 
 /** A recognized delimiter can be nested in a list item. Lift it to the document
  * level, splitting each ancestor around it so content stays on the correct side
- * of the section boundary. Literal code and unrecognized HTML stay untouched. */
+ * of the section boundary. Only structural containers can be split: definitions
+ * and other semantic nodes stay atomic, including their literal thread tags. */
 function liftDelimiters(node: RootContent): RootContent[] {
   if (node.data?.threadDelimiter?.partial) return [];
-  if (!("children" in node)) return [node];
+  if (
+    node.type !== "list" &&
+    node.type !== "listItem" &&
+    node.type !== "blockquote"
+  )
+    return [node];
   const parts: RootContent[] = [];
   let children: RootContent[] = [];
   let changed = false;
