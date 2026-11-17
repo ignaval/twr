@@ -5326,6 +5326,9 @@ const Conversation = memo(function Conversation({
                   text={block.text}
                   clamp={block.kind === "user" || block.kind === "notice"}
                   streaming={block.kind === "assistant" && !!block.pending}
+                  threadTags={
+                    block.kind === "assistant" && !!target?.is_orchestrator
+                  }
                   expanded={opened.get(block.id) ?? false}
                   onExpandedChange={(open) => setOpen(block.id, open)}
                 />

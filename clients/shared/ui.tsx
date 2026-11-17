@@ -15,6 +15,7 @@ import { externalLink, linkConfirmation } from "./links";
 import { X, LoaderCircle, FolderOpen, Copy, Check, List } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import type { PluggableList } from "unified";
 import type { Field } from "./commands";
 export function Spinner() {
   return (
@@ -479,11 +480,19 @@ const markdownComponents = {
     </div>
   ),
 };
-export const Markdown = memo(function Markdown({ text }: { text: string }) {
+export const Markdown = memo(function Markdown({
+  text,
+  className = "markdown",
+  remarkPlugins = [],
+}: {
+  text: string;
+  className?: string;
+  remarkPlugins?: PluggableList;
+}) {
   return (
-    <div className="markdown">
+    <div className={className}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, ...remarkPlugins]}
         components={markdownComponents}
       >
         {text}

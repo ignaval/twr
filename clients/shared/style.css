@@ -1139,6 +1139,20 @@ kbd {
 .copy-message:focus {
   opacity: 1;
 }
+.thread-sections > * + * {
+  margin-top: 12px;
+}
+.thread-message {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+  min-width: 0;
+}
+.thread-message-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  margin-bottom: 8px;
+}
 .markdown {
   overflow-wrap: anywhere;
   font-size: 1.076923rem;
