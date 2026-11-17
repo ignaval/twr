@@ -20,6 +20,8 @@ const withUser = new URLSearchParams(location.search).has("with-user");
 const combined = new URLSearchParams(location.search).has("combined");
 const short = new URLSearchParams(location.search).has("short");
 const sparse = new URLSearchParams(location.search).has("sparse");
+const fastHistory = new URLSearchParams(location.search).has("fast-history");
+const historyRequests: string[] = [];
 const event = (
   thread: string,
   turn: number,
@@ -60,6 +62,7 @@ declare global {
   interface Window {
     conversationScrollQA: {
       pending: () => string[];
+      historyRequests: () => string[];
       release: (thread: string, turn: number) => void;
       releaseNext: () => void;
       append: () => void;
@@ -69,6 +72,7 @@ declare global {
 }
 window.conversationScrollQA = {
   pending: () => [...pending.keys()],
+  historyRequests: () => [...historyRequests],
   releaseNext: () => {
     const resolve = pending.get("orch:2:next");
     if (!resolve) throw new Error("No pending next page");
@@ -159,6 +163,15 @@ window.twr = {
   rpc: async (method: string, params: Json = {}) => {
     if (method === "desktop.subscribe") subscription = params.subscription;
     if (method === "thread.transcript") {
+      if (params.turn) {
+        historyRequests.push(`${params.thread}:${params.turn}`);
+        if (fastHistory)
+          return {
+            events: history(params.thread, params.turn),
+            turn: params.turn,
+            more: false,
+          };
+      }
       // An older automatic turn spanning two pages. The first page must not
       // become visible before the full turn has arrived.
       if (sparse && params.turn === 2 && params.since_seq)

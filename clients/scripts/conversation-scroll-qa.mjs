@@ -149,6 +149,33 @@ try {
         previewScrollWidth: preview.scrollWidth,
       };
     });
+  const landedOnUser = async (page, text) => {
+    const user = page.locator(".block-user").filter({ hasText: text });
+    await expect(user).toBeFocused();
+    await expect
+      .poll(() =>
+        user.evaluate((node) => {
+          const scroll = node.closest(".conversation-scroll");
+          return Math.abs(
+            node.getBoundingClientRect().top -
+              scroll.getBoundingClientRect().top,
+          );
+        }),
+      )
+      .toBeLessThanOrEqual(1);
+    // Keep checking after the virtualizer's reconciliation and row measurement
+    // frames, not just when focus first reaches the destination.
+    await page.waitForTimeout(250);
+    await expect(user).toBeFocused();
+    expect(
+      await user.evaluate((node) =>
+        Math.abs(
+          node.getBoundingClientRect().top -
+            node.closest(".conversation-scroll").getBoundingClientRect().top,
+        ),
+      ),
+    ).toBeLessThanOrEqual(1);
+  };
 
   for (const mobile of [false, true]) {
     const page = await browser.newPage({
@@ -235,6 +262,53 @@ try {
     await atBottom(page);
     console.log(
       `PASS ${mobile ? "phone" : "desktop"}: automatic bottom-follow remains active`,
+    );
+
+    // Resolve a predecessor lookup immediately: its prepend can beat the
+    // virtualizer's outstanding scrollToIndex reconciliation frames.
+    await page.goto(url + "?with-user&fast-history");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await atBottom(page);
+    await expect(page.locator(".block-user")).toHaveCount(0);
+    for (const turn of [4, 3, 2]) {
+      await page.locator(".latest-user-message button").click();
+      await landedOnUser(page, `Task orch:${turn}`);
+      await expect(page.locator(".latest-user-preview")).toHaveText(
+        `Task orch:${turn - 1}`,
+      );
+      expect(
+        await page.evaluate(() =>
+          window.conversationScrollQA.historyRequests(),
+        ),
+      ).toEqual(
+        Array.from({ length: 5 - turn }, (_, index) => `orch:${3 - index}`),
+      );
+    }
+
+    // Also deliver a request already in flight in the very same browser task
+    // as the click, before any jump-settlement animation frame can run.
+    await page.goto(url + "?with-user");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await atBottom(page);
+    await page.locator(".load-earlier").evaluate((node) => node.click());
+    await pending(page, 3);
+    await page.evaluate(() => {
+      document.querySelector(".latest-user-message button").click();
+      window.conversationScrollQA.release("orch", 3);
+    });
+    await landedOnUser(page, "Task orch:4");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:3",
+    );
+    expect(
+      await page.evaluate(() => window.conversationScrollQA.historyRequests()),
+    ).toEqual(["orch:3"]);
+    console.log(
+      `PASS ${mobile ? "phone" : "desktop"}: fast and already-in-flight prepends during jump settlement preserve the clicked message, focus, and single-step destination`,
     );
 
     await page.goto(url + "?with-user");

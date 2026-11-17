@@ -5132,18 +5132,31 @@ const Conversation = memo(function Conversation({
   useLayoutEffect(() => {
     if (!jumpTarget) return;
     const index = blocks.findIndex((block) => block.id === jumpTarget);
+    if (index < 0) {
+      virtual.cancelScroll();
+      setJumpTarget(undefined);
+      return;
+    }
     const message = parent.current?.querySelector<HTMLElement>(
       `[data-index="${index}"]`,
     );
     const destination = virtual.getOffsetForIndex(index, "start")?.[0];
     if (
-      message &&
-      destination != null &&
-      Math.abs((virtual.scrollOffset ?? 0) - destination) <= 1
+      !message ||
+      destination == null ||
+      Math.abs((virtual.scrollOffset ?? 0) - destination) > 1
     ) {
-      message.focus({ preventScroll: true });
-      setJumpTarget(undefined);
+      // Resolve the ID again on every pending layout: an in-flight history
+      // prepend can move it while the virtualizer still retains a numeric index.
+      virtual.scrollToIndex(index, { align: "start", behavior: "auto" });
+      return;
     }
+    // Alignment can precede the virtualizer's final reconciliation frames.
+    // Retire that numeric command before a fast predecessor lookup prepends
+    // rows under it. Subsequent measurements use normal prepend anchoring.
+    virtual.cancelScroll();
+    message.focus({ preventScroll: true });
+    setJumpTarget(undefined);
   });
   const userIndexes = useMemo(
     () =>
@@ -5197,6 +5210,7 @@ const Conversation = memo(function Conversation({
     // serializes/pages requests and fences their results on thread switches.
     if (
       !previousUser &&
+      !jumpTarget &&
       earlier &&
       !earlierBusy &&
       !loading &&
@@ -5206,7 +5220,15 @@ const Conversation = memo(function Conversation({
       const frame = requestAnimationFrame(() => earlier());
       return () => cancelAnimationFrame(frame);
     }
-  }, [previousUser, earlier, earlierBusy, loading, error, connected]);
+  }, [
+    previousUser,
+    jumpTarget,
+    earlier,
+    earlierBusy,
+    loading,
+    error,
+    connected,
+  ]);
   useEffect(() => {
     if (steppedFrom && !jumpTarget && !atStep) setSteppedFrom(undefined);
   }, [steppedFrom, jumpTarget, atStep]);
@@ -5538,12 +5560,6 @@ const Conversation = memo(function Conversation({
               setFollowing(false);
               setJumpTarget(previousUser.id);
               setSteppedFrom(previousUser.id);
-              // Immediate scrolling lets the virtualizer correct measured row
-              // heights as the destination mounts, and respects reduced motion.
-              virtual.scrollToIndex(previousIndex, {
-                align: "start",
-                behavior: "auto",
-              });
             }}
           >
             <ArrowUpRight size={14} aria-hidden="true" />

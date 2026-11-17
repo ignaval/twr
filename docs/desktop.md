@@ -25,8 +25,9 @@ three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remain
 
 `npm run test:conversation-scroll` checks reading position during delayed history loads,
 scroll-relative user-message shortcuts, repeated keyboard jumps, short histories,
-history paging, live updates, and thread switches on desktop and phone layouts in a
-browser, using a disposable host. It needs Playwright's Chromium or `TWR_CHROMIUM_PATH`.
+history paging (including responses during jump settlement), live updates, and thread
+switches on desktop and phone layouts in a browser, using a disposable host. It needs
+Playwright's Chromium or `TWR_CHROMIUM_PATH`.
 Synthetic touch and momentum cases select the virtualizer's iOS path and verify deferred
 prepend adjustments and shortcut selection while those adjustments are held. They do not
 reproduce native WebKit or physical iOS scrolling.
@@ -98,6 +99,8 @@ results from the previous conversation.
 
 Loading older turns keeps the message you are reading at the same position, including
 when you scroll while a background or manual history request is pending.
+History arriving during a shortcut jump also preserves the message you clicked as its
+destination.
 
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads
