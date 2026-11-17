@@ -1778,8 +1778,10 @@ export default function App({
       const args = parsed.args;
       const chosen = destination || selected;
       const named = (name: string | undefined) =>
-        view.threads.find((thread) =>
-          [thread.id, thread.name, ...(thread.aliases || [])].includes(name),
+        view.threads.find(
+          (thread) =>
+            name !== undefined &&
+            [thread.id, thread.name, ...(thread.aliases || [])].includes(name),
         );
       const thread = (name?: string) => name || chosen;
       const toggle = (
@@ -3403,6 +3405,7 @@ export default function App({
                   }
                   earlierBusy={earlierBusy}
                   target={target}
+                  threads={view.threads}
                   onSetup={setupOrchestrator}
                   connected={connected}
                   summaries={assistance.summaries}
@@ -5040,6 +5043,7 @@ const Conversation = memo(function Conversation({
   earlier,
   earlierBusy,
   target,
+  threads,
   onSetup,
   connected,
   summaries,
@@ -5060,6 +5064,7 @@ const Conversation = memo(function Conversation({
   earlier?: () => void;
   earlierBusy: boolean;
   target?: Thread;
+  threads: Thread[];
   onSetup: () => void;
   connected: boolean;
 }) {
@@ -5380,6 +5385,7 @@ const Conversation = memo(function Conversation({
                   threadTags={
                     block.kind === "assistant" && !!target?.is_orchestrator
                   }
+                  threads={threads}
                   expanded={opened.get(block.id) ?? false}
                   onExpandedChange={(open) => setOpen(block.id, open)}
                 />

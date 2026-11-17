@@ -231,6 +231,62 @@ try {
     await expect(
       page.locator('section.thread-message[aria-label="reviewer"] li'),
     ).toHaveCount(2);
+    for (const theme of ["light", "dark"]) {
+      await page.evaluate((theme) => {
+        document.documentElement.dataset.theme = theme;
+      }, theme);
+      for (const [name, color] of [
+        ["builder", "rgb(0, 135, 175)"],
+        ["reviewer", "rgb(255, 0, 255)"],
+      ]) {
+        const section = page.locator(
+          `section.thread-message[aria-label="${name}"]`,
+        );
+        await expect(section).toHaveCSS("border-top-color", color);
+        const card = page
+          .locator(".sidebar .thread-card")
+          .filter({ hasText: name });
+        const ink = await card.evaluate((node) => {
+          const probe = document.createElement("span");
+          probe.className = "thread-ink";
+          node.append(probe);
+          const color = getComputedStyle(probe).color;
+          probe.remove();
+          return color;
+        });
+        await expect(section.locator(".thread-message-name")).toHaveCSS(
+          "color",
+          ink,
+        );
+      }
+      const unknown = page.locator(
+        'section.thread-message[aria-label="missing"]',
+      );
+      const neutral = await page
+        .locator(".app")
+        .evaluate((node) =>
+          getComputedStyle(node).getPropertyValue("--border").trim(),
+        );
+      // Compare computed colors so CSS hex/rgb/color-mix serialization is irrelevant.
+      expect(
+        await unknown.evaluate((node, neutral) => {
+          const probe = document.createElement("span");
+          probe.style.color = neutral;
+          node.append(probe);
+          const matches =
+            getComputedStyle(node).borderTopColor ===
+            getComputedStyle(probe).color;
+          probe.remove();
+          return matches;
+        }, neutral),
+      ).toBe(true);
+      await page.screenshot({
+        path: `test-results/thread-box-colors-${theme}.png`,
+      });
+    }
+    console.log(
+      "PASS thread box colors: distinct assigned palette colors, readable theme inks, and neutral unknown-thread borders in light and dark",
+    );
     await page
       .getByRole("textbox", { name: "Message orchestrator", exact: true })
       .fill("Orchestrator draft");

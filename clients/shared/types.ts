@@ -3,6 +3,8 @@ export type Json = any;
 export interface Thread {
   id: string;
   name: string;
+  aliases?: string[];
+  former_names?: string[];
   project?: string;
   runtime: string;
   box_name: string;

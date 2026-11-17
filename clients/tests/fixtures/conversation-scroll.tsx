@@ -43,7 +43,7 @@ function history(thread: string, turn: number) {
       event(thread, turn, turn * 100 + index + 1, "agent.text", {
         text:
           combined && index === 59
-            ? 'Summary before boxes.\n\n<thread name="builder">\n**Ready** with `code` and [shared reference][guide].\n</thread>\n\n<thread name="reviewer">\n- Checked Markdown\n- Checked navigation\n</thread>\n\n[guide]: https://example.com/guide'
+            ? 'Summary before boxes.\n\n<thread name="builder">\n**Ready** with `code` and [shared reference][guide].\n</thread>\n\n<thread name="reviewer">\n- Checked Markdown\n- Checked navigation\n</thread>\n\n<thread name="missing">\nUnknown worker update.\n</thread>\n\n[guide]: https://example.com/guide'
             : `Message ${thread}:${turn}:${index}\n\n${"Variable row height. ".repeat(5 + (index % 9) * 13)}`,
       }),
     ),
@@ -114,7 +114,17 @@ window.twr = {
                     box_name: "local",
                     mode: "default",
                     status: "idle",
-                    accent: "#3366ff",
+                    accent: "#0087af",
+                  },
+                  {
+                    id: "reviewer",
+                    name: "reviewer",
+                    is_orchestrator: false,
+                    runtime: "fake",
+                    box_name: "local",
+                    mode: "default",
+                    status: "idle",
+                    accent: "#ff00ff",
                   },
                 ]
               : []),

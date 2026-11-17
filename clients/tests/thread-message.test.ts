@@ -2,6 +2,8 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { MessageBody } from "../shared/MessageBody";
+import { THREAD_COLORS, threadInk } from "../shared/threadColor";
+import type { Thread } from "../shared/types";
 
 vi.mock("../shared/host", () => ({
   useHostAPI: () => ({
@@ -12,7 +14,12 @@ vi.mock("../shared/host", () => ({
 
 const render = (
   text: string,
-  options: { threadTags?: boolean; streaming?: boolean; mono?: boolean } = {},
+  options: {
+    threadTags?: boolean;
+    streaming?: boolean;
+    mono?: boolean;
+    threads?: Thread[];
+  } = {},
 ) =>
   renderToStaticMarkup(
     createElement(MessageBody, {
@@ -26,12 +33,145 @@ const render = (
 const boxes = (html: string) =>
   Array.from(
     html.matchAll(
-      /<section class="thread-message" aria-label="([^"]*)">([\s\S]*?)<\/section>/g,
+      /<section class="thread-message" aria-label="([^"]*)"[^>]*>([\s\S]*?)<\/section>/g,
     ),
     (match) => ({ name: match[1], html: match[2] }),
   );
 
 describe("orchestrator thread sections", () => {
+  const worker = (overrides: Partial<Thread> = {}): Thread => ({
+    id: "t1",
+    name: "api",
+    accent: THREAD_COLORS[1],
+    runtime: "fake",
+    box_name: "local",
+    mode: "default",
+    status: "idle",
+    is_orchestrator: false,
+    ...overrides,
+  });
+  const section = (name: string, threads: Thread[], streaming = false) =>
+    render(
+      `<thread name="${name}">\n**Working**\n${streaming ? "</thr" : "</thread>"}`,
+      { threads, streaming },
+    );
+
+  it("uses each assigned palette color and both readable inks without coloring Markdown body text", () => {
+    for (const accent of THREAD_COLORS) {
+      const html = section("api", [worker({ accent })]);
+      expect(html).toContain(`--thread-color:${accent}`);
+      expect(html).toContain(
+        `--thread-ink-light:${threadInk(accent, "light")}`,
+      );
+      expect(html).toContain(`--thread-ink-dark:${threadInk(accent, "dark")}`);
+      expect(html).toContain(
+        `--thread-ink-omarchy:var(--omarchy-ink-${accent.slice(1)}, var(--text))`,
+      );
+      expect(html).toContain('class="thread-message-name thread-ink"');
+      expect(html).toMatch(
+        /<div class="markdown">\s*<p><strong>Working<\/strong><\/p>/,
+      );
+    }
+    const html = render(
+      '<thread name="api">\nOne\n</thread>\n<thread name="docs">\nTwo\n</thread>',
+      {
+        threads: [
+          worker(),
+          worker({ id: "t2", name: "docs", accent: THREAD_COLORS[0] }),
+        ],
+      },
+    );
+    expect(html).toContain(`--thread-color:${THREAD_COLORS[0]}`);
+    expect(html).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+  });
+
+  it.each(["t1", "api", "backend", "old-api"])(
+    "resolves exact identity %s including renamed threads",
+    (name) => {
+      expect(
+        section(name, [
+          worker({ aliases: ["backend"], former_names: ["old-api"] }),
+        ]),
+      ).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+    },
+  );
+
+  it("prefers ids, then current names, then aliases over former names, independent of row order", () => {
+    const threads = [
+      worker({
+        id: "old",
+        name: "renamed",
+        former_names: ["api", "backend"],
+        accent: THREAD_COLORS[2],
+      }),
+      worker({
+        id: "other",
+        name: "other",
+        aliases: ["api", "backend"],
+        accent: THREAD_COLORS[3],
+      }),
+      worker(),
+      worker({ id: "api", name: "id-match", accent: THREAD_COLORS[4] }),
+    ];
+    for (const rows of [threads, [...threads].reverse()]) {
+      expect(section("api", rows)).toContain(
+        `--thread-color:${THREAD_COLORS[4]}`,
+      );
+      expect(
+        section(
+          "api",
+          rows.filter((t) => t.id !== "api"),
+        ),
+      ).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+      expect(section("backend", rows)).toContain(
+        `--thread-color:${THREAD_COLORS[3]}`,
+      );
+    }
+  });
+
+  it("keeps unknown, missing, invalid-color and ambiguous threads neutral without guessing prefixes", () => {
+    for (const [name, threads] of [
+      ["missing", [worker()]],
+      ["api", []],
+      ["ap", [worker()]],
+      ["api", [worker({ accent: "invalid" })]],
+      ["api", [worker(), worker({ id: "t2" })]],
+      [
+        "old",
+        [
+          worker({ former_names: ["old"] }),
+          worker({ id: "t2", name: "docs", former_names: ["old"] }),
+        ],
+      ],
+    ] as [string, Thread[]][]) {
+      const html = section(name, threads);
+      expect(html).not.toContain("--thread-color:");
+      expect(boxes(html)).toHaveLength(1);
+      expect(html).toContain("<strong>Working</strong>");
+    }
+    expect(
+      section("api", [
+        worker({ stopped: true }),
+        worker({ id: "t2", accent: THREAD_COLORS[2] }),
+      ]),
+    ).toContain(`--thread-color:${THREAD_COLORS[2]}`);
+  });
+
+  it("colors streaming sections and refreshes identity data even when the reply text is unchanged", () => {
+    const html = section("api", [worker()], true);
+    expect(html).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+    expect(html).toContain("<strong>Working</strong>");
+    expect(html).not.toContain("&lt;/thr");
+    expect(
+      section(
+        "api",
+        [worker({ name: "renamed", former_names: ["api"] })],
+        true,
+      ),
+    ).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+    expect(section("api", [], true)).not.toContain("--thread-color:");
+  });
+
   it("preserves a footnote definition atomically when its body contains thread tags", () => {
     const html = render(
       'Text[^n].\n\n[^n]: Before.\n    <thread name="a">\n    Inside.\n    </thread>\n    After.',
@@ -416,7 +556,7 @@ describe("orchestrator thread sections", () => {
       'class="thread-message" aria-label="install-topbar-fix"',
     );
     expect(html).toContain(
-      '<div class="thread-message-name">install-topbar-fix</div>',
+      '<div class="thread-message-name thread-ink">install-topbar-fix</div>',
     );
     expect(html).toContain("Started the merge");
     expect(html).toMatch(
