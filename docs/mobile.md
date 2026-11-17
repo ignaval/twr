@@ -54,7 +54,19 @@ The message field grows with what you write, wrapped lines included, at every te
 
 ## Voice
 
-The composer's microphone talks to the orchestrator: tap it to talk and tap again to send, hold it and let go, or start a hands-free session that sends one message per utterance and reads the replies aloud. The phone's own recognizer turns speech into text; the text goes through `say` like a typed message (marked as spoken), so a transcript that reads as an answer or a mode change comes back for confirmation instead. No audio leaves the phone except to the platform's recognizer when it is not on the device (below). Saying only "stop", "pause", "skip", "repeat" or "stop listening" controls the voice and is never sent.
+The composer's microphone dictates into the current conversation's message box: tap to talk
+and tap again to transcribe, or hold and let go. It appends to existing text, focuses the
+editor, and waits for you to edit and press **Send**. **Cancel dictation** drops pending
+recognition; switching conversations or workspaces drops late results. The waveform button
+starts a **hands-free conversation** that automatically sends one message per utterance to
+the orchestrator and reads its replies aloud, preserving the current draft. The phone's own
+recognizer turns speech into text; no audio leaves the phone except to the platform's
+recognizer when it is not on the device (below). Dictated drafts keep their spoken origin
+through edits and encrypted saves/reloads. On Send, an orchestrator transcript that reads
+as an answer or mode change requires **Review in message box**, then another explicit Send;
+dictated slash/shell commands also require review. In hands-free, saying only "stop", "pause",
+"skip", "repeat" or "stop listening" controls the voice and is never sent. In dictation those
+words are literal text. See [voice.md](voice.md) for routing and review details.
 
 | | iOS | Android |
 |---|---|---|
