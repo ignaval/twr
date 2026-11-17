@@ -64,6 +64,11 @@ to this thread** (or a double-click) deliberately changes the composer destinati
 composer always names its destination. Mentions reference threads without changing it.
 Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
 
+The first line of your latest message stays above the history in the orchestrator and
+each thread's conversation, on desktop and phone. Click it (or focus it and press Enter
+or Space) to jump to that message. Older turns load as needed to find it when automatic
+turns have followed it. While offline, the line uses the history saved on this device.
+
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads
 cannot be answered from a preview. As in the TUI, a request's buttons and number keys answer

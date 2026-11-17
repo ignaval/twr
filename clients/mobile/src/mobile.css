@@ -523,6 +523,10 @@ select {
   [data-mobile="true"] .conversation-scroll {
     padding: 8px 12px 12px;
   }
+  [data-mobile="true"] .latest-user-message > button,
+  [data-mobile="true"] .latest-user-empty {
+    padding-inline: 12px;
+  }
   [data-mobile="true"] .dialog {
     width: 100%;
     max-height: calc(100% - 12px);

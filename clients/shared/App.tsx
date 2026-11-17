@@ -1196,14 +1196,15 @@ export default function App({
         all.push(...page.events);
       }
       const cursor = page.next || 0;
-      // Give short conversations useful context immediately. Older turns remain
-      // paged, and the virtual list asks for more when the user reaches the top.
+      // Find the latest user message even when recent turns were automatic. Also
+      // give short conversations some context; the rest stays paged.
       for (
         let n = 0;
-        n < 3 &&
         firstTurn &&
         firstTurn > 1 &&
-        blocksOf(all).reduce((sum, b) => sum + b.text.length, 0) < 3000;
+        (!blocksOf(all).some((b) => b.kind === "user") ||
+          (n < 3 &&
+            blocksOf(all).reduce((sum, b) => sum + b.text.length, 0) < 3000));
         n++
       ) {
         let older = await rpc("thread.transcript", {
@@ -4977,6 +4978,9 @@ const Conversation = memo(function Conversation({
 }) {
   const hostApi = useHostAPI();
   const parent = useRef<HTMLDivElement>(null);
+  const list = useRef<HTMLDivElement>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const [jumpTarget, setJumpTarget] = useState<string>();
   const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
@@ -5009,7 +5013,32 @@ const Conversation = memo(function Conversation({
     estimateSize: () => 120,
     overscan: 8,
     getItemKey: (index) => blocks[index].id,
+    scrollMargin,
   });
+  // Controls and loading/error notices precede the virtual rows in the scroller.
+  // Include their height when locating a message, including after a resize.
+  useLayoutEffect(() => {
+    const measure = () => setScrollMargin(list.current?.offsetTop ?? 0);
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (parent.current) observer.observe(parent.current);
+    return () => observer.disconnect();
+  }, [loading, error, earlier, earlierBusy]);
+  useLayoutEffect(() => {
+    if (!jumpTarget) return;
+    const index = blocks.findIndex((block) => block.id === jumpTarget);
+    const message = parent.current?.querySelector<HTMLElement>(
+      `[data-index="${index}"]`,
+    );
+    if (message) {
+      message.focus({ preventScroll: true });
+      setJumpTarget(undefined);
+    }
+  });
+  const latestUser = blocks.findLast((block) => block.kind === "user");
+  const latestUserLine = latestUser
+    ? latestUser.text.split(/\r\n|\r|\n/, 1)[0].trim() || "Blank first line"
+    : "";
   const totalSize = virtual.getTotalSize();
   useLayoutEffect(() => {
     const element = parent.current;
@@ -5055,13 +5084,14 @@ const Conversation = memo(function Conversation({
     }
   }, [blocks[0]?.id]);
   useEffect(() => {
-    if (follow.current && blocks.length)
-      requestAnimationFrame(() => {
-        if (parent.current)
-          parent.current.scrollTop = parent.current.scrollHeight;
-      });
+    if (!follow.current || !blocks.length) return;
+    const frame = requestAnimationFrame(() => {
+      if (follow.current && parent.current)
+        parent.current.scrollTop = parent.current.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [blocks.length, last?.text, totalSize]);
-  return (
+  const history = (
     <div
       className="conversation-scroll"
       ref={parent}
@@ -5137,6 +5167,7 @@ const Conversation = memo(function Conversation({
         </Empty>
       )}
       <div
+        ref={list}
         className="transcript-virtual"
         style={{ height: totalSize, position: "relative" }}
       >
@@ -5148,12 +5179,14 @@ const Conversation = memo(function Conversation({
               data-index={row.index}
               ref={virtual.measureElement}
               className={`transcript-block block-${block.kind}`}
+              tabIndex={block.kind === "user" ? -1 : undefined}
+              aria-label={block.kind === "user" ? "Your message" : undefined}
               style={{
                 position: "absolute",
                 top: 0,
                 left: 0,
                 width: "100%",
-                transform: `translateY(${row.start}px)`,
+                transform: `translateY(${row.start - scrollMargin}px)`,
               }}
             >
               <div className="message-meta">
@@ -5289,6 +5322,42 @@ const Conversation = memo(function Conversation({
         </button>
       )}
     </div>
+  );
+  return (
+    <>
+      <div className="latest-user-message">
+        {latestUser ? (
+          <button
+            type="button"
+            title={latestUserLine}
+            aria-label={`Jump to your latest message: ${latestUserLine}`}
+            onClick={() => {
+              follow.current = false;
+              setFollowing(false);
+              anchor.current = undefined;
+              setJumpTarget(latestUser.id);
+              // Immediate scrolling lets the virtualizer correct measured row
+              // heights as the destination mounts, and respects reduced motion.
+              virtual.scrollToIndex(blocks.indexOf(latestUser), {
+                align: "start",
+                behavior: "auto",
+              });
+            }}
+          >
+            <ArrowUpRight size={14} aria-hidden="true" />
+            <span className="latest-user-label">You</span>
+            <span className="latest-user-preview">{latestUserLine}</span>
+          </button>
+        ) : (
+          <span className="latest-user-empty" role="status">
+            {loading
+              ? "Loading your latest message…"
+              : "No messages from you yet"}
+          </span>
+        )}
+      </div>
+      {history}
+    </>
   );
 });
 function ContextEditor({

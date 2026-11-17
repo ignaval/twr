@@ -1010,6 +1010,50 @@ kbd {
   gap: 4px;
   flex-shrink: 0;
 }
+.latest-user-message {
+  flex-shrink: 0;
+  min-width: 0;
+  border-block: 1px solid var(--border);
+}
+.latest-user-message > button,
+.latest-user-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  width: 100%;
+  padding: 8px 24px;
+  font-size: 0.923077rem;
+  line-height: 1.5;
+}
+.latest-user-message > button {
+  justify-content: flex-start;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  text-align: start;
+}
+.latest-user-message > button:hover {
+  background: var(--hover);
+}
+.latest-user-message > button:focus-visible,
+.transcript-block:focus-visible {
+  outline-offset: -2px;
+}
+.latest-user-message svg,
+.latest-user-label {
+  flex-shrink: 0;
+}
+.latest-user-label,
+.latest-user-empty {
+  color: var(--muted);
+}
+.latest-user-preview {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .conversation-scroll {
   flex: 1;
   min-height: 40px;
