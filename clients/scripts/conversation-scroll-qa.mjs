@@ -129,6 +129,26 @@ try {
           ),
       )
       .toBeLessThanOrEqual(2);
+  const shortcutSize = (page) =>
+    page.locator(".latest-user-message button").evaluate((button) => {
+      const preview = button.querySelector(".latest-user-preview");
+      const style = getComputedStyle(button);
+      const children = [...button.children];
+      return {
+        width: button.getBoundingClientRect().width,
+        rowWidth: button.parentElement.getBoundingClientRect().width,
+        contentWidth:
+          children.reduce(
+            (sum, child) => sum + child.getBoundingClientRect().width,
+            0,
+          ) +
+          parseFloat(style.columnGap) * (children.length - 1) +
+          parseFloat(style.paddingLeft) +
+          parseFloat(style.paddingRight),
+        previewWidth: preview.clientWidth,
+        previewScrollWidth: preview.scrollWidth,
+      };
+    });
 
   for (const mobile of [false, true]) {
     const page = await browser.newPage({
@@ -215,6 +235,84 @@ try {
     await atBottom(page);
     console.log(
       `PASS ${mobile ? "phone" : "desktop"}: automatic bottom-follow remains active`,
+    );
+
+    await page.goto(url + "?with-user");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await atBottom(page);
+    const compact = await shortcutSize(page);
+    expect(Math.abs(compact.width - compact.contentWidth)).toBeLessThanOrEqual(
+      1,
+    );
+    expect(compact.width).toBeLessThan(compact.rowWidth - 40);
+    const rowBox = await page.locator(".latest-user-message").boundingBox();
+    const beforeEmptyClick = await read(page);
+    const emptyPoint = {
+      x: rowBox.x + rowBox.width - 4,
+      y: rowBox.y + rowBox.height / 2,
+    };
+    expect(
+      await page.evaluate(
+        ({ x, y }) =>
+          !!document
+            .elementFromPoint(x, y)
+            ?.closest(".latest-user-message button"),
+        emptyPoint,
+      ),
+    ).toBe(false);
+    await page.mouse.click(emptyPoint.x, emptyPoint.y);
+    await unchanged(page, beforeEmptyClick);
+    await expect(page.locator(".block-user:focus")).toHaveCount(0);
+    expect(
+      await page.evaluate(() => window.conversationScrollQA.pending()),
+    ).toEqual([]);
+    await page.evaluate(() =>
+      window.conversationScrollQA.appendUser("A somewhat longer request"),
+    );
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "A somewhat longer request",
+    );
+    const wider = await shortcutSize(page);
+    expect(wider.width).toBeGreaterThan(compact.width);
+    expect(wider.width).toBeLessThan(wider.rowWidth);
+    const longPrompt = "UnbrokenRequest".repeat(100);
+    await page.evaluate(
+      (prompt) => window.conversationScrollQA.appendUser(prompt),
+      longPrompt,
+    );
+    await expect(page.locator(".latest-user-preview")).toHaveText(longPrompt);
+    const long = await shortcutSize(page);
+    expect(long.width).toBeLessThanOrEqual(long.rowWidth);
+    expect(long.previewScrollWidth).toBeGreaterThan(long.previewWidth);
+    await page.setViewportSize({
+      width: mobile ? 320 : 900,
+      height: mobile ? 844 : 800,
+    });
+    const narrow = await shortcutSize(page);
+    expect(narrow.width).toBeLessThan(long.width);
+    expect(narrow.width).toBeLessThanOrEqual(narrow.rowWidth);
+    expect(narrow.previewScrollWidth).toBeGreaterThan(narrow.previewWidth);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= window.innerWidth,
+      ),
+    ).toBe(true);
+    await page.evaluate(() => window.conversationScrollQA.appendUser("Tiny"));
+    await expect(page.locator(".latest-user-preview")).toHaveText("Tiny");
+    expect((await shortcutSize(page)).width).toBeLessThan(compact.width);
+    await page.locator(".latest-user-message button").focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator(".block-user:focus-visible")).toContainText(
+      "Tiny",
+    );
+    await page.setViewportSize({
+      width: mobile ? 390 : 1280,
+      height: mobile ? 844 : 800,
+    });
+    console.log(
+      `PASS ${mobile ? "phone" : "desktop"}: shortcut width follows its text, empty row space is not clickable, long text truncates within responsive bounds, and keyboard jumping remains available`,
     );
 
     await page.goto(url + "?with-user&combined");

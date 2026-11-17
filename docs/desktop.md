@@ -78,6 +78,8 @@ message. While browsing, it is the last user message whose start lies above the 
 viewport's top edge, with a 1 CSS pixel tolerance. Reaching or passing its start while
 scrolling upward changes the shortcut to the previous user message. Scrolling downward
 updates it in the other direction.
+The clickable link fits its displayed contents; the empty remainder of the row is not
+clickable. Long previews truncate within the conversation width as the window narrows.
 
 Click the shortcut (or focus it and press Enter or Space) to jump and focus that message,
 with a visible keyboard focus outline. Each activation steps backward, even if a short

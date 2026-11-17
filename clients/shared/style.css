@@ -1027,6 +1027,8 @@ kbd {
   line-height: 1.5;
 }
 .latest-user-message > button {
+  width: fit-content;
+  max-width: 100%;
   justify-content: flex-start;
   border: 0;
   border-radius: 0;

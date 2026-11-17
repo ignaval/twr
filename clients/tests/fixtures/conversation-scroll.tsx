@@ -63,7 +63,7 @@ declare global {
       release: (thread: string, turn: number) => void;
       releaseNext: () => void;
       append: () => void;
-      appendUser: () => void;
+      appendUser: (prompt?: string) => void;
     };
   }
 }
@@ -95,13 +95,13 @@ window.conversationScrollQA = {
         text: "Live reply below the viewport. ".repeat(200),
       }),
     }),
-  appendUser: () =>
+  appendUser: (prompt = "Live user request") =>
     emit({
       type: "thread",
       subscription,
       event: event("orch", 5, sequence++, "turn.started", {
         from: "user",
-        prompt: "Live user request",
+        prompt,
       }),
     }),
 };
