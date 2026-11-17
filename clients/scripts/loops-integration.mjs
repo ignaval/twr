@@ -2461,6 +2461,13 @@ exit 1
   await boxStatus.filter({ hasText: "waiting on the review" }).waitFor();
   const boxRounds = boxLoops.getByRole("list", { name: "Rounds" });
   await boxRounds.getByText("m1 under review").waitFor();
+  // Reopening details fetches the run metadata independently of the live state.
+  // Measure after Runs on arrives so this compares the box's connection change,
+  // rather than the initial detail load adding a row above the controls.
+  await boxLoops
+    .locator(".loop-facts dt")
+    .getByText("Runs on", { exact: true })
+    .waitFor();
   const boxControls = boxLoops.getByRole("group", { name: "Loop controls" });
   const pauseTop = () =>
     boxControls
