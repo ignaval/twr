@@ -141,6 +141,7 @@ function rig(
     submit?: (text: string) => Promise<Record<string, string>>;
     start?: () => Promise<void>;
     prepare?: () => Promise<boolean>;
+    live?: (on: boolean) => Promise<void>;
   } = {},
 ) {
   let events: VoiceCaptureEvents | undefined;
@@ -180,6 +181,7 @@ function rig(
       },
       async live(on) {
         log.push("live:" + on);
+        await options.live?.(on);
       },
     },
     draft: (text) => {
@@ -206,6 +208,56 @@ function rig(
 }
 
 describe("voice session", () => {
+  it("re-enables live reading each time hands-free starts after the toolbar turned it off", async () => {
+    let live = false;
+    const r = rig(undefined, {
+      live: async (on) => {
+        live = on;
+      },
+    });
+    await r.session.begin();
+    expect(live).toBe(true);
+    await r.session.end();
+    // The toolbar changes the workspace's reported live setting independently.
+    live = false;
+    r.session.speakerState({ playing: false, paused: false, queued: 0 });
+    await r.session.begin();
+    expect(live).toBe(true);
+    expect(r.log.filter((entry) => entry === "live:true")).toHaveLength(2);
+    r.events().speechStart();
+    await r.say("Read the new reply");
+    expect(r.sent).toEqual(["Read the new reply"]);
+    await r.session.end();
+    // Dictation never enables reading, even after a hands-free session.
+    live = false;
+    await r.session.press();
+    await r.say("An editable draft");
+    expect(live).toBe(false);
+    expect(r.drafted).toEqual(["An editable draft"]);
+    expect(r.log.filter((entry) => entry === "live:true")).toHaveLength(2);
+  });
+  it("preserves toolbar-off during an ongoing hands-free session while continuing to send", async () => {
+    let live = false;
+    const r = rig(undefined, {
+      live: async (on) => {
+        live = on;
+      },
+    });
+    await r.session.begin();
+    live = false;
+    r.session.speakerState({ playing: false, paused: false, queued: 0 });
+    // An already active session is not a new start.
+    await r.session.begin();
+    for (const text of ["First request", "Second request"]) {
+      r.events().speechStart();
+      await r.say(text);
+      expect(live).toBe(false);
+    }
+    expect(r.sent).toEqual(["First request", "Second request"]);
+    expect(r.session.state.phase).toBe("listening");
+    expect(r.log.filter((entry) => entry === "live:true")).toHaveLength(1);
+  });
+
   it("dictates literal controls and permission words without acting on them", async () => {
     const r = rig();
     for (const text of [

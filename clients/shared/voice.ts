@@ -657,7 +657,6 @@ export class VoiceSession {
   private starting = false;
   private ending = 0;
   private releaseWanted = false;
-  private speakerStarted = false;
   private busy = Promise.resolve();
   /** Invalidates callbacks and queued recognition when the context ends. */
   private generation = 0;
@@ -919,17 +918,15 @@ export class VoiceSession {
     if (skip) await this.deps.speaker.control("skip").catch(() => {});
     await this.deps.speaker.control("resume").catch(() => {});
   }
-  /** This device's speaker reads the replies: started once, the first time voice is used. */
+  /** Each new hands-free session enables live reading; toolbar-off during it stays off. */
   private async startSpeaker() {
-    if (this.speakerStarted || !this.deps.speaker) return;
-    this.speakerStarted = true;
+    if (!this.deps.speaker) return;
     const generation = this.generation;
     try {
       await this.deps.speaker.live(true);
     } catch (error) {
       if (generation !== this.generation) return;
       // An older gateway or a missing engine: voice still sends, nothing is read aloud here.
-      this.speakerStarted = false;
       this.set({
         error:
           "Replies are not read aloud on this device: " +

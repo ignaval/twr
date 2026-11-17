@@ -18,7 +18,9 @@ orchestrator and reads its replies aloud ([read-aloud.md](read-aloud.md)) on tha
 - **Hands-free conversation:** the waveform button beside it (`Cmd-Shift-L`) listens until you stop it.
   Each thing you say is one message, sent once you pause for two seconds (`[voice] pause_ms`),
   so a pause to think mid-sentence doesn't send half of it. The orchestrator's replies are read
-  aloud as they come, and it stops listening while they are (below).
+  aloud as they come, and it stops listening while they are (below). Each new hands-free
+  session turns live reading on. Turning it off in the read-aloud toolbar during a session
+  leaves listening and automatic sending active; the next session turns reading on again.
 
 The audio stays on your device. The hub gets the text, never a recording.
 
