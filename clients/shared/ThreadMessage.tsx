@@ -1,90 +1,179 @@
+import type { Blockquote, Root, RootContent } from "mdast";
+import type { Extension as FromMarkdownExtension } from "mdast-util-from-markdown";
+import type { Extension, State, Tokenizer } from "micromark-util-types";
+import type { Plugin } from "unified";
+import { memo } from "react";
 import { Markdown } from "./ui";
 
-type Section = { name?: string; text: string };
+declare module "micromark-util-types" {
+  interface TokenTypeMap {
+    threadDelimiter: "threadDelimiter";
+  }
+}
+
+declare module "mdast" {
+  interface Data {
+    threadDelimiter?: Delimiter;
+  }
+}
+
+type Delimiter = { name?: string; partial?: boolean };
+type Options = { text: string; streaming: boolean };
 const OPEN = '<thread name="';
 const CLOSE = "</thread>";
 
-/** Orchestrator tags are whole lines, never inline markup. Like the TUI, a new
- * opening tag ends the previous section, and an unfinished section runs to EOF.
- * Code examples keep their literal tags. */
-export function threadSections(text: string, streaming = false): Section[] {
-  if (!text.includes("<")) return [{ text }];
-  const sections: Section[] = [];
-  let name: string | undefined;
-  let body: string[] = [];
-  let fence: { character: string; length: number } | undefined;
-  const flush = () => {
-    const content = body.join("\n");
-    if (name !== undefined || content.trim())
-      sections.push({ name, text: content });
-    body = [];
-  };
-  const lines = text.split("\n");
-  for (const [index, line] of lines.entries()) {
-    if (fence) {
-      body.push(line);
-      const end = /^ {0,3}(`+|~+)[ \t]*\r?$/.exec(line);
-      if (end && end[1][0] === fence.character && end[1].length >= fence.length)
-        fence = undefined;
-      continue;
-    }
-    const start = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
-    if (start && (start[1][0] !== "`" || !start[2].includes("`"))) {
-      fence = { character: start[1][0], length: start[1].length };
-      body.push(line);
-      continue;
-    }
-    // Four spaces or a tab is Markdown code, not a protocol delimiter.
-    if (/^( {4}|\t)/.test(line)) {
-      body.push(line);
-      continue;
-    }
-    const tag = line.trim();
-    const opened = /^<thread name="([^"\r\n]+)">$/.exec(tag)?.[1].trim();
-    if (opened || tag === CLOSE) {
-      flush();
-      name = opened || undefined;
-    } else if (
-      streaming &&
-      index === lines.length - 1 &&
-      tag &&
-      (CLOSE.startsWith(tag) ||
-        OPEN.startsWith(tag) ||
-        (tag.startsWith(OPEN) && !tag.includes(">")))
-    ) {
-      // Hold a trailing partial delimiter until the next streaming update.
-      body.push("");
-    } else {
-      body.push(line);
-    }
-  }
-  flush();
-  return sections;
+function delimiter(line: string, streaming: boolean): Delimiter | undefined {
+  const tag = line.trim();
+  const name = /^<thread name="([^"\r\n]+)">$/.exec(tag)?.[1].trim();
+  if (name) return { name };
+  if (tag === CLOSE) return {};
+  if (
+    streaming &&
+    tag &&
+    (CLOSE.startsWith(tag) ||
+      OPEN.startsWith(tag) ||
+      (tag.startsWith(OPEN) && !tag.includes(">")))
+  )
+    return { partial: true };
 }
 
-export function ThreadMessage({
+/** Register a flow construct, so Markdown decides whether a line is prose or
+ * literal code (including fences nested in lists and quotes). A delimiter ends
+ * a Markdown block but leaves the whole reply in one document for references. */
+const remarkThreadSections: Plugin<[Options], Root> = function ({
   text,
   streaming,
-}: {
-  text: string;
-  streaming: boolean;
 }) {
+  const tokenize: Tokenizer = function (effects, ok, nok) {
+    const offset = this.now().offset;
+    const lineStart =
+      Math.max(
+        text.lastIndexOf("\n", offset - 1),
+        text.lastIndexOf("\r", offset - 1),
+      ) + 1;
+    const newline = text.indexOf("\n", offset);
+    const carriage = text.indexOf("\r", offset);
+    const lineEnd = Math.min(
+      newline === -1 ? text.length : newline,
+      carriage === -1 ? text.length : carriage,
+    );
+    // A quote/list marker before '<' makes this an example, not a protocol tag.
+    if (
+      !/^[ \t]*$/.test(text.slice(lineStart, offset)) ||
+      !delimiter(
+        text.slice(offset, lineEnd),
+        streaming && lineEnd === text.length,
+      )
+    )
+      return nok;
+
+    const consume: State = (code) => {
+      // Micromark represents CRLF, LF and CR with these virtual character codes.
+      if (code === null || code === -3 || code === -4 || code === -5) {
+        effects.exit("threadDelimiter");
+        return ok(code);
+      }
+      effects.consume(code);
+      return consume;
+    };
+    return (code) => {
+      effects.enter("threadDelimiter");
+      return consume(code);
+    };
+  };
+  const fromMarkdown: FromMarkdownExtension = {
+    enter: {
+      threadDelimiter(token) {
+        const value = this.sliceSerialize(token);
+        this.enter(
+          {
+            type: "html",
+            value,
+            data: { threadDelimiter: delimiter(value, streaming) },
+          },
+          token,
+        );
+      },
+    },
+    exit: {
+      threadDelimiter(token) {
+        this.exit(token);
+      },
+    },
+  };
+  const data = this.data() as {
+    micromarkExtensions?: Extension[];
+    fromMarkdownExtensions?: FromMarkdownExtension[];
+  };
+  (data.micromarkExtensions ??= []).push({
+    flow: { 60: { name: "threadDelimiter", tokenize } },
+  });
+  (data.fromMarkdownExtensions ??= []).push(fromMarkdown);
+
+  return (tree) => {
+    const sections: RootContent[] = [];
+    let name: string | undefined;
+    let body: RootContent[] = [];
+    const flush = () => {
+      if (name !== undefined || body.length) {
+        const content: Blockquote = {
+          type: "blockquote",
+          children: body as Blockquote["children"],
+          data: { hName: "div", hProperties: { className: ["markdown"] } },
+        };
+        sections.push(
+          name === undefined
+            ? content
+            : {
+                type: "blockquote",
+                data: {
+                  hName: "section",
+                  hProperties: {
+                    className: ["thread-message"],
+                    ariaLabel: name,
+                  },
+                },
+                children: [
+                  {
+                    type: "paragraph",
+                    children: [{ type: "text", value: name }],
+                    data: {
+                      hName: "div",
+                      hProperties: { className: ["thread-message-name"] },
+                    },
+                  },
+                  content,
+                ],
+              },
+        );
+      }
+      body = [];
+    };
+    for (const node of tree.children) {
+      const tag = node.data?.threadDelimiter;
+      if (tag) {
+        if (tag.partial) continue;
+        flush();
+        name = tag.name;
+      } else {
+        body.push(node);
+      }
+    }
+    flush();
+    tree.children = sections;
+  };
+};
+
+export const ThreadMessage = memo(function ThreadMessage({
+  text,
+  streaming,
+}: Options) {
+  if (!text.includes("<")) return <Markdown text={text} />;
   return (
-    <div className="thread-sections">
-      {threadSections(text, streaming).map((section, index) =>
-        section.name === undefined ? (
-          <Markdown key={index} text={section.text} />
-        ) : (
-          <section
-            key={index}
-            className="thread-message"
-            aria-label={section.name}
-          >
-            <div className="thread-message-name">{section.name}</div>
-            <Markdown text={section.text} />
-          </section>
-        ),
-      )}
-    </div>
+    <Markdown
+      text={text}
+      className="thread-sections"
+      remarkPlugins={[[remarkThreadSections, { text, streaming }]]}
+    />
   );
-}
+});
