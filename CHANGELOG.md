@@ -10,7 +10,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Fixed
 
-- Historical orchestrator thread boxes stay neutral when a later-created thread reuses a deleted thread's name or alias, including after reloading history.
+- Historical orchestrator thread boxes stay neutral when a later-created thread reuses a deleted thread's name or alias, including after reloading history. Colors use the matching turn's start as a conservative cutoff on both live and filtered-history paths; threads created during that turn stay neutral until a later turn, and a missing turn start stays neutral.
 - Orchestrator thread boxes in the desktop and phone apps use the corresponding thread's assigned color, with readable names in light and dark themes and a neutral fallback for unknown threads.
 - Removing **Load earlier turn** during an iOS touch or momentum scroll preserves the reading position while prepend adjustments are deferred.
 - Loading older conversation history in the background preserves the message and pixel offset you are reading, including when you scroll while the request is pending.

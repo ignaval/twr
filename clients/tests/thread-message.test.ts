@@ -3,7 +3,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { MessageBody } from "../shared/MessageBody";
 import { THREAD_COLORS, threadInk } from "../shared/threadColor";
-import type { Thread } from "../shared/types";
+import type { HubEvent, Thread } from "../shared/types";
+import { blocksOf } from "../shared/transcript";
 
 vi.mock("../shared/host", () => ({
   useHostAPI: () => ({
@@ -19,7 +20,7 @@ const render = (
     streaming?: boolean;
     mono?: boolean;
     threads?: Thread[];
-    messageTs?: string;
+    turnStartedAt?: string;
   } = {},
 ) =>
   renderToStaticMarkup(
@@ -27,7 +28,7 @@ const render = (
       text,
       clamp: false,
       threadTags: true,
-      messageTs: "2026-11-17T12:00:00Z",
+      turnStartedAt: "2026-11-17T12:00:00Z",
       ...options,
     }),
   );
@@ -201,7 +202,7 @@ describe("orchestrator thread sections", () => {
       expect(
         render(text, {
           threads: [replacement],
-          messageTs: "2026-11-17T12:00:02Z",
+          turnStartedAt: "2026-11-17T12:00:02Z",
         }),
       ).toContain(`--thread-color:${replacement.accent}`);
     },
@@ -215,7 +216,7 @@ describe("orchestrator thread sections", () => {
     "2026-11-17T12:00:00.000001Z",
     "2026-11-17T12:00:01Z",
   ])(
-    "keeps a match neutral unless its creation time %s proves it predates the message",
+    "keeps a match neutral unless its creation time %s proves it predates the turn",
     (created_at) => {
       for (const name of ["t1", "api", "backend", "old-api"]) {
         expect(
@@ -232,12 +233,12 @@ describe("orchestrator thread sections", () => {
   );
 
   it.each([undefined, "invalid"])(
-    "keeps identities neutral without a valid message timestamp: %s",
-    (messageTs) => {
+    "keeps identities neutral without a valid turn-start timestamp: %s",
+    (turnStartedAt) => {
       expect(
         render('<thread name="api">\nBody\n</thread>', {
           threads: [worker()],
-          messageTs,
+          turnStartedAt,
         }),
       ).not.toContain("--thread-color:");
     },
@@ -249,6 +250,135 @@ describe("orchestrator thread sections", () => {
       worker({ name: "other", aliases: ["api"] }),
     ];
     expect(section("api", threads)).not.toContain("--thread-color:");
+  });
+
+  it.each(["api", "backend"])(
+    "keeps %s neutral live and in final-only history when replacement happens mid-reply",
+    (name) => {
+      const text = `<thread name="${name}">\n**Streaming update**\n</thread>`;
+      const event = (
+        seq: number,
+        kind: string,
+        data: HubEvent["data"],
+        ts: string,
+        turn = 1,
+      ): HubEvent => ({
+        id: `orch:${seq}`,
+        thread: "orch",
+        seq,
+        turn,
+        kind,
+        data,
+        ts,
+      });
+      const start = event(1, "turn.started", {}, "2026-11-17T12:00:00Z");
+      const delta = event(
+        2,
+        "agent.text",
+        { text, delta: true },
+        "2026-11-17T12:00:01Z",
+      );
+      const final = event(
+        3,
+        "agent.text",
+        { text, final: true },
+        "2026-11-17T12:00:03Z",
+      );
+      const original = worker({ aliases: ["backend"] });
+      const replacement = worker({
+        id: "t2",
+        aliases: ["backend"],
+        accent: THREAD_COLORS[2],
+        created_at: "2026-11-17T12:00:02Z",
+      });
+      const reply = (events: HubEvent[], thread: Thread) => {
+        const block = blocksOf(events).find(
+          (block) => block.kind === "assistant",
+        )!;
+        return {
+          block,
+          html: render(block.text, {
+            threads: [thread],
+            streaming: !!block.pending,
+            turnStartedAt: block.turnStartedAt,
+          }),
+        };
+      };
+      expect(reply([start, delta], original).html).toContain(
+        `--thread-color:${original.accent}`,
+      );
+      const live = reply([start, delta, final], replacement);
+      // read_transcript_events retains turn.started and final text, never deltas.
+      const history = reply([start, final], replacement);
+      expect(live.block.ts).toBe(delta.ts);
+      expect(history.block.ts).toBe(final.ts);
+      for (const result of [
+        reply([start, delta], replacement),
+        live,
+        history,
+      ]) {
+        expect(result.block.turnStartedAt).toBe(start.ts);
+        expect(result.html).not.toContain("--thread-color:");
+        expect(result.html).toContain("<strong>Streaming update</strong>");
+      }
+      const laterStart = event(
+        4,
+        "turn.started",
+        {},
+        "2026-11-17T12:00:04Z",
+        2,
+      );
+      const laterFinal = event(
+        5,
+        "agent.text",
+        { text, final: true },
+        "2026-11-17T12:00:05Z",
+        2,
+      );
+      expect(reply([laterStart, laterFinal], replacement).html).toContain(
+        `--thread-color:${replacement.accent}`,
+      );
+    },
+  );
+
+  it("does not substitute a final timestamp or another turn/thread's start when the matching start is absent", () => {
+    const final: HubEvent = {
+      id: "orch:2",
+      seq: 2,
+      thread: "orch",
+      turn: 2,
+      kind: "agent.text",
+      ts: "2026-11-17T12:00:03Z",
+      data: { final: true, text: '<thread name="api">\nBody\n</thread>' },
+    };
+    const start = {
+      ...final,
+      id: "orch:1",
+      seq: 1,
+      kind: "turn.started",
+      ts: "2026-11-17T12:00:00Z",
+      data: {},
+    };
+    for (const events of [
+      [final],
+      [{ ...start, turn: 1 }, final],
+      [{ ...start, thread: "other" }, final],
+      [
+        { ...start, turn: undefined },
+        { ...final, turn: undefined },
+      ],
+    ]) {
+      const block = blocksOf(events).find(
+        (block) => block.kind === "assistant",
+      )!;
+      expect(block.turnStartedAt).toBeUndefined();
+      expect(
+        render(block.text, {
+          threads: [worker()],
+          turnStartedAt: block.turnStartedAt,
+        }),
+      ).not.toContain("--thread-color:");
+    }
   });
 
   it("preserves a footnote definition atomically when its body contains thread tags", () => {

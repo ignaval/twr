@@ -24,7 +24,7 @@ type Options = {
   text: string;
   streaming: boolean;
   threads?: Thread[];
-  messageTs?: string;
+  turnStartedAt?: string;
 };
 const OPEN = '<thread name="';
 const CLOSE = "</thread>";
@@ -119,7 +119,7 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
   text,
   streaming,
   threads = [],
-  messageTs,
+  turnStartedAt,
 }) {
   const tokenize: Tokenizer = function (effects, ok, nok) {
     const offset = this.now().offset;
@@ -196,15 +196,16 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
         const thread =
           name === undefined ? undefined : sectionThread(threads, name);
         // Names and aliases can be reused after deletion. The current match must
-        // demonstrably predate this reply, including after history remounts. Missing
+        // demonstrably predate its turn, whose start survives filtered history. Missing
         // dates and equal millisecond timestamps stay neutral (Date.parse loses
         // finer precision). Do not fall through to a weaker identity match.
-        const predatesMessage =
-          Date.parse(thread?.created_at ?? "") < Date.parse(messageTs ?? "");
+        const predatesTurn =
+          Date.parse(thread?.created_at ?? "") <
+          Date.parse(turnStartedAt ?? "");
         // mdast properties become HTML attributes; threadStyle validates the
         // accent and supplies the same theme inks used by the thread cards.
         const style = Object.entries(
-          threadStyle(predatesMessage ? thread?.accent : undefined),
+          threadStyle(predatesTurn ? thread?.accent : undefined),
         )
           .map(([key, value]) => `${key}:${value}`)
           .join(";");
@@ -263,7 +264,7 @@ export const ThreadMessage = memo(function ThreadMessage({
   text,
   streaming,
   threads,
-  messageTs,
+  turnStartedAt,
 }: Options) {
   if (!text.includes("<")) return <Markdown text={text} />;
   return (
@@ -271,7 +272,7 @@ export const ThreadMessage = memo(function ThreadMessage({
       text={text}
       className="thread-sections"
       remarkPlugins={[
-        [remarkThreadSections, { text, streaming, threads, messageTs }],
+        [remarkThreadSections, { text, streaming, threads, turnStartedAt }],
       ]}
     />
   );

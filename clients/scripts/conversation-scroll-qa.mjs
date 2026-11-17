@@ -447,6 +447,149 @@ try {
     await page.close();
   }
 
+  // Live first deltas and fetched final-only history have different timestamps.
+  // Replace the worker in between, then force an actual filtered RPC history read.
+  for (const theme of ["light", "dark"]) {
+    const page = await browser.newPage({
+      viewport: { width: 1440, height: 900 },
+    });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(url + "?with-user&combined");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await scrollTo(page, 1);
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme;
+    }, theme);
+    const threads = await page.evaluate(() =>
+      window.conversationScrollQA.threads(),
+    );
+    const original = threads.find((thread) => thread.id === "builder");
+    const others = threads.filter((thread) => thread.id !== "builder");
+    const update = (workers) =>
+      page.evaluate(
+        (threads) => window.conversationScrollQA.setThreads(threads),
+        [...others, ...workers],
+      );
+    await update([{ ...original, aliases: ["backend"] }]);
+    const text =
+      '<thread name="builder">\n**Streaming name update** [docs][d]\n</thread>\n<thread name="backend">\n**Streaming alias update**\n</thread>\n\n[d]: https://example.com/stream';
+    await page.evaluate((text) => {
+      window.conversationScrollQA.stream(
+        "turn.started",
+        { from: "user", prompt: "Streaming reuse scenario" },
+        "2026-11-17T12:00:00Z",
+      );
+      window.conversationScrollQA.stream(
+        "agent.text",
+        { text, delta: true },
+        "2026-11-17T12:00:01Z",
+      );
+    }, text);
+    await scrollTo(page, 1);
+    const boxes = page
+      .locator("section.thread-message")
+      .filter({ hasText: /Streaming (name|alias) update/ });
+    await expect(boxes).toHaveCount(2);
+    for (const box of await boxes.all()) {
+      await expect(box).toHaveCSS("border-top-color", "rgb(0, 135, 175)");
+      await box.evaluate((node) => {
+        node.dataset.mounted = "streaming";
+      });
+    }
+    await update([]);
+    for (const box of await boxes.all())
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+    await update([
+      {
+        ...original,
+        id: "replacement",
+        aliases: ["backend"],
+        accent: "#ff00ff",
+        created_at: "2026-11-17T12:00:02Z",
+      },
+    ]);
+    await page.evaluate(
+      (text) =>
+        window.conversationScrollQA.stream(
+          "agent.text",
+          { text, final: true },
+          "2026-11-17T12:00:03Z",
+        ),
+      text,
+    );
+    await expect(
+      page
+        .locator(".block-assistant")
+        .filter({ has: boxes.first() })
+        .locator(".spin"),
+    ).toHaveCount(0);
+    for (const box of await boxes.all()) {
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+      await expect(box).toHaveAttribute("data-mounted", "streaming");
+    }
+    const readsBefore = await page.evaluate(
+      () => window.conversationScrollQA.historyReads().length,
+    );
+    await page
+      .locator(".sidebar .thread-card-title b")
+      .getByText("reviewer", { exact: true })
+      .click();
+    await expect(
+      page.getByRole("textbox", {
+        name: "Message reviewer directly",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Back to orchestrator", exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        page.evaluate(() => window.conversationScrollQA.historyReads().length),
+      )
+      .toBeGreaterThan(readsBefore);
+    const fetched = await page.evaluate(() =>
+      window.conversationScrollQA.historyReads().at(-1),
+    );
+    expect(
+      fetched.map((event) => [event.kind, event.ts, event.data.delta]),
+    ).toEqual([
+      ["turn.started", "2026-11-17T12:00:00Z", undefined],
+      ["agent.text", "2026-11-17T12:00:03Z", undefined],
+    ]);
+    await scrollTo(page, 1);
+    await expect(boxes).toHaveCount(2);
+    for (const box of await boxes.all()) {
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+      await expect(box).not.toHaveAttribute("data-mounted", "streaming");
+    }
+    await expect(boxes.first().locator("a")).toHaveAttribute(
+      "href",
+      "https://example.com/stream",
+    );
+    await page.evaluate(() =>
+      window.conversationScrollQA.reply(
+        '<thread name="builder">\nNew turn name update.\n</thread>\n<thread name="backend">\nNew turn alias update.\n</thread>',
+        "2026-11-17T12:00:04Z",
+      ),
+    );
+    await scrollTo(page, 1);
+    const newBoxes = page
+      .locator("section.thread-message")
+      .filter({ hasText: /New turn (name|alias) update/ });
+    await expect(newBoxes).toHaveCount(2);
+    for (const box of await newBoxes.all())
+      await expect(box).toHaveCSS("border-top-color", "rgb(255, 0, 255)");
+    expect(errors).toEqual([]);
+    console.log(
+      `PASS ${theme}: replacement between first delta and final stays neutral after final-only RPC history reload for both name and alias; a later turn uses the replacement color`,
+    );
+    await page.close();
+  }
+
   // Chromium does not generate iOS momentum. Select the real virtualizer's iOS
   // branch via navigator, then drive its touch/tail lifecycle with synthetic
   // events. Assert that a prepend really is held (indexes advance while the

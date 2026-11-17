@@ -5386,7 +5386,7 @@ const Conversation = memo(function Conversation({
                     block.kind === "assistant" && !!target?.is_orchestrator
                   }
                   threads={threads}
-                  messageTs={block.ts}
+                  turnStartedAt={block.turnStartedAt}
                   expanded={opened.get(block.id) ?? false}
                   onExpandedChange={(open) => setOpen(block.id, open)}
                 />

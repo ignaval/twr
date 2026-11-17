@@ -14,9 +14,12 @@ import "../../mobile/src/mobile.css";
 
 const listeners = new Set<(event: DesktopEvent) => void>();
 let currentThreads: Thread[] = [];
+const recorded: HubEvent[] = [];
+const historyReads: HubEvent[][] = [];
 const emit = (event: DesktopEvent) => {
   if (event.type === "state" && event.state)
     currentThreads = event.state.threads;
+  if (event.type === "thread" && event.event) recorded.push(event.event);
   listeners.forEach((read) => read(event));
 };
 const pending = new Map<string, (page: Json) => void>();
@@ -65,10 +68,19 @@ declare global {
       threads: () => Thread[];
       setThreads: (threads: Thread[]) => void;
       reply: (text: string, ts: string) => void;
+      stream: (kind: string, data: Json, ts: string) => void;
+      historyReads: () => HubEvent[][];
     };
   }
 }
 window.conversationScrollQA = {
+  historyReads: () => historyReads,
+  stream: (kind, data, ts) =>
+    emit({
+      type: "thread",
+      subscription,
+      event: { ...event("orch", 5, sequence++, kind, data), ts },
+    }),
   threads: () => currentThreads,
   setThreads: (threads) =>
     emit({
@@ -81,12 +93,27 @@ window.conversationScrollQA = {
         head: 1,
       },
     }),
-  reply: (text, ts) =>
+  reply: (text, ts) => {
     emit({
       type: "thread",
       subscription,
-      event: { ...event("orch", 5, sequence++, "agent.text", { text }), ts },
-    }),
+      event: {
+        ...event("orch", 6, sequence++, "turn.started", {
+          from: "user",
+          prompt: "New worker task",
+        }),
+        ts,
+      },
+    });
+    emit({
+      type: "thread",
+      subscription,
+      event: {
+        ...event("orch", 6, sequence++, "agent.text", { text, final: true }),
+        ts,
+      },
+    });
+  },
   pending: () => [...pending.keys()],
   release: (thread, turn) => {
     const key = `${thread}:${turn}`;
@@ -171,6 +198,25 @@ window.twr = {
   rpc: async (method: string, params: Json = {}) => {
     if (method === "desktop.subscribe") subscription = params.subscription;
     if (method === "thread.transcript") {
+      const logged = recorded.filter((event) => event.thread === params.thread);
+      if (
+        logged.some((event) => event.kind === "turn.started") &&
+        !params.turn
+      ) {
+        const turn = logged
+          .filter((event) => event.kind === "turn.started")
+          .at(-1)!.turn;
+        // Match read_transcript_events: keep semantic rows, filter deltas before
+        // paging. History reloads must not reuse the live first-delta timestamp.
+        const events = logged.filter(
+          (event) =>
+            event.turn === turn &&
+            event.seq > (params.since_seq || 0) &&
+            (event.kind !== "agent.text" || event.data.final === true),
+        );
+        historyReads.push(events);
+        return { events, turn, next: logged.at(-1)!.seq, more: false };
+      }
       if (params.since_seq) return { events: [], more: false };
       if (params.turn)
         return new Promise<Json>((resolve) => {
