@@ -23,6 +23,9 @@ and companion from `clients/bin`, `target/debug`, or `target/release`. An explic
 `TWR_DESKTOP_BINARY_DIR` is accepted only in development. Packaged builds always use the
 three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remains useful for an independent test installation.
 
+`npm run test:conversation-scroll` checks reading position during delayed history loads
+in a browser, using a disposable host. It needs Playwright's Chromium or `TWR_CHROMIUM_PATH`.
+
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
 markers. A desktop app launched by a twr agent cannot turn itself into a user client.
@@ -71,6 +74,9 @@ and live updates appear first; older turns load in the background to find your m
 when automatic turns have followed it. If an older page fails, recent history stays
 available and **Load earlier turn** retries it. While offline, the line uses the history
 saved on this device.
+
+Loading older turns keeps the message you are reading at the same position, including
+when you scroll while a background or manual history request is pending.
 
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads

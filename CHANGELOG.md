@@ -10,6 +10,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Fixed
 
+- Loading older conversation history in the background preserves the message and pixel offset you are reading, including when you scroll while the request is pending.
 - Conversations show recent history and subscribe to live updates before looking for your latest message in older turns. A failed older page leaves recent history available, and switching conversations cancels the old lookup. A keyboard jump to your message now shows a visible focus outline.
 
 ## [0.5.0] - 2026-11-15

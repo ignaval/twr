@@ -13,6 +13,7 @@
     "build:rust": "node scripts/build-rust.mjs",
     "start": "electron .",
     "test": "vitest run",
+    "test:conversation-scroll": "node scripts/conversation-scroll-qa.mjs",
     "test:integration": "node scripts/integration.mjs && node scripts/loops-integration.mjs",
     "test:voice": "node scripts/voice-qa.mjs",
     "package": "npm run build:rust && npm run build && node scripts/notices.mjs && electron-builder --publish never",

@@ -5017,7 +5017,6 @@ const Conversation = memo(function Conversation({
   const list = useRef<HTMLDivElement>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
   const [jumpTarget, setJumpTarget] = useState<string>();
-  const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
   // Expanded messages and open tool details, by block: rows scrolled out of the virtual
@@ -5050,16 +5049,30 @@ const Conversation = memo(function Conversation({
     overscan: 8,
     getItemKey: (index) => blocks[index].id,
     scrollMargin,
+    // Preserve the current message and pixel offset on every prepend, including
+    // background loads and scrolling during a request. Bottom-follow stays ours.
+    anchorTo: "end",
+    followOnAppend: false,
   });
   // Controls and loading/error notices precede the virtual rows in the scroller.
   // Include their height when locating a message, including after a resize.
   useLayoutEffect(() => {
-    const measure = () => setScrollMargin(list.current?.offsetTop ?? 0);
+    const measure = () => {
+      const margin = list.current?.offsetTop ?? 0;
+      const delta = margin - virtual.options.scrollMargin;
+      // The last prepend removes Load earlier. Keep the reading position when
+      // that control (or a notice above the rows) changes the list's offset too.
+      if (delta && !follow.current && parent.current)
+        virtual.scrollToOffset(parent.current.scrollTop + delta, {
+          behavior: "auto",
+        });
+      setScrollMargin(margin);
+    };
     measure();
     const observer = new ResizeObserver(measure);
     if (parent.current) observer.observe(parent.current);
     return () => observer.disconnect();
-  }, [loading, error, earlier, earlierBusy]);
+  }, [loading, error, earlier, earlierBusy, virtual]);
   useLayoutEffect(() => {
     if (!jumpTarget) return;
     const index = blocks.findIndex((block) => block.id === jumpTarget);
@@ -5103,22 +5116,10 @@ const Conversation = memo(function Conversation({
   const last = blocks.at(-1);
   function loadEarlier() {
     if (!earlier || earlierBusy || !parent.current) return;
-    anchor.current = {
-      height: parent.current.scrollHeight,
-      top: parent.current.scrollTop,
-    };
     follow.current = false;
     setFollowing(false);
     earlier();
   }
-  useLayoutEffect(() => {
-    if (anchor.current && parent.current) {
-      const saved = anchor.current;
-      anchor.current = undefined;
-      parent.current.scrollTop =
-        saved.top + Math.max(0, parent.current.scrollHeight - saved.height);
-    }
-  }, [blocks[0]?.id]);
   useEffect(() => {
     if (!follow.current || !blocks.length) return;
     const frame = requestAnimationFrame(() => {
@@ -5370,7 +5371,6 @@ const Conversation = memo(function Conversation({
             onClick={() => {
               follow.current = false;
               setFollowing(false);
-              anchor.current = undefined;
               setJumpTarget(latestUser.id);
               // Immediate scrolling lets the virtualizer correct measured row
               // heights as the destination mounts, and respects reduced motion.
