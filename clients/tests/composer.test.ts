@@ -6,6 +6,7 @@ import type {
   Json,
   Thread,
 } from "../shared/types";
+import type { NativeVoiceEvent, VoiceCaptureStatus } from "../shared/voice";
 import { SUGGEST_SETTLE_MS } from "../shared/assistance";
 import {
   FakeEvent,
@@ -77,6 +78,9 @@ type HostOptions = {
   secure?: Record<string, string>;
   /** The connection takes uploads. */
   uploads?: boolean;
+  voice?: boolean;
+  voiceStatus?: () => Promise<VoiceCaptureStatus>;
+  voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
 };
 
@@ -84,8 +88,36 @@ function fakeHost(options: HostOptions = {}) {
   const listeners = new Set<(event: DesktopEvent) => void>();
   const secure = new Map<string, string>(Object.entries(options.secure || {}));
   const sent: { method: string; params: Json }[] = [];
+  const voiceListeners = new Set<(event: NativeVoiceEvent) => void>();
+  const voiceOps: string[] = [];
+  const nativeVoice = {
+    status:
+      options.voiceStatus || (async () => ({ available: true, local: true })),
+    start: async ({ mode }: { mode: string }) => {
+      voiceOps.push("start:" + mode);
+      if (mode === "push")
+        voiceListeners.forEach((listener) => listener({ type: "speechStart" }));
+    },
+    stop: async () => {
+      voiceOps.push("stop");
+    },
+    cancel: async () => {
+      voiceOps.push("cancel");
+    },
+    onEvent: (callback: (event: NativeVoiceEvent) => void) => {
+      voiceListeners.add(callback);
+      return () => {
+        voiceListeners.delete(callback);
+      };
+    },
+  };
   const host = {
     sent,
+    nativeVoice: options.voice ? nativeVoice : undefined,
+    voiceSetup: options.voiceSetup,
+    voiceOps,
+    voiceEvent: (event: NativeVoiceEvent) =>
+      voiceListeners.forEach((listener) => listener(event)),
     secure,
     /** What `thread.queue` lists, by thread. */
     queues: {} as Record<string, Json[]>,
@@ -646,6 +678,346 @@ describe("the latest user message above conversation history", () => {
     expect(
       app().find(".latest-user-message button").getAttribute("title"),
     ).toBe("Blank first line");
+  });
+});
+
+describe("dictation in the shared desktop and mobile composer", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: Parameters<typeof mount>[0] = {}) => {
+    vi.resetModules();
+    mounted = await mount({ ...options, voice: true });
+  };
+  const voiceEvent = async (event: NativeVoiceEvent) => {
+    await app().act(async () => app().host.voiceEvent(event));
+    await app().settle();
+  };
+  const mic = () => app().find("[data-voice-push]");
+  const dictate = async (text: string) => {
+    // Keyboard activation exercises the same microphone button without pointer events.
+    await app().click(mic(), { detail: 0 });
+    await app().click(mic(), { detail: 0 });
+    await voiceEvent({ type: "final", text });
+  };
+  const send = async () => {
+    await app().act(async () => {
+      app()
+        .find("form.composer")
+        .dispatchEvent(
+          new FakeEvent("submit", { bubbles: true, cancelable: true }),
+        );
+    });
+    await app().settle();
+  };
+
+  it.each([false, true])(
+    "appends to the latest draft, focuses it, and sends only explicitly (mobile=%s)",
+    async (mobile) => {
+      await start({ mobile });
+      await app().type("Typed first.");
+      await app().click(mic(), { detail: 0 });
+      await app().type(" Still typing.");
+      await app().click(mic(), { detail: 0 });
+      await voiceEvent({ type: "partial", text: "Spoken" });
+      expect(app().box().value).toBe("Typed first. Still typing.");
+      await voiceEvent({ type: "final", text: "Spoken last." });
+      expect(app().host.sent).toEqual([]);
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+      expect(app().box().value).toBe("Typed first. Still typing. Spoken last.");
+      expect(app().document.activeElement).toBe(app().box());
+      await app().type(" Edited.");
+      await send();
+      expect(app().host.sent).toEqual([
+        {
+          method: "say",
+          params: {
+            message: "Typed first. Still typing. Spoken last. Edited.",
+            seen_gseq: 1,
+            to: "orchestrator",
+            voice: true,
+          },
+        },
+      ]);
+      expect(app().box().value).toBe("");
+    },
+  );
+  it.each([false, true])(
+    "keeps active and error feedback inline and removes it after completion or dismissal (mobile=%s)",
+    async (mobile) => {
+      await start({ mobile });
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      await app().click(mic(), { detail: 0 });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Hearing you");
+      expect(app().all(".composer-actions .voice-bar")).toHaveLength(0);
+      expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+      await app().click(mic(), { detail: 0 });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Transcribing");
+      await voiceEvent({ type: "final", text: "Editable words" });
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().find("form.composer").textContent).not.toMatch(
+        /voice (?:is )?ready/i,
+      );
+      await app().click(mic(), { detail: 0 });
+      await voiceEvent({ type: "error", message: "Microphone unavailable" });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Microphone unavailable");
+      expect(app().box().value).toBe("Editable words");
+      await app().click(app().find(".voice-bar button", "Dismiss"));
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().box().value).toBe("Editable words");
+    },
+  );
+  it("removes model setup feedback after download without a ready dialog or acknowledgement", async () => {
+    let finish!: (status: VoiceCaptureStatus) => void;
+    await start({
+      voiceStatus: async () => ({
+        available: false,
+        local: true,
+        setup: true,
+        problem: "No model",
+      }),
+      voiceSetup: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await app().click(mic(), { detail: 0 });
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Voice needs a speech model");
+    await app().click(app().find(".voice-bar button", "Download model"));
+    expect(app().find(".voice-bar").textContent).toContain(
+      "Downloading the speech model",
+    );
+    await app().act(async () => finish({ available: true, local: true }));
+    await app().settle();
+    expect(app().all(".voice-bar")).toHaveLength(0);
+    expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+    expect(app().find("form.composer").textContent).not.toMatch(
+      /voice (?:is )?ready/i,
+    );
+    expect(app().host.sent).toEqual([]);
+  });
+  it("keeps failed model setup inline with retry and dismiss actions", async () => {
+    await start({
+      voiceStatus: async () => ({
+        available: false,
+        local: true,
+        setup: true,
+        problem: "No model",
+      }),
+      voiceSetup: async () => {
+        throw new Error("Download failed");
+      },
+    });
+    await app().click(mic(), { detail: 0 });
+    await app().click(app().find(".voice-bar button", "Download model"));
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Download failed");
+    expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+    expect(app().find(".voice-bar button", "Download model")).toBeDefined();
+    await app().click(app().find(".voice-bar button", "Dismiss"));
+    expect(app().all(".voice-bar")).toHaveLength(0);
+  });
+  it("supports hold-to-talk, the keyboard shortcut, and an end-of-draft caret", async () => {
+    await start();
+    await app().type("Typed");
+    const pointer = async (type: string) => {
+      await app().act(async () => {
+        mic().dispatchEvent(
+          new FakeEvent(type, { bubbles: true, pointerId: 1, button: 0 }),
+        );
+      });
+      await app().settle();
+    };
+    await pointer("pointerdown");
+    await app().wait(360);
+    await pointer("pointerup");
+    expect(app().host.voiceOps).toContain("stop");
+    await voiceEvent({ type: "final", text: "by holding" });
+    expect(app().box().value).toBe("Typed by holding");
+    expect(app().box().selectionStart).toBe(app().box().value.length);
+    const shortcut = async () => {
+      await app().act(async () => {
+        window.dispatchEvent(
+          new FakeEvent("keydown", {
+            code: "Space",
+            ctrlKey: true,
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+          }) as unknown as Event,
+        );
+      });
+      await app().settle();
+    };
+    await shortcut();
+    await shortcut();
+    await voiceEvent({ type: "final", text: "by shortcut" });
+    expect(app().box().value).toBe("Typed by holding by shortcut");
+    expect(app().host.sent).toEqual([]);
+  });
+  it("guards slash suggestions and Send as implementation loop against unreviewed dictation", async () => {
+    const methods: string[] = [];
+    await start({
+      rpc: (method) => {
+        methods.push(method);
+        return undefined;
+      },
+    });
+    await dictate("/job");
+    methods.length = 0;
+    await app().press("ArrowDown");
+    await app().press("Enter");
+    expect(methods).not.toContain("desktop.parse_slash");
+    expect(app().find(".dialog").textContent).toContain(
+      "Confirm spoken message",
+    );
+    await app().click(app().find(".dialog button", "Cancel"));
+    await app().talkTo("builder");
+    await dictate("Implement a task");
+    await app().click(app().find(".send-caret"));
+    await app().click(
+      app().find(".send-loop-panel button", "Send as implementation loop"),
+    );
+    expect(methods).not.toContain("thread.implement");
+    expect(app().find(".dialog").textContent).toContain(
+      "Confirm spoken message",
+    );
+  });
+  it("keeps dictation at the selected worker; hands-free still sends to the orchestrator", async () => {
+    await start();
+    await app().talkTo("builder");
+    await dictate("Check the tests");
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().host.sent).toEqual([]);
+    await send();
+    expect(app().host.sent).toEqual([
+      {
+        method: "thread.send",
+        params: { thread: "w1", prompt: "Check the tests" },
+      },
+    ]);
+    await app().type("Keep this worker draft");
+    await app().click(app().find("[data-voice-hands-free]"));
+    await voiceEvent({ type: "speechStart" });
+    await voiceEvent({ type: "final", text: "How is the workspace?" });
+    expect(app().host.sent.at(-1)).toMatchObject({
+      method: "say",
+      params: {
+        to: "orchestrator",
+        voice: true,
+        message: "How is the workspace?",
+      },
+    });
+    expect(app().box().value).toBe("Keep this worker draft");
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Listening");
+  });
+  it("retains spoken provenance through edits and encrypted draft reload, then requires explicit review of approvals", async () => {
+    const calls: Json[] = [];
+    const rpc: HostOptions["rpc"] = (method, params) => {
+      if (method === "say") {
+        calls.push(params);
+        return Promise.resolve(
+          params.voice ? { action: "confirm" } : { action: "sent" },
+        );
+      }
+    };
+    await start({ rpc });
+    await dictate("allow it");
+    await app().replace("@builder yes");
+    await app().wait(400);
+    const secure = Object.fromEntries(app().host.secure);
+    await app().unmount();
+    await start({ rpc, secure });
+    expect(app().box().value).toBe("@builder yes");
+    await send();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].voice).toBe(true);
+    expect(app().find(".dialog").textContent).toContain(
+      "Confirm spoken message",
+    );
+    await app().click(app().find(".dialog button", "Review in message box"));
+    expect(calls).toHaveLength(1);
+    expect(app().box().value).toBe("@builder yes");
+    await send();
+    expect(calls).toHaveLength(2);
+    expect(calls[1].voice).toBeUndefined();
+    expect(app().box().value).toBe("");
+  });
+  it.each(["/jobs", "!echo hello"])(
+    "holds dictated composer commands for review: %s",
+    async (command) => {
+      const methods: string[] = [];
+      await start({
+        rpc: (method) => {
+          methods.push(method);
+          return undefined;
+        },
+      });
+      await dictate(command);
+      methods.length = 0;
+      await send();
+      expect(methods).not.toContain("desktop.parse_slash");
+      expect(methods).not.toContain("shell.run");
+      expect(app().find(".dialog").textContent).toContain(
+        "Confirm spoken message",
+      );
+      expect(app().box().value).toBe(command);
+    },
+  );
+  it("drops late results on conversation switches, cancellation, disconnect and errors", async () => {
+    await start();
+    await app().type("Keep orchestrator draft");
+    await dictate("");
+    expect(app().box().value).toBe("Keep orchestrator draft");
+    await app().click(mic(), { detail: 0 });
+    await app().talkTo("builder");
+    await voiceEvent({ type: "final", text: "old conversation" });
+    expect(app().box().value).toBe("");
+    await app().type("Keep worker draft");
+    await app().click(mic(), { detail: 0 });
+    await app().click(app().find("button", "Cancel dictation"));
+    await voiceEvent({ type: "final", text: "cancelled" });
+    expect(app().box().value).toBe("Keep worker draft");
+    await app().click(mic(), { detail: 0 });
+    await voiceEvent({ type: "error", message: "Recognition failed" });
+    await voiceEvent({ type: "final", text: "late after error" });
+    expect(app().box().value).toBe("Keep worker draft");
+    await app().click(mic(), { detail: 0 });
+    await app().connection(false);
+    await voiceEvent({ type: "final", text: "disconnected" });
+    expect(app().box().value).toBe("Keep worker draft");
+    expect(app().host.sent).toEqual([]);
+  });
+  it("keeps dictated text out of the offline delivery queue", async () => {
+    await start();
+    const deliver = vi.fn(async () => ({ ok: true }));
+    app().host.sendMessage = deliver;
+    await dictate("Check the tests");
+    await app().connection(false);
+    await send();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(app().box().value).toBe("Check the tests");
+    await app().live("default");
+    await send();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(app().host.sent[0]).toMatchObject({
+      method: "say",
+      params: { voice: true },
+    });
   });
 });
 

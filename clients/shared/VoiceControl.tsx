@@ -1,8 +1,16 @@
 // Voice mode's controls in the composer (docs/voice.md): a microphone button (click to talk,
-// click again to send; or hold it and let go), a hands-free session, what was heard, and a
+// click again to transcribe; or hold it and let go), a hands-free session, what was heard, and a
 // transcript the hub handed back for confirmation. Recognition and playback stay on this
-// device; the text goes to the orchestrator through `say` with `voice: true`.
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+// device; hands-free sends through `say` with `voice: true`, dictation fills the composer.
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { createPortal } from "react-dom";
 import {
   AudioLines,
   Download,
@@ -24,7 +32,6 @@ import {
 } from "./voice";
 
 const PHASES: Record<string, string> = {
-  ready: "Voice ready",
   listening: "Listening",
   hearing: "Hearing you",
   transcribing: "Transcribing",
@@ -54,11 +61,18 @@ function voiceCapture(host: DesktopAPI): VoiceCapture | undefined {
 
 export interface VoiceControlProps {
   host: DesktopAPI;
+  /** Inline composer slot: status never floats over the conversation or editor. */
+  statusContainer: HTMLDivElement | null;
+  /** Changing conversation cancels recognition before it can reach a new draft. */
+  context: string;
   rpc: (method: string, params?: Json) => Promise<Json>;
   connected: boolean;
   allowed: boolean;
+  conversationAllowed: boolean;
   /** Sends a transcript to the orchestrator (`say`, `voice: true`). */
   submit(text: string): Promise<Json>;
+  /** Dictation fills the current composer without sending. */
+  draft(text: string): void;
   hint: string[];
   /** The orchestrator's last messages: what this device may have read aloud. */
   spoken(): string[];
@@ -70,6 +84,7 @@ export interface VoiceControlProps {
 export function VoiceControl(props: VoiceControlProps) {
   const { host, rpc } = props;
   const capture = useMemo(() => voiceCapture(host), [host]);
+  const mounted = useRef(true);
   const [state, setState] = useState<VoiceSessionState>({
     phase: "off",
     mode: "push",
@@ -77,8 +92,8 @@ export function VoiceControl(props: VoiceControlProps) {
     partial: "",
   });
   const [status, setStatus] = useState<VoiceCaptureStatus>();
-  /** Downloading the speech model (`twr voice setup`), or just done. */
-  const [setup, setSetup] = useState<"downloading" | "ready">();
+  /** Downloading the speech model (`twr voice setup`). Success needs no prompt. */
+  const [setup, setSetup] = useState(false);
   const [speakerInfo, setSpeakerInfo] = useState<
     SpeakerState & {
       running?: boolean;
@@ -149,6 +164,7 @@ export function VoiceControl(props: VoiceControlProps) {
             capture,
             speaker,
             submit: async (text) => latest.current.submit(text),
+            draft: (text) => latest.current.draft(text),
             repeat: async () => {
               await rpc("speech.request", {
                 last: 1,
@@ -187,23 +203,31 @@ export function VoiceControl(props: VoiceControlProps) {
     };
   }, [host, session]);
 
-  useEffect(
-    () => () => {
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
       quietly(session?.end());
       quietly(host.voiceArm?.(false));
-    },
-    [session, host],
-  );
+    };
+  }, [props.context, session, host]);
 
   const ready = useCallback(async () => {
     if (!capture) return false;
+    const context = latest.current.context;
     const s = await capture.status().catch((error): VoiceCaptureStatus => ({
       available: false,
       local: false,
       problem: String(error),
     }));
+    if (
+      context !== latest.current.context ||
+      !mounted.current ||
+      !latest.current.connected ||
+      !latest.current.allowed
+    )
+      return false;
     setStatus(s);
-    setSetup((v) => (v === "ready" ? undefined : v));
     if (!s.available) return false;
     if (session)
       session.options = {
@@ -211,19 +235,28 @@ export function VoiceControl(props: VoiceControlProps) {
         listenWhileSpeaking: Boolean(s.listenWhileSpeaking),
       };
     await host.voiceArm?.(true);
+    if (
+      context !== latest.current.context ||
+      !mounted.current ||
+      !latest.current.connected ||
+      !latest.current.allowed
+    ) {
+      await host.voiceArm?.(false);
+      return false;
+    }
     return true;
   }, [capture, host, session]);
   readyRef.current = ready;
 
   const downloadModel = useCallback(async () => {
     if (!host.voiceSetup) return;
-    setSetup("downloading");
+    setSetup(true);
     try {
       const s = await host.voiceSetup();
       setStatus(s.available ? undefined : s);
-      setSetup(s.available ? "ready" : undefined);
+      setSetup(false);
     } catch (error) {
-      setSetup(undefined);
+      setSetup(false);
       setStatus({
         available: false,
         local: false,
@@ -234,7 +267,7 @@ export function VoiceControl(props: VoiceControlProps) {
   }, [host]);
 
   // The microphone is granted while something is recorded or a session listens, and taken
-  // back once push to talk has sent (or dropped) its recording.
+  // back once push to talk has finished (or dropped) its recording.
   const armedFor =
     state.mode === "hands-free"
       ? state.phase !== "off"
@@ -243,17 +276,13 @@ export function VoiceControl(props: VoiceControlProps) {
     if (!armedFor && state.phase !== "off") quietly(host.voiceArm?.(false));
   }, [armedFor, state.phase, host]);
 
-  // With the hub gone, nothing heard could be sent: a hands-free session ends.
+  // Losing the connection or permission cancels recognition, including late results.
   useEffect(() => {
-    if (
-      !props.connected &&
-      state.mode === "hands-free" &&
-      state.phase !== "off"
-    )
+    if ((!props.connected || !props.allowed) && state.phase !== "off")
       quietly(session?.end().then(() => host.voiceArm?.(false)));
-  }, [props.connected, state.mode, state.phase, session, host]);
+  }, [props.connected, props.allowed, state.phase, session, host]);
 
-  // Mod+Shift+Space: talk, then send. Mod+Shift+L: a hands-free session on or off.
+  // Mod+Shift+Space: talk, then transcribe. Mod+Shift+L: a hands-free session on or off.
   const keys = useRef<(event: KeyboardEvent) => void>(() => {});
   useEffect(() => {
     const listener = (event: KeyboardEvent) => keys.current(event);
@@ -263,6 +292,9 @@ export function VoiceControl(props: VoiceControlProps) {
 
   if (!session || !capture) return null;
   const on = state.phase !== "off";
+  const active = !["off", "ready", "error"].includes(state.phase);
+  const unavailable = Boolean(status && !status.available);
+  const showStatus = active || unavailable || Boolean(state.error) || setup;
   const recording = state.mode === "push" && state.phase === "hearing";
   const handsFree = state.mode === "hands-free" && on;
   const disabled = !props.allowed || !props.connected;
@@ -276,10 +308,11 @@ export function VoiceControl(props: VoiceControlProps) {
       props.onError(error);
     }
   };
-  // A click starts recording and the next click sends; a long press is hold-to-talk, and
-  // letting go sends.
-  const micDown = () => {
-    if (disabled || handsFree || busy) return;
+  // A click starts recording and the next click transcribes; a long press is hold-to-talk, and
+  // letting go transcribes.
+  const micDown = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (disabled || handsFree || busy || event.button !== 0) return;
+    event.currentTarget.setPointerCapture?.(event.pointerId);
     pressedAt.current = Date.now();
     wasRecording.current = recording;
     if (!recording) void start();
@@ -288,7 +321,12 @@ export function VoiceControl(props: VoiceControlProps) {
     if (!wasRecording.current && Date.now() - pressedAt.current > HOLD_MS)
       session.release().catch(props.onError);
   };
-  const micClick = () => {
+  const micClick = (event: React.MouseEvent) => {
+    if (event.detail === 0 && !disabled && !handsFree && !busy) {
+      if (recording) session.release().catch(props.onError);
+      else void start();
+      return;
+    }
     if (wasRecording.current) session.release().catch(props.onError);
     wasRecording.current = false;
   };
@@ -317,7 +355,7 @@ export function VoiceControl(props: VoiceControlProps) {
       else if (!busy) void start();
     } else if (event.code === "KeyL") {
       event.preventDefault();
-      if (!disabled) void toggleHandsFree();
+      if (!disabled && props.conversationAllowed) void toggleHandsFree();
     }
   };
 
@@ -330,17 +368,13 @@ export function VoiceControl(props: VoiceControlProps) {
         ? "Speaking · talk to interrupt"
         : PHASES[state.phase];
 
-  return (
+  const feedback = (
     <>
-      {(on || status?.problem || state.confirm || setup) && (
+      {showStatus && (
         <div className="voice-bar" role="status" aria-live="polite">
-          {setup === "downloading" ? (
+          {setup ? (
             <span className="voice-phase">
               <Download size={14} /> Downloading the speech model (148 MB)…
-            </span>
-          ) : setup === "ready" && !on ? (
-            <span className="voice-phase">
-              <Mic size={14} /> Voice is ready: click the microphone to talk.
             </span>
           ) : status && !status.available && status.setup && host.voiceSetup ? (
             <span className="voice-problem voice-setup">
@@ -376,9 +410,11 @@ export function VoiceControl(props: VoiceControlProps) {
                         ? "Ignored its own voice"
                         : state.heard.outcome === "control"
                           ? `“${state.heard.text}”`
-                          : state.heard.outcome === "confirm"
-                            ? `Not sent yet: “${state.heard.text}”`
-                            : `Sent “${state.heard.text}”`))}
+                          : state.heard.outcome === "draft"
+                            ? "Added to message box · edit, then Send"
+                            : state.heard.outcome === "confirm"
+                              ? `Not sent yet: “${state.heard.text}”`
+                              : `Sent “${state.heard.text}”`))}
                 </span>
               )}
               {state.error && (
@@ -395,12 +431,18 @@ export function VoiceControl(props: VoiceControlProps) {
               <VolumeX size={14} /> Quiet
             </button>
           )}
+          {state.mode === "push" &&
+            ["hearing", "transcribing"].includes(state.phase) && (
+              <button type="button" onClick={() => quietly(session.end())}>
+                Cancel dictation
+              </button>
+            )}
           {handsFree && (
             <button type="button" onClick={() => void toggleHandsFree()}>
               <Square size={12} /> Stop listening
             </button>
           )}
-          {!on &&
+          {!active &&
             !setup &&
             status?.setup &&
             !status.available &&
@@ -409,12 +451,13 @@ export function VoiceControl(props: VoiceControlProps) {
                 <Download size={14} /> Download model
               </button>
             )}
-          {!on && setup !== "downloading" && (status?.problem || setup) && (
+          {!active && !setup && (unavailable || state.error) && (
             <button
               type="button"
               onClick={() => {
                 setStatus(undefined);
-                setSetup(undefined);
+                setSetup(false);
+                quietly(session.end());
               }}
             >
               Dismiss
@@ -450,21 +493,28 @@ export function VoiceControl(props: VoiceControlProps) {
           </div>
         </div>
       )}
+    </>
+  );
+
+  return (
+    <>
+      {props.statusContainer && createPortal(feedback, props.statusContainer)}
       <button
         type="button"
         className={`voice-button ${recording ? "recording" : ""}`}
         aria-pressed={recording}
         aria-label={
-          recording ? "Send what you said" : "Talk to the orchestrator"
+          recording ? "Transcribe what you said" : "Dictate a message"
         }
         title={
           recording
-            ? "Click or let go to send"
-            : "Talk to the orchestrator (click, or hold) · Mod+Shift+Space"
+            ? "Click or let go to add text to the message box"
+            : "Dictate a message (click, or hold) · Mod+Shift+Space"
         }
         disabled={disabled || handsFree || busy}
         onPointerDown={micDown}
         onPointerUp={micUp}
+        onPointerCancel={() => quietly(session.end())}
         onClick={micClick}
         data-voice-push
       >
@@ -475,8 +525,8 @@ export function VoiceControl(props: VoiceControlProps) {
         className={`voice-button ${handsFree ? "recording" : ""}`}
         aria-pressed={handsFree}
         aria-label={handsFree ? "Stop hands-free voice" : "Hands-free voice"}
-        title="Hands-free: listen and read replies aloud until you stop · Mod+Shift+L"
-        disabled={disabled}
+        title="Hands-free conversation: automatically send to the orchestrator and read replies aloud · Mod+Shift+L"
+        disabled={disabled || !props.conversationAllowed}
         onClick={() => void toggleHandsFree()}
         data-voice-hands-free
       >

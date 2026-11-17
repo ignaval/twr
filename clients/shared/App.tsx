@@ -355,6 +355,7 @@ export default function App({
       void saved
         .load()
         .then(() => {
+          drafts.restoreSpoken(saved.snapshot.spokenDrafts);
           drafts.update((current) => ({
             ...saved.snapshot.drafts,
             ...current,
@@ -408,7 +409,7 @@ export default function App({
           return;
         }
         void journal
-          .drafts(drafts.all(), epoch)
+          .drafts(drafts.all(), epoch, drafts.spoken())
           .then(() => setOfflineNotice(""))
           .catch((error) => setOfflineNotice(errorMessage(error)));
       };
@@ -995,6 +996,7 @@ export default function App({
               await saved.drafts(restored);
               localStorage.removeItem(oldKey);
             }
+            drafts.restoreSpoken(saved.snapshot.spokenDrafts);
             drafts.update((current) => ({ ...restored, ...current }));
             setJournal(saved);
             setOfflineNotice(saved.historyError);
@@ -1558,10 +1560,27 @@ export default function App({
       });
     else await run();
   };
+  const reviewDictation = (key: string, text: string) => {
+    setConfirmation({
+      title: "Confirm spoken message",
+      detail: `Heard “${text}”. Spoken text never answers a request, changes a mode, or runs a composer command by itself. Review it in the message box before sending it as typed.`,
+      action: "Review in message box",
+      run: () => {
+        drafts.review(key, text);
+        input.current?.focus();
+      },
+    });
+  };
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
     const draft = drafts.get(draftKey);
     if (!permitted("operate") || !draft.trim() || sending) return;
+    const spoken = drafts.isSpoken(draftKey);
+    if (spoken && !connected) return;
+    if (spoken && (draft.startsWith("/") || draft.startsWith("!"))) {
+      reviewDictation(draftKey, draft);
+      return;
+    }
     if (
       !connected &&
       (!journal || draft.startsWith("/") || draft.startsWith("!"))
@@ -1621,9 +1640,13 @@ export default function App({
               message: text,
               seen_gseq: view.head,
               to: "orchestrator",
-              suggested:
-                acceptedSuggestion.current?.key === key &&
-                acceptedSuggestion.current.text === text,
+              ...(spoken
+                ? { voice: true }
+                : {
+                    suggested:
+                      acceptedSuggestion.current?.key === key &&
+                      acceptedSuggestion.current.text === text,
+                  }),
             };
         // Live replies to a waiting request use only the current visible head.
         // They never enter the delayed message outbox or receive automatic retries.
@@ -1635,7 +1658,7 @@ export default function App({
             (item) =>
               item.reason === "permission" || item.reason === "question",
           );
-        if (journal && hostApi.sendMessage && !liveReply) {
+        if (journal && hostApi.sendMessage && !liveReply && !spoken) {
           const pending = { key, text: draft, saved: false };
           pendingEnqueue.current = pending;
           const epoch = journal.epoch;
@@ -1646,7 +1669,9 @@ export default function App({
             .catch((error) => {
               if (pendingEnqueue.current === pending)
                 pendingEnqueue.current = undefined;
-              void journal.drafts(drafts.all(), epoch).catch(() => {});
+              void journal
+                .drafts(drafts.all(), epoch, drafts.spoken())
+                .catch(() => {});
               throw error;
             });
           pending.saved = true;
@@ -1656,6 +1681,10 @@ export default function App({
         } else response = await rpc(method, params);
       }
 
+      if (spoken && response.action === "confirm") {
+        reviewDictation(key, draft);
+        return;
+      }
       for (const restored of response.restored_drafts || [])
         drafts.set(restored.key, (old) => appendDraft(old, restored.text));
       if (response.action === "pending") {
@@ -1693,6 +1722,10 @@ export default function App({
     if (!thread || thread.is_orchestrator || sending) return;
     const key = draftKey;
     const draft = drafts.get(key);
+    if (drafts.isSpoken(key)) {
+      reviewDictation(key, draft);
+      return;
+    }
     let plan: ReturnType<typeof sendAsLoop>;
     try {
       plan = sendAsLoop(draft);
@@ -1757,6 +1790,10 @@ export default function App({
     ...announcements(view.threads),
   ];
   async function submitSlash(text: string) {
+    if (drafts.isSpoken(draftKey)) {
+      reviewDictation(draftKey, drafts.get(draftKey));
+      return;
+    }
     if (slashPending.current) return;
     slashPending.current = true;
     setSending(true);

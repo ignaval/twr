@@ -27,6 +27,32 @@ function storage() {
   };
 }
 describe("encrypted offline recovery", () => {
+  it("persists unreviewed dictation together with its draft and drops stale markers on reload", async () => {
+    const disk = storage();
+    const journal = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "speech-draft",
+    );
+    await journal.drafts({ "work:orchestrator": "allow it" }, journal.epoch, {
+      "work:orchestrator": true,
+    });
+    const reopened = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "speech-draft",
+    );
+    await reopened.load();
+    expect(reopened.snapshot.spokenDrafts).toEqual({
+      "work:orchestrator": true,
+    });
+    await reopened.drafts({ "work:orchestrator": "" });
+    const empty = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "speech-draft",
+    );
+    await empty.load();
+    expect(empty.snapshot.spokenDrafts).toEqual({});
+  });
+
   it("delivers older workspace messages before a newly composed message", async () => {
     const disk = storage();
     const calls: string[] = [];
