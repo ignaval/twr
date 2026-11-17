@@ -225,6 +225,8 @@ export function Composer({
   fail: (error: unknown) => void;
 }) {
   const draft = useDraft(drafts, draftKey);
+  const [voiceStatusContainer, setVoiceStatusContainer] =
+    useState<HTMLDivElement | null>(null);
   const spokenDraft = useSyncExternalStore(drafts.subscribe, () =>
     drafts.isSpoken(draftKey),
   );
@@ -527,6 +529,7 @@ export function Composer({
             <VoiceControl
               context={draftKey + ":" + target?.id}
               host={hostApi}
+              statusContainer={voiceStatusContainer}
               rpc={rpc}
               connected={connected}
               allowed={operate && Boolean(target)}
@@ -594,6 +597,7 @@ export function Composer({
             )}
           </div>
         </div>
+        <div className="composer-voice-status" ref={setVoiceStatusContainer} />
         {mentions.length > 0 && !mentionHidden && (
           <div
             className="mentions"

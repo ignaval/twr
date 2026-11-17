@@ -246,13 +246,47 @@ try {
   await page
     .getByRole("button", { name: "Transcribe what you said" })
     .waitFor({ timeout: 10000 });
+  const placement = await page.locator(".voice-bar").evaluate((bar) => {
+    const composer = bar.closest(".composer");
+    const field = composer.querySelector("textarea");
+    const bounds = bar.getBoundingClientRect();
+    const box = composer.getBoundingClientRect();
+    return {
+      inline: bar.parentElement.classList.contains("composer-voice-status"),
+      position: getComputedStyle(bar).position,
+      belowEditor: bounds.top >= field.getBoundingClientRect().bottom,
+      withinComposer:
+        bounds.left >= box.left &&
+        bounds.right <= box.right &&
+        bounds.bottom <= box.bottom,
+    };
+  });
+  assert(
+    placement.inline && placement.belowEditor && placement.withinComposer,
+    JSON.stringify(placement),
+  );
+  assert(
+    !["absolute", "fixed"].includes(placement.position),
+    "voice status must not cover the UI",
+  );
   // The recording plays from its start once capture opens; leave it time to be heard.
   await wait(5000);
   await page.getByRole("button", { name: "Transcribe what you said" }).click();
-  await page
-    .locator(".voice-heard")
-    .filter({ hasText: "Added to message box" })
-    .waitFor({ timeout: 60000 });
+  await page.waitForFunction(
+    () => Boolean(document.querySelector(".composer textarea")?.value.trim()),
+    undefined,
+    { timeout: 60000 },
+  );
+  assert.equal(
+    await page.locator(".voice-bar").count(),
+    0,
+    "idle dictation has no status popup",
+  );
+  assert.equal(
+    await page.getByRole("dialog").count(),
+    0,
+    "dictation opens no ready dialog",
+  );
   const heard = await page
     .getByRole("textbox", { name: "Message orchestrator" })
     .inputValue();
@@ -325,10 +359,21 @@ try {
     .waitFor({ timeout: 10000 });
   await wait(3500);
   await page.getByRole("button", { name: "Transcribe what you said" }).click();
-  await page
-    .locator(".voice-heard")
-    .filter({ hasText: "Added to message box" })
-    .waitFor({ timeout: 60000 });
+  await page.waitForFunction(
+    () => Boolean(document.querySelector(".composer textarea")?.value.trim()),
+    undefined,
+    { timeout: 60000 },
+  );
+  assert.equal(
+    await page.locator(".voice-bar").count(),
+    0,
+    "idle dictation has no status popup",
+  );
+  assert.equal(
+    await page.getByRole("dialog").count(),
+    0,
+    "dictation opens no ready dialog",
+  );
   await page.getByRole("button", { name: "Send message", exact: true }).click();
   await page
     .getByRole("dialog", { name: "Confirm spoken message" })

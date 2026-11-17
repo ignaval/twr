@@ -1057,6 +1057,7 @@ export class VoiceSession {
       partial: "",
       confirm: undefined,
       heard: undefined,
+      error: undefined,
     });
     this.releaseWanted = false;
     try {

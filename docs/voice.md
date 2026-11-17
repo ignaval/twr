@@ -12,7 +12,9 @@ orchestrator and reads its replies aloud ([read-aloud.md](read-aloud.md)) on tha
   Enter on desktop). `Cmd-Shift-Space` (`Ctrl-Shift-Space` on Linux) toggles recording too.
   **Cancel dictation** drops a recording or pending recognition. Silence and errors leave
   the draft intact. Switching conversations or workspaces, leaving the composer, losing the
-  connection or losing permission cancels capture and drops late results.
+  connection or losing permission cancels capture and drops late results. There is no idle
+  ready popup: recording, recognition and errors appear inline in the composer and disappear
+  when finished or dismissed. Downloading a missing model also needs no success dialog.
 - **Hands-free conversation:** the waveform button beside it (`Cmd-Shift-L`) listens until you stop it.
   Each thing you say is one message, sent once you pause for two seconds (`[voice] pause_ms`),
   so a pause to think mid-sentence doesn't send half of it. The orchestrator's replies are read

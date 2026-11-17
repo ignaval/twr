@@ -6,7 +6,7 @@ import type {
   Json,
   Thread,
 } from "../shared/types";
-import type { NativeVoiceEvent } from "../shared/voice";
+import type { NativeVoiceEvent, VoiceCaptureStatus } from "../shared/voice";
 import { SUGGEST_SETTLE_MS } from "../shared/assistance";
 import {
   FakeEvent,
@@ -79,6 +79,8 @@ type HostOptions = {
   /** The connection takes uploads. */
   uploads?: boolean;
   voice?: boolean;
+  voiceStatus?: () => Promise<VoiceCaptureStatus>;
+  voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
 };
 
@@ -89,7 +91,8 @@ function fakeHost(options: HostOptions = {}) {
   const voiceListeners = new Set<(event: NativeVoiceEvent) => void>();
   const voiceOps: string[] = [];
   const nativeVoice = {
-    status: async () => ({ available: true, local: true }),
+    status:
+      options.voiceStatus || (async () => ({ available: true, local: true })),
     start: async ({ mode }: { mode: string }) => {
       voiceOps.push("start:" + mode);
       if (mode === "push")
@@ -111,6 +114,7 @@ function fakeHost(options: HostOptions = {}) {
   const host = {
     sent,
     nativeVoice: options.voice ? nativeVoice : undefined,
+    voiceSetup: options.voiceSetup,
     voiceOps,
     voiceEvent: (event: NativeVoiceEvent) =>
       voiceListeners.forEach((listener) => listener(event)),
@@ -719,6 +723,8 @@ describe("dictation in the shared desktop and mobile composer", () => {
       expect(app().box().value).toBe("Typed first. Still typing.");
       await voiceEvent({ type: "final", text: "Spoken last." });
       expect(app().host.sent).toEqual([]);
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
       expect(app().box().value).toBe("Typed first. Still typing. Spoken last.");
       expect(app().document.activeElement).toBe(app().box());
       await app().type(" Edited.");
@@ -737,6 +743,90 @@ describe("dictation in the shared desktop and mobile composer", () => {
       expect(app().box().value).toBe("");
     },
   );
+  it.each([false, true])(
+    "keeps active and error feedback inline and removes it after completion or dismissal (mobile=%s)",
+    async (mobile) => {
+      await start({ mobile });
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      await app().click(mic(), { detail: 0 });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Hearing you");
+      expect(app().all(".composer-actions .voice-bar")).toHaveLength(0);
+      expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+      await app().click(mic(), { detail: 0 });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Transcribing");
+      await voiceEvent({ type: "final", text: "Editable words" });
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().find("form.composer").textContent).not.toMatch(
+        /voice (?:is )?ready/i,
+      );
+      await app().click(mic(), { detail: 0 });
+      await voiceEvent({ type: "error", message: "Microphone unavailable" });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Microphone unavailable");
+      expect(app().box().value).toBe("Editable words");
+      await app().click(app().find(".voice-bar button", "Dismiss"));
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().box().value).toBe("Editable words");
+    },
+  );
+  it("removes model setup feedback after download without a ready dialog or acknowledgement", async () => {
+    let finish!: (status: VoiceCaptureStatus) => void;
+    await start({
+      voiceStatus: async () => ({
+        available: false,
+        local: true,
+        setup: true,
+        problem: "No model",
+      }),
+      voiceSetup: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await app().click(mic(), { detail: 0 });
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Voice needs a speech model");
+    await app().click(app().find(".voice-bar button", "Download model"));
+    expect(app().find(".voice-bar").textContent).toContain(
+      "Downloading the speech model",
+    );
+    await app().act(async () => finish({ available: true, local: true }));
+    await app().settle();
+    expect(app().all(".voice-bar")).toHaveLength(0);
+    expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+    expect(app().find("form.composer").textContent).not.toMatch(
+      /voice (?:is )?ready/i,
+    );
+    expect(app().host.sent).toEqual([]);
+  });
+  it("keeps failed model setup inline with retry and dismiss actions", async () => {
+    await start({
+      voiceStatus: async () => ({
+        available: false,
+        local: true,
+        setup: true,
+        problem: "No model",
+      }),
+      voiceSetup: async () => {
+        throw new Error("Download failed");
+      },
+    });
+    await app().click(mic(), { detail: 0 });
+    await app().click(app().find(".voice-bar button", "Download model"));
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Download failed");
+    expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+    expect(app().find(".voice-bar button", "Download model")).toBeDefined();
+    await app().click(app().find(".voice-bar button", "Dismiss"));
+    expect(app().all(".voice-bar")).toHaveLength(0);
+  });
   it("supports hold-to-talk, the keyboard shortcut, and an end-of-draft caret", async () => {
     await start();
     await app().type("Typed");
@@ -831,6 +921,9 @@ describe("dictation in the shared desktop and mobile composer", () => {
       },
     });
     expect(app().box().value).toBe("Keep this worker draft");
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Listening");
   });
   it("retains spoken provenance through edits and encrypted draft reload, then requires explicit review of approvals", async () => {
     const calls: Json[] = [];
