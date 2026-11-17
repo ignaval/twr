@@ -37,6 +37,47 @@ function delimiter(line: string, streaming: boolean): Delimiter | undefined {
     return { partial: true };
 }
 
+/** A recognized delimiter can be nested in a list item. Lift it to the document
+ * level, splitting each ancestor around it so content stays on the correct side
+ * of the section boundary. Literal code and unrecognized HTML stay untouched. */
+function liftDelimiters(node: RootContent): RootContent[] {
+  if (node.data?.threadDelimiter?.partial) return [];
+  if (!("children" in node)) return [node];
+  const parts: RootContent[] = [];
+  let children: RootContent[] = [];
+  let changed = false;
+  let emitted = false;
+  let firstChild = 0;
+  const flush = () => {
+    if (!children.length) return;
+    const fragment = { ...node, children } as typeof node;
+    if (node.type === "list" && fragment.type === "list" && node.ordered)
+      fragment.start = (node.start ?? 1) + firstChild;
+    // A continuation of the same task item must not repeat its checkbox.
+    if (fragment.type === "listItem" && emitted) fragment.checked = undefined;
+    parts.push(fragment);
+    emitted = true;
+    children = [];
+  };
+  for (const [index, child] of node.children.entries()) {
+    const lifted = liftDelimiters(child);
+    if (lifted.length !== 1 || lifted[0] !== child) changed = true;
+    for (const part of lifted) {
+      if (part.data?.threadDelimiter) {
+        changed = true;
+        flush();
+        parts.push(part);
+      } else {
+        if (!children.length) firstChild = index;
+        children.push(part);
+      }
+    }
+  }
+  if (!changed) return [node];
+  flush();
+  return parts;
+}
+
 /** Register a flow construct, so Markdown decides whether a line is prose or
  * literal code (including fences nested in lists and quotes). A delimiter ends
  * a Markdown block but leaves the whole reply in one document for references. */
@@ -149,7 +190,7 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
       }
       body = [];
     };
-    for (const node of tree.children) {
+    for (const node of tree.children.flatMap(liftDelimiters)) {
       const tag = node.data?.threadDelimiter;
       if (tag) {
         if (tag.partial) continue;

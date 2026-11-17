@@ -23,7 +23,188 @@ const render = (
     }),
   );
 
+const boxes = (html: string) =>
+  Array.from(
+    html.matchAll(
+      /<section class="thread-message" aria-label="([^"]*)">([\s\S]*?)<\/section>/g,
+    ),
+    (match) => ({ name: match[1], html: match[2] }),
+  );
+
 describe("orchestrator thread sections", () => {
+  it("ends a section at an indented closing delimiter after a list item", () => {
+    const html = render(
+      '<thread name="a">\n- Done\n  </thread>\nOutside prose',
+    );
+    expect(html).toContain("<li>Done</li>");
+    expect(html).not.toContain("&lt;/thread");
+    expect(html).toMatch(
+      /<\/section>\s*<div class="markdown">\s*<p>Outside prose/,
+    );
+  });
+
+  it("starts and ends a section within a list, leaving surrounding list content outside", () => {
+    const html = render(
+      '- Before\n  <thread name="a">\n  Inside\n  </thread>\n  After',
+    );
+    expect(html.match(/class="thread-message"/g)).toHaveLength(1);
+    expect(html).not.toContain("&lt;thread");
+    expect(html).not.toContain("&lt;/thread");
+    expect(html).toMatch(
+      /Before[\s\S]*<section class="thread-message" aria-label="a">[\s\S]*Inside[\s\S]*<\/section>[\s\S]*After/,
+    );
+    expect(html.match(/<ul>/g)).toHaveLength(3);
+  });
+
+  it("switches sections at an indented opening delimiter within a list", () => {
+    const html = render(
+      '<thread name="a">\n- Done\n  <thread name="b">\n  Working\n  </thread>\nOutside prose',
+    );
+    expect(html.match(/class="thread-message"/g)).toHaveLength(2);
+    expect(html).not.toContain("&lt;thread");
+    expect(html).not.toContain("&lt;/thread");
+    expect(html).toMatch(
+      /aria-label="a">[\s\S]*Done[\s\S]*<\/section>\s*<section class="thread-message" aria-label="b">[\s\S]*Working[\s\S]*<\/section>\s*<div class="markdown">\s*<p>Outside prose/,
+    );
+  });
+
+  it.each([
+    ["ordered list", "7. Done", "   "],
+    ["nested list", "- Parent\n  - Done", "    "],
+    ["loose list", "- First\n\n- Done", "  "],
+    ["task list", "- [x] Done", "  "],
+    ["quote with a list", "> - Done", "  "],
+  ])(
+    "closes a thread after a %s without consuming outside prose",
+    (_kind, content, indent) => {
+      const html = render(
+        `<thread name="a">\n${content}\n${indent}</thread>\nOutside prose`,
+      );
+      const sections = boxes(html);
+      expect(sections).toHaveLength(1);
+      expect(sections[0].html).toContain("Done");
+      expect(sections[0].html).not.toContain("Outside prose");
+      expect(html).not.toContain("&lt;/thread");
+      expect(html).toMatch(
+        /<\/section>\s*<div class="markdown">\s*<p>Outside prose/,
+      );
+    },
+  );
+
+  it.each([
+    ["ordered list", "7. Before", "   "],
+    ["nested list", "- Parent\n  - Before", "    "],
+    ["loose list", "- First\n\n- Before", "  "],
+    ["blockquote", "> Before", "  "],
+  ])("opens and closes a thread after a %s", (_kind, content, indent) => {
+    const html = render(
+      `${content}\n${indent}<thread name="a">\n${indent}Inside\n${indent}</thread>\nOutside prose`,
+    );
+    const sections = boxes(html);
+    expect(sections).toHaveLength(1);
+    expect(sections[0].name).toBe("a");
+    expect(sections[0].html).toContain("Inside");
+    expect(sections[0].html).not.toContain("Before");
+    expect(sections[0].html).not.toContain("Outside prose");
+    expect(html).toContain("Before");
+    expect(html).toContain("Outside prose");
+    expect(html).not.toContain("&lt;thread");
+    expect(html).not.toContain("&lt;/thread");
+  });
+
+  it("preserves ordered list numbering when a boundary splits the list", () => {
+    const html = render(
+      '<thread name="a">\n7. First\n8. Done\n   </thread>\n9. Outside',
+    );
+    expect(boxes(html)[0].html).toContain('<ol start="7">');
+    expect(boxes(html)[0].html.match(/<li>/g)).toHaveLength(2);
+    expect(html).toMatch(
+      /<\/section>\s*<div class="markdown">\s*<ol start="9">[\s\S]*Outside/,
+    );
+    expect(html).not.toContain("&lt;/thread");
+  });
+
+  it("preserves list numbering when opening and closing inside the same ordered item", () => {
+    const html = render(
+      '7. Before\n   <thread name="a">\n   Inside\n   </thread>\n8. After',
+    );
+    expect(boxes(html)[0].html).toContain('<ol start="7">');
+    expect(html).toMatch(
+      /<\/section>\s*<div class="markdown">\s*<ol start="8">[\s\S]*After/,
+    );
+  });
+
+  it("does not duplicate task checkboxes across fragments of the same item", () => {
+    const html = render(
+      '- [x] Done\n  <thread name="a">\n  More\n  </thread>\n  Continuing\n- [ ] Next',
+    );
+    expect(html.match(/type="checkbox"/g)).toHaveLength(2);
+    expect(html.match(/ checked=""/g)).toHaveLength(1);
+    expect(boxes(html)[0].html).not.toContain("<input");
+    expect(boxes(html)[0].html).toContain("More");
+    expect(html).toContain("Continuing");
+    expect(html).toContain("Next");
+    expect(html).not.toContain("&lt;thread");
+    expect(html).not.toContain("&lt;/thread");
+  });
+
+  it("switches between thread sections at consecutive nested delimiters", () => {
+    const html = render(
+      '<thread name="a">\n- Done\n  </thread>\n  <thread name="b">\n  Working\n  </thread>\nOutside prose',
+    );
+    const sections = boxes(html);
+    expect(sections.map((section) => section.name)).toEqual(["a", "b"]);
+    expect(sections[0].html).toContain("Done");
+    expect(sections[0].html).not.toContain("Working");
+    expect(sections[1].html).toContain("Working");
+    expect(sections[1].html).not.toContain("Outside prose");
+    expect(html).not.toContain("&lt;thread");
+    expect(html).not.toContain("&lt;/thread");
+  });
+
+  it.each(["</thr", '<thread name="b'])(
+    "hides streaming nested partial delimiter %s without losing the list",
+    (partial) => {
+      const text = `<thread name="a">\n- Done\n  ${partial}`;
+      const html = render(text, { streaming: true });
+      expect(boxes(html)).toHaveLength(1);
+      expect(boxes(html)[0].html).toContain("<li>Done</li>");
+      expect(html).not.toContain("&lt;/thr");
+      expect(html).not.toContain("&lt;thread");
+      const final = render(
+        '<thread name="a">\n- Done\n  </thread>\nOutside prose',
+      );
+      expect(boxes(final)[0].html).not.toContain("Outside prose");
+    },
+  );
+
+  it("keeps nested fence examples literal while an indented delimiter closes the real box", () => {
+    const html = render(
+      '<thread name="a">\n- ```xml\n  <thread name="example">\n  literal\n  </thread>\n  ```\n  </thread>\nOutside prose',
+    );
+    const sections = boxes(html);
+    expect(sections).toHaveLength(1);
+    expect(sections[0].html).toContain(
+      "&lt;thread name=&quot;example&quot;&gt;",
+    );
+    expect(sections[0].html).toContain("&lt;/thread&gt;");
+    expect(sections[0].html).not.toContain("Outside prose");
+    expect(html).toMatch(
+      /<\/section>\s*<div class="markdown">\s*<p>Outside prose/,
+    );
+  });
+
+  it("shares reference definitions across lifted section boundaries", () => {
+    const html = render(
+      'Before [docs][d].\n\n- Done\n  <thread name="a">\n  Inside [docs][d].\n  </thread>\nOutside [docs][d].\n\n[d]: https://example.com',
+    );
+    expect(html.match(/href="https:\/\/example.com\/"/g)).toHaveLength(3);
+    expect(boxes(html)[0].html).toContain("Inside");
+    expect(boxes(html)[0].html).not.toContain("Outside");
+    expect(boxes(html)[0].html).not.toContain("Before");
+    expect(html).not.toContain("[docs][d]");
+  });
+
   it.each([
     '- ```xml\n  <thread name="example">\n  literal content\n  </thread>\n  ```',
     '1. ~~~xml\n   <thread name="example">\n   literal content\n   </thread>\n   ~~~',
