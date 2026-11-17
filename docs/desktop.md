@@ -66,8 +66,11 @@ Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a l
 
 The first line of your latest message stays above the history in the orchestrator and
 each thread's conversation, on desktop and phone. Click it (or focus it and press Enter
-or Space) to jump to that message. Older turns load as needed to find it when automatic
-turns have followed it. While offline, the line uses the history saved on this device.
+or Space) to jump to that message, with a visible keyboard focus outline. Recent history
+and live updates appear first; older turns load in the background to find your message
+when automatic turns have followed it. If an older page fails, recent history stays
+available and **Load earlier turn** retries it. While offline, the line uses the history
+saved on this device.
 
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads

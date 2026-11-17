@@ -472,6 +472,9 @@ export default function App({
   const [transcriptError, setTranscriptError] = useState("");
   const [earliestTurn, setEarliestTurn] = useState<number>();
   const [earlierBusy, setEarlierBusy] = useState(false);
+  const [earlierError, setEarlierError] = useState("");
+  const recentTurn = useRef<number | undefined>(undefined);
+  const earlierRequest = useRef<number | undefined>(undefined);
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
@@ -1124,7 +1127,12 @@ export default function App({
             : [],
     );
     setTranscriptError("");
-    if (!kept) setEarliestTurn(undefined);
+    setEarlierError("");
+    setEarlierBusy(false);
+    if (!kept) {
+      setEarliestTurn(undefined);
+      recentTurn.current = undefined;
+    }
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -1145,6 +1153,7 @@ export default function App({
           since_seq: last,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         const fresh: HubEvent[] = [...page.events];
         for (let pages = 1; page.more && pages < 8; pages++) {
           page = await rpc("thread.transcript", {
@@ -1183,8 +1192,9 @@ export default function App({
           limit: 500,
         });
       }
+      if (generation !== transcriptGeneration.current) return;
       const all: HubEvent[] = [...page.events];
-      let firstTurn = page.turn as number | undefined;
+      const firstTurn = page.turn as number | undefined;
       while (page.more) {
         page = await rpc("thread.transcript", {
           thread: id,
@@ -1196,37 +1206,10 @@ export default function App({
         all.push(...page.events);
       }
       const cursor = page.next || 0;
-      // Find the latest user message even when recent turns were automatic. Also
-      // give short conversations some context; the rest stays paged.
-      for (
-        let n = 0;
-        firstTurn &&
-        firstTurn > 1 &&
-        (!blocksOf(all).some((b) => b.kind === "user") ||
-          (n < 3 &&
-            blocksOf(all).reduce((sum, b) => sum + b.text.length, 0) < 3000));
-        n++
-      ) {
-        let older = await rpc("thread.transcript", {
-          thread: id,
-          turn: firstTurn - 1,
-          limit: 500,
-        });
-        const batch: HubEvent[] = [...older.events];
-        while (older.more) {
-          older = await rpc("thread.transcript", {
-            thread: id,
-            turn: firstTurn - 1,
-            since_seq: older.next,
-            limit: 500,
-          });
-          batch.push(...older.events);
-        }
-        all.unshift(...batch);
-        firstTurn--;
-        if (generation !== transcriptGeneration.current) return;
-      }
       if (generation !== transcriptGeneration.current) return;
+      // Show and subscribe to the recent turn before looking for older context
+      // or the latest user message. Older-page failures must not block live use.
+      recentTurn.current = firstTurn;
       setEarliestTurn(firstTurn);
       setEvents(all);
       liveTranscript.current = id;
@@ -1246,6 +1229,10 @@ export default function App({
         if (generation === transcriptGeneration.current)
           setTranscriptLoading(false);
       });
+    return () => {
+      // Fence both initial loading and older-page requests on switches/unmount.
+      transcriptGeneration.current++;
+    };
   }, [target?.id, connected, transcriptRefresh, rpc]);
   useEffect(() => {
     if (!target || !connected) {
@@ -2490,16 +2477,26 @@ export default function App({
   );
   const earlierTarget = target?.id;
   const earlier = useCallback(async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+    if (
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      !earlierTarget ||
+      !connected ||
+      earlierBusy
+    )
       return;
     const generation = transcriptGeneration.current;
+    if (earlierRequest.current === generation) return;
+    earlierRequest.current = generation;
     setEarlierBusy(true);
+    setEarlierError("");
     try {
       let page = await rpc("thread.transcript", {
         thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
+      if (generation !== transcriptGeneration.current) return;
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
@@ -2508,17 +2505,56 @@ export default function App({
           since_seq: page.next,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         more.push(...page.events);
       }
       if (generation !== transcriptGeneration.current) return;
       setEvents((old) => mergeEvents(old, more));
       setEarliestTurn(earliestTurn - 1);
     } catch (e) {
-      fail(e);
+      if (generation === transcriptGeneration.current)
+        setEarlierError(errorMessage(e));
     } finally {
-      setEarlierBusy(false);
+      if (generation === transcriptGeneration.current) {
+        earlierRequest.current = undefined;
+        setEarlierBusy(false);
+      }
     }
-  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  }, [earliestTurn, earlierTarget, connected, earlierBusy, rpc]);
+  useEffect(() => {
+    if (
+      !connected ||
+      transcriptLoading ||
+      transcriptError ||
+      earlierBusy ||
+      earlierError ||
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      liveTranscript.current !== earlierTarget ||
+      activeSubscription.current !== String(transcriptGeneration.current)
+    )
+      return;
+    const blocks = blocksOf(events);
+    // Continue independently until the latest user message is known. Preserve
+    // the bounded short-conversation context lookup, after subscribing as well.
+    if (
+      !blocks.some((block) => block.kind === "user") ||
+      (recentTurn.current != null &&
+        recentTurn.current - earliestTurn < 3 &&
+        blocks.reduce((sum, block) => sum + block.text.length, 0) < 3000)
+    )
+      void earlier();
+  }, [
+    connected,
+    transcriptLoading,
+    transcriptError,
+    earlierBusy,
+    earlierError,
+    earliestTurn,
+    earlierTarget,
+    events,
+    earlier,
+  ]);
   const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   useEffect(() => {
     setPaletteIndex(0);
@@ -3315,7 +3351,7 @@ export default function App({
                   showTools={showTools}
                   showThinking={showThinking}
                   loading={transcriptLoading && !presentedEvents.length}
-                  error={transcriptError}
+                  error={transcriptError || earlierError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
                   }
@@ -5350,9 +5386,11 @@ const Conversation = memo(function Conversation({
           </button>
         ) : (
           <span className="latest-user-empty" role="status">
-            {loading
+            {loading || (earlier && !error)
               ? "Loading your latest message…"
-              : "No messages from you yet"}
+              : error
+                ? "Latest message unavailable"
+                : "No messages from you yet"}
           </span>
         )}
       </div>

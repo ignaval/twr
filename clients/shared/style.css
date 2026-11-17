@@ -1036,8 +1036,12 @@ kbd {
 .latest-user-message > button:hover {
   background: var(--hover);
 }
-.latest-user-message > button:focus-visible,
-.transcript-block:focus-visible {
+.latest-user-message > button:focus-visible {
+  outline-offset: -2px;
+}
+/* More specific than the general outline suppression for tabindex=-1 targets. */
+.transcript-block[tabindex="-1"]:focus-visible {
+  outline: 2px solid var(--focus);
   outline-offset: -2px;
 }
 .latest-user-message svg,
