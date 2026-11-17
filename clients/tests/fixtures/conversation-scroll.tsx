@@ -31,6 +31,10 @@ const short = new URLSearchParams(location.search).has("short");
 const sparse = new URLSearchParams(location.search).has("sparse");
 const fastHistory = new URLSearchParams(location.search).has("fast-history");
 const historyRequests: string[] = [];
+// Replay streamed final-only history only in the identity-cutoff reload scenario.
+const replayHistory = new URLSearchParams(location.search).has(
+  "replay-history",
+);
 const event = (
   thread: string,
   turn: number,
@@ -232,6 +236,7 @@ window.twr = {
     if (method === "thread.transcript") {
       const logged = recorded.filter((event) => event.thread === params.thread);
       if (
+        replayHistory &&
         logged.some((event) => event.kind === "turn.started") &&
         !params.turn
       ) {

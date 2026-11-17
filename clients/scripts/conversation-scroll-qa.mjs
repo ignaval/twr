@@ -855,7 +855,7 @@ try {
     });
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
-    await page.goto(url + "?with-user&combined");
+    await page.goto(url + "?with-user&combined&replay-history");
     await expect(page.locator(".latest-user-preview")).toHaveText(
       "Task orch:4",
     );
