@@ -4,6 +4,8 @@ import type { Extension, State, Tokenizer } from "micromark-util-types";
 import type { Plugin } from "unified";
 import { memo } from "react";
 import { Markdown } from "./ui";
+import { threadStyle } from "./threadColor";
+import type { Thread } from "./types";
 
 declare module "micromark-util-types" {
   interface TokenTypeMap {
@@ -18,9 +20,35 @@ declare module "mdast" {
 }
 
 type Delimiter = { name?: string; partial?: boolean };
-type Options = { text: string; streaming: boolean };
+type Options = {
+  text: string;
+  streaming: boolean;
+  threads?: Thread[];
+  turnStartedAt?: string;
+};
 const OPEN = '<thread name="';
 const CLOSE = "</thread>";
+
+/** Protocol names are exact identities, never guessed prefixes. Follow the hub's
+ * precedence (id, name, alias, former name) and duplicate-name rule: only the
+ * sole live match wins. An ambiguous or missing identity keeps a neutral box. */
+function sectionThread(threads: Thread[], name: string): Thread | undefined {
+  const id = threads.find((thread) => thread.id === name);
+  if (id) return id;
+  for (const matches of [
+    threads.filter((thread) => thread.name === name),
+    threads.filter((thread) => thread.aliases?.includes(name)),
+  ]) {
+    if (!matches.length) continue;
+    if (matches.length === 1) return matches[0];
+    const live = matches.filter((thread) => !thread.stopped);
+    return live.length === 1 ? live[0] : undefined;
+  }
+  const former = threads.filter((thread) =>
+    thread.former_names?.includes(name),
+  );
+  return former.length === 1 ? former[0] : undefined;
+}
 
 function delimiter(line: string, streaming: boolean): Delimiter | undefined {
   const tag = line.trim();
@@ -90,6 +118,8 @@ function liftDelimiters(node: RootContent): RootContent[] {
 const remarkThreadSections: Plugin<[Options], Root> = function ({
   text,
   streaming,
+  threads = [],
+  turnStartedAt,
 }) {
   const tokenize: Tokenizer = function (effects, ok, nok) {
     const offset = this.now().offset;
@@ -163,6 +193,22 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
     let body: RootContent[] = [];
     const flush = () => {
       if (name !== undefined || body.length) {
+        const thread =
+          name === undefined ? undefined : sectionThread(threads, name);
+        // Names and aliases can be reused after deletion. The current match must
+        // demonstrably predate its turn, whose start survives filtered history. Missing
+        // dates and equal millisecond timestamps stay neutral (Date.parse loses
+        // finer precision). Do not fall through to a weaker identity match.
+        const predatesTurn =
+          Date.parse(thread?.created_at ?? "") <
+          Date.parse(turnStartedAt ?? "");
+        // mdast properties become HTML attributes; threadStyle validates the
+        // accent and supplies the same theme inks used by the thread cards.
+        const style = Object.entries(
+          threadStyle(predatesTurn ? thread?.accent : undefined),
+        )
+          .map(([key, value]) => `${key}:${value}`)
+          .join(";");
         const content: Blockquote = {
           type: "blockquote",
           children: body as Blockquote["children"],
@@ -178,6 +224,7 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
                   hProperties: {
                     className: ["thread-message"],
                     ariaLabel: name,
+                    ...(style ? { style } : {}),
                   },
                 },
                 children: [
@@ -186,7 +233,9 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
                     children: [{ type: "text", value: name }],
                     data: {
                       hName: "div",
-                      hProperties: { className: ["thread-message-name"] },
+                      hProperties: {
+                        className: ["thread-message-name", "thread-ink"],
+                      },
                     },
                   },
                   content,
@@ -214,13 +263,17 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
 export const ThreadMessage = memo(function ThreadMessage({
   text,
   streaming,
+  threads,
+  turnStartedAt,
 }: Options) {
   if (!text.includes("<")) return <Markdown text={text} />;
   return (
     <Markdown
       text={text}
       className="thread-sections"
-      remarkPlugins={[[remarkThreadSections, { text, streaming }]]}
+      remarkPlugins={[
+        [remarkThreadSections, { text, streaming, threads, turnStartedAt }],
+      ]}
     />
   );
 });

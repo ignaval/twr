@@ -2,6 +2,9 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { MessageBody } from "../shared/MessageBody";
+import { THREAD_COLORS, threadInk } from "../shared/threadColor";
+import type { HubEvent, Thread } from "../shared/types";
+import { blocksOf } from "../shared/transcript";
 
 vi.mock("../shared/host", () => ({
   useHostAPI: () => ({
@@ -12,13 +15,20 @@ vi.mock("../shared/host", () => ({
 
 const render = (
   text: string,
-  options: { threadTags?: boolean; streaming?: boolean; mono?: boolean } = {},
+  options: {
+    threadTags?: boolean;
+    streaming?: boolean;
+    mono?: boolean;
+    threads?: Thread[];
+    turnStartedAt?: string;
+  } = {},
 ) =>
   renderToStaticMarkup(
     createElement(MessageBody, {
       text,
       clamp: false,
       threadTags: true,
+      turnStartedAt: "2026-11-17T12:00:00Z",
       ...options,
     }),
   );
@@ -26,12 +36,351 @@ const render = (
 const boxes = (html: string) =>
   Array.from(
     html.matchAll(
-      /<section class="thread-message" aria-label="([^"]*)">([\s\S]*?)<\/section>/g,
+      /<section class="thread-message" aria-label="([^"]*)"[^>]*>([\s\S]*?)<\/section>/g,
     ),
     (match) => ({ name: match[1], html: match[2] }),
   );
 
 describe("orchestrator thread sections", () => {
+  const worker = (overrides: Partial<Thread> = {}): Thread => ({
+    id: "t1",
+    name: "api",
+    created_at: "2026-11-16T12:00:00Z",
+    accent: THREAD_COLORS[1],
+    runtime: "fake",
+    box_name: "local",
+    mode: "default",
+    status: "idle",
+    is_orchestrator: false,
+    ...overrides,
+  });
+  const section = (name: string, threads: Thread[], streaming = false) =>
+    render(
+      `<thread name="${name}">\n**Working**\n${streaming ? "</thr" : "</thread>"}`,
+      { threads, streaming },
+    );
+
+  it("uses each assigned palette color and both readable inks without coloring Markdown body text", () => {
+    for (const accent of THREAD_COLORS) {
+      const html = section("api", [worker({ accent })]);
+      expect(html).toContain(`--thread-color:${accent}`);
+      expect(html).toContain(
+        `--thread-ink-light:${threadInk(accent, "light")}`,
+      );
+      expect(html).toContain(`--thread-ink-dark:${threadInk(accent, "dark")}`);
+      expect(html).toContain(
+        `--thread-ink-omarchy:var(--omarchy-ink-${accent.slice(1)}, var(--text))`,
+      );
+      expect(html).toContain('class="thread-message-name thread-ink"');
+      expect(html).toMatch(
+        /<div class="markdown">\s*<p><strong>Working<\/strong><\/p>/,
+      );
+    }
+    const html = render(
+      '<thread name="api">\nOne\n</thread>\n<thread name="docs">\nTwo\n</thread>',
+      {
+        threads: [
+          worker(),
+          worker({ id: "t2", name: "docs", accent: THREAD_COLORS[0] }),
+        ],
+      },
+    );
+    expect(html).toContain(`--thread-color:${THREAD_COLORS[0]}`);
+    expect(html).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+  });
+
+  it.each(["t1", "api", "backend", "old-api"])(
+    "resolves exact identity %s including renamed threads",
+    (name) => {
+      expect(
+        section(name, [
+          worker({ aliases: ["backend"], former_names: ["old-api"] }),
+        ]),
+      ).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+    },
+  );
+
+  it("prefers ids, then current names, then aliases over former names, independent of row order", () => {
+    const threads = [
+      worker({
+        id: "old",
+        name: "renamed",
+        former_names: ["api", "backend"],
+        accent: THREAD_COLORS[2],
+      }),
+      worker({
+        id: "other",
+        name: "other",
+        aliases: ["api", "backend"],
+        accent: THREAD_COLORS[3],
+      }),
+      worker(),
+      worker({ id: "api", name: "id-match", accent: THREAD_COLORS[4] }),
+    ];
+    for (const rows of [threads, [...threads].reverse()]) {
+      expect(section("api", rows)).toContain(
+        `--thread-color:${THREAD_COLORS[4]}`,
+      );
+      expect(
+        section(
+          "api",
+          rows.filter((t) => t.id !== "api"),
+        ),
+      ).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+      expect(section("backend", rows)).toContain(
+        `--thread-color:${THREAD_COLORS[3]}`,
+      );
+    }
+  });
+
+  it("keeps unknown, missing, invalid-color and ambiguous threads neutral without guessing prefixes", () => {
+    for (const [name, threads] of [
+      ["missing", [worker()]],
+      ["api", []],
+      ["ap", [worker()]],
+      ["api", [worker({ accent: "invalid" })]],
+      ["api", [worker(), worker({ id: "t2" })]],
+      [
+        "old",
+        [
+          worker({ former_names: ["old"] }),
+          worker({ id: "t2", name: "docs", former_names: ["old"] }),
+        ],
+      ],
+    ] as [string, Thread[]][]) {
+      const html = section(name, threads);
+      expect(html).not.toContain("--thread-color:");
+      expect(boxes(html)).toHaveLength(1);
+      expect(html).toContain("<strong>Working</strong>");
+    }
+    expect(
+      section("api", [
+        worker({ stopped: true }),
+        worker({ id: "t2", accent: THREAD_COLORS[2] }),
+      ]),
+    ).toContain(`--thread-color:${THREAD_COLORS[2]}`);
+  });
+
+  it("colors streaming sections with known current and former names", () => {
+    const html = section("api", [worker()], true);
+    expect(html).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+    expect(html).toContain("<strong>Working</strong>");
+    expect(html).not.toContain("&lt;/thr");
+    expect(
+      section(
+        "api",
+        [worker({ name: "renamed", former_names: ["api"] })],
+        true,
+      ),
+    ).toContain(`--thread-color:${THREAD_COLORS[1]}`);
+    expect(section("api", [], true)).not.toContain("--thread-color:");
+  });
+
+  it.each(["api", "backend"])(
+    "does not color historical boxes after deletion and reuse of %s",
+    (name) => {
+      const text = `<thread name="${name}">\n**Original update**\n</thread>`;
+      const original = worker({ aliases: ["backend"] });
+      const replacement = worker({
+        id: "t2",
+        aliases: ["backend"],
+        accent: THREAD_COLORS[2],
+        created_at: "2026-11-17T12:00:01Z",
+      });
+      expect(render(text, { threads: [original] })).toContain(
+        `--thread-color:${original.accent}`,
+      );
+      for (const threads of [[], [replacement]]) {
+        const html = render(text, { threads });
+        expect(html).not.toContain("--thread-color:");
+        expect(html).toContain("<strong>Original update</strong>");
+      }
+      // Fresh renders model reloaded history, without a component-local identity cache.
+      expect(render(text, { threads: [replacement] })).not.toContain(
+        "--thread-color:",
+      );
+      expect(
+        render(text, {
+          threads: [replacement],
+          turnStartedAt: "2026-11-17T12:00:02Z",
+        }),
+      ).toContain(`--thread-color:${replacement.accent}`);
+    },
+  );
+
+  it.each([
+    undefined,
+    null,
+    "invalid",
+    "2026-11-17T12:00:00Z",
+    "2026-11-17T12:00:00.000001Z",
+    "2026-11-17T12:00:01Z",
+  ])(
+    "keeps a match neutral unless its creation time %s proves it predates the turn",
+    (created_at) => {
+      for (const name of ["t1", "api", "backend", "old-api"]) {
+        expect(
+          section(name, [
+            worker({
+              created_at,
+              aliases: ["backend"],
+              former_names: ["old-api"],
+            }),
+          ]),
+        ).not.toContain("--thread-color:");
+      }
+    },
+  );
+
+  it.each([undefined, "invalid"])(
+    "keeps identities neutral without a valid turn-start timestamp: %s",
+    (turnStartedAt) => {
+      expect(
+        render('<thread name="api">\nBody\n</thread>', {
+          threads: [worker()],
+          turnStartedAt,
+        }),
+      ).not.toContain("--thread-color:");
+    },
+  );
+
+  it("does not fall through a later-created exact name to a weaker alias match", () => {
+    const threads = [
+      worker({ id: "new", created_at: "2026-11-17T12:00:01Z" }),
+      worker({ name: "other", aliases: ["api"] }),
+    ];
+    expect(section("api", threads)).not.toContain("--thread-color:");
+  });
+
+  it.each(["api", "backend"])(
+    "keeps %s neutral live and in final-only history when replacement happens mid-reply",
+    (name) => {
+      const text = `<thread name="${name}">\n**Streaming update**\n</thread>`;
+      const event = (
+        seq: number,
+        kind: string,
+        data: HubEvent["data"],
+        ts: string,
+        turn = 1,
+      ): HubEvent => ({
+        id: `orch:${seq}`,
+        thread: "orch",
+        seq,
+        turn,
+        kind,
+        data,
+        ts,
+      });
+      const start = event(1, "turn.started", {}, "2026-11-17T12:00:00Z");
+      const delta = event(
+        2,
+        "agent.text",
+        { text, delta: true },
+        "2026-11-17T12:00:01Z",
+      );
+      const final = event(
+        3,
+        "agent.text",
+        { text, final: true },
+        "2026-11-17T12:00:03Z",
+      );
+      const original = worker({ aliases: ["backend"] });
+      const replacement = worker({
+        id: "t2",
+        aliases: ["backend"],
+        accent: THREAD_COLORS[2],
+        created_at: "2026-11-17T12:00:02Z",
+      });
+      const reply = (events: HubEvent[], thread: Thread) => {
+        const block = blocksOf(events).find(
+          (block) => block.kind === "assistant",
+        )!;
+        return {
+          block,
+          html: render(block.text, {
+            threads: [thread],
+            streaming: !!block.pending,
+            turnStartedAt: block.turnStartedAt,
+          }),
+        };
+      };
+      expect(reply([start, delta], original).html).toContain(
+        `--thread-color:${original.accent}`,
+      );
+      const live = reply([start, delta, final], replacement);
+      // read_transcript_events retains turn.started and final text, never deltas.
+      const history = reply([start, final], replacement);
+      expect(live.block.ts).toBe(delta.ts);
+      expect(history.block.ts).toBe(final.ts);
+      for (const result of [
+        reply([start, delta], replacement),
+        live,
+        history,
+      ]) {
+        expect(result.block.turnStartedAt).toBe(start.ts);
+        expect(result.html).not.toContain("--thread-color:");
+        expect(result.html).toContain("<strong>Streaming update</strong>");
+      }
+      const laterStart = event(
+        4,
+        "turn.started",
+        {},
+        "2026-11-17T12:00:04Z",
+        2,
+      );
+      const laterFinal = event(
+        5,
+        "agent.text",
+        { text, final: true },
+        "2026-11-17T12:00:05Z",
+        2,
+      );
+      expect(reply([laterStart, laterFinal], replacement).html).toContain(
+        `--thread-color:${replacement.accent}`,
+      );
+    },
+  );
+
+  it("does not substitute a final timestamp or another turn/thread's start when the matching start is absent", () => {
+    const final: HubEvent = {
+      id: "orch:2",
+      seq: 2,
+      thread: "orch",
+      turn: 2,
+      kind: "agent.text",
+      ts: "2026-11-17T12:00:03Z",
+      data: { final: true, text: '<thread name="api">\nBody\n</thread>' },
+    };
+    const start = {
+      ...final,
+      id: "orch:1",
+      seq: 1,
+      kind: "turn.started",
+      ts: "2026-11-17T12:00:00Z",
+      data: {},
+    };
+    for (const events of [
+      [final],
+      [{ ...start, turn: 1 }, final],
+      [{ ...start, thread: "other" }, final],
+      [
+        { ...start, turn: undefined },
+        { ...final, turn: undefined },
+      ],
+    ]) {
+      const block = blocksOf(events).find(
+        (block) => block.kind === "assistant",
+      )!;
+      expect(block.turnStartedAt).toBeUndefined();
+      expect(
+        render(block.text, {
+          threads: [worker()],
+          turnStartedAt: block.turnStartedAt,
+        }),
+      ).not.toContain("--thread-color:");
+    }
+  });
+
   it("preserves a footnote definition atomically when its body contains thread tags", () => {
     const html = render(
       'Text[^n].\n\n[^n]: Before.\n    <thread name="a">\n    Inside.\n    </thread>\n    After.',
@@ -416,7 +765,7 @@ describe("orchestrator thread sections", () => {
       'class="thread-message" aria-label="install-topbar-fix"',
     );
     expect(html).toContain(
-      '<div class="thread-message-name">install-topbar-fix</div>',
+      '<div class="thread-message-name thread-ink">install-topbar-fix</div>',
     );
     expect(html).toContain("Started the merge");
     expect(html).toMatch(

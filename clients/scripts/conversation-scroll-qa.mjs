@@ -231,6 +231,62 @@ try {
     await expect(
       page.locator('section.thread-message[aria-label="reviewer"] li'),
     ).toHaveCount(2);
+    for (const theme of ["light", "dark"]) {
+      await page.evaluate((theme) => {
+        document.documentElement.dataset.theme = theme;
+      }, theme);
+      for (const [name, color] of [
+        ["builder", "rgb(0, 135, 175)"],
+        ["reviewer", "rgb(255, 0, 255)"],
+      ]) {
+        const section = page.locator(
+          `section.thread-message[aria-label="${name}"]`,
+        );
+        await expect(section).toHaveCSS("border-top-color", color);
+        const card = page
+          .locator(".sidebar .thread-card")
+          .filter({ hasText: name });
+        const ink = await card.evaluate((node) => {
+          const probe = document.createElement("span");
+          probe.className = "thread-ink";
+          node.append(probe);
+          const color = getComputedStyle(probe).color;
+          probe.remove();
+          return color;
+        });
+        await expect(section.locator(".thread-message-name")).toHaveCSS(
+          "color",
+          ink,
+        );
+      }
+      const unknown = page.locator(
+        'section.thread-message[aria-label="missing"]',
+      );
+      const neutral = await page
+        .locator(".app")
+        .evaluate((node) =>
+          getComputedStyle(node).getPropertyValue("--border").trim(),
+        );
+      // Compare computed colors so CSS hex/rgb/color-mix serialization is irrelevant.
+      expect(
+        await unknown.evaluate((node, neutral) => {
+          const probe = document.createElement("span");
+          probe.style.color = neutral;
+          node.append(probe);
+          const matches =
+            getComputedStyle(node).borderTopColor ===
+            getComputedStyle(probe).color;
+          probe.remove();
+          return matches;
+        }, neutral),
+      ).toBe(true);
+      await page.screenshot({
+        path: `test-results/thread-box-colors-${theme}.png`,
+      });
+    }
+    console.log(
+      "PASS thread box colors: distinct assigned palette colors, readable theme inks, and neutral unknown-thread borders in light and dark",
+    );
     await page
       .getByRole("textbox", { name: "Message orchestrator", exact: true })
       .fill("Orchestrator draft");
@@ -285,6 +341,251 @@ try {
     await page.screenshot({ path: "test-results/combined-ui-jump.png" });
     console.log(
       "PASS combined UI: named Markdown boxes and shared references, single-click destination changes, per-thread drafts and jump targets, details toggle/focus, and orchestrator-only tag parsing",
+    );
+    await page.close();
+  }
+
+  // Keep the same reply mounted while live snapshots change its thread identity.
+  // A new thread may reuse a deleted thread's name or alias, but not its history.
+  for (const theme of ["light", "dark"]) {
+    const page = await browser.newPage({
+      viewport: { width: 1440, height: 900 },
+    });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(url + "?with-user&combined");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await scrollTo(page, 1);
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme;
+    }, theme);
+    const box = page
+      .locator('section.thread-message[aria-label="builder"]')
+      .first();
+    await expect(box).toHaveCSS("border-top-color", "rgb(0, 135, 175)");
+    await box.evaluate((node) => {
+      node.dataset.mounted = "original";
+    });
+    const threads = await page.evaluate(() =>
+      window.conversationScrollQA.threads(),
+    );
+    const original = threads.find((thread) => thread.id === "builder");
+    const others = threads.filter((thread) => thread.id !== "builder");
+    const update = (workers) =>
+      page.evaluate(
+        (threads) => window.conversationScrollQA.setThreads(threads),
+        [...others, ...workers],
+      );
+    const neutral = async () => {
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+      await expect(box).toHaveAttribute("data-mounted", "original");
+      await expect(box.locator("strong")).toHaveText("Ready");
+      await expect(box.locator("a")).toHaveAttribute(
+        "href",
+        "https://example.com/guide",
+      );
+    };
+    // Missing metadata can arrive later through a snapshot, without a text update.
+    await update([{ ...original, created_at: null }]);
+    await neutral();
+    await update([
+      { ...original, name: "renamed-builder", former_names: ["builder"] },
+    ]);
+    await expect(box).toHaveCSS("border-top-color", "rgb(0, 135, 175)");
+    await expect(box).toHaveAttribute("data-mounted", "original");
+    await update([]);
+    await neutral();
+    const replacement = {
+      ...original,
+      id: "replacement",
+      created_at: "2026-11-17T12:00:01Z",
+      accent: "#ff00ff",
+    };
+    await update([replacement]);
+    await neutral();
+    await update([
+      { ...replacement, name: "replacement", aliases: ["builder"] },
+    ]);
+    await neutral();
+    // Force a history remount by leaving the conversation and coming back.
+    await page
+      .locator(".sidebar .thread-card-title b")
+      .getByText("replacement", { exact: true })
+      .click();
+    await expect(
+      page.getByRole("textbox", {
+        name: "Message replacement directly",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Back to orchestrator", exact: true })
+      .click();
+    await scrollTo(page, 1);
+    await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+    // A reply actually sent after replacement creation may use its alias/color.
+    await page.evaluate(() =>
+      window.conversationScrollQA.reply(
+        '<thread name="builder">\nNew worker update.\n</thread>',
+        "2026-11-17T12:00:02Z",
+      ),
+    );
+    await scrollTo(page, 1);
+    const boxes = page.locator('section.thread-message[aria-label="builder"]');
+    await expect(boxes).toHaveCount(2);
+    await expect(boxes.first()).not.toHaveAttribute("style", /--thread-color:/);
+    await expect(boxes.last()).toHaveCSS(
+      "border-top-color",
+      "rgb(255, 0, 255)",
+    );
+    expect(errors).toEqual([]);
+    console.log(
+      `PASS ${theme}: mounted metadata/rename/deletion updates, name and alias reuse stay neutral, history remount stays safe, and new replies resolve the replacement`,
+    );
+    await page.close();
+  }
+
+  // Live first deltas and fetched final-only history have different timestamps.
+  // Replace the worker in between, then force an actual filtered RPC history read.
+  for (const theme of ["light", "dark"]) {
+    const page = await browser.newPage({
+      viewport: { width: 1440, height: 900 },
+    });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(url + "?with-user&combined");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await scrollTo(page, 1);
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme;
+    }, theme);
+    const threads = await page.evaluate(() =>
+      window.conversationScrollQA.threads(),
+    );
+    const original = threads.find((thread) => thread.id === "builder");
+    const others = threads.filter((thread) => thread.id !== "builder");
+    const update = (workers) =>
+      page.evaluate(
+        (threads) => window.conversationScrollQA.setThreads(threads),
+        [...others, ...workers],
+      );
+    await update([{ ...original, aliases: ["backend"] }]);
+    const text =
+      '<thread name="builder">\n**Streaming name update** [docs][d]\n</thread>\n<thread name="backend">\n**Streaming alias update**\n</thread>\n\n[d]: https://example.com/stream';
+    await page.evaluate((text) => {
+      window.conversationScrollQA.stream(
+        "turn.started",
+        { from: "user", prompt: "Streaming reuse scenario" },
+        "2026-11-17T12:00:00Z",
+      );
+      window.conversationScrollQA.stream(
+        "agent.text",
+        { text, delta: true },
+        "2026-11-17T12:00:01Z",
+      );
+    }, text);
+    await scrollTo(page, 1);
+    const boxes = page
+      .locator("section.thread-message")
+      .filter({ hasText: /Streaming (name|alias) update/ });
+    await expect(boxes).toHaveCount(2);
+    for (const box of await boxes.all()) {
+      await expect(box).toHaveCSS("border-top-color", "rgb(0, 135, 175)");
+      await box.evaluate((node) => {
+        node.dataset.mounted = "streaming";
+      });
+    }
+    await update([]);
+    for (const box of await boxes.all())
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+    await update([
+      {
+        ...original,
+        id: "replacement",
+        aliases: ["backend"],
+        accent: "#ff00ff",
+        created_at: "2026-11-17T12:00:02Z",
+      },
+    ]);
+    await page.evaluate(
+      (text) =>
+        window.conversationScrollQA.stream(
+          "agent.text",
+          { text, final: true },
+          "2026-11-17T12:00:03Z",
+        ),
+      text,
+    );
+    await expect(
+      page
+        .locator(".block-assistant")
+        .filter({ has: boxes.first() })
+        .locator(".spin"),
+    ).toHaveCount(0);
+    for (const box of await boxes.all()) {
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+      await expect(box).toHaveAttribute("data-mounted", "streaming");
+    }
+    const readsBefore = await page.evaluate(
+      () => window.conversationScrollQA.historyReads().length,
+    );
+    await page
+      .locator(".sidebar .thread-card-title b")
+      .getByText("reviewer", { exact: true })
+      .click();
+    await expect(
+      page.getByRole("textbox", {
+        name: "Message reviewer directly",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Back to orchestrator", exact: true })
+      .click();
+    await expect
+      .poll(() =>
+        page.evaluate(() => window.conversationScrollQA.historyReads().length),
+      )
+      .toBeGreaterThan(readsBefore);
+    const fetched = await page.evaluate(() =>
+      window.conversationScrollQA.historyReads().at(-1),
+    );
+    expect(
+      fetched.map((event) => [event.kind, event.ts, event.data.delta]),
+    ).toEqual([
+      ["turn.started", "2026-11-17T12:00:00Z", undefined],
+      ["agent.text", "2026-11-17T12:00:03Z", undefined],
+    ]);
+    await scrollTo(page, 1);
+    await expect(boxes).toHaveCount(2);
+    for (const box of await boxes.all()) {
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+      await expect(box).not.toHaveAttribute("data-mounted", "streaming");
+    }
+    await expect(boxes.first().locator("a")).toHaveAttribute(
+      "href",
+      "https://example.com/stream",
+    );
+    await page.evaluate(() =>
+      window.conversationScrollQA.reply(
+        '<thread name="builder">\nNew turn name update.\n</thread>\n<thread name="backend">\nNew turn alias update.\n</thread>',
+        "2026-11-17T12:00:04Z",
+      ),
+    );
+    await scrollTo(page, 1);
+    const newBoxes = page
+      .locator("section.thread-message")
+      .filter({ hasText: /New turn (name|alias) update/ });
+    await expect(newBoxes).toHaveCount(2);
+    for (const box of await newBoxes.all())
+      await expect(box).toHaveCSS("border-top-color", "rgb(255, 0, 255)");
+    expect(errors).toEqual([]);
+    console.log(
+      `PASS ${theme}: replacement between first delta and final stays neutral after final-only RPC history reload for both name and alias; a later turn uses the replacement color`,
     );
     await page.close();
   }

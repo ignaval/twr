@@ -7,12 +7,21 @@ import type {
   DesktopEvent,
   HubEvent,
   Json,
+  Thread,
 } from "../../shared/types";
 import "../../shared/style.css";
 import "../../mobile/src/mobile.css";
 
 const listeners = new Set<(event: DesktopEvent) => void>();
-const emit = (event: DesktopEvent) => listeners.forEach((read) => read(event));
+let currentThreads: Thread[] = [];
+const recorded: HubEvent[] = [];
+const historyReads: HubEvent[][] = [];
+const emit = (event: DesktopEvent) => {
+  if (event.type === "state" && event.state)
+    currentThreads = event.state.threads;
+  if (event.type === "thread" && event.event) recorded.push(event.event);
+  listeners.forEach((read) => read(event));
+};
 const pending = new Map<string, (page: Json) => void>();
 let subscription = "";
 let sequence = 500;
@@ -43,7 +52,7 @@ function history(thread: string, turn: number) {
       event(thread, turn, turn * 100 + index + 1, "agent.text", {
         text:
           combined && index === 59
-            ? 'Summary before boxes.\n\n<thread name="builder">\n**Ready** with `code` and [shared reference][guide].\n</thread>\n\n<thread name="reviewer">\n- Checked Markdown\n- Checked navigation\n</thread>\n\n[guide]: https://example.com/guide'
+            ? 'Summary before boxes.\n\n<thread name="builder">\n**Ready** with `code` and [shared reference][guide].\n</thread>\n\n<thread name="reviewer">\n- Checked Markdown\n- Checked navigation\n</thread>\n\n<thread name="missing">\nUnknown worker update.\n</thread>\n\n[guide]: https://example.com/guide'
             : `Message ${thread}:${turn}:${index}\n\n${"Variable row height. ".repeat(5 + (index % 9) * 13)}`,
       }),
     ),
@@ -56,10 +65,55 @@ declare global {
       pending: () => string[];
       release: (thread: string, turn: number) => void;
       append: () => void;
+      threads: () => Thread[];
+      setThreads: (threads: Thread[]) => void;
+      reply: (text: string, ts: string) => void;
+      stream: (kind: string, data: Json, ts: string) => void;
+      historyReads: () => HubEvent[][];
     };
   }
 }
 window.conversationScrollQA = {
+  historyReads: () => historyReads,
+  stream: (kind, data, ts) =>
+    emit({
+      type: "thread",
+      subscription,
+      event: { ...event("orch", 5, sequence++, kind, data), ts },
+    }),
+  threads: () => currentThreads,
+  setThreads: (threads) =>
+    emit({
+      type: "state",
+      state: {
+        threads,
+        attention: [],
+        decisions: [],
+        decisions_seen: 0,
+        head: 1,
+      },
+    }),
+  reply: (text, ts) => {
+    emit({
+      type: "thread",
+      subscription,
+      event: {
+        ...event("orch", 6, sequence++, "turn.started", {
+          from: "user",
+          prompt: "New worker task",
+        }),
+        ts,
+      },
+    });
+    emit({
+      type: "thread",
+      subscription,
+      event: {
+        ...event("orch", 6, sequence++, "agent.text", { text, final: true }),
+        ts,
+      },
+    });
+  },
   pending: () => [...pending.keys()],
   release: (thread, turn) => {
     const key = `${thread}:${turn}`;
@@ -97,6 +151,7 @@ window.twr = {
             {
               id: "orch",
               name: "orchestrator",
+              created_at: "2026-11-16T12:00:00Z",
               is_orchestrator: true,
               runtime: "fake",
               box_name: "local",
@@ -109,12 +164,24 @@ window.twr = {
                   {
                     id: "builder",
                     name: "builder",
+                    created_at: "2026-11-16T12:00:00Z",
                     is_orchestrator: false,
                     runtime: "fake",
                     box_name: "local",
                     mode: "default",
                     status: "idle",
-                    accent: "#3366ff",
+                    accent: "#0087af",
+                  },
+                  {
+                    id: "reviewer",
+                    name: "reviewer",
+                    created_at: "2026-11-16T12:00:00Z",
+                    is_orchestrator: false,
+                    runtime: "fake",
+                    box_name: "local",
+                    mode: "default",
+                    status: "idle",
+                    accent: "#ff00ff",
                   },
                 ]
               : []),
@@ -131,6 +198,25 @@ window.twr = {
   rpc: async (method: string, params: Json = {}) => {
     if (method === "desktop.subscribe") subscription = params.subscription;
     if (method === "thread.transcript") {
+      const logged = recorded.filter((event) => event.thread === params.thread);
+      if (
+        logged.some((event) => event.kind === "turn.started") &&
+        !params.turn
+      ) {
+        const turn = logged
+          .filter((event) => event.kind === "turn.started")
+          .at(-1)!.turn;
+        // Match read_transcript_events: keep semantic rows, filter deltas before
+        // paging. History reloads must not reuse the live first-delta timestamp.
+        const events = logged.filter(
+          (event) =>
+            event.turn === turn &&
+            event.seq > (params.since_seq || 0) &&
+            (event.kind !== "agent.text" || event.data.final === true),
+        );
+        historyReads.push(events);
+        return { events, turn, next: logged.at(-1)!.seq, more: false };
+      }
       if (params.since_seq) return { events: [], more: false };
       if (params.turn)
         return new Promise<Json>((resolve) => {
