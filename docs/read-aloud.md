@@ -110,6 +110,22 @@ Live mode belongs to each speaker and each workspace. It is kept on the speaker'
 a laptop can read aloud while a phone doesn't, and it stays on across restarts. When several
 workspaces read aloud on one speaker, each message starts with its workspace's name.
 
+In the **local desktop app**, the speaker button in the conversation's top bar toggles
+automatic reading for this computer and workspace. Its highlighted speaker means on; the
+crossed-out speaker means off. The tooltip names the state and scope. It follows the saved
+live setting and changes made through `/read` or voice mode, including when the local TUI's
+speaker is doing the speaking. Opening a local desktop conversation attaches the speaker
+with its saved live setting. Turning it off stops the current automatic reply and drops
+queued automatic replies for this workspace; explicit `/read` requests and other workspaces
+keep their existing behavior. Turning it on reads new replies under the usual speech rules.
+
+The button is also available in deep dives: it still controls the **orchestrator's** replies,
+not automatic reading of worker messages. Use `/read N` to hear a worker on demand. Playback
+pause remains independent of the live setting. A disconnected or unavailable speaker shows
+an unknown state instead of claiming live mode is off; reconnecting reads the actual setting.
+The button needs no microphone or speech recognition model. It is not offered for remote hub
+views or phones, whose speaker bridge does not expose the same local device controls.
+
 A speaker that was away (the laptop slept, the connection dropped, the hub restarted) reads
 what was said meanwhile, if it was said in the last two minutes (`[speech] catchup_secs`).
 Older messages are counted: "4 earlier messages came while I was disconnected; they're on

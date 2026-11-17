@@ -6,6 +6,7 @@ import {
 } from "./offline";
 import { TerminalSnapshots } from "./terminalSnapshots";
 import { Outbox } from "./Outbox";
+import { ReadAloudControl } from "./ReadAloudControl";
 import { UploadController } from "./uploads";
 import { AttachmentManager } from "./AttachmentManager";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
@@ -3279,6 +3280,13 @@ export default function App({
                     </div>
                   </div>
                   <div className="conversation-actions">
+                    <ReadAloudControl
+                      key={workspace}
+                      host={hostApi}
+                      rpc={rpc}
+                      workspace={workspace}
+                      connected={connected}
+                    />
                     <button
                       className={`icon-button ${showTools ? "on" : ""}`}
                       aria-label="Toggle tool calls"
