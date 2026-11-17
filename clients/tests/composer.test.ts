@@ -335,7 +335,7 @@ describe("the latest user message above conversation history", () => {
     expect(preview()).toBe("Latest request");
     expect(
       app().find(".latest-user-message button").getAttribute("aria-label"),
-    ).toBe("Jump to your latest message: Latest request");
+    ).toBe("Jump to your previous message: Latest request");
     expect(app().all(".conversation-scroll .latest-user-message")).toHaveLength(
       0,
     );
@@ -449,7 +449,7 @@ describe("the latest user message above conversation history", () => {
       app().find(".conversation-scroll").getAttribute("aria-busy"),
     ).toBeNull();
     expect(app().find(".latest-user-empty").textContent).toBe(
-      "Loading your latest message…",
+      "Loading your previous message…",
     );
     await app().act(async () =>
       app().host.emit({
@@ -620,7 +620,7 @@ describe("the latest user message above conversation history", () => {
     await app().talkTo("builder");
     expect(app().all(".latest-user-preview")).toHaveLength(0);
     expect(app().find(".latest-user-empty").textContent).toBe(
-      "Loading your latest message…",
+      "Loading your previous message…",
     );
     await app().act(async () =>
       finish({

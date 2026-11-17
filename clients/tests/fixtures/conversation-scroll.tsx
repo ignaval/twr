@@ -27,6 +27,10 @@ let subscription = "";
 let sequence = 500;
 const withUser = new URLSearchParams(location.search).has("with-user");
 const combined = new URLSearchParams(location.search).has("combined");
+const short = new URLSearchParams(location.search).has("short");
+const sparse = new URLSearchParams(location.search).has("sparse");
+const fastHistory = new URLSearchParams(location.search).has("fast-history");
+const historyRequests: string[] = [];
 const event = (
   thread: string,
   turn: number,
@@ -45,13 +49,17 @@ const event = (
 function history(thread: string, turn: number) {
   return [
     event(thread, turn, turn * 100, "turn.started", {
-      from: withUser ? "user" : "orchestrator",
+      from:
+        withUser && (!sparse || turn === 4 || turn === 1)
+          ? "user"
+          : "orchestrator",
       prompt: `Task ${thread}:${turn}`,
     }),
-    ...Array.from({ length: 60 }, (_, index) =>
+    ...Array.from({ length: short ? 1 : 60 }, (_, index) =>
       event(thread, turn, turn * 100 + index + 1, "agent.text", {
-        text:
-          combined && index === 59
+        text: short
+          ? "Short reply."
+          : combined && index === 59
             ? 'Summary before boxes.\n\n<thread name="builder">\n**Ready** with `code` and [shared reference][guide].\n</thread>\n\n<thread name="reviewer">\n- Checked Markdown\n- Checked navigation\n</thread>\n\n<thread name="missing">\nUnknown worker update.\n</thread>\n\n[guide]: https://example.com/guide'
             : `Message ${thread}:${turn}:${index}\n\n${"Variable row height. ".repeat(5 + (index % 9) * 13)}`,
       }),
@@ -63,13 +71,16 @@ declare global {
   interface Window {
     conversationScrollQA: {
       pending: () => string[];
+      historyRequests: () => string[];
       release: (thread: string, turn: number) => void;
+      releaseNext: () => void;
       append: () => void;
       threads: () => Thread[];
       setThreads: (threads: Thread[]) => void;
       reply: (text: string, ts: string) => void;
       stream: (kind: string, data: Json, ts: string) => void;
       historyReads: () => HubEvent[][];
+      appendUser: (prompt?: string) => void;
     };
   }
 }
@@ -115,12 +126,24 @@ window.conversationScrollQA = {
     });
   },
   pending: () => [...pending.keys()],
+  historyRequests: () => [...historyRequests],
+  releaseNext: () => {
+    const resolve = pending.get("orch:2:next");
+    if (!resolve) throw new Error("No pending next page");
+    pending.delete("orch:2:next");
+    resolve({ events: [], turn: 2, more: false });
+  },
   release: (thread, turn) => {
     const key = `${thread}:${turn}`;
     const resolve = pending.get(key);
     if (!resolve) throw new Error(`No pending transcript request: ${key}`);
     pending.delete(key);
-    resolve({ events: history(thread, turn), turn, more: false });
+    resolve({
+      events: history(thread, turn),
+      turn,
+      more: sparse && turn === 2,
+      next: turn * 100 + 60,
+    });
   },
   append: () =>
     emit({
@@ -128,6 +151,15 @@ window.conversationScrollQA = {
       subscription,
       event: event("orch", 5, sequence++, "agent.text", {
         text: "Live reply below the viewport. ".repeat(200),
+      }),
+    }),
+  appendUser: (prompt = "Live user request") =>
+    emit({
+      type: "thread",
+      subscription,
+      event: event("orch", 5, sequence++, "turn.started", {
+        from: "user",
+        prompt,
       }),
     }),
 };
@@ -217,14 +249,31 @@ window.twr = {
         historyReads.push(events);
         return { events, turn, next: logged.at(-1)!.seq, more: false };
       }
+      if (params.turn) {
+        historyRequests.push(`${params.thread}:${params.turn}`);
+        if (fastHistory)
+          return {
+            events: history(params.thread, params.turn),
+            turn: params.turn,
+            more: false,
+          };
+      }
+      // An older automatic turn spanning two pages. The first page must not
+      // become visible before the full turn has arrived.
+      if (sparse && params.turn === 2 && params.since_seq)
+        return new Promise<Json>((resolve) => {
+          pending.set(`${params.thread}:2:next`, resolve);
+        });
       if (params.since_seq) return { events: [], more: false };
       if (params.turn)
         return new Promise<Json>((resolve) => {
           pending.set(`${params.thread}:${params.turn}`, resolve);
         });
       return {
-        events: history(params.thread, 4),
-        turn: 4,
+        events: short
+          ? [1, 2, 3, 4].flatMap((turn) => history(params.thread, turn))
+          : history(params.thread, 4),
+        turn: short ? 1 : 4,
         next: 460,
         more: false,
       };

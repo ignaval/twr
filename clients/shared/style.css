@@ -1027,14 +1027,20 @@ kbd {
   line-height: 1.5;
 }
 .latest-user-message > button {
+  width: fit-content;
+  max-width: 100%;
   justify-content: flex-start;
   border: 0;
   border-radius: 0;
   background: transparent;
   text-align: start;
 }
-.latest-user-message > button:hover {
+.latest-user-message > button:not([aria-disabled="true"]):hover {
   background: var(--hover);
+}
+.latest-user-message > button[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: default;
 }
 .latest-user-message > button:focus-visible {
   outline-offset: -2px;

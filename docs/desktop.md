@@ -23,10 +23,14 @@ and companion from `clients/bin`, `target/debug`, or `target/release`. An explic
 `TWR_DESKTOP_BINARY_DIR` is accepted only in development. Packaged builds always use the
 three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remains useful for an independent test installation.
 
-`npm run test:conversation-scroll` checks reading position during delayed history loads
-in a browser, using a disposable host. It needs Playwright's Chromium or `TWR_CHROMIUM_PATH`.
+`npm run test:conversation-scroll` checks reading position during delayed history loads,
+scroll-relative user-message shortcuts, repeated keyboard jumps, short histories,
+history paging (including responses during jump settlement), live updates, and thread
+switches on desktop and phone layouts in a browser, using a disposable host. It needs
+Playwright's Chromium or `TWR_CHROMIUM_PATH`.
 Synthetic touch and momentum cases select the virtualizer's iOS path and verify deferred
-prepend adjustments. They do not reproduce native WebKit or physical iOS scrolling.
+prepend adjustments and shortcut selection while those adjustments are held. They do not
+reproduce native WebKit or physical iOS scrolling.
 
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
@@ -69,16 +73,34 @@ The orchestrator conversation is primary. Selecting a thread opens its conversat
 composer always names its destination. Mentions reference threads without changing it.
 Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
 
-The first line of your latest message stays above the history in the orchestrator and
-each thread's conversation, on desktop and phone. Click it (or focus it and press Enter
-or Space) to jump to that message, with a visible keyboard focus outline. Recent history
-and live updates appear first; older turns load in the background to find your message
-when automatic turns have followed it. If an older page fails, recent history stays
-available and **Load earlier turn** retries it. While offline, the line uses the history
-saved on this device.
+Above the history, the orchestrator and each thread's conversation show the first line
+of your preceding message, on desktop and phone. At the bottom, this is your latest
+message. While browsing, it is the last user message whose start lies above the history
+viewport's top edge, with a 1 CSS pixel tolerance. Reaching or passing its start while
+scrolling upward changes the shortcut to the previous user message. Scrolling downward
+updates it in the other direction.
+The clickable link fits its displayed contents; the empty remainder of the row is not
+clickable. Long previews truncate within the conversation width as the window narrows.
+
+Click the shortcut (or focus it and press Enter or Space) to jump and focus that message,
+with a visible keyboard focus outline. Each activation steps backward, even if a short
+history prevents the destination from aligning at the top. Manual scrolling resumes
+selection from the reading position; **Jump to latest** resumes bottom-follow. At the
+earliest boundary, the shortcut says **No earlier messages from you** and does nothing.
+It stays focusable while loading and at that boundary so changing its target does not
+discard keyboard focus. Scrolling and background loads never transfer focus.
+
+Recent history and live updates appear first. Older turns, including all their pages,
+load in the background when the predecessor is not yet known, skipping automatic turns.
+If an older page fails, recent history stays available and **Load earlier turn** retries
+it. Offline lookup uses history already saved on this device and asks you to connect
+when older history is needed. Thread switches reset the shortcut and ignore delayed
+results from the previous conversation.
 
 Loading older turns keeps the message you are reading at the same position, including
 when you scroll while a background or manual history request is pending.
+History arriving during a shortcut jump also preserves the message you clicked as its
+destination.
 
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads
