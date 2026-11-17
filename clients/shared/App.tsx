@@ -2934,7 +2934,7 @@ export default function App({
           </div>
         )}
         <header className="topbar drag-region">
-          <div className="topbar-left no-drag">
+          <div className="topbar-left">
             {!sidebar && (
               <button
                 className="icon-button"
@@ -2989,9 +2989,9 @@ export default function App({
             )}
           </div>
           {headerAccessory && (
-            <div className="topbar-accessory no-drag">{headerAccessory}</div>
+            <div className="topbar-accessory">{headerAccessory}</div>
           )}
-          <div className="topbar-actions no-drag">
+          <div className="topbar-actions">
             <button
               className="icon-button"
               aria-label="Search conversations"
@@ -3044,6 +3044,7 @@ export default function App({
               }}
             >
               <summary
+                className="no-drag"
                 aria-label={
                   section === "chat" ? "Thread actions" : "More actions"
                 }
@@ -3069,6 +3070,7 @@ export default function App({
                 <MoreHorizontal size={18} />
               </summary>
               <div
+                className="no-drag"
                 onKeyDown={(event) =>
                   handleRovingKey(event, event.currentTarget, ":scope > button")
                 }
