@@ -389,7 +389,7 @@ try {
     );
   const select = async () => {
     await sidebar();
-    await sidebarCard().locator(".thread-card").click();
+    await sidebarCard().locator(".thread-card-title").click();
     await page
       .getByRole("button", { name: "Show thread details", exact: true })
       .click();
@@ -1390,7 +1390,7 @@ try {
     page.locator(".thread-list .thread-item").filter({ hasText: "web" });
   await sidebar();
   await webCard().waitFor();
-  await webCard().locator(".thread-card").click();
+  await webCard().locator(".thread-card-title").click();
   const webBox = page.getByRole("textbox", { name: "Message web directly" });
   await webBox.waitFor();
   await page.getByText("Loading conversation…").waitFor({ state: "hidden" });
@@ -1467,7 +1467,7 @@ try {
   await needsTask.waitFor();
   await needsTask.getByRole("button", { name: "Run without a loop" }).waitFor();
   await sidebar();
-  await webCard().locator(".thread-card").dblclick();
+  await webCard().locator(".thread-card-title").dblclick();
   await webSetup.waitFor();
   // The conversation's requests take at most a third of it: the card's answers arm once
   // scrolled into view, as for a person.
@@ -1513,7 +1513,7 @@ try {
   /** web's card selected: its inspector. */
   const selectWeb = async () => {
     await sidebar();
-    await webCard().locator(".thread-card").click();
+    await webCard().locator(".thread-card-title").click();
     await page
       .getByRole("button", { name: "Show thread details", exact: true })
       .click();
@@ -1910,7 +1910,7 @@ try {
     page.locator(".thread-list .thread-item").filter({ hasText: "sweeper" });
   const selectSweeper = async () => {
     await sidebar();
-    await swCard().locator(".thread-card").click();
+    await swCard().locator(".thread-card-title").click();
     await page
       .getByRole("button", { name: "Show thread details", exact: true })
       .click();
@@ -2290,7 +2290,7 @@ exit 1
     page.locator(".thread-list .thread-item").filter({ hasText: "boxer" });
   const selectBoxer = async () => {
     await sidebar();
-    await boxerCard().locator(".thread-card").click();
+    await boxerCard().locator(".thread-card-title").click();
     await page
       .getByRole("button", { name: "Show thread details", exact: true })
       .click();
@@ -2738,7 +2738,7 @@ exit 1
     page.locator(".thread-list .thread-item").filter({ hasText: "acpw" });
   const selectAcp = async () => {
     await sidebar();
-    await acpCard().locator(".thread-card").click();
+    await acpCard().locator(".thread-card-title").click();
     await page
       .getByRole("button", { name: "Show thread details", exact: true })
       .click();
