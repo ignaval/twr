@@ -5,6 +5,7 @@ export interface Thread {
   name: string;
   aliases?: string[];
   former_names?: string[];
+  created_at?: string | null;
   project?: string;
   runtime: string;
   box_name: string;

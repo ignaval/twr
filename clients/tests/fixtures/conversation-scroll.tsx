@@ -7,12 +7,18 @@ import type {
   DesktopEvent,
   HubEvent,
   Json,
+  Thread,
 } from "../../shared/types";
 import "../../shared/style.css";
 import "../../mobile/src/mobile.css";
 
 const listeners = new Set<(event: DesktopEvent) => void>();
-const emit = (event: DesktopEvent) => listeners.forEach((read) => read(event));
+let currentThreads: Thread[] = [];
+const emit = (event: DesktopEvent) => {
+  if (event.type === "state" && event.state)
+    currentThreads = event.state.threads;
+  listeners.forEach((read) => read(event));
+};
 const pending = new Map<string, (page: Json) => void>();
 let subscription = "";
 let sequence = 500;
@@ -56,10 +62,31 @@ declare global {
       pending: () => string[];
       release: (thread: string, turn: number) => void;
       append: () => void;
+      threads: () => Thread[];
+      setThreads: (threads: Thread[]) => void;
+      reply: (text: string, ts: string) => void;
     };
   }
 }
 window.conversationScrollQA = {
+  threads: () => currentThreads,
+  setThreads: (threads) =>
+    emit({
+      type: "state",
+      state: {
+        threads,
+        attention: [],
+        decisions: [],
+        decisions_seen: 0,
+        head: 1,
+      },
+    }),
+  reply: (text, ts) =>
+    emit({
+      type: "thread",
+      subscription,
+      event: { ...event("orch", 5, sequence++, "agent.text", { text }), ts },
+    }),
   pending: () => [...pending.keys()],
   release: (thread, turn) => {
     const key = `${thread}:${turn}`;
@@ -97,6 +124,7 @@ window.twr = {
             {
               id: "orch",
               name: "orchestrator",
+              created_at: "2026-11-16T12:00:00Z",
               is_orchestrator: true,
               runtime: "fake",
               box_name: "local",
@@ -109,6 +137,7 @@ window.twr = {
                   {
                     id: "builder",
                     name: "builder",
+                    created_at: "2026-11-16T12:00:00Z",
                     is_orchestrator: false,
                     runtime: "fake",
                     box_name: "local",
@@ -119,6 +148,7 @@ window.twr = {
                   {
                     id: "reviewer",
                     name: "reviewer",
+                    created_at: "2026-11-16T12:00:00Z",
                     is_orchestrator: false,
                     runtime: "fake",
                     box_name: "local",

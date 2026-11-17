@@ -20,7 +20,12 @@ declare module "mdast" {
 }
 
 type Delimiter = { name?: string; partial?: boolean };
-type Options = { text: string; streaming: boolean; threads?: Thread[] };
+type Options = {
+  text: string;
+  streaming: boolean;
+  threads?: Thread[];
+  messageTs?: string;
+};
 const OPEN = '<thread name="';
 const CLOSE = "</thread>";
 
@@ -114,6 +119,7 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
   text,
   streaming,
   threads = [],
+  messageTs,
 }) {
   const tokenize: Tokenizer = function (effects, ok, nok) {
     const offset = this.now().offset;
@@ -187,14 +193,18 @@ const remarkThreadSections: Plugin<[Options], Root> = function ({
     let body: RootContent[] = [];
     const flush = () => {
       if (name !== undefined || body.length) {
+        const thread =
+          name === undefined ? undefined : sectionThread(threads, name);
+        // Names and aliases can be reused after deletion. The current match must
+        // demonstrably predate this reply, including after history remounts. Missing
+        // dates and equal millisecond timestamps stay neutral (Date.parse loses
+        // finer precision). Do not fall through to a weaker identity match.
+        const predatesMessage =
+          Date.parse(thread?.created_at ?? "") < Date.parse(messageTs ?? "");
         // mdast properties become HTML attributes; threadStyle validates the
         // accent and supplies the same theme inks used by the thread cards.
         const style = Object.entries(
-          threadStyle(
-            name === undefined
-              ? undefined
-              : sectionThread(threads, name)?.accent,
-          ),
+          threadStyle(predatesMessage ? thread?.accent : undefined),
         )
           .map(([key, value]) => `${key}:${value}`)
           .join(";");
@@ -253,13 +263,16 @@ export const ThreadMessage = memo(function ThreadMessage({
   text,
   streaming,
   threads,
+  messageTs,
 }: Options) {
   if (!text.includes("<")) return <Markdown text={text} />;
   return (
     <Markdown
       text={text}
       className="thread-sections"
-      remarkPlugins={[[remarkThreadSections, { text, streaming, threads }]]}
+      remarkPlugins={[
+        [remarkThreadSections, { text, streaming, threads, messageTs }],
+      ]}
     />
   );
 });

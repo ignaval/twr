@@ -42,6 +42,7 @@ export function MessageBody({
   streaming = false,
   threadTags = false,
   threads,
+  messageTs,
   expanded: controlled,
   onExpandedChange,
 }: {
@@ -52,6 +53,8 @@ export function MessageBody({
   /** Only orchestrator assistant replies use the thread section protocol. */
   threadTags?: boolean;
   threads?: Thread[];
+  /** Timestamp of this reply's first text event, retained while it streams. */
+  messageTs?: string;
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
 }) {
@@ -95,6 +98,7 @@ export function MessageBody({
             text={content}
             streaming={streaming}
             threads={threads}
+            messageTs={messageTs}
           />
         ) : (
           <Markdown text={content} />

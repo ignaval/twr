@@ -19,6 +19,7 @@ const render = (
     streaming?: boolean;
     mono?: boolean;
     threads?: Thread[];
+    messageTs?: string;
   } = {},
 ) =>
   renderToStaticMarkup(
@@ -26,6 +27,7 @@ const render = (
       text,
       clamp: false,
       threadTags: true,
+      messageTs: "2026-11-17T12:00:00Z",
       ...options,
     }),
   );
@@ -42,6 +44,7 @@ describe("orchestrator thread sections", () => {
   const worker = (overrides: Partial<Thread> = {}): Thread => ({
     id: "t1",
     name: "api",
+    created_at: "2026-11-16T12:00:00Z",
     accent: THREAD_COLORS[1],
     runtime: "fake",
     box_name: "local",
@@ -157,7 +160,7 @@ describe("orchestrator thread sections", () => {
     ).toContain(`--thread-color:${THREAD_COLORS[2]}`);
   });
 
-  it("colors streaming sections and refreshes identity data even when the reply text is unchanged", () => {
+  it("colors streaming sections with known current and former names", () => {
     const html = section("api", [worker()], true);
     expect(html).toContain(`--thread-color:${THREAD_COLORS[1]}`);
     expect(html).toContain("<strong>Working</strong>");
@@ -170,6 +173,82 @@ describe("orchestrator thread sections", () => {
       ),
     ).toContain(`--thread-color:${THREAD_COLORS[1]}`);
     expect(section("api", [], true)).not.toContain("--thread-color:");
+  });
+
+  it.each(["api", "backend"])(
+    "does not color historical boxes after deletion and reuse of %s",
+    (name) => {
+      const text = `<thread name="${name}">\n**Original update**\n</thread>`;
+      const original = worker({ aliases: ["backend"] });
+      const replacement = worker({
+        id: "t2",
+        aliases: ["backend"],
+        accent: THREAD_COLORS[2],
+        created_at: "2026-11-17T12:00:01Z",
+      });
+      expect(render(text, { threads: [original] })).toContain(
+        `--thread-color:${original.accent}`,
+      );
+      for (const threads of [[], [replacement]]) {
+        const html = render(text, { threads });
+        expect(html).not.toContain("--thread-color:");
+        expect(html).toContain("<strong>Original update</strong>");
+      }
+      // Fresh renders model reloaded history, without a component-local identity cache.
+      expect(render(text, { threads: [replacement] })).not.toContain(
+        "--thread-color:",
+      );
+      expect(
+        render(text, {
+          threads: [replacement],
+          messageTs: "2026-11-17T12:00:02Z",
+        }),
+      ).toContain(`--thread-color:${replacement.accent}`);
+    },
+  );
+
+  it.each([
+    undefined,
+    null,
+    "invalid",
+    "2026-11-17T12:00:00Z",
+    "2026-11-17T12:00:00.000001Z",
+    "2026-11-17T12:00:01Z",
+  ])(
+    "keeps a match neutral unless its creation time %s proves it predates the message",
+    (created_at) => {
+      for (const name of ["t1", "api", "backend", "old-api"]) {
+        expect(
+          section(name, [
+            worker({
+              created_at,
+              aliases: ["backend"],
+              former_names: ["old-api"],
+            }),
+          ]),
+        ).not.toContain("--thread-color:");
+      }
+    },
+  );
+
+  it.each([undefined, "invalid"])(
+    "keeps identities neutral without a valid message timestamp: %s",
+    (messageTs) => {
+      expect(
+        render('<thread name="api">\nBody\n</thread>', {
+          threads: [worker()],
+          messageTs,
+        }),
+      ).not.toContain("--thread-color:");
+    },
+  );
+
+  it("does not fall through a later-created exact name to a weaker alias match", () => {
+    const threads = [
+      worker({ id: "new", created_at: "2026-11-17T12:00:01Z" }),
+      worker({ name: "other", aliases: ["api"] }),
+    ];
+    expect(section("api", threads)).not.toContain("--thread-color:");
   });
 
   it("preserves a footnote definition atomically when its body contains thread tags", () => {

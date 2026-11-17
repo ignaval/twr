@@ -345,6 +345,108 @@ try {
     await page.close();
   }
 
+  // Keep the same reply mounted while live snapshots change its thread identity.
+  // A new thread may reuse a deleted thread's name or alias, but not its history.
+  for (const theme of ["light", "dark"]) {
+    const page = await browser.newPage({
+      viewport: { width: 1440, height: 900 },
+    });
+    const errors = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    await page.goto(url + "?with-user&combined");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await scrollTo(page, 1);
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.theme = theme;
+    }, theme);
+    const box = page
+      .locator('section.thread-message[aria-label="builder"]')
+      .first();
+    await expect(box).toHaveCSS("border-top-color", "rgb(0, 135, 175)");
+    await box.evaluate((node) => {
+      node.dataset.mounted = "original";
+    });
+    const threads = await page.evaluate(() =>
+      window.conversationScrollQA.threads(),
+    );
+    const original = threads.find((thread) => thread.id === "builder");
+    const others = threads.filter((thread) => thread.id !== "builder");
+    const update = (workers) =>
+      page.evaluate(
+        (threads) => window.conversationScrollQA.setThreads(threads),
+        [...others, ...workers],
+      );
+    const neutral = async () => {
+      await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+      await expect(box).toHaveAttribute("data-mounted", "original");
+      await expect(box.locator("strong")).toHaveText("Ready");
+      await expect(box.locator("a")).toHaveAttribute(
+        "href",
+        "https://example.com/guide",
+      );
+    };
+    // Missing metadata can arrive later through a snapshot, without a text update.
+    await update([{ ...original, created_at: null }]);
+    await neutral();
+    await update([
+      { ...original, name: "renamed-builder", former_names: ["builder"] },
+    ]);
+    await expect(box).toHaveCSS("border-top-color", "rgb(0, 135, 175)");
+    await expect(box).toHaveAttribute("data-mounted", "original");
+    await update([]);
+    await neutral();
+    const replacement = {
+      ...original,
+      id: "replacement",
+      created_at: "2026-11-17T12:00:01Z",
+      accent: "#ff00ff",
+    };
+    await update([replacement]);
+    await neutral();
+    await update([
+      { ...replacement, name: "replacement", aliases: ["builder"] },
+    ]);
+    await neutral();
+    // Force a history remount by leaving the conversation and coming back.
+    await page
+      .locator(".sidebar .thread-card-title b")
+      .getByText("replacement", { exact: true })
+      .click();
+    await expect(
+      page.getByRole("textbox", {
+        name: "Message replacement directly",
+        exact: true,
+      }),
+    ).toBeVisible();
+    await page
+      .getByRole("button", { name: "Back to orchestrator", exact: true })
+      .click();
+    await scrollTo(page, 1);
+    await expect(box).not.toHaveAttribute("style", /--thread-color:/);
+    // A reply actually sent after replacement creation may use its alias/color.
+    await page.evaluate(() =>
+      window.conversationScrollQA.reply(
+        '<thread name="builder">\nNew worker update.\n</thread>',
+        "2026-11-17T12:00:02Z",
+      ),
+    );
+    await scrollTo(page, 1);
+    const boxes = page.locator('section.thread-message[aria-label="builder"]');
+    await expect(boxes).toHaveCount(2);
+    await expect(boxes.first()).not.toHaveAttribute("style", /--thread-color:/);
+    await expect(boxes.last()).toHaveCSS(
+      "border-top-color",
+      "rgb(255, 0, 255)",
+    );
+    expect(errors).toEqual([]);
+    console.log(
+      `PASS ${theme}: mounted metadata/rename/deletion updates, name and alias reuse stay neutral, history remount stays safe, and new replies resolve the replacement`,
+    );
+    await page.close();
+  }
+
   // Chromium does not generate iOS momentum. Select the real virtualizer's iOS
   // branch via navigator, then drive its touch/tail lifecycle with synthetic
   // events. Assert that a prepend really is held (indexes advance while the
