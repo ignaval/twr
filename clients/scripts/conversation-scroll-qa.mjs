@@ -61,7 +61,7 @@ try {
       (turn) => window.conversationScrollQA.release("orch", turn),
       turn,
     );
-  const read = (page) =>
+  const readNow = (page) =>
     page.locator(".conversation-scroll").evaluate((scroll) => {
       const top = scroll.getBoundingClientRect().top;
       const message = [...scroll.querySelectorAll(".block-assistant")].find(
@@ -70,7 +70,7 @@ try {
           return rect.bottom > top + 1 && rect.top < top + scroll.clientHeight;
         },
       );
-      if (!message) throw new Error("No visible message to anchor");
+      if (!message) return null;
       return {
         text: message.querySelector(".markdown p").textContent,
         offset: message.getBoundingClientRect().top - top,
@@ -79,6 +79,19 @@ try {
         margin: scroll.querySelector(".transcript-virtual").offsetTop,
       };
     });
+  const read = async (page) => {
+    let position;
+    await expect
+      .poll(
+        async () => {
+          position = await readNow(page);
+          return position !== null;
+        },
+        { message: "Wait for a visible virtual message to anchor" },
+      )
+      .toBe(true);
+    return position;
+  };
   const unchanged = async (page, saved) => {
     const position = () =>
       page.getByText(saved.text, { exact: true }).evaluate((node) => {
@@ -202,6 +215,221 @@ try {
     await atBottom(page);
     console.log(
       `PASS ${mobile ? "phone" : "desktop"}: automatic bottom-follow remains active`,
+    );
+
+    await page.goto(url + "?with-user&combined");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await atBottom(page);
+    // The destination is outside the mounted virtual rows.
+    await expect(page.locator(".block-user")).toHaveCount(0);
+    await page.locator(".latest-user-message button").focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator(".block-user:focus-visible")).toContainText(
+      "Task orch:4",
+    );
+    await pending(page, 3);
+    const jumpPosition = await read(page);
+    await page.evaluate(() => window.conversationScrollQA.appendUser());
+    await unchanged(page, jumpPosition);
+    await page.locator(".latest-user-message button").focus();
+    await release(page, 3);
+    await unchanged(page, jumpPosition);
+    await expect(page.locator(".latest-user-message button")).toBeFocused();
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:3",
+    );
+    // Crossing within the same user row must update, in both directions.
+    await page.locator(".conversation-scroll").evaluate((node) => {
+      node.scrollTop += 5;
+    });
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await page.locator(".conversation-scroll").evaluate((node) => {
+      node.scrollTop -= 5;
+    });
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:3",
+    );
+    for (const turn of [3, 2, 1]) {
+      await page.locator(".latest-user-message button").click();
+      await expect(page.locator(".block-user:focus")).toContainText(
+        `Task orch:${turn}`,
+      );
+      if (turn > 1) {
+        await pending(page, turn - 1);
+        const saved = await read(page);
+        await release(page, turn - 1);
+        await unchanged(page, saved);
+        await expect(page.locator(".latest-user-preview")).toHaveText(
+          `Task orch:${turn - 1}`,
+        );
+      }
+    }
+    await expect(page.locator(".latest-user-message button")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "No earlier messages from you",
+    );
+    const earliestPosition = await read(page);
+    await page
+      .locator(".latest-user-message button")
+      .evaluate((node) => node.click());
+    await unchanged(page, earliestPosition);
+    // Manual scrolling changes the preview without changing keyboard focus.
+    const composerFocus = page.getByRole("textbox", {
+      name: "Message orchestrator",
+      exact: true,
+    });
+    await composerFocus.focus();
+    await scrollTo(page, 0.65);
+    await expect(composerFocus).toBeFocused();
+    const browsingPosition = await read(page);
+    await page.evaluate(() => window.conversationScrollQA.appendUser());
+    await unchanged(page, browsingPosition);
+    await page.locator(".jump-latest").click();
+    await atBottom(page);
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Live user request",
+    );
+    await page.evaluate(() => window.conversationScrollQA.append());
+    await atBottom(page);
+
+    // A deep dive has its own cursor; a delayed lookup cannot
+    // replace its preview or move focus/scroll in the new conversation.
+    if (mobile)
+      await page
+        .getByRole("button", { name: "Show sidebar", exact: true })
+        .click();
+    await page
+      .locator(".sidebar .thread-card")
+      .filter({ hasText: "builder" })
+      .click();
+    if (mobile)
+      await page
+        .getByRole("button", { name: "Talk to this thread", exact: true })
+        .click();
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task builder:4",
+    );
+    for (const turn of [4, 3]) {
+      await page.locator(".latest-user-message button").click();
+      await expect(page.locator(".block-user:focus")).toContainText(
+        `Task builder:${turn}`,
+      );
+      if (turn === 4) {
+        await expect
+          .poll(() =>
+            page.evaluate(() => window.conversationScrollQA.pending()),
+          )
+          .toContain("builder:3");
+        await page.evaluate(() =>
+          window.conversationScrollQA.release("builder", 3),
+        );
+        await expect(page.locator(".latest-user-preview")).toHaveText(
+          "Task builder:3",
+        );
+      }
+    }
+    await expect
+      .poll(() => page.evaluate(() => window.conversationScrollQA.pending()))
+      .toContain("builder:2");
+    await page
+      .locator(mobile ? ".topbar" : ".conversation-heading")
+      .getByRole("button", {
+        name: mobile ? "Return to orchestrator" : "Back to orchestrator",
+        exact: true,
+      })
+      .click();
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await atBottom(page);
+    const switchedPosition = await read(page);
+    await page.evaluate(() =>
+      window.conversationScrollQA.release("builder", 2),
+    );
+    await unchanged(page, switchedPosition);
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    console.log(
+      `PASS ${mobile ? "phone" : "desktop"}: virtual jumps step backward, exact boundaries update within a row, background/live changes preserve position and focus, earliest boundary and deep-dive switches are isolated`,
+    );
+
+    await page.goto(url + "?with-user&sparse");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    // Reach the boundary manually, without activating the shortcut.
+    await scrollTo(page, 0);
+    await pending(page, 3);
+    const lookupPosition = await read(page);
+    await release(page, 3);
+    await unchanged(page, lookupPosition);
+    await pending(page, 2);
+    await release(page, 2);
+    await pending(page, "2:next");
+    await unchanged(page, lookupPosition);
+    await page.evaluate(() => window.conversationScrollQA.releaseNext());
+    await pending(page, 1);
+    await unchanged(page, lookupPosition);
+    await release(page, 1);
+    await unchanged(page, lookupPosition);
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:1",
+    );
+    console.log(
+      `PASS ${mobile ? "phone" : "desktop"}: manual boundary crossing finds a predecessor across automatic turns and paginated history without moving the viewport`,
+    );
+
+    await page.goto(url + "?with-user&short");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    for (const turn of [4, 3, 2, 1]) {
+      await page.locator(".latest-user-message button").focus();
+      await page.keyboard.press("Enter");
+      await expect(page.locator(".block-user:focus-visible")).toContainText(
+        `Task orch:${turn}`,
+      );
+      await expect(page.locator(".latest-user-preview")).toHaveText(
+        turn > 1 ? `Task orch:${turn - 1}` : "No earlier messages from you",
+      );
+    }
+    console.log(
+      `PASS ${mobile ? "phone" : "desktop"}: clamped jumps in a short history still step back once per keyboard activation`,
+    );
+    await page.goto(url + "?with-user&short");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await page.locator(".latest-user-message button").click();
+    await expect(page.locator(".block-user:focus")).toContainText(
+      "Task orch:4",
+    );
+    const shortOffset = await page
+      .locator(".conversation-scroll")
+      .evaluate((node) => node.scrollTop);
+    await page.evaluate(() => window.conversationScrollQA.append());
+    await page.waitForTimeout(250);
+    expect(
+      await page
+        .locator(".conversation-scroll")
+        .evaluate((node) => node.scrollTop),
+    ).toBe(shortOffset);
+    // Actual manual navigation back to the bottom resumes follow after a jump.
+    await page.locator(".conversation-scroll").dispatchEvent("wheel");
+    await scrollTo(page, 1);
+    await atBottom(page);
+    await page.evaluate(() => window.conversationScrollQA.append());
+    await atBottom(page);
+    console.log(
+      `PASS ${mobile ? "phone" : "desktop"}: a clamped jump pauses auto-follow; manual navigation to the bottom resumes it`,
     );
     expect(errors).toEqual([]);
     await page.close();
@@ -362,6 +590,44 @@ try {
     expect(errors).toEqual([]);
     console.log(
       `PASS synthetic iOS ${gesture}: verified held prepend, final-control removal, and unchanged message/pixel offset before and after gesture settlement`,
+    );
+
+    await page.goto(url + "?with-user");
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await page.locator(".load-earlier").click();
+    await pending(page, 3);
+    await touch("touchstart");
+    await scrollTo(page, 0.6);
+    await scrollTo(page, 0.4);
+    if (gesture === "momentum") {
+      await touch("touchend");
+      await page.locator(".conversation-scroll").evaluate((node) => {
+        node.scrollTop -= 37;
+      });
+      await frames(page);
+    }
+    const userHeldBefore = await read(page);
+    await release(page, 3);
+    await frames(page);
+    const userHeldAfter = await read(page);
+    expect(userHeldAfter.index - userHeldBefore.index).toBe(61);
+    expect(
+      Math.abs(userHeldAfter.scrollTop - userHeldBefore.scrollTop),
+    ).toBeLessThanOrEqual(1);
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    await unchanged(page, userHeldBefore);
+    if (gesture === "drag") await touch("touchend");
+    await unchanged(page, userHeldBefore);
+    await expect(page.locator(".latest-user-preview")).toHaveText(
+      "Task orch:4",
+    );
+    expect(errors).toEqual([]);
+    console.log(
+      `PASS synthetic iOS ${gesture}: predecessor selection uses held layout offsets and stays stable through settlement`,
     );
     await page.close();
   }

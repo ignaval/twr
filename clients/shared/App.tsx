@@ -5068,6 +5068,11 @@ const Conversation = memo(function Conversation({
   const list = useRef<HTMLDivElement>(null);
   const [scrollMargin, setScrollMargin] = useState(0);
   const [jumpTarget, setJumpTarget] = useState<string>();
+  // A jump can be clamped at the bottom of a short history. Remember the
+  // clicked message so another activation still steps back in that case.
+  const [steppedFrom, setSteppedFrom] = useState<string>();
+  const [, readScrollPosition] = useState(0);
+  const hasScrolled = useRef(false);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
   // Expanded messages and open tool details, by block: rows scrolled out of the virtual
@@ -5130,15 +5135,86 @@ const Conversation = memo(function Conversation({
     const message = parent.current?.querySelector<HTMLElement>(
       `[data-index="${index}"]`,
     );
-    if (message) {
+    const destination = virtual.getOffsetForIndex(index, "start")?.[0];
+    if (
+      message &&
+      destination != null &&
+      Math.abs((virtual.scrollOffset ?? 0) - destination) <= 1
+    ) {
       message.focus({ preventScroll: true });
       setJumpTarget(undefined);
     }
   });
-  const latestUser = blocks.findLast((block) => block.kind === "user");
-  const latestUserLine = latestUser
-    ? latestUser.text.split(/\r\n|\r|\n/, 1)[0].trim() || "Blank first line"
+  const userIndexes = useMemo(
+    () =>
+      blocks.flatMap((block, index) => (block.kind === "user" ? [index] : [])),
+    [blocks],
+  );
+  // Work in the virtualizer's layout coordinates. DOM scrollTop and rendered
+  // row starts omit held iOS prepend corrections and cannot be mixed with them.
+  const offset = virtual.scrollOffset ?? 0;
+  const readingRow = virtual.getVirtualItemForOffset(offset - 1);
+  const atBottom =
+    (!hasScrolled.current && follow.current) ||
+    !virtual.scrollRect?.height ||
+    virtual.isAtEnd(1);
+  // At the bottom offer the latest user message. Otherwise its start must be
+  // above the viewport's top edge (1 CSS px tolerance); reaching that start
+  // while scrolling upward advances to the preceding user message.
+  let beforeIndex = atBottom
+    ? blocks.length
+    : readingRow && readingRow.start <= offset - 1
+      ? readingRow.index + 1
+      : 0;
+  const steppedIndex = steppedFrom
+    ? blocks.findIndex((block) => block.id === steppedFrom)
+    : -1;
+  const stepOffset =
+    steppedIndex < 0
+      ? undefined
+      : virtual.getOffsetForIndex(steppedIndex, "start")?.[0];
+  const atStep = stepOffset != null && Math.abs(offset - stepOffset) <= 1;
+  if (steppedIndex >= 0 && (jumpTarget || atStep))
+    beforeIndex = Math.min(beforeIndex, steppedIndex);
+  const previousIndex = userIndexes.findLast((index) => index < beforeIndex);
+  const previousUser =
+    previousIndex == null ? undefined : blocks[previousIndex];
+  const previousUserLine = previousUser
+    ? previousUser.text.split(/\r\n|\r|\n/, 1)[0].trim() || "Blank first line"
     : "";
+  const boundaryText =
+    loading || (earlier && !error && connected)
+      ? "Loading your previous message…"
+      : error
+        ? "Previous message unavailable"
+        : earlier
+          ? "Connect to load earlier messages"
+          : userIndexes.length
+            ? "No earlier messages from you"
+            : "No messages from you yet";
+  useEffect(() => {
+    // Lookup must not turn off bottom-follow, move focus, or scroll. The parent
+    // serializes/pages requests and fences their results on thread switches.
+    if (
+      !previousUser &&
+      earlier &&
+      !earlierBusy &&
+      !loading &&
+      !error &&
+      connected
+    ) {
+      const frame = requestAnimationFrame(() => earlier());
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [previousUser, earlier, earlierBusy, loading, error, connected]);
+  useEffect(() => {
+    if (steppedFrom && !jumpTarget && !atStep) setSteppedFrom(undefined);
+  }, [steppedFrom, jumpTarget, atStep]);
+  function cancelMessageJump() {
+    setSteppedFrom(undefined);
+    setJumpTarget(undefined);
+    virtual.cancelScroll();
+  }
   const totalSize = virtual.getTotalSize();
   useLayoutEffect(() => {
     const element = parent.current;
@@ -5187,10 +5263,36 @@ const Conversation = memo(function Conversation({
       aria-label={`Conversation with ${target?.name || "orchestrator"}`}
       aria-busy={loading || undefined}
       tabIndex={0}
+      onWheel={cancelMessageJump}
+      onTouchStart={cancelMessageJump}
+      onPointerDown={cancelMessageJump}
+      onKeyDown={(event) => {
+        if (
+          [
+            "ArrowUp",
+            "ArrowDown",
+            "PageUp",
+            "PageDown",
+            "Home",
+            "End",
+            " ",
+          ].includes(event.key)
+        )
+          cancelMessageJump();
+      }}
       onScroll={() => {
         const p = parent.current!;
-        follow.current = p.scrollHeight - p.scrollTop - p.clientHeight < 100;
+        hasScrolled.current = true;
+        // A clamped jump near the bottom is still a deliberate history jump.
+        // Resume follow only when navigation leaves that jump position.
+        follow.current =
+          !jumpTarget &&
+          !steppedFrom &&
+          p.scrollHeight - p.scrollTop - p.clientHeight < 100;
         setFollowing(follow.current);
+        // A boundary can be crossed within the same virtual range (even within
+        // one tall message), where the virtualizer need not rerender itself.
+        readScrollPosition((position) => position + 1);
         if (p.scrollTop < 40 && !loading && !earlierBusy && earlier)
           loadEarlier();
       }}
@@ -5400,6 +5502,7 @@ const Conversation = memo(function Conversation({
         <button
           className="jump-latest"
           onClick={() => {
+            cancelMessageJump();
             follow.current = true;
             setFollowing(true);
             parent.current?.scrollTo({
@@ -5417,18 +5520,27 @@ const Conversation = memo(function Conversation({
   return (
     <>
       <div className="latest-user-message">
-        {latestUser ? (
+        {previousUser || userIndexes.length ? (
           <button
             type="button"
-            title={latestUserLine}
-            aria-label={`Jump to your latest message: ${latestUserLine}`}
+            title={previousUser ? previousUserLine : boundaryText}
+            aria-label={
+              previousUser
+                ? `Jump to your previous message: ${previousUserLine}`
+                : boundaryText
+            }
+            // Keep keyboard focus stable while a predecessor loads or at the
+            // earliest boundary. An unavailable action remains a no-op.
+            aria-disabled={!previousUser || undefined}
             onClick={() => {
+              if (!previousUser || previousIndex == null) return;
               follow.current = false;
               setFollowing(false);
-              setJumpTarget(latestUser.id);
+              setJumpTarget(previousUser.id);
+              setSteppedFrom(previousUser.id);
               // Immediate scrolling lets the virtualizer correct measured row
               // heights as the destination mounts, and respects reduced motion.
-              virtual.scrollToIndex(blocks.indexOf(latestUser), {
+              virtual.scrollToIndex(previousIndex, {
                 align: "start",
                 behavior: "auto",
               });
@@ -5436,15 +5548,13 @@ const Conversation = memo(function Conversation({
           >
             <ArrowUpRight size={14} aria-hidden="true" />
             <span className="latest-user-label">You</span>
-            <span className="latest-user-preview">{latestUserLine}</span>
+            <span className="latest-user-preview">
+              {previousUser ? previousUserLine : boundaryText}
+            </span>
           </button>
         ) : (
           <span className="latest-user-empty" role="status">
-            {loading || (earlier && !error)
-              ? "Loading your latest message…"
-              : error
-                ? "Latest message unavailable"
-                : "No messages from you yet"}
+            {boundaryText}
           </span>
         )}
       </div>
