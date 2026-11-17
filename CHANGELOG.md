@@ -4,6 +4,10 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ## [Unreleased]
 
+### Fixed
+
+- The release workflow explicitly passes the five Apple secrets to the reusable desktop workflow. Without that mapping, GitHub supplied empty values and selected an ad hoc Mac build despite the secrets being configured. Desktop releases now require all five values before building and fail instead of publishing an ad hoc app without self-update metadata.
+
 ## [0.5.0] - 2026-11-15
 
 Review and implementation loops: a thread's work reviewed round by round, read-only, by Codex, Claude Code, Grok Build or an ACP agent until it comes back clean, or planned, implemented and then reviewed, started from the TUI, the command line, the apps or the orchestrator, on the hub's machine or a remote box. The desktop app installs in one command (`install.sh --desktop`) or from a Homebrew tap, and the Mac app is signed with a Developer ID and notarized, so it opens without Gatekeeper's warnings and updates itself. Also store builds of the phone apps, and contrast fixes across the apps' and the TUI's themes.
