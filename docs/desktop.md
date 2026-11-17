@@ -558,20 +558,22 @@ quarantines what a cask installs.
 Pushing a stable `v<version>` tag runs `release.yml`. That publishes the CLI release,
 calls `desktop.yml` for the same commit (with all of its QA), then attaches the installers,
 update metadata and `desktop-sha256sums.txt` to the release. Prerelease tags skip the
-desktop. Optional secrets, all in the protected `release` environment (never repository-wide
+desktop. Keep the following secrets in the protected `release` environment (never repository-wide
 secrets, which pull-request runs can read):
 
 - `CSC_LINK`, `CSC_KEY_PASSWORD`, `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD`,
   `APPLE_TEAM_ID`: a Developer ID certificate (base64 `.p12`) and notarization
-  credentials. With them, the Mac app is signed, notarized and stapled, and
-  `latest-mac.yml` is published so Macs update themselves. Without them, the release
-  carries the ad hoc review disk image only. Notarization usually takes minutes, but a
+  credentials, required for a desktop release. The Mac app is signed, notarized and stapled,
+  and `latest-mac.yml` is published so Macs update themselves. The caller explicitly passes
+  these five secrets to `desktop.yml`; its Mac job reads their values from the protected
+  environment after approval. Missing values fail before the build instead of producing
+  an ad hoc release. Notarization usually takes minutes, but a
   new team's first submissions can wait hours at Apple, so the release's Mac job allows
   five.
-- `AUR_SSH_PRIVATE_KEY`: the key registered on the
+- `AUR_SSH_PRIVATE_KEY` (optional): the key registered on the
   `twr-desktop-bin` AUR account. With it, the release pushes the new PKGBUILD to the AUR.
   Otherwise, push the `twr-desktop-aur` workflow artifact by hand.
-- `HOMEBREW_TAP_DEPLOY_KEY`: a deploy key with write access to `ignaval/homebrew-twr`. With
+- `HOMEBREW_TAP_DEPLOY_KEY` (optional): a deploy key with write access to `ignaval/homebrew-twr`. With
   it, the release pushes `Formula/twr.rb` and, when the Mac app is Developer ID signed (the
   release has `latest-mac.yml`), `Casks/twr.rb`, after checking the signatures of the
   checksums they come from. Otherwise they are in the `twr-homebrew` workflow artifact.

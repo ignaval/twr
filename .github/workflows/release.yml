@@ -593,8 +593,14 @@ jobs:
     with:
       ref: ${{ needs.resolve.outputs.sha }}
       release: true
-    # No secrets are forwarded: the signing job reads the Apple credentials from
-    # the `release` environment it declares.
+    # Environment secrets still need an explicit caller mapping. The Mac job's
+    # protected `release` environment supplies their values after approval.
+    secrets:
+      CSC_LINK: ${{ secrets.CSC_LINK }}
+      CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
   desktop-release:
     name: attach the desktop installers
