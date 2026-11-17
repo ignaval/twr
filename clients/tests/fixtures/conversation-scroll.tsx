@@ -109,6 +109,7 @@ window.twr = {
                   {
                     id: "builder",
                     name: "builder",
+                    is_orchestrator: false,
                     runtime: "fake",
                     box_name: "local",
                     mode: "default",
