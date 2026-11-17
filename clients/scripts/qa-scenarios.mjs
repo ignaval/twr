@@ -62,9 +62,6 @@ export async function runMacQA(page, { fixture, hubPids }) {
       .locator(".thread-list .thread-card")
       .filter({ hasText: name })
       .click();
-    await page
-      .getByRole("button", { name: "Talk to this thread", exact: true })
-      .click();
   };
 
   // Open every manager on the release app, checking that the view renders successfully.
@@ -433,13 +430,23 @@ export async function runMacQA(page, { fixture, hubPids }) {
       .filter({ hasText: "qa-agent" })
       .click();
     assert(
-      await orchestrator.isVisible(),
-      "Selecting a thread must keep the orchestrator destination",
+      await page
+        .getByRole("textbox", {
+          name: "Message qa-agent directly",
+          exact: true,
+        })
+        .isVisible(),
+      "One click must open the thread conversation",
     );
-    // On smaller displays details overlay the composer. Dismiss them through
-    // the same control a user uses before returning to the conversation.
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
+    // Details use the existing overlay on smaller displays.
     await page
       .getByRole("button", { name: "Close thread details", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "Back to orchestrator", exact: true })
       .click();
     const message = `QA_STILL_TO_ORCHESTRATOR_${width}`;
     await orchestrator.fill(message);

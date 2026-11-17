@@ -461,7 +461,6 @@ try {
     .filter({ hasText: "packaged" })
     .first()
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page
     .getByRole("textbox", { name: "Message packaged directly" })
     .fill("PACKAGED_AGENT_OK");

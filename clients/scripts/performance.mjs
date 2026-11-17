@@ -2,11 +2,10 @@ import { expect } from "@playwright/test";
 import { qaSource } from "./qa-source.mjs";
 import { mkdirSync, writeFileSync } from "node:fs";
 export async function performanceAudit(page, label, application) {
-  if (
-    await page.evaluate(
-      () => document.documentElement.dataset.mobile === "true",
-    )
-  ) {
+  const mobile = await page.evaluate(
+    () => document.documentElement.dataset.mobile === "true",
+  );
+  if (mobile) {
     const dismiss = page.getByRole("button", {
       name: "Dismiss keyboard",
       exact: true,
@@ -55,9 +54,11 @@ export async function performanceAudit(page, label, application) {
     .locator(".thread-grid .thread-card")
     .filter({ hasText: "performance-audit" })
     .click();
-  await page
-    .getByRole("button", { name: "Talk to this thread", exact: true })
-    .click();
+  // Mobile cards open details first; desktop cards open the conversation.
+  if (mobile)
+    await page
+      .getByRole("button", { name: "Talk to this thread", exact: true })
+      .click();
   await page
     .getByRole("textbox", {
       name: "Message performance-audit directly",

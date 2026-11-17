@@ -292,6 +292,9 @@ export async function captureUI(page, { hubPids } = {}) {
     .locator(".thread-grid .thread-card")
     .filter({ hasText: "search-api" })
     .click();
+  await page
+    .getByRole("button", { name: "Show thread details", exact: true })
+    .click();
   await snap("dark-inspector");
   await page
     .getByRole("button", { name: "Close thread details", exact: true })
@@ -317,6 +320,9 @@ export async function captureUI(page, { hubPids } = {}) {
   await page
     .locator(".thread-grid .thread-card")
     .filter({ hasText: "search-api" })
+    .click();
+  await page
+    .getByRole("button", { name: "Show thread details", exact: true })
     .click();
   await snap("light-inspector");
   await page
@@ -412,9 +418,6 @@ export async function captureUI(page, { hubPids } = {}) {
   await page
     .locator(".thread-grid .thread-card")
     .filter({ hasText: "release-notes" })
-    .click();
-  await page
-    .getByRole("button", { name: "Talk to this thread", exact: true })
     .click();
   await page
     .locator(".block-assistant")

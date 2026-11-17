@@ -45,6 +45,8 @@ import {
   Plus,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   LayoutGrid,
   MessageSquare,
   Bell,
@@ -325,6 +327,7 @@ export default function App({
   const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
+  const detailsToggle = useRef<HTMLButtonElement>(null);
   const observedDestination = useRef<string | undefined>(undefined);
   // The message drafts, by destination: outside React state, so that typing re-renders
   // the composer alone (Composer.tsx).
@@ -2208,14 +2211,20 @@ export default function App({
     return byThread;
   }, [view.attention]);
   const attentionFor = (id: string) => attentionByThread.get(id) || noAttention;
-  const selectThread = useCallback((id: string) => setSelected(id), []);
   const openThread = useCallback((id: string) => {
     setDestination(id);
     setSection("chat");
     setSelected(undefined);
+    if (window.innerWidth <= 800) setSidebar(false);
   }, []);
-  // While a workspace connects, its entry keeps the rows it had (a double-click's second
-  // click lands on the row the first one chose).
+  const selectThread = useCallback(
+    (id: string) => {
+      if (document.documentElement.dataset.mobile === "true") setSelected(id);
+      else openThread(id);
+    },
+    [openThread],
+  );
+  // Keep the workspace's rows available while its connection is being established.
   const entries = workspaceEntries(
     workspaces,
     workspace,
@@ -2238,7 +2247,7 @@ export default function App({
   /**
    * Opens a workspace's orchestrator (no `thread`) or one of its threads from the sidebar,
    * switching to the workspace first when it is another one. `talk` makes the thread the
-   * message destination (a double-click); otherwise it is selected, opening its inspector.
+   * message destination; otherwise it is selected, opening its inspector.
    * Clicks while the switch connects update the pending request instead of switching again.
    * `then` runs once it is open (a new thread's form, the grid).
    */
@@ -2260,6 +2269,7 @@ export default function App({
       } else if (toThread) {
         setDestination(id);
         setSelected(undefined);
+        if (window.innerWidth <= 800) setSidebar(false);
       } else setSelected(id);
       after?.();
     };
@@ -2841,9 +2851,14 @@ export default function App({
                             <button
                               className="workspace-thread"
                               style={threadStyle(thread.accent)}
-                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
+                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. ${document.documentElement.dataset.mobile === "true" ? "Double-click" : "Click"} to talk to it.`}
                               onClick={(event) =>
-                                openIn(entry.name, thread.id, event.detail > 1)
+                                openIn(
+                                  entry.name,
+                                  thread.id,
+                                  document.documentElement.dataset.mobile !==
+                                    "true" || event.detail > 1,
+                                )
                               }
                             >
                               {thread.accent && (
@@ -3314,6 +3329,37 @@ export default function App({
                     >
                       <MoreHorizontal size={18} />
                     </button>
+                    {destination &&
+                      target &&
+                      document.documentElement.dataset.mobile !== "true" && (
+                        <button
+                          ref={detailsToggle}
+                          className={`icon-button ${selected === target.id ? "on" : ""}`}
+                          aria-label={
+                            selected === target.id
+                              ? "Hide thread details"
+                              : "Show thread details"
+                          }
+                          title={
+                            selected === target.id
+                              ? "Hide thread details"
+                              : "Show thread details"
+                          }
+                          aria-expanded={selected === target.id}
+                          aria-controls="twr-inspector"
+                          onClick={() =>
+                            setSelected((id) =>
+                              id === target.id ? undefined : target.id,
+                            )
+                          }
+                        >
+                          {selected === target.id ? (
+                            <PanelRightClose size={16} />
+                          ) : (
+                            <PanelRightOpen size={16} />
+                          )}
+                        </button>
+                      )}
                   </div>
                 </header>
                 <div
@@ -3758,7 +3804,11 @@ export default function App({
                   className="icon-button"
                   aria-label="Close thread details"
                   title="Close thread details"
-                  onClick={() => setSelected(undefined)}
+                  onClick={() => {
+                    setSelected(undefined);
+                    if (selected === destination && section === "chat")
+                      detailsToggle.current?.focus();
+                  }}
                 >
                   <X size={17} />
                 </button>
@@ -4635,11 +4685,12 @@ function ThreadCardButton({
 }) {
   const git = thread.git || thread.git_snapshot;
   const report = thread.last_report;
+  const mobile = document.documentElement.dataset.mobile === "true";
   return (
     <button
       className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
       aria-current={dived ? "location" : undefined}
-      aria-describedby={selected ? "twr-thread-open-hint" : undefined}
+      aria-describedby={mobile && selected ? "twr-thread-open-hint" : undefined}
       style={threadStyle(thread.accent)}
       onClick={(event) => {
         // A click on the loop chip opens the inspector at the loop's progress.
@@ -4651,7 +4702,7 @@ function ThreadCardButton({
           onLoop();
         else onSelect();
       }}
-      onDoubleClick={onOpen}
+      onDoubleClick={mobile ? onOpen : undefined}
       onKeyDown={(e) => {
         if (e.key === "Enter" && selected) {
           e.preventDefault();
