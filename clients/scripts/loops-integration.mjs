@@ -390,6 +390,9 @@ try {
   const select = async () => {
     await sidebar();
     await sidebarCard().locator(".thread-card").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
   };
   const talk = async () => {
@@ -1388,7 +1391,6 @@ try {
   await sidebar();
   await webCard().waitFor();
   await webCard().locator(".thread-card").click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   const webBox = page.getByRole("textbox", { name: "Message web directly" });
   await webBox.waitFor();
   await page.getByText("Loading conversation…").waitFor({ state: "hidden" });
@@ -1512,6 +1514,9 @@ try {
   const selectWeb = async () => {
     await sidebar();
     await webCard().locator(".thread-card").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
   };
   const current = () =>
@@ -1682,8 +1687,7 @@ try {
   });
   const sha = thread("web").last_loop.commits[0].sha.slice(0, 7);
   await announced(`web's implementation loop ended: clean; committed ${sha}`);
-  await select();
-  await webCard().locator(".thread-card").click();
+  await selectWeb();
   await webLoops.getByText("Last implementation loop: clean").waitFor();
   await webLoops
     .locator(".loop-commits code")
@@ -1907,6 +1911,9 @@ try {
   const selectSweeper = async () => {
     await sidebar();
     await swCard().locator(".thread-card").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
   };
   await selectSweeper();
@@ -2284,6 +2291,9 @@ exit 1
   const selectBoxer = async () => {
     await sidebar();
     await boxerCard().locator(".thread-card").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
     await inspector.getByRole("heading", { name: "boxer" }).waitFor();
   };
@@ -2729,6 +2739,9 @@ exit 1
   const selectAcp = async () => {
     await sidebar();
     await acpCard().locator(".thread-card").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
     await inspector.getByRole("heading", { name: "acpw" }).waitFor();
   };

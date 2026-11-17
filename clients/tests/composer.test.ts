@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DesktopEvent, Json, Thread } from "../shared/types";
+import type { DesktopEvent, InboxSource, Json, Thread } from "../shared/types";
 import { SUGGEST_SETTLE_MS } from "../shared/assistance";
 import {
   FakeEvent,
@@ -71,6 +71,7 @@ type HostOptions = {
   secure?: Record<string, string>;
   /** The connection takes uploads. */
   uploads?: boolean;
+  inboxSources?: InboxSource[];
 };
 
 function fakeHost(options: HostOptions = {}) {
@@ -98,6 +99,7 @@ function fakeHost(options: HostOptions = {}) {
       terminals: [],
     }),
     connect: async () => ({}),
+    inboxSources: async () => options.inboxSources || [],
     rpc: async (method: string, params: Json = {}) => {
       const answer = options.rpc?.(method, params);
       if (answer !== undefined) return answer;
@@ -170,6 +172,7 @@ async function mount(
     local?: Record<string, string>;
     /** The paired hub's id, as the mobile app marks it on the page. */
     hub?: string;
+    mobile?: boolean;
   } = {},
 ) {
   const document = installFakeDOM() as FakeDocument;
@@ -177,6 +180,7 @@ async function mount(
   for (const [key, value] of Object.entries(options.local || {}))
     localStorage.setItem(key, value);
   if (options.hub) document.documentElement.dataset.hub = options.hub;
+  if (options.mobile) document.documentElement.dataset.mobile = "true";
   const host = fakeHost(options);
   (window as any).twr = host;
   // react-dom looks for a DOM as it loads: import it once the stand-in is in place.
@@ -264,15 +268,9 @@ async function mount(
       await settle();
     },
     unmount: () => act(async () => root.unmount()),
-    /** Opens a worker's conversation, as a double-click on its sidebar card does. */
+    /** Opens a worker's conversation with one click on its sidebar card. */
     talkTo: async (name: string) => {
-      const card = find(".sidebar .thread-card", name);
-      await act(async () => {
-        card.dispatchEvent(
-          new FakeEvent("dblclick", { bubbles: true, cancelable: true }),
-        );
-      });
-      await settle();
+      await click(find(".sidebar .thread-card", name));
     },
     /** Switches to another workspace's orchestrator from the sidebar. */
     switchTo: async (workspace: string) => {
@@ -286,6 +284,133 @@ async function mount(
 
 let mounted: Mounted;
 const app = () => mounted;
+
+describe("thread navigation", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mounted = await mount();
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+
+  it("opens a sidebar conversation on one click and toggles its details without changing the draft", async () => {
+    expect(app().all('[aria-label="Show thread details"]')).toHaveLength(0);
+    await app().talkTo("builder");
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+    expect(
+      app()
+        .find(".sidebar .thread-card", "builder")
+        .getAttribute("aria-current"),
+    ).toBe("location");
+    await app().type("keep these words");
+    const toggle = app().find('[aria-label="Show thread details"]');
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.getAttribute("aria-controls")).toBe("twr-inspector");
+    await app().click(toggle);
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: builder",
+    );
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    await app().click(app().find('[aria-label="Hide thread details"]'));
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+    expect(app().box().value).toBe("keep these words");
+    await app().click(toggle);
+    await app().click(app().find('[aria-label="Close thread details"]'));
+    expect(app().document.activeElement).toBe(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    await app().click(toggle);
+    await app().talkTo("tester");
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message tester directly",
+    );
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+    await app().click(app().find('[aria-label="Show thread details"]'));
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: tester",
+    );
+  });
+
+  it("opens a conversation from the Threads grid on one click", async () => {
+    await app().click(app().find(".primary-nav button", "Thread grid"));
+    await app().click(app().find(".thread-grid .thread-card", "builder"));
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().all(".thread-grid")).toHaveLength(0);
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+  });
+
+  it("keeps loop chip clicks on loop progress without changing the conversation", async () => {
+    await app().live(
+      "default",
+      views.default.map((t) =>
+        t.id === "w1" ? { ...t, loop_line: "Round 1" } : t,
+      ),
+    );
+    await app().click(app().find(".sidebar .loop-chip"));
+    expect(app().box().getAttribute("aria-label")).toBe("Message orchestrator");
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: builder",
+    );
+    await app().talkTo("tester");
+    await app().click(app().find(".sidebar .loop-chip"));
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message tester directly",
+    );
+    await app().click(app().find('[aria-label="Show thread details"]'));
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: tester",
+    );
+  });
+
+  it("opens another workspace's thread conversation with one click", async () => {
+    await mounted.unmount();
+    const remote = thread({ id: "remote", name: "remote-builder" });
+    mounted = await mount({
+      inboxSources: [
+        {
+          hubId: "composer-test",
+          hubName: "Test hub",
+          workspace: "other",
+          threads: [remote],
+          attention: [],
+        },
+      ],
+    });
+    await app().click(
+      app().find("[data-workspace=other] .workspace-thread", "remote-builder"),
+    );
+    await app().live("other", [...views.other, remote]);
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message remote-builder directly",
+    );
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+  });
+
+  it("preserves mobile's details-first navigation and Enter to talk", async () => {
+    await mounted.unmount();
+    mounted = await mount({ mobile: true });
+    await app().click(app().find(".sidebar .thread-card", "builder"));
+    expect(app().box().getAttribute("aria-label")).toBe("Message orchestrator");
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: builder",
+    );
+    const card = app().find(".sidebar .thread-card", "builder");
+    expect(card.getAttribute("aria-describedby")).toBe("twr-thread-open-hint");
+    await app().act(async () => {
+      press(card, "Enter");
+    });
+    await app().settle();
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().all('[aria-label="Show thread details"]')).toHaveLength(0);
+  });
+});
 
 describe("the message box", () => {
   beforeEach(async () => {

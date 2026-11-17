@@ -215,9 +215,6 @@ async function talk(page, name) {
     .locator(".thread-list .thread-card")
     .filter({ hasText: name })
     .click();
-  await page
-    .getByRole("button", { name: "Talk to this thread", exact: true })
-    .click();
 }
 // Adds `message` to the stored outbox behind the app's back, for a reload to find. The app
 // writes this record whole from memory (a draft it is still saving, say), and such a write
@@ -1034,6 +1031,9 @@ try {
     await page
       .locator(".thread-list .thread-card")
       .filter({ hasText: "permission" })
+      .click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
       .click();
     const approval = page.locator(".inspector .attention-card");
     await approval.waitFor();
