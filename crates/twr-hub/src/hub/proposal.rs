@@ -49,6 +49,7 @@ use twr_core::reduce::AttentionItem;
 use twr_decisions::code::card::{self, CardLine};
 
 use super::attention::{answer_of, StagedAnswer};
+use super::config_set;
 use super::mode::StagedMode;
 use super::orch::cut;
 use super::{
@@ -111,6 +112,15 @@ pub(super) enum Proposed {
         #[serde(default)]
         lifecycle: u64,
     },
+    /// Set key `key` (its parts) of twr's config file to `value` (a JSON scalar), the file
+    /// having `before` when it was proposed (`None`: unset; `hub::config_set`). Confirm writes
+    /// it only while the file still has `before`.
+    Config {
+        key: Vec<String>,
+        value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<Value>,
+    },
 }
 
 /// The proposals of one orchestrator turn that ended, not on a card yet.
@@ -141,12 +151,16 @@ pub(super) struct Proposal {
 }
 
 impl Proposal {
-    /// Whether an action changes a thread's permission mode or moves it to another runtime
-    /// (what a device confirms only with `admin`, `hub::device_scope`).
+    /// Whether an action changes a thread's permission mode, moves it to another runtime or
+    /// changes twr's configuration (what a device confirms only with `admin`,
+    /// `hub::device_scope`).
     pub(super) fn changes_settings(&self) -> bool {
-        self.actions
-            .iter()
-            .any(|a| matches!(a, Proposed::Mode { .. } | Proposed::Move { .. }))
+        self.actions.iter().any(|a| {
+            matches!(
+                a,
+                Proposed::Mode { .. } | Proposed::Move { .. } | Proposed::Config { .. }
+            )
+        })
     }
 
     /// From a confirm card's `attention.raised`.
@@ -189,6 +203,8 @@ fn on_runtime(
 struct Earlier {
     modes: std::collections::HashMap<String, String>,
     runtimes: std::collections::HashMap<String, String>,
+    /// The config file's text with the config actions staged so far (`hub::config_set`).
+    config: Option<config_set::ConfigEdit>,
 }
 
 /// A confirm card's action staged into its batch ([`Core::confirm_card`]).
@@ -197,6 +213,8 @@ enum Staged {
     Mode(StagedMode),
     /// A move to another runtime: the thread whose settings apply once committed.
     Move(String),
+    /// A config change: its record, added to the batch once the file is written.
+    Config(Box<ConfigChanged>),
 }
 
 /// What the orchestrator is told about a proposed move to another runtime.
@@ -320,6 +338,11 @@ impl Core {
                 model: model.clone(),
                 effort: effort.clone(),
             },
+            Proposed::Config { key, value, before } => CardLine::Config {
+                key: key.clone(),
+                value: config_set::card_value(value),
+                before: before.as_ref().map(config_set::card_value),
+            },
         }
     }
 
@@ -331,8 +354,9 @@ impl Core {
     }
 
     /// Whether `action` still means something now: the item is open at the same revision, the
-    /// thread exists in the life it was proposed for and is not in that mode already.
-    fn still_proposed(&self, action: &Proposed) -> bool {
+    /// thread exists in the life it was proposed for and is not in that mode already, the
+    /// config file does not have that value already.
+    fn still_proposed(&self, hub: &Inner, action: &Proposed) -> bool {
         match action {
             Proposed::Answer {
                 attn_id, revision, ..
@@ -358,6 +382,7 @@ impl Core {
                 .registry
                 .get(thread)
                 .is_some_and(|v| !v.retired && v.lifecycle_seq == *lifecycle),
+            Proposed::Config { key, value, .. } => Core::config_still_proposed(hub, key, value),
         }
     }
 
@@ -374,7 +399,7 @@ impl Core {
         let actions: Vec<Proposed> = card
             .actions
             .iter()
-            .filter(|a| self.still_proposed(a))
+            .filter(|a| self.still_proposed(hub, a))
             .cloned()
             .collect();
         if actions.is_empty() {
@@ -459,6 +484,40 @@ impl Core {
                 Err(e) => skipped.push(format!("{what} ({})", e.message)),
             }
         }
+        // The config file, with every config action applied in order, is written before the
+        // batch commits, over exactly the text they were staged on; when the batch then fails,
+        // the old text goes back. A write that fails skips them all.
+        let config = earlier.config.take().filter(|c| c.new != c.old);
+        let mut config_written = None;
+        if let Some(c) = config {
+            match config_set::write_over(&c.file, &c.new, &c.old) {
+                Ok(()) => {
+                    for s in &staged {
+                        if let Staged::Config(rec) = s {
+                            let mut rec = rec.as_ref().clone();
+                            rec.ext = twr_ext_map(json!({ PROPOSAL_KEY: card }));
+                            batch.push(
+                                &proposal.orchestrator,
+                                None,
+                                Source::Hub,
+                                EventBody::ConfigChanged(rec),
+                            );
+                        }
+                    }
+                    config_written = Some(c);
+                }
+                Err(e) => {
+                    let mut unwritten = Vec::new();
+                    for i in (0..staged.len()).rev() {
+                        if matches!(staged[i], Staged::Config(_)) {
+                            staged.remove(i);
+                            unwritten.push(format!("{} ({})", applied.remove(i), e.message));
+                        }
+                    }
+                    skipped.extend(unwritten.into_iter().rev());
+                }
+            }
+        }
         let resolved = batch.push(
             HUB_THREAD,
             None,
@@ -476,6 +535,11 @@ impl Core {
         let done = match self.append_batch(hub, batch) {
             Ok(done) => done,
             Err(e) => {
+                if let Some(c) = &config_written {
+                    if let Err(back) = config_set::write_over(&c.file, &c.old, &c.new) {
+                        tracing::error!(error = %back.message, file = %c.file.display(), "a confirm card's config change was written but not recorded, and could not be undone");
+                    }
+                }
                 self.hub_cards.insert(card, proposal.clone());
                 return Err(append_err(e));
             }
@@ -487,7 +551,7 @@ impl Core {
         let answers = || {
             staged.iter().filter_map(|s| match s {
                 Staged::Answer(a) => Some(a),
-                Staged::Mode(_) | Staged::Move(_) => None,
+                Staged::Mode(_) | Staged::Move(_) | Staged::Config(_) => None,
             })
         };
         for a in answers() {
@@ -504,7 +568,7 @@ impl Core {
                 Staged::Move(thread) => {
                     self.apply_settings(hub, thread, &mut None);
                 }
-                Staged::Answer(_) => {}
+                Staged::Answer(_) | Staged::Config(_) => {}
             }
         }
         done.events
@@ -618,6 +682,12 @@ impl Core {
                 )?;
                 earlier.runtimes.insert(id.clone(), target);
                 Ok(Staged::Move(id))
+            }
+            // Against the file as the card's earlier config actions leave it; written, and
+            // recorded, by `confirm_card` (`hub::config_set`).
+            Proposed::Config { key, value, before } => {
+                Core::stage_config(hub, &mut earlier.config, key, value, before.as_ref())
+                    .map(|rec| Staged::Config(Box::new(rec)))
             }
         }
     }

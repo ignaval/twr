@@ -42,7 +42,8 @@
 //!   otherwise; nothing is applied without a covering command or the user's Confirm, and
 //!   nothing that failed provenance is applied at all;
 //! - (d) the confirm card for the proposals (names, labels, mode ids and item summaries
-//!   now and then replaced with escapes, invisible characters and the card's own syntax) shows
+//!   now and then replaced with escapes, invisible characters and the card's own syntax, and
+//!   now and then a config change with such key parts and values among them) shows
 //!   no invisible character as is and reads back (`card::parse`) as exactly its actions;
 //! - (e) when a call is direct: the message is one sentence (no mark but one trailing `.` or
 //!   `!`, no line break), of at most 48 tokens; every answer target it covers is a permission,
@@ -62,7 +63,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use twr_core::event::{AttentionReason, HUB_THREAD};
 use twr_core::reduce::ThreadStatus;
-use twr_decisions::code::card::{self, CardLine};
+use twr_decisions::code::card::{self, CardLine, CardValue};
 use twr_decisions::code::command::{
     answer_coverage, canonical_label, direct_actions, mode_coverage, Coverage, DirectAction, Scene,
     Waiting, COURTESY, NOT_NAMES, QUALIFIERS, RESERVED, STOPLIST,
@@ -1741,7 +1742,7 @@ fn fuzz(seed: u64, cases: u64) -> Stats {
                     .find(|t| t.id == id)
                     .map_or(id.to_string(), |t| t.name.clone())
             };
-            let lines: Vec<CardLine> = proposals
+            let mut lines: Vec<CardLine> = proposals
                 .iter()
                 .map(|(key, value)| {
                     let item = w.waiting.iter().find(|i| i.attn_id == *key);
@@ -1777,6 +1778,41 @@ fn fuzz(seed: u64, cases: u64) -> Stats {
                     }
                 })
                 .collect();
+            // A config change on the same card now and then, its key parts and values junk.
+            if rng.chance(25) {
+                let value = |rng: &mut Rng| match rng.below(3) {
+                    0 => CardValue::Str(card_junk(rng)),
+                    1 => CardValue::Literal(card_junk(rng)),
+                    _ => CardValue::Literal(
+                        (*rng.pick(&["true", "false", "3", "0.8", "unset"])).into(),
+                    ),
+                };
+                let parts = 1 + rng.below(3);
+                let key = (0..parts)
+                    .map(|_| {
+                        if rng.chance(50) {
+                            "tui".to_string()
+                        } else {
+                            card_junk(&mut rng)
+                        }
+                    })
+                    .collect();
+                let value_now = value(&mut rng);
+                let before = if rng.chance(30) {
+                    None
+                } else {
+                    Some(value(&mut rng))
+                };
+                let at = rng.below(lines.len() + 1);
+                lines.insert(
+                    at,
+                    CardLine::Config {
+                        key,
+                        value: value_now,
+                        before,
+                    },
+                );
+            }
             let summary = card::render(&lines);
             if let Some(c) = summary.chars().find(|&c| invisible(c)) {
                 fail(format!("card {summary:?} shows {c:?} as is"));

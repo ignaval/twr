@@ -1949,6 +1949,17 @@ impl Transcript {
                 resolution: false,
                 routine: None,
             }),
+            // A key of the config file set through the hub: shown the same way.
+            EventBody::ConfigChanged(p) => self.push(Entry::HubUpdate {
+                text: p.line(),
+                user_message: None,
+                attn_id: None,
+                about: None,
+                outcome: None,
+                seq: ev.seq,
+                resolution: false,
+                routine: None,
+            }),
             EventBody::ConversationUpdate(p) => {
                 let twr = p.ext.as_ref().and_then(|e| e.get("twr"));
                 let attn_id = twr

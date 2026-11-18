@@ -855,3 +855,71 @@ async fn a_device_without_admin_starts_threads_only_outside_the_home_and_data_fo
     drop(rt);
     hub.shutdown().await;
 }
+
+/// Changing twr's configuration needs `admin` on a device: its own `config.set`, the
+/// orchestrator relaying its message (`relay_forbidden`, directly or as a card), and Confirm on
+/// a card that holds a config change (the card stays open).
+#[tokio::test]
+async fn a_device_changes_the_configuration_only_with_admin() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let d = env.devices();
+    let mut sub = hub.subscribe_control(0);
+    for device in [&d.operate, &d.terminal] {
+        unauthorized(
+            hub.config_set("tui.suggest", json!(false), device).await,
+            "admin",
+        );
+    }
+    let r = hub
+        .config_set("tui.suggest", json!(false), &d.admin)
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "applied", "{r}");
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Watching.");
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    hub.say_to_orchestrator("turn suggestions back on", Some(seen), &d.operate)
+        .unwrap();
+    let (_, t2) = rt.next_turn().await;
+    for (k, v) in [("tui.suggest", json!(true)), ("codex.auto", json!("never"))] {
+        let e = hub
+            .config_set(k, v, &Caller::Orchestrator)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, codes::RELAY_FORBIDDEN, "{e:?}");
+        assert!(e.message.contains("admin"), "{e:?}");
+    }
+    rt.end_turn(t2, "Done.");
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    hub.say_to_orchestrator("let codex never ask", Some(seen), &tui())
+        .unwrap();
+    let (_, t3) = rt.next_turn().await;
+    let r = hub
+        .config_set("codex.auto", json!("never"), &Caller::Orchestrator)
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "needs_confirmation", "{r}");
+    rt.end_turn(t3, "It's on a card.");
+    let evs = until(&mut sub, |e| {
+        raised(e).is_some_and(|r| is_confirm_card(&e.thread, &r.ext))
+    })
+    .await;
+    let attn = raised(evs.last().unwrap()).unwrap().attn_id.clone();
+    unauthorized(
+        hub.respond(&attn, Answer::new("Confirm"), client(&d.operate)),
+        "admin",
+    );
+    assert!(!std::fs::read_to_string(env.config_file())
+        .unwrap()
+        .contains("[codex]"));
+    hub.respond(&attn, Answer::new("Confirm"), client(&d.admin))
+        .unwrap();
+    assert!(std::fs::read_to_string(env.config_file())
+        .unwrap()
+        .contains("[codex]\nauto = \"never\"\n"));
+    drop(rt);
+    hub.shutdown().await;
+}

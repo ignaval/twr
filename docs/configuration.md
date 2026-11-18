@@ -4,6 +4,8 @@ twr reads `~/.config/twr/config.toml`, or `$XDG_CONFIG_HOME/twr/config.toml`, or
 
 `twr info` shows what the running hub uses: its boxes and the orchestrator runtime. It also lists warnings about the config the hub started with, such as a short box token or a config file other users can access.
 
+You can also ask the orchestrator to change a key, as in "turn off suggestions". The hub edits that one value in place, as the TUI's settings do: the file's comments, spacing and every other line stay as they are, and a key the file lacks is added under its table's header. Display and voice preferences change at once; any other key waits for you to confirm a card; `[boxes]`, `hub.tls`, `env` values, command lines and secrets are never changed that way, and lists and tables you edit by hand. Each change says when it takes effect, which for most keys is the next start of the program that reads them. See [orchestrator.md](orchestrator.md#changing-twrs-configuration).
+
 ## Workspaces
 
 [Workspaces](workspaces.md) (`twr ws new <name>`, then `twr -w <name>` or `TWR_WORKSPACE`) are separate hubs on one machine that share this file. A named workspace ignores what belongs to the `default` workspace's hub: `hub.socket` (it has its own socket), `hub.listen` and `hub.tls` (runners connect to `default`), and `[orchestrator] cwd` (its orchestrator works in the workspace's own directory, so a Claude Code orchestrator keeps its own memories). The default workspace refuses a `hub.socket` in the directory of the workspaces' sockets (`<socket dir>/ws/`), where it could be one of theirs; `--socket` still works. Restart a workspace's hub (`twr -w <name> hub stop`, then `twr -w <name>`) after a change, like any hub.
