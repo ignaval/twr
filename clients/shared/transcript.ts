@@ -7,6 +7,9 @@ export interface Block {
   seq: number;
   turn?: number;
   ts: string;
+  /** Conservative identity cutoff. Unlike the first delta, turn.started survives
+   * filtered history reads; a missing matching start leaves thread boxes neutral. */
+  turnStartedAt?: string;
   pending?: boolean;
   about?: string;
   routine?: boolean;
@@ -17,9 +20,11 @@ export interface Block {
 export function blocksOf(events: HubEvent[]): Block[] {
   const output: Block[] = [];
   const calls = new Map<string, Block>();
+  const turnStarts = new Map<string, string>();
   let streaming: Block | undefined;
   for (const event of events) {
     const data = event.data || {};
+    const turnKey = JSON.stringify([event.thread, event.turn]);
     const base = {
       id: event.id,
       seq: event.seq,
@@ -28,6 +33,7 @@ export function blocksOf(events: HubEvent[]): Block[] {
     };
     switch (event.kind) {
       case "turn.started":
+        if (event.turn !== undefined) turnStarts.set(turnKey, event.ts);
         streaming = undefined;
         if (data.prompt)
           output.push({
@@ -39,7 +45,13 @@ export function blocksOf(events: HubEvent[]): Block[] {
       case "agent.text":
         if (data.delta) {
           if (!streaming || streaming.turn !== event.turn) {
-            streaming = { ...base, kind: "assistant", text: "", pending: true };
+            streaming = {
+              ...base,
+              kind: "assistant",
+              text: "",
+              pending: true,
+              turnStartedAt: turnStarts.get(turnKey),
+            };
             output.push(streaming);
           }
           streaming.text += data.text || "";
@@ -52,7 +64,12 @@ export function blocksOf(events: HubEvent[]): Block[] {
           if (streaming) streaming.pending = false;
           streaming = undefined;
           if (data.text)
-            output.push({ ...base, kind: "assistant", text: data.text });
+            output.push({
+              ...base,
+              kind: "assistant",
+              text: data.text,
+              turnStartedAt: turnStarts.get(turnKey),
+            });
         }
         break;
       case "agent.tool_call": {

@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DesktopEvent, Json, Thread } from "../shared/types";
+import type {
+  DesktopEvent,
+  HubEvent,
+  InboxSource,
+  Json,
+  Thread,
+} from "../shared/types";
+import type { NativeVoiceEvent, VoiceCaptureStatus } from "../shared/voice";
 import { SUGGEST_SETTLE_MS } from "../shared/assistance";
 import {
   FakeEvent,
@@ -71,14 +78,46 @@ type HostOptions = {
   secure?: Record<string, string>;
   /** The connection takes uploads. */
   uploads?: boolean;
+  voice?: boolean;
+  voiceStatus?: () => Promise<VoiceCaptureStatus>;
+  voiceSetup?: () => Promise<VoiceCaptureStatus>;
+  inboxSources?: InboxSource[];
 };
 
 function fakeHost(options: HostOptions = {}) {
   const listeners = new Set<(event: DesktopEvent) => void>();
   const secure = new Map<string, string>(Object.entries(options.secure || {}));
   const sent: { method: string; params: Json }[] = [];
+  const voiceListeners = new Set<(event: NativeVoiceEvent) => void>();
+  const voiceOps: string[] = [];
+  const nativeVoice = {
+    status:
+      options.voiceStatus || (async () => ({ available: true, local: true })),
+    start: async ({ mode }: { mode: string }) => {
+      voiceOps.push("start:" + mode);
+      if (mode === "push")
+        voiceListeners.forEach((listener) => listener({ type: "speechStart" }));
+    },
+    stop: async () => {
+      voiceOps.push("stop");
+    },
+    cancel: async () => {
+      voiceOps.push("cancel");
+    },
+    onEvent: (callback: (event: NativeVoiceEvent) => void) => {
+      voiceListeners.add(callback);
+      return () => {
+        voiceListeners.delete(callback);
+      };
+    },
+  };
   const host = {
     sent,
+    nativeVoice: options.voice ? nativeVoice : undefined,
+    voiceSetup: options.voiceSetup,
+    voiceOps,
+    voiceEvent: (event: NativeVoiceEvent) =>
+      voiceListeners.forEach((listener) => listener(event)),
     secure,
     /** What `thread.queue` lists, by thread. */
     queues: {} as Record<string, Json[]>,
@@ -98,6 +137,7 @@ function fakeHost(options: HostOptions = {}) {
       terminals: [],
     }),
     connect: async () => ({}),
+    inboxSources: async () => options.inboxSources || [],
     rpc: async (method: string, params: Json = {}) => {
       const answer = options.rpc?.(method, params);
       if (answer !== undefined) return answer;
@@ -170,6 +210,7 @@ async function mount(
     local?: Record<string, string>;
     /** The paired hub's id, as the mobile app marks it on the page. */
     hub?: string;
+    mobile?: boolean;
   } = {},
 ) {
   const document = installFakeDOM() as FakeDocument;
@@ -177,6 +218,7 @@ async function mount(
   for (const [key, value] of Object.entries(options.local || {}))
     localStorage.setItem(key, value);
   if (options.hub) document.documentElement.dataset.hub = options.hub;
+  if (options.mobile) document.documentElement.dataset.mobile = "true";
   const host = fakeHost(options);
   (window as any).twr = host;
   // react-dom looks for a DOM as it loads: import it once the stand-in is in place.
@@ -264,15 +306,9 @@ async function mount(
       await settle();
     },
     unmount: () => act(async () => root.unmount()),
-    /** Opens a worker's conversation, as a double-click on its sidebar card does. */
+    /** Opens a worker's conversation with one click on its sidebar card. */
     talkTo: async (name: string) => {
-      const card = find(".sidebar .thread-card", name);
-      await act(async () => {
-        card.dispatchEvent(
-          new FakeEvent("dblclick", { bubbles: true, cancelable: true }),
-        );
-      });
-      await settle();
+      await click(find(".sidebar .thread-card", name));
     },
     /** Switches to another workspace's orchestrator from the sidebar. */
     switchTo: async (workspace: string) => {
@@ -286,6 +322,831 @@ async function mount(
 
 let mounted: Mounted;
 const app = () => mounted;
+
+describe("the latest user message above conversation history", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: HostOptions = {}) => {
+    vi.resetModules();
+    mounted = await mount(options);
+  };
+  const prompt = (
+    turn: number,
+    text: string,
+    from = "user",
+    thread = "orch",
+  ): HubEvent => ({
+    id: `${thread}:${turn}`,
+    thread,
+    seq: turn * 10,
+    turn,
+    ts: "2026-11-17T12:00:00Z",
+    kind: "turn.started",
+    data: { from, prompt: text },
+  });
+  const preview = () => app().find(".latest-user-preview").textContent;
+  const deferredPage = () => {
+    let resolve!: (page: Json) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<Json>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    return { promise, resolve, reject };
+  };
+
+  it("shows only the latest user's first line and ignores drafts and automatic turns", async () => {
+    await start({
+      events: [
+        prompt(1, "Older request"),
+        prompt(2, "Latest request\r\nA second line"),
+        prompt(3, "Automatic prompt", "orchestrator"),
+      ],
+    });
+    expect(preview()).toBe("Latest request");
+    expect(
+      app().find(".latest-user-message button").getAttribute("aria-label"),
+    ).toBe("Jump to your previous message: Latest request");
+    expect(app().all(".conversation-scroll .latest-user-message")).toHaveLength(
+      0,
+    );
+    await app().type("Unsent draft");
+    expect(preview()).toBe("Latest request");
+    await app().connection(false);
+    expect(preview()).toBe("Latest request");
+  });
+
+  it("updates on a live user message, but keeps it through agent replies and prepended history", async () => {
+    let subscription = "";
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") subscription = params.subscription;
+        if (method === "thread.transcript")
+          return Promise.resolve({
+            events: [
+              prompt(
+                params.turn || 2,
+                "Request " + (params.turn || 2) + "x".repeat(3000),
+              ),
+            ],
+            turn: params.turn || 2,
+            more: false,
+          });
+      },
+    });
+    await app().click(app().find(".load-earlier"));
+    expect(preview()).toContain("Request 2");
+    await app().act(async () => {
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: prompt(3, "New request\nDetails"),
+      });
+    });
+    await app().wait(60);
+    expect(preview()).toBe("New request");
+    await app().act(async () => {
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: {
+          ...prompt(4, ""),
+          kind: "agent.text",
+          data: { text: "Reply", delta: true },
+        },
+      });
+    });
+    await app().wait(60);
+    expect(preview()).toBe("New request");
+  });
+
+  it("loads beyond three automatic turns and all pages to find the latest user", async () => {
+    const turns: number[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method !== "thread.transcript") return;
+        const turn = params.turn || 8;
+        turns.push(turn);
+        const paged = turn === 4 && !params.since_seq;
+        return Promise.resolve({
+          events: params.since_seq
+            ? []
+            : [
+                prompt(
+                  turn,
+                  turn === 3
+                    ? "Actual latest request\nDetails"
+                    : "x".repeat(3100),
+                  turn === 3 ? "user" : "orchestrator",
+                ),
+              ],
+          turn,
+          more: paged,
+          next: turn * 10,
+        });
+      },
+    });
+    expect(turns).toEqual([8, 7, 6, 5, 4, 4, 3]);
+    expect(preview()).toBe("Actual latest request");
+  });
+
+  it("subscribes and accepts live messages while an automatic worker's older history is pending", async () => {
+    const older = deferredPage();
+    const calls: string[] = [];
+    let subscription = "";
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") {
+          calls.push("subscribe");
+          subscription = params.subscription;
+        }
+        if (method !== "thread.transcript") return;
+        calls.push(String(params.turn || "recent"));
+        return params.turn
+          ? older.promise
+          : Promise.resolve({
+              events: [
+                prompt(100, "Automatic " + "x".repeat(3100), "orchestrator"),
+              ],
+              turn: 100,
+              more: false,
+              next: 1000,
+            });
+      },
+    });
+    expect(calls).toEqual(["recent", "subscribe", "99"]);
+    expect(app().all(".transcript-loading")).toHaveLength(0);
+    expect(
+      app().find(".conversation-scroll").getAttribute("aria-busy"),
+    ).toBeNull();
+    expect(app().find(".latest-user-empty").textContent).toBe(
+      "Loading your previous message…",
+    );
+    await app().act(async () =>
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: prompt(101, "Live user request"),
+      }),
+    );
+    await app().wait(60);
+    expect(preview()).toBe("Live user request");
+    await app().act(async () =>
+      older.resolve({
+        events: [prompt(99, "Older automatic task", "orchestrator")],
+        more: false,
+      }),
+    );
+    await app().settle();
+    expect(preview()).toBe("Live user request");
+    expect(calls).toEqual(["recent", "subscribe", "99"]);
+  });
+
+  it("retains recent history and live delivery when an older page fails, and allows retry", async () => {
+    let failOlder = true;
+    let subscription = "";
+    const turns: number[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") subscription = params.subscription;
+        if (method !== "thread.transcript") return;
+        const turn = params.turn || 100;
+        turns.push(turn);
+        if (!params.turn)
+          return Promise.resolve({
+            events: [prompt(100, "Recent user request")],
+            turn: 100,
+            more: false,
+          });
+        if (params.since_seq && failOlder)
+          return Promise.reject(new Error("Older page unavailable"));
+        return Promise.resolve({
+          events: params.since_seq
+            ? []
+            : [prompt(99, "x".repeat(3100), "orchestrator")],
+          more: !params.since_seq,
+          next: 990,
+        });
+      },
+    });
+    expect(turns).toEqual([100, 99, 99]);
+    expect(preview()).toBe("Recent user request");
+    expect(
+      app().find(".conversation-scroll .error-banner").textContent,
+    ).toContain("Older page unavailable");
+    expect(app().all(".transcript-loading")).toHaveLength(0);
+    await app().act(async () =>
+      app().host.emit({
+        type: "thread",
+        subscription,
+        event: prompt(101, "Live request after failure"),
+      }),
+    );
+    await app().wait(60);
+    expect(preview()).toBe("Live request after failure");
+    expect(turns).toEqual([100, 99, 99]); // No automatic retry loop on live updates.
+    failOlder = false;
+    await app().click(app().find(".load-earlier"));
+    expect(turns).toEqual([100, 99, 99, 99, 99]);
+    expect(app().all(".conversation-scroll .error-banner")).toHaveLength(0);
+    expect(preview()).toBe("Live request after failure");
+  });
+
+  it.each(["page", "error"])(
+    "ignores an old conversation's delayed %s without disturbing the new lookup",
+    async (result) => {
+      const oldPage = deferredPage();
+      const workerPage = deferredPage();
+      const calls: string[] = [];
+      await start({
+        rpc: (method, params) => {
+          if (method !== "thread.transcript") return;
+          calls.push(
+            `${params.thread}:${params.turn || "recent"}:${params.since_seq || 0}`,
+          );
+          if (params.turn)
+            return params.thread === "orch"
+              ? oldPage.promise
+              : workerPage.promise;
+          const turn = params.thread === "orch" ? 100 : 10;
+          return Promise.resolve({
+            events: [
+              prompt(turn, "x".repeat(3100), "orchestrator", params.thread),
+            ],
+            turn,
+            more: false,
+          });
+        },
+      });
+      await app().talkTo("builder");
+      expect(calls).toEqual([
+        "orch:recent:0",
+        "orch:99:0",
+        "w1:recent:0",
+        "w1:9:0",
+      ]);
+      await app().act(async () => {
+        if (result === "error")
+          oldPage.reject(new Error("Stale history error"));
+        else
+          oldPage.resolve({
+            events: [prompt(99, "Stale user request")],
+            more: true,
+            next: 991,
+          });
+      });
+      await app().settle();
+      expect(calls).toHaveLength(4); // No next page or duplicate worker request.
+      expect(app().all(".latest-user-preview")).toHaveLength(0);
+      expect(app().all(".conversation-scroll .error-banner")).toHaveLength(0);
+      expect(app().find(".load-earlier").disabled).toBe(true);
+      await app().act(async () =>
+        workerPage.resolve({
+          events: [prompt(9, "Worker's latest request", "user", "w1")],
+          more: false,
+        }),
+      );
+      await app().settle();
+      expect(preview()).toBe("Worker's latest request");
+      expect(app().find(".load-earlier").disabled).toBe(false);
+    },
+  );
+
+  it("keeps short-conversation context bounded to three turns after subscribing", async () => {
+    const calls: string[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.subscribe") calls.push("subscribe");
+        if (method !== "thread.transcript") return;
+        const turn = params.turn || 8;
+        calls.push(String(turn));
+        return Promise.resolve({
+          events: [
+            prompt(turn, "Short context", turn === 8 ? "user" : "orchestrator"),
+          ],
+          turn,
+          more: false,
+        });
+      },
+    });
+    expect(calls).toEqual(["8", "subscribe", "7", "6", "5"]);
+  });
+
+  it("clears the previous conversation's line while a thread deep dive loads", async () => {
+    let finish: (value: Json) => void = () => {};
+    await start({
+      rpc: (method, params) => {
+        if (method !== "thread.transcript") return;
+        return params.thread === "orch"
+          ? Promise.resolve({
+              events: [prompt(1, "Orchestrator request")],
+              more: false,
+            })
+          : new Promise((resolve) => {
+              finish = resolve;
+            });
+      },
+    });
+    expect(preview()).toBe("Orchestrator request");
+    await app().talkTo("builder");
+    expect(app().all(".latest-user-preview")).toHaveLength(0);
+    expect(app().find(".latest-user-empty").textContent).toBe(
+      "Loading your previous message…",
+    );
+    await app().act(async () =>
+      finish({
+        events: [prompt(1, "Worker request", "user", "w1")],
+        more: false,
+      }),
+    );
+    await app().settle();
+    expect(preview()).toBe("Worker request");
+  });
+
+  it("has no jump action when the complete history has no user message", async () => {
+    await start({ events: [prompt(1, "Automatic", "orchestrator")] });
+    expect(app().all(".latest-user-message button")).toHaveLength(0);
+    expect(app().find(".latest-user-empty").textContent).toBe(
+      "No messages from you yet",
+    );
+  });
+
+  it("keeps a message with a blank first line reachable", async () => {
+    await start({ events: [prompt(1, "\nDetails on the next line")] });
+    expect(preview()).toBe("Blank first line");
+    expect(
+      app().find(".latest-user-message button").getAttribute("title"),
+    ).toBe("Blank first line");
+  });
+});
+
+describe("dictation in the shared desktop and mobile composer", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: Parameters<typeof mount>[0] = {}) => {
+    vi.resetModules();
+    mounted = await mount({ ...options, voice: true });
+  };
+  const voiceEvent = async (event: NativeVoiceEvent) => {
+    await app().act(async () => app().host.voiceEvent(event));
+    await app().settle();
+  };
+  const mic = () => app().find("[data-voice-push]");
+  const dictate = async (text: string) => {
+    // Keyboard activation exercises the same microphone button without pointer events.
+    await app().click(mic(), { detail: 0 });
+    await app().click(mic(), { detail: 0 });
+    await voiceEvent({ type: "final", text });
+  };
+  const send = async () => {
+    await app().act(async () => {
+      app()
+        .find("form.composer")
+        .dispatchEvent(
+          new FakeEvent("submit", { bubbles: true, cancelable: true }),
+        );
+    });
+    await app().settle();
+  };
+
+  it.each([false, true])(
+    "appends to the latest draft, focuses it, and sends only explicitly (mobile=%s)",
+    async (mobile) => {
+      await start({ mobile });
+      await app().type("Typed first.");
+      await app().click(mic(), { detail: 0 });
+      await app().type(" Still typing.");
+      await app().click(mic(), { detail: 0 });
+      await voiceEvent({ type: "partial", text: "Spoken" });
+      expect(app().box().value).toBe("Typed first. Still typing.");
+      await voiceEvent({ type: "final", text: "Spoken last." });
+      expect(app().host.sent).toEqual([]);
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+      expect(app().box().value).toBe("Typed first. Still typing. Spoken last.");
+      expect(app().document.activeElement).toBe(app().box());
+      await app().type(" Edited.");
+      await send();
+      expect(app().host.sent).toEqual([
+        {
+          method: "say",
+          params: {
+            message: "Typed first. Still typing. Spoken last. Edited.",
+            seen_gseq: 1,
+            to: "orchestrator",
+            voice: true,
+          },
+        },
+      ]);
+      expect(app().box().value).toBe("");
+    },
+  );
+  it.each([false, true])(
+    "keeps active and error feedback inline and removes it after completion or dismissal (mobile=%s)",
+    async (mobile) => {
+      await start({ mobile });
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      await app().click(mic(), { detail: 0 });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Hearing you");
+      expect(app().all(".composer-actions .voice-bar")).toHaveLength(0);
+      expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+      await app().click(mic(), { detail: 0 });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Transcribing");
+      await voiceEvent({ type: "final", text: "Editable words" });
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().find("form.composer").textContent).not.toMatch(
+        /voice (?:is )?ready/i,
+      );
+      await app().click(mic(), { detail: 0 });
+      await voiceEvent({ type: "error", message: "Microphone unavailable" });
+      expect(
+        app().find(".composer-voice-status .voice-bar").textContent,
+      ).toContain("Microphone unavailable");
+      expect(app().box().value).toBe("Editable words");
+      await app().click(app().find(".voice-bar button", "Dismiss"));
+      expect(app().all(".voice-bar")).toHaveLength(0);
+      expect(app().box().value).toBe("Editable words");
+    },
+  );
+  it("removes model setup feedback after download without a ready dialog or acknowledgement", async () => {
+    let finish!: (status: VoiceCaptureStatus) => void;
+    await start({
+      voiceStatus: async () => ({
+        available: false,
+        local: true,
+        setup: true,
+        problem: "No model",
+      }),
+      voiceSetup: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await app().click(mic(), { detail: 0 });
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Voice needs a speech model");
+    await app().click(app().find(".voice-bar button", "Download model"));
+    expect(app().find(".voice-bar").textContent).toContain(
+      "Downloading the speech model",
+    );
+    await app().act(async () => finish({ available: true, local: true }));
+    await app().settle();
+    expect(app().all(".voice-bar")).toHaveLength(0);
+    expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+    expect(app().find("form.composer").textContent).not.toMatch(
+      /voice (?:is )?ready/i,
+    );
+    expect(app().host.sent).toEqual([]);
+  });
+  it("keeps failed model setup inline with retry and dismiss actions", async () => {
+    await start({
+      voiceStatus: async () => ({
+        available: false,
+        local: true,
+        setup: true,
+        problem: "No model",
+      }),
+      voiceSetup: async () => {
+        throw new Error("Download failed");
+      },
+    });
+    await app().click(mic(), { detail: 0 });
+    await app().click(app().find(".voice-bar button", "Download model"));
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Download failed");
+    expect(app().all("[role=dialog], [role=alertdialog]")).toHaveLength(0);
+    expect(app().find(".voice-bar button", "Download model")).toBeDefined();
+    await app().click(app().find(".voice-bar button", "Dismiss"));
+    expect(app().all(".voice-bar")).toHaveLength(0);
+  });
+  it("supports hold-to-talk, the keyboard shortcut, and an end-of-draft caret", async () => {
+    await start();
+    await app().type("Typed");
+    const pointer = async (type: string) => {
+      await app().act(async () => {
+        mic().dispatchEvent(
+          new FakeEvent(type, { bubbles: true, pointerId: 1, button: 0 }),
+        );
+      });
+      await app().settle();
+    };
+    await pointer("pointerdown");
+    await app().wait(360);
+    await pointer("pointerup");
+    expect(app().host.voiceOps).toContain("stop");
+    await voiceEvent({ type: "final", text: "by holding" });
+    expect(app().box().value).toBe("Typed by holding");
+    expect(app().box().selectionStart).toBe(app().box().value.length);
+    const shortcut = async () => {
+      await app().act(async () => {
+        window.dispatchEvent(
+          new FakeEvent("keydown", {
+            code: "Space",
+            ctrlKey: true,
+            shiftKey: true,
+            bubbles: true,
+            cancelable: true,
+          }) as unknown as Event,
+        );
+      });
+      await app().settle();
+    };
+    await shortcut();
+    await shortcut();
+    await voiceEvent({ type: "final", text: "by shortcut" });
+    expect(app().box().value).toBe("Typed by holding by shortcut");
+    expect(app().host.sent).toEqual([]);
+  });
+  it("guards slash suggestions and Send as implementation loop against unreviewed dictation", async () => {
+    const methods: string[] = [];
+    await start({
+      rpc: (method) => {
+        methods.push(method);
+        return undefined;
+      },
+    });
+    await dictate("/job");
+    methods.length = 0;
+    await app().press("ArrowDown");
+    await app().press("Enter");
+    expect(methods).not.toContain("desktop.parse_slash");
+    expect(app().find(".dialog").textContent).toContain(
+      "Confirm spoken message",
+    );
+    await app().click(app().find(".dialog button", "Cancel"));
+    await app().talkTo("builder");
+    await dictate("Implement a task");
+    await app().click(app().find(".send-caret"));
+    await app().click(
+      app().find(".send-loop-panel button", "Send as implementation loop"),
+    );
+    expect(methods).not.toContain("thread.implement");
+    expect(app().find(".dialog").textContent).toContain(
+      "Confirm spoken message",
+    );
+  });
+  it("keeps dictation at the selected worker; hands-free still sends to the orchestrator", async () => {
+    await start();
+    await app().talkTo("builder");
+    await dictate("Check the tests");
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().host.sent).toEqual([]);
+    await send();
+    expect(app().host.sent).toEqual([
+      {
+        method: "thread.send",
+        params: { thread: "w1", prompt: "Check the tests" },
+      },
+    ]);
+    await app().type("Keep this worker draft");
+    await app().click(app().find("[data-voice-hands-free]"));
+    await voiceEvent({ type: "speechStart" });
+    await voiceEvent({ type: "final", text: "How is the workspace?" });
+    expect(app().host.sent.at(-1)).toMatchObject({
+      method: "say",
+      params: {
+        to: "orchestrator",
+        voice: true,
+        message: "How is the workspace?",
+      },
+    });
+    expect(app().box().value).toBe("Keep this worker draft");
+    expect(
+      app().find(".composer-voice-status .voice-bar").textContent,
+    ).toContain("Listening");
+  });
+  it("retains spoken provenance through edits and encrypted draft reload, then requires explicit review of approvals", async () => {
+    const calls: Json[] = [];
+    const rpc: HostOptions["rpc"] = (method, params) => {
+      if (method === "say") {
+        calls.push(params);
+        return Promise.resolve(
+          params.voice ? { action: "confirm" } : { action: "sent" },
+        );
+      }
+    };
+    await start({ rpc });
+    await dictate("allow it");
+    await app().replace("@builder yes");
+    await app().wait(400);
+    const secure = Object.fromEntries(app().host.secure);
+    await app().unmount();
+    await start({ rpc, secure });
+    expect(app().box().value).toBe("@builder yes");
+    await send();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].voice).toBe(true);
+    expect(app().find(".dialog").textContent).toContain(
+      "Confirm spoken message",
+    );
+    await app().click(app().find(".dialog button", "Review in message box"));
+    expect(calls).toHaveLength(1);
+    expect(app().box().value).toBe("@builder yes");
+    await send();
+    expect(calls).toHaveLength(2);
+    expect(calls[1].voice).toBeUndefined();
+    expect(app().box().value).toBe("");
+  });
+  it.each(["/jobs", "!echo hello"])(
+    "holds dictated composer commands for review: %s",
+    async (command) => {
+      const methods: string[] = [];
+      await start({
+        rpc: (method) => {
+          methods.push(method);
+          return undefined;
+        },
+      });
+      await dictate(command);
+      methods.length = 0;
+      await send();
+      expect(methods).not.toContain("desktop.parse_slash");
+      expect(methods).not.toContain("shell.run");
+      expect(app().find(".dialog").textContent).toContain(
+        "Confirm spoken message",
+      );
+      expect(app().box().value).toBe(command);
+    },
+  );
+  it("drops late results on conversation switches, cancellation, disconnect and errors", async () => {
+    await start();
+    await app().type("Keep orchestrator draft");
+    await dictate("");
+    expect(app().box().value).toBe("Keep orchestrator draft");
+    await app().click(mic(), { detail: 0 });
+    await app().talkTo("builder");
+    await voiceEvent({ type: "final", text: "old conversation" });
+    expect(app().box().value).toBe("");
+    await app().type("Keep worker draft");
+    await app().click(mic(), { detail: 0 });
+    await app().click(app().find("button", "Cancel dictation"));
+    await voiceEvent({ type: "final", text: "cancelled" });
+    expect(app().box().value).toBe("Keep worker draft");
+    await app().click(mic(), { detail: 0 });
+    await voiceEvent({ type: "error", message: "Recognition failed" });
+    await voiceEvent({ type: "final", text: "late after error" });
+    expect(app().box().value).toBe("Keep worker draft");
+    await app().click(mic(), { detail: 0 });
+    await app().connection(false);
+    await voiceEvent({ type: "final", text: "disconnected" });
+    expect(app().box().value).toBe("Keep worker draft");
+    expect(app().host.sent).toEqual([]);
+  });
+  it("keeps dictated text out of the offline delivery queue", async () => {
+    await start();
+    const deliver = vi.fn(async () => ({ ok: true }));
+    app().host.sendMessage = deliver;
+    await dictate("Check the tests");
+    await app().connection(false);
+    await send();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(app().box().value).toBe("Check the tests");
+    await app().live("default");
+    await send();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(app().host.sent[0]).toMatchObject({
+      method: "say",
+      params: { voice: true },
+    });
+  });
+});
+
+describe("thread navigation", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mounted = await mount();
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+
+  it("opens a sidebar conversation on one click and toggles its details without changing the draft", async () => {
+    expect(app().all('[aria-label="Show thread details"]')).toHaveLength(0);
+    await app().talkTo("builder");
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+    expect(
+      app()
+        .find(".sidebar .thread-card", "builder")
+        .getAttribute("aria-current"),
+    ).toBe("location");
+    await app().type("keep these words");
+    const toggle = app().find('[aria-label="Show thread details"]');
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.getAttribute("aria-controls")).toBe("twr-inspector");
+    await app().click(toggle);
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: builder",
+    );
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    await app().click(app().find('[aria-label="Hide thread details"]'));
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+    expect(app().box().value).toBe("keep these words");
+    await app().click(toggle);
+    await app().click(app().find('[aria-label="Close thread details"]'));
+    expect(app().document.activeElement).toBe(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    await app().click(toggle);
+    await app().talkTo("tester");
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message tester directly",
+    );
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+    await app().click(app().find('[aria-label="Show thread details"]'));
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: tester",
+    );
+  });
+
+  it("opens a conversation from the Threads grid on one click", async () => {
+    await app().click(app().find(".primary-nav button", "Thread grid"));
+    await app().click(app().find(".thread-grid .thread-card", "builder"));
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().all(".thread-grid")).toHaveLength(0);
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+  });
+
+  it("keeps loop chip clicks on loop progress without changing the conversation", async () => {
+    await app().live(
+      "default",
+      views.default.map((t) =>
+        t.id === "w1" ? { ...t, loop_line: "Round 1" } : t,
+      ),
+    );
+    await app().click(app().find(".sidebar .loop-chip"));
+    expect(app().box().getAttribute("aria-label")).toBe("Message orchestrator");
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: builder",
+    );
+    await app().talkTo("tester");
+    await app().click(app().find(".sidebar .loop-chip"));
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message tester directly",
+    );
+    await app().click(app().find('[aria-label="Show thread details"]'));
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: tester",
+    );
+  });
+
+  it("opens another workspace's thread conversation with one click", async () => {
+    await mounted.unmount();
+    const remote = thread({ id: "remote", name: "remote-builder" });
+    mounted = await mount({
+      inboxSources: [
+        {
+          hubId: "composer-test",
+          hubName: "Test hub",
+          workspace: "other",
+          threads: [remote],
+          attention: [],
+        },
+      ],
+    });
+    await app().click(
+      app().find("[data-workspace=other] .workspace-thread", "remote-builder"),
+    );
+    await app().live("other", [...views.other, remote]);
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message remote-builder directly",
+    );
+    expect(app().all("#twr-inspector")).toHaveLength(0);
+  });
+
+  it("preserves mobile's details-first navigation and Enter to talk", async () => {
+    await mounted.unmount();
+    mounted = await mount({ mobile: true });
+    await app().click(app().find(".sidebar .thread-card", "builder"));
+    expect(app().box().getAttribute("aria-label")).toBe("Message orchestrator");
+    expect(app().find("#twr-inspector").getAttribute("aria-label")).toBe(
+      "Thread details: builder",
+    );
+    const card = app().find(".sidebar .thread-card", "builder");
+    expect(card.getAttribute("aria-describedby")).toBe("twr-thread-open-hint");
+    await app().act(async () => {
+      press(card, "Enter");
+    });
+    await app().settle();
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+    expect(app().all('[aria-label="Show thread details"]')).toHaveLength(0);
+  });
+});
 
 describe("the message box", () => {
   beforeEach(async () => {

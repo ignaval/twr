@@ -538,6 +538,9 @@ const threadItem = (name) =>
 const selectThread = async (name) => {
   await sidebarShown();
   await threadItem(name).locator(".thread-card").click();
+  await page
+    .getByRole("button", { name: "Show thread details", exact: true })
+    .click();
   await page.locator("#twr-inspector").waitFor();
 };
 const closeInspector = async () => {

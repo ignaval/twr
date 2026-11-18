@@ -1,17 +1,26 @@
 # Voice mode
 
 Talk to the orchestrator and hear its replies, in the desktop app and on iOS and Android. The
-device you talk to records you, turns what
-you said into text and sends it to the orchestrator, as if you had typed it. The orchestrator's
-messages come back read aloud ([read-aloud.md](read-aloud.md)) on that same device.
+device you talk to turns speech into text. Ordinary microphone input fills the message box
+for you to edit and send; hands-free conversation sends each utterance automatically to the
+orchestrator and reads its replies aloud ([read-aloud.md](read-aloud.md)) on that same device.
 
-- **Push to talk:** click the microphone beside Send, talk, and click again to send. Or hold it
-  down while you talk and let go to send. `Cmd-Shift-Space` (`Ctrl-Shift-Space` on Linux) does
-  the same from the keyboard.
-- **Hands-free:** the waveform button beside it (`Cmd-Shift-L`) listens until you stop it.
+- **Dictation (push to talk):** click the microphone beside Send, talk, and click again to
+  transcribe. Or hold it down while you talk and let go. Text is appended to the current
+  conversation's draft, preserving anything typed while recognition was running. The editor
+  receives focus with the caret at the end; edit the text and explicitly press **Send** (or
+  Enter on desktop). `Cmd-Shift-Space` (`Ctrl-Shift-Space` on Linux) toggles recording too.
+  **Cancel dictation** drops a recording or pending recognition. Silence and errors leave
+  the draft intact. Switching conversations or workspaces, leaving the composer, losing the
+  connection or losing permission cancels capture and drops late results. There is no idle
+  ready popup: recording, recognition and errors appear inline in the composer and disappear
+  when finished or dismissed. Downloading a missing model also needs no success dialog.
+- **Hands-free conversation:** the waveform button beside it (`Cmd-Shift-L`) listens until you stop it.
   Each thing you say is one message, sent once you pause for two seconds (`[voice] pause_ms`),
   so a pause to think mid-sentence doesn't send half of it. The orchestrator's replies are read
-  aloud as they come, and it stops listening while they are (below).
+  aloud as they come, and it stops listening while they are (below). Each new hands-free
+  session turns live reading on. Turning it off in the read-aloud toolbar during a session
+  leaves listening and automatic sending active; the next session turns reading on again.
 
 The audio stays on your device. The hub gets the text, never a recording.
 
@@ -27,7 +36,7 @@ then is read in full.
 With headphones, where nothing comes back, you can talk over the voice instead:
 `listen_while_speaking = true` in `[voice]` keeps hands-free listening while it reads, as push
 to talk always does. Then start talking and the voice stops at once, without waiting for the
-hub. What you said is recognized, and then:
+hub. In hands-free conversation, what you said is recognized, and then:
 
 - **A message.** It goes to the orchestrator, marked as spoken. The message that was being read
   is skipped, and the queue goes on.
@@ -43,30 +52,64 @@ hub. What you said is recognized, and then:
   | "stop listening", "voice off" | end the hands-free session |
 
   "Stop the api worker" is a message: only the word alone is a control. They work whenever
-  voice mode is listening; while hands-free waits for a reply to end, use the **Quiet** button.
+  hands-free conversation is listening; while hands-free waits for a reply to end, use the **Quiet** button.
 - **Nothing,** or twr's own voice heard back through the speakers: dropped, and the reading
   goes on. A transcript counts as an echo when most of its words, in order, are words of a
   message read aloud a moment ago.
 
-Spoken messages always go to the orchestrator, whichever thread the message box is aimed at.
+Hands-free messages always go to the orchestrator, whichever thread the message box is aimed
+at, without changing its draft. Dictation stays in the current message box and follows its
+destination when explicitly sent. Dictation treats words such as "stop" and "cancel" as
+literal text; the spoken audio controls above apply only in hands-free conversation.
+Dictation does not turn on reply playback; an existing reply paused during dictation resumes
+when recognition finishes.
 
 ## Spoken messages never answer by themselves
 
 A recognizer can mishear: "allow" for "a loud", "two" for "too". So a spoken message is never
-applied as a short command (an answer to a permission or a question, a mode change), whatever
+applied as an orchestrator short command (an answer to a permission or a question, a mode change), whatever
 it says. When one reads as one (`allow it`, `@api yes`, `set all to bypass`), the hub sends
 nothing and hands it back. The app shows it: **Review in message box** puts the text in the
 message box, where you send it as typed, or edit it; **Discard** drops it. Saying "never mind"
-drops it too.
+drops it too in hands-free mode. Dictated text keeps its spoken origin through edits and
+encrypted draft saves/reloads: the first **Send** still uses the hub's spoken-message check.
+If it requires review, **Review in message box** explicitly makes that draft typed; a separate
+**Send** then submits it. Dictated slash/shell commands and **Send as implementation loop**
+also require this explicit review before they can run. A direct worker message is a prompt,
+not an answer to the hub's waiting permission or question.
 
 To answer a request by voice, ask the orchestrator in your own words ("let the api worker run
 the migration"): the orchestrator relays it under the usual rules
 ([orchestrator.md](orchestrator.md)), or use the request's buttons.
 
-A spoken message is sent at once, about what is on screen now. It never waits in the offline
-outbox: with the hub disconnected, voice is off.
+Hands-free messages send at once; dictation waits for **Send**. Neither unreviewed spoken
+path uses the offline outbox or automatic retries. With the hub disconnected, capture is off
+and dictated drafts remain editable, saved with their spoken origin, until reconnected.
 
 ## Setting up recognition
+
+### Reusing browser capture
+
+The shared client module `clients/shared/voice.ts` exports `createWebCapture` independently
+of the composer. Its `VoiceCapture.start` accepts `push`, `hands-free`, and `one-shot`.
+Call `status()` first to load the configured silence interval, then start the chosen mode
+with transcript/error callbacks and any expected-word hints.
+
+`one-shot` starts one utterance and ends automatically after speech followed by the
+configured silence. It releases microphone tracks and audio resources before transcription
+delivers its final result. It does not require another click to send and does not resume
+listening after that utterance. Initial silence waits for speech or explicit cancellation;
+a client needing an initial-silence timeout must supply one. This mode is available through
+the browser capture API; the existing composer controls retain their push/hands-free
+behavior, and native/mobile recognizers reject unsupported one-shot requests explicitly.
+
+`cancel()` drops the current recording and suppresses stale transcription callbacks. It
+cannot abort a transcription promise supplied by the caller; the host recognizer is
+responsible for its own timeout and process cleanup. A replacement capture has independent
+microphone resources and callback state. One-shot capture is voice-activity detection, not
+wake-word detection.
+
+### Desktop recognizer setup
 
 On the desktop, twr recognizes speech with [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
 on your machine:
@@ -81,12 +124,33 @@ twr voice status           # says `voice: whisper (on this machine)`, or what is
 the model an empty `[voice] model` means. It downloads it from whisper.cpp's own models on
 Hugging Face over HTTPS, from one commit of that repository built into twr (not whatever the
 `main` branch holds now), and keeps it only once it is whole and its SHA-256 is the one built
-into twr too: a file that differs is never renamed into place, where whisper.cpp would load
-it. In the desktop app, turning voice on
+into twr too. Existing files are fully verified before being reused; a file at that path that
+fails verification (another build of the model included) is replaced by a verified download,
+so keep a model of your own elsewhere and name it with `[voice] model`. Downloads use private,
+unique temporary files and replace the destination atomically only after verification;
+interrupted or invalid downloads leave an existing model intact. In the desktop app, turning voice on
 before the model is there offers **Download model**, which does the same. `base.en` recognizes a
 short message in well under a second on Apple silicon once loaded (the first one after a start
-takes a few seconds). For other languages use a multilingual model (`ggml-base.bin`) and set
-`language`. The names of your threads are passed to the recognizer as words to expect, so
+takes a few seconds).
+
+For English and Spanish, download the multilingual model explicitly:
+
+```sh
+twr voice setup --model base
+```
+
+This provisions `voice/ggml-base.bin` in twr's data directory. Set `[voice] model` to its
+absolute path and `language = "auto"` to detect the language of each recording, or choose
+`"en"` or `"es"`. With `TWR_HOME=/absolute/home`, the model is at
+`/absolute/home/data/voice/ggml-base.bin`. `--model base.en` explicitly provisions the English
+model. Both choices use pinned size and SHA-256 metadata; setup does not edit configuration.
+Setup without flags keeps its English default and refuses a nonempty configured model path.
+
+`twr voice status --json` includes `setup_model` when a missing canonical model can be
+provisioned with `setup --model <name>`. Its existing `setup` flag still means setup without
+flags can help. Status checks availability and file presence; setup verifies model integrity.
+
+The names of your threads are passed to the recognizer as words to expect, so
 "api" is heard as `api`.
 
 `[voice]` in the config of the machine with the microphone (the hub reads none of it):
@@ -128,7 +192,7 @@ for scripts (`--json` for `{"text": ...}`, `--expect "api docs"` for words to ex
 
 ## Where it plays
 
-The desktop app starts a speaker of its own when you turn voice on: `twr speak --control stdio
+The desktop app starts a speaker of its own when you start hands-free conversation: `twr speak --control stdio
 --announce --name "<computer> desktop"` for this machine's hubs, with live reading turned on for
 the workspace. `--announce` makes it also say when something needs you ("api needs your
 permission"), as `"attention"` in `[speech] read` does
@@ -138,6 +202,11 @@ lists it, and it stops when the app quits. If the TUI's own speaker already spea
 machine, the app's waits, and voice mode pauses and resumes the one that speaks through the hub:
 speakers of one machine share a device id, which `twr speak --control stdio` prints first
 (`{"type": "speaker", "device", "name"}`).
+
+The local desktop conversation toolbar also attaches this speaker for its read-aloud
+button, restoring the saved live setting without enabling the microphone. Hands-free uses
+the same speaker and turns live reading on; the toolbar follows that change. Turning live
+reading off in the toolbar leaves hands-free listening under its usual rules.
 
 `twr speak --control stdio` is how any program can drive a speaker: controls on stdin, one per
 line (`pause`, `resume`, `stop`, `skip`, `quit`; anything else is ignored), and what it plays

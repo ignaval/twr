@@ -23,6 +23,15 @@ and companion from `clients/bin`, `target/debug`, or `target/release`. An explic
 `TWR_DESKTOP_BINARY_DIR` is accepted only in development. Packaged builds always use the
 three bundled executables (CLI, companion and mobile gateway). `TWR_HOME` remains useful for an independent test installation.
 
+`npm run test:conversation-scroll` checks reading position during delayed history loads,
+scroll-relative user-message shortcuts, repeated keyboard jumps, short histories,
+history paging (including responses during jump settlement), live updates, and thread
+switches on desktop and phone layouts in a browser, using a disposable host. It needs
+Playwright's Chromium or `TWR_CHROMIUM_PATH`.
+Synthetic touch and momentum cases select the virtualizer's iOS path and verify deferred
+prepend adjustments and shortcut selection while those adjustments are held. They do not
+reproduce native WebKit or physical iOS scrolling.
+
 The app recovers the login shell environment so that agents, git and developer tools are
 found when launched from Finder or an Omarchy launcher. It preserves agent identity
 markers. A desktop app launched by a twr agent cannot turn itself into a user client.
@@ -45,8 +54,8 @@ all of them with one `twr ws list --json --detail`, which asks each running hub 
 never starts a stopped hub to read it.
 
 Choosing an orchestrator or a thread in another workspace switches to that workspace and
-opens it there, with no separate switch. A click selects a thread (its inspector), a
-double-click talks to it, and `+N more` opens that workspace's grid. Each workspace's
+opens it there, with no separate switch. A single click opens a thread's conversation,
+and `+N more` opens that workspace's grid. Each workspace's
 `+` starts a new thread in it. Its name collapses or expands it, and the app remembers
 that on this device. **New workspace** at the end of the list, and the folder button
 beside the heading, create or remove workspaces. Needs you and the thread grid stay at
@@ -59,10 +68,39 @@ the other layout settings (Settings › Layout & text) and restored on the next 
 
 ## Workflows and CLI coverage
 
-The orchestrator conversation is primary. Selecting a thread opens its inspector; **Talk
-to this thread** (or a double-click) deliberately changes the composer destination. The
+The orchestrator conversation is primary. Selecting a thread opens its conversation; the
+**Show thread details** button beside its heading toggles its inspector. The
 composer always names its destination. Mentions reference threads without changing it.
 Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
+
+Above the history, the orchestrator and each thread's conversation show the first line
+of your preceding message, on desktop and phone. At the bottom, this is your latest
+message. While browsing, it is the last user message whose start lies above the history
+viewport's top edge, with a 1 CSS pixel tolerance. Reaching or passing its start while
+scrolling upward changes the shortcut to the previous user message. Scrolling downward
+updates it in the other direction.
+The clickable link fits its displayed contents; the empty remainder of the row is not
+clickable. Long previews truncate within the conversation width as the window narrows.
+
+Click the shortcut (or focus it and press Enter or Space) to jump and focus that message,
+with a visible keyboard focus outline. Each activation steps backward, even if a short
+history prevents the destination from aligning at the top. Manual scrolling resumes
+selection from the reading position; **Jump to latest** resumes bottom-follow. At the
+earliest boundary, the shortcut says **No earlier messages from you** and does nothing.
+It stays focusable while loading and at that boundary so changing its target does not
+discard keyboard focus. Scrolling and background loads never transfer focus.
+
+Recent history and live updates appear first. Older turns, including all their pages,
+load in the background when the predecessor is not yet known, skipping automatic turns.
+If an older page fails, recent history stays available and **Load earlier turn** retries
+it. Offline lookup uses history already saved on this device and asks you to connect
+when older history is needed. Thread switches reset the shortcut and ignore delayed
+results from the previous conversation.
+
+Loading older turns keeps the message you are reading at the same position, including
+when you scroll while a background or manual history request is pending.
+History arriving during a shortcut jump also preserves the message you clicked as its
+destination.
 
 Approval cards render requests literally, including command punctuation and paths. Every
 answer names the exact displayed request revision. Requests with unavailable full payloads

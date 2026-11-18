@@ -523,6 +523,10 @@ select {
   [data-mobile="true"] .conversation-scroll {
     padding: 8px 12px 12px;
   }
+  [data-mobile="true"] .latest-user-message > button,
+  [data-mobile="true"] .latest-user-empty {
+    padding-inline: 12px;
+  }
   [data-mobile="true"] .dialog {
     width: 100%;
     max-height: calc(100% - 12px);
@@ -730,6 +734,13 @@ select {
   max-height: 25%;
   overflow: auto;
   flex-shrink: 1;
+}
+/* The latest-user shortcut is a convenience: while typing (an open keyboard) or in a short
+   viewport its fixed row would take the composer's room to grow, or push it under the
+   navigation, so the composer keeps that space. */
+:root[data-mobile="true"][data-keyboard="true"] .latest-user-message,
+:root[data-mobile="true"].short-content .latest-user-message {
+  display: none;
 }
 :root[data-mobile="true"].tiny-content .toast {
   top: calc(max(env(safe-area-inset-top), var(--occlusion-top, 0px)) + 8px);

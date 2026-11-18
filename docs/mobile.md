@@ -54,7 +54,19 @@ The message field grows with what you write, wrapped lines included, at every te
 
 ## Voice
 
-The composer's microphone talks to the orchestrator: tap it to talk and tap again to send, hold it and let go, or start a hands-free session that sends one message per utterance and reads the replies aloud. The phone's own recognizer turns speech into text; the text goes through `say` like a typed message (marked as spoken), so a transcript that reads as an answer or a mode change comes back for confirmation instead. No audio leaves the phone except to the platform's recognizer when it is not on the device (below). Saying only "stop", "pause", "skip", "repeat" or "stop listening" controls the voice and is never sent.
+The composer's microphone dictates into the current conversation's message box: tap to talk
+and tap again to transcribe, or hold and let go. It appends to existing text, focuses the
+editor, and waits for you to edit and press **Send**. **Cancel dictation** drops pending
+recognition; switching conversations or workspaces drops late results. The waveform button
+starts a **hands-free conversation** that automatically sends one message per utterance to
+the orchestrator and reads its replies aloud, preserving the current draft. The phone's own
+recognizer turns speech into text; no audio leaves the phone except to the platform's
+recognizer when it is not on the device (below). Dictated drafts keep their spoken origin
+through edits and encrypted saves/reloads. On Send, an orchestrator transcript that reads
+as an answer or mode change requires **Review in message box**, then another explicit Send;
+dictated slash/shell commands also require review. In hands-free, saying only "stop", "pause",
+"skip", "repeat" or "stop listening" controls the voice and is never sent. In dictation those
+words are literal text. See [voice.md](voice.md) for routing and review details.
 
 | | iOS | Android |
 |---|---|---|
@@ -64,6 +76,7 @@ The composer's microphone talks to the orchestrator: tap it to talk and tap agai
 | Echo | `.playAndRecord` in `.voiceChat` mode with voice processing: the system's echo cancellation | the recognizer's own audio path; no app-level echo cancellation |
 | Voice | `AVSpeechSynthesizer` | `TextToSpeech` |
 
+Active voice status and errors appear inline in the composer, without an idle ready popup.
 The voice bar says whether recognition stays on the device; a denied permission shows how to allow it in Settings. Hands-free ends an utterance after about 2 s of silence, so a pause mid-sentence doesn't send half of it. It doesn't listen while the phone reads a reply aloud, nor for 0.8 s after, so the reply heard back is never sent; tap **Quiet** to cut a reply short. If you are already talking when a reply starts, it waits until what you said is sent. Push to talk works while a reply is read: the phone's voice pauses at once. Android has no continuous recognition: hands-free restarts the recognizer after each result, no-match or timeout, with a short pause in which a word can be missed, and some phones play a sound at each restart. Voice is foreground only on both platforms: leaving the app stops listening and the voice, and ends a hands-free session. On iOS, voice mode gives the audio session back once it stops listening and speaking, so music or a podcast it paused resumes. A call, Siri or another app's audio stops listening and the voice, and the voice bar says so; a hands-free session listens again when the interruption ends, if iOS says it may resume. Plugging in or removing headphones restarts the microphone in hands-free, and ends a push-to-talk recording with what it heard.
 
 ### The phone's speaker

@@ -7,6 +7,7 @@
 import {
   useEffect,
   useLayoutEffect,
+  useRef,
   useState,
   useSyncExternalStore,
   type FormEvent,
@@ -64,6 +65,30 @@ export function fitToText(field: HTMLTextAreaElement | null) {
  */
 export class Drafts {
   private values: Record<string, string> = {};
+  private speech: Record<string, boolean> = {};
+  /** Dictation remains spoken until explicitly reviewed, even after edits or reload. */
+  isSpoken(key: string) {
+    return Boolean(this.get(key) && this.speech[key]);
+  }
+  spoken() {
+    return { ...this.speech };
+  }
+  restoreSpoken(saved: Record<string, boolean> = {}) {
+    this.speech = { ...saved, ...this.speech };
+  }
+  dictate(key: string, text: string) {
+    this.speech[key] = true;
+    this.set(key, (old) =>
+      old ? old + (/\s$/.test(old) ? "" : " ") + text : text,
+    );
+  }
+  review(key: string, text: string) {
+    // A review only covers the exact text shown. New speech still needs review.
+    if (this.get(key) === text) {
+      delete this.speech[key];
+      for (const listener of [...this.listeners]) listener();
+    }
+  }
   private listeners = new Set<() => void>();
   /** The draft for one destination, `""` when there is none. */
   get(key: string): string {
@@ -89,6 +114,9 @@ export class Drafts {
   /** Replaces the whole record, from what it was. */
   update(change: (old: Record<string, string>) => Record<string, string>) {
     this.values = change(this.values);
+    this.speech = Object.fromEntries(
+      Object.entries(this.speech).filter(([key]) => this.values[key]),
+    );
     for (const listener of [...this.listeners]) listener();
   }
   subscribe = (listener: () => void) => {
@@ -197,6 +225,13 @@ export function Composer({
   fail: (error: unknown) => void;
 }) {
   const draft = useDraft(drafts, draftKey);
+  const [voiceStatusContainer, setVoiceStatusContainer] =
+    useState<HTMLDivElement | null>(null);
+  const spokenDraft = useSyncExternalStore(drafts.subscribe, () =>
+    drafts.isSpoken(draftKey),
+  );
+  const voiceContext = useRef(draftKey);
+  voiceContext.current = draftKey;
   const [slashHidden, setSlashHidden] = useState(memory.slashHidden);
   const [mentionIndex, setMentionIndex] = useState(memory.mentionIndex);
   const [mentionHidden, setMentionHidden] = useState(memory.mentionHidden);
@@ -492,11 +527,30 @@ export function Composer({
           </span>
           <div className="composer-actions">
             <VoiceControl
+              context={draftKey + ":" + target?.id}
               host={hostApi}
+              statusContainer={voiceStatusContainer}
               rpc={rpc}
               connected={connected}
-              allowed={operate && Boolean(orchestrator)}
+              allowed={operate && Boolean(target)}
+              conversationAllowed={Boolean(orchestrator)}
               submit={submitVoice}
+              draft={(text) => {
+                if (voiceContext.current !== draftKey) return;
+                onEdit();
+                drafts.dictate(draftKey, text);
+                const field = input.current;
+                field?.focus();
+                // React applies the controlled value before placing the caret.
+                requestAnimationFrame(() => {
+                  if (voiceContext.current !== draftKey || !field?.isConnected)
+                    return;
+                  field.setSelectionRange(
+                    field.value.length,
+                    field.value.length,
+                  );
+                });
+              }}
               hint={voiceHint}
               spoken={spokenLately}
               edit={(text) => {
@@ -515,7 +569,8 @@ export function Composer({
                 !operate ||
                 !draft.trim() ||
                 (!connected &&
-                  (!journal ||
+                  (spokenDraft ||
+                    !journal ||
                     draft.startsWith("/") ||
                     draft.startsWith("!"))) ||
                 (!target && !draft.startsWith("/")) ||
@@ -523,9 +578,11 @@ export function Composer({
               }
               aria-label={connected ? "Send message" : "Save message for later"}
               title={
-                connected
-                  ? "Send message"
-                  : "Save on this device until the hub reconnects"
+                !connected && spokenDraft
+                  ? "Reconnect to send dictated text"
+                  : connected
+                    ? "Send message"
+                    : "Save on this device until the hub reconnects"
               }
             >
               {sending ? <Spinner /> : <ArrowUp size={18} />}
@@ -540,6 +597,7 @@ export function Composer({
             )}
           </div>
         </div>
+        <div className="composer-voice-status" ref={setVoiceStatusContainer} />
         {mentions.length > 0 && !mentionHidden && (
           <div
             className="mentions"

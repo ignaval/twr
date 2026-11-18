@@ -2,7 +2,7 @@
 //
 // The device with the microphone owns the audio. It records, recognizes speech (the desktop
 // through `twr voice transcribe`, mobile through the platform's own recognizer) and sends
-// the text through the same `say` path as a typed message, marked `voice: true`. The hub never
+// hands-free text through `say`, marked `voice: true`; push-to-talk fills a draft. The hub never
 // receives audio. Replies come back through the existing read-aloud speaker.
 //
 // This module holds what is shared by every client:
@@ -12,7 +12,7 @@
 // - `localCommand`, `isLikelyEcho`: deterministic readings of a transcript;
 // - `VoiceSession`: the state machine the composer drives.
 
-export type VoiceMode = "push" | "hands-free";
+export type VoiceMode = "push" | "hands-free" | "one-shot";
 export type VoicePhase =
   | "off"
   | "ready"
@@ -50,7 +50,11 @@ export interface VoiceCaptureStatus {
 
 export interface VoiceCapture {
   status(): Promise<VoiceCaptureStatus>;
-  /** Starts listening. Push mode records until `stop`; hands-free emits one `final` per utterance. */
+  /**
+   * Push records until `stop`; hands-free emits per utterance. Browser one-shot releases
+   * audio after the first VAD-ended utterance, then delivers at most one final. Native
+   * implementations reject one-shot. Call `status` first to load the configured pause.
+   */
   start(
     mode: VoiceMode,
     events: VoiceCaptureEvents,
@@ -116,6 +120,10 @@ export function createNativeCapture(native: NativeVoice): VoiceCapture {
   return {
     status: () => native.status(),
     async start(mode, events, hint) {
+      if (mode === "one-shot")
+        throw new Error(
+          "One-shot voice capture is not supported by the native recognizer",
+        );
       unsubscribe?.();
       unsubscribe = native.onEvent((e) => {
         if (e.type === "speechStart") events.speechStart();
@@ -429,41 +437,69 @@ export function createWebCapture(
   transcribe: (wav: Uint8Array, hint: string[]) => Promise<string>,
   status: () => Promise<VoiceCaptureStatus>,
 ): VoiceCapture {
-  let stream: MediaStream | undefined;
-  let context: AudioContext | undefined;
-  let node: ScriptProcessorNode | undefined;
-  let mode: VoiceMode = "push";
-  let events: VoiceCaptureEvents | undefined;
-  let vad = new VoiceActivity();
-  let recorded: Float32Array[] = [];
-  let recordedLength = 0;
-  let hints: string[] = [];
-  let lastLevel = 0;
+  interface Run {
+    mode: VoiceMode;
+    events: VoiceCaptureEvents;
+    hints: string[];
+    vad: VoiceActivity;
+    recorded: Float32Array[];
+    recordedLength: number;
+    listening: boolean;
+    lastLevel: number;
+    stream?: MediaStream;
+    context?: AudioContext;
+    source?: MediaStreamAudioSourceNode;
+    node?: ScriptProcessorNode;
+    released?: Promise<void>;
+    chain: Promise<void>;
+    finished?: Promise<void>;
+  }
+  let current: Run | undefined;
   let pauseMs = PAUSE_MS;
   let deaf = false;
-  // Recognitions run one at a time, in order.
-  let chain = Promise.resolve();
-  const recognize = (samples: Float32Array) => {
-    const target = events;
-    chain = chain.then(async () => {
-      if (!target || samples.length < 16000 * 0.25) {
-        target?.final("");
-        return;
-      }
+  let guard = false;
+  // Detach resources synchronously before awaiting close: an old close must never touch
+  // the next run's microphone. Repeated stop/cancel calls share the same cleanup.
+  const release = (run: Run): Promise<void> => {
+    if (run.released) return run.released;
+    run.listening = false;
+    if (run.node) run.node.onaudioprocess = null;
+    run.node?.disconnect();
+    run.source?.disconnect();
+    run.stream?.getTracks().forEach((track) => track.stop());
+    run.recorded = [];
+    run.recordedLength = 0;
+    run.vad.reset();
+    run.released = run.context?.close().catch(() => {}) || Promise.resolve();
+    return run.released;
+  };
+  const recognize = (run: Run, samples: Float32Array) => {
+    // Each run has its own queue so a cancelled inference cannot block its replacement.
+    run.chain = run.chain.then(async () => {
+      if (current !== run) return;
       try {
-        target.final(await transcribe(encodeWav(samples), hints));
+        const text =
+          samples.length < 16000 * 0.25
+            ? ""
+            : await transcribe(encodeWav(samples), run.hints);
+        if (current === run) run.events.final(text);
       } catch (error) {
-        target.error(error instanceof Error ? error.message : String(error));
+        if (current === run)
+          run.events.error(
+            error instanceof Error ? error.message : String(error),
+          );
       }
     });
+    return run.chain;
   };
-  const release = async () => {
-    node?.disconnect();
-    node = undefined;
-    stream?.getTracks().forEach((t) => t.stop());
-    stream = undefined;
-    await context?.close().catch(() => {});
-    context = undefined;
+  const finish = (run: Run, samples?: Float32Array) => {
+    if (run.finished) return run.finished;
+    // Release before inference and before final, including the automatically ended path.
+    run.finished = release(run).then(async () => {
+      if (samples) recognize(run, samples);
+      await run.chain;
+    });
+    return run.finished;
   };
   return {
     async status() {
@@ -471,85 +507,115 @@ export function createWebCapture(
       if (s.pauseMs) pauseMs = clampPause(s.pauseMs);
       return s;
     },
-    async start(nextMode, nextEvents, hint) {
-      await release();
-      mode = nextMode;
-      events = nextEvents;
-      hints = hint;
-      // `deaf` is the session's to say, before or after the microphone opens.
-      vad = new VoiceActivity({ ...VAD_DEFAULTS, endSilenceMs: pauseMs });
-      recorded = [];
-      recordedLength = 0;
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      context = new AudioContext();
-      const source = context.createMediaStreamSource(stream);
-      node = context.createScriptProcessor(4096, 1, 1);
-      const rate = context.sampleRate;
-      node.onaudioprocess = (event) => {
-        const samples = downsample(event.inputBuffer.getChannelData(0), rate);
-        let peak = 0;
-        for (const s of samples) peak = Math.max(peak, Math.abs(s));
-        const now = performance.now();
-        const handsFreeDeaf = deaf && mode === "hands-free";
-        if (now - lastLevel > 100) {
-          lastLevel = now;
-          events?.level?.(handsFreeDeaf ? 0 : Math.min(1, peak * 2));
-        }
-        if (mode === "push") {
-          if (recordedLength / 16000 < PUSH_MAX_SECONDS) {
-            recorded.push(samples);
-            recordedLength += samples.length;
-          }
+    async start(mode, events, hint) {
+      const previous = current;
+      const vad = new VoiceActivity({ ...VAD_DEFAULTS, endSilenceMs: pauseMs });
+      vad.guard = guard;
+      const run: Run = {
+        mode,
+        events,
+        hints: [...hint],
+        vad,
+        recorded: [],
+        recordedLength: 0,
+        listening: true,
+        lastLevel: 0,
+        chain: Promise.resolve(),
+      };
+      current = run;
+      if (previous) await release(previous);
+      if (current !== run || !run.listening) return;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        // Permission can resolve after cancellation, stop, or a replacement start.
+        if (current !== run || !run.listening) {
+          stream.getTracks().forEach((track) => track.stop());
           return;
         }
-        // The device's own voice plays: nothing reaches the detector (its floor included).
-        if (handsFreeDeaf) return;
-        for (const happened of vad.push(samples)) {
-          if (happened.start) events?.speechStart();
-          if (happened.utterance) recognize(happened.utterance);
-        }
-      };
-      source.connect(node);
-      // A processor only runs connected to an output; it writes silence there.
-      node.connect(context.destination);
-      if (mode === "push") events.speechStart();
+        run.stream = stream;
+        const context = (run.context = new AudioContext());
+        const source = (run.source = context.createMediaStreamSource(stream));
+        const node = (run.node = context.createScriptProcessor(4096, 1, 1));
+        const rate = context.sampleRate;
+        node.onaudioprocess = (event) => {
+          if (current !== run || !run.listening) return;
+          const samples = downsample(event.inputBuffer.getChannelData(0), rate);
+          let peak = 0;
+          for (const s of samples) peak = Math.max(peak, Math.abs(s));
+          const now = performance.now();
+          const vadDeaf = deaf && mode !== "push";
+          if (now - run.lastLevel > 100) {
+            run.lastLevel = now;
+            events.level?.(vadDeaf ? 0 : Math.min(1, peak * 2));
+          }
+          if (current !== run || !run.listening) return;
+          if (mode === "push") {
+            if (run.recordedLength / 16000 < PUSH_MAX_SECONDS) {
+              run.recorded.push(samples);
+              run.recordedLength += samples.length;
+            }
+            return;
+          }
+          // The device's own voice never reaches the detector, including its floor.
+          if (vadDeaf) return;
+          for (const happened of vad.push(samples)) {
+            if (current !== run || !run.listening) break;
+            if (happened.start) events.speechStart();
+            if (current !== run || !run.listening) break;
+            if (happened.utterance) {
+              if (mode === "one-shot") {
+                void finish(run, happened.utterance);
+                break;
+              }
+              recognize(run, happened.utterance);
+            }
+          }
+        };
+        source.connect(node);
+        // A processor only runs connected to an output; it writes silence there.
+        node.connect(context.destination);
+        if (mode === "push") events.speechStart();
+      } catch (error) {
+        const live = current === run && run.listening;
+        await release(run);
+        if (live && current === run) throw error;
+      }
     },
     async stop() {
-      if (mode === "push") {
-        const all = new Float32Array(recordedLength);
-        let at = 0;
-        for (const r of recorded) {
-          all.set(r, at);
-          at += r.length;
-        }
-        recorded = [];
-        recordedLength = 0;
-        await release();
-        recognize(all);
-      } else {
-        const rest = vad.flush();
-        await release();
-        if (rest) recognize(rest);
+      const run = current;
+      if (!run) return;
+      if (!run.finished) {
+        let samples: Float32Array | undefined;
+        if (run.mode === "push") {
+          samples = new Float32Array(run.recordedLength);
+          let at = 0;
+          for (const chunk of run.recorded) {
+            samples.set(chunk, at);
+            at += chunk.length;
+          }
+        } else samples = run.vad.flush();
+        finish(run, samples);
       }
-      await chain;
+      await run.finished;
     },
     async cancel() {
-      events = undefined;
-      recorded = [];
-      await release();
+      const run = current;
+      current = undefined;
+      if (run) await release(run);
     },
     setEchoGuard(playing) {
-      vad.guard = playing;
+      guard = playing;
+      if (current) current.vad.guard = playing;
     },
     setDeaf(on) {
-      if (on && !deaf) vad.reset();
+      if (on && !deaf) current?.vad.reset();
       deaf = on;
     },
   };
@@ -575,6 +641,8 @@ export interface VoiceSessionDeps {
   speaker?: VoiceSpeaker;
   /** Sends a transcript to the orchestrator (`say` with `voice: true`). */
   submit(text: string): Promise<VoiceSubmitResult>;
+  /** Adds push-to-talk text to the composer, retaining its speech provenance. */
+  draft(text: string): void;
   /** Reads the last orchestrator message aloud again. */
   repeat?(): Promise<void>;
   /** Readies the microphone (recognizer set up, access granted); false: not now. */
@@ -593,7 +661,7 @@ export interface VoiceSessionState {
   /** The last thing heard, and what became of it. */
   heard?: {
     text: string;
-    outcome: "sent" | "confirm" | "control" | "echo" | "empty";
+    outcome: "draft" | "sent" | "confirm" | "control" | "echo" | "empty";
   };
   /** A transcript the hub handed back to confirm (it reads as an answer or a mode change). */
   confirm?: { text: string; reason: string };
@@ -617,7 +685,7 @@ export interface VoiceSessionOptions {
 }
 
 /**
- * Voice mode's state machine. Push-to-talk: `press` starts recording, `release` sends it.
+ * Voice mode's state machine. Push-to-talk: `press` starts recording, `release` transcribes it into the composer.
  * Hands-free: `begin` listens until `end`, one message per utterance. While the device's own
  * voice reads a reply, and for `echoTailMs` after, hands-free does not listen (its echo would be
  * sent as a message); a user already talking when a reply starts holds the reply until what
@@ -653,9 +721,11 @@ export class VoiceSession {
   private heardWhilePlaying = false;
   /** The microphone is being opened; a release meanwhile is kept for when it is. */
   private starting = false;
+  private ending = 0;
   private releaseWanted = false;
-  private speakerStarted = false;
   private busy = Promise.resolve();
+  /** Invalidates callbacks and queued recognition when the context ends. */
+  private generation = 0;
   constructor(private deps: VoiceSessionDeps) {}
   get state() {
     return this.s;
@@ -668,6 +738,7 @@ export class VoiceSession {
   get idle() {
     return (
       !this.starting &&
+      this.ending === 0 &&
       this.pending === 0 &&
       ["off", "ready", "error"].includes(this.s.phase)
     );
@@ -738,23 +809,36 @@ export class VoiceSession {
     return this.gated && Date.now() < this.deafUntil;
   }
   private events(): VoiceCaptureEvents {
+    const generation = this.generation;
+    const current = () => generation === this.generation;
     return {
-      speechStart: () => this.speechStarted(),
-      partial: (text) => {
-        if (this.dropping === 0 && !this.deaf) this.set({ partial: text });
+      speechStart: () => {
+        if (current()) this.speechStarted();
       },
-      level: (level) => this.set({ level: this.deaf ? 0 : level }),
+      partial: (text) => {
+        if (current() && this.dropping === 0 && !this.deaf)
+          this.set({ partial: text });
+      },
+      level: (level) => {
+        if (current()) this.set({ level: this.deaf ? 0 : level });
+      },
       final: (text) => {
+        if (!current()) return;
         // An utterance begun while deaf: the device's own voice, or the end of it.
         if (this.dropping > 0) {
           this.dropping--;
           return;
         }
-        this.busy = this.busy.then(() => this.heard(text));
+        this.busy = this.busy.then(() => {
+          if (current()) return this.heard(text, generation);
+        });
       },
       error: (message) => {
+        if (!current()) return;
         if (this.dropping > 0) this.dropping--;
-        this.busy = this.busy.then(() => this.failed(message));
+        this.busy = this.busy.then(() => {
+          if (current()) return this.failed(message);
+        });
       },
     };
   }
@@ -783,19 +867,26 @@ export class VoiceSession {
   }
   /** One utterance is handled: once none is left, the speaker this session paused goes on. */
   private async done(patch: Partial<VoiceSessionState>) {
+    const generation = this.generation;
     this.pending = Math.max(0, this.pending - 1);
     if (this.pending === 0) {
       await this.letGo(this.sentWhileHeld);
       this.sentWhileHeld = false;
       this.heardWhilePlaying = false;
     }
+    if (generation !== this.generation) return;
     this.set({ partial: "", ...patch, phase: patch.phase || this.after() });
     if (this.s.phase === "off") this.listenAgain();
   }
   private async failed(message: string) {
+    if (this.s.mode === "push") {
+      const generation = ++this.generation;
+      await this.deps.capture.cancel().catch(() => {});
+      if (generation !== this.generation) return;
+    }
     await this.done({ phase: "error", error: message });
   }
-  private async heard(raw: string) {
+  private async heard(raw: string, generation: number) {
     const text = raw.trim();
     if (!text) {
       await this.done({ heard: undefined });
@@ -805,9 +896,16 @@ export class VoiceSession {
       await this.done({ heard: { text, outcome: "echo" } });
       return;
     }
+    // Dictation is literal text, including words such as "stop" and "cancel".
+    if (this.s.mode === "push") {
+      this.deps.draft(text);
+      await this.done({ heard: { text, outcome: "draft" }, error: undefined });
+      return;
+    }
     const control = localCommand(text);
     if (control) {
       await this.applyControl(control);
+      if (generation !== this.generation) return;
       await this.done({
         heard: { text, outcome: "control" },
         ...(control === "end" ? { phase: "off" as VoicePhase } : {}),
@@ -817,6 +915,7 @@ export class VoiceSession {
     if (this.pending <= 1) this.set({ phase: "sending", partial: "" });
     try {
       const result = await this.deps.submit(text);
+      if (generation !== this.generation) return;
       if (result.action === "confirm") {
         // Nothing was sent: what was being read goes on.
         await this.done({
@@ -833,6 +932,7 @@ export class VoiceSession {
         error: undefined,
       });
     } catch (error) {
+      if (generation !== this.generation) return;
       await this.failed(error instanceof Error ? error.message : String(error));
     }
   }
@@ -884,15 +984,15 @@ export class VoiceSession {
     if (skip) await this.deps.speaker.control("skip").catch(() => {});
     await this.deps.speaker.control("resume").catch(() => {});
   }
-  /** This device's speaker reads the replies: started once, the first time voice is used. */
+  /** Each new hands-free session enables live reading; toolbar-off during it stays off. */
   private async startSpeaker() {
-    if (this.speakerStarted || !this.deps.speaker) return;
-    this.speakerStarted = true;
+    if (!this.deps.speaker) return;
+    const generation = this.generation;
     try {
       await this.deps.speaker.live(true);
     } catch (error) {
+      if (generation !== this.generation) return;
       // An older gateway or a missing engine: voice still sends, nothing is read aloud here.
-      this.speakerStarted = false;
       this.set({
         error:
           "Replies are not read aloud on this device: " +
@@ -905,20 +1005,41 @@ export class VoiceSession {
     if (!this.idle) return;
     this.starting = true;
     this.releaseWanted = false;
+    const generation = ++this.generation;
     const previous = this.s.phase;
     this.set({ mode: "push", phase: "hearing", error: undefined, partial: "" });
     try {
       if (this.deps.prepare && !(await this.deps.prepare())) {
+        if (generation !== this.generation) {
+          this.starting = false;
+          this.set({});
+          return;
+        }
         this.starting = false;
         this.set({ phase: previous === "error" ? "off" : previous });
         return;
       }
-      void this.startSpeaker();
+      if (generation !== this.generation) {
+        this.starting = false;
+        this.set({});
+        return;
+      }
       await this.deps.capture.start("push", this.events(), this.deps.hint());
+      if (generation !== this.generation) {
+        await this.deps.capture.cancel();
+        this.starting = false;
+        this.set({});
+        return;
+      }
     } catch (error) {
       this.starting = false;
+      if (generation !== this.generation) {
+        this.set({});
+        return;
+      }
       this.pending = 0;
       await this.letGo(false);
+      if (generation !== this.generation) return;
       this.set({
         phase: "error",
         error: error instanceof Error ? error.message : String(error),
@@ -928,21 +1049,28 @@ export class VoiceSession {
     this.starting = false;
     if (this.releaseWanted) await this.release();
   }
-  /** Push-to-talk released: what was said is recognized and sent. */
+  /** Push-to-talk released: what was said is recognized and drafted. */
   async release() {
     if (this.starting) {
       this.releaseWanted = true;
       return;
     }
     if (this.s.mode !== "push" || this.s.phase !== "hearing") return;
+    const generation = this.generation;
     this.set({ phase: "transcribing" });
-    await this.deps.capture.stop();
-    await this.busy;
+    try {
+      await this.deps.capture.stop();
+      await this.busy;
+    } catch (error) {
+      if (generation !== this.generation) return;
+      await this.failed(error instanceof Error ? error.message : String(error));
+    }
   }
   /** A hands-free session: listens until `end`. */
   async begin() {
     if (!this.idle) return;
     this.starting = true;
+    const generation = ++this.generation;
     this.set({
       mode: "hands-free",
       phase: "listening",
@@ -953,36 +1081,59 @@ export class VoiceSession {
     this.listenAgain();
     try {
       if (this.deps.prepare && !(await this.deps.prepare())) {
+        if (generation !== this.generation) return;
         this.set({ phase: "off" });
         return;
       }
+      if (generation !== this.generation) return;
       await this.startSpeaker();
+      if (generation !== this.generation) return;
       await this.deps.capture.start(
         "hands-free",
         this.events(),
         this.deps.hint(),
       );
+      if (generation !== this.generation) {
+        await this.deps.capture.cancel();
+        return;
+      }
       // A reply may be read aloud already.
       this.updateDeaf();
     } catch (error) {
+      if (generation !== this.generation) return;
       this.set({
         phase: "error",
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
       this.starting = false;
+      this.set({});
     }
   }
   /** Ends a session (hands-free) or drops a recording (push). */
   async end() {
+    this.ending++;
+    ++this.generation;
+    this.set({
+      phase: "off",
+      level: 0,
+      partial: "",
+      confirm: undefined,
+      heard: undefined,
+      error: undefined,
+    });
     this.releaseWanted = false;
-    await this.deps.capture.cancel();
-    this.pending = 0;
-    this.dropping = 0;
-    this.sentWhileHeld = false;
-    await this.letGo(false);
-    this.set({ phase: "off", level: 0, partial: "" });
-    this.listenAgain();
+    try {
+      await this.deps.capture.cancel();
+    } finally {
+      this.pending = 0;
+      this.dropping = 0;
+      this.sentWhileHeld = false;
+      await this.letGo(false);
+      this.ending--;
+      this.set({ phase: "off", level: 0, partial: "" });
+      this.listenAgain();
+    }
   }
   /** Drops the transcript waiting for confirmation. */
   dismissConfirm() {

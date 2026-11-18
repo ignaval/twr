@@ -6,6 +6,7 @@ import {
 } from "./offline";
 import { TerminalSnapshots } from "./terminalSnapshots";
 import { Outbox } from "./Outbox";
+import { ReadAloudControl } from "./ReadAloudControl";
 import { UploadController } from "./uploads";
 import { AttachmentManager } from "./AttachmentManager";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
@@ -45,6 +46,8 @@ import {
   Plus,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   LayoutGrid,
   MessageSquare,
   Bell,
@@ -325,6 +328,7 @@ export default function App({
   const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
   const [destination, setDestination] = useState<string>();
+  const detailsToggle = useRef<HTMLButtonElement>(null);
   const observedDestination = useRef<string | undefined>(undefined);
   // The message drafts, by destination: outside React state, so that typing re-renders
   // the composer alone (Composer.tsx).
@@ -352,6 +356,7 @@ export default function App({
       void saved
         .load()
         .then(() => {
+          drafts.restoreSpoken(saved.snapshot.spokenDrafts);
           drafts.update((current) => ({
             ...saved.snapshot.drafts,
             ...current,
@@ -405,7 +410,7 @@ export default function App({
           return;
         }
         void journal
-          .drafts(drafts.all(), epoch)
+          .drafts(drafts.all(), epoch, drafts.spoken())
           .then(() => setOfflineNotice(""))
           .catch((error) => setOfflineNotice(errorMessage(error)));
       };
@@ -472,6 +477,9 @@ export default function App({
   const [transcriptError, setTranscriptError] = useState("");
   const [earliestTurn, setEarliestTurn] = useState<number>();
   const [earlierBusy, setEarlierBusy] = useState(false);
+  const [earlierError, setEarlierError] = useState("");
+  const recentTurn = useRef<number | undefined>(undefined);
+  const earlierRequest = useRef<number | undefined>(undefined);
   const connectGeneration = useRef(0);
   const transcriptGeneration = useRef(0);
   const activeThread = useRef<string | undefined>(undefined);
@@ -989,6 +997,7 @@ export default function App({
               await saved.drafts(restored);
               localStorage.removeItem(oldKey);
             }
+            drafts.restoreSpoken(saved.snapshot.spokenDrafts);
             drafts.update((current) => ({ ...restored, ...current }));
             setJournal(saved);
             setOfflineNotice(saved.historyError);
@@ -1124,7 +1133,12 @@ export default function App({
             : [],
     );
     setTranscriptError("");
-    if (!kept) setEarliestTurn(undefined);
+    setEarlierError("");
+    setEarlierBusy(false);
+    if (!kept) {
+      setEarliestTurn(undefined);
+      recentTurn.current = undefined;
+    }
     activeSubscription.current = "";
     if (eventTimer.current) clearTimeout(eventTimer.current);
     eventTimer.current = undefined;
@@ -1145,6 +1159,7 @@ export default function App({
           since_seq: last,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         const fresh: HubEvent[] = [...page.events];
         for (let pages = 1; page.more && pages < 8; pages++) {
           page = await rpc("thread.transcript", {
@@ -1183,8 +1198,9 @@ export default function App({
           limit: 500,
         });
       }
+      if (generation !== transcriptGeneration.current) return;
       const all: HubEvent[] = [...page.events];
-      let firstTurn = page.turn as number | undefined;
+      const firstTurn = page.turn as number | undefined;
       while (page.more) {
         page = await rpc("thread.transcript", {
           thread: id,
@@ -1196,36 +1212,10 @@ export default function App({
         all.push(...page.events);
       }
       const cursor = page.next || 0;
-      // Give short conversations useful context immediately. Older turns remain
-      // paged, and the virtual list asks for more when the user reaches the top.
-      for (
-        let n = 0;
-        n < 3 &&
-        firstTurn &&
-        firstTurn > 1 &&
-        blocksOf(all).reduce((sum, b) => sum + b.text.length, 0) < 3000;
-        n++
-      ) {
-        let older = await rpc("thread.transcript", {
-          thread: id,
-          turn: firstTurn - 1,
-          limit: 500,
-        });
-        const batch: HubEvent[] = [...older.events];
-        while (older.more) {
-          older = await rpc("thread.transcript", {
-            thread: id,
-            turn: firstTurn - 1,
-            since_seq: older.next,
-            limit: 500,
-          });
-          batch.push(...older.events);
-        }
-        all.unshift(...batch);
-        firstTurn--;
-        if (generation !== transcriptGeneration.current) return;
-      }
       if (generation !== transcriptGeneration.current) return;
+      // Show and subscribe to the recent turn before looking for older context
+      // or the latest user message. Older-page failures must not block live use.
+      recentTurn.current = firstTurn;
       setEarliestTurn(firstTurn);
       setEvents(all);
       liveTranscript.current = id;
@@ -1245,6 +1235,10 @@ export default function App({
         if (generation === transcriptGeneration.current)
           setTranscriptLoading(false);
       });
+    return () => {
+      // Fence both initial loading and older-page requests on switches/unmount.
+      transcriptGeneration.current++;
+    };
   }, [target?.id, connected, transcriptRefresh, rpc]);
   useEffect(() => {
     if (!target || !connected) {
@@ -1567,10 +1561,27 @@ export default function App({
       });
     else await run();
   };
+  const reviewDictation = (key: string, text: string) => {
+    setConfirmation({
+      title: "Confirm spoken message",
+      detail: `Heard “${text}”. Spoken text never answers a request, changes a mode, or runs a composer command by itself. Review it in the message box before sending it as typed.`,
+      action: "Review in message box",
+      run: () => {
+        drafts.review(key, text);
+        input.current?.focus();
+      },
+    });
+  };
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
     const draft = drafts.get(draftKey);
     if (!permitted("operate") || !draft.trim() || sending) return;
+    const spoken = drafts.isSpoken(draftKey);
+    if (spoken && !connected) return;
+    if (spoken && (draft.startsWith("/") || draft.startsWith("!"))) {
+      reviewDictation(draftKey, draft);
+      return;
+    }
     if (
       !connected &&
       (!journal || draft.startsWith("/") || draft.startsWith("!"))
@@ -1630,9 +1641,13 @@ export default function App({
               message: text,
               seen_gseq: view.head,
               to: "orchestrator",
-              suggested:
-                acceptedSuggestion.current?.key === key &&
-                acceptedSuggestion.current.text === text,
+              ...(spoken
+                ? { voice: true }
+                : {
+                    suggested:
+                      acceptedSuggestion.current?.key === key &&
+                      acceptedSuggestion.current.text === text,
+                  }),
             };
         // Live replies to a waiting request use only the current visible head.
         // They never enter the delayed message outbox or receive automatic retries.
@@ -1644,7 +1659,7 @@ export default function App({
             (item) =>
               item.reason === "permission" || item.reason === "question",
           );
-        if (journal && hostApi.sendMessage && !liveReply) {
+        if (journal && hostApi.sendMessage && !liveReply && !spoken) {
           const pending = { key, text: draft, saved: false };
           pendingEnqueue.current = pending;
           const epoch = journal.epoch;
@@ -1655,7 +1670,9 @@ export default function App({
             .catch((error) => {
               if (pendingEnqueue.current === pending)
                 pendingEnqueue.current = undefined;
-              void journal.drafts(drafts.all(), epoch).catch(() => {});
+              void journal
+                .drafts(drafts.all(), epoch, drafts.spoken())
+                .catch(() => {});
               throw error;
             });
           pending.saved = true;
@@ -1665,6 +1682,10 @@ export default function App({
         } else response = await rpc(method, params);
       }
 
+      if (spoken && response.action === "confirm") {
+        reviewDictation(key, draft);
+        return;
+      }
       for (const restored of response.restored_drafts || [])
         drafts.set(restored.key, (old) => appendDraft(old, restored.text));
       if (response.action === "pending") {
@@ -1702,6 +1723,10 @@ export default function App({
     if (!thread || thread.is_orchestrator || sending) return;
     const key = draftKey;
     const draft = drafts.get(key);
+    if (drafts.isSpoken(key)) {
+      reviewDictation(key, draft);
+      return;
+    }
     let plan: ReturnType<typeof sendAsLoop>;
     try {
       plan = sendAsLoop(draft);
@@ -1766,6 +1791,10 @@ export default function App({
     ...announcements(view.threads),
   ];
   async function submitSlash(text: string) {
+    if (drafts.isSpoken(draftKey)) {
+      reviewDictation(draftKey, drafts.get(draftKey));
+      return;
+    }
     if (slashPending.current) return;
     slashPending.current = true;
     setSending(true);
@@ -1787,8 +1816,10 @@ export default function App({
       const args = parsed.args;
       const chosen = destination || selected;
       const named = (name: string | undefined) =>
-        view.threads.find((thread) =>
-          [thread.id, thread.name, ...(thread.aliases || [])].includes(name),
+        view.threads.find(
+          (thread) =>
+            name !== undefined &&
+            [thread.id, thread.name, ...(thread.aliases || [])].includes(name),
         );
       const thread = (name?: string) => name || chosen;
       const toggle = (
@@ -2220,14 +2251,20 @@ export default function App({
     return byThread;
   }, [view.attention]);
   const attentionFor = (id: string) => attentionByThread.get(id) || noAttention;
-  const selectThread = useCallback((id: string) => setSelected(id), []);
   const openThread = useCallback((id: string) => {
     setDestination(id);
     setSection("chat");
     setSelected(undefined);
+    if (window.innerWidth <= 800) setSidebar(false);
   }, []);
-  // While a workspace connects, its entry keeps the rows it had (a double-click's second
-  // click lands on the row the first one chose).
+  const selectThread = useCallback(
+    (id: string) => {
+      if (document.documentElement.dataset.mobile === "true") setSelected(id);
+      else openThread(id);
+    },
+    [openThread],
+  );
+  // Keep the workspace's rows available while its connection is being established.
   const entries = workspaceEntries(
     workspaces,
     workspace,
@@ -2250,7 +2287,7 @@ export default function App({
   /**
    * Opens a workspace's orchestrator (no `thread`) or one of its threads from the sidebar,
    * switching to the workspace first when it is another one. `talk` makes the thread the
-   * message destination (a double-click); otherwise it is selected, opening its inspector.
+   * message destination; otherwise it is selected, opening its inspector.
    * Clicks while the switch connects update the pending request instead of switching again.
    * `then` runs once it is open (a new thread's form, the grid).
    */
@@ -2272,6 +2309,7 @@ export default function App({
       } else if (toThread) {
         setDestination(id);
         setSelected(undefined);
+        if (window.innerWidth <= 800) setSidebar(false);
       } else setSelected(id);
       after?.();
     };
@@ -2489,16 +2527,26 @@ export default function App({
   );
   const earlierTarget = target?.id;
   const earlier = useCallback(async () => {
-    if (!earliestTurn || earliestTurn <= 1 || !earlierTarget || earlierBusy)
+    if (
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      !earlierTarget ||
+      !connected ||
+      earlierBusy
+    )
       return;
     const generation = transcriptGeneration.current;
+    if (earlierRequest.current === generation) return;
+    earlierRequest.current = generation;
     setEarlierBusy(true);
+    setEarlierError("");
     try {
       let page = await rpc("thread.transcript", {
         thread: earlierTarget,
         turn: earliestTurn - 1,
         limit: 500,
       });
+      if (generation !== transcriptGeneration.current) return;
       const more: HubEvent[] = [...page.events];
       while (page.more) {
         page = await rpc("thread.transcript", {
@@ -2507,17 +2555,56 @@ export default function App({
           since_seq: page.next,
           limit: 500,
         });
+        if (generation !== transcriptGeneration.current) return;
         more.push(...page.events);
       }
       if (generation !== transcriptGeneration.current) return;
       setEvents((old) => mergeEvents(old, more));
       setEarliestTurn(earliestTurn - 1);
     } catch (e) {
-      fail(e);
+      if (generation === transcriptGeneration.current)
+        setEarlierError(errorMessage(e));
     } finally {
-      setEarlierBusy(false);
+      if (generation === transcriptGeneration.current) {
+        earlierRequest.current = undefined;
+        setEarlierBusy(false);
+      }
     }
-  }, [earliestTurn, earlierTarget, earlierBusy, rpc, fail]);
+  }, [earliestTurn, earlierTarget, connected, earlierBusy, rpc]);
+  useEffect(() => {
+    if (
+      !connected ||
+      transcriptLoading ||
+      transcriptError ||
+      earlierBusy ||
+      earlierError ||
+      !earliestTurn ||
+      earliestTurn <= 1 ||
+      liveTranscript.current !== earlierTarget ||
+      activeSubscription.current !== String(transcriptGeneration.current)
+    )
+      return;
+    const blocks = blocksOf(events);
+    // Continue independently until the latest user message is known. Preserve
+    // the bounded short-conversation context lookup, after subscribing as well.
+    if (
+      !blocks.some((block) => block.kind === "user") ||
+      (recentTurn.current != null &&
+        recentTurn.current - earliestTurn < 3 &&
+        blocks.reduce((sum, block) => sum + block.text.length, 0) < 3000)
+    )
+      void earlier();
+  }, [
+    connected,
+    transcriptLoading,
+    transcriptError,
+    earlierBusy,
+    earlierError,
+    earliestTurn,
+    earlierTarget,
+    events,
+    earlier,
+  ]);
   const setupOrchestrator = useCallback(() => actionRef.current("orch"), []);
   useEffect(() => {
     setPaletteIndex(0);
@@ -2804,9 +2891,14 @@ export default function App({
                             <button
                               className="workspace-thread"
                               style={threadStyle(thread.accent)}
-                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. Double-click to talk to it.`}
+                              title={`${thread.name} in ${entry.name}: ${thread.status_label || thread.status}. ${document.documentElement.dataset.mobile === "true" ? "Double-click" : "Click"} to talk to it.`}
                               onClick={(event) =>
-                                openIn(entry.name, thread.id, event.detail > 1)
+                                openIn(
+                                  entry.name,
+                                  thread.id,
+                                  document.documentElement.dataset.mobile !==
+                                    "true" || event.detail > 1,
+                                )
                               }
                             >
                               {thread.accent && (
@@ -2934,7 +3026,7 @@ export default function App({
           </div>
         )}
         <header className="topbar drag-region">
-          <div className="topbar-left no-drag">
+          <div className="topbar-left">
             {!sidebar && (
               <button
                 className="icon-button"
@@ -2989,9 +3081,9 @@ export default function App({
             )}
           </div>
           {headerAccessory && (
-            <div className="topbar-accessory no-drag">{headerAccessory}</div>
+            <div className="topbar-accessory">{headerAccessory}</div>
           )}
-          <div className="topbar-actions no-drag">
+          <div className="topbar-actions">
             <button
               className="icon-button"
               aria-label="Search conversations"
@@ -3044,6 +3136,7 @@ export default function App({
               }}
             >
               <summary
+                className="no-drag"
                 aria-label={
                   section === "chat" ? "Thread actions" : "More actions"
                 }
@@ -3069,6 +3162,7 @@ export default function App({
                 <MoreHorizontal size={18} />
               </summary>
               <div
+                className="no-drag"
                 onKeyDown={(event) =>
                   handleRovingKey(event, event.currentTarget, ":scope > button")
                 }
@@ -3225,6 +3319,13 @@ export default function App({
                     </div>
                   </div>
                   <div className="conversation-actions">
+                    <ReadAloudControl
+                      key={workspace}
+                      host={hostApi}
+                      rpc={rpc}
+                      workspace={workspace}
+                      connected={connected}
+                    />
                     <button
                       className={`icon-button ${showTools ? "on" : ""}`}
                       aria-label="Toggle tool calls"
@@ -3275,6 +3376,37 @@ export default function App({
                     >
                       <MoreHorizontal size={18} />
                     </button>
+                    {destination &&
+                      target &&
+                      document.documentElement.dataset.mobile !== "true" && (
+                        <button
+                          ref={detailsToggle}
+                          className={`icon-button ${selected === target.id ? "on" : ""}`}
+                          aria-label={
+                            selected === target.id
+                              ? "Hide thread details"
+                              : "Show thread details"
+                          }
+                          title={
+                            selected === target.id
+                              ? "Hide thread details"
+                              : "Show thread details"
+                          }
+                          aria-expanded={selected === target.id}
+                          aria-controls="twr-inspector"
+                          onClick={() =>
+                            setSelected((id) =>
+                              id === target.id ? undefined : target.id,
+                            )
+                          }
+                        >
+                          {selected === target.id ? (
+                            <PanelRightClose size={16} />
+                          ) : (
+                            <PanelRightOpen size={16} />
+                          )}
+                        </button>
+                      )}
                   </div>
                 </header>
                 <div
@@ -3312,12 +3444,13 @@ export default function App({
                   showTools={showTools}
                   showThinking={showThinking}
                   loading={transcriptLoading && !presentedEvents.length}
-                  error={transcriptError}
+                  error={transcriptError || earlierError}
                   earlier={
                     earliestTurn && earliestTurn > 1 ? earlier : undefined
                   }
                   earlierBusy={earlierBusy}
                   target={target}
+                  threads={view.threads}
                   onSetup={setupOrchestrator}
                   connected={connected}
                   summaries={assistance.summaries}
@@ -3719,7 +3852,11 @@ export default function App({
                   className="icon-button"
                   aria-label="Close thread details"
                   title="Close thread details"
-                  onClick={() => setSelected(undefined)}
+                  onClick={() => {
+                    setSelected(undefined);
+                    if (selected === destination && section === "chat")
+                      detailsToggle.current?.focus();
+                  }}
                 >
                   <X size={17} />
                 </button>
@@ -4596,11 +4733,12 @@ function ThreadCardButton({
 }) {
   const git = thread.git || thread.git_snapshot;
   const report = thread.last_report;
+  const mobile = document.documentElement.dataset.mobile === "true";
   return (
     <button
       className={`thread-card ${selected ? "selected" : ""} ${dived ? "dived" : ""} ${large ? "large" : ""}`}
       aria-current={dived ? "location" : undefined}
-      aria-describedby={selected ? "twr-thread-open-hint" : undefined}
+      aria-describedby={mobile && selected ? "twr-thread-open-hint" : undefined}
       style={threadStyle(thread.accent)}
       onClick={(event) => {
         // A click on the loop chip opens the inspector at the loop's progress.
@@ -4612,7 +4750,7 @@ function ThreadCardButton({
           onLoop();
         else onSelect();
       }}
-      onDoubleClick={onOpen}
+      onDoubleClick={mobile ? onOpen : undefined}
       onKeyDown={(e) => {
         if (e.key === "Enter" && selected) {
           e.preventDefault();
@@ -4950,6 +5088,7 @@ const Conversation = memo(function Conversation({
   earlier,
   earlierBusy,
   target,
+  threads,
   onSetup,
   connected,
   summaries,
@@ -4970,12 +5109,20 @@ const Conversation = memo(function Conversation({
   earlier?: () => void;
   earlierBusy: boolean;
   target?: Thread;
+  threads: Thread[];
   onSetup: () => void;
   connected: boolean;
 }) {
   const hostApi = useHostAPI();
   const parent = useRef<HTMLDivElement>(null);
-  const anchor = useRef<{ height: number; top: number } | undefined>(undefined);
+  const list = useRef<HTMLDivElement>(null);
+  const [scrollMargin, setScrollMargin] = useState(0);
+  const [jumpTarget, setJumpTarget] = useState<string>();
+  // A jump can be clamped at the bottom of a short history. Remember the
+  // clicked message so another activation still steps back in that case.
+  const [steppedFrom, setSteppedFrom] = useState<string>();
+  const [, readScrollPosition] = useState(0);
+  const hasScrolled = useRef(false);
   const follow = useRef(true);
   const [following, setFollowing] = useState(true);
   // Expanded messages and open tool details, by block: rows scrolled out of the virtual
@@ -5007,7 +5154,139 @@ const Conversation = memo(function Conversation({
     estimateSize: () => 120,
     overscan: 8,
     getItemKey: (index) => blocks[index].id,
+    scrollMargin,
+    // Preserve the current message and pixel offset on every prepend, including
+    // background loads and scrolling during a request. Bottom-follow stays ours.
+    anchorTo: "end",
+    followOnAppend: false,
   });
+  // Controls and loading/error notices precede the virtual rows in the scroller.
+  // Include their height when locating a message, including after a resize.
+  useLayoutEffect(() => {
+    const measure = () => {
+      const margin = list.current?.offsetTop ?? 0;
+      const delta = margin - virtual.options.scrollMargin;
+      // The last prepend removes Load earlier. Keep the reading position when
+      // that control (or a notice above the rows) changes the list's offset too.
+      // Relative scrolling includes prepend adjustments held during iOS gestures;
+      // DOM scrollTop can lag behind the virtualizer's layout position.
+      if (delta && !follow.current && parent.current)
+        virtual.scrollBy(delta, { behavior: "auto" });
+      setScrollMargin(margin);
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    if (parent.current) observer.observe(parent.current);
+    return () => observer.disconnect();
+  }, [loading, error, earlier, earlierBusy, virtual]);
+  useLayoutEffect(() => {
+    if (!jumpTarget) return;
+    const index = blocks.findIndex((block) => block.id === jumpTarget);
+    if (index < 0) {
+      virtual.cancelScroll();
+      setJumpTarget(undefined);
+      return;
+    }
+    const message = parent.current?.querySelector<HTMLElement>(
+      `[data-index="${index}"]`,
+    );
+    const destination = virtual.getOffsetForIndex(index, "start")?.[0];
+    if (
+      !message ||
+      destination == null ||
+      Math.abs((virtual.scrollOffset ?? 0) - destination) > 1
+    ) {
+      // Resolve the ID again on every pending layout: an in-flight history
+      // prepend can move it while the virtualizer still retains a numeric index.
+      virtual.scrollToIndex(index, { align: "start", behavior: "auto" });
+      return;
+    }
+    // Alignment can precede the virtualizer's final reconciliation frames.
+    // Retire that numeric command before a fast predecessor lookup prepends
+    // rows under it. Subsequent measurements use normal prepend anchoring.
+    virtual.cancelScroll();
+    message.focus({ preventScroll: true });
+    setJumpTarget(undefined);
+  });
+  const userIndexes = useMemo(
+    () =>
+      blocks.flatMap((block, index) => (block.kind === "user" ? [index] : [])),
+    [blocks],
+  );
+  // Work in the virtualizer's layout coordinates. DOM scrollTop and rendered
+  // row starts omit held iOS prepend corrections and cannot be mixed with them.
+  const offset = virtual.scrollOffset ?? 0;
+  const readingRow = virtual.getVirtualItemForOffset(offset - 1);
+  const atBottom =
+    (!hasScrolled.current && follow.current) ||
+    !virtual.scrollRect?.height ||
+    virtual.isAtEnd(1);
+  // At the bottom offer the latest user message. Otherwise its start must be
+  // above the viewport's top edge (1 CSS px tolerance); reaching that start
+  // while scrolling upward advances to the preceding user message.
+  let beforeIndex = atBottom
+    ? blocks.length
+    : readingRow && readingRow.start <= offset - 1
+      ? readingRow.index + 1
+      : 0;
+  const steppedIndex = steppedFrom
+    ? blocks.findIndex((block) => block.id === steppedFrom)
+    : -1;
+  const stepOffset =
+    steppedIndex < 0
+      ? undefined
+      : virtual.getOffsetForIndex(steppedIndex, "start")?.[0];
+  const atStep = stepOffset != null && Math.abs(offset - stepOffset) <= 1;
+  if (steppedIndex >= 0 && (jumpTarget || atStep))
+    beforeIndex = Math.min(beforeIndex, steppedIndex);
+  const previousIndex = userIndexes.findLast((index) => index < beforeIndex);
+  const previousUser =
+    previousIndex == null ? undefined : blocks[previousIndex];
+  const previousUserLine = previousUser
+    ? previousUser.text.split(/\r\n|\r|\n/, 1)[0].trim() || "Blank first line"
+    : "";
+  const boundaryText =
+    loading || (earlier && !error && connected)
+      ? "Loading your previous message…"
+      : error
+        ? "Previous message unavailable"
+        : earlier
+          ? "Connect to load earlier messages"
+          : userIndexes.length
+            ? "No earlier messages from you"
+            : "No messages from you yet";
+  useEffect(() => {
+    // Lookup must not turn off bottom-follow, move focus, or scroll. The parent
+    // serializes/pages requests and fences their results on thread switches.
+    if (
+      !previousUser &&
+      !jumpTarget &&
+      earlier &&
+      !earlierBusy &&
+      !loading &&
+      !error &&
+      connected
+    ) {
+      const frame = requestAnimationFrame(() => earlier());
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [
+    previousUser,
+    jumpTarget,
+    earlier,
+    earlierBusy,
+    loading,
+    error,
+    connected,
+  ]);
+  useEffect(() => {
+    if (steppedFrom && !jumpTarget && !atStep) setSteppedFrom(undefined);
+  }, [steppedFrom, jumpTarget, atStep]);
+  function cancelMessageJump() {
+    setSteppedFrom(undefined);
+    setJumpTarget(undefined);
+    virtual.cancelScroll();
+  }
   const totalSize = virtual.getTotalSize();
   useLayoutEffect(() => {
     const element = parent.current;
@@ -5036,30 +5315,19 @@ const Conversation = memo(function Conversation({
   const last = blocks.at(-1);
   function loadEarlier() {
     if (!earlier || earlierBusy || !parent.current) return;
-    anchor.current = {
-      height: parent.current.scrollHeight,
-      top: parent.current.scrollTop,
-    };
     follow.current = false;
     setFollowing(false);
     earlier();
   }
-  useLayoutEffect(() => {
-    if (anchor.current && parent.current) {
-      const saved = anchor.current;
-      anchor.current = undefined;
-      parent.current.scrollTop =
-        saved.top + Math.max(0, parent.current.scrollHeight - saved.height);
-    }
-  }, [blocks[0]?.id]);
   useEffect(() => {
-    if (follow.current && blocks.length)
-      requestAnimationFrame(() => {
-        if (parent.current)
-          parent.current.scrollTop = parent.current.scrollHeight;
-      });
+    if (!follow.current || !blocks.length) return;
+    const frame = requestAnimationFrame(() => {
+      if (follow.current && parent.current)
+        parent.current.scrollTop = parent.current.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
   }, [blocks.length, last?.text, totalSize]);
-  return (
+  const history = (
     <div
       className="conversation-scroll"
       ref={parent}
@@ -5067,10 +5335,36 @@ const Conversation = memo(function Conversation({
       aria-label={`Conversation with ${target?.name || "orchestrator"}`}
       aria-busy={loading || undefined}
       tabIndex={0}
+      onWheel={cancelMessageJump}
+      onTouchStart={cancelMessageJump}
+      onPointerDown={cancelMessageJump}
+      onKeyDown={(event) => {
+        if (
+          [
+            "ArrowUp",
+            "ArrowDown",
+            "PageUp",
+            "PageDown",
+            "Home",
+            "End",
+            " ",
+          ].includes(event.key)
+        )
+          cancelMessageJump();
+      }}
       onScroll={() => {
         const p = parent.current!;
-        follow.current = p.scrollHeight - p.scrollTop - p.clientHeight < 100;
+        hasScrolled.current = true;
+        // A clamped jump near the bottom is still a deliberate history jump.
+        // Resume follow only when navigation leaves that jump position.
+        follow.current =
+          !jumpTarget &&
+          !steppedFrom &&
+          p.scrollHeight - p.scrollTop - p.clientHeight < 100;
         setFollowing(follow.current);
+        // A boundary can be crossed within the same virtual range (even within
+        // one tall message), where the virtualizer need not rerender itself.
+        readScrollPosition((position) => position + 1);
         if (p.scrollTop < 40 && !loading && !earlierBusy && earlier)
           loadEarlier();
       }}
@@ -5135,6 +5429,7 @@ const Conversation = memo(function Conversation({
         </Empty>
       )}
       <div
+        ref={list}
         className="transcript-virtual"
         style={{ height: totalSize, position: "relative" }}
       >
@@ -5146,12 +5441,14 @@ const Conversation = memo(function Conversation({
               data-index={row.index}
               ref={virtual.measureElement}
               className={`transcript-block block-${block.kind}`}
+              tabIndex={block.kind === "user" ? -1 : undefined}
+              aria-label={block.kind === "user" ? "Your message" : undefined}
               style={{
                 position: "absolute",
                 top: 0,
                 left: 0,
                 width: "100%",
-                transform: `translateY(${row.start}px)`,
+                transform: `translateY(${row.start - scrollMargin}px)`,
               }}
             >
               <div className="message-meta">
@@ -5254,6 +5551,11 @@ const Conversation = memo(function Conversation({
                   text={block.text}
                   clamp={block.kind === "user" || block.kind === "notice"}
                   streaming={block.kind === "assistant" && !!block.pending}
+                  threadTags={
+                    block.kind === "assistant" && !!target?.is_orchestrator
+                  }
+                  threads={threads}
+                  turnStartedAt={block.turnStartedAt}
                   expanded={opened.get(block.id) ?? false}
                   onExpandedChange={(open) => setOpen(block.id, open)}
                 />
@@ -5274,6 +5576,7 @@ const Conversation = memo(function Conversation({
         <button
           className="jump-latest"
           onClick={() => {
+            cancelMessageJump();
             follow.current = true;
             setFollowing(true);
             parent.current?.scrollTo({
@@ -5287,6 +5590,44 @@ const Conversation = memo(function Conversation({
         </button>
       )}
     </div>
+  );
+  return (
+    <>
+      <div className="latest-user-message">
+        {previousUser || userIndexes.length ? (
+          <button
+            type="button"
+            title={previousUser ? previousUserLine : boundaryText}
+            aria-label={
+              previousUser
+                ? `Jump to your previous message: ${previousUserLine}`
+                : boundaryText
+            }
+            // Keep keyboard focus stable while a predecessor loads or at the
+            // earliest boundary. An unavailable action remains a no-op.
+            aria-disabled={!previousUser || undefined}
+            onClick={() => {
+              if (!previousUser || previousIndex == null) return;
+              follow.current = false;
+              setFollowing(false);
+              setJumpTarget(previousUser.id);
+              setSteppedFrom(previousUser.id);
+            }}
+          >
+            <ArrowUpRight size={14} aria-hidden="true" />
+            <span className="latest-user-label">You</span>
+            <span className="latest-user-preview">
+              {previousUser ? previousUserLine : boundaryText}
+            </span>
+          </button>
+        ) : (
+          <span className="latest-user-empty" role="status">
+            {boundaryText}
+          </span>
+        )}
+      </div>
+      {history}
+    </>
   );
 });
 function ContextEditor({

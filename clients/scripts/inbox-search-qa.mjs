@@ -354,9 +354,6 @@ archive.commit()
     .locator(".thread-list .thread-card")
     .filter({ hasText: "history" })
     .click();
-  await page
-    .getByRole("button", { name: "Talk to this thread", exact: true })
-    .click();
   const composer = page.locator(".composer textarea");
   await composer.fill("KEEP_MY_DESTINATION_AND_DRAFT");
   const destination = await page.locator(".destination-chip").innerText();

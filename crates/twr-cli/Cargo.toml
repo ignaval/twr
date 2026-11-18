@@ -35,6 +35,8 @@ ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Private, unique, automatically cleaned voice model downloads.
+tempfile.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -45,7 +47,6 @@ webpki-roots.workspace = true
 twr-docs.workspace = true
 crossterm.workspace = true
 portable-pty.workspace = true
-tempfile.workspace = true
 
 [build-dependencies]
 twr-source.workspace = true

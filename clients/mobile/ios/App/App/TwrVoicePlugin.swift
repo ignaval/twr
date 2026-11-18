@@ -44,6 +44,8 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
 
     /// One recognition task: what it heard, and whether its `final` was sent.
     private final class Pass {
+        let generation: Int
+        init(generation: Int) { self.generation = generation }
         let request = SFSpeechAudioBufferRecognitionRequest()
         var task: SFSpeechRecognitionTask?
         var text = ""
@@ -55,6 +57,8 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
     private let audio = AVAudioEngine()
     private var recognizer: SFSpeechRecognizer?
     private var pass: Pass?
+    /// Cancelling invalidates every unfinished pass, including earlier hands-free utterances.
+    private var recognitionGeneration = 0
     /// Read by the audio thread: the request buffers go to.
     private let bufferLock = NSLock()
     private var bufferTarget: SFSpeechAudioBufferRecognitionRequest?
@@ -260,7 +264,9 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
                 call.reject("Voice mode works while twr is open")
                 return
             }
+            let generation = self.recognitionGeneration
             self.authorize { problem in
+                guard generation == self.recognitionGeneration else { call.resolve(); return }
                 if let problem { call.reject(problem); return }
                 if let problem = self.problem() { call.reject(problem); return }
                 do {
@@ -338,7 +344,7 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
 
     private func beginPass() {
         guard let recognizer, listening else { return }
-        let pass = Pass()
+        let pass = Pass(generation: recognitionGeneration)
         pass.request.shouldReportPartialResults = true
         pass.request.requiresOnDeviceRecognition = recognizer.supportsOnDeviceRecognition
         pass.request.contextualStrings = hints
@@ -362,6 +368,7 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
     }
 
     private func recognized(_ pass: Pass, result: SFSpeechRecognitionResult?, error: Error?) {
+        guard pass.generation == recognitionGeneration, !pass.delivered else { return }
         if let result {
             let text = result.bestTranscription.formattedString
             if !pass.ending && text != pass.text {
@@ -410,7 +417,7 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
 
     /// Ends `pass`'s audio; its final result follows (or what it heard, after a moment).
     private func endPass(_ pass: Pass) {
-        guard !pass.ending else { return }
+        guard pass.generation == recognitionGeneration, !pass.ending else { return }
         pass.ending = true
         silenceTimer?.invalidate()
         pass.request.endAudio()
@@ -429,7 +436,7 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
 
     /// Sends `pass`'s `final` once.
     private func deliver(_ pass: Pass) {
-        guard !pass.delivered else { return }
+        guard pass.generation == recognitionGeneration, !pass.delivered else { return }
         pass.delivered = true
         pass.task?.cancel()
         heardSpeech = false
@@ -481,6 +488,7 @@ final class TwrVoicePlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthesizerDele
     /// Stops listening and drops what was not recognized yet; with `release`, gives the audio
     /// session back unless the phone's voice is still speaking.
     private func teardown(release: Bool = true) {
+        recognitionGeneration += 1
         resumeHints = nil
         listening = false
         silenceTimer?.invalidate()

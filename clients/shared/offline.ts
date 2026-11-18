@@ -33,6 +33,8 @@ export interface CachedWorkspace {
 export interface OfflineRecord {
   version: 1;
   drafts: Record<string, string>;
+  /** Drafts containing unreviewed speech; saved atomically with their text. */
+  spokenDrafts?: Record<string, boolean>;
   workspaces: Record<string, CachedWorkspace>;
   outbox: OutboxMessage[];
 }
@@ -72,7 +74,11 @@ function workspaceSize(entry: CachedWorkspace): number {
 }
 /** The size checks below: each lane is measured by itself, history from cached sizes. */
 export function recordSize(record: OfflineRecord) {
-  const pending = bytes({ drafts: record.drafts, outbox: record.outbox });
+  const pending = bytes({
+    drafts: record.drafts,
+    spokenDrafts: record.spokenDrafts,
+    outbox: record.outbox,
+  });
   const history = Object.entries(record.workspaces).reduce(
     (sum, [key, entry]) => sum + key.length + 4 + workspaceSize(entry),
     0,
@@ -163,6 +169,16 @@ export function parseOffline(
       Object.entries(record.drafts).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
+    ),
+    spokenDrafts: Object.fromEntries(
+      Object.entries(record.spokenDrafts || {})
+        .filter(
+          ([key, value]) =>
+            value === true &&
+            typeof record.drafts[key] === "string" &&
+            record.drafts[key],
+        )
+        .map(([key]) => [key, true]),
     ),
     workspaces: Object.fromEntries(
       Object.entries(record.workspaces as Record<string, CachedWorkspace>)
@@ -264,6 +280,7 @@ export class OfflineJournal {
         this.record = {
           ...history,
           drafts: pending.drafts,
+          spokenDrafts: pending.spokenDrafts,
           outbox: pending.outbox,
         };
         if (!this.active || forgottenHosts.has(this.hostId))
@@ -287,7 +304,12 @@ export class OfflineJournal {
         )
           await this.host.secureWrite(
             this.key,
-            JSON.stringify({ ...history, drafts: {}, outbox: [] }),
+            JSON.stringify({
+              ...history,
+              drafts: {},
+              spokenDrafts: {},
+              outbox: [],
+            }),
           );
         this.changed();
       })().catch((error) => {
@@ -335,7 +357,7 @@ export class OfflineJournal {
           );
         const payload =
           lane === "history"
-            ? { ...next, drafts: {}, outbox: [] }
+            ? { ...next, drafts: {}, spokenDrafts: {}, outbox: [] }
             : { ...next, workspaces: {} };
         await this.host.secureWrite!(
           lane === "history" ? this.key : this.pendingKey,
@@ -348,12 +370,20 @@ export class OfflineJournal {
     this.tail = job;
     return job;
   }
-  drafts(drafts: Record<string, string>, epoch = this.generation) {
+  drafts(
+    drafts: Record<string, string>,
+    epoch = this.generation,
+    spokenDrafts?: Record<string, boolean>,
+  ) {
     if (epoch !== this.generation)
       return Promise.reject(
         new Error("Offline storage changed before saving this draft"),
       );
-    return this.update((record) => ({ ...record, drafts }));
+    return this.update((record) => ({
+      ...record,
+      drafts,
+      spokenDrafts: spokenDrafts ?? record.spokenDrafts,
+    }));
   }
   cache(
     workspace: string,

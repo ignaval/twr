@@ -140,12 +140,15 @@ function rig(
   options: {
     submit?: (text: string) => Promise<Record<string, string>>;
     start?: () => Promise<void>;
+    prepare?: () => Promise<boolean>;
+    live?: (on: boolean) => Promise<void>;
   } = {},
 ) {
   let events: VoiceCaptureEvents | undefined;
   let isDeaf = false;
   const log: string[] = [];
   const sent: string[] = [];
+  const drafted: string[] = [];
   const states: VoiceSessionState[] = [];
   const capture: VoiceCapture = {
     status: async () => ({ available: true, local: true }),
@@ -178,8 +181,13 @@ function rig(
       },
       async live(on) {
         log.push("live:" + on);
+        await options.live?.(on);
       },
     },
+    draft: (text) => {
+      drafted.push(text);
+    },
+    prepare: options.prepare,
     async submit(text) {
       sent.push(text);
       return options.submit ? options.submit(text) : submitResult;
@@ -196,21 +204,184 @@ function rig(
     await new Promise((r) => setTimeout(r, 0));
     await new Promise((r) => setTimeout(r, 0));
   };
-  return { session, log, sent, states, say, events: () => events! };
+  return { session, log, sent, drafted, states, say, events: () => events! };
 }
 
 describe("voice session", () => {
-  it("pauses the device's voice at once when the user talks, and goes past it once sent", async () => {
+  it("re-enables live reading each time hands-free starts after the toolbar turned it off", async () => {
+    let live = false;
+    const r = rig(undefined, {
+      live: async (on) => {
+        live = on;
+      },
+    });
+    await r.session.begin();
+    expect(live).toBe(true);
+    await r.session.end();
+    // The toolbar changes the workspace's reported live setting independently.
+    live = false;
+    r.session.speakerState({ playing: false, paused: false, queued: 0 });
+    await r.session.begin();
+    expect(live).toBe(true);
+    expect(r.log.filter((entry) => entry === "live:true")).toHaveLength(2);
+    r.events().speechStart();
+    await r.say("Read the new reply");
+    expect(r.sent).toEqual(["Read the new reply"]);
+    await r.session.end();
+    // Dictation never enables reading, even after a hands-free session.
+    live = false;
+    await r.session.press();
+    await r.say("An editable draft");
+    expect(live).toBe(false);
+    expect(r.drafted).toEqual(["An editable draft"]);
+    expect(r.log.filter((entry) => entry === "live:true")).toHaveLength(2);
+  });
+  it("preserves toolbar-off during an ongoing hands-free session while continuing to send", async () => {
+    let live = false;
+    const r = rig(undefined, {
+      live: async (on) => {
+        live = on;
+      },
+    });
+    await r.session.begin();
+    live = false;
+    r.session.speakerState({ playing: false, paused: false, queued: 0 });
+    // An already active session is not a new start.
+    await r.session.begin();
+    for (const text of ["First request", "Second request"]) {
+      r.events().speechStart();
+      await r.say(text);
+      expect(live).toBe(false);
+    }
+    expect(r.sent).toEqual(["First request", "Second request"]);
+    expect(r.session.state.phase).toBe("listening");
+    expect(r.log.filter((entry) => entry === "live:true")).toHaveLength(1);
+  });
+
+  it("dictates literal controls and permission words without acting on them", async () => {
+    const r = rig();
+    for (const text of [
+      "stop",
+      "cancel",
+      "allow it",
+      "/mode bypass",
+      "!rm file",
+    ]) {
+      await r.session.press();
+      await r.say(text);
+    }
+    expect(r.drafted).toEqual([
+      "stop",
+      "cancel",
+      "allow it",
+      "/mode bypass",
+      "!rm file",
+    ]);
+    expect(r.sent).toEqual([]);
+    expect(r.session.state.confirm).toBeUndefined();
+    expect(r.log.filter((op) => op.startsWith("speaker:"))).toEqual([]);
+  });
+  it("drops late transcripts, partials and errors after cancellation", async () => {
+    const r = rig();
+    await r.session.press();
+    const old = r.events();
+    await r.session.end();
+    await r.session.begin();
+    old.partial?.("old partial");
+    old.final("allow it");
+    old.error("late error");
+    await tick();
+    expect(r.drafted).toEqual([]);
+    expect(r.sent).toEqual([]);
+    expect(r.session.state).toMatchObject({ phase: "listening", partial: "" });
+    expect(r.session.state.error).toBeUndefined();
+  });
+  it("drops a transcript already queued when cancelled", async () => {
+    const r = rig();
+    await r.session.press();
+    r.events().final("late text");
+    await r.session.end();
+    await tick();
+    expect(r.drafted).toEqual([]);
+    expect(r.session.state.phase).toBe("off");
+  });
+  it("does not resurrect a hands-free session when an in-flight send completes", async () => {
+    let finish!: (value: Record<string, string>) => void;
+    const r = rig(undefined, {
+      submit: () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    await r.session.begin();
+    r.events().speechStart();
+    r.events().final("old message");
+    await tick();
+    await r.session.end();
+    finish({ action: "confirm", reason: "old review" });
+    await tick();
+    await tick();
+    expect(r.session.state.phase).toBe("off");
+    expect(r.session.state.confirm).toBeUndefined();
+  });
+  it("allows native hands-free recognition to resume after an audio interruption", async () => {
+    const r = rig();
+    await r.session.begin();
+    r.events().error("Audio interrupted");
+    await tick();
+    expect(r.session.state.phase).toBe("error");
+    r.events().speechStart();
+    await r.say("We are back");
+    expect(r.sent).toEqual(["We are back"]);
+  });
+  it("does not open a microphone after cancellation during preparation", async () => {
+    let ready!: (value: boolean) => void;
+    const r = rig(undefined, {
+      prepare: () =>
+        new Promise((resolve) => {
+          ready = resolve;
+        }),
+    });
+    const pressing = r.session.press();
+    await r.session.end();
+    ready(true);
+    await pressing;
+    expect(r.log).not.toContain("start:push");
+    expect(r.session.state.phase).toBe("off");
+  });
+  it("cancels a microphone that finishes opening after the session ended", async () => {
+    let ready!: () => void;
+    const r = rig(undefined, {
+      start: () =>
+        new Promise((resolve) => {
+          ready = resolve;
+        }),
+    });
+    const pressing = r.session.press();
+    await tick();
+    await r.session.end();
+    ready();
+    await pressing;
+    await r.say("late text");
+    expect(r.drafted).toEqual([]);
+    expect(r.session.state.phase).toBe("off");
+    expect(r.log.at(-1)).toBe("cancel");
+  });
+
+  it("dictates into the composer without sending or starting playback, then resumes a held reply", async () => {
     const r = rig();
     r.session.speakerState({ playing: true, paused: false, queued: 0 });
     await r.session.press();
     expect(r.log).toContain("speaker:pause");
     await r.say("Check on the api worker");
-    expect(r.sent).toEqual(["Check on the api worker"]);
-    expect(r.log.slice(-2)).toEqual(["speaker:skip", "speaker:resume"]);
+    expect(r.sent).toEqual([]);
+    expect(r.drafted).toEqual(["Check on the api worker"]);
+    expect(r.log).not.toContain("live:true");
+    expect(r.log).not.toContain("speaker:skip");
+    expect(r.log.slice(-1)).toEqual(["speaker:resume"]);
     expect(r.session.state.heard).toEqual({
       text: "Check on the api worker",
-      outcome: "sent",
+      outcome: "draft",
     });
   });
   it("never pauses a speaker that was not playing, nor resumes one the user paused", async () => {
@@ -247,7 +418,8 @@ describe("voice session", () => {
       reason: "reads as an answer",
       heard: "allow it",
     });
-    await r.session.press();
+    await r.session.begin();
+    r.events().speechStart();
     await r.say("allow it");
     expect(r.session.state.confirm).toEqual({
       text: "allow it",
@@ -371,17 +543,20 @@ describe("voice session races (review regressions)", () => {
     const r = rig(undefined, {
       submit: () => new Promise((resolve) => (finish = resolve)),
     });
-    await r.session.press();
+    await r.session.begin();
+    r.events().speechStart();
     r.events().final("check the docs");
     await tick();
     expect(r.session.state.phase).toBe("sending");
     expect(r.session.idle).toBe(false);
     await r.session.press();
-    expect(r.log.filter((l) => l === "start:push")).toHaveLength(1);
+    expect(r.log.filter((l) => l === "start:hands-free")).toHaveLength(1);
     finish({ action: "delegate" });
     await tick();
     await tick();
-    expect(r.session.state.phase).toBe("ready");
+    expect(r.session.state.phase).toBe("listening");
+    expect(r.session.idle).toBe(false);
+    await r.session.end();
     expect(r.session.idle).toBe(true);
   });
   it("holds the speaker until the last of overlapping utterances is handled", async () => {
@@ -422,8 +597,10 @@ describe("voice session races (review regressions)", () => {
   });
   it("resumes what was read when the hub hands a transcript back", async () => {
     const r = rig({ action: "confirm", reason: "reads as an answer" });
+    r.session.options.listenWhileSpeaking = true;
     r.session.speakerState({ playing: true, paused: false, queued: 0 });
-    await r.session.press();
+    await r.session.begin();
+    r.events().speechStart();
     await r.say("allow it");
     expect(r.log.slice(-1)).toEqual(["speaker:resume"]);
     expect(r.log).not.toContain("speaker:skip");
@@ -468,6 +645,7 @@ describe("voice session races (review regressions)", () => {
           throw new Error("Unsupported mobile operation");
         },
       },
+      draft: () => {},
       submit: async () => ({}),
       hint: () => [],
       spoken: () => [],
@@ -555,7 +733,8 @@ describe("hands-free while its own voice reads", () => {
     await r.session.press();
     expect(r.log).toContain("speaker:pause");
     await r.say("Check on the api worker");
-    expect(r.sent).toEqual(["Check on the api worker"]);
+    expect(r.sent).toEqual([]);
+    expect(r.drafted).toEqual(["Check on the api worker"]);
     expect(r.log).not.toContain("deaf:true");
     const unseen = rig();
     await unseen.session.begin();

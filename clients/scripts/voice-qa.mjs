@@ -5,7 +5,7 @@
 //
 //   TWR_VOICE_QA_MODEL=/path/ggml-base.en.bin node scripts/voice-qa.mjs
 //
-// Checks: push to talk sends the transcript to the orchestrator marked spoken; the reply is
+// Checks: push to talk fills an editable draft; explicit Send marks it spoken; the reply is
 // read aloud by the app's own speaker (a command engine that logs what it is given); a
 // transcript that reads as a mode change is held for confirmation, nothing sent.
 import { _electron as electron } from "@playwright/test";
@@ -236,26 +236,71 @@ try {
   // Voice talks to the orchestrator, as the message box does: one is chosen first.
   twr("orchestrator", "use", "claude-code");
 
-  // 1. Push to talk: click, the fake microphone plays the sentence, click to send.
+  // 1. Dictation: click, the fake microphone plays the sentence, click to fill the box.
   const sentence = "Check on the docs worker and tell me when the tests pass.";
   ({ app } = await launch(recording("message", sentence)));
   let page = await app.firstWindow();
-  const talk = page.getByRole("button", { name: "Talk to the orchestrator" });
+  const talk = page.getByRole("button", { name: "Dictate a message" });
   await talk.waitFor();
   await talk.click();
   await page
-    .getByRole("button", { name: "Send what you said" })
+    .getByRole("button", { name: "Transcribe what you said" })
     .waitFor({ timeout: 10000 });
+  const placement = await page.locator(".voice-bar").evaluate((bar) => {
+    const composer = bar.closest(".composer");
+    const field = composer.querySelector("textarea");
+    const bounds = bar.getBoundingClientRect();
+    const box = composer.getBoundingClientRect();
+    return {
+      inline: bar.parentElement.classList.contains("composer-voice-status"),
+      position: getComputedStyle(bar).position,
+      belowEditor: bounds.top >= field.getBoundingClientRect().bottom,
+      withinComposer:
+        bounds.left >= box.left &&
+        bounds.right <= box.right &&
+        bounds.bottom <= box.bottom,
+    };
+  });
+  assert(
+    placement.inline && placement.belowEditor && placement.withinComposer,
+    JSON.stringify(placement),
+  );
+  assert(
+    !["absolute", "fixed"].includes(placement.position),
+    "voice status must not cover the UI",
+  );
   // The recording plays from its start once capture opens; leave it time to be heard.
   await wait(5000);
-  await page.getByRole("button", { name: "Send what you said" }).click();
-  await page
-    .locator(".voice-heard")
-    .filter({ hasText: "Sent" })
-    .waitFor({ timeout: 60000 });
-  const heard = await page.locator(".voice-heard").innerText();
+  await page.getByRole("button", { name: "Transcribe what you said" }).click();
+  await page.waitForFunction(
+    () => Boolean(document.querySelector(".composer textarea")?.value.trim()),
+    undefined,
+    { timeout: 60000 },
+  );
+  assert.equal(
+    await page.locator(".voice-bar").count(),
+    0,
+    "idle dictation has no status popup",
+  );
+  assert.equal(
+    await page.getByRole("dialog").count(),
+    0,
+    "dictation opens no ready dialog",
+  );
+  const heard = await page
+    .getByRole("textbox", { name: "Message orchestrator" })
+    .inputValue();
   assert.match(heard, /docs worker/i, heard);
   assert.match(heard, /tests pass/i, heard);
+  // Recognition alone must not create a user turn. Only the explicit Send does.
+  const unsent = JSON.parse(twr("orchestrator", "show", "--json"));
+  const unsentId = unsent.thread?.id || unsent.thread;
+  if (typeof unsentId === "string")
+    assert(
+      !/docs worker/i.test(twr("events", unsentId)),
+      "dictation sent without Send",
+    );
+  await page.getByRole("button", { name: "Send message", exact: true }).click();
   const orchestrator = await until(
     () => {
       const shown = JSON.parse(twr("orchestrator", "show", "--json"));
@@ -274,7 +319,9 @@ try {
     "the orchestrator never received the spoken message",
   );
   assert.match(events, /"from":"user"/);
-  console.log("PASS: push to talk sent the transcript to the orchestrator");
+  console.log(
+    "PASS: push to talk filled a draft; explicit Send delivered it to the orchestrator",
+  );
 
   // 2. Hands-free: the app's own speaker starts and reads the orchestrator's replies.
   await page.getByRole("button", { name: "Hands-free voice" }).click();
@@ -306,14 +353,30 @@ try {
   const before = twr("events", orchestrator.id).split("\n").length;
   ({ app } = await launch(recording("command", "Set all to bypass.")));
   page = await app.firstWindow();
-  await page.getByRole("button", { name: "Talk to the orchestrator" }).click();
+  await page.getByRole("button", { name: "Dictate a message" }).click();
   await page
-    .getByRole("button", { name: "Send what you said" })
+    .getByRole("button", { name: "Transcribe what you said" })
     .waitFor({ timeout: 10000 });
   await wait(3500);
-  await page.getByRole("button", { name: "Send what you said" }).click();
+  await page.getByRole("button", { name: "Transcribe what you said" }).click();
+  await page.waitForFunction(
+    () => Boolean(document.querySelector(".composer textarea")?.value.trim()),
+    undefined,
+    { timeout: 60000 },
+  );
+  assert.equal(
+    await page.locator(".voice-bar").count(),
+    0,
+    "idle dictation has no status popup",
+  );
+  assert.equal(
+    await page.getByRole("dialog").count(),
+    0,
+    "dictation opens no ready dialog",
+  );
+  await page.getByRole("button", { name: "Send message", exact: true }).click();
   await page
-    .getByRole("alertdialog", { name: "Confirm spoken message" })
+    .getByRole("dialog", { name: "Confirm spoken message" })
     .waitFor({ timeout: 60000 });
   const after = twr("events", orchestrator.id).split("\n").length;
   assert.equal(after, before, "a held transcript records nothing");

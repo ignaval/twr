@@ -389,7 +389,10 @@ try {
     );
   const select = async () => {
     await sidebar();
-    await sidebarCard().locator(".thread-card").click();
+    await sidebarCard().locator(".thread-card-title").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
   };
   const talk = async () => {
@@ -1387,8 +1390,7 @@ try {
     page.locator(".thread-list .thread-item").filter({ hasText: "web" });
   await sidebar();
   await webCard().waitFor();
-  await webCard().locator(".thread-card").click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
+  await webCard().locator(".thread-card-title").click();
   const webBox = page.getByRole("textbox", { name: "Message web directly" });
   await webBox.waitFor();
   await page.getByText("Loading conversation…").waitFor({ state: "hidden" });
@@ -1465,7 +1467,7 @@ try {
   await needsTask.waitFor();
   await needsTask.getByRole("button", { name: "Run without a loop" }).waitFor();
   await sidebar();
-  await webCard().locator(".thread-card").dblclick();
+  await webCard().locator(".thread-card-title").dblclick();
   await webSetup.waitFor();
   // The conversation's requests take at most a third of it: the card's answers arm once
   // scrolled into view, as for a person.
@@ -1511,7 +1513,10 @@ try {
   /** web's card selected: its inspector. */
   const selectWeb = async () => {
     await sidebar();
-    await webCard().locator(".thread-card").click();
+    await webCard().locator(".thread-card-title").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
   };
   const current = () =>
@@ -1682,8 +1687,7 @@ try {
   });
   const sha = thread("web").last_loop.commits[0].sha.slice(0, 7);
   await announced(`web's implementation loop ended: clean; committed ${sha}`);
-  await select();
-  await webCard().locator(".thread-card").click();
+  await selectWeb();
   await webLoops.getByText("Last implementation loop: clean").waitFor();
   await webLoops
     .locator(".loop-commits code")
@@ -1906,7 +1910,10 @@ try {
     page.locator(".thread-list .thread-item").filter({ hasText: "sweeper" });
   const selectSweeper = async () => {
     await sidebar();
-    await swCard().locator(".thread-card").click();
+    await swCard().locator(".thread-card-title").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
   };
   await selectSweeper();
@@ -2283,7 +2290,10 @@ exit 1
     page.locator(".thread-list .thread-item").filter({ hasText: "boxer" });
   const selectBoxer = async () => {
     await sidebar();
-    await boxerCard().locator(".thread-card").click();
+    await boxerCard().locator(".thread-card-title").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
     await inspector.getByRole("heading", { name: "boxer" }).waitFor();
   };
@@ -2451,6 +2461,13 @@ exit 1
   await boxStatus.filter({ hasText: "waiting on the review" }).waitFor();
   const boxRounds = boxLoops.getByRole("list", { name: "Rounds" });
   await boxRounds.getByText("m1 under review").waitFor();
+  // Reopening details fetches the run metadata independently of the live state.
+  // Measure after Runs on arrives so this compares the box's connection change,
+  // rather than the initial detail load adding a row above the controls.
+  await boxLoops
+    .locator(".loop-facts dt")
+    .getByText("Runs on", { exact: true })
+    .waitFor();
   const boxControls = boxLoops.getByRole("group", { name: "Loop controls" });
   const pauseTop = () =>
     boxControls
@@ -2728,7 +2745,10 @@ exit 1
     page.locator(".thread-list .thread-item").filter({ hasText: "acpw" });
   const selectAcp = async () => {
     await sidebar();
-    await acpCard().locator(".thread-card").click();
+    await acpCard().locator(".thread-card-title").click();
+    await page
+      .getByRole("button", { name: "Show thread details", exact: true })
+      .click();
     await inspector.waitFor();
     await inspector.getByRole("heading", { name: "acpw" }).waitFor();
   };

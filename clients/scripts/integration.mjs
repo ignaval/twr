@@ -400,14 +400,17 @@ try {
     .filter({ hasText: "Permission requested" })
     .waitFor({ state: "hidden", timeout: 15000 });
   console.log("Revision-bound permission answered");
-  // Conversation and message routing: selecting a card doesn't change the destination.
+  // Conversation and message routing: one card click opens the thread directly.
   await page
     .getByRole("button", { name: /api.*done/ })
     .first()
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page.getByRole("textbox", { name: "Message api directly" }).waitFor();
-  await page.getByText("Hello desktop", { exact: true }).waitFor();
+  // Scoped: the latest-user shortcut above the history repeats the message's first line.
+  await page
+    .locator(".conversation-scroll")
+    .getByText("Hello desktop", { exact: true })
+    .waitFor();
   await page
     .locator(".conversation-scroll")
     .getByText("Finished safely", { exact: true })
@@ -498,7 +501,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   // Structured forms really run in a PTY, and interactive attach reaches the same session.
   const session = await page.evaluate(() =>
     window.twr.terminalOpen({ args: ["attach", "api"], title: "Attach test" }),
@@ -655,7 +657,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page
     .getByRole("button", {
       name: "Continue with configured features",
@@ -768,7 +769,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   await page.waitForTimeout(1000);
   assert.notEqual(
@@ -800,7 +800,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   const composerBox = () =>
     page.evaluate(() => {
@@ -893,7 +892,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await suggestedComposer.waitFor();
   console.log(
     "PASS: the message field grows with wrapped text at 22 px, to its cap, and shrinks back, in full and phone-width windows",
@@ -1092,7 +1090,6 @@ try {
     .locator(".thread-list .thread-card")
     .filter({ hasText: "api" })
     .click();
-  await page.getByRole("button", { name: "Talk to this thread" }).click();
   await page.setViewportSize({ width: 520, height: 850 });
   assert(
     await page
