@@ -167,7 +167,11 @@ export function createMobileVoice(
   });
   return {
     status: () => plugin.status(),
-    start: (options) => plugin.start(options),
+    async start(options) {
+      if (options.mode === "one-shot")
+        throw new Error("One-shot voice capture is not supported on mobile");
+      await plugin.start(options);
+    },
     stop: () => plugin.stop(),
     cancel: () => plugin.cancel(),
     onEvent(callback) {

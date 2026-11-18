@@ -66,6 +66,10 @@ pub struct Status {
     /// is missing (the desktop app offers to download it).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub setup: bool,
+    /// Catalogue name for `voice setup --model` when a canonical model is missing.
+    /// `setup` retains its legacy meaning: setup without flags can help.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_model: Option<String>,
     /// `[voice] pause_ms`: what the app listening hands-free takes for the end of an utterance.
     pub pause_ms: u64,
     /// `[voice] listen_while_speaking`: whether hands-free listens while replies are read.
@@ -78,12 +82,12 @@ pub struct MissingModel(pub PathBuf);
 
 impl std::fmt::Display for MissingModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "no speech model yet: `twr voice setup` downloads whisper's base.en ({MODEL_SIZE}) to \
-             {}, or name yours with [voice] model (docs/voice.md)",
-            self.0.display()
-        )
+        let spec = MODELS
+            .iter()
+            .find(|m| self.0.ends_with(m.path))
+            .unwrap_or(&MODELS[0]);
+        let selector = format!(" --model {}", spec.name);
+        write!(f, "no speech model yet: `twr voice setup{selector}` downloads whisper's {} (148 MB) to {}, or name yours with [voice] model (docs/voice.md)", spec.name, self.0.display())
     }
 }
 
@@ -112,6 +116,9 @@ pub fn resolve(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> anyh
             expand_home(cfg.model.trim())
         };
         if !model.is_file() {
+            if configured_model(cfg, data_dir).is_some() {
+                return Err(MissingModel(model).into());
+            }
             bail!(
                 "no whisper model at {} ([voice] model): download one, or leave [voice] model \
                  empty and run `twr voice setup` (docs/voice.md)",
@@ -151,6 +158,7 @@ pub fn status(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> Statu
             local: k.local(),
             problem: None,
             setup: false,
+            setup_model: None,
             pause_ms: cfg.pause_ms,
             listen_while_speaking: cfg.listen_while_speaking,
         },
@@ -158,7 +166,11 @@ pub fn status(cfg: &VoiceConfig, data_dir: &Path, path: Option<&OsStr>) -> Statu
             available: false,
             engine: None,
             local: false,
-            setup: e.downcast_ref::<MissingModel>().is_some(),
+            setup: cfg.model.trim().is_empty() && e.downcast_ref::<MissingModel>().is_some(),
+            setup_model: e
+                .downcast_ref::<MissingModel>()
+                .and_then(|_| configured_model(cfg, data_dir))
+                .map(|m| m.name.to_owned()),
             problem: Some(format!("{e:#}")),
             pause_ms: cfg.pause_ms,
             listen_while_speaking: cfg.listen_while_speaking,
@@ -185,6 +197,45 @@ pub const MODEL_SHA256: &str = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fd
 pub const MODEL_BYTES: u64 = 147_964_211;
 /// Its size, as said to the user.
 pub const MODEL_SIZE: &str = "148 MB";
+
+/// An allowlisted whisper.cpp model. Metadata is the Git LFS pointer at `MODEL_COMMIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelSpec {
+    pub name: &'static str,
+    pub path: &'static str,
+    pub url: &'static str,
+    pub sha256: &'static str,
+    pub bytes: u64,
+}
+
+/// English remains the default, including for existing callers of setup without flags.
+pub const MODELS: [ModelSpec; 2] = [
+    ModelSpec { name: "base.en", path: DEFAULT_MODEL, url: MODEL_URL,
+        sha256: MODEL_SHA256, bytes: MODEL_BYTES },
+    // Authoritative pointer (not a hash inferred from a filename):
+    // https://huggingface.co/ggerganov/whisper.cpp/raw/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin
+    ModelSpec { name: "base", path: "voice/ggml-base.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin",
+        sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+        bytes: 147_951_465 },
+];
+
+/// Only catalogue names are accepted; never arbitrary URLs or paths.
+pub fn model_spec(name: &str) -> anyhow::Result<&'static ModelSpec> {
+    MODELS
+        .iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| anyhow!("unknown voice model {name:?}; choose base.en or base"))
+}
+
+/// The canonical configured model, if setup can provision it without changing config.
+fn configured_model(cfg: &VoiceConfig, data_dir: &Path) -> Option<&'static ModelSpec> {
+    if cfg.model.trim().is_empty() {
+        return Some(&MODELS[0]);
+    }
+    let path = expand_home(cfg.model.trim());
+    MODELS.iter().find(|m| path == data_dir.join(m.path))
+}
 
 /// Whether `head`, a downloaded file's first bytes, starts a whisper.cpp model: ggml's magic,
 /// `0x67676d6c` little-endian.
@@ -415,6 +466,61 @@ mod tests {
         assert!(MODEL_SHA256
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    }
+
+    #[test]
+    fn multilingual_catalogue_metadata_and_configured_status() {
+        let base = model_spec("base").unwrap();
+        assert_eq!(base.bytes, 147_951_465);
+        assert_eq!(
+            base.sha256,
+            "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
+        );
+        for m in MODELS {
+            assert_eq!(
+                m.url,
+                format!(
+                    "https://huggingface.co/ggerganov/whisper.cpp/resolve/{MODEL_COMMIT}/{}",
+                    Path::new(m.path).file_name().unwrap().to_str().unwrap()
+                )
+            );
+        }
+        // Captured verbatim from /raw/{MODEL_COMMIT}/ggml-{name}.bin, not model downloads.
+        for (m, pointer) in MODELS.iter().zip([
+            include_str!("../tests/fixtures/ggml-base.en.bin.lfs"),
+            include_str!("../tests/fixtures/ggml-base.bin.lfs"),
+        ]) {
+            assert!(pointer
+                .lines()
+                .any(|l| l == format!("oid sha256:{}", m.sha256)));
+            assert!(pointer.lines().any(|l| l == format!("size {}", m.bytes)));
+        }
+        assert_eq!(MODELS[0].path, DEFAULT_MODEL);
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let program = script(&bin, "whisper-cli", "exit 0");
+        let mut cfg = cfg();
+        cfg.model = d.path().join(base.path).to_str().unwrap().into();
+        cfg.language = "auto".into();
+        let s = status(&cfg, d.path(), Some(bin.as_os_str()));
+        assert!(!s.available && !s.setup);
+        assert_eq!(s.setup_model.as_deref(), Some("base"));
+        assert!(s.problem.unwrap().contains("setup --model base"));
+        std::fs::create_dir(d.path().join("voice")).unwrap();
+        std::fs::write(&cfg.model, b"fixture").unwrap();
+        assert_eq!(
+            resolve(&cfg, d.path(), Some(bin.as_os_str())).unwrap(),
+            Kind::Whisper {
+                program,
+                model: PathBuf::from(&cfg.model),
+                language: "auto".into(),
+            }
+        );
+        assert!(status(&cfg, d.path(), Some(bin.as_os_str())).available);
+        cfg.model = d.path().join("custom.bin").to_str().unwrap().into();
+        let s = status(&cfg, d.path(), Some(bin.as_os_str()));
+        assert!(!s.setup && s.setup_model.is_none());
     }
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {

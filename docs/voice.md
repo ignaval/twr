@@ -88,6 +88,29 @@ and dictated drafts remain editable, saved with their spoken origin, until recon
 
 ## Setting up recognition
 
+### Reusing browser capture
+
+The shared client module `clients/shared/voice.ts` exports `createWebCapture` independently
+of the composer. Its `VoiceCapture.start` accepts `push`, `hands-free`, and `one-shot`.
+Call `status()` first to load the configured silence interval, then start the chosen mode
+with transcript/error callbacks and any expected-word hints.
+
+`one-shot` starts one utterance and ends automatically after speech followed by the
+configured silence. It releases microphone tracks and audio resources before transcription
+delivers its final result. It does not require another click to send and does not resume
+listening after that utterance. Initial silence waits for speech or explicit cancellation;
+a client needing an initial-silence timeout must supply one. This mode is available through
+the browser capture API; the existing composer controls retain their push/hands-free
+behavior, and native/mobile recognizers reject unsupported one-shot requests explicitly.
+
+`cancel()` drops the current recording and suppresses stale transcription callbacks. It
+cannot abort a transcription promise supplied by the caller; the host recognizer is
+responsible for its own timeout and process cleanup. A replacement capture has independent
+microphone resources and callback state. One-shot capture is voice-activity detection, not
+wake-word detection.
+
+### Desktop recognizer setup
+
 On the desktop, twr recognizes speech with [whisper.cpp](https://github.com/ggml-org/whisper.cpp)
 on your machine:
 
@@ -101,12 +124,33 @@ twr voice status           # says `voice: whisper (on this machine)`, or what is
 the model an empty `[voice] model` means. It downloads it from whisper.cpp's own models on
 Hugging Face over HTTPS, from one commit of that repository built into twr (not whatever the
 `main` branch holds now), and keeps it only once it is whole and its SHA-256 is the one built
-into twr too: a file that differs is never renamed into place, where whisper.cpp would load
-it. In the desktop app, turning voice on
+into twr too. Existing files are fully verified before being reused; a file at that path that
+fails verification (another build of the model included) is replaced by a verified download,
+so keep a model of your own elsewhere and name it with `[voice] model`. Downloads use private,
+unique temporary files and replace the destination atomically only after verification;
+interrupted or invalid downloads leave an existing model intact. In the desktop app, turning voice on
 before the model is there offers **Download model**, which does the same. `base.en` recognizes a
 short message in well under a second on Apple silicon once loaded (the first one after a start
-takes a few seconds). For other languages use a multilingual model (`ggml-base.bin`) and set
-`language`. The names of your threads are passed to the recognizer as words to expect, so
+takes a few seconds).
+
+For English and Spanish, download the multilingual model explicitly:
+
+```sh
+twr voice setup --model base
+```
+
+This provisions `voice/ggml-base.bin` in twr's data directory. Set `[voice] model` to its
+absolute path and `language = "auto"` to detect the language of each recording, or choose
+`"en"` or `"es"`. With `TWR_HOME=/absolute/home`, the model is at
+`/absolute/home/data/voice/ggml-base.bin`. `--model base.en` explicitly provisions the English
+model. Both choices use pinned size and SHA-256 metadata; setup does not edit configuration.
+Setup without flags keeps its English default and refuses a nonempty configured model path.
+
+`twr voice status --json` includes `setup_model` when a missing canonical model can be
+provisioned with `setup --model <name>`. Its existing `setup` flag still means setup without
+flags can help. Status checks availability and file presence; setup verifies model integrity.
+
+The names of your threads are passed to the recognizer as words to expect, so
 "api" is heard as `api`.
 
 `[voice]` in the config of the machine with the microphone (the hub reads none of it):

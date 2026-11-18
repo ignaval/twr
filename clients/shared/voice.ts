@@ -12,7 +12,7 @@
 // - `localCommand`, `isLikelyEcho`: deterministic readings of a transcript;
 // - `VoiceSession`: the state machine the composer drives.
 
-export type VoiceMode = "push" | "hands-free";
+export type VoiceMode = "push" | "hands-free" | "one-shot";
 export type VoicePhase =
   | "off"
   | "ready"
@@ -50,7 +50,11 @@ export interface VoiceCaptureStatus {
 
 export interface VoiceCapture {
   status(): Promise<VoiceCaptureStatus>;
-  /** Starts listening. Push mode records until `stop`; hands-free emits one `final` per utterance. */
+  /**
+   * Push records until `stop`; hands-free emits per utterance. Browser one-shot releases
+   * audio after the first VAD-ended utterance, then delivers at most one final. Native
+   * implementations reject one-shot. Call `status` first to load the configured pause.
+   */
   start(
     mode: VoiceMode,
     events: VoiceCaptureEvents,
@@ -116,6 +120,10 @@ export function createNativeCapture(native: NativeVoice): VoiceCapture {
   return {
     status: () => native.status(),
     async start(mode, events, hint) {
+      if (mode === "one-shot")
+        throw new Error(
+          "One-shot voice capture is not supported by the native recognizer",
+        );
       unsubscribe?.();
       unsubscribe = native.onEvent((e) => {
         if (e.type === "speechStart") events.speechStart();
@@ -429,41 +437,69 @@ export function createWebCapture(
   transcribe: (wav: Uint8Array, hint: string[]) => Promise<string>,
   status: () => Promise<VoiceCaptureStatus>,
 ): VoiceCapture {
-  let stream: MediaStream | undefined;
-  let context: AudioContext | undefined;
-  let node: ScriptProcessorNode | undefined;
-  let mode: VoiceMode = "push";
-  let events: VoiceCaptureEvents | undefined;
-  let vad = new VoiceActivity();
-  let recorded: Float32Array[] = [];
-  let recordedLength = 0;
-  let hints: string[] = [];
-  let lastLevel = 0;
+  interface Run {
+    mode: VoiceMode;
+    events: VoiceCaptureEvents;
+    hints: string[];
+    vad: VoiceActivity;
+    recorded: Float32Array[];
+    recordedLength: number;
+    listening: boolean;
+    lastLevel: number;
+    stream?: MediaStream;
+    context?: AudioContext;
+    source?: MediaStreamAudioSourceNode;
+    node?: ScriptProcessorNode;
+    released?: Promise<void>;
+    chain: Promise<void>;
+    finished?: Promise<void>;
+  }
+  let current: Run | undefined;
   let pauseMs = PAUSE_MS;
   let deaf = false;
-  // Recognitions run one at a time, in order.
-  let chain = Promise.resolve();
-  const recognize = (samples: Float32Array) => {
-    const target = events;
-    chain = chain.then(async () => {
-      if (!target || samples.length < 16000 * 0.25) {
-        target?.final("");
-        return;
-      }
+  let guard = false;
+  // Detach resources synchronously before awaiting close: an old close must never touch
+  // the next run's microphone. Repeated stop/cancel calls share the same cleanup.
+  const release = (run: Run): Promise<void> => {
+    if (run.released) return run.released;
+    run.listening = false;
+    if (run.node) run.node.onaudioprocess = null;
+    run.node?.disconnect();
+    run.source?.disconnect();
+    run.stream?.getTracks().forEach((track) => track.stop());
+    run.recorded = [];
+    run.recordedLength = 0;
+    run.vad.reset();
+    run.released = run.context?.close().catch(() => {}) || Promise.resolve();
+    return run.released;
+  };
+  const recognize = (run: Run, samples: Float32Array) => {
+    // Each run has its own queue so a cancelled inference cannot block its replacement.
+    run.chain = run.chain.then(async () => {
+      if (current !== run) return;
       try {
-        target.final(await transcribe(encodeWav(samples), hints));
+        const text =
+          samples.length < 16000 * 0.25
+            ? ""
+            : await transcribe(encodeWav(samples), run.hints);
+        if (current === run) run.events.final(text);
       } catch (error) {
-        target.error(error instanceof Error ? error.message : String(error));
+        if (current === run)
+          run.events.error(
+            error instanceof Error ? error.message : String(error),
+          );
       }
     });
+    return run.chain;
   };
-  const release = async () => {
-    node?.disconnect();
-    node = undefined;
-    stream?.getTracks().forEach((t) => t.stop());
-    stream = undefined;
-    await context?.close().catch(() => {});
-    context = undefined;
+  const finish = (run: Run, samples?: Float32Array) => {
+    if (run.finished) return run.finished;
+    // Release before inference and before final, including the automatically ended path.
+    run.finished = release(run).then(async () => {
+      if (samples) recognize(run, samples);
+      await run.chain;
+    });
+    return run.finished;
   };
   return {
     async status() {
@@ -471,85 +507,115 @@ export function createWebCapture(
       if (s.pauseMs) pauseMs = clampPause(s.pauseMs);
       return s;
     },
-    async start(nextMode, nextEvents, hint) {
-      await release();
-      mode = nextMode;
-      events = nextEvents;
-      hints = hint;
-      // `deaf` is the session's to say, before or after the microphone opens.
-      vad = new VoiceActivity({ ...VAD_DEFAULTS, endSilenceMs: pauseMs });
-      recorded = [];
-      recordedLength = 0;
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      context = new AudioContext();
-      const source = context.createMediaStreamSource(stream);
-      node = context.createScriptProcessor(4096, 1, 1);
-      const rate = context.sampleRate;
-      node.onaudioprocess = (event) => {
-        const samples = downsample(event.inputBuffer.getChannelData(0), rate);
-        let peak = 0;
-        for (const s of samples) peak = Math.max(peak, Math.abs(s));
-        const now = performance.now();
-        const handsFreeDeaf = deaf && mode === "hands-free";
-        if (now - lastLevel > 100) {
-          lastLevel = now;
-          events?.level?.(handsFreeDeaf ? 0 : Math.min(1, peak * 2));
-        }
-        if (mode === "push") {
-          if (recordedLength / 16000 < PUSH_MAX_SECONDS) {
-            recorded.push(samples);
-            recordedLength += samples.length;
-          }
+    async start(mode, events, hint) {
+      const previous = current;
+      const vad = new VoiceActivity({ ...VAD_DEFAULTS, endSilenceMs: pauseMs });
+      vad.guard = guard;
+      const run: Run = {
+        mode,
+        events,
+        hints: [...hint],
+        vad,
+        recorded: [],
+        recordedLength: 0,
+        listening: true,
+        lastLevel: 0,
+        chain: Promise.resolve(),
+      };
+      current = run;
+      if (previous) await release(previous);
+      if (current !== run || !run.listening) return;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        // Permission can resolve after cancellation, stop, or a replacement start.
+        if (current !== run || !run.listening) {
+          stream.getTracks().forEach((track) => track.stop());
           return;
         }
-        // The device's own voice plays: nothing reaches the detector (its floor included).
-        if (handsFreeDeaf) return;
-        for (const happened of vad.push(samples)) {
-          if (happened.start) events?.speechStart();
-          if (happened.utterance) recognize(happened.utterance);
-        }
-      };
-      source.connect(node);
-      // A processor only runs connected to an output; it writes silence there.
-      node.connect(context.destination);
-      if (mode === "push") events.speechStart();
+        run.stream = stream;
+        const context = (run.context = new AudioContext());
+        const source = (run.source = context.createMediaStreamSource(stream));
+        const node = (run.node = context.createScriptProcessor(4096, 1, 1));
+        const rate = context.sampleRate;
+        node.onaudioprocess = (event) => {
+          if (current !== run || !run.listening) return;
+          const samples = downsample(event.inputBuffer.getChannelData(0), rate);
+          let peak = 0;
+          for (const s of samples) peak = Math.max(peak, Math.abs(s));
+          const now = performance.now();
+          const vadDeaf = deaf && mode !== "push";
+          if (now - run.lastLevel > 100) {
+            run.lastLevel = now;
+            events.level?.(vadDeaf ? 0 : Math.min(1, peak * 2));
+          }
+          if (current !== run || !run.listening) return;
+          if (mode === "push") {
+            if (run.recordedLength / 16000 < PUSH_MAX_SECONDS) {
+              run.recorded.push(samples);
+              run.recordedLength += samples.length;
+            }
+            return;
+          }
+          // The device's own voice never reaches the detector, including its floor.
+          if (vadDeaf) return;
+          for (const happened of vad.push(samples)) {
+            if (current !== run || !run.listening) break;
+            if (happened.start) events.speechStart();
+            if (current !== run || !run.listening) break;
+            if (happened.utterance) {
+              if (mode === "one-shot") {
+                void finish(run, happened.utterance);
+                break;
+              }
+              recognize(run, happened.utterance);
+            }
+          }
+        };
+        source.connect(node);
+        // A processor only runs connected to an output; it writes silence there.
+        node.connect(context.destination);
+        if (mode === "push") events.speechStart();
+      } catch (error) {
+        const live = current === run && run.listening;
+        await release(run);
+        if (live && current === run) throw error;
+      }
     },
     async stop() {
-      if (mode === "push") {
-        const all = new Float32Array(recordedLength);
-        let at = 0;
-        for (const r of recorded) {
-          all.set(r, at);
-          at += r.length;
-        }
-        recorded = [];
-        recordedLength = 0;
-        await release();
-        recognize(all);
-      } else {
-        const rest = vad.flush();
-        await release();
-        if (rest) recognize(rest);
+      const run = current;
+      if (!run) return;
+      if (!run.finished) {
+        let samples: Float32Array | undefined;
+        if (run.mode === "push") {
+          samples = new Float32Array(run.recordedLength);
+          let at = 0;
+          for (const chunk of run.recorded) {
+            samples.set(chunk, at);
+            at += chunk.length;
+          }
+        } else samples = run.vad.flush();
+        finish(run, samples);
       }
-      await chain;
+      await run.finished;
     },
     async cancel() {
-      events = undefined;
-      recorded = [];
-      await release();
+      const run = current;
+      current = undefined;
+      if (run) await release(run);
     },
     setEchoGuard(playing) {
-      vad.guard = playing;
+      guard = playing;
+      if (current) current.vad.guard = playing;
     },
     setDeaf(on) {
-      if (on && !deaf) vad.reset();
+      if (on && !deaf) current?.vad.reset();
       deaf = on;
     },
   };
