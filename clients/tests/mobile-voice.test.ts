@@ -75,6 +75,20 @@ function rig(options: { speakFails?: string } = {}) {
 }
 
 describe("mobile voice", () => {
+  it("rejects direct one-shot calls without changing ordinary native modes", async () => {
+    const r = rig();
+    await expect(r.voice.start({ mode: "one-shot", hint: [] })).rejects.toThrow(
+      "not supported",
+    );
+    expect(r.plugin.start).not.toHaveBeenCalled();
+    await r.voice.start({ mode: "push", hint: ["api"] });
+    expect(r.plugin.start).toHaveBeenCalledExactlyOnceWith({
+      mode: "push",
+      hint: ["api"],
+    });
+    r.voice.dispose();
+  });
+
   it("passes recognition events through to the composer's capture", async () => {
     const r = rig();
     await flush();

@@ -894,9 +894,12 @@ enum VoiceCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Download whisper.cpp's base.en model (148 MB) to `voice/ggml-base.en.bin` in twr's data
-    /// directory, the model `[voice] model` left empty means.
-    Setup,
+    /// Download a pinned whisper.cpp model to the data directory (no config changes).
+    Setup {
+        /// Catalogue model. Omit for base.en; explicit selection ignores [voice] model.
+        #[arg(long, value_parser = ["base.en", "base"])]
+        model: Option<String>,
+    },
     /// The text of one recording: a 16 kHz mono 16-bit WAV on stdin (at most two minutes),
     /// its text on stdout (empty when nothing was said).
     Transcribe {
@@ -8236,8 +8239,8 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
                 println!("voice: {}", s.problem.as_deref().unwrap_or("unavailable"));
             }
         }
-        VoiceCmd::Setup => {
-            voice_setup(&config.voice, &root.data_dir).await?;
+        VoiceCmd::Setup { model } => {
+            voice_setup(&config.voice, &root.data_dir, model.as_deref()).await?;
             let s = twr_voice::status(&config.voice, &root.data_dir, path.as_deref());
             match (s.available, s.problem) {
                 (true, _) => println!("voice: ready"),
@@ -8283,6 +8286,7 @@ async fn voice(cmd: VoiceCmd, paths: &Paths) -> anyhow::Result<()> {
 struct ModelCheck {
     len: u64,
     sha256: &'static str,
+    source: &'static str,
     got: u64,
     head: Vec<u8>,
     digest: ring::digest::Context,
@@ -8293,6 +8297,7 @@ impl ModelCheck {
         ModelCheck {
             len,
             sha256,
+            source: twr_voice::engine::MODEL_URL,
             got: 0,
             head: Vec::with_capacity(4),
             digest: ring::digest::Context::new(&ring::digest::SHA256),
@@ -8300,17 +8305,18 @@ impl ModelCheck {
     }
 
     fn update(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
-        use twr_voice::engine::{is_model, MODEL_URL};
+        use twr_voice::engine::is_model;
+        let source = self.source;
         if self.head.len() < 4 {
             self.head.extend(chunk.iter().take(4 - self.head.len()));
             if self.head.len() == 4 && !is_model(&self.head) {
-                bail!("{MODEL_URL} did not send a whisper model; nothing was kept");
+                bail!("{source} did not send a whisper model; nothing was kept");
             }
         }
         self.got += chunk.len() as u64;
         if self.got > self.len {
             bail!(
-                "{MODEL_URL} sent more than the model's {} bytes; nothing was kept",
+                "{source} sent more than the model's {} bytes; nothing was kept",
                 self.len
             );
         }
@@ -8319,10 +8325,11 @@ impl ModelCheck {
     }
 
     fn finish(self) -> anyhow::Result<()> {
-        use twr_voice::engine::{is_model, MODEL_URL};
+        use twr_voice::engine::is_model;
+        let source = self.source;
         if self.got != self.len || !is_model(&self.head) {
             bail!(
-                "{MODEL_URL} did not send a whole whisper model ({} of {} bytes); nothing was kept",
+                "{source} did not send a whole whisper model ({} of {} bytes); nothing was kept",
                 self.got,
                 self.len
             );
@@ -8336,7 +8343,7 @@ impl ModelCheck {
             .collect();
         if actual != self.sha256 {
             bail!(
-                "{MODEL_URL} is not the model twr expects: its SHA-256 is {actual}, not {}; \
+                "{source} is not the model twr expects: its SHA-256 is {actual}, not {}; \
                  nothing was kept",
                 self.sha256
             );
@@ -8345,27 +8352,84 @@ impl ModelCheck {
     }
 }
 
-/// `twr voice setup`: [`twr_voice::engine::MODEL_URL`] (pinned to a commit) to the default
-/// model's place, through a private file beside it, renamed into place only once whole and its
-/// SHA-256 the one twr expects ([`ModelCheck`]).
-async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> anyhow::Result<()> {
-    use std::io::Write;
-    use twr_voice::engine::{is_model, DEFAULT_MODEL, MODEL_BYTES, MODEL_SHA256, MODEL_URL};
-    if !cfg.model.trim().is_empty() {
-        bail!(
-            "[voice] model names your own model ({}): `twr voice setup` only downloads the \
-             default one; leave [voice] model empty to use it",
-            cfg.model.trim()
-        );
+/// Select a canonical destination, retaining no-flag protection of custom configuration.
+fn setup_model(
+    cfg: &twr_core::config::VoiceConfig,
+    selected: Option<&str>,
+) -> anyhow::Result<&'static twr_voice::engine::ModelSpec> {
+    if selected.is_none() && !cfg.model.trim().is_empty() {
+        bail!("[voice] model names your own model ({}): `twr voice setup` only downloads the default one; leave [voice] model empty to use it, or select --model explicitly", cfg.model.trim());
     }
-    let target = data_dir.join(DEFAULT_MODEL);
-    if std::fs::File::open(&target)
-        .and_then(|mut f| {
-            let mut head = [0u8; 4];
-            std::io::Read::read_exact(&mut f, &mut head).map(|_| head)
-        })
-        .is_ok_and(|head| is_model(&head))
-    {
+    twr_voice::engine::model_spec(selected.unwrap_or("base.en"))
+}
+
+/// Fully validate existing files too: a ggml header alone does not establish integrity.
+fn verified_model(target: &Path, spec: &twr_voice::engine::ModelSpec) -> anyhow::Result<()> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(target)?;
+    if file.metadata()?.len() != spec.bytes {
+        bail!("model size mismatch");
+    }
+    let mut check = ModelCheck::new(spec.bytes, spec.sha256);
+    check.source = spec.url;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        check.update(&buf[..n])?;
+    }
+    check.finish()
+}
+
+/// The private staging file owns cleanup even if the download future is cancelled.
+struct ModelDownload {
+    part: tempfile::NamedTempFile,
+    check: ModelCheck,
+}
+
+impl ModelDownload {
+    fn new(target: &Path, spec: &twr_voice::engine::ModelSpec) -> anyhow::Result<Self> {
+        let dir = target.parent().context("the model's directory")?;
+        let part = tempfile::Builder::new()
+            .prefix(".model-")
+            .tempfile_in(dir)?;
+        let mut check = ModelCheck::new(spec.bytes, spec.sha256);
+        check.source = spec.url;
+        Ok(Self { part, check })
+    }
+
+    fn write(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write;
+        self.check.update(chunk)?;
+        self.part.write_all(chunk)?;
+        Ok(())
+    }
+
+    fn finish(self, target: &Path) -> anyhow::Result<()> {
+        self.check.finish()?;
+        self.part
+            .as_file()
+            .sync_all()
+            .context("writing the model")?;
+        self.part
+            .persist(target)
+            .with_context(|| format!("moving the model to {}", target.display()))?;
+        Ok(())
+    }
+}
+
+/// Provision only a verified model, atomically, through a unique private temporary file.
+async fn voice_setup(
+    cfg: &twr_core::config::VoiceConfig,
+    data_dir: &Path,
+    selected: Option<&str>,
+) -> anyhow::Result<()> {
+    let spec = setup_model(cfg, selected)?;
+    let source = spec.url;
+    let target = data_dir.join(spec.path);
+    if verified_model(&target, spec).is_ok() {
         eprintln!("twr: the model is already at {}", target.display());
         return Ok(());
     }
@@ -8374,25 +8438,26 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
     let client = https_client()
         .https_only(true)
         .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30 * 60))
         .build()
         .context("setting up the HTTP client")?;
-    eprintln!("twr: downloading {MODEL_URL}");
+    eprintln!("twr: downloading {source}");
     let mut resp = client
-        .get(MODEL_URL)
+        .get(source)
         .send()
         .await
-        .with_context(|| format!("downloading {MODEL_URL}"))?;
+        .with_context(|| format!("downloading {source}"))?;
     if !resp.status().is_success() {
-        bail!("downloading {MODEL_URL} failed: HTTP {}", resp.status());
+        bail!("downloading {source} failed: HTTP {}", resp.status());
     }
-    if let Some(total) = resp.content_length().filter(|n| *n != MODEL_BYTES) {
-        bail!("{MODEL_URL} is {total} bytes, not the model's {MODEL_BYTES}; nothing was kept");
+    if let Some(total) = resp.content_length().filter(|n| *n != spec.bytes) {
+        bail!(
+            "{source} is {total} bytes, not the model's {}; nothing was kept",
+            spec.bytes
+        );
     }
-    let part = target.with_extension(format!("bin.part-{}", std::process::id()));
+    let mut staging = ModelDownload::new(&target, spec)?;
     let download = async {
-        let mut file =
-            std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
-        let mut check = ModelCheck::new(MODEL_BYTES, MODEL_SHA256);
         let mut shown = 0;
         let chunk_wait = std::time::Duration::from_secs(60);
         while let Some(chunk) = tokio::time::timeout(chunk_wait, resp.chunk())
@@ -8400,19 +8465,13 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
             .map_err(|_| anyhow!("the download stalled"))?
             .context("downloading the model")?
         {
-            check.update(&chunk)?;
-            file.write_all(&chunk)
-                .with_context(|| format!("writing {}", part.display()))?;
-            let pct = check.got * 100 / MODEL_BYTES;
+            staging.write(&chunk)?;
+            let pct = staging.check.got * 100 / spec.bytes;
             if pct >= shown + 10 {
                 shown = pct - pct % 10;
                 eprintln!("twr: {shown}%");
             }
         }
-        check.finish()?;
-        file.sync_all().context("writing the model")?;
-        std::fs::rename(&part, &target)
-            .with_context(|| format!("moving the model to {}", target.display()))?;
         anyhow::Ok(())
     };
     // Stopped (Ctrl-C, or the desktop app giving up): the partial file goes too.
@@ -8423,10 +8482,8 @@ async fn voice_setup(cfg: &twr_core::config::VoiceConfig, data_dir: &Path) -> an
         _ = term.recv() => Err(anyhow!("download stopped")),
         _ = tokio::signal::ctrl_c() => Err(anyhow!("download stopped")),
     };
-    if result.is_err() {
-        let _ = std::fs::remove_file(&part);
-    }
     result?;
+    staging.finish(&target)?;
     eprintln!("twr: the model is at {}", target.display());
     Ok(())
 }
@@ -9137,6 +9194,102 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn voice_setup_selection_and_cli_contract() {
+        use twr_core::config::VoiceConfig;
+        let mut cfg = VoiceConfig::default();
+        assert_eq!(setup_model(&cfg, None).unwrap().name, "base.en");
+        for name in ["base", "base.en"] {
+            assert_eq!(setup_model(&cfg, Some(name)).unwrap().name, name);
+            assert!(Cli::try_parse_from(["twr", "voice", "setup", "--model", name]).is_ok());
+            let args = ["voice", "setup", "--model", name].map(String::from);
+            assert!(twr_core::app_commands::validate(&args).is_ok());
+        }
+        assert!(Cli::try_parse_from(["twr", "voice", "setup"]).is_ok());
+        for name in ["large", "../base", "https://example.com/model", "BASE"] {
+            assert!(setup_model(&cfg, Some(name)).is_err());
+            assert!(Cli::try_parse_from(["twr", "voice", "setup", "--model", name]).is_err());
+        }
+        cfg.model = "/custom/model.bin".into();
+        assert!(setup_model(&cfg, None).is_err());
+        assert_eq!(
+            setup_model(&cfg, Some("base")).unwrap().path,
+            "voice/ggml-base.bin"
+        );
+        cfg.model = "/isolated/voice/ggml-base.bin".into();
+        assert!(setup_model(&cfg, None).is_err());
+        assert!(setup_model(&cfg, Some("base")).is_ok());
+        assert_eq!(cfg.model, "/isolated/voice/ggml-base.bin");
+    }
+
+    #[test]
+    fn voice_setup_private_atomic_and_existing_integrity() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.bin");
+        let bytes = b"lmggfixture model";
+        let spec = twr_voice::engine::ModelSpec {
+            name: "fixture",
+            path: "model.bin",
+            url: "https://example.invalid/model",
+            bytes: bytes.len() as u64,
+            sha256: Box::leak(sha256_hex(bytes).into_boxed_str()),
+        };
+        std::fs::write(&target, b"original").unwrap();
+        let mut one = ModelDownload::new(&target, &spec).unwrap();
+        let two = ModelDownload::new(&target, &spec).unwrap();
+        assert_ne!(one.part.path(), two.part.path());
+        assert_eq!(
+            one.part.as_file().metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let abandoned = two.part.path().to_owned();
+        drop(two);
+        assert!(!abandoned.exists());
+        one.write(&bytes[..5]).unwrap();
+        let partial = one.part.path().to_owned();
+        assert!(one.finish(&target).is_err());
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mut bad = ModelDownload::new(&target, &spec).unwrap();
+        let mut corrupt = bytes.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        bad.write(&corrupt).unwrap();
+        assert!(bad.finish(&target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mut good = ModelDownload::new(&target, &spec).unwrap();
+        good.write(bytes).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let mut concurrent = ModelDownload::new(&target, &spec).unwrap();
+        concurrent.write(bytes).unwrap();
+        good.finish(&target).unwrap();
+        concurrent.finish(&target).unwrap();
+        verified_model(&target, &spec).unwrap();
+        std::fs::write(&target, corrupt).unwrap();
+        assert!(verified_model(&target, &spec).is_err());
+        std::fs::write(&target, b"lmgg").unwrap();
+        assert!(verified_model(&target, &spec).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn voice_setup_cancelled_download_cleans_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("model.bin");
+        std::fs::write(&target, b"original").unwrap();
+        let spec = twr_voice::engine::model_spec("base").unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_millis(1), async {
+            let mut staging = ModelDownload::new(&target, spec).unwrap();
+            staging.write(b"lmggpartial").unwrap();
+            std::future::pending::<()>().await;
+            staging.finish(&target).unwrap();
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// `twr voice setup` keeps only exactly the model it pinned: ggml's magic, its size and its
     /// SHA-256, checked while it streams and before the rename.
