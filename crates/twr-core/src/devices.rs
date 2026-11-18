@@ -396,6 +396,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "account.add",
             "account.remove",
             "config.show",
+            "config.set",
             "desktop.config.read",
             "desktop.config.set",
             "desktop.config.save",

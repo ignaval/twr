@@ -14,6 +14,7 @@
 //! | `box.agents`        | `{box, refresh?}` (`refresh`: users only)           | `{box, online, agents}`: the box's agent CLIs (`local`: the hub's own), probed again first with `refresh` (`hub::box_agents`); the orchestrator and agents see `runtime, found, login` of each |
 //! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
+//! | `config.set`        | `{key, value}` (`key` dotted, `value` a boolean, number or string; a device needs `admin`; not for agents) | `{status: "applied", key, value, before, effect}`, or for the orchestrator and a key that goes on the confirm card `{status: "needs_confirmation", key, value, before, effect, message}`: one key of `config.toml` set, its comments and the rest of the file kept, and `config.changed` recorded (`hub::config_set`). The orchestrator's only in a turn of the user's latest message (`relay_forbidden` otherwise); boxes, `hub.tls`, `env` entries, command lines and secret-looking values are refused for everyone (`bad_request`) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
 //! | `thread.spawn_status` | `{operation_id}` | durable operation |
 //! | `conversation.search` | `{query, thread?, before?:event_id, limit?}` | literal case-insensitive search across messages, tool output and decisions, including archive; `{items, next, more, workspace}` |
@@ -723,6 +724,7 @@ pub const METHODS: &[&str] = &[
     "hub.glance",
     "hub.shutdown",
     "config.show",
+    "config.set",
     "runner.manage",
     "runner.status",
     "runner.connect",
@@ -834,6 +836,9 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "hub.glance",
     "box.agents",
     "config.show",
+    // In a turn of the user's latest message only; most keys go on the confirm card
+    // (`hub::config_set`).
+    "config.set",
     "thread.new",
     "thread.spawn",
     "thread.spawn_status",
@@ -891,6 +896,7 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
 /// as having acted, and is refused once the user took back that turn's message
 /// ([`Hub::orchestrator_acts`]).
 const ORCHESTRATOR_CHANGES: &[&str] = &[
+    "config.set",
     "thread.new",
     "thread.spawn",
     "thread.send",
@@ -1333,7 +1339,7 @@ async fn connection(
             | "runner.recover" | "runner.revoke" | "runner.forget" | "box.projects"
             | "box.token" | "account.status" | "account.remove" | "thread.set_model"
             | "speech.request" | "speech.control" | "loop.request" | "loop.setup.update"
-            | "loop.settings.get" | "loop.settings.set" => {
+            | "loop.settings.get" | "loop.settings.set" | "config.set" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -2504,6 +2510,12 @@ async fn call_async(
         // A move looks the thread's project up first when its log does not say it, as git
         // has it (`hub::thread_account`).
         "account.remove" => hub.account_remove(params(p)?, caller).await,
+        // The file is read and written off the async threads (`hub::config_set`).
+        "config.set" => {
+            let p: crate::hub::config_set::ConfigSetParams = params(p)?;
+            hub.config_set_bound(&p.key, p.value, caller, received)
+                .await
+        }
         "thread.set_model" => {
             let p: SetModelParams = params(p)?;
             let req = crate::hub::ModelRequest {

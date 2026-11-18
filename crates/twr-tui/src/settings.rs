@@ -174,6 +174,7 @@ pub fn scalar_text(v: &crate::config_edit::Scalar) -> String {
     match v {
         Scalar::Bool(b) => b.to_string(),
         Scalar::Int(i) => i.to_string(),
+        Scalar::Float(_) => v.text(),
         Scalar::Str(s) => format!("{s:?}"),
     }
 }

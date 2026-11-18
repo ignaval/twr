@@ -125,6 +125,7 @@ mod closing;
 mod coalesce;
 mod commands;
 mod compact;
+pub mod config_set;
 mod config_view;
 mod context;
 /// `O_NOFOLLOW | O_NONBLOCK` for this platform (0 where twr does not spell it out): for opening
@@ -2951,9 +2952,14 @@ impl Hub {
     }
 
     /// `config.show`: the configuration the hub runs with ([`config_view`]), its boxes the
-    /// hub's own list (those added since it started included).
+    /// hub's own list (those added since it started included), and `preferences`, the keys the
+    /// orchestrator changes at once as config.toml has them now
+    /// ([`config_set::preferences`]).
     pub fn config_show(&self) -> Value {
-        config_view(&self.inner.config, Some(&self.inner.box_configs()))
+        let mut view = config_view(&self.inner.config, Some(&self.inner.box_configs()));
+        // What `config.set` changes at once, as the file has it now (`hub::config_set`).
+        view["preferences"] = config_set::preferences(&self.inner);
+        view
     }
 
     /// The workspace this hub serves ([`HubOptions::workspace`]; `default` for none).

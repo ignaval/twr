@@ -245,11 +245,12 @@ pub const WRITTEN_SUMMARY_MAX: usize = 600;
 /// Longest annotation note, in bytes.
 pub const NOTE_MAX: usize = 2000;
 
-/// The orchestrator's system context with the relay and mode rules filled in.
+/// The orchestrator's system context with the relay, mode and config rules filled in.
 pub fn system_prompt() -> String {
     SYSTEM_PROMPT_TEMPLATE
         .replace("{{RELAY_RULE}}", twr_mcp::RELAY_RULE)
         .replace("{{MODE_RULE}}", twr_mcp::MODE_RULE)
+        .replace("{{CONFIG_RULE}}", twr_mcp::CONFIG_RULE)
 }
 
 /// The allow rule for every tool of the twr MCP server (Claude Code permission syntax: a bare
@@ -1220,6 +1221,8 @@ impl OrchState {
                 Proposed::Move { thread, .. } => {
                     t.moved.insert(thread.clone());
                 }
+                // Once per key per turn: [`Core::config_proposed`].
+                Proposed::Config { .. } => {}
             }
             t.proposals.push(action);
         }
@@ -3380,6 +3383,40 @@ impl Core {
         Ok(())
     }
 
+    /// The `set_config` gate's provenance (`hub::config_set`), for a key the orchestrator
+    /// changes directly or proposes on the confirm card alike: a user turn whose message is the
+    /// user's latest and not taken back ([`Core::user_turn`]), not a message from a paired
+    /// device without `admin` ([`Core::relayed_for_admin`]); with `bound` (the call as
+    /// admitted), the turn the call came in, still open. `relay_forbidden` otherwise.
+    pub(super) fn config_check(
+        &self,
+        hub: &Inner,
+        bound: Option<&super::withdraw::OrchCall>,
+    ) -> Result<(), RpcError> {
+        const WHAT: &str = "change twr's configuration";
+        if let Some(b) = bound {
+            let now = self.orch.turn.as_ref().map(|t| t.turn);
+            if b.turn.is_none() || b.turn != now {
+                return Err(rpc(
+                    codes::RELAY_FORBIDDEN,
+                    format!("the turn this call came in has ended: it cannot {WHAT}; ask the user"),
+                ));
+            }
+        }
+        self.user_turn(WHAT)?;
+        self.relayed_for_admin(hub, WHAT)
+    }
+
+    /// Whether the orchestrator's current turn already proposed a change of config key `key`
+    /// (its parts) for the confirm card.
+    pub(super) fn config_proposed(&self, key: &[String]) -> bool {
+        self.orch.turn.as_ref().is_some_and(|t| {
+            t.proposals
+                .iter()
+                .any(|p| matches!(p, Proposed::Config { key: k, .. } if k == key))
+        })
+    }
+
     /// [`Core::names_unsettled`] for the message of user turn `t` (unknown history: unsettled).
     fn turn_names_unsettled(&self, t: &OrchTurn, scene: &Scene) -> bool {
         match (t.said_after, t.arrived) {
@@ -5416,6 +5453,7 @@ mod tests {
         let p = system_prompt();
         assert!(p.contains(twr_mcp::RELAY_RULE));
         assert!(p.contains(twr_mcp::MODE_RULE));
+        assert!(p.contains(twr_mcp::CONFIG_RULE));
         assert!(!p.contains("{{"));
         assert!(p.contains("[twr notice]"));
         assert!(p.contains("hub-authored conversation updates"));

@@ -6,6 +6,7 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Added
 
+- Ask the orchestrator to change twr's configuration ("turn off suggestions", "set the default mode to plan"): its new `set_config` tool asks the hub (`config.set`), which edits that one key of `config.toml` in place, keeping its comments and every other line. Display and voice preferences change at once; any other key goes on the confirm card, which writes it only while the file still has the value it shows; boxes, `hub.tls`, `env` values, command lines and secret-looking values are never changed this way. Each change is a line in the orchestrator's conversation (`config.changed`) saying when it takes effect, and `config.show` has a `preferences` section with those keys as the file has them now ([orchestrator.md](docs/orchestrator.md#changing-twrs-configuration)).
 - In the desktop and phone apps, every conversation keeps the first line of your latest message above its history. Click it to jump to that message, including when automatic turns have followed it.
 
 ### Fixed

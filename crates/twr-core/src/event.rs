@@ -1844,6 +1844,54 @@ impl MemoryChanged {
     }
 }
 
+/// `config.changed`: a key of twr's `config.toml` set through the hub (`config.set`, the
+/// orchestrator's `set_config` tool, or a confirm card holding that change), appended by the hub
+/// on the orchestrator's thread so the user sees every change.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigChanged {
+    /// The key, as `config.set` writes it: `tui.suggest`, `projects."my.api".codex_auto`.
+    pub key: String,
+    /// The new value (a JSON scalar).
+    pub value: Value,
+    /// What the file had (`None`: unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<Value>,
+    /// Who changed it: `orchestrator` or `user` (directly, or by confirming a card).
+    pub by: String,
+    /// When the change takes effect, in words: `now`, `the next time a TUI starts`, ...
+    pub effect: String,
+    /// Extras (`ext.twr.proposal`: the confirm card that applied it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+impl ConfigChanged {
+    /// One line saying what changed, as the TUI and transcripts show it: `set tui.suggest =
+    /// false (was true); takes effect the next time a TUI starts`, `... (by you)`.
+    pub fn line(&self) -> String {
+        let text = |v: &Value| match v {
+            Value::String(s) => format!("{s:?}"),
+            other => other.to_string(),
+        };
+        let was = self.before.as_ref().map_or("unset".to_string(), text);
+        let by = if self.by == "user" { " (by you)" } else { "" };
+        let effect = if self.effect == "now" {
+            "takes effect now".to_string()
+        } else {
+            format!("takes effect {}", self.effect)
+        };
+        format!(
+            "set {} = {} (was {was}){by}; {effect}",
+            self.key,
+            text(&self.value)
+        )
+    }
+}
+
 /// The orchestrator's memory tools (twr's MCP server), by their own names.
 pub const MEMORY_TOOLS: &[&str] = &["memory_list", "memory_read", "memory_save", "memory_forget"];
 
@@ -3019,6 +3067,8 @@ event_body! {
     ProjectRead(ProjectRead) => "project.read",
     /// `memory.changed`
     MemoryChanged(MemoryChanged) => "memory.changed",
+    /// `config.changed`
+    ConfigChanged(ConfigChanged) => "config.changed",
     /// `worktree.disk`
     WorktreeDisk(WorktreeDiskMeasured) => "worktree.disk",
     /// `worktree.trimmed`
@@ -3085,7 +3135,8 @@ impl EventBody {
 /// context: a few per session at most, and cards show it), `conversation.update`, `account.*`
 /// (the hub's `account.usage`, `account.added`, `account.removed`, `account.status`),
 /// `project.read` (an orchestrator read, shown to the user), `memory.changed` (a note of the
-/// orchestrator's memory saved or forgotten, shown too), `worktree.*`, `trash.*` (the hub's
+/// orchestrator's memory saved or forgotten, shown too), `config.changed` (a key of the config
+/// file set through the hub, shown too), `worktree.*`, `trash.*` (the hub's
 /// `trash.purged`) and `loop.*` (a loop's steps and the saved loop settings: clients fold only
 /// the control stream). `agent.*` never goes on the control stream.
 pub fn is_control_kind(kind: &str) -> bool {
@@ -3108,6 +3159,7 @@ pub fn is_control_kind(kind: &str) -> bool {
         || kind.starts_with("account.")
         || kind == "project.read"
         || kind == "memory.changed"
+        || kind == "config.changed"
         || kind.starts_with("worktree.")
         || kind.starts_with("trash.")
         || kind.starts_with("loop.")
@@ -3466,6 +3518,14 @@ mod tests {
                 rev: Some("0123456789ab".into()),
                 by: "orchestrator".into(),
                 origin: Some("user".into()),
+                ..Default::default()
+            }),
+            EventBody::ConfigChanged(ConfigChanged {
+                key: "tui.suggest".into(),
+                value: json!(false),
+                before: Some(json!(true)),
+                by: "orchestrator".into(),
+                effect: "the next time a TUI starts".into(),
                 ..Default::default()
             }),
             EventBody::WorktreeDisk(WorktreeDiskMeasured {
@@ -4118,6 +4178,7 @@ mod tests {
             "thread.created",
             "project.read",
             "memory.changed",
+            "config.changed",
             "thread.crashed",
             "thread.attached",
             "thread.renamed",
