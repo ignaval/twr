@@ -43,8 +43,9 @@
 //! | `trash.restore`     | `{item, as?}` (users only)                          | `{thread, thread_name, previous_name, item, box, worktree, branch, checkout?, notes, skipped, session_id, message}` |
 //! | `log.compact`       | `{vacuum?, drop_checkpoints?}` (users only)         | `{rows, bytes, kinds, purged_threads, turns, blobs, blob_bytes, archived, batches, longest_batch_ms, plan_ms, copy_ms, delete_ms, sweep_ms, total_ms, freed_pages, vacuum?: {ms, before, after, incremental_set}, checkpoints_dropped, skipped?}`: the agent events `[log]` lets go moved to `archive.db` now (`hub::prune`) |
 //! | `log.stats`         | - (users only)                                      | `{db, archive, checkpoints, backlog: {head, full, compacted}, retention_days, archive_on, next}`: sizes of the log and what the next compaction moves (`hub::prune`) |
-//! | `orchestrator.show` | -                                                   | `{available, runtime, model, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed) |
+//! | `orchestrator.show` | -                                                   | `{available, runtime, model, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, access, running_access, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed; `access`: its access level as last set, `limited` or `full`; `running_access`: the level its live runtime started with, null when none runs, another one only while it restarts with `access` after its turn) |
 //! | `orchestrator.reset` | - (users only)                                      | Fresh session on the current runtime/model, no handoff; same result as `orchestrator.use` with `handoff: null` |
+//! | `orchestrator.access` | `{access?: "limited" \| "full"}` (users only; a device needs `admin`) | without `access`: `{access}`; with it: `{access, previous, persisted, persist_error?, restart: "now" \| "after_turn" \| "none"}`: the orchestrator's access level, applied at once (its runtime restarts on its session, after its running turn) and written to `config.toml` (`hub::orch_access`) |
 //! | `orchestrator.use`  | `{runtime, model?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, previous: {thread, name, runtime, model, stopping, dropped_prompts} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
 //! | `thread.park`       | `{thread, keep?, force?}`                           | `{thread, parked: true, worktree?, worktree_removed, kept_dirty, dirty_files?, kept_reason?, kept, worktree_missing?, worktree_error?, pending}` |
 //! | `thread.resume`     | `{thread}`                                          | `{thread, resumed: true, worktree?, worktree_recreated, turn, pending}` |
@@ -788,6 +789,7 @@ pub const METHODS: &[&str] = &[
     "orchestrator.show",
     "orchestrator.reset",
     "orchestrator.use",
+    "orchestrator.access",
     "orchestrator.watch",
     "orchestrator.unwatch",
     "orchestrator.watches",
@@ -1330,16 +1332,49 @@ async fn connection(
                     break;
                 }
             }
-            "thread.pull" | "thread.new" | "thread.park" | "thread.resume" | "thread.delete"
-            | "thread.trim" | "usage.threads" | "context.read" | "context.set"
-            | "orchestrator.use" | "orchestrator.reset" | "trash.list" | "trash.empty"
-            | "trash.restore" | "log.compact" | "log.stats" | "project.files" | "project.read"
-            | "project.search" | "memory.list" | "memory.read" | "box.add" | "box.install"
-            | "box.restart" | "runner.manage" | "runner.status" | "runner.connect"
-            | "runner.recover" | "runner.revoke" | "runner.forget" | "box.projects"
-            | "box.token" | "account.status" | "account.remove" | "thread.set_model"
-            | "speech.request" | "speech.control" | "loop.request" | "loop.setup.update"
-            | "loop.settings.get" | "loop.settings.set" | "config.set" => {
+            "thread.pull"
+            | "thread.new"
+            | "thread.park"
+            | "thread.resume"
+            | "thread.delete"
+            | "thread.trim"
+            | "usage.threads"
+            | "context.read"
+            | "context.set"
+            | "orchestrator.use"
+            | "orchestrator.reset"
+            | "orchestrator.access"
+            | "trash.list"
+            | "trash.empty"
+            | "trash.restore"
+            | "log.compact"
+            | "log.stats"
+            | "project.files"
+            | "project.read"
+            | "project.search"
+            | "memory.list"
+            | "memory.read"
+            | "box.add"
+            | "box.install"
+            | "box.restart"
+            | "runner.manage"
+            | "runner.status"
+            | "runner.connect"
+            | "runner.recover"
+            | "runner.revoke"
+            | "runner.forget"
+            | "box.projects"
+            | "box.token"
+            | "account.status"
+            | "account.remove"
+            | "thread.set_model"
+            | "speech.request"
+            | "speech.control"
+            | "loop.request"
+            | "loop.setup.update"
+            | "loop.settings.get"
+            | "loop.settings.set"
+            | "config.set" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -2536,6 +2571,11 @@ async fn call_async(
         "orchestrator.reset" => {
             let _: EmptyParams = params(p)?;
             hub.reset_orchestrator(caller).await
+        }
+        // Reads or sets the orchestrator's access level (`hub::orch_access`).
+        "orchestrator.access" => {
+            let p: crate::hub::orch_access::AccessParams = params(p)?;
+            hub.orchestrator_access(p.access.as_deref(), caller).await
         }
         // Waits for the previous orchestrator's handoff summary (`hub::handoff`).
         "orchestrator.use" => {

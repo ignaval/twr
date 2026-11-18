@@ -1,5 +1,5 @@
 //! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`,
-//! `/account`, `/accounts`, `/rename`, `/orch`, `/new`, `/review`, `/implement`, `/loop`,
+//! `/account`, `/accounts`, `/rename`, `/orch`, `/access`, `/new`, `/review`, `/implement`, `/loop`,
 //! `/park`, `/resume`,
 //! `/compact-context`,
 //! `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
@@ -101,6 +101,9 @@ pub enum Slash {
     },
     /// `/orch` without arguments: pick the runtime to switch the orchestrator to.
     OrchPick,
+    /// `/access [limited|full]`: show the orchestrator's access level, or set it
+    /// (`orchestrator.access`; `full` asks first, `the client`).
+    Access(Option<String>),
     /// `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]] [--implement
     /// [--setup] <task>]`: a new thread; with `--implement`, one whose first prompt is the task,
     /// run as an implementation loop (`thread.new {loop: {kind: implement, setup?}}`).
@@ -830,6 +833,8 @@ pub enum ArgKind {
     ModeOrThread,
     /// `on` or `off`.
     OnOff,
+    /// An orchestrator access level ([`ACCESS_LEVELS`]).
+    Access,
     /// A workspace name.
     Workspace,
     /// An account of the thread named before it (else of the thread dived into or selected).
@@ -917,6 +922,14 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "switch the orchestrator (y: with a summary, s: without); alone, pick its runtime; \
          alias /orchestrator",
         &[ArgKind::Runtime],
+    ),
+    (
+        "/access",
+        "/access [limited|full]",
+        "show the orchestrator's access, or set it: limited (twr's tools and a web search) or \
+         full (every tool, its shell included, without asking; asks y); applies now, after its \
+         current turn",
+        &[ArgKind::Access],
     ),
     (
         "/clear",
@@ -1130,6 +1143,12 @@ pub const MODES: &[&str] = &[
     "bypassPermissions",
 ];
 
+/// The orchestrator's access levels, as `/access` takes them, with what each gives.
+pub const ACCESS_LEVELS: &[(&str, &str)] = &[
+    ("limited", "twr's tools and a web search only"),
+    ("full", "every tool, its shell included, without asking"),
+];
+
 /// Whether command `name` (canonical) takes arguments at all.
 pub fn takes_args(name: &str) -> bool {
     COMMANDS
@@ -1282,6 +1301,13 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                 model: Some(model.clone()),
             }),
             _ => bad(),
+        },
+        "/access" => match one(args)?.as_deref() {
+            None => Ok(Slash::Access(None)),
+            Some(level) if ACCESS_LEVELS.iter().any(|(l, _)| *l == level) => {
+                Ok(Slash::Access(Some(level.to_string())))
+            }
+            Some(_) => bad(),
         },
         "/account" => {
             if let [add, runtime, name] = args {
@@ -1533,6 +1559,7 @@ pub fn complete(
         };
         let modes: Vec<String> = MODES.iter().map(|m| m.to_string()).collect();
         let on_off = ["on".to_string(), "off".into()];
+        let levels: Vec<String> = ACCESS_LEVELS.iter().map(|l| l.0.to_string()).collect();
         let read: Vec<String> = READ_WORDS.iter().map(|w| w.0.to_string()).collect();
         let loop_words: Vec<String> = LOOP_WORDS
             .iter()
@@ -1549,6 +1576,7 @@ pub fn complete(
             | ArgKind::AccountOrThread => threads,
             ArgKind::Mode => &modes[..],
             ArgKind::OnOff => &on_off[..],
+            ArgKind::Access => &levels[..],
             ArgKind::Workspace => workspaces,
             ArgKind::Read => &read[..],
             ArgKind::Account | ArgKind::Free => &[][..],
@@ -1853,6 +1881,10 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
         Some(ArgKind::Read) => READ_WORDS
             .iter()
             .map(|(w, what)| (w.to_string(), what.to_string()))
+            .collect(),
+        Some(ArgKind::Access) => ACCESS_LEVELS
+            .iter()
+            .map(|(l, what)| (l.to_string(), what.to_string()))
             .collect(),
         // (Answered before: `review_rows`, `implement_rows`, `loop_rows`.)
         Some(ArgKind::Review | ArgKind::Implement | ArgKind::Loop | ArgKind::Free) | None => {
@@ -2975,6 +3007,21 @@ mod tests {
         assert_eq!(parse("/mouse"), Ok(Slash::Mouse(None)));
         assert_eq!(parse("/mouse off"), Ok(Slash::Mouse(Some(false))));
         assert_eq!(parse("/mouse on"), Ok(Slash::Mouse(Some(true))));
+        assert_eq!(parse("/access"), Ok(Slash::Access(None)));
+        assert_eq!(
+            parse("/access full"),
+            Ok(Slash::Access(Some("full".into())))
+        );
+        assert_eq!(
+            parse("/access limited"),
+            Ok(Slash::Access(Some("limited".into())))
+        );
+        assert!(parse("/access root").is_err());
+        assert!(parse("/access full now").is_err());
+        assert_eq!(
+            complete("/access f", &[], &[], &[]).0.as_deref(),
+            Some("/access full ")
+        );
         // `/orch` alone picks the runtime; the views, pins and quitting.
         assert_eq!(parse("/orch"), Ok(Slash::OrchPick));
         assert_eq!(parse("/orchestrator"), Ok(Slash::OrchPick));

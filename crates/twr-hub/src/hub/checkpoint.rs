@@ -185,6 +185,8 @@ impl Core {
             // Memory only: what a replay read for the compacted backlog (`hub::subscribe`).
             compact_rows: _,
             orch,
+            // Memory only: the level the hub started with, then changed (`hub::orch_access`).
+            orch_access: _,
             hub_questions,
             hub_cards,
             delete_cards,

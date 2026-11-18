@@ -923,3 +923,23 @@ async fn a_device_changes_the_configuration_only_with_admin() {
     drop(rt);
     hub.shutdown().await;
 }
+
+/// The orchestrator's access level (`orchestrator.access`) is a device's to read or set only
+/// with `admin`.
+#[tokio::test]
+async fn a_device_sets_the_orchestrators_access_only_with_admin() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let d = env.devices();
+    for device in [&d.operate, &d.terminal] {
+        unauthorized(hub.orchestrator_access(Some("full"), device).await, "admin");
+        unauthorized(hub.orchestrator_access(None, device).await, "admin");
+    }
+    let r = hub
+        .orchestrator_access(Some("full"), &d.admin)
+        .await
+        .unwrap();
+    assert_eq!(r["access"], "full", "{r}");
+    assert_eq!(hub.info()["orchestrator"]["access"], "full");
+    hub.shutdown().await;
+}

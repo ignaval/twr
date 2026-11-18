@@ -1216,6 +1216,19 @@ enum OrchestratorCmd {
     /// Clear the conversation: a fresh session on the current runtime/model, no handoff.
     /// The old conversation stays in the log; workers and their attention are kept.
     Reset,
+    /// Show or set the orchestrator's access level: `limited` (twr's tools and a web search
+    /// only) or `full` (every tool a worker has, its shell included, without asking, in every
+    /// turn). Applied now, without a hub restart: a running orchestrator restarts with it on
+    /// its session, after its current turn. Kept in config.toml (`[orchestrator] access`).
+    /// Without a level: print the current one.
+    Access {
+        /// `limited` or `full`.
+        #[arg(value_parser = ["limited", "full"])]
+        level: Option<String>,
+        /// Print the raw `orchestrator.access` JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the orchestrator: its runtime and model, its thread, the configured default and
     /// the runtimes that can host it.
     Show {
@@ -2360,6 +2373,9 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         Cmd::Orchestrator {
             cmd: OrchestratorCmd::Show { json },
         } => orchestrator_show(&socket, json).await,
+        Cmd::Orchestrator {
+            cmd: OrchestratorCmd::Access { level, json },
+        } => orchestrator_access(&socket, level.as_deref(), json).await,
         Cmd::Orchestrator {
             cmd:
                 OrchestratorCmd::Use {
@@ -6840,6 +6856,61 @@ async fn orchestrator_show(socket: &Path, raw: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn orchestrator_access(socket: &Path, level: Option<&str>, raw: bool) -> anyhow::Result<()> {
+    let mut c = connect(socket).await?;
+    let params = match level {
+        Some(l) => json!({ "access": l }),
+        None => json!({}),
+    };
+    let r = c.call("orchestrator.access", params).await?;
+    if raw {
+        outln!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
+    out!("{}", orchestrator_access_text(&r));
+    if let Some(e) = r["persist_error"].as_str() {
+        errln!(
+            "twr: warning: not kept in config.toml ({e}): it applies until the hub stops; set              `[orchestrator] access` there by hand to keep it"
+        );
+    }
+    Ok(())
+}
+
+/// What full access means, in one line.
+const FULL_ACCESS_NOTE: &str = "With full access the orchestrator runs any command and uses     every tool without asking, in every turn (also the ones a watch or a hub notice starts).";
+
+/// `twr orchestrator access` for an `orchestrator.access` result: the level alone when only
+/// read, else what changed and when the orchestrator picks it up.
+fn orchestrator_access_text(r: &Value) -> String {
+    let access = str_of(&r["access"]);
+    let mut out = if r["previous"].is_null() {
+        format!("orchestrator access: {access}\n")
+    } else if r["previous"] == r["access"] {
+        format!("orchestrator access is already {access}\n")
+    } else {
+        let when = match r["restart"].as_str() {
+            Some("now") => "the orchestrator is restarting with it now, on the same conversation",
+            Some("after_turn") => {
+                "the orchestrator restarts with it when its current turn ends, on the same \
+                 conversation"
+            }
+            _ => "the orchestrator starts with it next time it runs",
+        };
+        format!(
+            "orchestrator access: {access} (was {}): {when}\n",
+            str_of(&r["previous"])
+        )
+    };
+    if r["persisted"].as_bool() == Some(true) {
+        out.push_str("Kept in config.toml.\n");
+    }
+    if access == "full" {
+        out.push_str(FULL_ACCESS_NOTE);
+        out.push('\n');
+    }
+    out
+}
+
 /// The orchestrator's runtime as `twr orchestrator show`, `twr info` and `twr orchestrator
 /// use` write it (`o`: an `orchestrator.show` object, `hub.info`'s `orchestrator`, an
 /// `orchestrator.use` answer), as a thread's
@@ -6902,6 +6973,15 @@ fn orchestrator_text(o: &Value) -> String {
         .filter_map(Value::as_str)
         .collect();
     out.push_str(&format!("can run on:   {}\n", runtimes.join(", ")));
+    if let Some(access) = o["access"].as_str() {
+        let pending = match o["running_access"].as_str() {
+            Some(r) if r != access => format!(" (its runtime runs {r} until its turn ends)"),
+            _ => String::new(),
+        };
+        out.push_str(&format!(
+            "access:       {access}{pending} (`twr orchestrator access` changes it)\n"
+        ));
+    }
     if let Some(n) = o["retired"].as_u64().filter(|n| *n > 0) {
         out.push_str(&format!(
             "retired:      {n} earlier orchestrator thread(s)\n"
@@ -10688,6 +10768,42 @@ mod tests {
             "--no-summary"
         ])
         .is_err());
+        for (args, want) in [
+            (&["twr", "orchestrator", "access"][..], None),
+            (&["twr", "orchestrator", "access", "full"][..], Some("full")),
+            (
+                &["twr", "orchestrator", "access", "limited"][..],
+                Some("limited"),
+            ),
+        ] {
+            let c = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(
+                    c.cmd,
+                    Some(Cmd::Orchestrator {
+                        cmd: OrchestratorCmd::Access { ref level, json: false }
+                    }) if level.as_deref() == want
+                ),
+                "{args:?}"
+            );
+        }
+        assert!(Cli::try_parse_from(["twr", "orchestrator", "access", "root"]).is_err());
+        assert_eq!(
+            orchestrator_access_text(&json!({"access": "limited"})),
+            "orchestrator access: limited\n"
+        );
+        let set = orchestrator_access_text(&json!({
+            "access": "full", "previous": "limited", "persisted": true, "restart": "after_turn"
+        }));
+        assert!(set.starts_with("orchestrator access: full (was limited): the orchestrator restarts with it when its current turn ends"), "{set}");
+        assert!(
+            set.contains("Kept in config.toml.") && set.contains("without asking, in every turn"),
+            "{set}"
+        );
+        let same = orchestrator_access_text(&json!({
+            "access": "limited", "previous": "limited", "persisted": false, "restart": "none"
+        }));
+        assert_eq!(same, "orchestrator access is already limited\n");
         let c = Cli::try_parse_from(["twr", "orchestrator", "show", "--json"]).unwrap();
         assert!(matches!(
             c.cmd,

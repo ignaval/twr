@@ -358,7 +358,9 @@ pub struct OrchestratorConfig {
     /// orchestrator use <runtime>:<account>` switches it (the switch is kept in the log).
     pub account: Option<Pin>,
     /// What the orchestrator's own tools may do ([`OrchestratorAccess`]; default `limited`).
-    /// Read each time its runtime starts, from the configuration the hub started with.
+    /// The level the hub starts with; `orchestrator.access` changes it while the hub runs (and
+    /// writes it back here), the orchestrator's runtime restarting with it after its turn
+    /// (`twr-hub`'s `hub::orch_access`).
     pub access: OrchestratorAccess,
 }
 

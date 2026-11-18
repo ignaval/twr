@@ -59,7 +59,19 @@ What stays the same: the hub's refusals (the relay rule, modes, deletions, the m
 
 A Claude Code orchestrator with full access also gets a `PreToolUse` hook, `twr claude-memory-guard --protect <path>`, on Write, Edit, MultiEdit and NotebookEdit. It denies a write into twr's own files: the directory of `config.toml`, `config.toml` and `boxes.toml` themselves (also where a link points), the data directory (with the worktrees and the orchestrator's memory in it), and `TWR_HOME`. Paths are resolved the way the memory guard resolves them, letter case doesn't count, and whatever the hook can't decide is denied. Reads aren't hooked. This covers the file tools only: its shell can still change any of those files, so the hook catches a mistake, not an attack. When the hub doesn't know the `twr` binary, or Claude Code's managed settings would keep the hook from running, the orchestrator starts with full access and no hook, and the hub logs a warning.
 
-The level is read each time the orchestrator's runtime starts, from the configuration the hub started with. So after you change it, restart the hub (`twr hub stop`, then `twr`); a running orchestrator keeps what it started with until then. The hub reports it as the orchestrator's `access` (`hub.info`, `orchestrator.show`), and `config.show` shows it too, so the orchestrator itself sees it with `hub_info` and `show_config`. A Claude Code orchestrator you attach gets the same as its runtime does. [security-model.md](security-model.md#full-access) says what full access gives up.
+#### Changing the level
+
+Change it while the hub runs, from any of these:
+
+- `/access full` or `/access limited` in the TUI (`/access` alone says the current level), or its settings' Orchestrator access row.
+- `twr orchestrator access full` (or `limited`; no level prints the current one).
+- The apps' Settings, and their command palette's `access`.
+- The orchestrator itself, when you ask it: its `set_config` puts `orchestrator.access` on a confirm card, which applies it the same way once you confirm.
+- `[orchestrator] access` in `config.toml`, by hand: read when the hub starts.
+
+Switching to full access asks you to confirm first everywhere but the CLI and the config file; switching back to limited doesn't. A change applies without a hub restart. An idle orchestrator restarts with the new level at once; a busy one finishes its current turn first, and is never cut off in the middle of one. Either way it resumes its session, so the conversation goes on with the new tools, mode and system prompt. If you change the level twice during one turn, the last change wins, and changing it back means no restart. A switch or reset under way (`twr orchestrator use`, `/clear`) starts the new orchestrator with the level as it is then. The level is written to `config.toml` (`[orchestrator] access`, the rest of the file kept as it was), so the next hub keeps it. If it can't be written (no config file, `[orchestrator]` written as an inline table, a file twr can't write), it still applies until the hub stops, and you're told why it wasn't kept. Every change is a line in the orchestrator's conversation (`config.changed`).
+
+The hub reports the level as the orchestrator's `access` (`hub.info`, `orchestrator.show`), right away, and `running_access` says what its runtime runs until it restarts. `config.show` shows the level the hub started with, so the orchestrator itself sees it with `hub_info` and `show_config`. A Claude Code orchestrator you attach gets the same as its runtime does. [security-model.md](security-model.md#full-access) says what full access gives up.
 
 ## Reading your projects
 
@@ -233,6 +245,7 @@ Each change is a line in the orchestrator's conversation, such as `set tui.sugge
 | `voice.model`, `voice.language`, `voice.timeout_secs`, `voice.engine`, `voice.whisper` | with the next recording voice mode recognizes |
 | `voice.pause_ms`, `voice.listen_while_speaking` | the next time voice mode starts in the desktop app |
 | `orchestrator.runtime`, `model`, `effort`, `account` | only for a first orchestrator: the current one keeps its own (`twr orchestrator use` switches it) |
+| `orchestrator.access` | now: the orchestrator restarts with it, after its current turn if one is running ([Changing the level](#changing-the-level)) |
 | everything else, `threads.thinking` included | when the hub restarts (`twr hub stop`, then `twr`) |
 
 To read the current values, the orchestrator uses `show_config`: what the hub loaded when it started, and under `preferences` the keys it changes at once as the file has them now. The `set_config` description carries the rule in these words:

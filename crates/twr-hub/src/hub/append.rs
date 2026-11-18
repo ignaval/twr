@@ -573,7 +573,7 @@ impl Core {
                         twr.insert(
                             "prompt_fingerprint".into(),
                             serde_json::json!(super::orch::prompt_fingerprint(
-                                hub.config.orchestrator.access
+                                self.orch_runtime_access()
                             )),
                         );
                     }

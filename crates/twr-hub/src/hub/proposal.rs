@@ -568,7 +568,15 @@ impl Core {
                 Staged::Move(thread) => {
                     self.apply_settings(hub, thread, &mut None);
                 }
-                Staged::Answer(_) | Staged::Config(_) => {}
+                // The orchestrator's access applies now, as the user's own change does
+                // (`hub::orch_access`).
+                Staged::Config(rec) => {
+                    let key = config_set::parse_key(&rec.key).unwrap_or_default();
+                    if let Some(to) = config_set::access_change(&key, &rec.value) {
+                        self.apply_access(hub, to, caller.source());
+                    }
+                }
+                Staged::Answer(_) => {}
             }
         }
         done.events

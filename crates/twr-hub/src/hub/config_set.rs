@@ -45,6 +45,7 @@
 //! starts, and so on.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use twr_core::config_edit::{self, Current, Scalar};
@@ -76,6 +77,9 @@ pub(super) enum Effect {
     /// `[orchestrator] runtime`, `model`, `effort`, `account`: they pick the first
     /// orchestrator only; the current one keeps its own.
     FirstOrchestrator,
+    /// `[orchestrator] access`: now, the orchestrator restarting with it after its running
+    /// turn (`hub::orch_access`).
+    OrchestratorAccess,
     /// Everything else: the hub reads it when it starts.
     HubRestart,
 }
@@ -98,6 +102,9 @@ impl Effect {
                 "only for a first orchestrator, when the hub makes one: the current orchestrator \
                  keeps its own (`twr orchestrator use` switches it)"
             }
+            Effect::OrchestratorAccess => {
+                "now: the orchestrator restarts with it (after its current turn, if one is running)"
+            }
             Effect::HubRestart => "when the hub restarts (`twr hub stop`, then `twr`)",
         }
     }
@@ -113,6 +120,7 @@ impl Effect {
             ["orchestrator", "runtime" | "model" | "effort" | "account"] => {
                 Effect::FirstOrchestrator
             }
+            ["orchestrator", "access"] => Effect::OrchestratorAccess,
             _ => Effect::HubRestart,
         }
     }
@@ -470,6 +478,17 @@ pub(super) fn preferences(hub: &Inner) -> Value {
     Value::Object(out)
 }
 
+/// The access level a change of key `key` (its parts) to `value` sets the orchestrator to, when
+/// it is `orchestrator.access` (`hub::orch_access`).
+pub(super) fn access_change(
+    key: &[String],
+    value: &Value,
+) -> Option<twr_core::config::OrchestratorAccess> {
+    (key.len() == 2 && key[0] == "orchestrator" && key[1] == "access")
+        .then(|| super::orch_access::parse(value))
+        .flatten()
+}
+
 /// What `config.set` takes.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -524,7 +543,7 @@ impl Core {
     /// [`Hub::config_set`] under the core lock.
     fn config_set(
         &mut self,
-        hub: &Inner,
+        hub: &Arc<Inner>,
         key: &str,
         value: &Value,
         caller: &Caller,
@@ -601,6 +620,11 @@ impl Core {
             if let Err(e) = self.append(hub, &orch, turn, Source::Hub, rec) {
                 tracing::warn!(error = %e, key = %name, "could not record a config change");
             }
+        }
+        // The orchestrator's access applies now (`hub::orch_access`); only the user gets
+        // here with it (the orchestrator's goes on the card).
+        if let Some(to) = access_change(&parts, &value) {
+            out["restart"] = json!(self.apply_access(hub, to, caller.source()));
         }
         out["status"] = json!("applied");
         Ok(out)
@@ -849,6 +873,6 @@ mod tests {
         assert_eq!(e("voice.pause_ms"), Effect::VoiceStart);
         assert_eq!(e("threads.thinking"), Effect::HubRestart);
         assert_eq!(e("orchestrator.model"), Effect::FirstOrchestrator);
-        assert_eq!(e("orchestrator.access"), Effect::HubRestart);
+        assert_eq!(e("orchestrator.access"), Effect::OrchestratorAccess);
     }
 }

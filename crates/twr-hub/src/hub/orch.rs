@@ -1802,9 +1802,13 @@ impl Core {
                 // `[orchestrator] runtime` is set: `runtime` is not just `default_runtime`.
                 "explicit": hub.config.orchestrator.runtime.is_some(),
             },
-            // `[orchestrator] access` as the hub started with it: what the orchestrator's
-            // runtime gets each time it starts ([`restrict`]).
-            "access": hub.config.orchestrator.access.as_str(),
+            // The access level (`hub::orch_access`): `[orchestrator] access` as the hub
+            // started with it, or as changed since; what the orchestrator's runtime gets each
+            // time it starts ([`restrict`]).
+            "access": self.orch_access.level.as_str(),
+            // The level its live runtime started with (null: none runs): another one only
+            // while it waits for its turn to end to restart with `access`.
+            "running_access": self.orch_live_access().map(|a| a.as_str()),
             "retired": self.registry.list().iter().filter(|v| v.retired).count(),
             "runtimes": hub.orchestrator_runtimes(),
         });
@@ -2029,7 +2033,9 @@ impl Core {
                 }
             }
             // Stopped, parked or handed to the user: what was queued is dropped. A crash keeps
-            // the queue (it goes out once the orchestrator runs again).
+            // the queue (it goes out once the orchestrator runs again), and so does a restart
+            // in new settings (an access change, `hub::orch_access`): it runs again at once.
+            EventBody::ThreadStopped(p) if self.is_orch(&ev.thread) && is_settings_restart(p) => {}
             EventBody::ThreadStopped(_)
             | EventBody::ThreadParked(_)
             | EventBody::ThreadAttached(_)
@@ -2458,6 +2464,11 @@ impl Core {
         if !self.may_take_turn(&orch) || self.store.pending_count(&orch)? > 0 {
             return Ok(());
         }
+        // A runtime that started with another access level is restarted first
+        // (`hub::orch_access`): the notices go to the new one.
+        if self.restart_for_settings(hub, &orch)? {
+            return Ok(());
+        }
         // A new orchestrator's handoff goes first; the notices follow its turn.
         if self.deliver_pending_handoff(hub, &orch)?.is_some() {
             return Ok(());
@@ -2593,7 +2604,7 @@ impl Core {
     ) -> anyhow::Result<Option<OrchSpawn>> {
         self.orch.token = None;
         let token = new_token()?;
-        let access = hub.config.orchestrator.access;
+        let access = self.orch_access.level;
         cfg.system_append = Some(system_prompt(access));
         cfg.refresh_system_prompt = true;
         cfg.env.push((
@@ -2694,7 +2705,7 @@ impl Core {
             hub.twr_exe.as_deref(),
             &policy,
             memory.as_deref(),
-            hub.config.orchestrator.access,
+            self.orch_access.level,
             &twr_own_paths(hub),
         );
         cfg.system_append = None;
@@ -2808,7 +2819,7 @@ impl Core {
         let mode = orchestrator_mode(
             &runtime,
             &hub.config.threads.default_mode,
-            hub.config.orchestrator.access,
+            self.orch_access.level,
         );
         let mut twr = json!({ "role": "orchestrator" });
         if !notices.is_empty() {

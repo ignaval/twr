@@ -1544,6 +1544,49 @@ fn orchestrator_show_and_use_switch_the_runtime() {
     assert_eq!(v["retired"], 1);
 }
 
+/// `twr orchestrator access`: prints the level, sets it (said when the orchestrator picks it
+/// up, and that it is kept in config.toml, whose comments stay), says what full access means,
+/// and `twr orchestrator show` reports it.
+#[test]
+fn orchestrator_access_shows_and_sets_the_level() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let config = "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\" # mine\n";
+    std::fs::write(home.join("config.toml"), config).unwrap();
+    let _hub = start_hub(home);
+    assert_eq!(
+        ok(home, &["orchestrator", "access"]),
+        "orchestrator access: limited\n"
+    );
+    let out = ok(home, &["orchestrator", "access", "full"]);
+    assert!(
+        out.starts_with(
+            "orchestrator access: full (was limited): the orchestrator starts with it next time it runs\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("Kept in config.toml."), "{out}");
+    assert!(out.contains("runs any command"), "{out}");
+    let file = std::fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(
+        file,
+        config.replace("[orchestrator]\n", "[orchestrator]\naccess = \"full\"\n")
+    );
+    assert!(ok(home, &["orchestrator", "show"]).contains("access:       full"));
+    let out = ok(home, &["orchestrator", "access", "full"]);
+    assert!(
+        out.starts_with("orchestrator access is already full\n"),
+        "{out}"
+    );
+    let v: Value =
+        serde_json::from_str(&ok(home, &["orchestrator", "access", "limited", "--json"])).unwrap();
+    assert_eq!(v["access"], "limited");
+    assert_eq!(v["restart"], "none");
+    assert!(!twr(home, &["orchestrator", "access", "root"])
+        .status
+        .success());
+}
+
 /// Text agents (or prompts) control reaches the terminal with its control characters escaped:
 /// `--pretty`, the attention listing, `thread list` and the JSON lines of `events` (where a C1
 /// control, which JSON leaves raw, is written as `\u009b`: still the same JSON).

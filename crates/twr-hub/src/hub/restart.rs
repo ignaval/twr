@@ -52,7 +52,9 @@
 //! machinery kills (identity-checked).
 //!
 //! Not restarted: the orchestrator (its settings are its runtime's choice, `hub::orch`; the
-//! RPCs refuse it) and `pty` threads (they apply no mode; `thread.set_model` refuses them).
+//! RPCs refuse it), but for a change of its access level (`hub::orch_access`: its live runtime
+//! started with the other level; the stop says `mode_change`, a narrowing is full to limited),
+//! and `pty` threads (they apply no mode; `thread.set_model` refuses them).
 //!
 //! A runtime move is recorded on the live runtime's settings too ([`RunSettings::moved`]): a
 //! move between two agents of the same runtime (two `acp` agents or presets, or back to the
@@ -428,7 +430,12 @@ impl Core {
         let Some(view) = self.registry.get(thread) else {
             return false;
         };
-        if view.is_orchestrator() || !applies_settings(&view.runtime) {
+        // The orchestrator's settings are its runtime's choice; only its access level
+        // restarts it (`hub::orch_access`).
+        if view.is_orchestrator() {
+            return self.access_restart_due(thread);
+        }
+        if !applies_settings(&view.runtime) {
             return false;
         }
         let Some(rt) = self.rt.get(thread) else {
@@ -450,6 +457,9 @@ impl Core {
     pub(super) fn narrowing_due(&self, thread: &str) -> bool {
         if !self.restart_due(thread) {
             return false;
+        }
+        if self.orch.is_thread(thread) {
+            return self.access_narrows();
         }
         match (
             self.rt
@@ -510,7 +520,17 @@ impl Core {
             return Ok(false);
         };
         let to = RunSettings::of(view);
-        let reason = from.restart_reason(&to);
+        // The orchestrator's is an access change: a permission change, which its exit
+        // restarts on its session (`hub::orch_access`).
+        let orch = self.orch.is_thread(thread);
+        let reason = if orch {
+            MODE_RESTART_REASON
+        } else {
+            from.restart_reason(&to)
+        };
+        if orch {
+            self.orch_access.restarting = true;
+        }
         // Recorded first, like `thread.stop` (but the queue is kept): whenever the exit is
         // recorded, the thread closes as stopped, never crashed.
         let remote_stop = self.remote_stop(hub, thread);
@@ -552,13 +572,18 @@ impl Core {
     /// what happened since. A failure is logged: the thread is idle with no runtime, like
     /// after a stop.
     pub(super) fn restart_after_settings_change(&mut self, hub: &Arc<Inner>, thread: &str) {
+        // The orchestrator only after its access restart (`hub::orch_access`), and not while
+        // a switch replaces it.
+        let orch = self.orch.is_thread(thread);
+        let access_restart = orch && std::mem::take(&mut self.orch_access.restarting);
         let Some(view) = self.registry.get(thread) else {
             return;
         };
         if view.stopped
             || view.handoff_pending
             || view.session_id.is_none()
-            || view.is_orchestrator()
+            || (view.is_orchestrator() && !access_restart)
+            || (orch && self.orch.switching)
         {
             return;
         }
@@ -567,6 +592,11 @@ impl Core {
         }
         if let Err(e) = self.start_runtime(hub, thread, None) {
             tracing::error!(thread, error = %format!("{e:#}"), "cannot restart the runtime in its new settings; the next prompt starts it");
+            return;
+        }
+        // Notices queued meanwhile go to the restarted orchestrator.
+        if orch {
+            let _ = hub.notify_tx.send(());
         }
     }
 

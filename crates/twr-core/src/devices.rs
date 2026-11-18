@@ -404,6 +404,7 @@ pub const METHOD_SCOPES: &[(&str, &[&str])] = &[
             "thread.set_mode",
             "orchestrator.use",
             "orchestrator.reset",
+            "orchestrator.access",
             "box.agents",
             "box.projects",
             "box.install",

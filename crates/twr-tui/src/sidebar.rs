@@ -2724,14 +2724,86 @@ pub(crate) mod tests {
             st.handle_key(crate::app::tests::key(KeyCode::Down));
         }
         let r = rows(&mut st, 40, 20).join("\n");
-        assert!(r.contains("Wake after"), "{r}");
+        assert!(r.contains("Loops"), "{r}");
         assert!(!cells(
             &mut st,
             40,
             20,
-            &Target::Setting(crate::settings::Key::WakeAfter)
+            &Target::Setting(crate::settings::Key::Loops)
         )
         .is_empty());
+    }
+
+    /// The settings' Orchestrator access row: the level the hub last said (`hub.info` here),
+    /// changed through the hub (`orchestrator.access`), full asking `y` first in the overlay
+    /// (anything else cancels and it stays open), limited at once; nothing before the hub said
+    /// the level, nor in an agent's TUI.
+    #[test]
+    fn the_settings_change_the_orchestrators_access_through_the_hub() {
+        use crate::app::Action;
+        use crate::settings::Key;
+        use crossterm::event::KeyCode;
+        let key = |c| crate::app::tests::key(c);
+        let mut st = in_workspaces("default");
+        st.open_settings();
+        let r = rows(&mut st, 160, 50).join("\n");
+        assert!(
+            r.contains("Orchestrator access") && r.contains("[orchestrator] access"),
+            "{r}"
+        );
+        // Unknown yet: nothing to change.
+        assert!(tap(&mut st, 160, 50, &Target::Setting(Key::OrchAccess)).is_empty());
+        assert!(tap(&mut st, 160, 50, &Target::Setting(Key::OrchAccess)).is_empty());
+        assert!(st.view.status.as_deref().unwrap().contains("has not said"));
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({"orchestrator": {"access": "limited"}}),
+        );
+        let r = rows(&mut st, 160, 50).join("\n");
+        assert!(r.contains("limited · twr's tools and a web search"), "{r}");
+        assert!(r.contains("applies now"), "{r}");
+        // To full: asked first; `n` cancels and the overlay stays.
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.starts_with("Give the orchestrator full access?"),
+            "{prompt}"
+        );
+        assert!(st.handle_key(key(KeyCode::Char('n'))).is_empty());
+        assert!(st.view.confirm.is_none() && st.view.settings.is_some());
+        assert_eq!(st.view.status.as_deref(), Some("cancelled"));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('y'))),
+            vec![Action::OrchestratorAccess {
+                access: Some("full".into())
+            }]
+        );
+        assert!(st.view.settings.is_some());
+        st.apply_result(
+            "orchestrator.access",
+            &serde_json::json!({"access": "full", "previous": "limited", "persisted": true,
+                                "restart": "now"}),
+        );
+        let r = rows(&mut st, 160, 50).join("\n");
+        assert!(r.contains("full · every tool, without asking"), "{r}");
+        // Back to limited: at once.
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            vec![Action::OrchestratorAccess {
+                access: Some("limited".into())
+            }]
+        );
+        assert!(st.view.confirm.is_none());
+        // An agent's TUI changes nothing.
+        st.agent = Some("thread web's agent".into());
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("changes no setting"));
     }
 
     /// The views get the columns the docked sidebar leaves: what depends on their width (the

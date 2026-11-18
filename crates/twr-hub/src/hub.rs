@@ -155,6 +155,7 @@ mod mode;
 mod model;
 mod one_shot;
 mod orch;
+pub mod orch_access;
 mod project_read;
 mod proposal;
 mod prune;
@@ -1708,6 +1709,9 @@ struct Core {
     retry_reads: retry::RetryReads,
     /// Orchestrator bookkeeping (rebuilt from the log; the token lives only here).
     orch: orch::OrchState,
+    /// The orchestrator's access level, and what its runtime started with (`hub::orch_access`).
+    /// Memory only: `[orchestrator] access` when the hub starts.
+    orch_access: orch_access::AccessRt,
     /// Hub questions (`attention.raised` on [`HUB_THREAD`] from `say`) still open, with the
     /// message each one routes once answered (`ext.twr.pending_message`).
     hub_questions: HashMap<String, route::PendingRoute>,
@@ -2520,7 +2524,7 @@ impl Core {
         if self.is_orch(thread) {
             twr.insert(
                 "prompt_fingerprint".into(),
-                json!(orch::prompt_fingerprint(hub.config.orchestrator.access)),
+                json!(orch::prompt_fingerprint(self.orch_runtime_access())),
             );
         }
         // The orchestrator's memory, when its runtime has not got this version of it
@@ -2681,6 +2685,11 @@ impl Core {
         if let Some(r) = self.rt.get(thread) {
             cfg.env.extend(r.acp_env.iter().cloned());
         }
+        // The orchestrator's access level it starts with (`hub::orch_access`).
+        let orch_access = self
+            .orch
+            .is_thread(thread)
+            .then_some(self.orch_access.level);
         // Removed on drop: when this runtime exits, or right away if it cannot start.
         let orch_spawn = if self.orch.is_thread(thread) {
             self.orchestrator_spawn_config(hub, &view, &mut cfg)?
@@ -2758,6 +2767,11 @@ impl Core {
         // The orchestrator's token is valid from now on, and only while this runtime lives.
         if let Some(token) = orch_token {
             self.orch.arm_token(token, generation);
+        }
+        // And this runtime runs with that level; a restart for an access change is over.
+        if let Some(level) = orch_access {
+            self.orch_access.runtime = Some((generation, level));
+            self.orch_access.restarting = false;
         }
         let log_runtime = self.runtime_gen(thread);
         // A remote session's run is the hub's to name (`spawn` / `resume`): known before any

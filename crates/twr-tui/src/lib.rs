@@ -126,6 +126,29 @@ fn is_dry_run(result: &Value) -> bool {
 /// `thread.new`, `thread.stop`, `thread.park`, `thread.resume`, `thread.delete`,
 /// `trash.empty`, `trash.restore` or `orchestrator.use` did (`None` for other methods, and for a `thread.send` that started a
 /// turn: the transcript shows it).
+/// The status line of an `orchestrator.access` change: the level, when the orchestrator picks
+/// it up, and whether config.toml keeps it. `None` for a read (no `previous`).
+pub fn access_status(r: &Value) -> Option<String> {
+    let previous = r["previous"].as_str()?;
+    let access = r["access"].as_str().unwrap_or("?");
+    if previous == access {
+        return Some(format!("orchestrator access is already {access}"));
+    }
+    let when = match r["restart"].as_str() {
+        Some("now") => "the orchestrator restarts with it now",
+        Some("after_turn") => "the orchestrator restarts with it after its current turn",
+        _ => "the orchestrator starts with it next time",
+    };
+    let kept = match r["persist_error"].as_str() {
+        _ if r["persisted"].as_bool() == Some(true) => "kept in config.toml".to_string(),
+        Some(e) => format!("for this hub run only, config.toml was left alone: {e}"),
+        None => "for this hub run only".to_string(),
+    };
+    Some(format!(
+        "orchestrator access: {access} (was {previous}); {when}; {kept}"
+    ))
+}
+
 pub fn result_status(method: &str, result: &Value) -> Option<String> {
     // The hub's advisory on a call that makes, changes, restarts or starts a thread's runtime
     // (its box reports the runtime's CLI missing): said after what was done, alone when
@@ -356,6 +379,9 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                  until you answer Delete on it"
             ));
         }
+        // A change of the orchestrator's access (a read says nothing here: the view does,
+        // [`crate::app::AppState::apply_result`]).
+        "orchestrator.access" => return access_status(result),
         "orchestrator.reset" => {
             let mut msg = match result["start_error"].as_str() {
                 Some(e) => {
@@ -581,6 +607,13 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Trim { thread } => Some(("thread.trim", json!({"thread": thread}))),
         Action::CompactContext { thread } => Some(("thread.compact", json!({"thread": thread}))),
         Action::ResetOrchestrator => Some(("orchestrator.reset", json!({}))),
+        Action::OrchestratorAccess { access } => Some((
+            "orchestrator.access",
+            match access {
+                Some(a) => json!({ "access": a }),
+                None => json!({}),
+            },
+        )),
         Action::UseOrchestrator {
             runtime,
             model,
@@ -2361,6 +2394,7 @@ async fn serve_calls(
                 if FOLLOWED.contains(&method) {
                     let _ = results.followed.send((method, r));
                 } else if method == "orchestrator.reset"
+                    || method == "orchestrator.access"
                     || method == "thread.activity"
                     || method == "thread.queue"
                     || method == "message.send_now"
@@ -3024,6 +3058,7 @@ where
     state.view.model_choices = show["models"].clone();
     state.view.orch_default = orch_default;
     state.view.orch_default_account = show["account"].as_str().map(str::to_string);
+    state.view.orch_access = show["access"].as_str().map(str::to_string);
     state.view.default_runtime = crate::app::default_runtime(&show);
     state.accounts_answered(&accounts, std::time::Instant::now());
     state.view.mouse = carried.mouse;
