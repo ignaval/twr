@@ -3801,6 +3801,90 @@ fn the_memory_guard_hook_keeps_file_tools_in_the_memory_directory() {
     );
 }
 
+/// The guard of an orchestrator with full access (`--protect`, the command the hub configures,
+/// run by `sh`): a write outside twr's directories goes on (exit 0, no output), one inside
+/// them is blocked (exit 2), and so is a call that names no path or a tool it does not check.
+#[test]
+fn the_full_access_guard_hook_keeps_writes_out_of_twrs_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let config = root.join("config/twr");
+    let data = root.join("data/twr");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    // An unreadable config does not matter.
+    std::fs::write(config.join("config.toml"), "not = [valid").unwrap();
+    let settings = twr_adapters::claude_code::guard::protect_settings(
+        Path::new(TWR),
+        &[config.clone(), data.clone()],
+        None,
+    );
+    let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hook = |input: &str| {
+        let mut child = Command::new("sh")
+            .args(["-c", &command])
+            .env("TWR_HOME", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.as_bytes()).unwrap();
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    };
+    let call = |tool: &str, path: &Path| {
+        serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"file_path": path, "content": "x"},
+            "cwd": root,
+        })
+        .to_string()
+    };
+    let out = hook(&call("Write", &root.join("notes/a.md")));
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    for (tool, path) in [
+        ("Write", config.join("config.toml")),
+        ("Edit", config.join("boxes.toml")),
+        ("Write", data.join("twr.db")),
+        ("Bash", root.join("notes/a.md")),
+    ] {
+        let out = hook(&call(tool, &path));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{tool} {}: {out:?}",
+            path.display()
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("set_config"));
+    }
+    assert_eq!(hook("{").status.code(), Some(2));
+    // `--memory-dir` and `--protect` are two modes, not one.
+    let out = twr_cmd()
+        .args([
+            "claude-memory-guard",
+            "--memory-dir",
+            "/m",
+            "--protect",
+            "/p",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+}
+
 /// A guard that cannot decide within its deadline (here: input that never ends) denies, with
 /// exit 2, before Claude Code's hook timeout would let the call through.
 #[test]

@@ -16,6 +16,8 @@
 //! autostart = false
 //! model = "sonnet"          # unset = threads.model, else the runtime's default
 //! account = "work"          # the first orchestrator's account; unset = the policy's default
+//! access = "limited"        # limited (default): only twr's tools and web search; "full": every
+//!                           # tool, like a worker in bypassPermissions (read when it starts)
 //!
 //! [hub]
 //! socket = "/run/user/1000/twr/hub.sock"   # defaults to the resolved path
@@ -355,6 +357,35 @@ pub struct OrchestratorConfig {
     /// them that can be used); `None`: the policy's default, else the native account. `twr
     /// orchestrator use <runtime>:<account>` switches it (the switch is kept in the log).
     pub account: Option<Pin>,
+    /// What the orchestrator's own tools may do ([`OrchestratorAccess`]; default `limited`).
+    /// Read each time its runtime starts, from the configuration the hub started with.
+    pub access: OrchestratorAccess,
+}
+
+/// `[orchestrator] access`: what the orchestrator's runtime may do with its own tools, besides
+/// twr's (`twr-hub`'s `hub::orch::restrict`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorAccess {
+    /// twr's tools and a web search only: no shell, no file tools (Claude Code keeps Read,
+    /// Write and Edit for its memory directory), none of the user's own MCP servers, and a
+    /// mode that never runs anything else unasked.
+    #[default]
+    Limited,
+    /// Every tool, like a worker in `bypassPermissions`: its runtime's shell, files and web,
+    /// and the user's own MCP servers, plugins and apps, in every turn. A generic ACP agent is
+    /// unchanged (ACP cannot take its tools away, nor give it more than it has).
+    Full,
+}
+
+impl OrchestratorAccess {
+    /// The config spelling: `limited`, `full`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrchestratorAccess::Limited => "limited",
+            OrchestratorAccess::Full => "full",
+        }
+    }
 }
 
 impl Default for OrchestratorConfig {
@@ -369,6 +400,7 @@ impl Default for OrchestratorConfig {
             read_deny: Vec::new(),
             memory: true,
             account: None,
+            access: OrchestratorAccess::Limited,
         }
     }
 }
@@ -3610,6 +3642,26 @@ account = "gpu-work"
             let c = Config::from_toml_str(&format!("[orchestrator]\n{toml}")).unwrap();
             let want = Pin(want.into_iter().map(str::to_string).collect());
             assert_eq!(c.orchestrator_account(), Some(&want), "{toml}");
+        }
+    }
+
+    /// `[orchestrator] access` is `limited` unless the config says `full`; anything else is
+    /// refused.
+    #[test]
+    fn the_orchestrators_access_is_limited_by_default() {
+        let d = Config::from_toml_str("").unwrap();
+        assert_eq!(d.orchestrator.access, OrchestratorAccess::Limited);
+        for (toml, want) in [
+            ("access = \"limited\"", OrchestratorAccess::Limited),
+            ("access = \"full\"", OrchestratorAccess::Full),
+        ] {
+            let c = Config::from_toml_str(&format!("[orchestrator]\n{toml}")).unwrap();
+            assert_eq!(c.orchestrator.access, want, "{toml}");
+            assert_eq!(format!("access = \"{}\"", want.as_str()), toml);
+        }
+        for bad in ["\"Full\"", "\"bypass\"", "true"] {
+            let err = Config::from_toml_str(&format!("[orchestrator]\naccess = {bad}"));
+            assert!(err.is_err(), "{bad}");
         }
     }
 

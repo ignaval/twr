@@ -24,7 +24,8 @@
 //!   cannot tell what it would run. Every `mcpServer/startupStatus/updated` naming a server
 //!   outside the set ends it too ([`Translator::translate`]: `fatal`), in case a server came
 //!   from somewhere `config/read` does not list. Plugins and apps, which bring servers of their
-//!   own, are turned off by `codex::thread_config`.
+//!   own, are turned off by `codex::thread_config`. A thread that keeps the user's own servers
+//!   (`Open::keep_own_mcp`, the orchestrator with full access) has no allowlist: none of this.
 //! - A turn is `turn/start{threadId, input}`; its response carries `turn.id`, and
 //!   `turn/completed{turn{status, error, durationMs}}` ends it. Every notification of the turn
 //!   carries `turnId`. Sends are queued here and started one at a time: `turn/start` during a
@@ -197,6 +198,9 @@ pub struct Open {
     /// config first (`config/read`) and puts those before twr's; when the read fails, twr's
     /// addition is left out instead, so the user's own instructions still apply.
     pub added_instructions: Option<String>,
+    /// The thread keeps the user's own MCP servers beside those of `params.config.mcp_servers`
+    /// (`SpawnConfig::keep_own_mcp`): no allowlist (module docs, "MCP allowlist").
+    pub keep_own_mcp: bool,
 }
 
 impl Open {
@@ -465,6 +469,7 @@ impl Translator {
             .params
             .pointer("/config/mcp_servers")
             .and_then(Value::as_object)
+            .filter(|_| !open.keep_own_mcp)
             .map(|m| m.keys().cloned().collect());
         Translator {
             mcp_allow,
@@ -4012,6 +4017,7 @@ mod tests {
                 params: json!({}),
                 mode_note: None,
                 added_instructions: None,
+                keep_own_mcp: false,
             },
         );
         let cmd = format!("cargo test --workspace -- {}", "--flag ".repeat(60));
@@ -4043,6 +4049,7 @@ mod tests {
                 params: json!({}),
                 mode_note: None,
                 added_instructions: None,
+                keep_own_mcp: false,
             },
         );
         let out = t.translate(r#"{"method":"item/tool/call","id":7,"params":{}}"#);
@@ -4077,6 +4084,7 @@ mod tests {
                     "sandbox": "workspace-write"}),
                 mode_note: None,
                 added_instructions: None,
+                keep_own_mcp: false,
             },
         );
         t.start();
@@ -4102,6 +4110,7 @@ mod tests {
                         "approvalsReviewer": "user", "sandbox": "read-only"}),
                     mode_note: None,
                     added_instructions: None,
+                    keep_own_mcp: false,
                 },
             );
             t.start();
@@ -4160,6 +4169,7 @@ mod tests {
                     "sandbox": "workspace-write"}),
                 mode_note: None,
                 added_instructions: None,
+                keep_own_mcp: false,
             },
         );
         t.start();
@@ -4446,6 +4456,7 @@ mod tests {
                 params: params.clone(),
                 mode_note: None,
                 added_instructions: None,
+                keep_own_mcp: false,
             },
         );
         t.start();
@@ -4475,6 +4486,7 @@ mod tests {
                 params: params.clone(),
                 mode_note: None,
                 added_instructions: None,
+                keep_own_mcp: false,
             },
         );
         t2.start();
@@ -4502,6 +4514,7 @@ mod tests {
             params,
             mode_note: None,
             added_instructions: Some("NOTE".into()),
+            keep_own_mcp: false,
         };
         let start = |params: Value, config_reply: &str| {
             let mut t = Translator::new(TranslatorOptions::default(), open(params));

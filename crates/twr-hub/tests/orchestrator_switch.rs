@@ -189,6 +189,7 @@ impl Adapter for OrchAdapter {
                 "settings": cfg.settings,
                 "mcp_config": cfg.mcp_config,
                 "mcp_config_file": cfg.mcp_config_file,
+                "keep_own_mcp": cfg.keep_own_mcp,
                 "env": cfg.env,
             })
             .to_string(),
@@ -396,7 +397,12 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
     if rt.runtime == "claude-code" {
         assert_eq!(
             rt.cfg.builtin_tools,
-            Some(vec!["Read".into(), "Write".into(), "Edit".into()])
+            Some(vec![
+                "Read".into(),
+                "Write".into(),
+                "Edit".into(),
+                "WebSearch".into()
+            ])
         );
         assert_eq!(
             rt.cfg.settings,
@@ -405,11 +411,27 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
                 None
             ))
         );
+    } else if rt.runtime == "acp" {
+        // ACP cannot restrict its tools: asked for none, as before.
+        assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()));
+        assert_eq!(rt.cfg.settings, None);
     } else {
-        assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()), "{}", rt.runtime);
+        // A web search alone.
+        assert_eq!(
+            rt.cfg.builtin_tools,
+            Some(vec!["WebSearch".into()]),
+            "{}",
+            rt.runtime
+        );
         assert_eq!(rt.cfg.settings, None, "{}", rt.runtime);
     }
-    assert_eq!(rt.cfg.allowed_tools, vec!["mcp__twr".to_string()]);
+    let allowed: &[&str] = if rt.runtime == "acp" {
+        &["mcp__twr"]
+    } else {
+        &["mcp__twr", "WebSearch"]
+    };
+    assert_eq!(rt.cfg.allowed_tools, allowed, "{}", rt.runtime);
+    assert!(!rt.cfg.keep_own_mcp, "{}", rt.runtime);
     assert!(rt
         .cfg
         .system_append
@@ -1343,12 +1365,19 @@ async fn attaching_the_orchestrator_keeps_its_restrictions() {
         assert_eq!(grant.argv[0], "orch-attach", "{runtime}");
         let asked: Value = serde_json::from_str(&grant.argv[2]).unwrap();
         assert_eq!(asked["mode"], "dontAsk", "{runtime}");
-        assert_eq!(asked["builtin_tools"], json!(["Read", "Write", "Edit"]));
+        assert_eq!(
+            asked["builtin_tools"],
+            json!(["Read", "Write", "Edit", "WebSearch"])
+        );
         assert_eq!(
             asked["settings"]["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             "'/opt/twr/bin/twr' claude-memory-guard || exit 2"
         );
-        assert_eq!(asked["allowed_tools"], json!(["mcp__twr"]), "{runtime}");
+        assert_eq!(
+            asked["allowed_tools"],
+            json!(["mcp__twr", "WebSearch"]),
+            "{runtime}"
+        );
         assert_eq!(
             asked["mcp_config"],
             json!({ "mcpServers": {} }),
@@ -1364,6 +1393,101 @@ async fn attaching_the_orchestrator_keeps_its_restrictions() {
         );
         hub.attach_end(&id, "test", grant.lease, None).unwrap();
     }
+    hub.shutdown().await;
+}
+
+/// `[orchestrator] access = "full"`: every orchestrator runtime but a generic ACP agent runs
+/// like a worker in bypass (recorded on its thread), with every built-in tool and the user's
+/// own MCP servers beside twr's, its own memory still off and twr's tools still allowed; Claude
+/// Code's file tools are guarded off twr's own files, and attaching it carries the same. The
+/// hub reports the access level. ACP is as with limited access.
+#[tokio::test]
+async fn full_access_runs_the_orchestrator_like_a_worker_in_bypass() {
+    use twr_core::config::OrchestratorAccess;
+    let mut env = Env::new();
+    let hub = Hub::open(env.opts(|c| c.orchestrator.access = OrchestratorAccess::Full))
+        .await
+        .unwrap();
+    assert_eq!(hub.info()["orchestrator"]["access"], "full");
+    let r = hub.say("watch the builds", None, &tui()).await.unwrap();
+    let id = r["thread"].as_str().unwrap().to_string();
+    let mut claude = env.orch().await;
+    let cfg = claude.cfg.clone();
+    assert_eq!(cfg.mode, "bypassPermissions");
+    assert_eq!(thread_json(&hub, &id)["mode"], "bypassPermissions");
+    assert_eq!(cfg.builtin_tools, None);
+    assert!(cfg.keep_own_mcp && cfg.native_memory_off);
+    assert_eq!(cfg.allowed_tools, ["mcp__twr", "WebSearch"]);
+    assert!(
+        cfg.mcp_config_file.is_some(),
+        "twr's server, with its token"
+    );
+    assert!(cfg
+        .env
+        .contains(&("CLAUDE_CODE_DISABLE_ATTACHMENTS".into(), "1".into())));
+    let sys = cfg.system_append.as_deref().unwrap();
+    assert!(sys.contains("You have full access") && sys.contains("set_config"));
+    assert!(!sys.contains("You write no code"));
+    let settings = cfg.settings.as_ref().unwrap();
+    let hook = &settings["hooks"]["PreToolUse"][0];
+    assert_eq!(hook["matcher"], "Write|Edit|MultiEdit|NotebookEdit");
+    let command = hook["hooks"][0]["command"].as_str().unwrap();
+    let data = env.path().join("data");
+    assert!(
+        command.starts_with("'/opt/twr/bin/twr' claude-memory-guard --protect ")
+            && command.contains(&format!("--protect '{}'", data.display()))
+            && command.ends_with(" || exit 2"),
+        "{command}"
+    );
+    // Attached, the same.
+    hub.send_by(&id, "hello", &tui()).unwrap();
+    let (_, t) = claude.next_turn().await;
+    claude.end_turn(t);
+    let grant = timeout(WAIT, async {
+        loop {
+            match hub.attach_begin(&id, true, "test").await {
+                Err(e) if e.message.contains("no runtime session") => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                other => return other,
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let asked: Value = serde_json::from_str(&grant.argv[2]).unwrap();
+    assert_eq!(asked["mode"], "bypassPermissions");
+    assert_eq!(asked["builtin_tools"], Value::Null);
+    assert_eq!(asked["keep_own_mcp"], true);
+    assert_eq!(asked["settings"], *settings);
+    assert_eq!(asked["mcp_config"], json!({ "mcpServers": {} }));
+    hub.attach_end(&id, "test", grant.lease, None).unwrap();
+    // The attached one is not running: each new one starts on a message.
+    for runtime in ["codex", "grok-build"] {
+        let r = switch(&hub, runtime, None, quick()).await;
+        let id = r["thread"].as_str().unwrap();
+        hub.send_by(id, "hello", &tui()).unwrap();
+        let mut rt = env.orch().await;
+        let (_, t) = rt.next_turn().await;
+        rt.end_turn(t);
+        assert_eq!(rt.cfg.mode, "bypassPermissions", "{runtime}");
+        assert_eq!(
+            thread_json(&hub, id)["mode"],
+            "bypassPermissions",
+            "{runtime}"
+        );
+        assert_eq!(rt.cfg.builtin_tools, None, "{runtime}");
+        assert_eq!(rt.cfg.settings, None, "{runtime}");
+        assert!(rt.cfg.keep_own_mcp && rt.cfg.native_memory_off, "{runtime}");
+        assert_eq!(rt.cfg.allowed_tools, ["mcp__twr", "WebSearch"], "{runtime}");
+    }
+    let r = switch(&hub, "acp:agent --stdio", None, quick()).await;
+    let acp = env.orch().await;
+    assert_eq!(r["runtime"], "acp");
+    assert_eq!(acp.cfg.mode, "manual");
+    assert_eq!(acp.cfg.builtin_tools, Some(Vec::new()));
+    assert!(!acp.cfg.keep_own_mcp);
     hub.shutdown().await;
 }
 

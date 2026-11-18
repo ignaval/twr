@@ -1774,14 +1774,38 @@ fn args_for_the_orchestrator() {
             "tools": ["search_tool", "use_tool"]})
     );
     assert_eq!(grok_build::denied_builtins(&cfg), grok_build::BUILTIN_DENY);
-    // Some built-ins, or no restriction: nothing denied.
-    for builtin_tools in [None, Some(vec!["Bash".to_string()])] {
-        let cfg = SpawnConfig {
-            builtin_tools,
-            ..Default::default()
-        };
-        assert!(!build_args(&cfg).contains(&"--deny".to_string()));
-    }
+    // No restriction: nothing denied, no profile.
+    let open = SpawnConfig::default();
+    assert!(!build_args(&open).contains(&"--deny".to_string()));
+    assert_eq!(agent_profile(&open), None);
+    // Some built-ins: every other one denied. The orchestrator's web search: everything but
+    // WebSearch, whose grok tool is in the profile.
+    let some = |tools: &[&str]| SpawnConfig {
+        builtin_tools: Some(tools.iter().map(|t| t.to_string()).collect()),
+        ..Default::default()
+    };
+    assert_eq!(
+        grok_build::denied_builtins(&some(&["Bash"])),
+        [
+            "Read",
+            "Edit",
+            "Write",
+            "Grep",
+            "Glob",
+            "WebFetch",
+            "WebSearch"
+        ]
+    );
+    let web = some(&["WebSearch"]);
+    assert_eq!(
+        grok_build::denied_builtins(&web),
+        ["Bash", "Read", "Edit", "Write", "Grep", "Glob", "WebFetch"]
+    );
+    assert_eq!(
+        agent_profile(&web).unwrap()["tools"],
+        json!(["search_tool", "use_tool", "web_search"])
+    );
+    assert!(grok_build::denied_builtins(&some(grok_build::BUILTIN_DENY)).is_empty());
     // Some built-ins: grok's names for them (unknown names taken as grok names).
     assert_eq!(
         profile_tools(&[

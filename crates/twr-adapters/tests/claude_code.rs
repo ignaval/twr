@@ -1849,6 +1849,19 @@ fn args_for_new_and_resumed_sessions() {
     assert!(joined.contains("--append-system-prompt be brief"));
     assert!(joined.contains("--mcp-config {\"mcpServers\":{}} --strict-mcp-config"));
     assert!(joined.ends_with("--allowedTools mcp__twr__send,Read"));
+    // Keeping the user's own servers (the orchestrator with full access): no strict flag, and
+    // with no built-in tool list, no `--tools` (every one).
+    let own = SpawnConfig {
+        keep_own_mcp: true,
+        mode: "bypassPermissions".into(),
+        ..cfg.clone()
+    };
+    let a = build_args(&own, "11111111-2222-4333-8444-555555555555");
+    let joined = a.join(" ");
+    assert!(joined.contains("--permission-mode bypassPermissions"));
+    assert!(joined.contains("--mcp-config {\"mcpServers\":{}} --allowedTools"));
+    assert!(!a.contains(&"--strict-mcp-config".to_string()));
+    assert!(!a.contains(&"--tools".to_string()));
 
     let cfg = SpawnConfig {
         resume_session: Some("abc".into()),

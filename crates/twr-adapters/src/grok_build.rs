@@ -50,12 +50,13 @@
 //! after the model ([`EFFORTS`]; an unknown value fails the session); `allowed_tools` → `--allow` (effective for built-in tool rules such as
 //! `Bash(git *)`, not for MCP tools); `builtin_tools: Some(list)` → `_meta.agentProfile` with
 //! `tools` = grok's MCP meta-tools (`search_tool`, `use_tool`) plus the grok names of the
-//! listed tools ([`profile_tools`]). With `Some([])` (the orchestrator) the model has no
-//! shell, file or web tool at all (verified: asked to run `ls` it reports no shell tool) and
-//! still reaches its MCP servers; each MCP call asks for permission unless the mode is
-//! bypass (grok ignores MCP allow rules), so a grok orchestrator in `default` mode raises an
-//! attention item per twr tool call. Every [`BUILTIN_DENY`] name also gets `--deny` (not
-//! enforced by 1.0.44 in `agent stdio`, kept for the TUI `attach` and later versions).
+//! listed tools ([`profile_tools`]). With `Some([])` the model has no shell, file or web tool
+//! at all (verified: asked to run `ls` it reports no shell tool) and still reaches its MCP
+//! servers; the orchestrator's `Some(["WebSearch"])` adds `web_search` alone (not verified
+//! live). Each MCP call asks for permission unless the mode is bypass (grok ignores MCP allow
+//! rules), so a grok orchestrator in `default` mode raises an attention item per twr tool
+//! call. Every [`BUILTIN_DENY`] name the list leaves out also gets `--deny` (not enforced by
+//! 1.0.44 in `agent stdio`, kept for the TUI `attach` and later versions).
 //! `--no-leader` keeps the agent in this process (a shared leader would outlive `stop` and
 //! escape the process-group kill).
 //!
@@ -241,9 +242,9 @@ fn mode_of(cfg: &SpawnConfig) -> &'static str {
 
 /// Every tool name grok's permission rules recognize except `MCPTool` (grok 1.0.44 docs,
 /// "Tool Names": `Bash`, `Read`, `Edit` (and `Write`), `Grep` (and `Glob`), `MCPTool`,
-/// `WebFetch`, `WebSearch`). With `builtin_tools: Some([])` each gets a `--deny` rule, which
-/// grok 1.0.44 does not enforce in `agent stdio` (the agent profile is what restricts the
-/// tools there, see [`agent_profile`]).
+/// `WebFetch`, `WebSearch`). With `builtin_tools: Some(list)` each one the list does not name
+/// gets a `--deny` rule, which grok 1.0.44 does not enforce in `agent stdio` (the agent profile
+/// is what restricts the tools there, see [`agent_profile`]).
 pub const BUILTIN_DENY: &[&str] = &[
     "Bash",
     "Read",
@@ -262,13 +263,17 @@ pub const MCP_META_TOOLS: &[&str] = &["search_tool", "use_tool"];
 /// Name of the agent profile twr sends with `builtin_tools`.
 pub const PROFILE_NAME: &str = "twr-restricted";
 
-/// The `--deny` rules for `cfg`: [`BUILTIN_DENY`] when it allows no built-in tool.
+/// The `--deny` rules for `cfg`: with `builtin_tools: Some(list)`, every [`BUILTIN_DENY`] name
+/// the list does not name (all of them for `Some([])`); none with `None`.
 pub fn denied_builtins(cfg: &SpawnConfig) -> Vec<String> {
-    if cfg.builtin_tools.as_ref().is_some_and(Vec::is_empty) {
-        BUILTIN_DENY.iter().map(|t| t.to_string()).collect()
-    } else {
-        Vec::new()
-    }
+    let Some(allowed) = &cfg.builtin_tools else {
+        return Vec::new();
+    };
+    BUILTIN_DENY
+        .iter()
+        .filter(|t| !allowed.iter().any(|a| a.trim() == **t))
+        .map(|t| t.to_string())
+        .collect()
 }
 
 /// grok's tool names for twr's (Claude's) built-in tool names; a name twr does not know is
@@ -327,8 +332,9 @@ pub fn agent_profile(cfg: &SpawnConfig) -> Option<Value> {
 }
 
 /// The top-level options fixing what the session may do: `--no-auto-update`,
-/// `--permission-mode`, `--allow` per `allowed_tools` rule and, with no built-in tools at
-/// all (`Some([])`, e.g. the orchestrator), a `--deny` per [`BUILTIN_DENY`] name.
+/// `--permission-mode`, `--allow` per `allowed_tools` rule and, with a list of built-in tools
+/// (`Some`, e.g. the orchestrator's), a `--deny` per [`BUILTIN_DENY`] name it leaves out
+/// ([`denied_builtins`]).
 fn permission_args(cfg: &SpawnConfig) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "--no-auto-update".into(),

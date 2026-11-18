@@ -6,7 +6,7 @@
 //! claude -p --input-format stream-json --output-format stream-json --verbose
 //!   --include-partial-messages --permission-mode <mode> [--permission-prompts host]
 //!   --permission-prompt-tool stdio (--resume <id> | --session-id <new uuid v4>)
-//!   [--model M] [--effort E] [--append-system-prompt S] [--mcp-config <json> --strict-mcp-config]
+//!   [--model M] [--effort E] [--append-system-prompt S] [--mcp-config <json> [--strict-mcp-config]]
 //!   [--allowedTools a,b] [--tools <built-in tools, "" = none>] [--settings <json>]
 //! ```
 //!
@@ -352,7 +352,11 @@ fn tool_args(cfg: &SpawnConfig) -> Vec<String> {
         _ => None,
     };
     if let Some(mcp) = mcp {
-        a.extend(["--mcp-config".into(), mcp, "--strict-mcp-config".into()]);
+        a.extend(["--mcp-config".into(), mcp]);
+        // Without it the user's own servers load beside these (`keep_own_mcp`).
+        if !cfg.keep_own_mcp {
+            a.push("--strict-mcp-config".into());
+        }
     }
     if !cfg.allowed_tools.is_empty() {
         a.extend(["--allowedTools".into(), cfg.allowed_tools.join(",")]);

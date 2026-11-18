@@ -6,6 +6,8 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 ### Added
 
+- The orchestrator can search the web (Claude Code's WebSearch, Codex's web search on cached results, Grok Build's web search), on every runtime but a generic ACP agent. It gets no page fetching, and it's told to read results as data, never instructions.
+- `[orchestrator] access = "full"` runs the orchestrator like a worker in `bypassPermissions`, in every turn: its runtime's shell, files and web and your own MCP servers, with nothing asking first. A Claude Code orchestrator's file tools still may not write twr's own config and data files (`twr claude-memory-guard --protect`), though its shell can. The default, `"limited"`, keeps today's limits. See [orchestrator.md](docs/orchestrator.md#full-access) and [security-model.md](docs/security-model.md#full-access).
 - In the desktop and phone apps, every conversation keeps the first line of your latest message above its history. Click it to jump to that message, including when automatic turns have followed it.
 
 ### Fixed

@@ -194,14 +194,20 @@ enum Cmd {
     },
     /// The Claude Code orchestrator's file guard, a `PreToolUse` hook the hub configures: reads
     /// the hook's JSON on stdin and denies Read, Write and Edit outside the session's memory
-    /// directory, and whatever it cannot decide within its deadline (a deny decision on stdout
-    /// and exit 2).
+    /// directory (with `--protect`: Write, Edit and NotebookEdit inside twr's own directories),
+    /// and whatever it cannot decide within its deadline (a deny decision on stdout and exit
+    /// 2).
     #[command(name = "claude-memory-guard", hide = true)]
     ClaudeMemoryGuard {
         /// The one memory directory to allow (the `autoMemoryDirectory` the hub set), instead
         /// of the ones derived from the session's transcript and working directory.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "protect")]
         memory_dir: Option<PathBuf>,
+        /// A directory or file of twr's own that the file-writing tools may not touch
+        /// (repeated); the guard then lets those tools write anywhere else (an orchestrator
+        /// with `[orchestrator] access = "full"`).
+        #[arg(long)]
+        protect: Vec<PathBuf>,
     },
     /// Serve the twr MCP tools on stdin/stdout for the orchestrator's runtime (logs go to
     /// stderr; stdout is the MCP channel). The hub starts it for the orchestrator with
@@ -1466,8 +1472,12 @@ fn main() -> ExitCode {
     );
     // Before anything else that could fail: a hook that exits with anything but 2 lets the
     // tool call through.
-    if let Some(Cmd::ClaudeMemoryGuard { memory_dir }) = &cli.cmd {
-        return memory_guard(memory_dir.clone());
+    if let Some(Cmd::ClaudeMemoryGuard {
+        memory_dir,
+        protect,
+    }) = &cli.cmd
+    {
+        return memory_guard(memory_dir.clone(), protect.clone());
     }
     // The hub sets the agent marker only on what it starts for a thread:
     // a hub started from an agent's shell must not pass that shell's marker on to the rest
@@ -1532,8 +1542,10 @@ fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, background: bool) {
 /// (`twr_adapters::claude_code::guard`) within the guard's deadline. A denial (outside the
 /// memory directory, stdin unreadable, a panic, no decision by the deadline) is a JSON decision
 /// on stdout and exit 2, which Claude Code blocks on either way. With `memory_dir`
-/// (`--memory-dir`), exactly that directory is allowed (`guard::check_with`).
-fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
+/// (`--memory-dir`), exactly that directory is allowed (`guard::check_with`); with `protect`
+/// (`--protect`), the file-writing tools may write anywhere but there
+/// (`guard::check_protected`).
+fn memory_guard(memory_dir: Option<PathBuf>, protect: Vec<PathBuf>) -> ExitCode {
     use std::io::Read;
     use twr_adapters::claude_code::guard;
     let read = || {
@@ -1543,7 +1555,12 @@ fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
             .read_to_string(&mut input)
             .map(|_| input)
     };
-    match guard::run_with(read, guard::deadline(), memory_dir) {
+    let policy = if protect.is_empty() {
+        guard::Policy::Memory(memory_dir)
+    } else {
+        guard::Policy::Protect(protect)
+    };
+    match guard::run_policy(read, guard::deadline(), policy) {
         Some(deny) => {
             outln!("{deny}");
             ExitCode::from(2)

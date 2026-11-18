@@ -2519,7 +2519,7 @@ impl Core {
         if self.is_orch(thread) {
             twr.insert(
                 "prompt_fingerprint".into(),
-                json!(orch::prompt_fingerprint()),
+                json!(orch::prompt_fingerprint(hub.config.orchestrator.access)),
             );
         }
         // The orchestrator's memory, when its runtime has not got this version of it
