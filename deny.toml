@@ -11,7 +11,12 @@ version = 2
 # The RustSec advisory database. A vulnerability fails the check, and so does an unmaintained
 # crate anywhere in the graph or an unsound one a workspace crate depends on directly (the
 # defaults); a yanked version warns. An `ignore` entry needs its reason.
-ignore = []
+ignore = [
+    # chrono is unmaintained (RUSTSEC-2026-0543): no vulnerability, no fixed release, and it
+    # stays in the graph through iroh/netwatch, rmcp, schemars and wmi even if twr stops using
+    # it directly. Revisit by replacing twr's own uses (jiff or time) once those move off it.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not vulnerable; required transitively by iroh, rmcp, schemars and wmi" },
+]
 
 [licenses]
 version = 2
