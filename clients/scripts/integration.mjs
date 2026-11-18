@@ -406,7 +406,11 @@ try {
     .first()
     .click();
   await page.getByRole("textbox", { name: "Message api directly" }).waitFor();
-  await page.getByText("Hello desktop", { exact: true }).waitFor();
+  // Scoped: the latest-user shortcut above the history repeats the message's first line.
+  await page
+    .locator(".conversation-scroll")
+    .getByText("Hello desktop", { exact: true })
+    .waitFor();
   await page
     .locator(".conversation-scroll")
     .getByText("Finished safely", { exact: true })

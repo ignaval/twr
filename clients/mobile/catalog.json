@@ -4535,14 +4535,33 @@
   {
     "id": "cli:voice setup",
     "title": "twr voice setup",
-    "description": "Download whisper.cpp's base.en model (148 MB) to `voice/ggml-base.en.bin` in twr's data directory, the model `[voice] model` left empty means",
+    "description": "Download a pinned whisper.cpp model to the data directory (no config changes)",
     "group": "CLI · voice",
-    "fields": [],
+    "fields": [
+      {
+        "key": "model",
+        "label": "model",
+        "type": "select",
+        "description": "Catalogue model. Omit for base.en; explicit selection ignores [voice] model [possible values: base.en, base]",
+        "advanced": false,
+        "options": [
+          "base.en",
+          "base"
+        ]
+      }
+    ],
     "cli": [
       "voice",
       "setup"
     ],
-    "cliFields": []
+    "cliFields": [
+      {
+        "key": "model",
+        "flag": "--model",
+        "many": false,
+        "separator": false
+      }
+    ]
   },
   {
     "id": "cli:voice status",

@@ -1064,6 +1064,15 @@ kbd {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* In a short window the column has no room for both: header, bar, the history's minimum and
+   the composer leave a waiting request no height at all, its answers unreachable. A request
+   for this conversation takes the bar's place until it is answered. */
+@media (max-height: 660px) {
+  .content-column:has(.conversation-attention:not(:empty))
+    .latest-user-message {
+    display: none;
+  }
+}
 .conversation-scroll {
   flex: 1;
   min-height: 40px;
