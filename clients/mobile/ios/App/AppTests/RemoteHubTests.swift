@@ -351,21 +351,27 @@ final class RemoteHubTests: XCTestCase {
           """)
         let group = "document.querySelector('.orchestrator-access [role=group]')"
         let pressed = "[...\(group).querySelectorAll('button')].find(e=>e.getAttribute('aria-pressed')==='true')?.textContent"
+        // The choices stay disabled (aria-busy) until the hub's answer is read back: a tap
+        // before then does nothing.
+        let settled = "!\(group).hasAttribute('aria-busy') && ![...\(group).querySelectorAll('button')].some(e=>e.disabled)"
         let press = { (label: String) in "[...\(group).querySelectorAll('button')].find(e=>e.textContent==='\(label)').click();return true" }
         let dialogButton = { (label: String) in "[...document.querySelectorAll('[role=dialog] button')].find(e=>e.textContent==='\(label)').click();return true" }
         try await until("return \(group) && \(pressed)==='Limited'")
+        try await until("return \(settled)")
         _ = try await js(press("Full"))
         try await until("return document.querySelector('[role=dialog]')?.textContent.includes('Give the orchestrator full access?')")
         _ = try await js(dialogButton("Cancel"))
         try await until("return !document.querySelector('[role=dialog]') && \(pressed)==='Limited'")
         let cancelled = try await hostAccess()
         XCTAssertEqual(cancelled[0], "limited", "Cancel must leave the hub at Limited")
+        try await until("return \(settled)")
         _ = try await js(press("Full"))
         try await until("return !!document.querySelector('[role=dialog]')")
         _ = try await js(dialogButton("Give full access"))
         try await until("return \(pressed)==='Full' && document.querySelector('.orchestrator-access [role=status]').textContent.includes('full access')")
         let full = try await hostAccess()
         XCTAssertEqual(full, ["full", "full"], "Full must apply on the hub and in config.toml")
+        try await until("return \(settled)")
         _ = try await js(press("Limited"))
         try await until("return !document.querySelector('[role=dialog]') && \(pressed)==='Limited' && document.querySelector('.orchestrator-access [role=status]').textContent.includes('limited access')")
         let limited = try await hostAccess()
