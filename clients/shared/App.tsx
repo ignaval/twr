@@ -1977,6 +1977,11 @@ export default function App({
         case "OrchPick":
           action("orch");
           break;
+        case "Access":
+          // `/access [limited|full]`: the palette's form, on the level named (Full still
+          // asks first); with none, on the current level.
+          action("access", args ? { access: args } : {});
+          break;
         case "Clear":
           action("clear");
           break;
