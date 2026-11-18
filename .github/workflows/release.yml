@@ -527,6 +527,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          # Whether this run attested the archives (the condition of the steps above): the
+          # notes promise attestations only then.
+          PROVENANCE: ${{ github.event_name == 'push' && needs.resolve.outputs.sha == github.sha }}
         run: |
           prerelease=false
           case "$TAG" in *-*) prerelease=true ;; esac
@@ -567,8 +570,11 @@ jobs:
           twr's release key before it installs anything, and \`install.sh\` does too where its
           \`openssl\` can (OpenSSL 3; macOS's LibreSSL can't, and checks
           \`sha256sums.txt.p256.sig\` instead where a release has it). To check by hand, see
-          [docs/install.md](https://github.com/ignaval/twr/blob/main/docs/install.md). Each
-          archive also has a build provenance attestation, which the GitHub CLI checks:
+          [docs/install.md](https://github.com/ignaval/twr/blob/main/docs/install.md).
+          NOTES
+          if [ "$PROVENANCE" = true ]; then
+            cat >> notes.md <<NOTES
+          Each archive also has a build provenance attestation, which the GitHub CLI checks:
 
           \`\`\`sh
           gh attestation verify twr-<target>.tar.gz --repo ignaval/twr \\
@@ -579,6 +585,16 @@ jobs:
           \`desktop-sha256sums.txt\`, signed in \`desktop-sha256sums.txt.sig\` with the same key,
           and have attestations too.
           NOTES
+          else
+            cat >> notes.md <<NOTES
+
+          The desktop installers of a stable release, attached once built, are listed in
+          \`desktop-sha256sums.txt\`, signed in \`desktop-sha256sums.txt.sig\` with the same key.
+
+          This release was built by hand (a rebuild run from \`main\`), so its files carry no
+          build provenance attestations: check them against the signed checksums.
+          NOTES
+          fi
           gh release create "$TAG" --verify-tag --title "twr $TAG" --generate-notes \
             --notes-file notes.md "${flags[@]}" dist/*
 
