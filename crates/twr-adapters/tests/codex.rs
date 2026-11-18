@@ -2139,6 +2139,7 @@ async fn the_runtime_never_inherits_twr_secrets() {
         cwd: dir.path().to_path_buf(),
         env: vec![
             ("TWR_THREAD".into(), "T1".into()),
+            ("BRANCH_NAME".into(), "fix/secrets".into()),
             ("TWR_ORCH_TOKEN".into(), "orch-secret".into()),
         ],
         ..Default::default()
@@ -2157,8 +2158,13 @@ async fn the_runtime_never_inherits_twr_secrets() {
     for k in ["TWR_RUNNER_TOKEN", "TWR_ORCH_TOKEN"] {
         assert!(!env.contains_key(k), "{k} leaked");
     }
-    assert!(!info["env"].to_string().contains("secret"));
+    // Ordinary values (for example a CI branch named `fix/secrets`) may contain
+    // the word "secret"; only the injected token values must be absent.
+    for secret in ["runner-secret", "orch-secret"] {
+        assert!(!info["env"].to_string().contains(secret));
+    }
     assert_eq!(env["TWR_THREAD"], "T1");
+    assert_eq!(env["BRANCH_NAME"], "fix/secrets");
     drop(h);
 }
 
