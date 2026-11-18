@@ -281,6 +281,12 @@ pub struct ViewState {
     /// The account of that orchestrator (`orchestrator.show` `account`: a name, the native
     /// account's under its current one), labelled in that header as a thread's is.
     pub orch_default_account: Option<String>,
+    /// The orchestrator's access level, `limited` or `full`, as the hub last said it
+    /// (`orchestrator.show`, `hub.info`, `orchestrator.access`, a `config.changed` of
+    /// `orchestrator.access`); `None` until it did (an older hub says nothing).
+    pub orch_access: Option<String>,
+    /// `/access` without a level asked the hub: its answer goes to the status bar.
+    pub access_asked: bool,
     /// The hub's `default_runtime`, when `orchestrator.show` says it: its `configured.runtime`
     /// while no `[orchestrator] runtime` is set (`/new --account` suggestions).
     pub default_runtime: Option<String>,
@@ -1200,6 +1206,12 @@ pub enum Action {
     },
     /// A fresh orchestrator session, without a handoff (`/clear`).
     ResetOrchestrator,
+    /// Read the orchestrator's access level, or set it (`orchestrator.access`, `/access`, the
+    /// settings' Orchestrator access row).
+    OrchestratorAccess {
+        /// The level to set (`limited`, `full`); `None` reads it.
+        access: Option<String>,
+    },
     /// Leave the TUI.
     Quit,
     /// Answer an attention item with one of its options.
@@ -1940,6 +1952,17 @@ impl Transcript {
             }),
             // A note of the orchestrator's memory saved or forgotten: shown the same way.
             EventBody::MemoryChanged(p) => self.push(Entry::HubUpdate {
+                text: p.line(),
+                user_message: None,
+                attn_id: None,
+                about: None,
+                outcome: None,
+                seq: ev.seq,
+                resolution: false,
+                routine: None,
+            }),
+            // A key of the config file set through the hub: shown the same way.
+            EventBody::ConfigChanged(p) => self.push(Entry::HubUpdate {
                 text: p.line(),
                 user_message: None,
                 attn_id: None,
@@ -3575,6 +3598,15 @@ impl AppState {
                 }
             }
             EventBody::AttentionRaised(p) => self.note_delete_card(&ev.thread, p),
+            // The orchestrator's access level changed (by anyone): the settings row shows it
+            // (the replay's is in the `orchestrator.show` asked for on connecting).
+            EventBody::ConfigChanged(p)
+                if self.catch_up.is_none() && p.key == "orchestrator.access" =>
+            {
+                if let Some(v) = p.value.as_str() {
+                    self.view.orch_access = Some(v.to_string());
+                }
+            }
             // A `!` command ended (as the hub records it, nobody else): Ctrl-C quits again.
             EventBody::TaskUpdated(p)
                 if !p.running && twr_core::event::is_job_task(&ev.source, &ev.body) =>
@@ -3966,7 +3998,18 @@ impl AppState {
             // The orchestrator the hub would start, asked for again after an account change
             // ([`AppState::account_calls`]). A failed call arrives as null: what was known
             // stays.
+            "orchestrator.access" => {
+                if let Some(a) = result["access"].as_str() {
+                    self.view.orch_access = Some(a.to_string());
+                    if std::mem::take(&mut self.view.access_asked) {
+                        self.view.status = Some(crate::settings::access_line(a));
+                    }
+                }
+            }
             "orchestrator.show" => {
+                if let Some(a) = result["access"].as_str() {
+                    self.view.orch_access = Some(a.to_string());
+                }
                 if let Some(rt) = result["runtime"].as_str() {
                     let model = result["model"].as_str().map(str::to_string);
                     self.view.orch_default = Some((rt.to_string(), model));
@@ -3980,6 +4023,9 @@ impl AppState {
             // A failed poll arrives as null: nothing changes but the next poll.
             "hub.info" => {
                 self.info_pending = false;
+                if let Some(a) = result["orchestrator"]["access"].as_str() {
+                    self.view.orch_access = Some(a.to_string());
+                }
                 if let Some(disk) = result["disk"].as_object() {
                     self.disk_low = disk
                         .iter()
@@ -5467,6 +5513,11 @@ impl AppState {
                 self.confirm_switch(runtime, &shown, model)
             }
             Slash::OrchPick => self.open_orch_picker(),
+            Slash::Access(None) => {
+                self.view.access_asked = true;
+                return (vec![Action::OrchestratorAccess { access: None }], true);
+            }
+            Slash::Access(Some(level)) => return (self.set_access(&level), true),
             Slash::Grid => self.toggle_grid(),
             Slash::Decisions => self.toggle_decisions(),
             Slash::Pin(q) => {
@@ -11829,6 +11880,107 @@ pub(crate) mod tests {
             assert!(st.handle_key(key(KeyCode::Char(c))).is_empty());
         }
         st.handle_key(key(KeyCode::Enter))
+    }
+
+    /// `/access` alone asks the hub and says the level; `/access full` asks `y` first, naming
+    /// what it gives (anything else cancels); `/access limited` goes at once. The hub's answer
+    /// says when the orchestrator picks it up and whether config.toml keeps it, and the view
+    /// follows it. A TUI an agent runs changes nothing.
+    #[test]
+    fn access_shows_the_level_and_asks_before_full() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let read = Action::OrchestratorAccess { access: None };
+        assert_eq!(type_line(&mut st, "/access"), std::slice::from_ref(&read));
+        assert_eq!(
+            crate::action_request(&read),
+            Some(("orchestrator.access", json!({})))
+        );
+        st.apply_result("orchestrator.access", &json!({"access": "limited"}));
+        assert_eq!(st.view.orch_access.as_deref(), Some("limited"));
+        let status = st.view.status.clone().unwrap();
+        assert!(
+            status.starts_with("orchestrator access: limited"),
+            "{status}"
+        );
+        // Full asks first.
+        assert!(type_line(&mut st, "/access full").is_empty());
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.contains("runs any command") && prompt.ends_with("[y/N]"),
+            "{prompt}"
+        );
+        assert!(st.handle_key(key(KeyCode::Char('n'))).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some("cancelled"));
+        assert!(type_line(&mut st, "/access full").is_empty());
+        let full = Action::OrchestratorAccess {
+            access: Some("full".into()),
+        };
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('y'))),
+            std::slice::from_ref(&full)
+        );
+        assert_eq!(
+            crate::action_request(&full),
+            Some(("orchestrator.access", json!({"access": "full"})))
+        );
+        let r = json!({"access": "full", "previous": "limited", "persisted": true, "restart": "after_turn"});
+        assert_eq!(
+            crate::result_status("orchestrator.access", &r).as_deref(),
+            Some(
+                "orchestrator access: full (was limited); the orchestrator restarts with it \
+                 after its current turn; kept in config.toml"
+            )
+        );
+        st.apply_result("orchestrator.access", &r);
+        assert_eq!(st.view.orch_access.as_deref(), Some("full"));
+        let unkept = json!({"access": "limited", "previous": "full", "persisted": false,
+            "persist_error": "this hub runs without a config file", "restart": "now"});
+        assert_eq!(
+            crate::result_status("orchestrator.access", &unkept).as_deref(),
+            Some(
+                "orchestrator access: limited (was full); the orchestrator restarts with it \
+                 now; for this hub run only, config.toml was left alone: this hub runs without \
+                 a config file"
+            )
+        );
+        // A read says nothing there (the view does).
+        assert_eq!(
+            crate::result_status("orchestrator.access", &json!({"access": "full"})),
+            None
+        );
+        // Limited goes at once.
+        assert_eq!(
+            type_line(&mut st, "/access limited"),
+            [Action::OrchestratorAccess {
+                access: Some("limited".into())
+            }]
+        );
+        assert!(st.view.confirm.is_none());
+        // Another client's change, live: the view follows.
+        st.apply_control(&Event::new(
+            "t-orch",
+            90,
+            None,
+            twr_core::event::Source::Hub,
+            EventBody::ConfigChanged(twr_core::event::ConfigChanged {
+                key: "orchestrator.access".into(),
+                value: json!("limited"),
+                by: "user".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(st.view.orch_access.as_deref(), Some("limited"));
+        // An agent's TUI changes nothing.
+        st.agent = Some("thread web's agent".into());
+        assert!(type_line(&mut st, "/access full").is_empty());
+        assert!(st.view.confirm.is_none());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("changes no setting"));
     }
 
     #[test]

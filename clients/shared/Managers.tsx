@@ -1,6 +1,7 @@
 import { RunnerPanel } from "./RunnerPanel";
 import { OfflineOptions } from "./OfflineOptions";
 import { AppOptions } from "./AppOptions";
+import { OrchestratorAccessOptions } from "./OrchestratorAccessOptions";
 import { LayoutOptions } from "./LayoutOptions";
 import { errorMessage } from "./errors";
 import { AppearanceOptions } from "./AppearanceOptions";
@@ -62,6 +63,10 @@ export interface ManagerProps {
   canAdmin?: boolean;
   /** A live hub connection (Settings › Loops reads the hub). */
   connected?: boolean;
+  /** `hub.info`'s `orchestrator.access` (absent on an older hub). */
+  orchestratorAccess?: string;
+  /** The orchestrator's settings changed here: read `hub.info` again. */
+  infoChanged?: () => void;
 }
 const meta: Record<
   string,
@@ -146,6 +151,9 @@ export function Manager(props: ManagerProps) {
         action={action}
         canAdmin={props.canAdmin !== false}
         connected={props.connected !== false}
+        refreshKey={props.refreshKey}
+        orchestratorAccess={props.orchestratorAccess}
+        infoChanged={props.infoChanged}
       />
     );
   if (!info) return null;
@@ -797,9 +805,15 @@ function Settings({
   action,
   canAdmin,
   connected,
+  refreshKey,
+  orchestratorAccess,
+  infoChanged,
 }: {
   canAdmin: boolean;
   connected: boolean;
+  refreshKey?: number;
+  orchestratorAccess?: string;
+  infoChanged?: () => void;
   fail: ManagerProps["fail"];
   rpc: ManagerProps["rpc"];
   action: ManagerProps["action"];
@@ -874,6 +888,12 @@ function Settings({
           <button onClick={() => action("orch")}>Change orchestrator</button>
           <button onClick={() => action("clear")}>Fresh conversation…</button>
         </div>
+        <OrchestratorAccessOptions
+          rpc={rpc}
+          live={orchestratorAccess}
+          refreshKey={refreshKey}
+          changed={infoChanged}
+        />
       </section>
       <LoopSettingsPanel connected={connected} />
       <section className="settings-section">

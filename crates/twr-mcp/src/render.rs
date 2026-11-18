@@ -342,9 +342,11 @@ pub fn transcript_line(ev: &Value) -> Option<String> {
             }
             format!("text: {}", clip.field(&d, "text", FIELD_CAP))
         }
-        "conversation.update" | "project.read" | "memory.changed" | "context.compacted" => {
-            control_line(ev, &mut clip)
-        }
+        "conversation.update"
+        | "project.read"
+        | "memory.changed"
+        | "config.changed"
+        | "context.compacted" => control_line(ev, &mut clip),
         "agent.tool_call" => {
             let risky = if d.get("risky").and_then(Value::as_bool).unwrap_or(false) {
                 " [risky]"
@@ -405,6 +407,11 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
         }
         "memory.changed" => {
             let p: twr_core::event::MemoryChanged =
+                serde_json::from_value(d.clone()).unwrap_or_default();
+            format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
+        }
+        "config.changed" => {
+            let p: twr_core::event::ConfigChanged =
                 serde_json::from_value(d.clone()).unwrap_or_default();
             format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
         }
@@ -2098,6 +2105,23 @@ mod tests {
         assert_eq!(
             control_body(&event),
             "hub: forgot memory short-replies (by you)"
+        );
+        let event = json!({"seq": 8, "thread": "orch", "kind": "config.changed",
+            "data": {"key": "tui.suggest", "value": false, "before": true,
+                "by": "orchestrator", "effect": "the next time a TUI starts"}});
+        assert_eq!(
+            transcript_line(&event).as_deref(),
+            Some(
+                "hub: set tui.suggest = false (was true); takes effect the next time a TUI starts"
+            )
+        );
+        let event = json!({"seq": 9, "kind": "config.changed",
+            "data": {"key": "threads.default_mode", "value": "plan", "by": "user",
+                "effect": "when the hub restarts (`twr hub stop`, then `twr`)"}});
+        assert_eq!(
+            control_body(&event),
+            "hub: set threads.default_mode = \"plan\" (was unset) (by you); takes effect when \
+             the hub restarts (`twr hub stop`, then `twr`)"
         );
     }
 

@@ -1745,3 +1745,77 @@ describe("implementation loops from the message box", () => {
     );
   });
 });
+
+/* `/access [limited|full]` (docs/orchestrator.md › Full access): the shared slash table's
+ * command opens the palette's Orchestrator access form on the level named, and Full still
+ * asks before anything reaches the hub. */
+describe("/access in the message box", () => {
+  const asked: { method: string; params: Json }[] = [];
+  beforeEach(async () => {
+    vi.resetModules();
+    asked.length = 0;
+    mounted = await mount({
+      rpc: (method, params) => {
+        if (method === "hub.info")
+          return Promise.resolve({
+            workspace: "default",
+            orchestrator: { access: "limited" },
+          });
+        if (method === "orchestrator.access") {
+          asked.push({ method, params });
+          return Promise.resolve({
+            access: params.access,
+            previous: "limited",
+            persisted: true,
+            restart: "now",
+          });
+        }
+        if (method === "desktop.parse_slash") {
+          const words = String(params.line).trim().split(/\s+/);
+          if (words[0] === "/access")
+            return Promise.resolve({ kind: "Access", args: words[1] ?? null });
+        }
+        return undefined;
+      },
+    });
+    // The app's next hub.info poll reads the level.
+    await app().wait(50);
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  /** Submits the open Orchestrator access form. */
+  const submit = async () => {
+    await app().act(async () => {
+      app()
+        .find("[role=dialog] form", "Orchestrator access")
+        .dispatchEvent(
+          new FakeEvent("submit", { bubbles: true, cancelable: true }),
+        );
+    });
+    await app().settle();
+  };
+
+  it("opens the Orchestrator access form on the level named, without calling the hub", async () => {
+    await app().type("/access full");
+    await app().press("Enter");
+    app().find("[role=dialog]", "Orchestrator access");
+    expect(asked).toEqual([]);
+    expect(app().host.sent).toEqual([]);
+    // Submitting it asks first, as Full does: the form holds the level named.
+    await submit();
+    expect(
+      app().find("[role=dialog]", "Give the orchestrator full access?"),
+    ).toBeTruthy();
+    expect(asked).toEqual([]);
+  });
+
+  it("runs /access limited from the form without asking", async () => {
+    await app().type("/access limited");
+    await app().press("Enter");
+    await submit();
+    expect(asked).toEqual([
+      { method: "orchestrator.access", params: { access: "limited" } },
+    ]);
+  });
+});

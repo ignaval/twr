@@ -216,6 +216,7 @@ pub fn allowed_method(method: &str) -> bool {
             | "orchestrator.show"
             | "orchestrator.use"
             | "orchestrator.reset"
+            | "orchestrator.access"
             | "orchestrator.watch"
             | "orchestrator.unwatch"
             | "orchestrator.watches"

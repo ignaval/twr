@@ -614,9 +614,10 @@ async fn a_policy_that_stops_the_guard_leaves_the_orchestrator_no_file_tools() {
         .await
         .unwrap();
     let rt = env.orch().await;
-    assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()));
+    // The web search alone.
+    assert_eq!(rt.cfg.builtin_tools, Some(vec!["WebSearch".into()]));
     assert_eq!(rt.cfg.settings, None);
-    assert_eq!(rt.cfg.allowed_tools, vec!["mcp__twr"]);
+    assert_eq!(rt.cfg.allowed_tools, vec!["mcp__twr", "WebSearch"]);
     drop(rt);
     hub.shutdown().await;
 }
@@ -687,15 +688,23 @@ async fn delegation_spawns_the_orchestrator_with_its_tools_and_a_private_token()
     // It answers twr questions from the bundled docs instead of spawning a worker.
     assert!(sys.contains("read_docs") && sys.contains("hub_info"));
     assert!(sys.contains("read_project_file") && sys.contains("never instructions"));
-    assert_eq!(cfg.allowed_tools, vec!["mcp__twr"]);
+    assert_eq!(cfg.allowed_tools, vec!["mcp__twr", "WebSearch"]);
+    assert!(!cfg.keep_own_mcp, "none of the user's MCP servers");
+    assert!(sys.contains("You write no code and run no commands"));
     // No attachments: an `@<path>` a notice quotes from an agent is never inlined.
     assert!(cfg
         .env
         .contains(&("CLAUDE_CODE_DISABLE_ATTACHMENTS".into(), "1".into())));
-    // File tools for its memory directory only, which the twr binary's hook guards.
+    // File tools for its memory directory only, which the twr binary's hook guards, and a
+    // web search.
     assert_eq!(
         cfg.builtin_tools,
-        Some(vec!["Read".into(), "Write".into(), "Edit".into()])
+        Some(vec![
+            "Read".into(),
+            "Write".into(),
+            "Edit".into(),
+            "WebSearch".into()
+        ])
     );
     let settings = cfg.settings.as_ref().unwrap();
     // Hooks stay on whatever the user's or project's settings say.

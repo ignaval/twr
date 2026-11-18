@@ -134,9 +134,30 @@ export function blocksOf(events: HubEvent[]): Block[] {
       case "prompt.withdrawn":
         output.push({ ...base, kind: "notice", text: "Message taken back" });
         break;
+      case "config.changed":
+        if (data.key)
+          output.push({ ...base, kind: "notice", text: configLine(data) });
+        break;
     }
   }
   return output;
+}
+/** A `config.changed` (a key of config.toml set through the hub) as the TUI's hub line says
+ * it (`ConfigChanged::line`): `Set tui.suggest = false (was true) (by you); takes effect
+ * now`. `orchestrator.access`'s effect may come as the hub's `restart` word. */
+function configLine(data: Record<string, any>): string {
+  const text = (value: unknown) => JSON.stringify(value) ?? "null";
+  const was = data.before == null ? "unset" : text(data.before);
+  const by = data.by === "user" ? " (by you)" : "";
+  const effect =
+    data.effect === "now" || !data.effect
+      ? "now"
+      : data.effect === "after_turn"
+        ? "when the orchestrator's turn ends"
+        : data.effect === "none"
+          ? "the next time the orchestrator starts"
+          : String(data.effect);
+  return `Set ${data.key} = ${text(data.value)} (was ${was})${by}; takes effect ${effect}`;
 }
 export interface RoutineRun {
   thread: string;

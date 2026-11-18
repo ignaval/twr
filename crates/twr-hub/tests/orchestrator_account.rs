@@ -306,7 +306,12 @@ fn assert_native(rt: &OrchRt) {
 fn assert_guarded(rt: &OrchRt, memory: Option<&Path>) {
     assert_eq!(
         rt.cfg.builtin_tools,
-        Some(vec!["Read".into(), "Write".into(), "Edit".into()])
+        Some(vec![
+            "Read".into(),
+            "Write".into(),
+            "Edit".into(),
+            "WebSearch".into()
+        ])
     );
     assert_eq!(
         rt.cfg.settings,
@@ -697,7 +702,7 @@ async fn an_accounts_server_managed_settings_turn_its_file_tools_off() {
     assert_eq!(r["account"], "work", "{r}");
     let work = env.orch().await;
     assert_on_work(&work, &env);
-    assert_eq!(work.cfg.builtin_tools, Some(Vec::new()));
+    assert_eq!(work.cfg.builtin_tools, Some(vec!["WebSearch".into()]));
     assert_eq!(work.cfg.settings, None);
     hub.shutdown().await;
 }
@@ -749,7 +754,10 @@ async fn attaching_the_orchestrator_carries_its_account() {
         asked["settings"],
         guard::settings(Path::new(TWR), Some(&memory))
     );
-    assert_eq!(asked["builtin_tools"], json!(["Read", "Write", "Edit"]));
+    assert_eq!(
+        asked["builtin_tools"],
+        json!(["Read", "Write", "Edit", "WebSearch"])
+    );
     hub.attach_end(&id, "test", grant.lease, None).unwrap();
     hub.shutdown().await;
 }

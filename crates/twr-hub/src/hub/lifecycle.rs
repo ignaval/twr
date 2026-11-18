@@ -80,6 +80,9 @@ impl Hub {
         let view =
             twr_core::account::AccountsView::new(&opts.config).with_default_root(&accounts_root);
         let (mut core, reader) = Core::replay_accounts(&opts.db_path, feed, view)?;
+        // The orchestrator's access level, from the config until it is changed
+        // (`hub::orch_access`).
+        core.orch_access.level = opts.config.orchestrator.access;
         let account_warnings =
             super::accounts::check_at_start(&core.accounts, &opts.config, &native_dir)?;
         core.account_native_dir = Arc::clone(&native_dir);
@@ -727,6 +730,7 @@ impl Core {
             persist_retries: 0,
             retry_reads: Default::default(),
             orch: orch::OrchState::default(),
+            orch_access: Default::default(),
             hub_questions: HashMap::new(),
             hub_cards: HashMap::new(),
             delete_cards: HashMap::new(),
@@ -1069,6 +1073,11 @@ impl Core {
             self.try_dispatch(inner, &thread)?;
         }
         mark("queues dispatched");
+        // The orchestrator's recorded mode follows a level changed in the file meanwhile
+        // (`hub::orch_access`).
+        if let Err(e) = self.sync_orchestrator_mode(inner, Source::Hub) {
+            tracing::warn!(error = %format!("{e:#}"), "cannot record the orchestrator's mode for its access");
+        }
         self.autostart_orchestrator(inner);
         // Notices rebuilt from the log wait for the orchestrator like new ones.
         if std::mem::take(&mut self.orch.wake) || !self.orch.notices.is_empty() {

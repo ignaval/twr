@@ -14,8 +14,10 @@
 //! `[codex] auto` and `wake_after_secs` are shown, not changed: the models are free text with
 //! a size check of their own, the summaries' pace a span the file spells, and the last two are the hub's, read when it starts (as `config.show` reports
 //! them): a change needs the file edited and the hub restarted, and `[codex] auto` decides what
-//! Codex threads run without asking, which no stray tap should change. A TUI an agent runs
-//! changes nothing.
+//! Codex threads run without asking, which no stray tap should change. The orchestrator's
+//! access is the hub's too, but the hub changes it live (`orchestrator.access`): the row shows
+//! the level the hub last said, and a change goes through the hub, full asking `y` first, as
+//! `/access` does. A TUI an agent runs changes nothing.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -56,10 +58,12 @@ pub enum Key {
     /// The saved loop settings, the hub's: opens the loop settings editor
     /// ([`crate::loops`]).
     Loops,
+    /// `[orchestrator] access`, the hub's, changed through it (`orchestrator.access`).
+    OrchAccess,
 }
 
 /// The rows, in order.
-pub const KEYS: [Key; 12] = [
+pub const KEYS: [Key; 13] = [
     Key::Suggest,
     Key::SuggestModel,
     Key::Summaries,
@@ -71,8 +75,27 @@ pub const KEYS: [Key; 12] = [
     Key::Colors,
     Key::CodexAuto,
     Key::WakeAfter,
+    Key::OrchAccess,
     Key::Loops,
 ];
+
+/// The question before the orchestrator gets full access (`/access full`, the settings' row).
+pub const FULL_ACCESS_PROMPT: &str = "Give the orchestrator full access? It runs any command \
+    and uses every tool without asking, in every turn (also a watch's or a notice's). It \
+    restarts with it after its current turn. [y/N]";
+
+/// What `/access` says of level `access`.
+pub fn access_line(access: &str) -> String {
+    match access {
+        "full" => "orchestrator access: full (it runs any command without asking, in every \
+                   turn; /access limited takes that back)"
+            .into(),
+        "limited" => "orchestrator access: limited (twr's tools and a web search; /access \
+                      full gives it every tool)"
+            .into(),
+        other => format!("orchestrator access: {other}"),
+    }
+}
 
 /// The compact widths a change steps through (0: never compact).
 pub const COMPACT_WIDTHS: [u16; 7] = [0, 40, 50, 60, 80, 100, 120];
@@ -174,6 +197,7 @@ pub fn scalar_text(v: &crate::config_edit::Scalar) -> String {
     match v {
         Scalar::Bool(b) => b.to_string(),
         Scalar::Int(i) => i.to_string(),
+        Scalar::Float(_) => v.text(),
         Scalar::Str(s) => format!("{s:?}"),
     }
 }
@@ -384,6 +408,20 @@ fn rows(state: &AppState, s: &Settings) -> Vec<Row> {
                 kept: "wake_after_secs · the hub's: edit the file, then restart the hub".into(),
                 editable: false,
             },
+            Key::OrchAccess => Row {
+                key,
+                label: "Orchestrator access",
+                value: match v.orch_access.as_deref() {
+                    Some("full") => "full · every tool, without asking".into(),
+                    Some("limited") => "limited · twr's tools and a web search".into(),
+                    Some(other) => other.into(),
+                    None => "…".into(),
+                },
+                kept: "[orchestrator] access · the hub's: applies now, after the orchestrator's \
+                       current turn (full asks first)"
+                    .into(),
+                editable: !agent && v.orch_access.is_some(),
+            },
             Key::Loops => Row {
                 key,
                 label: "Loops",
@@ -455,9 +493,12 @@ pub fn step(state: &AppState, key: Key, forward: bool) -> Option<Change> {
             Change::CompactWidth(next)
         }
         Key::WsSidebar => Change::WsSidebar(v.sidebar_hidden),
-        Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter | Key::Loops => {
-            return None
-        }
+        Key::SuggestModel
+        | Key::SummaryEvery
+        | Key::CodexAuto
+        | Key::WakeAfter
+        | Key::Loops
+        | Key::OrchAccess => return None,
     })
 }
 

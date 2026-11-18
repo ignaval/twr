@@ -642,6 +642,25 @@ for (const [
             res.statusCode = 500;
             res.end(String(error));
           });
+      } else if (req.url === "/orchestrator-access") {
+        // What Settings › Orchestrator changed, seen from the host: the hub's level and
+        // config.toml's `[orchestrator] access` line.
+        ownerCall("orchestrator.show")
+          .then((show) =>
+            res.end(
+              JSON.stringify({
+                hub: show.access,
+                config:
+                  readFileSync(join(fixture, "config.toml"), "utf8").match(
+                    /^access = "(\w+)"$/m,
+                  )?.[1] ?? null,
+              }),
+            ),
+          )
+          .catch((error) => {
+            res.statusCode = 500;
+            res.end(String(error));
+          });
       } else if (req.url === "/verify-upload") {
         const files = readdirSync(fixture, {
           recursive: true,

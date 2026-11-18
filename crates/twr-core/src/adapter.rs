@@ -48,7 +48,9 @@ pub struct SpawnConfig {
     pub system_append: Option<String>,
     /// Rebuild the system prompt on resume when the runtime supports it (orchestrators).
     pub refresh_system_prompt: bool,
-    /// MCP server configuration to attach.
+    /// MCP server configuration to attach: by itself a strict set, the only MCP servers the
+    /// runtime gets (Claude Code's `--strict-mcp-config`, Codex's allowlist), unless
+    /// [`SpawnConfig::keep_own_mcp`].
     pub mcp_config: Option<Value>,
     /// A file holding the MCP server configuration, used instead of `mcp_config` when set.
     /// The hub uses it when the configuration carries a secret (the orchestrator token): a
@@ -99,6 +101,11 @@ pub struct SpawnConfig {
     /// Build's memory (`GROK_MEMORY=0`). Claude Code ignores it (its orchestrator keeps its
     /// own memory directory). Never sent to a runner.
     pub native_memory_off: bool,
+    /// Keep the runtime's own MCP servers (the user's, and on Codex its plugins and apps)
+    /// beside those of `mcp_config`, instead of making that a strict set: Claude Code without
+    /// `--strict-mcp-config`, Codex without the allowlist. The orchestrator with `[orchestrator]
+    /// access = "full"`. Never sent to a runner.
+    pub keep_own_mcp: bool,
 }
 
 /// What a Codex thread in `auto` mode does with a command its sandbox does not allow, when

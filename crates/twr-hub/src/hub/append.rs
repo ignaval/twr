@@ -572,7 +572,9 @@ impl Core {
                     if let Some(twr) = twr.as_object_mut() {
                         twr.insert(
                             "prompt_fingerprint".into(),
-                            serde_json::json!(super::orch::prompt_fingerprint()),
+                            serde_json::json!(super::orch::prompt_fingerprint(
+                                self.orch_runtime_access()
+                            )),
                         );
                     }
                 }

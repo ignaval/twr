@@ -17,7 +17,11 @@
 //!   `answer <thread>: "<label>"`, then ` (<item summary>)` when the item is known;
 //! - `set <thread> → <mode>`, or `set <thread> → custom mode "<mode>"`;
 //! - `move <thread> → <runtime>`, then `, model "<model>"` and `, effort "<effort>"` for each
-//!   one given (a thread moved to another runtime, `hub::switch`).
+//!   one given (a thread moved to another runtime, `hub::switch`);
+//! - `config <key> = <value> (was <value>)`, or `(was unset)`: a key of twr's `config.toml`
+//!   set (`hub::config_set`). The key's parts are joined with `.`, each bare when it is only
+//!   ASCII letters, digits, `_` and `-`, else quoted; a string value is quoted, a boolean or a
+//!   number written as TOML writes it.
 
 /// What a card's summary starts with.
 pub const HEAD: &str = "From your message: ";
@@ -50,6 +54,22 @@ pub enum CardLine {
         model: Option<String>,
         effort: Option<String>,
     },
+    /// Set key `key` (its parts: `["tui", "suggest"]`) of twr's config file to `value`;
+    /// `before`: what the file had (`None`: unset).
+    Config {
+        key: Vec<String>,
+        value: CardValue,
+        before: Option<CardValue>,
+    },
+}
+
+/// A config value as a card shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CardValue {
+    /// A string, shown quoted.
+    Str(String),
+    /// A boolean or a number as TOML writes it (`false`, `3`, `0.8`); never empty.
+    Literal(String),
 }
 
 /// Whether `c` is hidden wherever it stands: what Rust's `Debug` escapes after a letter
@@ -130,6 +150,87 @@ fn name(s: &str) -> String {
     escape_with(s, &[' ', ':', '(', ')', '→'])
 }
 
+/// Whether a key part is written without quotes.
+fn bare(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A config key as a card writes it: its parts joined with `.`, each bare or quoted.
+pub fn key_text(key: &[String]) -> String {
+    key.iter()
+        .map(|p| {
+            if bare(p) {
+                p.clone()
+            } else {
+                format!("\"{}\"", escape(p))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// A config value as a card writes it: a string quoted; a literal with spaces, quotes and
+/// parentheses escaped (and `unset`, which says the key had no value, with its first letter).
+fn value_text(v: &CardValue) -> String {
+    match v {
+        CardValue::Str(s) => format!("\"{}\"", escape(s)),
+        CardValue::Literal(l) => {
+            let t = escape_with(l, &[' ', '(', ')']);
+            match t.strip_prefix('u') {
+                Some(rest) if t == "unset" => format!("{}{rest}", escaped('u')),
+                _ => t,
+            }
+        }
+    }
+}
+
+/// A config value read back at the start of `s` ([`value_text`]): the value and the rest.
+fn value_at(s: &str) -> Option<(CardValue, &str)> {
+    if let Some(q) = s.strip_prefix('"') {
+        let (v, rest) = quoted(q)?;
+        return Some((CardValue::Str(v), rest));
+    }
+    let (token, rest) = s.split_at(s.find(' ').unwrap_or(s.len()));
+    if token.is_empty() {
+        return None;
+    }
+    Some((CardValue::Literal(unescape(token)?), rest))
+}
+
+/// A config key read back at the start of `s` ([`key_text`]), up to ` = `: its parts and what
+/// follows ` = `.
+fn key_at(s: &str) -> Option<(Vec<String>, &str)> {
+    let mut parts = Vec::new();
+    let mut rest = s;
+    loop {
+        let (part, after) = if let Some(q) = rest.strip_prefix('"') {
+            let (p, after) = quoted(q)?;
+            if bare(&p) {
+                // A bare part is never quoted: one reading only.
+                return None;
+            }
+            (p, after)
+        } else {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            (rest[..end].to_string(), &rest[end..])
+        };
+        parts.push(part);
+        if let Some(after) = after.strip_prefix('.') {
+            rest = after;
+        } else {
+            return Some((parts, after.strip_prefix(" = ")?));
+        }
+    }
+}
+
 /// One action as a card writes it.
 pub fn line(l: &CardLine) -> String {
     match l {
@@ -176,6 +277,12 @@ pub fn line(l: &CardLine) -> String {
             }
             s
         }
+        CardLine::Config { key, value, before } => format!(
+            "config {} = {} (was {})",
+            key_text(key),
+            value_text(value),
+            before.as_ref().map_or("unset".to_string(), value_text)
+        ),
     }
 }
 
@@ -234,6 +341,20 @@ pub fn parse_line(s: &str) -> Option<CardLine> {
             answer,
             item: item(rest)?,
         });
+    }
+    if let Some(rest) = s.strip_prefix("config ") {
+        let (key, rest) = key_at(rest)?;
+        let (value, rest) = value_at(rest)?;
+        let was = rest.strip_prefix(" (was ")?.strip_suffix(')')?;
+        let before = if was == "unset" {
+            None
+        } else {
+            match value_at(was)? {
+                (v, "") => Some(v),
+                _ => return None,
+            }
+        };
+        return Some(CardLine::Config { key, value, before });
     }
     if let Some(rest) = s.strip_prefix("move ") {
         let (thread, rest) = rest.split_once(" → ")?;
@@ -387,5 +508,73 @@ mod tests {
         );
         assert_eq!(parse("From your message: allow"), None);
         assert_eq!(parse("allow api"), None);
+    }
+
+    fn config(key: &[&str], value: CardValue, before: Option<CardValue>) -> CardLine {
+        CardLine::Config {
+            key: key.iter().map(|k| k.to_string()).collect(),
+            value,
+            before,
+        }
+    }
+
+    fn lit(s: &str) -> CardValue {
+        CardValue::Literal(s.into())
+    }
+
+    fn st(s: &str) -> CardValue {
+        CardValue::Str(s.into())
+    }
+
+    #[test]
+    fn config_lines_read_back() {
+        assert_eq!(
+            line(&config(
+                &["tui", "suggest"],
+                lit("false"),
+                Some(lit("true"))
+            )),
+            "config tui.suggest = false (was true)"
+        );
+        assert_eq!(
+            line(&config(&["threads", "default_mode"], st("plan"), None)),
+            "config threads.default_mode = \"plan\" (was unset)"
+        );
+        assert_eq!(
+            line(&config(
+                &["projects", "my.api", "codex_auto"],
+                st("ask"),
+                Some(st("never"))
+            )),
+            "config projects.\"my.api\".codex_auto = \"ask\" (was \"never\")"
+        );
+        let lines = vec![
+            config(&["tui", "suggest"], lit("false"), Some(lit("true"))),
+            config(&["speech", "volume"], lit("0.8"), Some(lit("1.0"))),
+            config(&["a b", "x = y", "\"q\".z"], st("say \"hi\" · (x)"), None),
+            config(&["k"], lit("unset"), Some(lit("unset"))),
+            config(&["k"], st("unset"), Some(st(""))),
+            config(&["k"], lit("a (was b)"), Some(lit("x\u{200B} y"))),
+            config(&["\u{202E}", ""], lit("·"), Some(st("\\"))),
+            mode("config", "plan", false),
+        ];
+        let s = render(&lines);
+        assert!(!s.chars().any(always_hidden), "{s}");
+        assert_eq!(parse(&s), Some(lines));
+        // `unset` the literal never reads as no value.
+        assert_ne!(
+            line(&config(&["k"], lit("v"), Some(lit("unset")))),
+            line(&config(&["k"], lit("v"), None))
+        );
+        for bad in [
+            "config tui.suggest = false",
+            "config = false (was true)",
+            "config tui. = false (was true)",
+            "config \"tui\".suggest = false (was true)",
+            "config tui.suggest = false (was true) x",
+            "config tui.suggest = false (was a b)",
+        ] {
+            assert_eq!(parse_line(bad), None, "{bad}");
+        }
     }
 }

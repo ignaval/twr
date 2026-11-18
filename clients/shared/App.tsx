@@ -84,8 +84,10 @@ import {
   commands as applicationCommands,
   parameters,
   commandArguments,
+  confirmationOf,
   type Command,
 } from "./commands";
+import { accessLevel, accessOutcome } from "./orchestrator-access";
 import type {
   Attention,
   InboxSource,
@@ -206,6 +208,20 @@ const statusIcon = (status: string) =>
     <Circle size={10} />
   );
 
+/** What `orchestrator.access` did, in words, as Settings › Orchestrator says it. */
+function AccessResult({ value }: { value: Json }) {
+  const outcome = accessOutcome(value);
+  return (
+    <>
+      <p className="success-text">{outcome.text}</p>
+      {outcome.warning && (
+        <p className="error-text" role="alert">
+          {outcome.warning}
+        </p>
+      )}
+    </>
+  );
+}
 function operationAction(command: Command, again: boolean) {
   const labels: Record<string, string> = {
     new: "Create thread",
@@ -617,6 +633,10 @@ export default function App({
               : initialValues[f.key]) ??
               (command.id === "delete" && f.key === "threads"
                 ? initialValues.thread
+                : undefined) ??
+              // Orchestrator access opens on the level the hub reports.
+              (command.id === "access" && f.key === "access"
+                ? accessLevel(infoRef.current?.orchestrator?.access)
                 : undefined) ??
               f.initial ??
               (f.type === "boolean" ? false : ""),
@@ -1510,6 +1530,8 @@ export default function App({
           const value = await rpc(operation.method!, params);
           setResult(value);
           setRefresh((n) => n + 1);
+          if (operation.method === "orchestrator.access")
+            void refreshInfo().catch(() => {});
           if (operation.id === "new") {
             setOperation(undefined);
             setDestination(value.id);
@@ -1551,11 +1573,16 @@ export default function App({
         setOperationBusy(false);
       }
     };
-    if (operation.confirm)
+    const confirm = confirmationOf(operation, values);
+    // Full access asks only when it changes something.
+    const unchanged =
+      operation.id === "access" &&
+      values.access === accessLevel(infoRef.current?.orchestrator?.access);
+    if (confirm && !unchanged)
       setConfirmation({
-        title: operation.title,
-        detail: operation.confirm,
-        action: operationAction(operation, false),
+        title: confirm.title,
+        detail: confirm.detail,
+        action: confirm.action || operationAction(operation, false),
         destructive: true,
         run: () => void run(),
       });
@@ -1949,6 +1976,11 @@ export default function App({
           break;
         case "OrchPick":
           action("orch");
+          break;
+        case "Access":
+          // `/access [limited|full]`: the palette's form, on the level named (Full still
+          // asks first); with none, on the current level.
+          action("access", args ? { access: args } : {});
           break;
         case "Clear":
           action("clear");
@@ -2614,9 +2646,14 @@ export default function App({
       .querySelector<HTMLElement>("[data-palette-active=true]")
       ?.scrollIntoView({ block: "nearest" });
   }, [paletteIndex]);
+  // Orchestrator access only where the hub reports a level: an older hub has neither.
+  const hasAccess = accessLevel(info?.orchestrator?.access) !== undefined;
   const allCommands = useMemo(
-    () => [...commands, ...(permitted("terminal") ? cliCommands : [])],
-    [cliCommands, commands],
+    () => [
+      ...commands.filter((c) => c.id !== "access" || hasAccess),
+      ...(permitted("terminal") ? cliCommands : []),
+    ],
+    [cliCommands, commands, hasAccess],
   );
   const matching = allCommands.filter((c) =>
     (c.title + " " + c.group + " " + c.id)
@@ -3831,6 +3868,8 @@ export default function App({
                 canAdmin={permitted("admin")}
                 workspace={workspace}
                 refreshKey={refresh}
+                orchestratorAccess={info?.orchestrator?.access}
+                infoChanged={() => void refreshInfo().catch(() => {})}
                 rpc={rpc}
                 action={action}
                 cliAction={cliAction}
@@ -4435,6 +4474,8 @@ export default function App({
                         Update settings
                       </button>
                     </>
+                  ) : operation.id === "access" ? (
+                    <AccessResult value={result} />
                   ) : operation.id === "context-read" ? (
                     <ContextEditor
                       key={values.project + ":" + result.hash}

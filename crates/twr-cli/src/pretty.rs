@@ -404,6 +404,7 @@ pub fn summary(ev: &Event) -> String {
         EventBody::ContextCompacted(p) => p.line(),
         EventBody::ProjectRead(p) => p.line(),
         EventBody::MemoryChanged(p) => p.line(),
+        EventBody::ConfigChanged(p) => p.line(),
         other => json_short(&other.data().unwrap_or_default()),
     }
 }
@@ -625,6 +626,18 @@ mod tests {
             ..Default::default()
         }));
         assert_eq!(summary(&read), "read api:README.md (10 bytes)");
+        let set = ev(EventBody::ConfigChanged(twr_core::event::ConfigChanged {
+            key: "speech.volume".into(),
+            value: serde_json::json!(0.8),
+            before: Some(serde_json::json!(1.0)),
+            by: "orchestrator".into(),
+            effect: "now".into(),
+            ..Default::default()
+        }));
+        assert_eq!(
+            summary(&set),
+            "set speech.volume = 0.8 (was 1.0); takes effect now"
+        );
     }
 
     /// A stop the hub makes to restart a runtime says why, not that the thread stopped.
