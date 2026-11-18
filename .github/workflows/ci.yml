@@ -222,8 +222,9 @@ jobs:
       - run: npm run format:check
       # Known advisories of high or critical severity, in the whole tree: Electron and the
       # Capacitor runtime ship in the apps but are devDependencies (electron-builder and
-      # Capacitor want them there), so `--omit=dev` would skip them.
-      - run: npm audit --audit-level=high
+      # Capacitor want them there), so `--omit=dev` would skip them. scripts/audit.mjs is
+      # `npm audit --audit-level=high` with its reasoned, per-package allowlist.
+      - run: node scripts/audit.mjs
 
   real-systemd:
     # The rest of the suite replaces systemd-run and systemctl with stand-ins
