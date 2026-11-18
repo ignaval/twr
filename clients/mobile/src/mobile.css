@@ -735,8 +735,10 @@ select {
   overflow: auto;
   flex-shrink: 1;
 }
-/* The latest-user shortcut is a convenience: in a short viewport (an open keyboard) its fixed
-   row would push the composer under the navigation, so the composer keeps that space. */
+/* The latest-user shortcut is a convenience: while typing (an open keyboard) or in a short
+   viewport its fixed row would take the composer's room to grow, or push it under the
+   navigation, so the composer keeps that space. */
+:root[data-mobile="true"][data-keyboard="true"] .latest-user-message,
 :root[data-mobile="true"].short-content .latest-user-message {
   display: none;
 }
