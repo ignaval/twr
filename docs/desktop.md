@@ -169,6 +169,15 @@ it has been on screen 300 ms, so a key pressed as it appears isn't taken for it)
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
 
+Settings › Orchestrator also sets the orchestrator's [access](orchestrator.md#full-access)
+(`orchestrator.access`): **Limited** or **Full**, each described in one line. Full asks
+first, in words, what it gives up; Limited doesn't. The answer says when it applies (at
+once, when the orchestrator's current turn ends, or at its next start) and warns when
+`config.toml` couldn't be updated, so the level lasts only until the hub restarts. The
+palette's **Orchestrator access** does the same. A hub too old to report the level shows
+neither, and on a phone the choice needs a device with admin access. The orchestrator's
+conversation shows each change of a setting made through the hub as a line, as the TUI does.
+
 Right-click offers Cut, Copy, Paste and Select All in text fields, Copy for selected text,
 and Copy Link Address on a link (links are copied, not opened).
 macOS uses Command shortcuts; Linux uses Control. Terminal keys pass to the terminal,

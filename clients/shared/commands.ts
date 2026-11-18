@@ -1,3 +1,4 @@
+import { ACCESS_CHOICES, FULL_ACCESS_CONFIRM } from "./orchestrator-access";
 /** Typed user operations. The complete CLI catalog is also discovered from the bundled
  * binary's help, so newly added CLI flags remain reachable without hand-maintained copies. */
 export interface Field {
@@ -34,6 +35,14 @@ export interface Command {
   method?: string;
   fields: Field[];
   confirm?: string;
+  /** A confirmation only some values ask for: `field`'s value `value` (see `confirmationOf`). */
+  confirmWhen?: {
+    field: string;
+    value: string;
+    title: string;
+    detail: string;
+    action: string;
+  };
   cli?: string[];
   cliFields?: {
     key: string;
@@ -293,6 +302,27 @@ export const commands: Command[] = [
     "Keep workers and history; start a fresh orchestrator session.",
     "Start a fresh orchestrator conversation?",
   ),
+  {
+    ...cmd(
+      "access",
+      "Orchestrator access",
+      "Orchestrator",
+      "orchestrator.access",
+      [
+        f("access", "Access", {
+          type: "select",
+          required: true,
+          options: ACCESS_CHOICES.map((choice) => choice.value),
+          initial: "limited",
+          description: ACCESS_CHOICES.map(
+            (choice) => `${choice.label}: ${choice.description}`,
+          ).join(" "),
+        }),
+      ],
+      "What the orchestrator may do with its own tools. Full asks first.",
+    ),
+    confirmWhen: { field: "access", value: "full", ...FULL_ACCESS_CONFIRM },
+  },
   cmd("watch", "Watch a thread", "Orchestrator", "orchestrator.watch", [
     thread,
     f("note", "What should the orchestrator do?", {
@@ -646,4 +676,16 @@ export function commandArguments(
     ...variadicOptions,
     ...(trailing.length ? ["--", ...trailing] : []),
   ];
+}
+/** What running `command` with `values` asks first, or nothing: its `confirm`, or its
+ * `confirmWhen` when the form holds that value. */
+export function confirmationOf(
+  command: Command,
+  values: Record<string, any>,
+): { title: string; detail: string; action?: string } | undefined {
+  const when = command.confirmWhen;
+  if (when && values[when.field] === when.value)
+    return { title: when.title, detail: when.detail, action: when.action };
+  if (command.confirm) return { title: command.title, detail: command.confirm };
+  return undefined;
 }
