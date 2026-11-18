@@ -735,6 +735,11 @@ select {
   overflow: auto;
   flex-shrink: 1;
 }
+/* The latest-user shortcut is a convenience: in a short viewport (an open keyboard) its fixed
+   row would push the composer under the navigation, so the composer keeps that space. */
+:root[data-mobile="true"].short-content .latest-user-message {
+  display: none;
+}
 :root[data-mobile="true"].tiny-content .toast {
   top: calc(max(env(safe-area-inset-top), var(--occlusion-top, 0px)) + 8px);
   max-height: 44px;
