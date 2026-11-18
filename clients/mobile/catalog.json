@@ -2860,6 +2860,50 @@
     ]
   },
   {
+    "id": "cli:orchestrator access",
+    "title": "twr orchestrator access",
+    "description": "Show or set the orchestrator's access level: `limited` (twr's tools and a web search only) or `full` (every tool a worker has, its shell included, without asking, in every turn). Applied now, without a hub restart: a running orchestrator restarts with it on its session, after its current turn. Kept in config.toml (`[orchestrator] access`). Without a level: print the current one",
+    "group": "CLI · orchestrator",
+    "fields": [
+      {
+        "key": "level",
+        "label": "level",
+        "type": "select",
+        "required": false,
+        "description": "`limited` or `full` [possible values: limited, full]",
+        "options": [
+          "limited",
+          "full"
+        ]
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Print the raw `orchestrator.access` JSON",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "orchestrator",
+      "access"
+    ],
+    "cliFields": [
+      {
+        "key": "level",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
     "id": "cli:orchestrator reset",
     "title": "twr orchestrator reset",
     "description": "Clear the conversation: a fresh session on the current runtime/model, no handoff. The old conversation stays in the log; workers and their attention are kept",
