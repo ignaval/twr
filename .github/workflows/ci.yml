@@ -90,6 +90,11 @@ jobs:
             fi
           fi
           git lfs version
+      - name: Install ALSA's headers (Linux: the audio output of twr's own voices)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libasound2-dev pkg-config
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Use a temporary directory without symlinks (macOS)
         # macOS's $TMPDIR is under /var, a symlink to /private/var: git and twr report the
@@ -352,7 +357,9 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.zig }}" = "true" ]; then
-            cargo zigbuild --release --locked -p twr-cli --target "$TARGET"
+            # Static musl: without twr's own voices (sherpa-onnx's prebuilt libraries are
+            # glibc's, and a static ALSA can't load PipeWire's plugin).
+            cargo zigbuild --release --locked -p twr-cli --no-default-features --target "$TARGET"
           else
             cargo build --release --locked -p twr-cli --target "$TARGET"
           fi
@@ -438,6 +445,12 @@ jobs:
 
       - name: Write the third-party licences
         run: cargo about generate --locked --fail -o THIRD-PARTY-LICENSES.html about.hbs
+
+      # The macOS builds have twr's own voices (the `neural` feature): sherpa-onnx's C and C++
+      # libraries, which cargo-about doesn't list (licenses/native).
+      - name: Add the native libraries' licences (macOS)
+        if: endsWith(matrix.target, 'apple-darwin')
+        run: node licenses/native/section.mjs THIRD-PARTY-LICENSES.html
 
       - name: Package (not published)
         shell: bash

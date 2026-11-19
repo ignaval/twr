@@ -475,6 +475,7 @@ impl DeviceVoice {
             config: start.config,
             voice: None,
             rate: None,
+            voices: Default::default(),
             state: start.store,
             report: Some(Arc::new(|note: &str| {
                 crate::gateway_log!("phone speaker: {note}")
@@ -706,6 +707,7 @@ mod tests {
             voice: Some("Ava".into()),
             rate: 180,
             volume: 1.0,
+            ..Prefs::default()
         };
         let said = tokio::spawn(engine.speak("Hello there.", &prefs));
         let event = next_event(&mut rx, "voice-speak").await;

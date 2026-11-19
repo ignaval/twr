@@ -35,6 +35,13 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+# Build-time only: sherpa-onnx-sys's build script unpacks its prebuilt libraries with `zip`,
+# whose bzip2 and PPMd decoders carry these permissive licences. Nothing of theirs is in a
+# twr binary.
+exceptions = [
+    { crate = "libbz2-rs-sys", allow = ["bzip2-1.0.6"] },
+    { crate = "ppmd-rust", allow = ["MIT-0"] },
+]
 
 [bans]
 multiple-versions = "warn"

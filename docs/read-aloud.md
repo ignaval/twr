@@ -6,8 +6,10 @@ what you say back: [voice.md](voice.md)):
 - **as they come**, with `/read on` (live mode);
 - **on demand**, with `/read N` for the last N messages.
 
-The voice is the one of the machine you listen on: macOS's own voices, or speech-dispatcher on
-Linux, or a program of your own. When the TUI runs on a server over SSH or mosh, your laptop
+The voice is the one of the machine you listen on: macOS's own voices (its Premium and
+Enhanced ones too), twr's own [local neural voices](#twrs-own-voices) (Kokoro, Supertonic,
+Piper, on macOS and Linux), speech-dispatcher on Linux, or a program of your own; one per
+language if you like ([below](#a-voice-per-language)). When the TUI runs on a server over SSH or mosh, your laptop
 does the speaking: the text reaches it over an SSH connection of its own, and nothing plays on
 the server.
 
@@ -214,7 +216,10 @@ What it needs:
 ```toml
 [speech]
 engine = "auto"          # auto | say | avspeech | spd | command
-voice = ""               # the engine's voice; empty: the system's default
+voice = ""               # the engine's voice; empty: the system's default. "kokoro/af_heart":
+                         # one of twr's own (`twr voices list`)
+voices = {}              # a voice per language: { en = "Ava (Premium)", es = "kokoro/ef_dora" }
+espeak = ""              # the espeak-ng program for Kokoro and Piper; empty: espeak-ng on PATH
 rate = 0                 # words per minute (80-500); 0: the engine's default
 volume = 1.0             # 0.0-1.0 (avspeech, spd)
 read = ["replies", "commentary"]   # and "attention": hear when something needs you
@@ -228,10 +233,68 @@ command = []             # engine = "command": a program and its arguments, no s
 
 | Engine | Where | Notes |
 |---|---|---|
+| `auto` | macOS, Linux (the default) | `say` on macOS, `spd` on Linux when `spd-say` is installed, and [twr's own voices](#twrs-own-voices) for a voice named `<model>/<voice>`: each sentence goes to the one its voice belongs to |
 | `say` | macOS (the default there) | macOS's `say`, the text on its stdin, `-v` for the voice and `-r` for the rate. Pause restarts the sentence. Checked from `say`'s documentation, not yet on a real Mac by twr's tests |
 | `avspeech` | macOS | AVSpeechSynthesizer in-process: pauses mid-sentence, volume. Not yet run on a real Mac; opt in with `engine = "avspeech"` |
 | `spd` | Linux (the default when `spd-say` is installed) | speech-dispatcher's `spd-say`, the text on its stdin. The voice depends on its output module, often espeak-ng. Install speech-dispatcher from your distribution |
 | `command` | anywhere | your program, run without a shell, each sentence (up to 300 characters) on its stdin; stopping ends its process group. For Piper, espeak-ng, or a hosted voice through your own script |
+
+### macOS's voices
+
+`twr voices list` shows the voices `say` has, the best first: **Premium** and **Enhanced**
+ones sound far better than the default ones, and are downloaded in System Settings →
+Accessibility → Spoken Content → System voice → Manage Voices (a few hundred MB each).
+Then name one: `voice = "Ava (Premium)"`, or `/read voice Ava (Premium)`. Siri's voices
+can't be named; `say` uses one only as the system's own voice, with `voice` empty.
+
+### twr's own voices
+
+Neural voices that run on the machine's CPU, downloaded once with `twr voices install`:
+
+| Model | Voices | Download | Notes |
+|---|---|---|---|
+| `kokoro` | English (US, UK), Spanish: `kokoro/af_heart`, `af_bella`, `am_michael`, `bf_emma`, `ef_dora`, `em_alex`, … | 350 MB | the most natural; needs a recent CPU (it makes a second of speech in a quarter of a second on an Apple M-series chip with four threads) and about 800 MB of memory while it speaks |
+| `supertonic` | `supertonic/F1`-`F5`, `M1`-`M5`, each in English and Spanish | 129 MB | twice as fast as Kokoro; its model's licence (OpenRAIL-M) forbids some uses, such as impersonating someone |
+| `piper-en`, `piper-es` | `piper-en/lessac`, `piper-es/claude` (Mexican Spanish) | 67 MB each | runs on any machine, sounds more synthetic |
+
+```sh
+twr voices list                        # this machine's and twr's voices, installed or not
+twr voices install kokoro              # download, check, and time it on this machine
+twr voices try kokoro/ef_dora          # hear it ("Hola. Así sueno…"); or say your own text
+twr voices try kokoro/af_heart "Hi" --out hi.wav
+```
+
+- **What is downloaded.** Each model is one archive of sherpa-onnx's `tts-models` release on
+  GitHub, pinned by its size and SHA-256; twr checks both as it downloads, and keeps nothing
+  that differs. It unpacks it with the system's `tar` into twr's data directory
+  (`speech/<model>`), keeps only the model's files and licence, and replaces an older copy in
+  one step.
+- **Speed.** Installing times the model on this machine: `twr voices list` says whether it
+  keeps up with playback (it makes speech in under 0.6 of the time it plays) or is slow here.
+  A slow model still works, but may pause between sentences.
+- **espeak-ng.** Kokoro and Piper read phonemes, which the `espeak-ng` program spells out for
+  them (GPL; twr runs it, never links it): `brew install espeak-ng`, `pacman -S espeak-ng`, or
+  `apt install espeak-ng`. Supertonic needs nothing.
+- **Playing.** twr plays its voices itself, on the default output device (CoreAudio, or ALSA
+  on Linux, which PipeWire and PulseAudio serve): a message's sentences follow each other with
+  no gap, and pause stops mid-word.
+- **Builds.** twr's own voices are the `neural` feature of `twr-cli`, on by default: building
+  twr on Linux needs ALSA's headers (`alsa-lib` on Arch, `libasound2-dev` on Debian and
+  Ubuntu). The static Linux binaries of the release are built without it
+  (`--no-default-features`); install twr from source there for these voices.
+
+### A voice per language
+
+`voices` gives each language twr tells apart (English, `en`, and Spanish, `es`) its own voice;
+a message is read with the voice of its language, told from its words, and any other (too
+short, or mixed) with `voice`. `twr speak --voice-for es=kokoro/ef_dora` does the same for one
+speaker. A macOS voice and one of twr's can share the work:
+
+```toml
+[speech]
+voice = "Ava (Premium)"
+voices = { en = "Ava (Premium)", es = "kokoro/ef_dora" }
+```
 
 macOS's documentation doesn't say whether its ordinary voices work offline. With the `command`
 engine, the text goes wherever your program sends it: a hosted voice gets every word of the

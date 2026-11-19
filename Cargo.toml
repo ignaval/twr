@@ -21,6 +21,7 @@ twr-mcp = { path = "crates/twr-mcp" }
 twr-tui = { path = "crates/twr-tui" }
 twr-docs = { path = "crates/twr-docs" }
 twr-avspeech = { path = "crates/twr-avspeech" }
+twr-neural = { path = "crates/twr-neural" }
 twr-speech = { path = "crates/twr-speech" }
 twr-voice = { path = "crates/twr-voice" }
 
@@ -75,6 +76,14 @@ ring = "0.17.14"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSArray", "NSObject"] }
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVSpeechSynthesis"] }
+# twr-neural: local neural voices (Kokoro, Supertonic, Piper) through sherpa-onnx's C API
+# (Apache-2.0), linked statically from its prebuilt libraries, which its build script downloads
+# from the project's GitHub release (or takes from `SHERPA_ONNX_LIB_DIR`). 2.x has no espeak-ng
+# (GPL) in it: twr runs the `espeak-ng` program for the voices that need one.
+sherpa-onnx = "=2.0.1"
+# twr-neural's audio output (Apache-2.0): CoreAudio on macOS, ALSA on Linux (alsa-lib, which
+# PipeWire and PulseAudio serve through their ALSA plugins).
+cpal = "0.18"
 
 # Dev and test builds (`test` inherits `dev`) keep only line tables: panics and backtraces still
 # name file and line, and debuggers can step by line, but the variables and types of full

@@ -633,8 +633,17 @@ pub enum SpeechLocal {
 pub struct SpeechConfig {
     /// What speaks ([`SpeechEngine`]).
     pub engine: SpeechEngine,
-    /// The engine's voice; empty: the system's default.
+    /// The engine's voice; empty: the system's default. A local neural voice is named
+    /// `<model>/<voice>` (`kokoro/af_heart`, `twr voices list`): `auto` speaks it with twr's
+    /// own engine and any other voice with the system's.
     pub voice: String,
+    /// A voice per language (`{ en = "Ava (Premium)", es = "kokoro/ef_dora" }`), as
+    /// `twr_core::speech::LANGUAGES` names them: a message in one of them is read with its
+    /// voice, any other with `voice`.
+    pub voices: BTreeMap<String, String>,
+    /// The `espeak-ng` program that spells words out for the Kokoro and Piper voices; empty:
+    /// `espeak-ng` on `PATH`.
+    pub espeak: String,
     /// Words per minute; 0: the engine's default.
     pub rate: u32,
     /// Volume, 0.0 to 1.0, where the engine has one.
@@ -664,6 +673,8 @@ impl Default for SpeechConfig {
         SpeechConfig {
             engine: SpeechEngine::Auto,
             voice: String::new(),
+            voices: BTreeMap::new(),
+            espeak: String::new(),
             rate: 0,
             volume: 1.0,
             read: crate::speech::default_read(),
@@ -710,6 +721,18 @@ impl SpeechConfig {
             .flatten()
         {
             anyhow::bail!(e);
+        }
+        for (lang, voice) in &self.voices {
+            if !crate::speech::LANGUAGES.contains(&lang.as_str()) {
+                anyhow::bail!(
+                    "speech.voices: {lang:?} is not a language twr tells apart ({})",
+                    crate::speech::LANGUAGES.join(", ")
+                );
+            }
+            if let Some(e) = crate::speech::name_error(&format!("speech.voices.{lang}"), voice, 128)
+            {
+                anyhow::bail!(e);
+            }
         }
         Ok(())
     }
@@ -2890,7 +2913,16 @@ mod tests {
         assert_eq!(c.speech.read.len(), 3);
         let c = Config::from_toml_str("[speech]\nread = [\"attention\"]\n").unwrap();
         assert_eq!(c.speech.read, vec![crate::speech::ReadKind::Attention]);
+        let c = Config::from_toml_str(
+            "[speech]\nvoice = \"Ava (Premium)\"\nespeak = \"/opt/homebrew/bin/espeak-ng\"\n\
+             voices = { en = \"Ava (Premium)\", es = \"kokoro/ef_dora\" }\n",
+        )
+        .unwrap();
+        assert_eq!(c.speech.voices["es"], "kokoro/ef_dora");
+        assert_eq!(c.speech.espeak, "/opt/homebrew/bin/espeak-ng");
         for bad in [
+            "[speech]\nvoices = { fr = \"Thomas\" }\n",
+            "[speech]\nvoices = { es = \"\" }\n",
             "[speech]\nengine = \"command\"\n",
             "[speech]\nvolume = 2.0\n",
             "[speech]\nrate = 20\n",
