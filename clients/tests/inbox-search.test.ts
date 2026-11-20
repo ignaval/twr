@@ -197,4 +197,28 @@ describe("exact event rendering", () => {
       }),
     ).toContain('"chosen": "deny"');
   });
+
+  it("names a message's files without their paths", () => {
+    const prompt =
+      "see\nUploaded file: a.png\n/w/.twr-uploads/1/a.png\nUploaded file: b.txt\n/w/.twr-uploads/2/b.txt";
+    const event: HubEvent = {
+      id: "e2",
+      seq: 2,
+      thread: "worker",
+      kind: "turn.started",
+      ts: "2026-11-06T10:00:00Z",
+      data: { prompt },
+    };
+    expect(eventText(event)).toBe("see\n\nAttached: a.png, b.txt");
+    expect(
+      eventText({
+        ...event,
+        kind: "conversation.update",
+        data: { user_message: prompt, text: "reply" },
+      }),
+    ).toBe("see\n\nAttached: a.png, b.txt\n\nreply");
+    // A fenced example is text, as written.
+    const fenced = "```\nUploaded file: a\n/w/.twr-uploads/1/a\n```";
+    expect(eventText({ ...event, data: { prompt: fenced } })).toBe(fenced);
+  });
 });

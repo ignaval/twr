@@ -199,6 +199,37 @@ function backToDraft(
     },
   };
 }
+/**
+ * Drafts as the box holds them: an older app wrote a file's `Uploaded file:` pair into its
+ * draft, so each such pair (an upload's path, as `splitAttachments` reads it) moves out of
+ * the text onto the conversation's files, once each. Drafts without one stay as they are.
+ */
+export function draftsWithFiles(
+  drafts: Record<string, string>,
+  draftFiles: Record<string, NamedFile[]> = {},
+): Pick<OfflineRecord, "drafts"> & {
+  draftFiles: Record<string, NamedFile[]>;
+} {
+  let files = draftFiles;
+  const out = { ...drafts };
+  for (const [key, text] of Object.entries(drafts)) {
+    const { body, files: named } = splitAttachments(text);
+    if (!named.length) continue;
+    const saved = files[key] || [];
+    const known = new Set(saved.map((file) => file.path));
+    out[key] = body;
+    files = {
+      ...files,
+      [key]: [
+        ...saved,
+        ...named.filter(
+          (file) => !known.has(file.path) && known.add(file.path),
+        ),
+      ],
+    };
+  }
+  return { drafts: out, draftFiles: files };
+}
 export function parseOffline(
   value: string | null,
   now = Date.now(),
@@ -234,24 +265,23 @@ export function parseOffline(
           }
         : {}),
     }));
-  return {
-    version: 1,
-    drafts: Object.fromEntries(
+  const { drafts, draftFiles } = draftsWithFiles(
+    Object.fromEntries(
       Object.entries(record.drafts).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     ),
+    draftFilesOf(record.draftFiles),
+  );
+  return {
+    version: 1,
+    drafts,
     spokenDrafts: Object.fromEntries(
       Object.entries(record.spokenDrafts || {})
-        .filter(
-          ([key, value]) =>
-            value === true &&
-            typeof record.drafts[key] === "string" &&
-            record.drafts[key],
-        )
+        .filter(([key, value]) => value === true && drafts[key])
         .map(([key]) => [key, true]),
     ),
-    draftFiles: draftFilesOf(record.draftFiles),
+    draftFiles,
     workspaces: Object.fromEntries(
       Object.entries(record.workspaces as Record<string, CachedWorkspace>)
         .filter(

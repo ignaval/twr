@@ -830,12 +830,14 @@ const TASK_ROWS: usize = 3;
 const TASK_ROW_CHARS: usize = 100;
 
 /// A held task as the card's rows: its first lines, each cut, and a count of what is not
-/// shown; `what the conversation already settled` without one.
+/// shown; `what the conversation already settled` without one. The files it names show by
+/// name on a last row (`Attached: …`), never their paths.
 fn task_rows(task: Option<&str>) -> Vec<String> {
     let Some(task) = task.map(str::trim).filter(|t| !t.is_empty()) else {
         return vec!["what the conversation already settled".into()];
     };
-    let lines: Vec<&str> = task.lines().filter(|l| !l.trim().is_empty()).collect();
+    let (body, files) = twr_core::upload::split_attachments(task);
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut out: Vec<String> = lines
         .iter()
         .take(TASK_ROWS)
@@ -854,6 +856,17 @@ fn task_rows(task: Option<&str>) -> Vec<String> {
             "(+{more} more line{})",
             if more == 1 { "" } else { "s" }
         ));
+    }
+    if !files.is_empty() {
+        let names = prompts::one_line(&files.join(", "));
+        out.push(if names.chars().count() > TASK_ROW_CHARS {
+            format!(
+                "Attached: {}…",
+                names.chars().take(TASK_ROW_CHARS).collect::<String>()
+            )
+        } else {
+            format!("Attached: {names}")
+        });
     }
     out
 }
@@ -2552,10 +2565,11 @@ impl Core {
                 }
             }
         };
+        // Trimmed as a message is: a file's path that ends the task stays exact.
         let task = req
             .task
             .as_deref()
-            .map(str::trim)
+            .map(twr_core::upload::trim_message)
             .filter(|t| !t.is_empty())
             .map(str::to_string);
         // The orchestrator never starts a loop over a card the thread has open, nor raises it

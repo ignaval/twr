@@ -6,7 +6,9 @@ import {
   fileKind,
   fileSize,
   lineName,
+  namedText,
   splitAttachments,
+  trimMessage,
   withAttachments,
 } from "../shared/attachmentText";
 import {
@@ -47,11 +49,11 @@ describe("a message's attachment lines", () => {
     // The old draft format: the pair in the middle of what was typed.
     expect(
       splitAttachments(
-        "before\nUploaded file: a.txt\nC:\\Users\\me\\a.txt\nafter",
+        "before\nUploaded file: a.txt\nC:\\Users\\me\\.twr-uploads\\1\\a.txt\nafter",
       ),
     ).toEqual({
       body: "before\nafter",
-      files: [{ name: "a.txt", path: "C:\\Users\\me\\a.txt" }],
+      files: [{ name: "a.txt", path: "C:\\Users\\me\\.twr-uploads\\1\\a.txt" }],
     });
     for (const text of [
       "Uploaded file: a.txt",
@@ -65,6 +67,66 @@ describe("a message's attachment lines", () => {
       expect(splitAttachments(text)).toEqual({ body: text, files: [] });
   });
 
+  it("reads a pair only with an upload's path, and never in a fenced code block", () => {
+    const pair = "Uploaded file: a.txt\n/w/.twr-uploads/1/a.txt";
+    // A path that is not where twr puts an upload is text.
+    for (const text of [
+      "Uploaded file: mock.txt\n/tmp/mock.txt",
+      "Uploaded file: a\n/w/.twr-uploads/a",
+      "Uploaded file: a\n/w/.twr-uploads//a",
+      "Uploaded file: a\nrelative/.twr-uploads/1/a",
+    ])
+      expect(splitAttachments(text)).toEqual({ body: text, files: [] });
+    // A fenced example stays as written, so Take back and Send again keep it there.
+    for (const text of [
+      `\`\`\`\n${pair}\n\`\`\`\nafter`,
+      `  ~~~text\n${pair}\n~~~`,
+      `\`\`\`\`\n\`\`\`\n${pair}\n\`\`\`\`\nafter`,
+    ])
+      expect(splitAttachments(text)).toEqual({ body: text, files: [] });
+    const fenced = `\`\`\`\n${pair}\n\`\`\``;
+    const sent = withAttachments(fenced, named);
+    expect(splitAttachments(sent)).toEqual({ body: fenced, files: named });
+    expect(
+      splitAttachments(withAttachments(splitAttachments(sent).body, named)),
+    ).toEqual({
+      body: fenced,
+      files: named,
+    });
+    // The pairs that end a message are the composer's, even in a fence left open.
+    expect(splitAttachments(withAttachments("```\ncode", named))).toEqual({
+      body: "```\ncode",
+      files: named,
+    });
+    // Outside a fence, an upload's pair anywhere counts (an older app's draft).
+    expect(splitAttachments(`\`\`\`\nx\n\`\`\`\n${pair}\nmore`)).toEqual({
+      body: "```\nx\n```\nmore",
+      files: [{ name: "a.txt", path: "/w/.twr-uploads/1/a.txt" }],
+    });
+  });
+
+  it("trims a message but keeps the path of a file named last exactly", () => {
+    const path = "/w/.twr-uploads/1/notes.txt ";
+    expect(trimMessage(`  see\nUploaded file: notes.txt\n${path}\n\n`)).toBe(
+      `see\nUploaded file: notes.txt\n${path}`,
+    );
+    expect(trimMessage("  hello \n")).toBe("hello");
+    expect(trimMessage(`look\n${path}`)).toBe(`look\n${path.trim()}`);
+    expect(trimMessage("Uploaded file: a\n/tmp/a ")).toBe(
+      "Uploaded file: a\n/tmp/a",
+    );
+  });
+
+  it("names a message's files on a line of their own where no chip shows", () => {
+    expect(namedText(withAttachments("see", named))).toBe(
+      "see\n\nAttached: shot.png, notes.txt",
+    );
+    expect(namedText(attachmentLines(named))).toBe(
+      "Attached: shot.png, notes.txt",
+    );
+    expect(namedText("plain")).toBe("plain");
+  });
+
   it("keeps a name with line breaks on its one line, so the path is never text", () => {
     for (const name of [
       "notes\nfinal.txt",
@@ -73,12 +135,17 @@ describe("a message's attachment lines", () => {
       "notes\u0085\tfinal.txt",
     ]) {
       const sent = withAttachments("see", [
-        { name, path: "/u/a/notes_final.txt" },
+        { name, path: "/u/.twr-uploads/a/notes_final.txt" },
       ]);
       expect(sent.split("\n")).toHaveLength(3);
       expect(splitAttachments(sent)).toEqual({
         body: "see",
-        files: [{ name: "notes final.txt", path: "/u/a/notes_final.txt" }],
+        files: [
+          {
+            name: "notes final.txt",
+            path: "/u/.twr-uploads/a/notes_final.txt",
+          },
+        ],
       });
     }
     expect(lineName("\n\r")).toBe("attachment");

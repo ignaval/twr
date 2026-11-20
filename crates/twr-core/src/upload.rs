@@ -378,6 +378,96 @@ pub fn trim_message(message: &str) -> &str {
     }
 }
 
+/// The prefix of the line naming a message's file: `Uploaded file: <name>`, then its path.
+const NAMED: &str = "Uploaded file: ";
+
+/// Whether `line` is an uploaded copy's path as the apps write it: absolute (POSIX or a
+/// Windows drive), ending in `.twr-uploads/<directory>/<name>`, with no control character.
+fn upload_path(line: &str) -> bool {
+    let absolute = line.starts_with('/')
+        || matches!(line.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+    if !absolute || line.chars().any(char::is_control) {
+        return false;
+    }
+    let mut parts = line.rsplit(['/', '\\']);
+    let (Some(name), Some(dir), Some(base)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !name.is_empty() && !dir.is_empty() && base == ".twr-uploads"
+}
+
+/// The fence a line opens a fenced code block with (CommonMark: up to three spaces, then
+/// three or more backticks or tildes).
+fn fence_of(line: &str) -> Option<&str> {
+    let rest = line.trim_start_matches(' ');
+    if line.len() - rest.len() > 3 {
+        return None;
+    }
+    let c = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let fence = &rest[..rest.len() - rest.trim_start_matches(c).len()];
+    (fence.len() >= 3).then_some(fence)
+}
+
+/// A message's text without its files' lines, and the files' names, as the apps read them:
+/// an `Uploaded file: <name>` line followed by an upload's path line, outside fenced code
+/// blocks; the pairs that end the message count even in a fence left open, since the apps
+/// write them there. Anything else stays text.
+pub fn split_attachments(message: &str) -> (String, Vec<String>) {
+    if !message.contains(NAMED) {
+        return (message.to_string(), Vec::new());
+    }
+    let lines: Vec<&str> = message.split('\n').collect();
+    let pair_at = |i: usize| {
+        let name = lines[i].strip_prefix(NAMED)?;
+        let path = lines.get(i + 1)?;
+        (!name.trim().is_empty() && upload_path(path)).then_some(name)
+    };
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    let mut tail = end;
+    while tail >= 2 && pair_at(tail - 2).is_some() {
+        tail -= 2;
+    }
+    let (mut kept, mut names) = (Vec::new(), Vec::new());
+    let mut fence: Option<&str> = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let named = if (tail..end).contains(&i) || fence.is_none() {
+            pair_at(i)
+        } else {
+            None
+        };
+        if let Some(name) = named {
+            names.push(name.trim().to_string());
+            i += 2;
+            continue;
+        }
+        match fence {
+            Some(f) => {
+                // Closed by a fence of its kind, at least as long, with nothing after it.
+                let closes = fence_of(line).is_some_and(|c| {
+                    c[..1] == f[..1]
+                        && c.len() >= f.len()
+                        && line.trim_start_matches(' ')[c.len()..].trim().is_empty()
+                });
+                if closes {
+                    fence = None;
+                }
+            }
+            None => fence = fence_of(line),
+        }
+        kept.push(line);
+        i += 1;
+    }
+    if names.is_empty() {
+        return (message.to_string(), names);
+    }
+    (kept.join("\n").trim_end().to_string(), names)
+}
+
 /// Requests travel only over an authenticated hub/runner connection. The hub supplies the
 /// thread root and the authenticated caller's scope; a client cannot select a filesystem path.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1225,6 +1315,44 @@ mod tests {
         assert_eq!(
             trim_message("Uploaded file: a\nnot a path  "),
             "Uploaded file: a\nnot a path"
+        );
+    }
+
+    #[test]
+    fn a_message_names_its_files_by_upload_paths_outside_fences() {
+        let pair = "Uploaded file: a.txt\n/w/.twr-uploads/1/a.txt";
+        assert_eq!(
+            split_attachments(&format!("see\n{pair}")),
+            ("see".to_string(), vec!["a.txt".to_string()])
+        );
+        // An older app's draft: a pair in the middle, a Windows path, a trailing space.
+        assert_eq!(
+            split_attachments("a\nUploaded file: b \nC:\\w\\.twr-uploads\\2\\b \nc"),
+            ("a\nc".to_string(), vec!["b".to_string()])
+        );
+        for text in [
+            "Uploaded file: mock.txt\n/tmp/mock.txt",
+            "Uploaded file: a\n/w/.twr-uploads/a",
+            "Uploaded file: a\n/w/.twr-uploads/1/a\tb",
+            "Uploaded file: a\r\n/w/.twr-uploads/1/a\r",
+            "Uploaded file: \n/w/.twr-uploads/1/a",
+            "plain",
+        ] {
+            assert_eq!(split_attachments(text), (text.to_string(), vec![]));
+        }
+        // A fenced example stays text; the pairs that end the message count, even in a
+        // fence left open.
+        let fenced = format!("```\n{pair}\n```\nafter");
+        assert_eq!(split_attachments(&fenced), (fenced.clone(), vec![]));
+        let tilde = format!("~~~~\n```\n{pair}\n~~~~");
+        assert_eq!(split_attachments(&tilde), (tilde.clone(), vec![]));
+        assert_eq!(
+            split_attachments(&format!("```\ncode\n{pair}")),
+            ("```\ncode".to_string(), vec!["a.txt".to_string()])
+        );
+        assert_eq!(
+            split_attachments(&format!("```\n{pair}\n```\n{pair}\n")),
+            (format!("```\n{pair}\n```"), vec!["a.txt".to_string()])
         );
     }
 

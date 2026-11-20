@@ -1,5 +1,6 @@
 import {
   appendDraft,
+  draftsWithFiles,
   messageDraft,
   offlineJournal,
   type OfflineJournal,
@@ -1061,20 +1062,30 @@ export default function App({
             try {
               legacy = JSON.parse(localStorage.getItem(oldKey) || "{}");
             } catch {}
-            const previous = Object.fromEntries(
-              Object.entries(legacy || {}).filter(
-                (entry): entry is [string, string] =>
-                  typeof entry[1] === "string",
+            // Their files' pairs, as an older app wrote them into a draft, move onto
+            // the conversations' files (the journal does the same for its own drafts).
+            const previous = draftsWithFiles(
+              Object.fromEntries(
+                Object.entries(legacy || {}).filter(
+                  (entry): entry is [string, string] =>
+                    typeof entry[1] === "string",
+                ),
               ),
             );
-            const restored = { ...previous, ...saved.snapshot.drafts };
-            if (Object.keys(previous).length) {
-              await saved.drafts(restored);
+            const restored = { ...previous.drafts, ...saved.snapshot.drafts };
+            restoreFiles(previous.draftFiles);
+            restoreFiles(saved.snapshot.draftFiles);
+            if (Object.keys(previous.drafts).length) {
+              await saved.drafts(
+                restored,
+                undefined,
+                undefined,
+                uploads.committed(),
+              );
               localStorage.removeItem(oldKey);
             }
             drafts.restoreSpoken(saved.snapshot.spokenDrafts);
             drafts.update((current) => ({ ...restored, ...current }));
-            restoreFiles(saved.snapshot.draftFiles);
             setJournal(saved);
             setOfflineNotice(saved.historyError);
           })
@@ -1785,8 +1796,15 @@ export default function App({
             .catch((error) => {
               if (pendingEnqueue.current === pending)
                 pendingEnqueue.current = undefined;
+              // The save this send stopped, done now: with the box's files, which may
+              // hold one uploaded since the last save.
               void journal
-                .drafts(drafts.all(), epoch, drafts.spoken())
+                .drafts(
+                  drafts.all(),
+                  epoch,
+                  drafts.spoken(),
+                  uploads.committed(),
+                )
                 .catch(() => {});
               throw error;
             });

@@ -2,6 +2,7 @@
  * inspector's Loops section, the loop chip, the Review loop offer, Send as implementation
  * loop, the New thread form's switch, the setup card and the settings editor. Nothing here decides what the hub decides: who may start a loop,
  * on which settings, whether settings hold, the loop line. The hub says; this reads it. */
+import { trimMessage } from "./attachmentText";
 import type { Attention, Json, Thread } from "./types";
 
 /** `runtime[:account]/model[:effort]`: a named implementer (twr-core `ModelChoice`). */
@@ -1129,7 +1130,8 @@ export const MAX_TASK_BYTES = 16 * 1024;
  * What **Send as implementation loop** sends for a composer's `draft`: the message is the
  * task, as typed (`//` escapes a leading `/`, as Send does). A command or a shell line is no
  * task. An empty draft asks for what the conversation already settled, and `confirm` says so
- * first: nothing was typed.
+ * first: nothing was typed. The whitespace around it goes, except in the path of a file
+ * named last (`trimMessage`).
  */
 export function sendAsLoop(draft: string): {
   task?: string;
@@ -1144,7 +1146,8 @@ export function sendAsLoop(draft: string): {
     throw new Error(
       "A shell command is no task: send it with Send, or write what to build.",
     );
-  const task = text.trim();
+  // Trimmed as the hub trims it: a file's path that ends the task stays exact.
+  const task = trimMessage(text);
   if (new TextEncoder().encode(task).length > MAX_TASK_BYTES)
     throw new Error(
       "The task is longer than 16 KiB: put the details in a file and name it in the task.",

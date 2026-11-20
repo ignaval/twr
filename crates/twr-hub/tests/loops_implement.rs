@@ -1435,6 +1435,45 @@ async fn the_card_holds_the_task() {
     hub.shutdown().await;
 }
 
+/// A task that ends with a file the apps attached keeps that file's path exactly, a trailing
+/// space too (an older app's upload), from the request to the card, the loop and its plan
+/// prompt; the card's summary names the file and never shows the path.
+#[tokio::test]
+async fn a_task_keeps_its_files_path_and_the_card_shows_its_name() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = worker(&env, &hub, "api").await;
+    let path = "/w/.twr-uploads/1/notes.txt ";
+    let task = format!("{TASK}\nUploaded file: notes.txt\n{path}");
+    let card = request(&hub, &t, json!({"task": format!("  {task}\n\n")}))
+        .await
+        .unwrap();
+    assert_eq!(card["status"], "needs_setup");
+    let summary = item(&hub, &card["attn_id"]).unwrap()["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(summary.contains("Attached: notes.txt"), "{summary}");
+    assert!(!summary.contains(".twr-uploads"), "{summary}");
+    assert!(!summary.contains("Uploaded file"), "{summary}");
+    let got = hub
+        .loop_setup_get(
+            serde_json::from_value(json!({"attn_id": card["attn_id"]})).unwrap(),
+            &user(),
+        )
+        .unwrap();
+    assert_eq!(got["setup"]["task"], task);
+    respond(&hub, &card, START, &user()).unwrap();
+    assert_eq!(ended(&hub, &t).await.outcome, Outcome::Clean);
+    assert_eq!(get(&hub, &t)["started"]["task"], task);
+    let turns = of_kind(&hub, &t, "turn.started");
+    let EventBody::TurnStarted(p) = &turns[0].body else {
+        unreachable!()
+    };
+    assert!(p.prompt.contains(&format!("{path}\n")), "{}", p.prompt);
+    hub.shutdown().await;
+}
+
 /// `thread.new {loop}`: the thread is made with its worktree, and the task is its first
 /// prompt only as the loop's: on saved settings the plan prompt is its first turn; with the
 /// card needed, the thread stays idle with the card open, and stays (idle) after a cancel,

@@ -32,6 +32,8 @@ import { announce, scrollBehavior } from "./a11y";
 import { mayAnswer } from "./arming";
 import { canRespond } from "./attention";
 import { useArming } from "./useArming";
+import { splitAttachments } from "./attachmentText";
+import { SentAttachments } from "./ComposerAttachments";
 import {
   SETUP_START,
   commitNotes,
@@ -1313,6 +1315,18 @@ export function LoopSetupCard({
   );
 }
 
+/** A held task as the card shows it: its text, and the files it names as chips with their
+ * names only (the task keeps their paths, for the loop). */
+function HeldTask({ text }: { text: string }) {
+  const { body, files } = splitAttachments(text);
+  return (
+    <>
+      {body}
+      <SentAttachments files={files} />
+    </>
+  );
+}
+
 /** A setup card's held task, whole (`loop.setup.get`): the summary shows its first lines
  * only. Read again for each revision; `undefined` until it comes, or when it can't. */
 function useHeldTask(item: Attention, wanted: boolean) {
@@ -1449,7 +1463,7 @@ function SetupCardBody({
                         role="region"
                         aria-label="Task"
                       >
-                        {held || value}
+                        <HeldTask text={held || value} />
                       </div>
                     ) : (
                       value

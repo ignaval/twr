@@ -414,7 +414,7 @@ fn task_of(log: &LoopLog) -> Option<String> {
     log.started
         .as_ref()
         .and_then(|s| s.task.as_deref())
-        .map(str::trim)
+        .map(twr_core::upload::trim_message)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
 }

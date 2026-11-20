@@ -355,7 +355,8 @@ machine.
   loop's card adds its plan check and commit rows; there is no Workers row when the
   implementer's runtime runs no subagents), the hub's warnings, and anything to change
   first. An implementation loop's card holds its task, whole, in a box that scrolls
-  inside the card. **Start and save** starts the loop and saves its settings; it waits while
+  inside the card; the files the task names show there as chips with their names only.
+  **Start and save** starts the loop and saves its settings; it waits while
   the card lists something to change first. **Change…** opens the settings editor on the
   card; saving there raises the card again with the new values. A card that holds a task has
   **Run without a loop**, which sends the task to the thread as an ordinary message and

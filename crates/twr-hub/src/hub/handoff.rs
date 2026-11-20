@@ -409,7 +409,7 @@ impl Core {
                     out.push(format!(
                         "[{}] user: {}\norchestrator: {}\n",
                         ev.ts.format("%Y-%m-%d %H:%M UTC"),
-                        cut(p.prompt.trim(), ENTRY_MAX),
+                        cut(twr_core::upload::trim_message(&p.prompt), ENTRY_MAX),
                         reply
                     ));
                 }

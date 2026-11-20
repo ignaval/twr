@@ -209,7 +209,9 @@ describe("encrypted offline recovery", () => {
     await old.load();
     expect(old.snapshot.drafts).toEqual({ "work:orchestrator": "kept" });
     expect(old.snapshot.draftFiles).toEqual({});
-    const files = { "work:w1": [{ name: "a.txt", path: "/w/a.txt" }] };
+    const files = {
+      "work:w1": [{ name: "a.txt", path: "/w/.twr-uploads/q/a.txt" }],
+    };
     await old.drafts({ "work:orchestrator": "" }, old.epoch, {}, files);
     const reopened = new OfflineJournal(host, "old-files");
     await reopened.load();
@@ -238,17 +240,20 @@ describe("encrypted offline recovery", () => {
     const message = await journal.enqueue(
       "work",
       "thread.send",
-      { thread: "w1", prompt: "See attached\nUploaded file: a.txt\n/w/a.txt" },
-      "See attached\nUploaded file: a.txt\n/w/a.txt",
+      {
+        thread: "w1",
+        prompt: "See attached\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
+      },
+      "See attached\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
     );
     await journal.moveToDraft(message.id);
     expect(journal.snapshot.drafts["work:w1"]).toBe("See attached");
     expect(journal.snapshot.draftFiles).toEqual({
-      "work:w1": [{ name: "a.txt", path: "/w/a.txt" }],
+      "work:w1": [{ name: "a.txt", path: "/w/.twr-uploads/q/a.txt" }],
     });
     await journal.enqueue("work", "thread.send", {
       thread: "w1",
-      prompt: "again\nUploaded file: a.txt\n/w/a.txt",
+      prompt: "again\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
     });
     expect(journal.snapshot.drafts["work:w1"]).toBe("");
     expect(journal.snapshot.draftFiles).toEqual({});
@@ -263,7 +268,7 @@ describe("encrypted offline recovery", () => {
     const of = (prefix: string) =>
       Array.from({ length: 8 }, (_, i) => ({
         name: `${prefix}${i}.txt`,
-        path: `/w/${prefix}${i}.txt`,
+        path: `/w/.twr-uploads/${i}/${prefix}${i}.txt`,
       }));
     const queued = withAttachments("queued", of("q"));
     const message = await journal.enqueue(
@@ -289,8 +294,8 @@ describe("encrypted offline recovery", () => {
       disk as unknown as DesktopAPI,
       "reserved-files",
     );
-    const a = { name: "a.txt", path: "/w/a.txt" };
-    const b = { name: "b.txt", path: "/w/b.txt" };
+    const a = { name: "a.txt", path: "/w/.twr-uploads/q/a.txt" };
+    const b = { name: "b.txt", path: "/w/.twr-uploads/q/b.txt" };
     await journal.drafts(
       {},
       journal.epoch,

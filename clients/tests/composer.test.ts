@@ -193,7 +193,7 @@ function fakeHost(options: HostOptions = {}) {
     terminalRead: async () => ({ data: "", sequence: 0 }),
     uploadFile: options.uploads
       ? async (file: { name: string }, thread: string) => ({
-          path: "/uploads/" + file.name,
+          path: "/w/.twr-uploads/u/" + file.name,
           thread,
         })
       : undefined,
@@ -1641,7 +1641,7 @@ describe("attached files", () => {
     expect(app().box().value).toBe("see");
     expect(chips()).toHaveLength(1);
     expect(chips()[0]).toContain("notes.txt");
-    expect(shown()).not.toContain("/uploads");
+    expect(shown()).not.toContain(".twr-uploads");
     // The old full-width bar is gone.
     expect(app().all(".attachment-manager, .attachment-item")).toHaveLength(0);
     // The draft saved on the device is the text alone; the file is saved beside it.
@@ -1649,7 +1649,7 @@ describe("attached files", () => {
     expect(pending().drafts).toEqual({ "default:orchestrator": "see" });
     expect(pending().draftFiles).toEqual({
       "default:orchestrator": [
-        { name: "notes.txt", path: "/uploads/notes.txt" },
+        { name: "notes.txt", path: "/w/.twr-uploads/u/notes.txt" },
       ],
     });
   });
@@ -1663,7 +1663,7 @@ describe("attached files", () => {
       {
         method: "say",
         params: expect.objectContaining({
-          message: "see\nUploaded file: notes.txt\n/uploads/notes.txt",
+          message: "see\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
         }),
       },
     ]);
@@ -1686,7 +1686,7 @@ describe("attached files", () => {
         method: "thread.send",
         params: {
           thread: "w1",
-          prompt: "Uploaded file: a.txt\n/uploads/a.txt",
+          prompt: "Uploaded file: a.txt\n/w/.twr-uploads/u/a.txt",
         },
       },
     ]);
@@ -1698,7 +1698,7 @@ describe("attached files", () => {
     let finish!: () => void;
     app().host.uploadFile = (async (file: { name: string }) => {
       await new Promise<void>((resolve) => (finish = resolve));
-      return { path: "/uploads/" + file.name };
+      return { path: "/w/.twr-uploads/u/" + file.name };
     }) as any;
     await app().type("soon");
     await attach();
@@ -1717,7 +1717,7 @@ describe("attached files", () => {
     expect(sendButton().disabled).toBe(false);
     await app().press("Enter");
     expect(app().host.sent[0].params.message).toBe(
-      "soon\nUploaded file: notes.txt\n/uploads/notes.txt",
+      "soon\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
     );
   });
 
@@ -1731,7 +1731,7 @@ describe("attached files", () => {
     await app().replace("now");
     await app().press("Enter");
     expect(app().host.sent[0].params.message).toBe(
-      "now\nUploaded file: notes.txt\n/uploads/notes.txt",
+      "now\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
     );
   });
 
@@ -1747,10 +1747,10 @@ describe("attached files", () => {
     const outbox = app().find(".outbox-message");
     expect(outbox.textContent).toContain("later");
     expect(outbox.textContent).toContain("notes.txt");
-    expect(outbox.textContent).not.toContain("/uploads");
+    expect(outbox.textContent).not.toContain(".twr-uploads");
     await app().wait(450);
     expect([...app().host.secure.values()].join("\n")).toContain(
-      "later\\nUploaded file: notes.txt\\n/uploads/notes.txt",
+      "later\\nUploaded file: notes.txt\\n/w/.twr-uploads/u/notes.txt",
     );
     // Moved back to the draft: the text to the box, the file to the box's files.
     await app().click(
@@ -1758,7 +1758,7 @@ describe("attached files", () => {
     );
     expect(app().box().value).toBe("later");
     expect(chips()).toHaveLength(1);
-    expect(shown()).not.toContain("/uploads");
+    expect(shown()).not.toContain(".twr-uploads");
   });
 
   it("puts a queued message's files back on Take back, and shows them by name", async () => {
@@ -1766,14 +1766,14 @@ describe("attached files", () => {
     app().host.queues.w1 = [
       {
         ref: 7,
-        prompt: "queued words\nUploaded file: a.png\n/w/a.png",
+        prompt: "queued words\nUploaded file: a.png\n/w/.twr-uploads/q/a.png",
         mine: true,
       },
     ];
     await app().talkTo("builder");
     const queued = app().find(".queued-message");
     expect(queued.textContent).toContain("a.png");
-    expect(queued.textContent).not.toContain("/w/a.png");
+    expect(queued.textContent).not.toContain("/w/.twr-uploads/q/a.png");
     await app().click(app().find(".queued-message button", "Take back"));
     expect(app().box().value).toBe("queued words");
     expect(chips()).toEqual([expect.stringContaining("a.png")]);
@@ -1782,7 +1782,7 @@ describe("attached files", () => {
       method: "thread.send",
       params: {
         thread: "w1",
-        prompt: "queued words\nUploaded file: a.png\n/w/a.png",
+        prompt: "queued words\nUploaded file: a.png\n/w/.twr-uploads/q/a.png",
       },
     });
   });
@@ -1800,7 +1800,8 @@ describe("attached files", () => {
       method: "say",
       params: {
         voice: true,
-        message: "What is in it?\nUploaded file: notes.txt\n/uploads/notes.txt",
+        message:
+          "What is in it?\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
       },
     });
     expect(chips()).toHaveLength(0);
@@ -1830,7 +1831,7 @@ describe("attached files", () => {
       {
         thread: "w1",
         kind: "implement",
-        task: "build this\nUploaded file: spec.md\n/uploads/spec.md",
+        task: "build this\nUploaded file: spec.md\n/w/.twr-uploads/u/spec.md",
       },
     ]);
     expect(chips()).toHaveLength(0);
@@ -1867,8 +1868,88 @@ describe("attached files", () => {
     await submit();
     expect(app().host.sent.at(-1)).toEqual({
       method: "thread.send",
-      params: { thread: "w1", prompt: "Uploaded file: a.txt\n/uploads/a.txt" },
+      params: {
+        thread: "w1",
+        prompt: "Uploaded file: a.txt\n/w/.twr-uploads/u/a.txt",
+      },
     });
+  });
+
+  it("keeps a file attached just before a send the outbox refuses, over a restart", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await app().connection(false);
+    await app().type("later");
+    await app().wait(450);
+    // The outbox refuses the message (it is full); every other save goes through.
+    const write = app().host.secureWrite;
+    app().host.secureWrite = async (key: string, value: string) => {
+      if (JSON.parse(value).outbox?.length)
+        throw new Error("Outbox is full (100 messages)");
+      return write(key, value);
+    };
+    // Sent before the file's own save (350 ms after it uploaded) comes.
+    await attach();
+    await app().press("Enter");
+    expect(app().all(".outbox-message")).toHaveLength(0);
+    expect(app().box().value).toBe("later");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    expect(pending().draftFiles).toEqual({
+      "default:orchestrator": [
+        { name: "notes.txt", path: "/w/.twr-uploads/u/notes.txt" },
+      ],
+    });
+    app().host.secureWrite = write;
+    await restart();
+    expect(app().box().value).toBe("later");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+  });
+
+  it("moves an older app's file lines out of a saved draft, into the box's files", async () => {
+    await start();
+    await app().type("x");
+    await app().wait(450);
+    // The previous composer wrote each uploaded file's pair into the draft itself.
+    const record = pending();
+    record.drafts["default:orchestrator"] =
+      "See\nUploaded file: old.txt \n/w/.twr-uploads/9/old.txt \nmore\n```\nUploaded file: mock.txt\n/w/.twr-uploads/1/mock.txt\n```";
+    app().host.secure.set(
+      "offline-pending:composer-test",
+      JSON.stringify(record),
+    );
+    await restart();
+    expect(app().box().value).toBe(
+      "See\nmore\n```\nUploaded file: mock.txt\n/w/.twr-uploads/1/mock.txt\n```",
+    );
+    expect(chips()).toEqual([expect.stringContaining("old.txt")]);
+    expect(shown()).not.toContain("/w/.twr-uploads/9");
+    await app().wait(450);
+    expect(pending().draftFiles["default:orchestrator"]).toEqual([
+      { name: "old.txt ", path: "/w/.twr-uploads/9/old.txt " },
+    ]);
+    // Sent, the file goes with the message as it was uploaded: its path exactly.
+    await submit();
+    expect(app().host.sent.at(-1)?.params.message).toBe(
+      "See\nmore\n```\nUploaded file: mock.txt\n/w/.twr-uploads/1/mock.txt\n```\nUploaded file: old.txt\n/w/.twr-uploads/9/old.txt ",
+    );
+  });
+
+  it("moves the old mobile app's file lines into the box's files", async () => {
+    await start({
+      hub: "h1",
+      local: {
+        "twr.mobile.drafts.h1": JSON.stringify({
+          "default:orchestrator":
+            "old words\nUploaded file: a.png\n/w/.twr-uploads/3/a.png",
+        }),
+      },
+    });
+    expect(app().box().value).toBe("old words");
+    expect(chips()).toEqual([expect.stringContaining("a.png")]);
+    expect(pending().drafts["default:orchestrator"]).toBe("old words");
+    expect(pending().draftFiles["default:orchestrator"]).toEqual([
+      { name: "a.png", path: "/w/.twr-uploads/3/a.png" },
+    ]);
   });
 
   it("empties the box's files when offline storage is reset, and saves none of them", async () => {
@@ -1888,7 +1969,7 @@ describe("attached files", () => {
     await app().wait(450);
     const stored = [...app().host.secure.values()].join("\n");
     expect(stored).not.toContain("notes.txt");
-    expect(stored).not.toContain("/uploads/");
+    expect(stored).not.toContain("/w/.twr-uploads/u/");
   });
 
   it("keeps a taken-back message's files over a restart", async () => {
@@ -1896,7 +1977,7 @@ describe("attached files", () => {
     app().host.queues.w1 = [
       {
         ref: 7,
-        prompt: "See attached\nUploaded file: a.png\n/w/a.png",
+        prompt: "See attached\nUploaded file: a.png\n/w/.twr-uploads/q/a.png",
         mine: true,
       },
     ];
@@ -1922,7 +2003,7 @@ describe("attached files", () => {
     // Saved split at once, before the drafts' own save: a restart now loses nothing.
     expect(pending().drafts["default:orchestrator"]).toBe("later");
     expect(pending().draftFiles["default:orchestrator"]).toEqual([
-      { name: "notes.txt", path: "/uploads/notes.txt" },
+      { name: "notes.txt", path: "/w/.twr-uploads/u/notes.txt" },
     ]);
     await restart();
     expect(app().box().value).toBe("later");
@@ -1937,7 +2018,7 @@ describe("attached files", () => {
       uploadedTo.push(thread);
       if (file.name === "late.txt")
         await new Promise<void>((resolve) => (finish = resolve));
-      return { path: "/uploads/" + file.name };
+      return { path: "/w/.twr-uploads/u/" + file.name };
     }) as any;
     await attach();
     await attach("late.txt");
@@ -1955,7 +2036,7 @@ describe("attached files", () => {
     expect(uploadedTo).toEqual(["orch", "orch"]);
     await app().press("Enter");
     expect(app().host.sent.at(-1)?.params.message).toBe(
-      "draft\nUploaded file: notes.txt\n/uploads/notes.txt\nUploaded file: late.txt\n/uploads/late.txt",
+      "draft\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt\nUploaded file: late.txt\n/w/.twr-uploads/u/late.txt",
     );
     expect(chips()).toHaveLength(0);
   });
@@ -1985,7 +2066,7 @@ describe("attached files", () => {
     await app().settle();
     const messages = app().host.sent.map((sent) => sent.params.message);
     expect(messages).toEqual([
-      "typed\nUploaded file: notes.txt\n/uploads/notes.txt",
+      "typed\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
       "spoken",
     ]);
     expect(chips()).toHaveLength(0);
