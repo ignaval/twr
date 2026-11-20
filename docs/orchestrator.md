@@ -308,12 +308,15 @@ You can move the orchestrator to another runtime or model whenever you like.
 ```sh
 twr orchestrator show                   # runtime, model, thread, and which runtimes can host it
 twr orchestrator use codex --model gpt-5
+twr orchestrator use codex --model gpt-6.2-sol --effort low
 twr orchestrator use grok-build         # no --model: the runtime's default
 twr orchestrator use gemini             # a [runtimes.gemini] preset (see configuration.md)
 twr orchestrator use 'acp:opencode acp' # any ACP agent
 ```
 
 In the TUI, type `/orch <runtime> [model]`, or `/orch` alone to pick the runtime from a list. Then `y` switches with a handoff summary and `s` without.
+
+`--effort` (`orchestrator.use` `effort`) starts it at that reasoning effort, one its runtime takes (checked before anything changes); without it, the runtime's default, as for the model. A reset keeps the current effort.
 
 Only runtimes that can attach the twr MCP tools qualify: `claude-code`, `codex`, `grok-build` and ACP agents. `pty:` commands and `fake` are refused. The orchestrator can't switch itself. `[orchestrator]` in the config only decides the first orchestrator. After a switch the choice is recorded in the event log, so it survives hub restarts.
 

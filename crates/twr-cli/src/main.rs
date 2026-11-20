@@ -1265,6 +1265,9 @@ enum OrchestratorCmd {
         /// Model (default: the runtime's default).
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort, in the runtime's vocabulary (default: the runtime's default).
+        #[arg(long)]
+        effort: Option<String>,
         /// Do not ask the current orchestrator for a handoff summary: the new one gets only
         /// what the log shows (recent conversation, threads, attention items, reports).
         #[arg(long)]
@@ -2407,6 +2410,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
                 OrchestratorCmd::Use {
                     runtime,
                     model,
+                    effort,
                     no_summary,
                     wait,
                 },
@@ -2421,7 +2425,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
             };
             let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
             let ask: Option<Ask<'_>> = if tty { Some(&mut ask) } else { None };
-            orchestrator_use(&socket, &runtime, model, !no_summary, wait, ask).await
+            orchestrator_use(&socket, &runtime, model, effort, !no_summary, wait, ask).await
         }
         Cmd::Info { json } => info(&socket, json).await,
         Cmd::Usage {
@@ -7023,6 +7027,7 @@ async fn orchestrator_use(
     socket: &Path,
     runtime: &str,
     model: Option<String>,
+    effort: Option<String>,
     mut summary: bool,
     wait: Option<u64>,
     ask: Option<Ask<'_>>,
@@ -7031,6 +7036,9 @@ async fn orchestrator_use(
     let mut params = json!({ "runtime": runtime });
     if let Some(m) = model {
         params["model"] = json!(m);
+    }
+    if let Some(e) = effort {
+        params["effort"] = json!(e);
     }
     let wait_secs = wait.unwrap_or(twr_hub::hub::SUMMARY_WAIT.as_secs());
     if summary {
@@ -10758,8 +10766,16 @@ mod tests {
         assert!(matches!(
             c.cmd,
             Some(Cmd::Orchestrator {
-                cmd: OrchestratorCmd::Use { ref runtime, ref model, no_summary: false, wait: None }
+                cmd: OrchestratorCmd::Use { ref runtime, ref model, effort: None, no_summary: false, wait: None }
             }) if runtime == "codex" && model.as_deref() == Some("o5")
+        ));
+        let c = Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--effort", "low"])
+            .unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Orchestrator {
+                cmd: OrchestratorCmd::Use { ref effort, model: None, .. }
+            }) if effort.as_deref() == Some("low")
         ));
         let c =
             Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--no-summary"]).unwrap();
