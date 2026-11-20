@@ -621,7 +621,11 @@ impl Core {
                             summary: format!(
                                 "{name}: its {} is stuck: {}. Resume asks for that step again; \
                                  stop ends the loop.",
-                                loop_report::kind_words(state.kind),
+                                if state.once {
+                                    loop_report::PASS_WORDS
+                                } else {
+                                    loop_report::kind_words(state.kind)
+                                },
                                 prompts::one_line(&why)
                             ),
                             options: vec![LOOP_STUCK_RESUME.into(), LOOP_STUCK_STOP.into()],
@@ -1023,11 +1027,7 @@ impl Core {
                 vec![
                     (
                         "outcome",
-                        loop_report::outcome_words(
-                            kind,
-                            state.outcome.unwrap_or_default(),
-                            log.answered_rounds(),
-                        ),
+                        log.outcome_words(state.outcome.unwrap_or_default()),
                     ),
                     (
                         "report_path",
@@ -1299,11 +1299,7 @@ impl Core {
                     let log = self.loop_log(thread, &state.id);
                     format!(
                         "{}; checking its commit",
-                        loop_report::outcome_words(
-                            state.kind,
-                            state.outcome.unwrap_or_default(),
-                            log.answered_rounds()
-                        )
+                        log.outcome_words(state.outcome.unwrap_or_default())
                     )
                 });
                 Some(LoopAnswer {
@@ -1339,11 +1335,7 @@ impl Core {
                         why: format!("cannot write {}: {e:#}", path.display()),
                     },
                 };
-                let summary = format!(
-                    "{}; report: {}",
-                    loop_report::outcome_words(state.kind, outcome, log.answered_rounds()),
-                    path.display()
-                );
+                let summary = format!("{}; report: {}", log.outcome_words(outcome), path.display());
                 Some(LoopAnswer {
                     mark,
                     summary: Some(summary),
@@ -2060,8 +2052,7 @@ impl Core {
                 .flatten()
                 .map(|r| r.grade)
                 .unwrap_or(Grade::Success);
-            let mut summary =
-                loop_report::outcome_words(state.kind, outcome, log.answered_rounds());
+            let mut summary = log.outcome_words(outcome);
             if let Some(c) = committed.words() {
                 summary.push_str("; ");
                 summary.push_str(&c);

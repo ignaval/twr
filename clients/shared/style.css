@@ -2276,6 +2276,11 @@ meter::-webkit-meter-optimum-value {
 .loop-offer:disabled {
   opacity: 0.55;
 }
+.loop-offers {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
 .thread-card-offer {
   align-self: flex-start;
   margin: -2px 12px 6px;

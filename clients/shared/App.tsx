@@ -2476,7 +2476,14 @@ export default function App({
           );
           const words = startedWords(detail?.started, found);
           const line = words || result.loop?.line;
-          setNotice(startedNotice(name, request.kind, line));
+          setNotice(
+            startedNotice(
+              name,
+              request.kind,
+              line,
+              request.kind === "review" && !!request.once,
+            ),
+          );
         } else if (result?.status === "needs_setup") {
           // The card is the user's to answer: bring it into view, never answer it here.
           if (!found) setSection("attention");

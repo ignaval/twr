@@ -129,7 +129,7 @@ as code with a copy button instead of a link that does nothing.
 | New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
 | Stop, park/resume, compact, trim, delete | Inspector actions; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
-| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Send as implementation loop, the Review loop button on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
+| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Send as implementation loop, the Review once and Review loop buttons on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |
 | Attach, PTY fallback, arbitrary shell | Embedded xterm.js terminals using the matching real CLI or login shell |
 | Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
@@ -230,18 +230,19 @@ machine.
   action: without one, or on a read-only device, the choice says why and nothing is saved
   for later.
 - **Start one.** Select a thread: its inspector has a **Loops** section with **Review
-  loop** and **Implementation loop…** (which asks for the task, empty meaning what the
+  loop**, **Review once** (a [single review pass](usage.md#a-single-review-pass): one review,
+  the thread's triage, the report) and **Implementation loop…** (which asks for the task, empty meaning what the
   conversation settled) and, under them, the settings a loop would run on (profile,
   implementer, reviewer, and whether they are this project's) or `first run: you will be
   asked to choose models`, with **Change…**. When a thread's turn ends with changes in its worktree (files not committed, or
   commits ahead of its base) and no loop has reviewed them, its sidebar card, its
-  conversation and the orchestrator's **Latest thread reports** also show a **Review loop**
-  button (the grid's tiles do too in a narrow window such as a phone's, where the grid is
+  conversation and the orchestrator's **Latest thread reports** also show **Review once** and
+  **Review loop** buttons (the grid's tiles do too in a narrow window such as a phone's, where the grid is
   the thread list).
-  `[loops] offer_review = false` turns that button off, and it hides while the thread's setup
+  `[loops] offer_review = false` turns those buttons off, and it hides while the thread's setup
   card is open and on a thread someone stopped (send it a message first; a thread stopped
   only because the hub shut down keeps the button). `/review` in the composer does the same for the thread you talk to or have
-  selected, and takes the CLI's options (`--setup`, `--scope`, `--profile`, `--reviewer`,
+  selected, and takes the CLI's options (`--setup`, `--once`, `--scope`, `--profile`, `--reviewer`,
   `--implementer`, `--workers`, `--commit`). `/implement` starts an implementation loop with
   the same rule as the terminal UI: in a thread's conversation every word is the task;
   elsewhere a first word that names a thread is the thread, else the selected one, and the

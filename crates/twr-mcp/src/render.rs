@@ -1507,6 +1507,9 @@ pub fn loop_request(r: &Value, name: &str) -> Value {
             if let Some(p) = r.get("settings_of").filter(|p| p.is_string()) {
                 out["settings_of"] = p.clone();
             }
+            if l.get("once").and_then(Value::as_bool) == Some(true) {
+                out["once"] = Value::Bool(true);
+            }
             out
         }
         "needs_setup" => {
@@ -1606,8 +1609,11 @@ const LOOP_ROUNDS: usize = 30;
 pub fn loop_state(r: &Value) -> String {
     let name = str_of(r, "thread_name");
     let kind = str_of(r, "kind");
+    let once = r["started"].get("once").and_then(Value::as_bool) == Some(true);
     let words_of_kind = if kind == "implement" {
         "implementation loop"
+    } else if once {
+        "single review pass"
     } else {
         "review loop"
     };

@@ -2605,6 +2605,7 @@ async fn loop_tools() {
             "commit",
             "implementer",
             "kind",
+            "once",
             "plan_check",
             "profile",
             "reviewer",
@@ -2650,6 +2651,9 @@ async fn loop_tools() {
         assert!(twr_mcp::LOOP_RULE.contains(want), "{want:?}");
     }
     assert!(desc("start_loop").contains("Never on your own initiative"));
+    // A review asked for, not a loop: one pass on that thread, never another thread's review.
+    assert!(desc("start_loop").contains("with once: true on that thread itself"));
+    assert!(desc("start_loop").contains("Never review a thread's work from another thread"));
     assert!(desc("stop_loop").contains("cannot pause, resume or skip"));
     assert!(tools
         .iter()
@@ -2680,12 +2684,27 @@ async fn loop_tools() {
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["status"], "started");
     assert_eq!(v["loop"], "L1");
+    assert!(v.get("once").is_none(), "{v}");
     assert_eq!(v["line"], "high · scope");
     assert_eq!(v["settings_of"], "api");
     assert_eq!(
         v["settings"],
         "profile high · implementer the thread's own · workers claude-opus-5-5 high · \
          reviewer codex gpt-6.1-sol · commit match"
+    );
+    // `once`: a single pass, passed through.
+    h.mock.clear();
+    h.call(
+        "start_loop",
+        json!({"thread": "api", "kind": "review", "once": true}),
+    )
+    .await;
+    assert_eq!(
+        h.mock.calls(),
+        [(
+            "loop.request".to_string(),
+            json!({"thread": "api", "kind": "review", "once": true})
+        )]
     );
     // Overrides as named, and `setup`: the card, and what to tell the user.
     h.mock.clear();

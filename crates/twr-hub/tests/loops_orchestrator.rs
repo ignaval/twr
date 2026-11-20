@@ -1094,3 +1094,118 @@ async fn a_stuck_loop_the_orchestrator_started_is_no_routine_update() {
     assert_eq!(got["state"]["waiting_on"], "user", "{got}");
     hub.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// A single pass
+// ---------------------------------------------------------------------------------------------
+
+/// "Review it": the orchestrator's `once` request runs one review pass in that thread, on the
+/// saved settings, and wakes it with the pass's report; an implementation loop has none.
+#[tokio::test]
+async fn the_orchestrator_runs_one_review_pass_in_the_thread_itself() {
+    let env = Env::drive();
+    let hub = env.hub().await;
+    save(&hub, None, settings("high", "codex/gpt-6.1-sol")).await;
+    let t = changed(&env, &hub, "api").await;
+    let r = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "started", "{r}");
+    assert_eq!(r["loop"]["once"], true, "{r}");
+    let last = ended(&hub, &t).await;
+    assert_eq!(last.outcome, Outcome::Clean);
+    assert!(last.once);
+    let s = started(&hub, &t);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].once);
+    // One review run, at the profile's strongest tier, and no other.
+    let runs: Vec<(String, String)> = events(&hub, &t)
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::LoopReviewStarted(p) => Some((p.round, p.effort)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs, [("x1".to_string(), "xhigh".to_string())]);
+    assert!(events(&hub, &t)
+        .iter()
+        .all(|e| !matches!(e.body, EventBody::LoopTransition(_))));
+    until(&hub, "the notice of the pass's report", |h| {
+        notices(h).iter().any(|n| n.contains("thread=api report"))
+    })
+    .await;
+    let n = notices(&hub);
+    let notice = n.iter().find(|n| n.contains("thread=api report")).unwrap();
+    assert!(
+        notice.contains("single review pass clean: no findings"),
+        "{notice}"
+    );
+    let ls = lines(&hub);
+    assert!(
+        ls.iter().any(|(l, _)| l.starts_with(
+            "api started a single review pass, which the orchestrator asked for: high"
+        )),
+        "{ls:?}"
+    );
+    // The report says it was one pass.
+    let report = hub
+        .loop_report(serde_json::from_value(json!({"thread": t})).unwrap())
+        .unwrap();
+    let text = report["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("# Review pass report: api\n\nSingle review pass clean: no findings"),
+        "{text}"
+    );
+    assert!(
+        text.contains("## Single pass") && !text.contains("## Sweep"),
+        "{text}"
+    );
+    // An implementation loop runs no single pass.
+    let e = hub
+        .loop_request(
+            serde_json::from_value(json!({"thread": t, "kind": "implement", "once": true}))
+                .unwrap(),
+            &orch(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+    hub.shutdown().await;
+}
+
+/// The first single pass shows the setup card as any first loop does; the card says it is a
+/// single pass, and answering it starts one.
+#[tokio::test]
+async fn a_first_single_pass_shows_the_card_and_its_answer_starts_one() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    let r = request(&hub, &t, json!({"once": true}), &user())
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    assert_eq!(r["why"], "first_run");
+    let card = setup(&hub, &t, &r["attn_id"]);
+    assert!(card.once);
+    let summary = item(&hub, &r["attn_id"]).unwrap()["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        summary.contains("Run          single pass: one review at xhigh, its triage, the report"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("Reviewer     codex · gpt-6.1-sol · xhigh\n"),
+        "{summary}"
+    );
+    answer(&hub, &r, START, &user()).unwrap();
+    let s = started(&hub, &t);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].once);
+    let view = hub.thread_view(&t).unwrap();
+    let l = view.r#loop.as_ref().unwrap();
+    assert!(l.once);
+    assert_eq!(twr_core::loops::line(l), "high · single pass · scope");
+    hub.shutdown().await;
+}

@@ -986,6 +986,8 @@ pub enum ActionKind {
     LoopChange,
     /// Starts a review loop on the thread, as `/review` (`review loop`).
     LoopStart,
+    /// Starts a single review pass on the thread, as `/review --once` (`review once`).
+    LoopOnce,
     /// Puts `/implement ` in the input box, ready for the task (`implementation loop…`).
     LoopImplement,
     /// Opens the loop settings editor on the settings the thread's project uses
@@ -5762,6 +5764,7 @@ impl AppState {
             Slash::Review {
                 thread,
                 setup,
+                once,
                 scope,
                 profile,
                 reviewer,
@@ -5776,7 +5779,7 @@ impl AppState {
                     ("workers", workers),
                     ("commit", commit),
                 ];
-                return self.request_review(thread.as_deref(), setup, scope, overrides);
+                return self.request_review(thread.as_deref(), setup, once, scope, overrides);
             }
             Slash::Loop {
                 thread,
@@ -7191,6 +7194,7 @@ impl AppState {
                     match &t.r#loop {
                         None => {
                             rows.push(row(ActionKind::LoopStart, "review loop"));
+                            rows.push(row(ActionKind::LoopOnce, "review once"));
                             rows.push(row(ActionKind::LoopImplement, "implementation loop…"));
                         }
                         Some(l) => {
@@ -7472,7 +7476,12 @@ impl AppState {
             }
             ActionKind::LoopStart => {
                 return self
-                    .request_review(Some(&thread), false, None, Vec::new())
+                    .request_review(Some(&thread), false, false, None, Vec::new())
+                    .0;
+            }
+            ActionKind::LoopOnce => {
+                return self
+                    .request_review(Some(&thread), false, true, None, Vec::new())
                     .0;
             }
             ActionKind::LoopImplement => self.prefill_implement(&thread),
@@ -21865,6 +21874,7 @@ pub(crate) mod tests {
             [
                 ActionKind::Talk,
                 ActionKind::LoopStart,
+                ActionKind::LoopOnce,
                 ActionKind::LoopImplement,
                 ActionKind::LoopSettings,
                 ActionKind::Pin,

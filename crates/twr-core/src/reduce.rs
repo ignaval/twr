@@ -523,6 +523,9 @@ pub struct LastLoop {
     /// Who asked for it: left out for the user.
     #[serde(skip_serializing_if = "crate::loops::ControlBy::is_user")]
     pub requested_by: crate::loops::ControlBy,
+    /// It was a single pass ([`crate::event::LoopStarted::once`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub once: bool,
 }
 
 /// `ext.twr.reason` of the `thread.stopped` the hub records for a runtime its own shutdown
@@ -562,6 +565,7 @@ impl ThreadView {
             commits: l.commits,
             commit_problem: l.commit_problem,
             requested_by: l.requested_by,
+            once: l.once,
             ended_turn: self
                 .current_turn
                 .or(self.last_turn.as_ref().map(|t| t.turn)),

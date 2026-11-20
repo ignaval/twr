@@ -153,15 +153,16 @@ fn loop_started_text(v: &twr_core::reduce::ThreadView, p: &LoopStarted) -> Strin
         format!("; this run only: {}", run.join(", "))
     };
     let kind = match p.kind {
-        twr_core::loops::LoopKind::Review => "review",
-        twr_core::loops::LoopKind::Implement => "implementation",
+        twr_core::loops::LoopKind::Review if p.once => "single review pass",
+        twr_core::loops::LoopKind::Review => "review loop",
+        twr_core::loops::LoopKind::Implement => "implementation loop",
     };
     let asked = match p.requested_by {
         twr_core::loops::ControlBy::Orchestrator => ", which the orchestrator asked for",
         _ => "",
     };
     format!(
-        "{} started a {kind} loop{asked}: {} · implementer {implementer} · reviewer {} {} \
+        "{} started a {kind}{asked}: {} · implementer {implementer} · reviewer {} {} \
          ({from}{run})",
         v.name, p.profile.name, s.reviewer.runtime, s.reviewer.model
     )
@@ -255,7 +256,16 @@ impl Core {
                 .map(|l| l.kind)
                 .or_else(|| worker.and_then(|v| v.r#loop.as_ref().map(|l| l.kind)))
                 .unwrap_or_default();
-            let loop_words = super::loops::kind_words(kind);
+            let once = prev_loop
+                .as_ref()
+                .map(|l| l.once)
+                .or_else(|| worker.and_then(|v| v.r#loop.as_ref().map(|l| l.once)))
+                .unwrap_or_default();
+            let loop_words = if once {
+                super::loops::PASS_WORDS
+            } else {
+                super::loops::kind_words(kind)
+            };
             let (text, about, ext) = match (&e.body, worker) {
                 // A loop's setup card (`hub::loops`): the user's to answer, like a question.
                 (EventBody::AttentionRaised(p), Some(v))
@@ -423,12 +433,19 @@ impl Core {
                         .as_deref()
                         .map(|r| format!(": {}", cut(r, 300)))
                         .unwrap_or_default();
-                    (
+                    let words = if once {
                         format!(
-                            "{}: {}{why}",
-                            v.name,
+                            "{} {}",
+                            super::loops::PASS_WORDS,
                             super::loops::outcome_words(kind, p.outcome, rounds)
-                        ),
+                                .trim_start_matches(super::loops::kind_words(kind))
+                                .trim_start()
+                        )
+                    } else {
+                        super::loops::outcome_words(kind, p.outcome, rounds)
+                    };
+                    (
+                        format!("{}: {words}{why}", v.name),
                         Some(e.thread.clone()),
                         not_routine(twr_ext_map(json!({"loop": p.id, "outcome": p.outcome}))),
                     )

@@ -22,6 +22,7 @@ import {
   RefreshCw,
   Repeat,
   RotateCw,
+  SearchCheck,
 } from "lucide-react";
 import { createPortal } from "react-dom";
 import type { Attention, Json, Thread } from "./types";
@@ -186,42 +187,73 @@ export function LoopEndedLine({ thread }: { thread: Thread }) {
       <span className="visually-hidden"> ended: </span>
       {problem && <AlertCircle size={12} aria-hidden="true" />}
       <span className="loop-line">
-        {words.replace(/^(review|implementation) loop /, "")}
+        {words
+          .replace(/^(review loop|implementation loop) /, "")
+          .replace(/^single review pass /, "single pass ")}
       </span>
     </span>
   );
 }
 
-/** The quiet Review loop button on a finished turn with changes. */
+/** The quiet Review once and Review loop buttons on a finished turn with changes. */
 export function ReviewLoopOffer({
   thread,
   className = "",
-  label = "Review loop",
 }: {
   thread: Thread;
   className?: string;
-  label?: string;
 }) {
   const loops = useLoops();
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<"" | "once" | "loop">("");
+  const start = (which: "once" | "loop") => {
+    setBusy(which);
+    void loops
+      .startReview(thread.id, which === "once" ? { once: true } : {})
+      .finally(() => setBusy(""));
+  };
   return (
-    <button
-      type="button"
-      className={`loop-offer ${className}`}
-      disabled={!loops.access.act || busy}
-      title={
-        loops.access.why ||
-        `Start a review loop on ${thread.name}'s changes: a reviewer model checks them round by round and the thread fixes what holds up.`
-      }
-      aria-label={`${label}: ${thread.name}`}
-      onClick={() => {
-        setBusy(true);
-        void loops.startReview(thread.id).finally(() => setBusy(false));
-      }}
+    <span
+      className={`loop-offers ${className}`}
+      role="group"
+      aria-label={`Review ${thread.name}'s changes`}
     >
-      {busy ? <Spinner /> : <Repeat size={13} aria-hidden="true" />}
-      {label}
-    </button>
+      <button
+        type="button"
+        className="loop-offer"
+        disabled={!loops.access.act || !!busy}
+        title={
+          loops.access.why ||
+          `Review ${thread.name}'s changes once: a reviewer model checks them, the thread fixes what holds up, and it ends.`
+        }
+        aria-label={`Review once: ${thread.name}`}
+        onClick={() => start("once")}
+      >
+        {busy === "once" ? (
+          <Spinner />
+        ) : (
+          <SearchCheck size={13} aria-hidden="true" />
+        )}
+        Review once
+      </button>
+      <button
+        type="button"
+        className="loop-offer"
+        disabled={!loops.access.act || !!busy}
+        title={
+          loops.access.why ||
+          `Start a review loop on ${thread.name}'s changes: a reviewer model checks them round by round and the thread fixes what holds up.`
+        }
+        aria-label={`Review loop: ${thread.name}`}
+        onClick={() => start("loop")}
+      >
+        {busy === "loop" ? (
+          <Spinner />
+        ) : (
+          <Repeat size={13} aria-hidden="true" />
+        )}
+        Review loop
+      </button>
+    </span>
   );
 }
 
@@ -445,6 +477,27 @@ export function LoopsSection({
             </button>
             <button
               type="button"
+              disabled={!start.act || !!busy}
+              title={
+                start.why ||
+                "Review the thread's work once: a reviewer model checks it, the thread verifies and fixes or dismisses each finding, and it ends."
+              }
+              aria-describedby={
+                start.why && act ? `${headingId}-start-why` : undefined
+              }
+              onClick={() =>
+                run("once", () => loops.startReview(thread.id, { once: true }))
+              }
+            >
+              {busy === "once" ? (
+                <Spinner />
+              ) : (
+                <SearchCheck size={15} aria-hidden="true" />
+              )}
+              Review once
+            </button>
+            <button
+              type="button"
               ref={implementOpener}
               disabled={!start.act || !!busy}
               aria-describedby={
@@ -478,7 +531,8 @@ export function LoopsSection({
           {last && (
             <div className="loop-last">
               <p className="muted">
-                Last {kindWords(last.kind)}: {outcomeWords(last.outcome)}
+                Last {kindWords(last.kind, last.once)}:{" "}
+                {outcomeWords(last.outcome)}
               </p>
               {last.kind === "implement" || last.commits?.length ? (
                 <Commits
@@ -887,7 +941,7 @@ function LoopProgress({
   detail?: Json;
   thread: Thread;
 }) {
-  const phases = phasesOf(state.kind);
+  const phases = phasesOf(state.kind, state.once);
   const started = startedWords(detail?.started, thread);
   const current = phases.indexOf(state.phase);
   const skipped = skippedPhases(state);
@@ -899,7 +953,8 @@ function LoopProgress({
           {thread.loop_badge ||
             (state.kind === "implement" ? "IMPLEMENT LOOP" : "REVIEW LOOP")}
         </span>{" "}
-        {state.profile} · {waitingWords(state)}
+        {state.profile}
+        {state.once ? " · single pass" : ""} · {waitingWords(state)}
       </p>
       <ol className="loop-phases" aria-label="Phases">
         {phases.map((phase, i) => {

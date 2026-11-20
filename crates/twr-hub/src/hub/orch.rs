@@ -5631,6 +5631,14 @@ mod tests {
         // move to another runtime goes on the card unless the worker's mode is restricted.
         assert!(p.contains("set_model") && p.contains("effort") && p.contains("applied directly"));
         assert!(p.contains("A runtime move returns needs_confirmation"));
+        // A review request is one pass in the worker's own thread: never a review thread,
+        // never rounds by hand; loops only when asked; a one-off request is no preference.
+        assert!(p.contains("start_loop {kind:\n\"review\", once: true} on it"));
+        assert!(p.contains("Never spawn a thread to review, check or re-review"));
+        assert!(p.contains("never run review rounds by hand"));
+        assert!(p.contains("runs only when the user asks for a loop by name"));
+        assert!(p.contains("covers\nonly the work it came with"));
+        assert!(p.contains("never\ncall a one-off request a user preference"));
         // Deleting goes on the user's card; the trash is read-only to it.
         assert!(p.contains("delete_thread") && p.contains("list_trash is read-only"));
         // A cut transcript line is read in full by its seq.

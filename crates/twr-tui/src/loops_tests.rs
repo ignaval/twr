@@ -775,6 +775,22 @@ fn review_requests_a_loop_and_needs_setup_selects_the_card() {
             json!({"thread": "t-gamma", "kind": "review"})
         )]
     );
+    // `/review --once` and the popup's `review once`: a single pass.
+    assert_eq!(
+        loop_call(&type_line(&mut st, "/review gamma --once")),
+        [(
+            "loop.request",
+            json!({"thread": "t-gamma", "kind": "review", "once": true})
+        )]
+    );
+    st.set_focus(Some("t-gamma".into()));
+    assert_eq!(
+        loop_call(&run_row(&mut st, ActionKind::LoopOnce)),
+        [(
+            "loop.request",
+            json!({"thread": "t-gamma", "kind": "review", "once": true})
+        )]
+    );
 }
 
 /// `/loop`: its controls on the thread's loop (`stop` asks `y`), `status` in the status bar,
@@ -1264,6 +1280,31 @@ fn a_skipped_verification_reads_as_skipped() {
     assert!(
         rows.contains(&"scope · ladder · sweep skipped · verify skipped · ▸report".to_string()),
         "{rows:?}"
+    );
+}
+
+/// A single pass's progress lists only its phases, its line says it is one, and skip to verify
+/// is refused.
+#[test]
+fn a_single_pass_reads_as_one() {
+    let mut p = started();
+    p.once = true;
+    let (mut m, _) = LoopState::start(&p).unwrap();
+    let now = twr_core::testkit::base_time();
+    m.step(Input::GoalWritten { goal: "G".into() }, now)
+        .unwrap();
+    assert_eq!(twr_core::loops::line(&m), "high · single pass · x1");
+    let rows: Vec<String> = crate::loops::progress_rows(&m, 80)
+        .iter()
+        .map(line_text)
+        .collect();
+    assert!(
+        rows.contains(&"scope · ▸ladder · report".to_string()),
+        "{rows:?}"
+    );
+    assert_eq!(
+        crate::loops::skip_refused(&m),
+        Some("a single pass has no verification to skip to")
     );
 }
 

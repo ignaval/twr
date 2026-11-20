@@ -2108,7 +2108,7 @@
   {
     "id": "cli:loop review",
     "title": "twr loop review",
-    "description": "Start a review loop on a thread's work: an adversarial reviewer (another model, run read-only) reviews it round after round, and the thread verifies and fixes or dismisses each finding, until the reviewer has nothing left. It starts at once on your saved loop settings and prints them. The first time, or with --setup, or when a saved setting no longer holds, the thread's settings card comes first: on a terminal you answer it here (1 start and save, 2 change… in your editor, 3 cancel); without one it stays open, this prints the `twr respond` line that starts it, and exits 2. No flag starts a first loop without that card",
+    "description": "Start a review loop on a thread's work: an adversarial reviewer (another model, run read-only) reviews it round after round, and the thread verifies and fixes or dismisses each finding, until the reviewer has nothing left. It starts at once on your saved loop settings and prints them. The first time, or with --setup, or when a saved setting no longer holds, the thread's settings card comes first: on a terminal you answer it here (1 start and save, 2 change… in your editor, 3 cancel); without one it stays open, this prints the `twr respond` line that starts it, and exits 2. No flag starts a first loop without that card. With --once it is a single pass: one review, the thread's triage of what it found, then the report",
     "group": "CLI · loop",
     "fields": [
       {
@@ -2123,6 +2123,13 @@
         "label": "setup",
         "type": "boolean",
         "description": "Show the settings card first, even when saved settings hold; starting from it saves what it shows",
+        "advanced": false
+      },
+      {
+        "key": "once",
+        "label": "once",
+        "type": "boolean",
+        "description": "A single pass: one review run at the profile's strongest tier, the thread's triage of its findings, then the report. No second round, sweep or verification",
         "advanced": false
       },
       {
@@ -2189,6 +2196,12 @@
       {
         "key": "setup",
         "flag": "--setup",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "once",
+        "flag": "--once",
         "many": false,
         "separator": false
       },

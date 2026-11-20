@@ -104,7 +104,7 @@ mod report;
 use twr_runner::loops::{acp_review, git, review};
 
 pub(super) use driver::{reap_reviews, watch, LoopRuns};
-pub(super) use report::{kind_words, outcome_words, transition_words};
+pub(super) use report::{kind_words, outcome_words, transition_words, PASS_WORDS};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -243,6 +243,9 @@ pub struct LoopRequest {
     /// when the thread has commits beyond its base, else `uncommitted`. Refused for an
     /// implementation loop.
     pub scope: Option<String>,
+    /// A single pass of a review loop: one review run, its triage, the report
+    /// ([`LoopStarted::once`]). Refused for an implementation loop.
+    pub once: bool,
     /// What this run changes, as the user typed it.
     pub overrides: Overrides,
 }
@@ -694,6 +697,17 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
             .as_ref()
             .map_or_else(|| s.profile.clone(), |p| p.summary())
     ));
+    if setup.once {
+        rows.push(format!(
+            "Run          single pass: one review{}, its triage, the report",
+            setup
+                .profile
+                .as_ref()
+                .and_then(|p| p.pass_tier())
+                .map(|t| format!(" at {}", t.effort))
+                .unwrap_or_default()
+        ));
+    }
     if let Some(scope) = &setup.scope {
         rows.push(format!(
             "Scope        {}",
@@ -738,7 +752,14 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
         rows.push(format!("Workers      {workers}"));
     }
     let mut efforts: Vec<String> = Vec::new();
-    if let Some(p) = &setup.profile {
+    if let Some(t) = setup
+        .profile
+        .as_ref()
+        .and_then(|p| p.pass_tier())
+        .filter(|_| setup.once)
+    {
+        efforts.push(t.effort);
+    } else if let Some(p) = &setup.profile {
         for e in p.tiers.iter().map(|t| &t.effort).chain([&p.verify.effort]) {
             if !efforts.contains(e) {
                 efforts.push(e.clone());
@@ -864,7 +885,9 @@ fn start_of(ext: &Option<JsonMap>) -> StartFacts {
 /// A start the machine refused.
 fn start_err(e: StartError) -> RpcError {
     match e {
-        StartError::EmptyProfile(_) => rpc(codes::BAD_REQUEST, e.to_string()),
+        StartError::EmptyProfile(_) | StartError::OnceImplement => {
+            rpc(codes::BAD_REQUEST, e.to_string())
+        }
     }
 }
 
@@ -1058,6 +1081,8 @@ struct Origin {
     task: Option<String>,
     /// Who asked for it.
     requested_by: ControlBy,
+    /// A single pass.
+    once: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1153,6 +1178,7 @@ impl Hub {
             task: Some(l.task),
             setup: l.setup,
             scope: None,
+            once: false,
             overrides: l.overrides,
         };
         match self.loop_request(req, caller).await {
@@ -1218,6 +1244,9 @@ impl Hub {
         let kind = parse_kind(&p.kind)?;
         twr_core::loops::settings::check_run(kind, p.scope.as_deref(), p.task.as_deref())
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        if p.once && kind == LoopKind::Implement {
+            return Err(start_err(StartError::OnceImplement));
+        }
         let scope = parse_scope(p.scope.as_deref())?;
         let id = {
             let core = self.inner.core();
@@ -2049,6 +2078,7 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
                     "task": p.task,
                     "commit_fixes": p.commit_fixes,
                     "requested_by": p.requested_by,
+                    "once": p.once,
                     "baseline": twr_ext(&p.ext)
                         .and_then(|t| t.get(LOOP_START_KEY))
                         .and_then(|s| s.get("baseline"))
@@ -2593,6 +2623,7 @@ impl Core {
                     overrides,
                     task,
                     requested_by: requester(caller),
+                    once: req.once,
                 },
                 from,
                 caller,
@@ -2650,6 +2681,7 @@ impl Core {
             } else {
                 ControlBy::Orchestrator
             },
+            once: req.once,
             warnings: proposal.warnings,
             problems: proposal
                 .problems
@@ -2799,6 +2831,7 @@ impl Core {
             task: origin.task,
             commit_fixes,
             requested_by: origin.requested_by,
+            once: origin.once,
             folder,
             ext: twr_ext_map(json!({ LOOP_START_KEY: facts })),
             ..Default::default()
@@ -2994,6 +3027,7 @@ impl Core {
                 overrides: setup.overrides.clone(),
                 task: setup.task.clone(),
                 requested_by: setup.requested_by,
+                once: setup.once,
             },
             StartFrom::card(card),
             caller,

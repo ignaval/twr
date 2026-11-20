@@ -217,6 +217,7 @@ A review loop has another model review a thread's work, round after round, until
 twr loop review api                          # start a review loop on api's work
 twr loop review api --scope since:main       # what it reviews; also --profile, --reviewer, ... for this run
 twr loop review api --setup                  # show the settings card first
+twr loop review api --once                   # one review pass: review, triage, report
 twr loop implement api add a CSV export      # plan, implement, review and commit a task
 twr thread new api --loop implement add rate limiting   # the same in a new thread
 twr loop list                                # the running loops
@@ -226,7 +227,7 @@ twr loop report api                          # the loop's report, from any machi
 twr loop settings                            # the saved settings; --edit, --reset, `set`
 ```
 
-In the desktop and mobile apps, a thread's inspector has the same actions, a finished turn with changes offers **Review loop**, and `/review` and `/loop` work in the composer ([desktop.md](desktop.md#loops)).
+In the desktop and mobile apps, a thread's inspector has the same actions, a finished turn with changes offers **Review once** and **Review loop**, and `/review` and `/loop` work in the composer ([desktop.md](desktop.md#loops)).
 
 ### Starting a review loop
 
@@ -250,6 +251,10 @@ How much review a loop runs is its profile: `high` runs a medium-effort tier unt
 While a loop runs, the hub sends the thread one prompt per step, each starting with `[twr loop <id> <step>]`: the scope step (run the gates, write a GOAL paragraph for the reviewer), each round's triage, the sweep, the report.
 
 **The sweep** distills what the ladder fixed into named rules and audits the whole touched surface for each one. By default (`sweep = "thread"`) the thread does it in one turn, with its own read-only subagents where its runtime has them. With `sweep = "runs"` (the settings editor's **Sweep** row, `twr loop settings set --sweep runs`, or `[loops] sweep` for the first card) it takes two turns with the hub's runs between them: the thread names the rules (`rules` step, at most 12), the hub runs one read-only audit run per rule on the reviewer's model at the verification's effort, up to `[loops] max_audit_runs` at once, and the thread then gets their reports as data (`sweep` step), verifies every citation, fixes what survives and reports each rule. That costs one reviewer call per rule. An audit run that fails is retried once; one that fails again leaves its rule not audited, which the thread is told and either audits itself or reports as not audited with the reason. While the audits run, the loop line reads `sweep · auditing 2/5` (rules audited of all) and the card `background · auditing 3 of 5 rules`. A message you send the thread goes ahead of the loop's next prompt, and the loop goes on after that turn. While a round's review runs, the thread shows as `background`. Each step's turn has a report like any other turn; the loop's last one is its report ([below](#the-report)).
+
+### A single review pass
+
+`--once` (`/review --once` in the TUI and the apps, **Review once** in the apps and the thread's action popup) runs one review pass instead of a loop: the scope step, one review round, the thread's triage of what it found, and the report. There is no second round, no sweep and no verification, so nothing reviews the fixes. The round runs at the profile's strongest ladder tier (`xhigh` for `high`, `medium` for `medium` and `low`), on the saved reviewer. The pass ends `clean` when the reviewer found nothing, else `triaged` once the thread has fixed or dismissed every finding; the report and the conversation say so: `single review pass: 3 findings, 2 fixed, 1 dismissed`. The loop line reads `high · single pass · x1`. The commit setting applies as for a review loop, the first pass shows the settings card as a first loop does, and skip to verify is refused. A pass survives a hub restart like a loop and goes on as a single pass.
 
 ### Implementation loops
 
@@ -330,7 +335,7 @@ A round's files in the loop folder are its last run's: `round-m1.prompt.md`, `ro
 
 ### Asking the orchestrator for a loop
 
-You can ask the orchestrator for a loop in words: "run a review loop on api", "start a thread on api to add rate limiting, with an implementation loop", "...and let me pick the models". It starts one only when you ask, by name or in clear words, never on its own. It asks the hub, which holds it to your settings: the loop starts at once only on your saved settings, still holding, and only if the orchestrator named nothing that differs from them (a profile, reviewer or other setting you said, which it passes along as you said it). Otherwise, and whenever you ask to pick or check the models, the hub raises the thread's settings card for you, and the orchestrator tells you so ("I've asked you to choose the loop's models on api's card"). Only you answer the card; the orchestrator's picks show in its `This run` row, and changing the card's settings drops them. A new thread it starts with a loop is made either way, and stays if you cancel the card, with its task not sent.
+Ask the orchestrator to review a thread's work ("review it", "then review their work") and it runs a single pass in that thread ([above](#a-single-review-pass)), never a review in another thread and never review rounds of its own; a loop runs only when you ask for one. You can ask the orchestrator for a loop in words: "run a review loop on api", "start a thread on api to add rate limiting, with an implementation loop", "...and let me pick the models". It starts one only when you ask, by name or in clear words, never on its own. It asks the hub, which holds it to your settings: the loop starts at once only on your saved settings, still holding, and only if the orchestrator named nothing that differs from them (a profile, reviewer or other setting you said, which it passes along as you said it). Otherwise, and whenever you ask to pick or check the models, the hub raises the thread's settings card for you, and the orchestrator tells you so ("I've asked you to choose the loop's models on api's card"). Only you answer the card; the orchestrator's picks show in its `This run` row, and changing the card's settings drops them. A new thread it starts with a loop is made either way, and stays if you cancel the card, with its task not sent.
 
 The start line in the conversation says the orchestrator asked for it ("api started a review loop, which the orchestrator asked for: ..."). Its rounds are routine updates: the orchestrator doesn't report them one by one. When the loop ends, the hub wakes the orchestrator with the loop's report and it tells you how it ended; a loop that gets stuck wakes it too, though only you answer the stuck item. It can tell you how a loop is going (`get_loop`) and stop one when you ask (`stop_loop`); pausing, resuming, skipping and the settings stay yours ([orchestrator.md](orchestrator.md#loops)).
 

@@ -303,7 +303,62 @@ impl LoopLog {
     pub(in crate::hub) fn plan_path(&self) -> Option<String> {
         self.plans.iter().rev().find_map(|p| p.path.clone())
     }
+
+    /// It is a single pass (`loop.started.once`).
+    pub(in crate::hub) fn once(&self) -> bool {
+        self.started.as_ref().is_some_and(|s| s.once)
+    }
+
+    /// How the loop that ended (or will end) `outcome` is said: [`pass_words`] for a single
+    /// pass, else [`outcome_words`].
+    pub(in crate::hub) fn outcome_words(&self, outcome: Outcome) -> String {
+        if self.once() {
+            pass_words(self, outcome)
+        } else {
+            outcome_words(self.kind(), outcome, self.answered_rounds())
+        }
+    }
 }
+
+/// How single pass `log` that ended `outcome` is said, with its round's triage: `single review
+/// pass clean: no findings`, `single review pass: 3 findings, 2 fixed, 1 dismissed`, `single
+/// review pass stopped before its review`.
+pub(in crate::hub) fn pass_words(log: &LoopLog, outcome: Outcome) -> String {
+    let round = log.rounds.iter().find(|r| r.id != PLAN_CHECK_ROUND);
+    let answered = round.filter(|r| r.answered);
+    let found = |r: &RoundLog| match r.findings.len() {
+        1 => "1 finding".to_string(),
+        n => format!("{n} findings"),
+    };
+    match outcome {
+        Outcome::Clean => format!("{PASS_WORDS} clean: no findings"),
+        Outcome::Triaged => {
+            let r = answered.cloned().unwrap_or_default();
+            let count = |v: Verdict| r.triage.iter().filter(|t| t.verdict == v).count();
+            let mut parts = vec![
+                found(&r),
+                format!("{} fixed", count(Verdict::Fixed)),
+                format!("{} dismissed", count(Verdict::Dismissed)),
+            ];
+            if count(Verdict::Duplicate) > 0 {
+                parts.push(format!("{} duplicate", count(Verdict::Duplicate)));
+            }
+            format!("{PASS_WORDS}: {}", parts.join(", "))
+        }
+        Outcome::Stopped | Outcome::Failed => format!(
+            "{PASS_WORDS} {} {}",
+            outcome.as_str(),
+            match answered {
+                Some(r) => format!("after its review ({})", found(r)),
+                None => "before its review".to_string(),
+            }
+        ),
+        other => format!("{PASS_WORDS} {}", other.as_str()),
+    }
+}
+
+/// What a single pass is called where a loop says `review loop`.
+pub(in crate::hub) const PASS_WORDS: &str = "single review pass";
 
 /// What a loop committed, as its report and end say it: the commits, or why it did not.
 #[derive(Debug, Clone, Default)]
@@ -381,6 +436,7 @@ pub(in crate::hub) fn outcome_words(kind: LoopKind, outcome: Outcome, rounds: us
         Outcome::Clean => "clean",
         Outcome::LedgerFixedPoint => "at a ledger fixed point (every finding already ledgered)",
         Outcome::CapExpired => "with its verification cap spent and findings still arriving",
+        Outcome::Triaged => "with its findings triaged",
         Outcome::Stopped => "stopped",
         Outcome::Failed => "failed",
     };
@@ -404,16 +460,14 @@ pub(in crate::hub) fn report(
     let mut out = String::new();
     let started = log.started.clone().unwrap_or_default();
     let kind = started.kind;
+    let once = log.once();
     let title = match kind {
+        LoopKind::Review if once => "Review pass report",
         LoopKind::Review => "Review loop report",
         LoopKind::Implement => "Implementation loop report",
     };
     let _ = writeln!(out, "# {title}: {name}\n");
-    let _ = write!(
-        out,
-        "{}",
-        capitalized(&outcome_words(kind, outcome, log.answered_rounds()))
-    );
+    let _ = write!(out, "{}", capitalized(&log.outcome_words(outcome)));
     if let Some(c) = committed.words() {
         let _ = write!(out, "; {c}");
     }
@@ -568,129 +622,15 @@ pub(in crate::hub) fn report(
             let _ = writeln!(out, "{line}");
         }
     }
-    let _ = writeln!(out, "\n## Transition\n");
-    match &log.transition {
-        Some((_, round)) if round.is_empty() => {
-            let _ = writeln!(out, "Skipped to verification before any ladder round.");
-        }
-        Some((reason, round)) => {
-            let _ = write!(out, "After {round}: {}.", transition_words(*reason));
-            if log.verify_skipped {
-                let _ = write!(
-                    out,
-                    " The loop went straight to its report: a verification round could only \
-                     have repeated {round}."
-                );
-            }
-            let _ = writeln!(out);
-        }
-        None => {
-            let _ = writeln!(out, "The ladder did not end.");
-        }
-    }
-    let _ = writeln!(out, "\n## Sweep\n");
-    let audits = log.audits.as_deref().unwrap_or_default();
-    if log.audits.is_some() {
+    if once {
         let _ = writeln!(
             out,
-            "{}",
-            match audits.len() {
-                0 => "Audited by runs of the reviewer's model: the thread named no rule worth an \
-                      audit."
-                    .to_string(),
-                n => format!(
-                    "Audited by runs of the reviewer's model, one per rule ({n} rule{}), the \
-                     thread verifying their reports.",
-                    if n == 1 { "" } else { "s" }
-                ),
-            }
+            "\n## Single pass\n\nOne review round at the profile's strongest tier, then the \
+             thread's triage of its findings. No second round, sweep or verification ran: no \
+             review checked the fixes."
         );
-        let _ = writeln!(out);
-    } else if log.sweep.as_ref().is_some_and(|r| !r.is_empty()) {
-        let _ = writeln!(out, "Audited by the thread.\n");
-    }
-    match &log.sweep {
-        Some(rules) if rules.is_empty() => {
-            let _ = writeln!(out, "No rule to audit.");
-        }
-        Some(rules) => {
-            for r in rules {
-                let mut line = format!(
-                    "- {}: {}",
-                    super::prompts::one_line(&r.rule),
-                    r.result.as_str()
-                );
-                // Who audited it: its run (what it found), or the thread.
-                if log.audits.is_some() {
-                    match audits.iter().find(|a| a.rule.name == r.rule) {
-                        Some(a) if a.answered => {
-                            let _ = write!(
-                                line,
-                                " (audit {}: {}{})",
-                                a.id,
-                                match a.findings.len() {
-                                    0 => "no finding".to_string(),
-                                    1 => "1 finding".to_string(),
-                                    n => format!("{n} findings"),
-                                },
-                                match a.failures.len() {
-                                    0 => String::new(),
-                                    _ => format!(
-                                        "; failed run: {}",
-                                        failures_with_files(
-                                            Path::new(folder),
-                                            &format!("audit-{}", a.id),
-                                            &a.failures,
-                                            true
-                                        )
-                                    ),
-                                }
-                            );
-                        }
-                        Some(a) => {
-                            let _ = write!(
-                                line,
-                                " (audit {} not run: {}; {})",
-                                a.id,
-                                failures_with_files(
-                                    Path::new(folder),
-                                    &format!("audit-{}", a.id),
-                                    &a.failures,
-                                    false
-                                ),
-                                if r.result == SweepResult::NotAudited {
-                                    "nobody audited it"
-                                } else {
-                                    "the thread audited it"
-                                }
-                            );
-                        }
-                        None => {}
-                    }
-                }
-                if let Some(l) = &r.location {
-                    let _ = write!(line, " at {}", super::prompts::one_line(l));
-                }
-                if let Some(why) = &r.reason {
-                    let _ = write!(line, " ({})", super::prompts::one_line(why));
-                }
-                let _ = writeln!(out, "{line}");
-            }
-        }
-        None if log.audits.as_ref().is_some_and(Vec::is_empty) => {
-            let _ = writeln!(out, "No rule to audit.");
-        }
-        None => {
-            let _ = writeln!(
-                out,
-                "Skipped: {}.",
-                match &log.transition {
-                    Some((TransitionReason::Skipped, _)) => "the loop skipped to verification",
-                    _ if log.fixed().is_empty() => "the ladder fixed nothing",
-                    _ => "the profile has no sweep",
-                }
-            );
-        }
+    } else {
+        transition_and_sweep(&mut out, log, folder);
     }
     let _ = writeln!(out, "\n## How it ended\n");
     let verify: Vec<&RoundLog> = log
@@ -699,15 +639,23 @@ pub(in crate::hub) fn report(
         .filter(|r| r.id.starts_with(twr_core::loops::contract::VERIFY_TAG))
         .collect();
     let how = capitalized(match outcome {
+        Outcome::Clean if once => "clean: the one round found nothing",
         Outcome::Clean => "clean: the last round found nothing",
         Outcome::LedgerFixedPoint => {
             "ledger fixed point: every finding of the last round was already in the ledger"
         }
         Outcome::CapExpired => "cap expired: findings were still arriving",
+        Outcome::Triaged => {
+            "triaged: the thread fixed or dismissed every finding of the one round, and no \
+             review after it checked the fixes"
+        }
         Outcome::Stopped => "stopped",
         Outcome::Failed => "failed",
     });
     match &log.transition {
+        _ if once => {
+            let _ = writeln!(out, "{how}.");
+        }
         Some((_, round)) if log.verify_skipped && verify.is_empty() => {
             let effort = log
                 .rounds
@@ -849,6 +797,134 @@ pub(in crate::hub) fn report(
         }
     }
     out
+}
+
+/// The Transition and Sweep sections of a full loop's report (a single pass has neither).
+fn transition_and_sweep(out: &mut String, log: &LoopLog, folder: &str) {
+    let _ = writeln!(out, "\n## Transition\n");
+    match &log.transition {
+        Some((_, round)) if round.is_empty() => {
+            let _ = writeln!(out, "Skipped to verification before any ladder round.");
+        }
+        Some((reason, round)) => {
+            let _ = write!(out, "After {round}: {}.", transition_words(*reason));
+            if log.verify_skipped {
+                let _ = write!(
+                    out,
+                    " The loop went straight to its report: a verification round could only \
+                     have repeated {round}."
+                );
+            }
+            let _ = writeln!(out);
+        }
+        None => {
+            let _ = writeln!(out, "The ladder did not end.");
+        }
+    }
+    let _ = writeln!(out, "\n## Sweep\n");
+    let audits = log.audits.as_deref().unwrap_or_default();
+    if log.audits.is_some() {
+        let _ = writeln!(
+            out,
+            "{}",
+            match audits.len() {
+                0 => "Audited by runs of the reviewer's model: the thread named no rule worth an \
+                      audit."
+                    .to_string(),
+                n => format!(
+                    "Audited by runs of the reviewer's model, one per rule ({n} rule{}), the \
+                     thread verifying their reports.",
+                    if n == 1 { "" } else { "s" }
+                ),
+            }
+        );
+        let _ = writeln!(out);
+    } else if log.sweep.as_ref().is_some_and(|r| !r.is_empty()) {
+        let _ = writeln!(out, "Audited by the thread.\n");
+    }
+    match &log.sweep {
+        Some(rules) if rules.is_empty() => {
+            let _ = writeln!(out, "No rule to audit.");
+        }
+        Some(rules) => {
+            for r in rules {
+                let mut line = format!(
+                    "- {}: {}",
+                    super::prompts::one_line(&r.rule),
+                    r.result.as_str()
+                );
+                // Who audited it: its run (what it found), or the thread.
+                if log.audits.is_some() {
+                    match audits.iter().find(|a| a.rule.name == r.rule) {
+                        Some(a) if a.answered => {
+                            let _ = write!(
+                                line,
+                                " (audit {}: {}{})",
+                                a.id,
+                                match a.findings.len() {
+                                    0 => "no finding".to_string(),
+                                    1 => "1 finding".to_string(),
+                                    n => format!("{n} findings"),
+                                },
+                                match a.failures.len() {
+                                    0 => String::new(),
+                                    _ => format!(
+                                        "; failed run: {}",
+                                        failures_with_files(
+                                            Path::new(folder),
+                                            &format!("audit-{}", a.id),
+                                            &a.failures,
+                                            true
+                                        )
+                                    ),
+                                }
+                            );
+                        }
+                        Some(a) => {
+                            let _ = write!(
+                                line,
+                                " (audit {} not run: {}; {})",
+                                a.id,
+                                failures_with_files(
+                                    Path::new(folder),
+                                    &format!("audit-{}", a.id),
+                                    &a.failures,
+                                    false
+                                ),
+                                if r.result == SweepResult::NotAudited {
+                                    "nobody audited it"
+                                } else {
+                                    "the thread audited it"
+                                }
+                            );
+                        }
+                        None => {}
+                    }
+                }
+                if let Some(l) = &r.location {
+                    let _ = write!(line, " at {}", super::prompts::one_line(l));
+                }
+                if let Some(why) = &r.reason {
+                    let _ = write!(line, " ({})", super::prompts::one_line(why));
+                }
+                let _ = writeln!(out, "{line}");
+            }
+        }
+        None if log.audits.as_ref().is_some_and(Vec::is_empty) => {
+            let _ = writeln!(out, "No rule to audit.");
+        }
+        None => {
+            let _ = writeln!(
+                out,
+                "Skipped: {}.",
+                match &log.transition {
+                    Some((TransitionReason::Skipped, _)) => "the loop skipped to verification",
+                    _ if log.fixed().is_empty() => "the ladder fixed nothing",
+                    _ => "the profile has no sweep",
+                }
+            );
+        }
+    }
 }
 
 /// The plan check's part of an implementation loop's report: whether it ran and why, its

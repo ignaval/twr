@@ -262,6 +262,14 @@ Deleted threads go to the trash, where they stay for `[trash] keep_days` (7 days
 
 ## Loops
 
+### Asking for a review
+
+Ask the orchestrator to review a worker's work ("review it", "then review their work", "have it reviewed") and it runs one review pass in that worker's own thread: `start_loop` with `once: true`. The reviewer model reviews the work once, the worker verifies each finding and fixes or dismisses it, and the pass ends with its report ([usage.md](usage.md#a-single-review-pass)). If the worker is still running, the orchestrator sets a watch that starts the pass when it finishes. It never spawns a separate thread to review, check or re-review another thread's work, and it never runs review rounds itself by sending "re-review" prompts or relaying findings between threads.
+
+A request like that covers the task you gave it with. It carries over to later tasks only when you say so ("from now on", "for every task", "always"): the orchestrator then saves it as a memory note and, if it acts on finishes, sets a watch on every worker. A watch note never calls a one-off request your preference.
+
+### Loops
+
 Ask it for a review loop or an implementation loop ("run a review loop on api", "start a thread on api to add rate limiting, with an implementation loop") and it calls `start_loop`, or `spawn_thread` with `loop` for a new thread whose first prompt is the task ([usage.md](usage.md#loops) says what a loop does). It does so only when you ask for a loop, never on its own, and passes a profile, a reviewer or another setting only as you said it. A loop runs only on settings you chose, and the hub holds the orchestrator to that: the loop starts at once only on your saved settings, still holding, with nothing the orchestrator named differing from them. Anything else, and "...and let me pick the models" (`setup`), raises the thread's settings card for you, and the orchestrator tells you the card waits ("I've asked you to choose the loop's models on api's card"). It can't answer, dismiss or annotate the card, and asking again while it is open changes nothing on it.
 
 A loop it started is said in the conversation as one it asked for. Its rounds are routine updates and cost no turn. When it ends, the hub wakes the orchestrator with the loop's report, as a watch would, and it tells you how it ended; a stuck loop wakes it too, but only you answer the stuck item. `get_loop` shows a loop's phase, rounds and findings, ledger, the settings it runs on, how the last one ended and its report's path; `stop_loop` stops one when you ask. It can't pause, resume or skip a loop, and it can't read or change the loop settings ([security-model.md](security-model.md#the-orchestrator)).
