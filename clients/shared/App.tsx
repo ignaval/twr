@@ -10,6 +10,7 @@ import { ReadAloudControl } from "./ReadAloudControl";
 import { UploadController } from "./uploads";
 import { AttachmentManager } from "./AttachmentManager";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
+import { ModelPicker } from "./ModelPicker";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
@@ -483,6 +484,8 @@ export default function App({
     /** Something stops, goes or is interrupted: the button says so in danger style. */
     destructive?: boolean;
     run: () => void;
+    /** A second way to go on, beside the confirming button (a switch without its summary). */
+    alt?: { action: string; run: () => void };
   }>();
   const [workspaceModal, setWorkspaceModal] = useState(false);
   const [newWorkspace, setNewWorkspace] = useState("");
@@ -3709,6 +3712,19 @@ export default function App({
                   spokenLately={spokenLately}
                   onDismissKeyboard={onDismissKeyboard}
                   fail={fail}
+                  modelPicker={
+                    <ModelPicker
+                      target={target}
+                      kind={destination ? "thread" : "orchestrator"}
+                      catalog={modelCatalog}
+                      rpc={rpc}
+                      connected={connected}
+                      operate={permitted("operate")}
+                      confirm={setConfirmation}
+                      fail={fail}
+                      input={input}
+                    />
+                  }
                 />
               </>
             )}
@@ -4540,6 +4556,17 @@ export default function App({
             <span />
             <div>
               <button onClick={() => setConfirmation(undefined)}>Cancel</button>
+              {confirmation.alt && (
+                <button
+                  onClick={() => {
+                    const run = confirmation.alt!.run;
+                    setConfirmation(undefined);
+                    run();
+                  }}
+                >
+                  {confirmation.alt.action}
+                </button>
+              )}
               <button
                 className={confirmation.destructive ? "danger" : "primary"}
                 onClick={() => {

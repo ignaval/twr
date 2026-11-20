@@ -610,6 +610,66 @@ async fn switching_runtimes_makes_a_new_orchestrator_each_time() {
     hub.shutdown().await;
 }
 
+/// `orchestrator.use` without the summary request, with reasoning effort `effort`.
+fn with_effort(effort: &str) -> SwitchOptions {
+    SwitchOptions {
+        effort: Some(effort.into()),
+        ..quick()
+    }
+}
+
+/// A switch's effort: checked and spelled as the runtime spells it, given to the new session
+/// in place of `[orchestrator] effort` (even for the first orchestrator), reported by the
+/// result and `orchestrator.show`, and kept by the log across a restart. `default` is the
+/// runtime's own, as is leaving it out on a later switch.
+#[tokio::test]
+async fn a_switch_takes_an_effort_that_survives_a_restart() {
+    let mut env = Env::new();
+    let hub = Hub::open(env.opts(|c| c.orchestrator.effort = Some("max".into())))
+        .await
+        .unwrap();
+    env.worker(&hub, "api").await;
+    // The first orchestrator, asked for one: it replaces the configured effort.
+    let r = switch(&hub, "codex", Some("o5"), with_effort("HIGH")).await;
+    assert_eq!(r["effort"], "high");
+    assert_eq!(r["previous"], Value::Null);
+    let first = r["thread"].as_str().unwrap().to_string();
+    assert_eq!(hub.info()["orchestrator"]["effort"], "high");
+    assert_eq!(hub.info()["orchestrator"]["configured"]["effort"], "max");
+    hub.shutdown().await;
+    drop(hub);
+
+    let hub = env.reopen_with(|c| c.orchestrator.autostart = true).await;
+    let mut codex = env.orch().await;
+    assert_eq!(codex.runtime, "codex");
+    assert_eq!(codex.cfg.model.as_deref(), Some("o5"));
+    assert_eq!(codex.cfg.effort.as_deref(), Some("high"));
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(first.as_str()));
+    assert_eq!(hub.info()["orchestrator"]["effort"], "high");
+
+    // Same runtime, another effort: still a new session, with the handoff.
+    let r = switch(&hub, "codex", Some("o5"), with_effort("low")).await;
+    assert_eq!(r["effort"], "low");
+    assert_eq!(r["previous"]["effort"], "high");
+    codex.wait_stopped().await;
+    let mut codex = env.orch().await;
+    assert_eq!(codex.cfg.effort.as_deref(), Some("low"));
+    let (handoff, t) = codex.next_turn().await;
+    assert!(handoff.starts_with("[twr handoff]"), "{handoff}");
+    codex.end_turn(t);
+
+    // `default`, then left out: the runtime's own either way.
+    let r = switch(&hub, "claude-code", None, with_effort("default")).await;
+    assert_eq!(r["effort"], Value::Null);
+    codex.wait_stopped().await;
+    let claude = env.orch().await;
+    assert_eq!(claude.cfg.effort, None);
+    let r = switch(&hub, "grok-build", None, quick()).await;
+    assert_eq!(r["effort"], Value::Null);
+    assert_eq!(hub.info()["orchestrator"]["effort"], Value::Null);
+    hub.shutdown().await;
+}
+
 /// The switch lives in the log: a restarted hub keeps the new runtime and model (the config
 /// still says claude-code) and autostarts that one.
 #[tokio::test]
@@ -726,6 +786,19 @@ async fn only_users_switch_and_only_to_runtimes_that_attach_mcp() {
             .await
             .unwrap_err();
         assert_eq!(e.code, codes::BAD_REQUEST, "{model:?}");
+    }
+    // An effort the runtime does not take (Grok Build has no `max`), before anything happens.
+    for (runtime, effort) in [
+        ("codex", "turbo"),
+        ("grok-build", "max"),
+        ("claude-code", "x\n"),
+    ] {
+        let e = hub
+            .use_orchestrator(runtime, None, with_effort(effort), &tui())
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{runtime} {effort:?}");
+        assert!(e.message.contains("reasoning effort"), "{}", e.message);
     }
     assert!(hub.list_threads().is_empty(), "nothing was created");
     assert!(hub.orchestrator_thread().is_none());
@@ -921,6 +994,7 @@ async fn a_busy_orchestrator_is_waited_for_then_skipped() {
     let opts = SwitchOptions {
         summary: true,
         wait: Duration::from_millis(400),
+        effort: None,
     };
     let started = std::time::Instant::now();
     let user = tui();
@@ -994,6 +1068,7 @@ async fn a_handoff_summary_waits_for_background_work_then_stops_it_on_timeout() 
             SwitchOptions {
                 summary: true,
                 wait: Duration::from_millis(100),
+                effort: None,
             },
             &tui(),
         )

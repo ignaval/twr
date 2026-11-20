@@ -2744,7 +2744,17 @@ impl Core {
             ));
         }
         let account = self.orchestrator_account(hub, &runtime, OrchAccountFrom::Config)?;
-        self.create_orchestrator(hub, runtime, model, None, Source::Hub, false, &[], &account)
+        self.create_orchestrator(
+            hub,
+            runtime,
+            model,
+            None,
+            None,
+            Source::Hub,
+            false,
+            &[],
+            &account,
+        )
     }
 
     /// Whether `name` is taken by anything but an orchestrator thread (a new orchestrator
@@ -2763,7 +2773,10 @@ impl Core {
     }
 
     /// Appends `thread.created` for a new orchestrator thread running `runtime` (`model`: the
-    /// runtime's default when `None`). It becomes the orchestrator; any previous one is
+    /// runtime's default when `None`; `effort`: the one `orchestrator.use` asked for, already
+    /// canonical, `Some(None)` the runtime's default; `None` when not asked: a reset keeps the
+    /// previous one's, the first orchestrator takes `[orchestrator] effort`, a switch the
+    /// runtime's default). It becomes the orchestrator; any previous one is
     /// retired by this very event (`ThreadView::retired`). Its name is `orchestrator` and its
     /// alias `orch`, unless a worker thread holds them (then `orchestrator-<n>` / no alias).
     /// `reset`: a new conversation (`orchestrator reset`); `notices`: the queued notices it
@@ -2777,6 +2790,7 @@ impl Core {
         hub: &Inner,
         runtime: String,
         model: Option<String>,
+        effort: Option<Option<String>>,
         handoff: Option<&str>,
         source: Source,
         reset: bool,
@@ -2846,18 +2860,22 @@ impl Core {
                 }
             }
         }
-        // Config selects the first orchestrator only. A runtime switch gets that
-        // runtime's defaults, just as it does for the model.
-        let effort = self
-            .orch
-            .thread
-            .is_none()
-            .then_some(hub.config.orchestrator.effort.as_deref())
-            .flatten()
-            .map(|e| runtime_spec::canonical_effort(e, &runtime))
-            .transpose()
-            .map_err(|e| rpc(codes::BAD_REQUEST, e))?
-            .flatten();
+        // An effort the switch asked for wins. Otherwise config selects the first orchestrator
+        // only, and a runtime switch gets that runtime's defaults, just as it does for the
+        // model.
+        let effort = match effort {
+            Some(e) => e,
+            None => self
+                .orch
+                .thread
+                .is_none()
+                .then_some(hub.config.orchestrator.effort.as_deref())
+                .flatten()
+                .map(|e| runtime_spec::canonical_effort(e, &runtime))
+                .transpose()
+                .map_err(|e| rpc(codes::BAD_REQUEST, e))?
+                .flatten(),
+        };
         if effort.is_some() {
             // As the orchestrator is spawned: its directory, no configured environment.
             let cwd = orchestrator_cwd(&hub.config);
@@ -4014,6 +4032,10 @@ impl Hub {
     /// and the state the log shows. The new orchestrator starts right away when the previous
     /// one was running (or with `orchestrator.autostart`), else with the next message it gets
     /// (or notice); either way the handoff is its first turn.
+    ///
+    /// `opts.effort` is the new orchestrator's reasoning effort, checked like `thread.new`'s
+    /// (one the runtime takes, `default` its own); not given, a switch runs the runtime's
+    /// default and the first orchestrator `[orchestrator] effort`.
     pub async fn use_orchestrator(
         &self,
         runtime: &str,
@@ -4051,12 +4073,13 @@ impl Hub {
         // The account: the spec's on a switch (`claude-code:work`; another account of the
         // same runtime is a switch like any other), the current one's on a reset, the
         // configured one for a first orchestrator.
-        let (runtime, model, from) = match choice {
+        let (runtime, model, effort, from) = match choice {
             Some((runtime, model)) => {
                 // A device names a command line only with `terminal` (`hub::device_scope`).
                 self.inner.check_caller_runtime(caller, runtime.trim())?;
-                let (runtime, model) = self.check_switch(runtime, model, caller)?;
-                (runtime, model, OrchAccountFrom::Switch)
+                let (runtime, model, effort) =
+                    self.check_switch(runtime, model, opts.effort.as_deref(), caller)?;
+                (runtime, model, effort, OrchAccountFrom::Switch)
             }
             None => {
                 let core = self.inner.core();
@@ -4069,10 +4092,11 @@ impl Hub {
                     .is_some();
                 drop(core);
                 if exists {
-                    (runtime, model, OrchAccountFrom::Keep)
+                    (runtime, model, None, OrchAccountFrom::Keep)
                 } else {
-                    let (runtime, model) = self.check_switch(&runtime, model.as_deref(), caller)?;
-                    (runtime, model, OrchAccountFrom::Config)
+                    let (runtime, model, _) =
+                        self.check_switch(&runtime, model.as_deref(), None, caller)?;
+                    (runtime, model, None, OrchAccountFrom::Config)
                 }
             }
         };
@@ -4111,10 +4135,13 @@ impl Hub {
                 .clone()
                 .filter(|t| core.registry.get(t).is_some())
         };
-        let to = match &model {
+        let mut to = match &model {
             Some(m) => format!("{runtime}, model {m}"),
             None => runtime.clone(),
         };
+        if let Some(Some(e)) = &effort {
+            to.push_str(&format!(", effort {e}"));
+        }
         let summary = match &current {
             Some(old) if opts.summary => self.handoff_summary(old, &to, opts.wait).await,
             Some(_) => Summary::Skipped("the switch was asked without it".into()),
@@ -4147,6 +4174,7 @@ impl Hub {
                 "runtime": view.runtime,
                 "model": view.model,
                 "model_actual": view.actual_model,
+                "effort": view.effort,
                 "stopping": stop["stopping"],
                 "dropped_prompts": stop["dropped_prompts"],
             });
@@ -4158,6 +4186,7 @@ impl Hub {
             &self.inner,
             runtime,
             model,
+            effort,
             handoff.as_ref().map(|h| h.text.as_str()),
             caller.source(),
             reset,
@@ -4215,6 +4244,7 @@ impl Hub {
         out["runtime"] = json!(view.runtime);
         out["model"] = json!(view.model);
         out["model_actual"] = json!(view.actual_model);
+        out["effort"] = json!(view.effort);
         let (account, shown, _) = core.thread_account_json(view);
         out["account"] = json!(account);
         out["account_shown"] = json!(shown);
@@ -4222,13 +4252,17 @@ impl Hub {
     }
 
     /// The checks of `orchestrator.use` before anything happens: a user, a local runtime that
-    /// can host the orchestrator, a sane model. Returns the trimmed runtime and model.
+    /// can host the orchestrator, a sane model, an effort the runtime takes (and its `claude`,
+    /// as far as the hub knows). Returns the trimmed runtime and model, and the canonical
+    /// effort when one was asked (`Some(None)`: the runtime's default).
+    #[allow(clippy::type_complexity)]
     fn check_switch(
         &self,
         runtime: &str,
         model: Option<&str>,
+        effort: Option<&str>,
         caller: &Caller,
-    ) -> Result<(String, Option<String>), RpcError> {
+    ) -> Result<(String, Option<String>, Option<Option<String>>), RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
                 codes::UNAUTHORIZED,
@@ -4279,7 +4313,17 @@ impl Hub {
                 ),
             ));
         }
-        Ok((runtime.to_string(), model.map(str::to_string)))
+        let effort = effort
+            .map(|e| runtime_spec::canonical_effort(e, &adapter))
+            .transpose()
+            .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        if let Some(Some(_)) = &effort {
+            let cwd = orchestrator_cwd(&self.inner.config);
+            if let Some(why) = runtime_spec::effort_refusal(&adapter, true, &[], &cwd) {
+                return Err(rpc(codes::BAD_REQUEST, why));
+            }
+        }
+        Ok((runtime.to_string(), model.map(str::to_string), effort))
     }
 
     /// `report.write`: a report for a worker's finished turn (default: its last one), written
@@ -4680,6 +4724,7 @@ mod tests {
                 "fake".into(),
                 None,
                 None,
+                None,
                 Source::User("tui".into()),
                 true,
                 &notices,
@@ -5063,6 +5108,7 @@ mod tests {
             core.create_orchestrator(
                 &hub.inner,
                 "fake".into(),
+                None,
                 None,
                 Some("the handoff"),
                 Source::User("tui".into()),

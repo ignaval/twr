@@ -497,6 +497,11 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
          updates",
     ),
     (
+        "Alt-M",
+        "pick the model and effort of where the line goes, named at the input box's bottom \
+         right: in a dive the thread's (/model), else the orchestrator's (a switch you confirm)",
+    ),
+    (
         "Ctrl-R",
         "while a speaker reads aloud, stop it (/read stop); otherwise say how to start (/read)",
     ),
@@ -581,7 +586,8 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
          Threads' ‹ hides it and the tab strip's ≡ shows it; the Chat, Needs you and Threads tabs switch screens (a whole share of \
          the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
-         closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; [ yes ] and \
+         closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; the model at the \
+         input box's bottom right opens its picker (Alt-M); [ yes ] and \
          [ no ] answer a question; a tap on a notice clears it, on a note does what its key \
          says",
     ),
@@ -1012,9 +1018,22 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
     let runtime = crate::app::orch_label(&m.runtime, &state.accounts);
     let effort = m.chosen.is_some();
     let (title, note) = match (&m.thread, effort) {
-        (None, _) => (
+        (None, false) if !m.efforts.is_empty() => (
+            format!("Model for the orchestrator on {runtime}"),
+            "(its reasoning effort next; a switch starts a new session with a handoff)".to_string(),
+        ),
+        (None, false) => (
             format!("Model for the orchestrator on {runtime}"),
             "(the default is the one the runtime picks; /orch switches it later)".to_string(),
+        ),
+        (None, true) => (
+            format!("Reasoning effort for the orchestrator on {runtime}"),
+            match m.chosen.as_ref().and_then(Option::as_deref) {
+                Some(model) => format!("(with model {model}; you confirm the switch next)"),
+                None => {
+                    "(with the runtime's default model; you confirm the switch next)".to_string()
+                }
+            },
         ),
         (Some((_, name)), false) => (
             format!("Model for {name} ({runtime})"),
@@ -1032,6 +1051,7 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
         ModelRow::Default => "default".to_string(),
         ModelRow::Known(id, _) => id.clone(),
         ModelRow::Custom => "custom…".to_string(),
+        ModelRow::OtherRuntime => "other runtime…".to_string(),
     };
     let name_width = m
         .rows
@@ -1079,6 +1099,7 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
             ModelRow::Known(_, about) => about.clone(),
             ModelRow::Custom if m.typed.is_some() && chosen => String::new(),
             ModelRow::Custom => "type an id".to_string(),
+            ModelRow::OtherRuntime => "switch the orchestrator to another agent".to_string(),
         };
         if !about.is_empty() {
             spans.push(Span::styled(about, dim));
@@ -1086,7 +1107,7 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
         let is_current = match row {
             ModelRow::Default => current.is_none(),
             ModelRow::Known(id, _) => current == Some(id.as_str()),
-            ModelRow::Custom => false,
+            ModelRow::Custom | ModelRow::OtherRuntime => false,
         };
         if is_current {
             spans.push(Span::styled("  (current)", dim));
@@ -1096,7 +1117,7 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
     out.push(Line::from(""));
     let keys = if m.typed.is_some() {
         "type the id · Enter choose · Esc back to the list"
-    } else if back || effort {
+    } else if (back && !m.other_runtime) || effort {
         "↑↓ or 1-9 pick · Enter choose · Esc back"
     } else {
         "↑↓ or 1-9 pick · Enter choose · Esc cancel"
@@ -8348,6 +8369,24 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
             Target::TakeBack,
         );
     }
+    // The model and effort of where the line goes, at the bottom border's right, in the
+    // border's text color (a dimmed border color would not read on a light terminal): a tap
+    // opens their picker (Alt-M).
+    if let Some((text, cells)) = state
+        .model_label()
+        .and_then(|(model, effort)| input_model_label(&model, effort.as_deref(), area.width))
+    {
+        block = block.title_bottom(Line::from(Span::styled(text, said)).right_aligned());
+        if area.height >= 2 {
+            // Right-aligned, one cell in from the corner.
+            let w = u16::try_from(cells).unwrap_or(0);
+            let x = (area.x + area.width).saturating_sub(w + 1);
+            panes.target(
+                Rect::new(x, area.y + area.height - 1, w, 1),
+                Target::ModelPicker,
+            );
+        }
+    }
     let inner = block.inner(area);
     let line = &state.view.input;
     let view = line.view(usize::from(inner.width), usize::from(inner.height));
@@ -8395,6 +8434,37 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
             inner.y + at(row, inner.height),
         ));
     }
+}
+
+/// The input box's model label for a box `width` columns wide ([`AppState::model_label`]):
+/// ` model · effort `, shortened as the box narrows: the effort dropped first, then the model
+/// cut (`opus-…`), then nothing once under 6 cells of it would show. It takes at most two
+/// thirds of the border between its corners. Returns the text and its
+/// width in cells.
+pub fn input_model_label(model: &str, effort: Option<&str>, width: u16) -> Option<(String, usize)> {
+    let room = usize::from(width).saturating_sub(2);
+    // At most two thirds of the border.
+    let room = room.saturating_sub(room / 3);
+    let cells = crate::edit::width;
+    if let Some(e) = effort {
+        let full = format!(" {model} · {e} ");
+        if cells(&full) <= room {
+            let w = cells(&full);
+            return Some((full, w));
+        }
+    }
+    let alone = format!(" {model} ");
+    if cells(&alone) <= room {
+        let w = cells(&alone);
+        return Some((alone, w));
+    }
+    // ` ` + at least 5 cells of the model and `…` + ` `.
+    if room < 8 {
+        return None;
+    }
+    let cut = format!(" {} ", truncate_cells(model, room - 2));
+    let w = cells(&cut);
+    Some((cut, w))
 }
 
 /// The popup above the input line: the commands (or an argument's values, or the threads an
@@ -10235,6 +10305,27 @@ fn status_height(state: &AppState, area: Rect) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The input box's model label shortens as the box narrows: the effort first, then the
+    /// model cut, then nothing; never more than two thirds of the border.
+    #[test]
+    fn the_input_model_label_shortens_on_narrow_boxes() {
+        let label = |w| input_model_label("opus-5-5", Some("high"), w).map(|(t, _)| t);
+        assert_eq!(label(80).as_deref(), Some(" opus-5-5 · high "));
+        assert_eq!(label(20).as_deref(), Some(" opus-5-5 "));
+        assert_eq!(label(14).as_deref(), Some(" opus-… "));
+        assert_eq!(label(12), None);
+        assert_eq!(
+            input_model_label("default", None, 40),
+            Some((" default ".to_string(), 9))
+        );
+        for w in 0..60 {
+            if let Some((t, cells)) = input_model_label("claude-opus-5-5", Some("xhigh"), w) {
+                assert_eq!(crate::edit::width(&t), cells);
+                assert!(cells * 3 <= usize::from(w - 2) * 2 + 2, "{w}: {t}");
+            }
+        }
+    }
 
     /// An approval's text keeps every space when wrapped: quoted repeated spaces across a
     /// row's end read as they run, where word wrapping dropped the ones at the break. Both a

@@ -316,12 +316,15 @@ You can move the orchestrator to another runtime or model whenever you like.
 ```sh
 twr orchestrator show                   # runtime, model, thread, and which runtimes can host it
 twr orchestrator use codex --model gpt-5
-twr orchestrator use grok-build         # no --model: the runtime's default
+twr orchestrator use codex --model gpt-5 --effort high
+twr orchestrator use grok-build         # no --model or --effort: the runtime's defaults
 twr orchestrator use gemini             # a [runtimes.gemini] preset (see configuration.md)
 twr orchestrator use 'acp:opencode acp' # any ACP agent
 ```
 
-In the TUI, type `/orch <runtime> [model]`, or `/orch` alone to pick the runtime from a list. Then `y` switches with a handoff summary and `s` without.
+`--effort` takes one of the runtime's reasoning efforts (`twr orchestrator show --json` lists them under `models`), or `default` for the runtime's own. Without it the new orchestrator runs the runtime's default effort: `[orchestrator] effort` only applies to the first orchestrator. A switch to the same runtime with another model or effort is a switch like any other, with a new session and a handoff. The effort is recorded with the new orchestrator, so it survives hub restarts, and `twr orchestrator show` prints it.
+
+In the TUI, type `/orch <runtime> [model]`, or `/orch` alone to pick the runtime, then its model and effort, from lists. `Alt-M`, or a click on the model at the right of the input box's bottom border, opens the same picker on the current runtime ([tui.md](tui.md#choosing-the-orchestrator)). Then `y` switches with a handoff summary and `s` without. In the desktop and phone apps, the model button in the message box's footer does the same ([desktop.md](desktop.md#model-and-effort)), and so does the command palette's **Switch orchestrator**.
 
 Only runtimes that can attach the twr MCP tools qualify: `claude-code`, `codex`, `grok-build` and ACP agents. `pty:` commands and `fake` are refused. The orchestrator can't switch itself. `[orchestrator]` in the config only decides the first orchestrator. After a switch the choice is recorded in the event log, so it survives hub restarts.
 

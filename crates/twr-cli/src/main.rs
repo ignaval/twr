@@ -1265,6 +1265,10 @@ enum OrchestratorCmd {
         /// Model (default: the runtime's default).
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort, one the runtime takes (`twr orchestrator show --json` lists them
+        /// under `models`), or `default`: the runtime's own (the default).
+        #[arg(long)]
+        effort: Option<String>,
         /// Do not ask the current orchestrator for a handoff summary: the new one gets only
         /// what the log shows (recent conversation, threads, attention items, reports).
         #[arg(long)]
@@ -2407,6 +2411,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
                 OrchestratorCmd::Use {
                     runtime,
                     model,
+                    effort,
                     no_summary,
                     wait,
                 },
@@ -2421,7 +2426,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
             };
             let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
             let ask: Option<Ask<'_>> = if tty { Some(&mut ask) } else { None };
-            orchestrator_use(&socket, &runtime, model, !no_summary, wait, ask).await
+            orchestrator_use(&socket, &runtime, model, effort, !no_summary, wait, ask).await
         }
         Cmd::Info { json } => info(&socket, json).await,
         Cmd::Usage {
@@ -6852,6 +6857,13 @@ fn trash_empty_text(r: &Value) -> String {
 // --- thread list -------------------------------------------------------------------------------
 
 /// The model part of an orchestrator line: ` model <m>` or ` (the runtime's default model)`.
+/// `, effort <e>` for a reasoning effort, nothing for the runtime's default (null).
+fn effort_text(effort: &Value) -> String {
+    effort
+        .as_str()
+        .map_or_else(String::new, |e| format!(", effort {e}"))
+}
+
 fn model_text(model: &Value) -> String {
     match model.as_str() {
         Some(m) => format!(" model {m}"),
@@ -6957,8 +6969,9 @@ fn orchestrator_runtime(o: &Value) -> String {
 fn orchestrator_text(o: &Value) -> String {
     let runtime = orchestrator_runtime(o);
     let mut out = format!(
-        "orchestrator: {runtime}{}{}\n",
+        "orchestrator: {runtime}{}{}{}\n",
         models_text(&o["model"], &o["model_actual"]),
+        effort_text(&o["effort"]),
         if o["available"].as_bool() == Some(true) {
             ""
         } else {
@@ -7023,6 +7036,7 @@ async fn orchestrator_use(
     socket: &Path,
     runtime: &str,
     model: Option<String>,
+    effort: Option<String>,
     mut summary: bool,
     wait: Option<u64>,
     ask: Option<Ask<'_>>,
@@ -7031,6 +7045,9 @@ async fn orchestrator_use(
     let mut params = json!({ "runtime": runtime });
     if let Some(m) = model {
         params["model"] = json!(m);
+    }
+    if let Some(e) = effort {
+        params["effort"] = json!(e);
     }
     let wait_secs = wait.unwrap_or(twr_hub::hub::SUMMARY_WAIT.as_secs());
     if summary {
@@ -7080,9 +7097,10 @@ fn orchestrator_use_text(r: &Value) -> String {
 
 fn orchestrator_session_text(r: &Value, reset: bool) -> String {
     let mut out = format!(
-        "orchestrator is now {}{}: thread {} ({})",
+        "orchestrator is now {}{}{}: thread {} ({})",
         orchestrator_runtime(r),
         model_text(&r["model"]),
+        effort_text(&r["effort"]),
         str_of(&r["name"]),
         str_of(&r["thread"])
     );
@@ -10758,8 +10776,16 @@ mod tests {
         assert!(matches!(
             c.cmd,
             Some(Cmd::Orchestrator {
-                cmd: OrchestratorCmd::Use { ref runtime, ref model, no_summary: false, wait: None }
+                cmd: OrchestratorCmd::Use { ref runtime, ref model, effort: None, no_summary: false, wait: None }
             }) if runtime == "codex" && model.as_deref() == Some("o5")
+        ));
+        let c = Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--effort", "high"])
+            .unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Orchestrator {
+                cmd: OrchestratorCmd::Use { ref effort, model: None, .. }
+            }) if effort.as_deref() == Some("high")
         ));
         let c =
             Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--no-summary"]).unwrap();
@@ -10840,6 +10866,16 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["twr", "orchestrator", "use"]).is_err());
 
+        let with_effort = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": "o5",
+            "effort": "high", "started": false, "previous": null,
+        }));
+        assert!(
+            with_effort.starts_with(
+                "orchestrator is now codex model o5, effort high: thread orchestrator (01NEW),"
+            ),
+            "{with_effort}"
+        );
         let switched = orchestrator_use_text(&json!({
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": "o5",
             "started": true,
@@ -10925,6 +10961,14 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("retired:      1 earlier"), "{shown}");
+        let shown = orchestrator_text(&json!({
+            "available": true, "runtime": "codex", "model": "o5", "effort": "xhigh",
+            "thread": null, "configured": {"runtime": "codex"}, "runtimes": ["codex"],
+        }));
+        assert!(
+            shown.starts_with("orchestrator: codex model o5, effort xhigh\n"),
+            "{shown}"
+        );
     }
 
     /// The orchestrator's runtime is labelled with its account only while `account_shown`:

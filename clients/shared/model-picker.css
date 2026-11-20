@@ -1,0 +1,270 @@
+/* The composer's model and effort picker (shared/ModelPicker.tsx): a compact button at the
+ * right of the composer's footer row, before the voice and send buttons, and a popup above
+ * the composer (`.composer` is its positioned box) with three columns: the runtimes, their
+ * models, the efforts. On a phone the popup is a bottom sheet, its columns stacked, every row
+ * a 44-point target. */
+
+/* The hints share the row: they shorten first, then hide, before the picker does. */
+.composer-bottom:has(.model-picker) > #twr-composer-hints {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-picker {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.model-picker-trigger {
+  gap: 6px;
+  min-width: 0;
+  max-width: 260px;
+  padding: 4px 8px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.923077rem;
+  white-space: nowrap;
+}
+.model-picker-trigger:hover:not(:disabled) {
+  background: var(--hover);
+}
+.model-picker-trigger[aria-expanded="true"] {
+  background: var(--active);
+}
+.model-picker-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.model-picker-effort {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.model-picker-mark {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 0.769231rem;
+  font-weight: 600;
+  line-height: 1;
+}
+@media (max-width: 720px) {
+  .composer-bottom:has(.model-picker) > #twr-composer-hints {
+    display: none;
+  }
+  .composer-bottom:has(.model-picker) {
+    justify-content: flex-end;
+  }
+}
+@media (max-width: 460px) {
+  .model-picker-effort {
+    display: none;
+  }
+}
+
+.model-picker-popup {
+  position: absolute;
+  right: 8px;
+  bottom: calc(100% + 6px);
+  z-index: 20;
+  display: grid;
+  grid-template-columns: minmax(120px, 150px) minmax(220px, 1fr) minmax(
+      150px,
+      180px
+    );
+  width: min(640px, calc(100vw - 32px));
+  max-height: min(420px, 60vh);
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+  color: var(--text);
+}
+.model-picker-popup:focus {
+  outline: none;
+}
+.model-picker-popup button {
+  justify-content: flex-start;
+  width: 100%;
+  border: 0;
+  background: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  text-align: left;
+}
+.model-picker-popup button:hover,
+.model-picker-popup button.active {
+  background: var(--hover);
+}
+.model-picker-popup button.active {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.model-picker-popup button[aria-selected="true"],
+.model-picker-popup button[aria-checked="true"] {
+  background: var(--accent-soft);
+}
+.model-picker-popup .current {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.model-picker-rail,
+.model-picker-models,
+.model-picker-efforts {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+  gap: 2px;
+}
+.model-picker-rail {
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+.model-picker-rail-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-picker-search {
+  margin: 0 0 4px;
+  width: 100%;
+}
+.model-picker-models > [role="listbox"] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-picker-models button {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.model-picker-name {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.model-picker-about {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 0.846154rem;
+}
+.model-picker-about:empty {
+  display: none;
+}
+.model-picker-models button .current {
+  position: absolute;
+  right: 8px;
+}
+.model-picker-models button {
+  position: relative;
+  padding-right: 26px;
+}
+.model-picker-custom > input {
+  width: 100%;
+}
+.model-picker-efforts {
+  border-left: 1px solid var(--border);
+}
+.model-picker-efforts > header {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 8px 6px;
+}
+.model-picker-efforts > header > span {
+  color: var(--muted);
+  font-size: 0.846154rem;
+  overflow-wrap: anywhere;
+}
+.model-picker-efforts > [role="radiogroup"] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-picker-radio {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid var(--field-border);
+}
+[aria-checked="true"] > .model-picker-radio {
+  border: 4px solid var(--accent);
+}
+.model-picker-efforts > footer {
+  display: flex;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 8px;
+}
+.model-picker-popup .model-picker-efforts > footer > button {
+  justify-content: center;
+  border: 1px solid var(--border);
+}
+.model-picker-popup .model-picker-efforts > footer > button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.model-picker-note {
+  margin: 4px 8px;
+  color: var(--muted);
+  font-size: 0.846154rem;
+}
+
+/* A phone: a bottom sheet, the runtimes a row of chips over the models and the efforts. */
+[data-mobile="true"] .model-picker-trigger {
+  min-height: 44px;
+  max-width: 150px;
+  padding: 4px 6px;
+}
+[data-mobile="true"] .model-picker-effort {
+  display: none;
+}
+[data-mobile="true"] .model-picker-popup {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: auto;
+  max-height: 80dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  border-radius: 14px 14px 0 0;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+[data-mobile="true"] .model-picker-rail,
+[data-mobile="true"] .model-picker-models,
+[data-mobile="true"] .model-picker-efforts {
+  overflow: visible;
+  border: 0;
+}
+[data-mobile="true"] .model-picker-rail {
+  flex-direction: row;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+}
+[data-mobile="true"] .model-picker-rail > button {
+  width: auto;
+}
+[data-mobile="true"] .model-picker-efforts {
+  border-top: 1px solid var(--border);
+}
+[data-mobile="true"] .model-picker-popup button,
+[data-mobile="true"] .model-picker-search,
+[data-mobile="true"] .model-picker-custom > input {
+  min-height: 44px;
+  min-width: 44px;
+}

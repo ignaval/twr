@@ -43,10 +43,10 @@
 //! | `trash.restore`     | `{item, as?}` (users only)                          | `{thread, thread_name, previous_name, item, box, worktree, branch, checkout?, notes, skipped, session_id, message}` |
 //! | `log.compact`       | `{vacuum?, drop_checkpoints?}` (users only)         | `{rows, bytes, kinds, purged_threads, turns, blobs, blob_bytes, archived, batches, longest_batch_ms, plan_ms, copy_ms, delete_ms, sweep_ms, total_ms, freed_pages, vacuum?: {ms, before, after, incremental_set}, checkpoints_dropped, skipped?}`: the agent events `[log]` lets go moved to `archive.db` now (`hub::prune`) |
 //! | `log.stats`         | - (users only)                                      | `{db, archive, checkpoints, backlog: {head, full, compacted}, retention_days, archive_on, next}`: sizes of the log and what the next compaction moves (`hub::prune`) |
-//! | `orchestrator.show` | -                                                   | `{available, runtime, model, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, access, running_access, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed; `access`: its access level as last set, `limited` or `full`; `running_access`: the level its live runtime started with, null when none runs, another one only while it restarts with `access` after its turn) |
+//! | `orchestrator.show` | -                                                   | `{available, runtime, model, model_actual, effort, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, access, running_access, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed; `access`: its access level as last set, `limited` or `full`; `running_access`: the level its live runtime started with, null when none runs, another one only while it restarts with `access` after its turn) |
 //! | `orchestrator.reset` | - (users only)                                      | Fresh session on the current runtime/model, no handoff; same result as `orchestrator.use` with `handoff: null` |
 //! | `orchestrator.access` | `{access?: "limited" \| "full"}` (users only; a device needs `admin`) | without `access`: `{access}`; with it: `{access, previous, persisted, persist_error?, restart: "now" \| "after_turn" \| "none"}`: the orchestrator's access level, applied at once (its runtime restarts on its session, after its running turn) and written to `config.toml` (`hub::orch_access`) |
-//! | `orchestrator.use`  | `{runtime, model?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, previous: {thread, name, runtime, model, stopping, dropped_prompts} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
+//! | `orchestrator.use`  | `{runtime, model?, effort?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, model_actual, effort, previous: {thread, name, runtime, model, model_actual, effort, stopping, dropped_prompts} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
 //! | `thread.park`       | `{thread, keep?, force?}`                           | `{thread, parked: true, worktree?, worktree_removed, kept_dirty, dirty_files?, kept_reason?, kept, worktree_missing?, worktree_error?, pending}` |
 //! | `thread.resume`     | `{thread}`                                          | `{thread, resumed: true, worktree?, worktree_recreated, turn, pending}` |
 //! | `attention.respond` | `{attn_id, revision?, answer: "allow" \| {decision, message?}, message?}` or `{attn_id, revision?, option_index, message?}` | the `attention.resolved` event (the orchestrator: or `{status: "needs_confirmation", attn_id, answer, message}`) |
@@ -133,7 +133,8 @@
 //! process that both left its parent (reparented to init) and exec'd again without the marker
 //! is not recognized, nor is a command a daemon of the user's that already runs (tmux, screen,
 //! `systemd-run --user`, an IDE server) starts for an agent.
-//! `orchestrator.use` switches the orchestrator to another runtime (and model): a new
+//! `orchestrator.use` switches the orchestrator to another runtime (and model and reasoning
+//! effort: one the runtime takes, unset or `default` for its own): a new
 //! orchestrator thread with a new session (no conversation moves between runtimes); the
 //! current one is stopped and retired (`hub::orch`). The new one starts with a handoff turn
 //! (`hub::handoff`): the previous one's own summary, asked for first unless `summary: false`
@@ -1516,6 +1517,9 @@ struct UseOrchestratorParams {
     runtime: String,
     #[serde(default)]
     model: Option<String>,
+    /// Reasoning effort for the new orchestrator (`default`: the runtime's own).
+    #[serde(default)]
+    effort: Option<String>,
     /// Ask the previous orchestrator for a handoff summary (default true).
     #[serde(default = "yes")]
     summary: bool,
@@ -2582,6 +2586,7 @@ async fn call_async(
             let p: UseOrchestratorParams = params(p)?;
             let mut opts = SwitchOptions {
                 summary: p.summary,
+                effort: p.effort,
                 ..SwitchOptions::default()
             };
             if let Some(w) = p.wait_secs {

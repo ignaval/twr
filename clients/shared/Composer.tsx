@@ -11,6 +11,7 @@ import {
   useState,
   useSyncExternalStore,
   type FormEvent,
+  type ReactNode,
   type RefObject,
 } from "react";
 import { ArrowUp, ChevronDown, Paperclip, X } from "lucide-react";
@@ -185,6 +186,7 @@ export function Composer({
   spokenLately,
   onDismissKeyboard,
   fail,
+  modelPicker,
 }: {
   drafts: Drafts;
   /** The destination on screen: its draft is the box's text. */
@@ -223,6 +225,8 @@ export function Composer({
   spokenLately: () => string[];
   onDismissKeyboard?: () => void;
   fail: (error: unknown) => void;
+  /** The model and effort picker (`ModelPicker`), at the footer row's right. */
+  modelPicker?: ReactNode;
 }) {
   const draft = useDraft(drafts, draftKey);
   const [voiceStatusContainer, setVoiceStatusContainer] =
@@ -525,6 +529,7 @@ export function Composer({
               </small>
             )}
           </span>
+          {modelPicker}
           <div className="composer-actions">
             <VoiceControl
               context={draftKey + ":" + target?.id}

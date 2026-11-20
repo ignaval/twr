@@ -617,11 +617,15 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::UseOrchestrator {
             runtime,
             model,
+            effort,
             summary,
         } => {
             let mut p = json!({ "runtime": runtime });
             if let Some(m) = model {
                 p["model"] = json!(m);
+            }
+            if let Some(e) = effort {
+                p["effort"] = json!(e);
             }
             if !summary {
                 p["summary"] = json!(false);
@@ -6050,6 +6054,7 @@ mod tests {
         let (m, p) = action_request(&Action::UseOrchestrator {
             runtime: "codex".into(),
             model: Some("o5".into()),
+            effort: None,
             summary: true,
         })
         .unwrap();
@@ -6063,6 +6068,7 @@ mod tests {
         let (_, p) = action_request(&Action::UseOrchestrator {
             runtime: "grok-build".into(),
             model: None,
+            effort: None,
             summary: false,
         })
         .unwrap();

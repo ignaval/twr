@@ -215,6 +215,51 @@ that (a short one at a large text size, or with a notice above the conversation)
 where the composer still fits, so Send, the microphone and Upload stay in view. It shrinks
 again when the text is deleted or sent.
 
+### Model and effort
+
+The message box's footer row shows, at its right before the microphone and Send, what its
+destination runs: the orchestrator, or the thread you opened. It names the runtime by a
+short mark (`Cl` Claude Code, `Cx` Codex, `Gk` Grok Build), the model (the one the runtime
+reports it runs, else the one you asked for, else **Default**) and the reasoning effort
+(**High**, or **Default**). The command hints beside it shorten, then hide, as the window
+narrows. Click it, or press Ctrl+Shift+M (⌘+Shift+M on a Mac), to open the picker above the
+message box:
+
+- On the left, the runtimes twr lists models for (Claude Code, Codex, Grok Build), the
+  current one checked. A thread on another runtime, such as an ACP agent, lists its own
+  first.
+- In the middle, **Search models…**, then the highlighted runtime's models with a few words
+  on each, the current one checked: **Default** (the runtime's own), the models twr knows,
+  and **Custom model id…**, where you type an id and press Enter.
+- On the right, **Effort** with the model it is for, and a row for each effort the runtime
+  takes, after **Default**.
+
+The focus starts in the search. ↑ and ↓ move, Enter picks a model, and the highlight moves
+on to the efforts with the popup still open; Enter or a click on an effort applies both at
+once. ← and → move between the columns, ← from an empty search to the runtimes. **Done**
+applies what is picked so far. Esc or **Cancel** closes the picker with nothing changed and
+puts the focus back in the message box; so does a click outside, leaving the focus where you
+clicked. On a phone the picker is a sheet
+at the bottom of the screen, its columns stacked, every row a full-size touch target.
+
+Only what changed is sent. For a thread on its own runtime that is `thread.set_model` with
+the model, the effort, or both; picking the runtime's default sends `default`. Another
+runtime moves the thread, so the app asks first: its next message starts a new session of
+that runtime with a handoff. A `pty` thread runs its own command line, so the picker offers
+it only another runtime. For the orchestrator every change is a switch
+(`orchestrator.use`), a new orchestrator session with a handoff, even on the same runtime, so
+the app always asks: **Switch with summary** first asks the current orchestrator for its own
+summary, **Switch without summary** hands over only what the log shows
+([orchestrator.md](orchestrator.md#switching-the-orchestrator)).
+
+While the change is under way the button shows a spinner; a refusal from the hub shows as
+any other error. The button is disabled while the hub is disconnected and on a device
+without the `operate` scope, and hidden while the conversation has no destination. A change
+made elsewhere (by the orchestrator, `twr model`, the TUI) shows as soon as the thread list
+updates. The command palette's **Change model, runtime or account** and **Switch
+orchestrator** forms still work, and are where accounts are chosen; **Switch orchestrator**
+has a reasoning effort field too.
+
 ### Loops
 
 A review loop has a reviewer model check a thread's changes round by round while the thread

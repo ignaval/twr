@@ -284,6 +284,7 @@ export const commands: Command[] = [
   cmd("orch", "Switch orchestrator", "Orchestrator", "orchestrator.use", [
     runtime,
     f("model", "Model", { type: "model" }),
+    f("effort", "Reasoning effort", { type: "effort" }),
     f("summary", "Include a handoff summary", {
       type: "boolean",
       initial: true,

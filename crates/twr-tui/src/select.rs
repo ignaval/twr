@@ -61,6 +61,9 @@ pub enum Target {
     /// The input box's top border while the last message can be taken back: the first tap
     /// arms the second, which takes it back (Esc Esc).
     TakeBack,
+    /// The model and effort at the right of the input box's bottom border: opens the model
+    /// picker of where the line goes (Alt-M).
+    ModelPicker,
     /// A row of the action popup: a tap highlights it, a tap on the highlighted row runs it
     /// (an answer, Dismiss or Stop only once a tap highlighted it on the item as it is now,
     /// read long enough).

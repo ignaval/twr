@@ -101,6 +101,10 @@ pub struct SwitchOptions {
     /// How long to wait for a busy previous orchestrator to become idle (capped at
     /// [`SUMMARY_WAIT_MAX`]).
     pub wait: Duration,
+    /// The new orchestrator's reasoning effort (`orchestrator.use` `effort`): one the runtime
+    /// takes, or `default` (or blank) for the runtime's own. `None`: not asked, so a switch
+    /// gets the runtime's default and the first orchestrator `[orchestrator] effort`.
+    pub effort: Option<String>,
 }
 
 impl Default for SwitchOptions {
@@ -108,6 +112,7 @@ impl Default for SwitchOptions {
         SwitchOptions {
             summary: true,
             wait: SUMMARY_WAIT,
+            effort: None,
         }
     }
 }
