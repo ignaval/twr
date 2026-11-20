@@ -87,7 +87,7 @@ impl std::fmt::Display for MissingModel {
             .find(|m| self.0.ends_with(m.path))
             .unwrap_or(&MODELS[0]);
         let selector = format!(" --model {}", spec.name);
-        write!(f, "no speech model yet: `twr voice setup{selector}` downloads whisper's {} (148 MB) to {}, or name yours with [voice] model (docs/voice.md)", spec.name, self.0.display())
+        write!(f, "no speech model yet: `twr voice setup{selector}` downloads whisper's {} ({}) to {}, or name yours with [voice] model (docs/voice.md)", spec.name, spec.size, self.0.display())
     }
 }
 
@@ -206,26 +206,38 @@ pub struct ModelSpec {
     pub url: &'static str,
     pub sha256: &'static str,
     pub bytes: u64,
+    /// Its size, as said to the user.
+    pub size: &'static str,
 }
 
 /// English remains the default, including for existing callers of setup without flags.
-pub const MODELS: [ModelSpec; 2] = [
+/// `small` and `small.en` recognize noticeably better than `base` (fewer wrong words, the
+/// language told apart better in short clips) at about three times the size and time.
+pub const MODELS: [ModelSpec; 4] = [
     ModelSpec { name: "base.en", path: DEFAULT_MODEL, url: MODEL_URL,
-        sha256: MODEL_SHA256, bytes: MODEL_BYTES },
-    // Authoritative pointer (not a hash inferred from a filename):
-    // https://huggingface.co/ggerganov/whisper.cpp/raw/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin
+        sha256: MODEL_SHA256, bytes: MODEL_BYTES, size: MODEL_SIZE },
+    // Authoritative pointers (not hashes inferred from a filename):
+    // https://huggingface.co/ggerganov/whisper.cpp/raw/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-<name>.bin
     ModelSpec { name: "base", path: "voice/ggml-base.bin",
         url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin",
         sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
-        bytes: 147_951_465 },
+        bytes: 147_951_465, size: "148 MB" },
+    ModelSpec { name: "small.en", path: "voice/ggml-small.en.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en.bin",
+        sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+        bytes: 487_614_201, size: "488 MB" },
+    ModelSpec { name: "small", path: "voice/ggml-small.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.bin",
+        sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+        bytes: 487_601_967, size: "488 MB" },
 ];
 
 /// Only catalogue names are accepted; never arbitrary URLs or paths.
 pub fn model_spec(name: &str) -> anyhow::Result<&'static ModelSpec> {
-    MODELS
-        .iter()
-        .find(|m| m.name == name)
-        .ok_or_else(|| anyhow!("unknown voice model {name:?}; choose base.en or base"))
+    MODELS.iter().find(|m| m.name == name).ok_or_else(|| {
+        let names: Vec<_> = MODELS.iter().map(|m| m.name).collect();
+        anyhow!("unknown voice model {name:?}; choose {}", names.join(", "))
+    })
 }
 
 /// The canonical configured model, if setup can provision it without changing config.
@@ -272,6 +284,24 @@ pub fn hint_words(hint: &[String]) -> Vec<String> {
     out
 }
 
+/// Audio after the end of a recording whisper is shown: whisper was trained on its whole
+/// 30-second window, and a window cut close to the speech misheard its last words.
+const WINDOW_PAD_SECONDS: f32 = 3.0;
+
+/// The part of whisper's 30-second window (`-ac`, in its 1500 positions, 50 a second) a
+/// recording of `seconds` needs, when `language` is set: most commands are a few seconds, and
+/// whisper otherwise works through 30 seconds of silence after them. With 14 spoken commands
+/// in English and Spanish this recognized the same words 2.5 times as fast. `None` (the whole
+/// window) for `auto`, where it often misheard the start ("Hey Claude" as "H. Laud"), and
+/// for recordings close to 30 seconds.
+pub fn audio_context(seconds: f32, language: &str) -> Option<u32> {
+    if language == "auto" || !seconds.is_finite() {
+        return None;
+    }
+    let n = ((seconds.max(0.0) + WINDOW_PAD_SECONDS) * 50.0 / 64.0).ceil() as u32 * 64;
+    (n < 1500).then_some(n)
+}
+
 /// The text `recording` (checked by [`crate::wav::check`]) says, recognized by `kind` within
 /// `timeout`, expecting the words of `hint` ([`hint_words`]): one line, empty when nothing
 /// was said ([`crate::text::clean`]).
@@ -313,6 +343,9 @@ pub async fn transcribe(
                 .map(|n| n.get().clamp(1, 8))
             {
                 args.extend(["-t".into(), n.to_string()]);
+            }
+            if let Some(n) = audio_context(rec.seconds, language) {
+                args.extend(["-ac".into(), n.to_string()]);
             }
             if !hint.is_empty() {
                 args.extend(["--prompt".into(), format!("{}.", hint.join(", "))]);
@@ -489,6 +522,8 @@ mod tests {
         for (m, pointer) in MODELS.iter().zip([
             include_str!("../tests/fixtures/ggml-base.en.bin.lfs"),
             include_str!("../tests/fixtures/ggml-base.bin.lfs"),
+            include_str!("../tests/fixtures/ggml-small.en.bin.lfs"),
+            include_str!("../tests/fixtures/ggml-small.bin.lfs"),
         ]) {
             assert!(pointer
                 .lines()
@@ -651,6 +686,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_set_language_fits_the_window_to_the_recording() {
+        assert_eq!(audio_context(1.0, "en"), Some(256));
+        assert_eq!(audio_context(5.0, "es"), Some(448));
+        assert_eq!(audio_context(20.0, "en"), Some(1152));
+        // Close to whisper's 30 seconds, and with the language guessed: the whole window.
+        assert_eq!(audio_context(27.0, "en"), None);
+        assert_eq!(audio_context(5.0, "auto"), None);
+        assert_eq!(audio_context(f32::NAN, "en"), None);
+    }
+
     #[tokio::test]
     async fn whisper_gets_a_private_file_and_fixed_arguments() {
         let d = tempfile::tempdir().unwrap();
@@ -687,6 +733,9 @@ mod tests {
         );
         let at = args.iter().position(|a| *a == "--prompt").unwrap();
         assert_eq!(args[at + 1], "api, docs.", "only plain words, once each");
+        // One second of speech: four seconds of whisper's window, in 64s.
+        let at = args.iter().position(|a| *a == "-ac").unwrap();
+        assert_eq!(args[at + 1], "256");
         assert_eq!(args[args.len() - 2], "-f");
         assert!(
             !Path::new(args[args.len() - 1]).exists(),

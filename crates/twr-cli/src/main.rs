@@ -913,8 +913,9 @@ enum VoiceCmd {
     },
     /// Download a pinned whisper.cpp model to the data directory (no config changes).
     Setup {
-        /// Catalogue model. Omit for base.en; explicit selection ignores [voice] model.
-        #[arg(long, value_parser = ["base.en", "base"])]
+        /// Catalogue model: base.en, base (multilingual), or small.en and small (more accurate,
+        /// 488 MB, slower). Omit for base.en; explicit selection ignores [voice] model.
+        #[arg(long, value_parser = ["base.en", "base", "small.en", "small"])]
         model: Option<String>,
     },
     /// The text of one recording: a 16 kHz mono 16-bit WAV on stdin (at most two minutes),
@@ -9357,6 +9358,7 @@ mod tests {
             url: "https://example.invalid/model",
             bytes: bytes.len() as u64,
             sha256: Box::leak(sha256_hex(bytes).into_boxed_str()),
+            size: "17 B",
         };
         std::fs::write(&target, b"original").unwrap();
         let mut one = ModelDownload::new(&target, &spec).unwrap();
