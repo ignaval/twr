@@ -9,7 +9,11 @@ import { Outbox } from "./Outbox";
 import { ReadAloudControl } from "./ReadAloudControl";
 import { UploadController, unfinished } from "./uploads";
 import { QueuedText, SentMessage, attachmentWait } from "./ComposerAttachments";
-import { splitAttachments, withAttachments } from "./attachmentText";
+import {
+  splitAttachments,
+  withAttachments,
+  type NamedFile,
+} from "./attachmentText";
 import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
@@ -357,9 +361,9 @@ export default function App({
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
-  const pendingEnqueue = useRef<
-    { key: string; text: string; saved: boolean } | undefined
-  >(undefined);
+  // A message on its way into the outbox: the drafts wait to save until it is there and
+  // its draft is cleared, so a save never writes back the text the outbox just took.
+  const pendingEnqueue = useRef<{ key: string } | undefined>(undefined);
   const [journal, setJournal] = useState<OfflineJournal>();
   const [offlineNotice, setOfflineNotice] = useState("");
   useEffect(() => {
@@ -381,6 +385,7 @@ export default function App({
             ...saved.snapshot.drafts,
             ...current,
           }));
+          restoreFiles(saved.snapshot.draftFiles);
           setJournal(saved);
           setOfflineNotice("");
         })
@@ -397,8 +402,21 @@ export default function App({
   const hasLiveSnapshot = useRef(false);
   // Attached files stay on their conversation (ComposerAttachments shows them in the
   // message box): a message names the uploaded ones as it is sent (`withAttachments`).
+  // They are keyed as drafts are, by conversation (`orchestrator` or a thread's id), and
+  // saved with them on this device: names and paths of the uploaded ones.
   const [uploads] = useState(() => new UploadController(hostApi));
-  const currentOrchestrator = useRef<Record<string, string | undefined>>({});
+  /** A draft key's workspace and conversation: `<workspace>:<conversation>`. */
+  const draftPlace = (key: string) => {
+    const at = key.lastIndexOf(":");
+    return { space: key.slice(0, at), conversation: key.slice(at + 1) };
+  };
+  /** Puts files saved with the drafts back on their conversations, uploaded. */
+  const restoreFiles = (saved: Record<string, NamedFile[]> = {}) => {
+    for (const [key, files] of Object.entries(saved)) {
+      const { space, conversation } = draftPlace(key);
+      if (files.length) uploads.restore(files, conversation, space);
+    }
+  };
   /**
    * Puts a message's text back in a draft (`key`: `<workspace>:orchestrator` or
    * `<workspace>:<thread>`), as Take back and the outbox do: the files it names go back on
@@ -407,29 +425,22 @@ export default function App({
   const restoreDraft = (key: string, text: string) => {
     if (!text.trim()) return;
     const { body, files } = splitAttachments(text);
-    const at = key.lastIndexOf(":");
-    const space = key.slice(0, at);
-    const id = key.slice(at + 1);
-    const thread =
-      id === "orchestrator" ? currentOrchestrator.current[space] : id;
-    if (!files.length || !thread) {
+    if (!files.length) {
       drafts.set(key, (old) => appendDraft(old, text));
       return;
     }
-    uploads.restore(files, thread, space);
+    const { space, conversation } = draftPlace(key);
+    uploads.restore(files, conversation, space);
     if (body.trim()) drafts.set(key, (old) => appendDraft(old, body));
   };
   useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
-  // Saves the drafts on this device 350 ms after the last change to any of them, into
-  // the storage epoch of that change.
+  // Saves the drafts on this device 350 ms after the last change to any of them, or to
+  // the uploaded files of any conversation, into the storage epoch of that change.
   useEffect(() => {
     if (!journal) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const changed = () => {
-      const pending = pendingEnqueue.current;
-      if (pending?.saved && drafts.get(pending.key) !== pending.text)
-        pendingEnqueue.current = undefined;
       const epoch = journal.epoch;
       const persist = () => {
         if (pendingEnqueue.current) {
@@ -438,7 +449,7 @@ export default function App({
           return;
         }
         void journal
-          .drafts(drafts.all(), epoch, drafts.spoken())
+          .drafts(drafts.all(), epoch, drafts.spoken(), uploads.committed())
           .then(() => setOfflineNotice(""))
           .catch((error) => setOfflineNotice(errorMessage(error)));
       };
@@ -449,12 +460,21 @@ export default function App({
     };
     changed();
     const unsubscribe = drafts.subscribe(changed);
+    // Upload progress changes nothing saved: only a file uploaded, sent or removed does.
+    let files = JSON.stringify(uploads.committed());
+    const stopFiles = uploads.subscribe(() => {
+      const now = JSON.stringify(uploads.committed());
+      if (now === files) return;
+      files = now;
+      changed();
+    });
     return () => {
       unsubscribe();
+      stopFiles();
       clearTimeout(timer);
       if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
     };
-  }, [journal, drafts]);
+  }, [journal, drafts, uploads]);
   const [sending, setSending] = useState(false);
   const slashPending = useRef(false);
   const [queued, setQueued] = useState<Json[]>([]);
@@ -544,7 +564,12 @@ export default function App({
       : [...listed, { id: "usage", title: "Usage limits: how much is left" }];
   }, [slashCommands, commands]);
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
-  currentOrchestrator.current[workspace] = orchestrator?.id;
+  // A switch of the orchestrator's model or effort gives it a new thread: its files stay
+  // on its conversation, and those whose upload has not begun go to the new thread.
+  useEffect(() => {
+    if (orchestrator)
+      uploads.retarget("orchestrator", workspace, orchestrator.id);
+  }, [uploads, workspace, orchestrator?.id]);
   const target = destination
     ? view.threads.find((t) => t.id === destination)
     : orchestrator;
@@ -1046,6 +1071,7 @@ export default function App({
             }
             drafts.restoreSpoken(saved.snapshot.spokenDrafts);
             drafts.update((current) => ({ ...restored, ...current }));
+            restoreFiles(saved.snapshot.draftFiles);
             setJournal(saved);
             setOfflineNotice(saved.historyError);
           })
@@ -1632,11 +1658,12 @@ export default function App({
     // The conversation's uploaded files go with the message, named after its text
     // (`withAttachments`); a composer command and a shell line take none. A message waits
     // while a file is still on its way (Send is disabled, and says why).
+    // Files another message on its way reserved are not this one's.
     const attached =
       target &&
       !(draft.startsWith("/") && !draft.startsWith("//")) &&
       !(draft.startsWith("!") && !draft.startsWith("!!!"))
-        ? uploads.of(target.id, workspace)
+        ? uploads.available(destination || "orchestrator", workspace)
         : [];
     if (attached.some(unfinished)) {
       announce(attachmentWait(attached));
@@ -1668,6 +1695,10 @@ export default function App({
       );
       return;
     }
+    // Reserved before anything is awaited: a hands-free message sent meanwhile can't name
+    // them too. Released in the end unless this message took them.
+    const fileIds = files.map((file) => file.id);
+    if (!uploads.reserve(fileIds)) return;
     setSending(true);
     const key = draftKey;
     const text = draft.startsWith("//") ? draft.slice(1) : draft;
@@ -1679,7 +1710,7 @@ export default function App({
     const takeFiles = () => {
       if (taken) return;
       taken = true;
-      uploads.take(files.map((file) => file.id));
+      uploads.take(fileIds);
     };
     try {
       let response: Json;
@@ -1741,7 +1772,7 @@ export default function App({
               item.reason === "permission" || item.reason === "question",
           );
         if (journal && hostApi.sendMessage && !liveReply && !spoken) {
-          const pending = { key, text: draft, saved: false };
+          const pending = { key };
           pendingEnqueue.current = pending;
           const epoch = journal.epoch;
           clearTimeout(draftSaveTimer.current);
@@ -1756,9 +1787,12 @@ export default function App({
                 .catch(() => {});
               throw error;
             });
-          pending.saved = true;
           takeFiles();
           drafts.set(key, (old) => (old === draft ? "" : old));
+          // The outbox holds the message and the box is cleared: the drafts save again,
+          // even when that cleared nothing (a message of files alone).
+          if (pendingEnqueue.current === pending)
+            pendingEnqueue.current = undefined;
           if (connected) response = await journal.deliver(message);
           else response = { saved_offline: true };
         } else response = await rpc(method, params);
@@ -1792,6 +1826,7 @@ export default function App({
     } catch (e) {
       fail(e);
     } finally {
+      uploads.release(fileIds);
       setSending(false);
       input.current?.focus();
     }
@@ -1811,7 +1846,7 @@ export default function App({
       return;
     }
     // The thread's uploaded files are part of the task, named after its text.
-    const attached = uploads.of(thread.id, workspace);
+    const attached = uploads.available(thread.id, workspace);
     if (attached.some(unfinished)) {
       announce(attachmentWait(attached));
       return;
@@ -1831,16 +1866,23 @@ export default function App({
       fail(error);
       return;
     }
+    const fileIds = files.map((file) => file.id);
     const run = async () => {
+      // Taken by another message since (the task names them): ask again.
+      if (!uploads.reserve(fileIds)) {
+        announce("Your files went with another message. Check the task again.");
+        return;
+      }
       setSending(true);
       try {
         if (
           await startImplement(thread.id, plan.task ? { task: plan.task } : {})
         ) {
           drafts.set(key, (old) => (old === draft ? "" : old));
-          uploads.take(files.map((file) => file.id));
+          uploads.take(fileIds);
         }
       } finally {
+        uploads.release(fileIds);
         setSending(false);
         input.current?.focus();
       }
@@ -1862,26 +1904,33 @@ export default function App({
   const submitVoice = async (text: string): Promise<Json> => {
     if (!orchestrator)
       throw new Error("Choose an orchestrator before talking to it.");
-    const files = uploads.ready(orchestrator.id, workspace);
-    const response = await rpc("say", {
-      message: withAttachments(
-        text,
-        files.map((item) => ({ name: item.file.name, path: item.path! })),
-      ),
-      seen_gseq: view.head,
-      to: "orchestrator",
-      voice: true,
-    });
-    if (response.action === "pending") {
-      setSection("attention");
-      throw new Error(
-        "Not sent: review the waiting requests and answer the exact item shown.",
-      );
+    // Reserved at once, as a typed message does: a file goes with one message only.
+    const files = uploads.ready("orchestrator", workspace);
+    const fileIds = files.map((item) => item.id);
+    if (!uploads.reserve(fileIds))
+      throw new Error("Your files are going with another message.");
+    try {
+      const response = await rpc("say", {
+        message: withAttachments(
+          text,
+          files.map((item) => ({ name: item.file.name, path: item.path! })),
+        ),
+        seen_gseq: view.head,
+        to: "orchestrator",
+        voice: true,
+      });
+      if (response.action === "pending") {
+        setSection("attention");
+        throw new Error(
+          "Not sent: review the waiting requests and answer the exact item shown.",
+        );
+      }
+      if (response.action !== "confirm") uploads.take(fileIds);
+      setQueueRefresh((n) => n + 1);
+      return response;
+    } finally {
+      uploads.release(fileIds);
     }
-    if (response.action !== "confirm")
-      uploads.take(files.map((item) => item.id));
-    setQueueRefresh((n) => n + 1);
-    return response;
   };
   const voiceHintWords = useMemo(() => voiceHint(view.threads), [view.threads]);
   // What this device may have read aloud lately, for voice mode's echo check: the

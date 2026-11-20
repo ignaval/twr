@@ -87,11 +87,12 @@ export function attachmentWait(items: readonly Attachment[]) {
 /** The strip in the message box. Renders nothing while the conversation has no files. */
 export function ComposerAttachments({
   controller,
-  thread,
+  conversation,
   workspace,
 }: {
   controller: UploadController;
-  thread?: string;
+  /** `orchestrator`, or a thread's id (`Attachment.conversation`). */
+  conversation?: string;
   workspace: string;
 }) {
   const all = useSyncExternalStore(
@@ -100,7 +101,8 @@ export function ComposerAttachments({
     controller.getSnapshot,
   );
   const items = all.filter(
-    (item) => item.thread === thread && item.workspace === workspace,
+    (item) =>
+      item.conversation === conversation && item.workspace === workspace,
   );
   const [shown, setShown] = useState<string>();
   const phases = useRef(new Map<string, string>());

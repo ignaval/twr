@@ -16,9 +16,21 @@ function isPath(line: string) {
   return /^(?:\/|[A-Za-z]:[\\/])\S/.test(line) && line.trim() === line;
 }
 
+/**
+ * A file's name as its `Uploaded file:` line holds it: on one line. A name may hold line
+ * breaks (`\n`, `\r`, U+2028 and the like) or other control characters, which would split
+ * the pair and leave the path as message text; each run of them becomes one space.
+ */
+export function lineName(name: string) {
+  const flat = name.replace(/[\p{Cc}\u2028\u2029]+/gu, " ").trim();
+  return flat || "attachment";
+}
+
 /** The lines naming `files`, one pair per file. */
 export function attachmentLines(files: readonly NamedFile[]) {
-  return files.map((file) => `${PREFIX}${file.name}\n${file.path}`).join("\n");
+  return files
+    .map((file) => `${PREFIX}${lineName(file.name)}\n${file.path}`)
+    .join("\n");
 }
 
 /** `text` as sent with `files`: the text, then each file's pair on its own lines. */

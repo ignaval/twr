@@ -1614,6 +1614,15 @@ describe("attached files", () => {
       .concat(app().find("form.composer").textContent, app().box().value)
       .join("\n");
   const sendButton = () => app().find(".send-button");
+  /** What the device saved of drafts and the outbox. */
+  const pending = () =>
+    JSON.parse(app().host.secure.get("offline-pending:composer-test") || "{}");
+  /** Quits and starts again on this device's saved storage. */
+  const restart = async (options: Parameters<typeof mount>[0] = {}) => {
+    const secure = Object.fromEntries(app().host.secure);
+    await app().unmount();
+    await start({ secure, ...options });
+  };
   const submit = async () => {
     await app().act(async () => {
       app()
@@ -1635,10 +1644,14 @@ describe("attached files", () => {
     expect(shown()).not.toContain("/uploads");
     // The old full-width bar is gone.
     expect(app().all(".attachment-manager, .attachment-item")).toHaveLength(0);
+    // The draft saved on the device is the text alone; the file is saved beside it.
     await app().wait(450);
-    expect(JSON.stringify([...app().host.secure.values()])).not.toContain(
-      "/uploads/notes.txt",
-    );
+    expect(pending().drafts).toEqual({ "default:orchestrator": "see" });
+    expect(pending().draftFiles).toEqual({
+      "default:orchestrator": [
+        { name: "notes.txt", path: "/uploads/notes.txt" },
+      ],
+    });
   });
 
   it("names the files after the text it sends, then clears them", async () => {
@@ -1819,6 +1832,141 @@ describe("attached files", () => {
         kind: "implement",
         task: "build this\nUploaded file: spec.md\n/uploads/spec.md",
       },
+    ]);
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("keeps saving drafts after a message of files alone goes to the outbox", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await attach();
+    await app().connection(false);
+    await submit();
+    expect(app().find(".outbox-message").textContent).toContain("notes.txt");
+    expect(chips()).toHaveLength(0);
+    await app().talkTo("builder");
+    await app().type("second draft");
+    await app().wait(450);
+    expect(pending().drafts["default:w1"]).toBe("second draft");
+    expect(pending().draftFiles).toEqual({});
+  });
+
+  it("keeps a draft's files over a restart, with text and alone", async () => {
+    await start();
+    await app().type("See attached");
+    await attach();
+    await app().talkTo("builder");
+    await attach("a.txt");
+    await app().wait(450);
+    await restart();
+    expect(app().box().value).toBe("See attached");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    await app().talkTo("builder");
+    expect(app().box().value).toBe("");
+    expect(chips()).toEqual([expect.stringContaining("a.txt")]);
+    await submit();
+    expect(app().host.sent.at(-1)).toEqual({
+      method: "thread.send",
+      params: { thread: "w1", prompt: "Uploaded file: a.txt\n/uploads/a.txt" },
+    });
+  });
+
+  it("keeps a taken-back message's files over a restart", async () => {
+    await start();
+    app().host.queues.w1 = [
+      {
+        ref: 7,
+        prompt: "See attached\nUploaded file: a.png\n/w/a.png",
+        mine: true,
+      },
+    ];
+    await app().talkTo("builder");
+    await app().click(app().find(".queued-message button", "Take back"));
+    await app().wait(450);
+    await restart();
+    await app().talkTo("builder");
+    expect(app().box().value).toBe("See attached");
+    expect(chips()).toEqual([expect.stringContaining("a.png")]);
+  });
+
+  it("keeps a message's files over a restart once it is moved back from the outbox", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await attach();
+    await app().connection(false);
+    await app().type("later");
+    await app().press("Enter");
+    await app().click(
+      app().find(".outbox-message button", "Move to original draft"),
+    );
+    // Saved split at once, before the drafts' own save: a restart now loses nothing.
+    expect(pending().drafts["default:orchestrator"]).toBe("later");
+    expect(pending().draftFiles["default:orchestrator"]).toEqual([
+      { name: "notes.txt", path: "/uploads/notes.txt" },
+    ]);
+    await restart();
+    expect(app().box().value).toBe("later");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+  });
+
+  it("keeps the orchestrator's files when a switch gives it a new thread", async () => {
+    await start();
+    const uploadedTo: string[] = [];
+    let finish!: () => void;
+    app().host.uploadFile = (async (file: { name: string }, thread: string) => {
+      uploadedTo.push(thread);
+      if (file.name === "late.txt")
+        await new Promise<void>((resolve) => (finish = resolve));
+      return { path: "/uploads/" + file.name };
+    }) as any;
+    await attach();
+    await attach("late.txt");
+    await app().type("draft");
+    const switched = [
+      thread({ id: "orch-new", name: "orchestrator", is_orchestrator: true }),
+      ...views.default.filter((t) => !t.is_orchestrator),
+    ];
+    await app().live("default", switched);
+    expect(app().box().value).toBe("draft");
+    expect(chips()).toHaveLength(2);
+    // The transfer that began goes on to the thread its receipt names.
+    await app().act(async () => finish());
+    await app().wait(50);
+    expect(uploadedTo).toEqual(["orch", "orch"]);
+    await app().press("Enter");
+    expect(app().host.sent.at(-1)?.params.message).toBe(
+      "draft\nUploaded file: notes.txt\n/uploads/notes.txt\nUploaded file: late.txt\n/uploads/late.txt",
+    );
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("names a file in one message when hands-free speech and Send go at once", async () => {
+    let deliver!: () => void;
+    await start({
+      voice: true,
+      rpc: (method, params) => {
+        if (method !== "say" || params.voice) return undefined;
+        app().host.sent.push({ method, params });
+        return new Promise((resolve) => {
+          deliver = () => resolve({ action: "sent" });
+        });
+      },
+    });
+    await attach();
+    await app().type("typed");
+    await app().press("Enter");
+    await app().click(app().find("[data-voice-hands-free]"));
+    await app().act(async () => app().host.voiceEvent({ type: "speechStart" }));
+    await app().act(async () =>
+      app().host.voiceEvent({ type: "final", text: "spoken" }),
+    );
+    await app().settle();
+    await app().act(async () => deliver());
+    await app().settle();
+    const messages = app().host.sent.map((sent) => sent.params.message);
+    expect(messages).toEqual([
+      "typed\nUploaded file: notes.txt\n/uploads/notes.txt",
+      "spoken",
     ]);
     expect(chips()).toHaveLength(0);
   });

@@ -5,6 +5,7 @@ import {
   attachmentLines,
   fileKind,
   fileSize,
+  lineName,
   splitAttachments,
   withAttachments,
 } from "../shared/attachmentText";
@@ -64,6 +65,25 @@ describe("a message's attachment lines", () => {
       expect(splitAttachments(text)).toEqual({ body: text, files: [] });
   });
 
+  it("keeps a name with line breaks on its one line, so the path is never text", () => {
+    for (const name of [
+      "notes\nfinal.txt",
+      "notes\r\nfinal.txt",
+      "notes\u2028final.txt",
+      "notes\u0085\tfinal.txt",
+    ]) {
+      const sent = withAttachments("see", [
+        { name, path: "/u/a/notes_final.txt" },
+      ]);
+      expect(sent.split("\n")).toHaveLength(3);
+      expect(splitAttachments(sent)).toEqual({
+        body: "see",
+        files: [{ name: "notes final.txt", path: "/u/a/notes_final.txt" }],
+      });
+    }
+    expect(lineName("\n\r")).toBe("attachment");
+  });
+
   it("names kinds and sizes for the chips", () => {
     expect(fileKind("a.PNG")).toBe("image");
     expect(fileKind("main.rs")).toBe("code");
@@ -80,6 +100,7 @@ describe("attachment status", () => {
     id: "1",
     file: { name: "big.bin", size: 1000 } as File,
     thread: "t",
+    conversation: "t",
     workspace: "w",
     phase: "uploading",
     loaded: 0,

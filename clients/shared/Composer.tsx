@@ -232,12 +232,17 @@ export function Composer({
 }) {
   const draft = useDraft(drafts, draftKey);
   // The conversation's attached files: a message carries the uploaded ones (not a
-  // command or a shell line), and waits while any is still on its way.
+  // command or a shell line), and waits while any is still on its way. They are keyed as
+  // the draft is: the orchestrator's stay with it when its thread changes.
+  const conversation = destination || "orchestrator";
   const attached = useSyncExternalStore(
     uploads.subscribe,
     uploads.getSnapshot,
   ).filter(
-    (item) => item.thread === target?.id && item.workspace === workspace,
+    (item) =>
+      !!target &&
+      item.conversation === conversation &&
+      item.workspace === workspace,
   );
   const carriesFiles =
     !(draft.startsWith("/") && !draft.startsWith("//")) &&
@@ -367,7 +372,7 @@ export function Composer({
         </div>
         <ComposerAttachments
           controller={uploads}
-          thread={target?.id}
+          conversation={target ? conversation : undefined}
           workspace={workspace}
         />
         <textarea
@@ -522,7 +527,7 @@ export function Composer({
                   event.target.value = "";
                   if (target) {
                     try {
-                      uploads.add(files, target.id, workspace);
+                      uploads.add(files, target.id, workspace, conversation);
                     } catch (error) {
                       fail(error);
                     }

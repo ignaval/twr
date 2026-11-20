@@ -1,5 +1,6 @@
 import type { DesktopAPI, HubEvent, Json, ViewState } from "./types";
 import { requestId } from "./remote-crypto";
+import { splitAttachments, type NamedFile } from "./attachmentText";
 
 export interface DurableMessage {
   id: string;
@@ -35,6 +36,13 @@ export interface OfflineRecord {
   drafts: Record<string, string>;
   /** Drafts containing unreviewed speech; saved atomically with their text. */
   spokenDrafts?: Record<string, boolean>;
+  /**
+   * The uploaded files on each draft's conversation, by draft key: names and paths, saved
+   * with the text, so a restart puts them back in the box. Optional, like `spokenDrafts`:
+   * a record without it (an older app's) loads with none, and an older app reading this
+   * one keeps the text and drops the files.
+   */
+  draftFiles?: Record<string, NamedFile[]>;
   workspaces: Record<string, CachedWorkspace>;
   outbox: OutboxMessage[];
 }
@@ -77,6 +85,7 @@ export function recordSize(record: OfflineRecord) {
   const pending = bytes({
     drafts: record.drafts,
     spokenDrafts: record.spokenDrafts,
+    draftFiles: record.draftFiles,
     outbox: record.outbox,
   });
   const history = Object.entries(record.workspaces).reduce(
@@ -127,6 +136,60 @@ export function activateOfflineHost(hostId: string) {
 }
 function blank(): OfflineRecord {
   return { version: 1, drafts: {}, workspaces: {}, outbox: [] };
+}
+/** Saved draft files that are well formed: a list of names and paths per key. */
+function draftFilesOf(value: unknown): Record<string, NamedFile[]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .map(([key, files]): [string, NamedFile[]] => [
+        key,
+        Array.isArray(files)
+          ? files
+              .filter(
+                (file): file is NamedFile =>
+                  !!file &&
+                  typeof file.name === "string" &&
+                  typeof file.path === "string" &&
+                  !!file.path,
+              )
+              .slice(0, 8)
+              .map(({ name, path }) => ({ name, path }))
+          : [],
+      ])
+      .filter(([, files]) => files.length),
+  );
+}
+/**
+ * `text` taken back into a draft, split as the app's box holds it: the text without its
+ * `Uploaded file:` lines into the draft, the files it names onto the conversation's saved
+ * files (once each).
+ */
+function backToDraft(
+  record: OfflineRecord,
+  key: string,
+  text: string,
+): Pick<OfflineRecord, "drafts" | "draftFiles"> {
+  const { body, files } = splitAttachments(text);
+  if (!files.length)
+    return {
+      drafts: {
+        ...record.drafts,
+        [key]: appendDraft(record.drafts[key], text),
+      },
+      draftFiles: record.draftFiles,
+    };
+  const saved = record.draftFiles?.[key] || [];
+  const known = new Set(saved.map((file) => file.path));
+  return {
+    drafts: body.trim()
+      ? { ...record.drafts, [key]: appendDraft(record.drafts[key], body) }
+      : record.drafts,
+    draftFiles: {
+      ...record.draftFiles,
+      [key]: [...saved, ...files.filter((file) => !known.has(file.path))],
+    },
+  };
 }
 export function parseOffline(
   value: string | null,
@@ -180,6 +243,7 @@ export function parseOffline(
         )
         .map(([key]) => [key, true]),
     ),
+    draftFiles: draftFilesOf(record.draftFiles),
     workspaces: Object.fromEntries(
       Object.entries(record.workspaces as Record<string, CachedWorkspace>)
         .filter(
@@ -281,6 +345,7 @@ export class OfflineJournal {
           ...history,
           drafts: pending.drafts,
           spokenDrafts: pending.spokenDrafts,
+          draftFiles: pending.draftFiles,
           outbox: pending.outbox,
         };
         if (!this.active || forgottenHosts.has(this.hostId))
@@ -308,6 +373,7 @@ export class OfflineJournal {
               ...history,
               drafts: {},
               spokenDrafts: {},
+              draftFiles: {},
               outbox: [],
             }),
           );
@@ -357,7 +423,13 @@ export class OfflineJournal {
           );
         const payload =
           lane === "history"
-            ? { ...next, drafts: {}, spokenDrafts: {}, outbox: [] }
+            ? {
+                ...next,
+                drafts: {},
+                spokenDrafts: {},
+                draftFiles: {},
+                outbox: [],
+              }
             : { ...next, workspaces: {} };
         await this.host.secureWrite!(
           lane === "history" ? this.key : this.pendingKey,
@@ -374,6 +446,9 @@ export class OfflineJournal {
     drafts: Record<string, string>,
     epoch = this.generation,
     spokenDrafts?: Record<string, boolean>,
+    /** Every conversation's uploaded files (`UploadController.committed`); left out, the
+     * saved ones stay. */
+    draftFiles?: Record<string, NamedFile[]>,
   ) {
     if (epoch !== this.generation)
       return Promise.reject(
@@ -383,6 +458,7 @@ export class OfflineJournal {
       ...record,
       drafts,
       spokenDrafts: spokenDrafts ?? record.spokenDrafts,
+      draftFiles: draftFiles ?? record.draftFiles,
     }));
   }
   cache(
@@ -457,9 +533,12 @@ export class OfflineJournal {
         throw new Error("Outbox is full (100 messages)");
       const key =
         workspace + ":" + (method === "say" ? "orchestrator" : params.thread);
+      // The message names the conversation's files now: they leave its draft with the text.
+      const { [key]: _, ...draftFiles } = record.draftFiles || {};
       return {
         ...record,
         drafts: { ...record.drafts, [key]: "" },
+        draftFiles,
         outbox: [...record.outbox, message],
       };
     });
@@ -505,10 +584,7 @@ export class OfflineJournal {
       return {
         ...record,
         outbox: record.outbox.filter((item) => item.id !== id),
-        drafts: {
-          ...record.drafts,
-          [key]: appendDraft(record.drafts[key], messageDraft(message)),
-        },
+        ...backToDraft(record, key, messageDraft(message)),
       };
     });
   }
@@ -626,10 +702,7 @@ export class OfflineJournal {
               return {
                 ...record,
                 outbox: record.outbox.filter((item) => item.id !== message.id),
-                drafts: {
-                  ...record.drafts,
-                  [key]: appendDraft(record.drafts[key], text),
-                },
+                ...backToDraft(record, key, text),
               };
             });
             const key =

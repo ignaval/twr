@@ -310,3 +310,77 @@ describe("shared attachment transfers", () => {
     controller.dispose();
   });
 });
+
+describe("a conversation's attachments and its messages", () => {
+  /** A controller whose uploads finish when `finish` is called, in order. */
+  const held = () => {
+    const threads: string[] = [];
+    const waiting: (() => void)[] = [];
+    const controller = new UploadController({
+      uploadFile: async (_file, thread) => {
+        const n = threads.push(thread);
+        await new Promise<void>((resolve) => waiting.push(resolve));
+        return { path: "/orch/.twr-uploads/" + n };
+      },
+    });
+    return { controller, threads, finish: () => waiting.shift()?.() };
+  };
+
+  it("lets one message reserve a file at a time, and gives it back when not taken", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const controller = new UploadController({
+      uploadFile: async () => ({ path: "/w/a" }),
+    });
+    controller.add([file()], "w1", "ws");
+    await vi.waitFor(() =>
+      expect(controller.ready("w1", "ws")).toHaveLength(1),
+    );
+    const [item] = controller.ready("w1", "ws");
+    expect(controller.reserve([item.id])).toBe(true);
+    // Another message sent meanwhile sees nothing to name, and can't reserve it.
+    expect(controller.ready("w1", "ws")).toEqual([]);
+    expect(controller.available("w1", "ws")).toEqual([]);
+    expect(controller.reserve([item.id])).toBe(false);
+    // Still shown in the box while the first is on its way.
+    expect(controller.of("w1", "ws")).toHaveLength(1);
+    controller.release([item.id]);
+    expect(controller.ready("w1", "ws")).toHaveLength(1);
+    expect(controller.reserve([item.id])).toBe(true);
+    controller.take([item.id]);
+    controller.release([item.id]);
+    expect(controller.of("w1", "ws")).toEqual([]);
+    expect(controller.reserve([item.id])).toBe(false);
+    controller.dispose();
+  });
+
+  it("keeps the orchestrator's files on its conversation when its thread changes", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const { controller, threads, finish } = held();
+    controller.add([file(), file(), file()], "orch-1", "ws", "orchestrator");
+    await vi.waitFor(() => expect(threads).toHaveLength(2));
+    controller.retarget("orchestrator", "ws", "orch-2");
+    const [first, second, third] = controller.of("orchestrator", "ws");
+    // Begun transfers keep the thread their receipts name; the waiting one moves.
+    expect([first.thread, second.thread, third.thread]).toEqual([
+      "orch-1",
+      "orch-1",
+      "orch-2",
+    ]);
+    finish();
+    finish();
+    await vi.waitFor(() => expect(threads).toHaveLength(3));
+    expect(threads).toEqual(["orch-1", "orch-1", "orch-2"]);
+    finish();
+    await vi.waitFor(() =>
+      expect(controller.ready("orchestrator", "ws")).toHaveLength(3),
+    );
+    expect(controller.committed()).toEqual({
+      "ws:orchestrator": [
+        { name: "hello.txt", path: "/orch/.twr-uploads/1" },
+        { name: "hello.txt", path: "/orch/.twr-uploads/2" },
+        { name: "hello.txt", path: "/orch/.twr-uploads/3" },
+      ],
+    });
+    controller.dispose();
+  });
+});

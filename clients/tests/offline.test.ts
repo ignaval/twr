@@ -191,6 +191,67 @@ describe("encrypted offline recovery", () => {
     await expect(journal.deliver(message)).rejects.toThrow("removed");
     expect(calls).toBe(0);
   });
+  it("saves a draft's files beside its text, and loads a journal saved without them", async () => {
+    const disk = storage();
+    const host = disk as unknown as DesktopAPI;
+    // A journal an older app saved: version 1, no files.
+    disk.values.set(
+      "offline-pending:old-files",
+      JSON.stringify({
+        version: 1,
+        drafts: { "work:orchestrator": "kept" },
+        workspaces: {},
+        outbox: [],
+      }),
+    );
+    const old = new OfflineJournal(host, "old-files");
+    await old.load();
+    expect(old.snapshot.drafts).toEqual({ "work:orchestrator": "kept" });
+    expect(old.snapshot.draftFiles).toEqual({});
+    const files = { "work:w1": [{ name: "a.txt", path: "/w/a.txt" }] };
+    await old.drafts({ "work:orchestrator": "" }, old.epoch, {}, files);
+    const reopened = new OfflineJournal(host, "old-files");
+    await reopened.load();
+    expect(reopened.snapshot.draftFiles).toEqual(files);
+    // Left out, the saved files stay; damaged entries are dropped on load.
+    await reopened.drafts({ "work:orchestrator": "typing" });
+    expect(reopened.snapshot.draftFiles).toEqual(files);
+    expect(
+      parseOffline(
+        JSON.stringify({
+          version: 1,
+          drafts: {},
+          workspaces: {},
+          outbox: [],
+          draftFiles: { a: [{ name: 1, path: "/x" }, { name: "b" }], b: "x" },
+        }),
+      ).draftFiles,
+    ).toEqual({});
+  });
+  it("moves a message's files back beside its draft, and clears them when one is sent", async () => {
+    const disk = storage();
+    const journal = new OfflineJournal(
+      { ...disk, sendMessage: async () => ({}) } as unknown as DesktopAPI,
+      "move-files",
+    );
+    const message = await journal.enqueue(
+      "work",
+      "thread.send",
+      { thread: "w1", prompt: "See attached\nUploaded file: a.txt\n/w/a.txt" },
+      "See attached\nUploaded file: a.txt\n/w/a.txt",
+    );
+    await journal.moveToDraft(message.id);
+    expect(journal.snapshot.drafts["work:w1"]).toBe("See attached");
+    expect(journal.snapshot.draftFiles).toEqual({
+      "work:w1": [{ name: "a.txt", path: "/w/a.txt" }],
+    });
+    await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "again\nUploaded file: a.txt\n/w/a.txt",
+    });
+    expect(journal.snapshot.drafts["work:w1"]).toBe("");
+    expect(journal.snapshot.draftFiles).toEqual({});
+  });
   it("marks expiry during a session and definite rejections for review", async () => {
     const disk = storage();
     const journal = new OfflineJournal(

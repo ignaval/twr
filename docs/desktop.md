@@ -220,7 +220,8 @@ a 64-pixel tile, any other file as a chip with its name and size, each with a âœ
 or removes it. No path shows, and nothing is written into the draft: the message names the
 conversation's uploaded files (`Uploaded file: <name>` and the path) as it is sent, and a sent
 message shows them as chips with the name only. Send waits, disabled and saying why, while a
-file is still uploading. See [thread attachments](attachments.md).
+file is still uploading. Uploaded files are saved with the draft, so they are still attached
+after a restart. See [thread attachments](attachments.md).
 
 ### Model and effort
 

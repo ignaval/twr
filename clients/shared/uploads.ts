@@ -190,7 +190,13 @@ export function createCancelUpload(
 export interface Attachment {
   id: string;
   file: File;
+  /** The thread the upload goes to: the one its transfer began with (its resume receipt
+   * names it), so it never changes once the transfer has begun. */
   thread: string;
+  /** The conversation it belongs to, as its draft is keyed (`<workspace>:<conversation>`):
+   * `orchestrator` for the orchestrator's, which outlives a switch of the orchestrator's
+   * thread, else the thread's id. */
+  conversation: string;
   workspace: string;
   phase:
     | "queued"
@@ -227,15 +233,18 @@ type Job = {
   cancelled?: boolean;
 };
 /**
- * The attachments of every conversation: each belongs to the thread (and workspace) it was
- * picked in, and stays there, uploaded or not, until a message to that conversation takes
- * it ([`UploadController.take`]) or you remove it. Queue state is independent of a mounted
- * composer: navigating threads preserves progress.
+ * The attachments of every conversation: each belongs to the conversation (and workspace)
+ * it was picked in, and stays there, uploaded or not, until a message to that conversation
+ * takes it ([`UploadController.take`]) or you remove it. Queue state is independent of a
+ * mounted composer: navigating threads preserves progress. A message about to be sent
+ * reserves its files first ([`UploadController.reserve`]), so that no other message names
+ * them while it is on its way.
  */
 export class UploadController {
   private jobs = new Map<string, Job>();
   private listeners = new Set<() => void>();
   private snapshot: Attachment[] = [];
+  private reserved = new Set<string>();
   private disposed = false;
   private workspace?: string;
   /** Image previews of sent attachments, by uploaded path, for the sent message's chips:
@@ -263,12 +272,15 @@ export class UploadController {
     this.snapshot = [...this.jobs.values()].map((job) => ({ ...job.item }));
     this.listeners.forEach((listener) => listener());
   }
-  add(files: File[], thread: string, workspace: string) {
+  /** Picks `files` in a conversation (`thread` when it is not given): they upload to
+   * `thread`. */
+  add(files: File[], thread: string, workspace: string, conversation = thread) {
     if (!this.host.uploadFile)
       throw new Error("File uploads are unavailable on this connection");
     // A ready attachment waits for its message: it is never evicted to make room.
     if (
-      this.of(thread, workspace).length + files.length > MAX_ATTACHMENTS ||
+      this.of(conversation, workspace).length + files.length >
+        MAX_ATTACHMENTS ||
       [...this.jobs.values()].filter((job) => unfinished(job.item)).length +
         files.length >
         MAX_ATTACHMENTS
@@ -283,6 +295,7 @@ export class UploadController {
         id: requestId(),
         file,
         thread,
+        conversation,
         workspace,
         phase: "queued",
         loaded: 0,
@@ -336,16 +349,79 @@ export class UploadController {
     this.emit();
   }
   /** One conversation's attachments, in the order they were picked. */
-  of(thread: string, workspace: string): Attachment[] {
+  of(conversation: string, workspace: string): Attachment[] {
     return this.snapshot.filter(
-      (item) => item.thread === thread && item.workspace === workspace,
+      (item) =>
+        item.conversation === conversation && item.workspace === workspace,
     );
   }
-  /** One conversation's uploaded attachments: what its next message carries. */
-  ready(thread: string, workspace: string): Attachment[] {
-    return this.of(thread, workspace).filter(
+  /** One conversation's attachments that no message on its way has reserved: what the next
+   * message may carry. */
+  available(conversation: string, workspace: string): Attachment[] {
+    return this.of(conversation, workspace).filter(
+      (item) => !this.reserved.has(item.id),
+    );
+  }
+  /** One conversation's uploaded, unreserved attachments: what its next message carries. */
+  ready(conversation: string, workspace: string): Attachment[] {
+    return this.available(conversation, workspace).filter(
       (item) => item.phase === "ready" && item.path,
     );
+  }
+  /**
+   * Reserves these attachments for one message, before it is sent: all of them or, when
+   * one is gone or another message reserved it first, none (`false`). Synchronous, so two
+   * messages sent at once can't both name a file. The message then takes them
+   * ([`take`](#take)) or, not delivered, releases them ([`release`](#release)).
+   */
+  reserve(ids: readonly string[]) {
+    if (ids.some((id) => !this.jobs.has(id) || this.reserved.has(id)))
+      return false;
+    for (const id of ids) this.reserved.add(id);
+    return true;
+  }
+  /** Gives back what [`reserve`](#reserve) took that the message did not take. */
+  release(ids: readonly string[]) {
+    for (const id of ids) this.reserved.delete(id);
+  }
+  /**
+   * Points a conversation's attachments whose transfer has not begun at `thread` (the
+   * orchestrator's new thread after a switch). One that began keeps its thread: its
+   * receipt names it, and the hub still resolves the retired orchestrator, to the same
+   * directory (`orchestrator.cwd`).
+   */
+  retarget(conversation: string, workspace: string, thread: string) {
+    let changed = false;
+    for (const job of this.jobs.values()) {
+      const item = job.item;
+      if (
+        item.conversation !== conversation ||
+        item.workspace !== workspace ||
+        item.thread === thread ||
+        job.running ||
+        item.resume ||
+        item.path ||
+        !["queued", "paused", "error"].includes(item.phase)
+      )
+        continue;
+      item.thread = thread;
+      changed = true;
+    }
+    if (changed) this.emit();
+  }
+  /**
+   * Every conversation's uploaded attachments, by draft key (`<workspace>:<conversation>`):
+   * names and paths only, which is what the drafts save on the device with their text.
+   */
+  committed(): Record<string, NamedFile[]> {
+    const out: Record<string, NamedFile[]> = {};
+    for (const item of this.snapshot)
+      if (item.phase === "ready" && item.path)
+        (out[item.workspace + ":" + item.conversation] ??= []).push({
+          name: item.file.name,
+          path: item.path,
+        });
+    return out;
   }
   /**
    * Takes these attachments off their conversation: the message that names them was
@@ -354,6 +430,7 @@ export class UploadController {
    */
   take(ids: readonly string[]) {
     for (const id of ids) {
+      this.reserved.delete(id);
       const job = this.jobs.get(id);
       if (!job) continue;
       this.jobs.delete(id);
@@ -367,15 +444,22 @@ export class UploadController {
    * Puts files a message named back on a conversation, uploaded (a message taken back to
    * the draft): its next message names them again. A file already there is not added twice.
    */
-  restore(files: readonly NamedFile[], thread: string, workspace: string) {
-    const known = new Set(this.of(thread, workspace).map((item) => item.path));
+  restore(
+    files: readonly NamedFile[],
+    conversation: string,
+    workspace: string,
+  ) {
+    const known = new Set(
+      this.of(conversation, workspace).map((item) => item.path),
+    );
     for (const named of files) {
       if (known.has(named.path)) continue;
       known.add(named.path);
       const item: Attachment = {
         id: requestId(),
         file: new File([], named.name),
-        thread,
+        thread: conversation,
+        conversation,
         workspace,
         phase: "ready",
         loaded: 0,
@@ -480,6 +564,7 @@ export class UploadController {
     }
     if (job.item.image) URL.revokeObjectURL(job.item.image);
     this.jobs.delete(id);
+    this.reserved.delete(id);
     this.emit();
   }
   dispose() {
