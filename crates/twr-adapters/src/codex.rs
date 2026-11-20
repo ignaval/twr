@@ -361,27 +361,36 @@ pub fn mode_note(mode: &str, builtin_tools: Option<&[String]>) -> Option<String>
 /// is Codex's to say.
 pub const EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 
-/// The models twr's pickers offer for Codex ([`crate::models`]): those Codex 0.166.0's
-/// `model/list` reported on 2026-11-07, in its order (`gpt-6.1-sol` its default), with its
-/// descriptions. Codex takes other ids too, so the list is a choice, not a check.
+/// The models twr's pickers offer for Codex ([`crate::models`]): those Codex 0.171.0's
+/// `model/list` reported on 2026-11-20, in its order (`gpt-6.2-sol` its default), with its
+/// descriptions (hidden ones left out). Codex takes other ids too, so the list is a choice,
+/// not a check.
 pub const MODELS: &[crate::KnownModel] = &[
     crate::KnownModel::new(
+        "gpt-6.2-sol",
+        "fast, go-to model for coding and everyday work",
+    ),
+    crate::KnownModel::new(
+        "gpt-6.2-astra",
+        "most capable model for complex coding and professional work",
+    ),
+    crate::KnownModel::new(
+        "gpt-6.1-terra",
+        "efficient model for visual understanding and computer use",
+    ),
+    crate::KnownModel::new(
         "gpt-6.1-sol",
-        "latest workhorse model for coding and everyday work",
+        "previous generation model for coding and everyday work",
     ),
     crate::KnownModel::new(
         "gpt-6-astra",
-        "frontier intelligence for the most demanding work",
+        "previous generation model for complex coding and professional work",
     ),
-    crate::KnownModel::new("gpt-6.1-terra", "GPT-6.1 Terra"),
-    crate::KnownModel::new("gpt-6-sol", "previous generation workhorse model"),
+    crate::KnownModel::new("gpt-6-sol", "legacy model for coding and everyday work"),
     crate::KnownModel::new("gpt-6-luna", "fast and affordable model for easier tasks"),
-    crate::KnownModel::new("gpt-5.6-sol", "older generation workhorse model"),
-    crate::KnownModel::new(
-        "gpt-5.6-terra",
-        "older balanced model for straightforward work",
-    ),
-    crate::KnownModel::new("gpt-5.6-luna", "older fast and efficient model"),
+    crate::KnownModel::new("gpt-5.6-sol", "legacy model for coding and everyday work"),
+    crate::KnownModel::new("gpt-5.6-terra", "legacy balanced model for agentic coding"),
+    crate::KnownModel::new("gpt-5.6-luna", "legacy fast model for simpler tasks"),
 ];
 
 /// The mode ids this adapter maps exactly as written (twr's and Codex's own); any other
