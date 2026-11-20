@@ -27,6 +27,8 @@ The TUI only asks when no orchestrator was ever chosen: no orchestrator thread e
 
 `Alt-M` in the stack view, a click on the model at the right of the input box's bottom border, or `/model` alone, opens the orchestrator's picker on its current runtime: its models, with `other runtime…` last, which leads to the runtimes list above, then its efforts, then the same `y`/`s` confirmation. `Esc` on its models closes it. Any of these switches is a new orchestrator session with a handoff, even on the same runtime ([orchestrator.md](orchestrator.md#switching-the-orchestrator)). `/model orch` opens it too.
 
+A model picker shows what runs as it opens. If that changes underneath it (another client switches the orchestrator, or sets, moves or deletes the thread), it closes and the status bar says so (`alpha changed: the model picker closed; open it again to pick`), and a switch it asked to confirm is cancelled (`cancelled: the orchestrator changed before you confirmed`).
+
 The models listed are the ones each runtime reported when this twr was released (Claude Code's aliases `opus`, `sonnet`, `haiku`, `fable` and `opusplan` first, then full ids; Codex's and Grok Build's model lists), so a newer model may be missing: type it under `custom…`. A name the runtime doesn't know, such as `opus-5.5` for Claude Code, fails every turn ("There's an issue with the selected model"); `default` never does.
 
 ## Workspaces

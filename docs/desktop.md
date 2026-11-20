@@ -223,6 +223,11 @@ message shows them as chips with the name only. Send waits, disabled and saying 
 file is still uploading. Uploaded files are saved with the draft, so they are still attached
 after a restart. See [thread attachments](attachments.md).
 
+Drafts are saved on this device a moment (350 ms) after you stop typing; a file is saved as
+soon as it is uploaded, removed or put back. Closing the window or quitting saves what is still
+waiting first: the window waits for that save, up to 2 seconds, before it closes. The phone
+app saves it as it goes to the background.
+
 ### Model and effort
 
 The message box's footer row shows, at its right before the microphone and Send, what its
@@ -265,6 +270,12 @@ it only another runtime. For the orchestrator every change is a switch
 the app always asks: **Switch with summary** first asks the current orchestrator for its own
 summary, **Switch without summary** hands over only what the log shows
 ([orchestrator.md](orchestrator.md#switching-the-orchestrator)).
+
+What you pick is planned against what runs as the picker opens. If that changes underneath
+it (another client switches the orchestrator, sets or moves the thread, or deletes it), the
+picker closes and the screen reader is told why; open it again to pick from what runs now. A
+confirmation it asked is taken back the same way, and one answered anyway changes nothing and
+says to pick again.
 
 While the change is under way the button shows a spinner; a refusal from the hub shows as
 any other error. The button is disabled while the hub is disconnected and on a device

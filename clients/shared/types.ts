@@ -318,6 +318,9 @@ export interface DesktopAppAPI {
   diagnostics(): Promise<string>;
   openLogs(): Promise<void>;
   onUpdate(callback: (status: UpdateStatus) => void): () => void;
+  /** Runs `save` when the window is about to close or the app to quit, and lets the close
+   * go ahead once it is done (`desktop/save-before-close.ts`). */
+  onSaveNow(save: () => Promise<void>): () => void;
 }
 declare global {
   interface Window {

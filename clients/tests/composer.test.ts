@@ -1875,6 +1875,38 @@ describe("attached files", () => {
     });
   });
 
+  it("saves a file the moment it is uploaded or removed, without typing's delay", async () => {
+    await start();
+    await attach();
+    // Quit at once, well within the 350 ms the drafts wait after typing stops.
+    await restart();
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    await app().click(app().find(".attachment-remove"));
+    expect(chips()).toEqual([]);
+    await restart();
+    expect(chips()).toEqual([]);
+  });
+
+  it("saves what waits for its delay as the app goes away, or the page unloads", async () => {
+    await start();
+    await app().type("quick words");
+    await attach();
+    await app().type(" and a file");
+    // The desktop window closing, or the phone app going to the background.
+    const { saveNow } = await import("../shared/save-now");
+    await app().act(() => saveNow());
+    await restart();
+    expect(app().box().value).toBe("quick words and a file");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    await app().type(", then more");
+    await app().act(async () => {
+      window.dispatchEvent(new FakeEvent("pagehide") as unknown as Event);
+    });
+    await app().settle();
+    await restart();
+    expect(app().box().value).toBe("quick words and a file, then more");
+  });
+
   it("keeps a file attached just before a send the outbox refuses, over a restart", async () => {
     await start();
     app().host.sendMessage = async () => ({ action: "sent" });
@@ -1957,6 +1989,9 @@ describe("attached files", () => {
     await app().type("See attached");
     await attach();
     expect(chips()).toHaveLength(1);
+    // As Settings' reset does: the storage is emptied (the file was saved as it uploaded),
+    // then the app is told.
+    app().host.secure.clear();
     await app().act(async () => {
       window.dispatchEvent(
         new FakeEvent("twr:offline-reset", {

@@ -275,6 +275,11 @@ pub struct ViewState {
     /// The choice of the orchestrator's runtime, while it is pending
     /// ([`AppState::picker_open`]): the first-run one, or `/orch` without arguments.
     pub picker: Option<Picker>,
+    /// What the last model picker opened for ([`PickerFor`]): when that changes underneath
+    /// (another client switches the orchestrator, sets or moves the thread, or deletes it),
+    /// the picker closes and the switch it asked to confirm is cancelled
+    /// ([`AppState::drop_stale_picker`]).
+    pub picker_for: Option<PickerFor>,
     /// The orchestrator the hub would start (`orchestrator.show` `runtime`, `model`), for the
     /// main pane's header before an orchestrator thread exists.
     pub orch_default: Option<(String, Option<String>)>,
@@ -609,6 +614,17 @@ pub struct Picker {
     /// The model step ([`ModelStep`]): after a runtime is chosen, or the whole picker for a
     /// thread's `/model` (then `runtimes` is empty). `None`: the runtimes are shown.
     pub step: Option<ModelStep>,
+}
+
+/// What a model picker opened for ([`ViewState::picker_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickerFor {
+    /// The thread's id; `None`: the orchestrator.
+    pub thread: Option<String>,
+    /// Its name, as the picker opened.
+    pub name: String,
+    /// What it ran then ([`AppState::model_target`]).
+    pub runs: String,
 }
 
 /// A row of a model picker ([`ModelStep`]).
@@ -3687,6 +3703,9 @@ impl AppState {
         {
             self.view.picker = None;
         }
+        if self.catch_up.is_none() {
+            self.drop_stale_picker();
+        }
     }
 
     /// What `t`'s box token says after `@box` ([`BoxStatus::word`]): nothing for a box online
@@ -6114,6 +6133,60 @@ impl AppState {
             switch: true,
             step: None,
         });
+        self.view.picker_for = Some(PickerFor {
+            thread: None,
+            name: "the orchestrator".into(),
+            runs: self.model_target(None),
+        });
+    }
+
+    /// What `thread` (`None`: the current orchestrator) runs, as [`PickerFor::runs`]: its
+    /// id, runtime, account, model and effort; empty when there is no such thread.
+    fn model_target(&self, thread: Option<&str>) -> String {
+        let t = match thread {
+            Some(id) => self.registry.get(id).filter(|t| !t.retired),
+            None => self.orchestrator(),
+        };
+        t.map_or_else(String::new, |t| {
+            [
+                t.id.as_str(),
+                &t.runtime,
+                t.account.as_deref().unwrap_or(""),
+                t.model.as_deref().unwrap_or(""),
+                t.effort.as_deref().unwrap_or(""),
+            ]
+            .join("\0")
+        })
+    }
+
+    /// What the open model picker, or the orchestrator switch it asked to confirm, was for
+    /// changed underneath ([`ViewState::picker_for`]): the picker closes, or the switch is
+    /// cancelled, and the status bar says why. The next choice starts from what runs now.
+    fn drop_stale_picker(&mut self) {
+        let Some(was) = self.view.picker_for.as_ref() else {
+            return;
+        };
+        if self.model_target(was.thread.as_deref()) == was.runs {
+            return;
+        }
+        let was = self.view.picker_for.take().expect("checked above");
+        let gone = was.thread.is_some() && self.model_target(was.thread.as_deref()).is_empty();
+        let what = format!("{} {}", was.name, if gone { "is gone" } else { "changed" });
+        if self.view.picker.as_ref().is_some_and(|p| p.switch) {
+            self.view.picker = None;
+            self.view.status = Some(format!(
+                "{what}: the model picker closed; open it again to pick"
+            ));
+        } else if was.thread.is_none()
+            && self
+                .view
+                .confirm
+                .as_ref()
+                .is_some_and(|c| matches!(c.action, Action::UseOrchestrator { .. }))
+        {
+            self.view.confirm = None;
+            self.view.status = Some(format!("cancelled: {what} before you confirmed"));
+        }
     }
 
     /// The orchestrator's model picker (Alt-M, a tap on the input box's model label, `/model`
@@ -8115,6 +8188,11 @@ impl AppState {
             model: None,
             switch: true,
             step: Some(step),
+        });
+        self.view.picker_for = Some(PickerFor {
+            thread: Some(thread.id.clone()),
+            name: thread.name.clone(),
+            runs: self.model_target(Some(&thread.id)),
         });
     }
 
@@ -16814,6 +16892,78 @@ pub(crate) mod tests {
                 summary: true,
             }]
         );
+    }
+
+    /// A model picker whose thread changes underneath (another client sets its model,
+    /// deletes it, or switches the orchestrator) closes, saying why, and a switch it asked to
+    /// confirm is cancelled: the next choice starts from what runs now.
+    #[test]
+    fn a_model_picker_closes_when_what_it_is_for_changes_underneath() {
+        let mut st = with_orch();
+        st.view.model_choices = catalog();
+        let model = |m: &str| {
+            EventBody::ThreadModelChanged(twr_core::event::ThreadModelChanged {
+                model: Some(m.into()),
+                ..Default::default()
+            })
+        };
+        let alt_m = || mods(KeyCode::Char('m'), KeyModifiers::ALT);
+        let mut a = ThreadScript::new("t-alpha");
+        let mut o = ThreadScript::new("t-orch");
+        type_line(&mut st, "/model alpha");
+        assert!(st.picker_open());
+        // What another thread does leaves it open.
+        control(&mut st, &[ThreadScript::new("t-beta").event(model("m1"))]);
+        assert!(st.picker_open());
+        control(&mut st, &[a.event(model("m2"))]);
+        assert!(!st.picker_open());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("alpha changed: the model picker closed; open it again to pick")
+        );
+        type_line(&mut st, "/model alpha");
+        control(
+            &mut st,
+            &[
+                a.event(EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                    name: "alpha".into(),
+                    ..Default::default()
+                })),
+            ],
+        );
+        assert!(!st.picker_open());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("alpha is gone: the model picker closed; open it again to pick")
+        );
+        // The orchestrator's picker, then the switch it asks to confirm.
+        st.handle_key(alt_m());
+        assert!(st.picker_open());
+        control(&mut st, &[o.event(model("sonnet"))]);
+        assert!(!st.picker_open());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("the orchestrator changed: the model picker closed; open it again to pick")
+        );
+        st.handle_key(alt_m());
+        st.handle_key(key(KeyCode::Enter));
+        st.handle_key(key(KeyCode::Down));
+        st.handle_key(key(KeyCode::Enter));
+        assert!(
+            st.view
+                .confirm
+                .as_ref()
+                .is_some_and(|c| matches!(c.action, Action::UseOrchestrator { .. })),
+            "{:?}",
+            st.view.status
+        );
+        control(&mut st, &[o.event(model("opus"))]);
+        assert!(st.view.confirm.is_none());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("cancelled: the orchestrator changed before you confirmed")
+        );
+        assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
     }
 
     /// `/orch`'s picker asks for the effort after the model, the current one's selected on

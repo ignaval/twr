@@ -28,6 +28,7 @@ import {
   type Pick,
 } from "./modelPick";
 import { Spinner } from "./ui";
+import { announce } from "./a11y";
 import type { Json, Thread } from "./types";
 import "./model-picker.css";
 
@@ -52,6 +53,7 @@ export function ModelPicker({
   operate,
   admin,
   confirm,
+  withdraw,
   fail,
   input,
 }: {
@@ -69,6 +71,9 @@ export function ModelPicker({
    * own runtime still change. */
   admin: boolean;
   confirm: (c: PickerConfirmation) => void;
+  /** Takes back a confirmation `confirm` asked: false when it is no longer asked (it was
+   * answered or cancelled). */
+  withdraw: (c: PickerConfirmation) => boolean;
   fail: (error: unknown) => void;
   /** The message field: Esc gives it the focus back. */
   input: RefObject<HTMLTextAreaElement | null>;
@@ -92,6 +97,29 @@ export function ModelPicker({
   const search = useRef<HTMLInputElement>(null);
   const customField = useRef<HTMLInputElement>(null);
   const id = useId();
+  // What the picker is for: the thread, and what it runs. Its choices and the confirmation
+  // it asks are planned against it, so when it changes underneath (another client switches
+  // the orchestrator, sets or moves the thread, or deletes it) the popup closes and the
+  // confirmation is taken back: the next choice starts from what runs now.
+  const targetKey = target
+    ? JSON.stringify([
+        target.id,
+        target.runtime,
+        target.model || "",
+        target.effort || "",
+        target.account || "",
+      ])
+    : "";
+  const latestKey = useRef(targetKey);
+  latestKey.current = targetKey;
+  const openedOn = useRef(targetKey);
+  const asked = useRef<{ key: string; confirmation: PickerConfirmation }>(
+    undefined,
+  );
+  const targetName = useRef("");
+  if (target)
+    targetName.current =
+      kind === "orchestrator" ? "The orchestrator" : target.name;
   // Every orchestrator change is a switch (`orchestrator.use`), which is admin's.
   const switchBlocked = kind === "orchestrator" && !admin;
   const disabled = !target || !connected || !operate || switchBlocked || busy;
@@ -158,6 +186,7 @@ export function ModelPicker({
         effortRows(catalog, pick.runtime).indexOf(pick.effort ?? null),
       ),
     });
+    openedOn.current = targetKey;
     setOpen(true);
   };
   const close = (refocus = true) => {
@@ -216,10 +245,23 @@ export function ModelPicker({
     document.addEventListener("pointerdown", outside);
     return () => document.removeEventListener("pointerdown", outside);
   }, [open]);
-  // Gone (the destination changed, the hub went away): closed.
+  // Gone (the destination changed, the hub went away): closed. Changed underneath (above):
+  // closed, saying so, and a confirmation it asked taken back.
   useEffect(() => {
-    if (disabled && open) close(false);
-  }, [disabled, target?.id]);
+    const was = targetName.current;
+    const changed = target ? `${was} changed` : `${was} is gone`;
+    const stale = asked.current;
+    if (stale && stale.key !== targetKey) {
+      asked.current = undefined;
+      if (withdraw(stale.confirmation))
+        announce(`${changed}: the change you were confirming was cancelled.`);
+    }
+    if (!open) return;
+    if (openedOn.current !== targetKey) {
+      close(false);
+      announce(`${changed}: the model picker closed. Open it again to pick.`);
+    } else if (disabled) close(false);
+  }, [disabled, targetKey]);
 
   const active =
     nav.column === "rail"
@@ -274,6 +316,28 @@ export function ModelPicker({
       );
       return;
     }
+    // Asked against what runs now: it goes ahead only if that is still so.
+    const key = targetKey;
+    const ask = (c: PickerConfirmation) => {
+      const current = (run: () => void) => () => {
+        if (asked.current?.confirmation === confirmation)
+          asked.current = undefined;
+        if (latestKey.current !== key) {
+          const whose =
+            kind === "orchestrator" ? "The orchestrator" : target.name;
+          fail(new Error(`${whose} changed before you confirmed: pick again`));
+          return;
+        }
+        run();
+      };
+      const confirmation: PickerConfirmation = {
+        ...c,
+        run: current(c.run),
+        ...(c.alt ? { alt: { ...c.alt, run: current(c.alt.run) } } : {}),
+      };
+      asked.current = { key, confirmation };
+      confirm(confirmation);
+    };
     const what = [
       pick.runtime,
       pick.model ? `model ${pick.model}` : "",
@@ -282,7 +346,7 @@ export function ModelPicker({
       .filter(Boolean)
       .join(", ");
     if (plan.kind === "orchestrator") {
-      confirm({
+      ask({
         title: `Switch the orchestrator to ${what}?`,
         detail:
           "This starts a new orchestrator session that begins with a handoff: what the log " +
@@ -299,7 +363,7 @@ export function ModelPicker({
       return;
     }
     if (plan.move) {
-      confirm({
+      ask({
         title: `Move ${target.name} to ${what}?`,
         detail:
           "A conversation cannot move between runtimes: the next message starts a new " +

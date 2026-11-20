@@ -18,6 +18,7 @@ import {
 import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
+import { onSaveNow } from "./save-now";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
@@ -439,12 +440,24 @@ export default function App({
   };
   useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
-  // Saves the drafts on this device 350 ms after the last change to any of them, or to
-  // the uploaded files of any conversation, into the storage epoch of that change.
+  // Saves the drafts on this device 350 ms after the last change to any of them, into the
+  // storage epoch of that change. A change to a conversation's uploaded files (one uploaded,
+  // sent, removed or put back) saves at once, and as the app goes away (`save-now.ts`: the
+  // desktop window closing, the phone app going to the background, the page unloading)
+  // whatever still waits for its delay saves now.
   useEffect(() => {
     if (!journal) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const changed = () => {
+    const stop = () => {
+      clearTimeout(timer);
+      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+    };
+    const save = (epoch: number) =>
+      journal
+        .drafts(drafts.all(), epoch, drafts.spoken(), uploads.committed())
+        .then(() => setOfflineNotice(""))
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    const changed = (delay = 350) => {
       const epoch = journal.epoch;
       const persist = () => {
         if (pendingEnqueue.current) {
@@ -452,31 +465,42 @@ export default function App({
           draftSaveTimer.current = timer;
           return;
         }
-        void journal
-          .drafts(drafts.all(), epoch, drafts.spoken(), uploads.committed())
-          .then(() => setOfflineNotice(""))
-          .catch((error) => setOfflineNotice(errorMessage(error)));
+        void save(epoch);
       };
-      clearTimeout(timer);
-      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
-      timer = setTimeout(persist, 350);
+      stop();
+      timer = setTimeout(persist, delay);
       draftSaveTimer.current = timer;
     };
     changed();
-    const unsubscribe = drafts.subscribe(changed);
+    const unsubscribe = drafts.subscribe(() => changed());
     // Upload progress changes nothing saved: only a file uploaded, sent or removed does.
+    // At once means once what changed it is done (a message put back restores its files,
+    // then its text): a save between the two would write the files without the text.
     let files = JSON.stringify(uploads.committed());
     const stopFiles = uploads.subscribe(() => {
       const now = JSON.stringify(uploads.committed());
       if (now === files) return;
       files = now;
-      changed();
+      changed(0);
     });
+    const saveNow = async () => {
+      stop();
+      // A message on its way into the outbox clears its draft first (up to 1.5 s, inside
+      // the 2 s a closing desktop window waits); one still on its way keeps the drafts
+      // saved before it, never writing back what it took.
+      for (let i = 0; i < 15 && pendingEnqueue.current; i++)
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!pendingEnqueue.current) await save(journal.epoch);
+    };
+    const unregister = onSaveNow(saveNow);
+    const unloading = () => void saveNow();
+    window.addEventListener("pagehide", unloading);
     return () => {
       unsubscribe();
       stopFiles();
-      clearTimeout(timer);
-      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      unregister();
+      window.removeEventListener("pagehide", unloading);
+      stop();
     };
   }, [journal, drafts, uploads]);
   const [sending, setSending] = useState(false);
@@ -3891,6 +3915,11 @@ export default function App({
                       // The local app has no device scopes: it is the user, with all of them.
                       admin={permitted("admin")}
                       confirm={setConfirmation}
+                      withdraw={(asked) => {
+                        if (confirmation !== asked) return false;
+                        setConfirmation(undefined);
+                        return true;
+                      }}
                       fail={fail}
                       input={input}
                     />

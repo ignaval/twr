@@ -244,6 +244,7 @@ describe("the popup, rendered", () => {
   let mount: (props: Json) => Promise<{
     calls: { method: string; params: Json }[];
     confirms: Json[];
+    withdrawn: Json[];
     errors: unknown[];
     root: FakeElement;
     field: FakeElement;
@@ -259,6 +260,7 @@ describe("the popup, rendered", () => {
     mount = async (props) => {
       const calls: { method: string; params: Json }[] = [];
       const confirms: Json[] = [];
+      const withdrawn: Json[] = [];
       const errors: unknown[] = [];
       const container = document.createElement("div");
       document.body.appendChild(container);
@@ -277,6 +279,10 @@ describe("the popup, rendered", () => {
           return {};
         },
         confirm: (c: Json) => confirms.push(c),
+        withdraw: (c: Json) => {
+          withdrawn.push(c);
+          return confirms.at(-1) === c;
+        },
         fail: (e: unknown) => errors.push(e),
         input: { current: field },
         ...props,
@@ -291,6 +297,7 @@ describe("the popup, rendered", () => {
       return {
         calls,
         confirms,
+        withdrawn,
         errors,
         root: container,
         field,
@@ -456,6 +463,110 @@ describe("the popup, rendered", () => {
         params: { runtime: "claude-code", effort: "max", summary: false },
       },
     ]);
+  });
+
+  /** What the screen reader was last told (the announcer speaks after 150 ms). */
+  const spoken = async () => {
+    await new Promise((r) => setTimeout(r, 200));
+    return document.querySelector("[data-twr-live=polite]")?.textContent ?? "";
+  };
+  const codexOrchestrator = thread({
+    id: "o1",
+    name: "orchestrator",
+    runtime: "codex",
+    is_orchestrator: true,
+  });
+  const claudeOrchestrator = thread({
+    id: "o2",
+    name: "orchestrator",
+    runtime: "claude-code",
+    is_orchestrator: true,
+  });
+
+  it("closes, saying why, when another client switches the orchestrator underneath it", async () => {
+    const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    expect(q(m.root, "[role=dialog]")).not.toBeNull();
+    await m.rerender({ target: claudeOrchestrator, kind: "orchestrator" });
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(await spoken()).toBe(
+      "The orchestrator changed: the model picker closed. Open it again to pick.",
+    );
+    // Opened again, it starts from what runs now.
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    expect(
+      q(m.root, ".model-picker-models [role=listbox]")!.getAttribute(
+        "aria-label",
+      ),
+    ).toBe("Models for claude-code");
+    expect(m.calls).toEqual([]);
+  });
+
+  it("closes when the thread's model changes elsewhere, or the thread is deleted", async () => {
+    const m = await mount({ target: thread({ model: "opus" }) });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.rerender({ target: thread({ model: "sonnet" }) });
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(await spoken()).toBe(
+      "api changed: the model picker closed. Open it again to pick.",
+    );
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.rerender({ target: undefined });
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(await spoken()).toBe(
+      "api is gone: the model picker closed. Open it again to pick.",
+    );
+    // Progress the runtime reports (not what was asked) leaves an open popup as it is.
+    await m.rerender({ target: thread({ model: "sonnet" }) });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.rerender({
+      target: thread({ model: "sonnet", model_actual: "sonnet-4" }),
+    });
+    expect(q(m.root, "[role=dialog]")).not.toBeNull();
+  });
+
+  it("takes back a switch it asked to confirm when the orchestrator changes first", async () => {
+    const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    // Codex's default model, effort low: a switch, asked to confirm.
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    expect(m.confirms).toHaveLength(1);
+    const stale = m.confirms[0];
+    await m.rerender({ target: claudeOrchestrator, kind: "orchestrator" });
+    expect(m.withdrawn).toEqual([stale]);
+    expect(await spoken()).toBe(
+      "The orchestrator changed: the change you were confirming was cancelled.",
+    );
+    // A confirmation answered anyway (it was on screen as it changed) does nothing.
+    await m.act(() => stale.run());
+    await m.act(() => stale.alt.run());
+    expect(m.calls).toEqual([]);
+    expect(String(m.errors.at(-1))).toContain(
+      "The orchestrator changed before you confirmed: pick again",
+    );
+  });
+
+  it("still switches once confirmed while nothing changed, and takes back nothing after", async () => {
+    const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => m.confirms[0].run());
+    expect(m.calls).toEqual([
+      {
+        method: "orchestrator.use",
+        params: { runtime: "codex", effort: "low", summary: true },
+      },
+    ]);
+    // The switch it made gives the orchestrator a new thread: nothing to take back.
+    await m.rerender({
+      target: { ...codexOrchestrator, id: "o3", effort: "low" },
+      kind: "orchestrator",
+    });
+    expect(m.withdrawn).toEqual([]);
   });
 
   it("shows a refusal through the app's error path", async () => {
