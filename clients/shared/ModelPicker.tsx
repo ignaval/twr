@@ -50,6 +50,7 @@ export function ModelPicker({
   rpc,
   connected,
   operate,
+  admin,
   confirm,
   fail,
   input,
@@ -63,6 +64,10 @@ export function ModelPicker({
   connected: boolean;
   /** This device may change threads (its `operate` scope). */
   operate: boolean;
+  /** This device may switch the orchestrator and move a thread to another runtime (its
+   * `admin` scope; the local app always may). Without it a worker's model and effort on its
+   * own runtime still change. */
+  admin: boolean;
   confirm: (c: PickerConfirmation) => void;
   fail: (error: unknown) => void;
   /** The message field: Esc gives it the focus back. */
@@ -74,6 +79,9 @@ export function ModelPicker({
   const [runtime, setRuntime] = useState("");
   const [pending, setPending] = useState<Pick>({ runtime: "" });
   const [custom, setCustom] = useState<string | null>(null);
+  // Why the last choice was refused (a runtime this device may not move to, an empty custom
+  // id), shown in the models column until the next choice.
+  const [notice, setNotice] = useState("");
   const [nav, setNav] = useState<Nav>({
     column: "models",
     rail: 0,
@@ -84,14 +92,18 @@ export function ModelPicker({
   const search = useRef<HTMLInputElement>(null);
   const customField = useRef<HTMLInputElement>(null);
   const id = useId();
-  const disabled = !target || !connected || !operate || busy;
+  // Every orchestrator change is a switch (`orchestrator.use`), which is admin's.
+  const switchBlocked = kind === "orchestrator" && !admin;
+  const disabled = !target || !connected || !operate || switchBlocked || busy;
   const reason = !connected
     ? "Disconnected"
     : !operate
       ? "This device may not change models"
-      : busy
-        ? "Changing the model…"
-        : undefined;
+      : switchBlocked
+        ? "Switching the orchestrator needs a device with admin access"
+        : busy
+          ? "Changing the model…"
+          : undefined;
 
   const now = target ? currentPick(target) : { runtime: "" };
   const runtimes = pickerRuntimes(catalog, target?.runtime);
@@ -103,6 +115,17 @@ export function ModelPicker({
   );
   const efforts = effortRows(catalog, runtime);
   const locked = runsCommandLine(runtime);
+  /** Another runtime than the thread's: a move, which this device may not make. */
+  const blocked = (r: string) => !admin && r !== now.runtime;
+  // A picked model the list doesn't have (a custom id): the custom row shows it, chosen.
+  const customPicked =
+    !!pending.model &&
+    !modelRows(
+      catalog,
+      runtime,
+      "",
+      runtime === now.runtime ? target?.model : undefined,
+    ).some((r) => r.kind === "model" && r.value === pending.model);
 
   const optionId = (column: string, i: number) => `${id}-${column}-${i}`;
   const focusOption = (option?: string) => {
@@ -125,6 +148,7 @@ export function ModelPicker({
     setRuntime(pick.runtime);
     setQuery("");
     setCustom(null);
+    setNotice("");
     setNav({
       column: runsCommandLine(pick.runtime) ? "rail" : "models",
       rail: Math.max(0, runtimes.indexOf(pick.runtime)),
@@ -244,6 +268,12 @@ export function ModelPicker({
     close();
     const plan = planChange(kind, target, pick);
     if (plan.kind === "none") return;
+    if (!admin && (plan.kind === "orchestrator" || plan.move)) {
+      fail(
+        new Error(`${needsAdmin(plan.kind)} needs a device with admin access`),
+      );
+      return;
+    }
     const what = [
       pick.runtime,
       pick.model ? `model ${pick.model}` : "",
@@ -281,10 +311,21 @@ export function ModelPicker({
     }
     void call("thread.set_model", plan.params);
   };
+  const needsAdmin = (what: "orchestrator" | "thread") =>
+    what === "orchestrator"
+      ? "Switching the orchestrator"
+      : `Moving ${target.name} to another runtime`;
   const chooseRuntime = (r: string) => {
+    if (blocked(r)) {
+      setNotice(
+        `Moving ${target.name} to ${r} needs a device with admin access.`,
+      );
+      return;
+    }
     setRuntime(r);
     setQuery("");
     setCustom(null);
+    setNotice("");
     // Another runtime starts from its own defaults; the current one from what runs now.
     const pick: Pick = r === now.runtime ? { ...now } : { runtime: r };
     setPending(pick);
@@ -311,6 +352,7 @@ export function ModelPicker({
     const pick = { ...pending, runtime, model };
     setPending(pick);
     setCustom(null);
+    setNotice("");
     // No efforts to pick (a runtime the catalog doesn't list, an older hub): chosen, the
     // effort as it is.
     if (efforts.length <= 1) {
@@ -325,15 +367,39 @@ export function ModelPicker({
     if (!mobile()) search.current?.focus();
   };
   const chooseRow = (row: ModelRow) => {
-    if (row.kind === "custom") setCustom(query.trim());
-    else chooseModel(row.kind === "model" ? row.value : undefined);
+    if (row.kind === "custom") {
+      setNotice("");
+      setCustom(query.trim() || (customPicked ? pending.model! : ""));
+    } else chooseModel(row.kind === "model" ? row.value : undefined);
   };
-  const chooseEffort = (effort: string | null) =>
-    apply({ ...pending, runtime, effort: effort ?? undefined });
-  const done = () =>
-    apply(
-      locked ? { runtime } : { ...pending, runtime, effort: pending.effort },
-    );
+  /** The custom id typed, or `undefined` (with the reason shown) while it is empty. */
+  const typedId = () => {
+    const model = (custom ?? "").trim();
+    if (model) return model;
+    setNotice("Type a model id first, or pick a model from the list.");
+    customField.current?.focus();
+    return undefined;
+  };
+  const commitCustom = () => {
+    const model = typedId();
+    if (model) chooseModel(model);
+  };
+  /** What is picked so far, the custom id typed included (it is chosen with an effort or
+   * Done, as with Enter), or `undefined` while that id is empty. */
+  const picked = (): Pick | undefined => {
+    if (custom === null) return { ...pending, runtime };
+    const model = typedId();
+    return model ? { ...pending, runtime, model } : undefined;
+  };
+  const chooseEffort = (effort: string | null) => {
+    const pick = picked();
+    if (pick) apply({ ...pick, effort: effort ?? undefined });
+  };
+  const done = () => {
+    if (locked) return apply({ runtime });
+    const pick = picked();
+    if (pick) apply(pick);
+  };
 
   const keyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     const field = event.currentTarget as HTMLInputElement;
@@ -424,10 +490,17 @@ export function ModelPicker({
                 id={optionId("rail", i)}
                 tabIndex={-1}
                 aria-selected={r === runtime}
+                aria-disabled={blocked(r) || undefined}
                 className={
                   nav.column === "rail" && nav.rail === i ? "active" : ""
                 }
-                title={r === now.runtime ? `${r} (current)` : r}
+                title={
+                  r === now.runtime
+                    ? `${r} (current)`
+                    : blocked(r)
+                      ? `${r}: moving to it needs a device with admin access`
+                      : r
+                }
                 onClick={() => chooseRuntime(r)}
               >
                 <span className="model-picker-mark" aria-hidden="true">
@@ -461,10 +534,16 @@ export function ModelPicker({
               }}
               onKeyDown={keyDown}
             />
+            <p className="model-picker-notice" role="status">
+              {notice}
+            </p>
             {locked ? (
               <p className="model-picker-note" id={`${id}-models`}>
                 {target.name} runs its own command line: it has no model or
-                effort. Pick another runtime to move it to an agent.
+                effort.{" "}
+                {admin
+                  ? "Pick another runtime to move it to an agent."
+                  : "Moving it to another runtime needs a device with admin access."}
               </p>
             ) : (
               <div
@@ -477,26 +556,36 @@ export function ModelPicker({
                     <div className="model-picker-custom" key="custom">
                       <input
                         ref={customField}
+                        type="text"
                         aria-label="Custom model id"
                         placeholder="Model id"
                         autoComplete="off"
                         spellCheck={false}
                         value={custom}
                         onChange={(event) => setCustom(event.target.value)}
+                        enterKeyHint="done"
                         onKeyDown={(event) => {
                           if (event.key === "Enter") {
                             event.preventDefault();
                             event.stopPropagation();
-                            if (custom.trim()) chooseModel(custom.trim());
+                            commitCustom();
                           }
                           if (event.key === "Escape") {
                             event.preventDefault();
                             event.stopPropagation();
                             setCustom(null);
+                            setNotice("");
                             search.current?.focus();
                           }
                         }}
                       />
+                      <button
+                        type="button"
+                        aria-label="Use this model id"
+                        onClick={commitCustom}
+                      >
+                        Use
+                      </button>
                     </div>
                   ) : (
                     <button
@@ -510,7 +599,7 @@ export function ModelPicker({
                           ? pending.model === row.value
                           : row.kind === "default"
                             ? !pending.model
-                            : false
+                            : customPicked
                       }
                       className={
                         nav.column === "models" && nav.model === i
@@ -535,7 +624,9 @@ export function ModelPicker({
                           ? "the runtime's own"
                           : row.kind === "model"
                             ? row.description
-                            : ""}
+                            : customPicked
+                              ? pending.model
+                              : ""}
                       </span>
                       {runtime === now.runtime &&
                         (row.kind === "model"

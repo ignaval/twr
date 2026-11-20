@@ -171,8 +171,33 @@
   position: relative;
   padding-right: 26px;
 }
+.model-picker-custom {
+  display: flex;
+  gap: 6px;
+}
 .model-picker-custom > input {
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.model-picker-popup .model-picker-custom > button {
+  flex: 0 0 auto;
+  width: auto;
+  justify-content: center;
+  border: 1px solid var(--border);
+}
+/* A runtime this device may not move the thread to (it needs admin): listed, not chosen. */
+.model-picker-popup button[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+/* Why the last choice was refused; empty (and taking no room) otherwise. */
+.model-picker-notice {
+  margin: 0 8px;
+  color: var(--text);
+  font-size: 0.846154rem;
+}
+.model-picker-notice:not(:empty) {
+  margin-bottom: 4px;
 }
 .model-picker-efforts {
   border-left: 1px solid var(--border);

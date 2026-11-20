@@ -238,14 +238,17 @@ message box:
   first.
 - In the middle, **Search models…**, then the highlighted runtime's models with a few words
   on each, the current one checked: **Default** (the runtime's own), the models twr knows,
-  and **Custom model id…**, where you type an id and press Enter.
+  and **Custom model id…**, where you type an id and press Enter or **Use**. The row then
+  shows the id, chosen, and opens again with it.
 - On the right, **Effort** with the model it is for, and a row for each effort the runtime
   takes, after **Default**.
 
 The focus starts in the search. ↑ and ↓ move, Enter picks a model, and the highlight moves
 on to the efforts with the popup still open; Enter or a click on an effort applies both at
 once. ← and → move between the columns, ← from an empty search to the runtimes. **Done**
-applies what is picked so far. A long list scrolls to keep the highlighted row in view, in
+applies what is picked so far, an id typed in the custom field included, as an effort picked
+while the field is open does; with the field empty, the picker stays open and asks you to type
+an id or pick a model. A long list scrolls to keep the highlighted row in view, in
 every column. Esc or **Cancel** closes the picker with nothing changed and
 puts the focus back in the message box; so does a click outside, leaving the focus where you
 clicked. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. On a
@@ -265,7 +268,12 @@ summary, **Switch without summary** hands over only what the log shows
 
 While the change is under way the button shows a spinner; a refusal from the hub shows as
 any other error. The button is disabled while the hub is disconnected and on a device
-without the `operate` scope, and hidden while the conversation has no destination. A change
+without the `operate` scope, and hidden while the conversation has no destination. Switching
+the orchestrator and moving a thread to another runtime need the `admin` scope, so on a paired
+device without it the orchestrator's button is disabled, its tooltip saying why, and a
+thread's picker lists the other runtimes greyed out: picking one says it needs a device with
+admin access, while the thread's own runtime's models and efforts still change. The desktop
+app on its own hub has every scope. A change
 made elsewhere (by the orchestrator, `twr model`, the TUI) shows as soon as the thread list
 updates. The command palette's **Change model, runtime or account** and **Switch
 orchestrator** forms still work, and are where accounts are chosen; **Switch orchestrator**

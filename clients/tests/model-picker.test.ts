@@ -270,6 +270,7 @@ describe("the popup, rendered", () => {
         catalog,
         connected: true,
         operate: true,
+        admin: true,
         rpc: async (method: string, params: Json) => {
           calls.push({ method, params });
           if (props.refuse) throw new Error("refused");
@@ -465,6 +466,186 @@ describe("the popup, rendered", () => {
     await m.act(() => void press(search(m.root) as any, "Enter"));
     expect(m.calls).toHaveLength(1);
     expect(String(m.errors[0])).toContain("refused");
+  });
+
+  const option = (root: FakeElement, column: string, text: string) =>
+    root
+      .querySelectorAll(`${column} [role=option], ${column} [role=radio]`)
+      .find((n: FakeElement) => n.textContent.startsWith(text))!;
+  const customField = (root: FakeElement) =>
+    q(root, ".model-picker-custom input") as unknown as FakeInput;
+  const done = (root: FakeElement) =>
+    q(root, ".model-picker-efforts footer .primary")!;
+  const notice = (root: FakeElement) =>
+    q(root, ".model-picker-notice")!.textContent;
+
+  it("on a device without admin, changes a thread's model on its runtime but offers no move", async () => {
+    const m = await mount({ target: thread({ model: "opus" }), admin: false });
+    const trigger = q(m.root, ".model-picker-trigger")!;
+    expect(trigger.getAttribute("disabled")).toBeNull();
+    await m.act(() => click(trigger));
+    // The other runtimes are listed, disabled, with the reason.
+    const codex = option(m.root, ".model-picker-rail", "Cxcodex");
+    expect(codex.getAttribute("aria-disabled")).toBe("true");
+    expect(codex.getAttribute("title")).toContain(
+      "needs a device with admin access",
+    );
+    const own = option(m.root, ".model-picker-rail", "Clclaude-code");
+    expect(own.getAttribute("aria-disabled")).toBeNull();
+    // A click, or Enter on it, is refused with the reason; the models stay the thread's.
+    await m.act(() => click(codex));
+    expect(notice(m.root)).toBe(
+      "Moving api to codex needs a device with admin access.",
+    );
+    await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    const models = () =>
+      q(m.root, ".model-picker-models [role=listbox]")!.getAttribute(
+        "aria-label",
+      );
+    expect(models()).toBe("Models for claude-code");
+    expect(m.confirms).toEqual([]);
+    // Its own runtime's models and efforts still change.
+    // → to the models, on opus; ↓ to sonnet.
+    await m.act(() => void press(search(m.root) as any, "ArrowRight"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    expect(notice(m.root)).toBe("");
+    await m.act(() => click(option(m.root, ".model-picker-efforts", "Low")));
+    expect(m.calls).toEqual([
+      {
+        method: "thread.set_model",
+        params: { thread: "t1", model: "sonnet", effort: "low" },
+      },
+    ]);
+    expect(m.errors).toEqual([]);
+  });
+
+  it("on a device without admin, a pty thread says why it can't move", async () => {
+    const m = await mount({
+      target: thread({ runtime: "pty", name: "sh" }),
+      admin: false,
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    expect(q(m.root, ".model-picker-note")!.textContent).toContain(
+      "Moving it to another runtime needs a device with admin access",
+    );
+    const focused = () => document.activeElement as FakeElement;
+    await m.act(() => void press(focused(), "ArrowDown"));
+    await m.act(() => void press(focused(), "Enter"));
+    expect(search(m.root).getAttribute("disabled")).not.toBeNull();
+    expect(notice(m.root)).toContain("needs a device with admin access");
+    await m.act(() => click(done(m.root)));
+    expect(m.calls).toEqual([]);
+    expect(m.confirms).toEqual([]);
+  });
+
+  it("on a device without admin, the orchestrator's picker is disabled with the reason", async () => {
+    const orch = thread({
+      id: "o",
+      name: "orchestrator",
+      is_orchestrator: true,
+    });
+    const m = await mount({ target: orch, kind: "orchestrator", admin: false });
+    const trigger = q(m.root, ".model-picker-trigger")!;
+    expect(trigger.getAttribute("disabled")).not.toBeNull();
+    expect(trigger.getAttribute("title")).toContain(
+      "Switching the orchestrator needs a device with admin access",
+    );
+    await m.act(() => {
+      window.dispatchEvent(
+        new FakeEvent("keydown", {
+          key: "M",
+          ctrlKey: true,
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }) as unknown as Event,
+      );
+    });
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    // With admin (the local app has every scope), it opens.
+    await m.rerender({ admin: true });
+    expect(trigger.getAttribute("disabled")).toBeNull();
+  });
+
+  it("applies a typed custom model id with Done, and refuses an empty one", async () => {
+    const m = await mount({
+      target: thread({ model: "opus", effort: "high" }),
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() =>
+      click(option(m.root, ".model-picker-models", "Custom model id")),
+    );
+    // Done with the field empty: refused, the popup open, the reason shown.
+    await m.act(() => click(done(m.root)));
+    expect(q(m.root, "[role=dialog]")).not.toBeNull();
+    expect(notice(m.root)).toBe(
+      "Type a model id first, or pick a model from the list.",
+    );
+    expect(document.activeElement === (customField(m.root) as any)).toBe(true);
+    await m.act(() => typeInto(customField(m.root), "opus-next"));
+    await m.act(() => click(done(m.root)));
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(m.calls).toEqual([
+      {
+        method: "thread.set_model",
+        params: { thread: "t1", model: "opus-next" },
+      },
+    ]);
+  });
+
+  it("applies a typed custom id with the effort picked, on another runtime too", async () => {
+    const m = await mount({ target: thread({ model: "opus" }) });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => click(option(m.root, ".model-picker-rail", "Cxcodex")));
+    await m.act(() =>
+      click(option(m.root, ".model-picker-models", "Custom model id")),
+    );
+    await m.act(() => typeInto(customField(m.root), "o9"));
+    await m.act(() => click(option(m.root, ".model-picker-efforts", "High")));
+    expect(m.confirms).toHaveLength(1);
+    expect(m.confirms[0].title).toBe(
+      "Move api to codex, model o9, effort High?",
+    );
+    await m.act(() => m.confirms[0].run());
+    expect(m.calls).toEqual([
+      {
+        method: "thread.set_model",
+        params: { thread: "t1", runtime: "codex", model: "o9", effort: "high" },
+      },
+    ]);
+  });
+
+  it("commits a custom id with its Use button, and shows it as the model chosen", async () => {
+    const m = await mount({ target: thread({}) });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() =>
+      click(option(m.root, ".model-picker-models", "Custom model id")),
+    );
+    const use = q(m.root, ".model-picker-custom button")!;
+    expect(use.textContent).toBe("Use");
+    await m.act(() => click(use));
+    expect(notice(m.root)).toContain("Type a model id first");
+    await m.act(() => typeInto(customField(m.root), "mine"));
+    await m.act(() => click(q(m.root, ".model-picker-custom button")!));
+    // The field closes; its row shows the id, chosen, and the efforts are for it.
+    expect(customField(m.root)).toBeNull();
+    const row = option(m.root, ".model-picker-models", "Custom model id");
+    expect(row.getAttribute("aria-selected")).toBe("true");
+    expect(row.textContent).toContain("mine");
+    expect(q(m.root, ".model-picker-efforts header")!.textContent).toContain(
+      "mine",
+    );
+    expect(m.calls).toEqual([]);
+    // Opened again, the field holds it.
+    await m.act(() => click(row));
+    expect(customField(m.root).value).toBe("mine");
+    await m.act(() => click(done(m.root)));
+    expect(m.calls).toEqual([
+      { method: "thread.set_model", params: { thread: "t1", model: "mine" } },
+    ]);
   });
 
   it("opens with Ctrl+Shift+M; a pty thread picks only another runtime", async () => {

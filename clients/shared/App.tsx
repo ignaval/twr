@@ -3870,6 +3870,8 @@ export default function App({
                       rpc={rpc}
                       connected={connected}
                       operate={permitted("operate")}
+                      // The local app has no device scopes: it is the user, with all of them.
+                      admin={permitted("admin")}
                       confirm={setConfirmation}
                       fail={fail}
                       input={input}
