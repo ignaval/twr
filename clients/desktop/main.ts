@@ -52,6 +52,7 @@ import { parseLoginEnvironment, runLoginShell } from "./login-env";
 import { discoverCatalog } from "./catalog";
 import { AppServices } from "./app-services";
 import { DesktopVoice } from "./voice";
+import { DesktopVoices } from "./voices";
 import { RendererRecovery } from "./crash-recovery";
 import { testAutomation } from "./automation";
 import { contextMenuTemplate } from "./context-menu";
@@ -110,6 +111,7 @@ let remoteTransport: DesktopTransport;
 let services: AppServices | undefined;
 let hubVersion: string | undefined;
 let voice: DesktopVoice | undefined;
+let voices: DesktopVoices | undefined;
 // The microphone is granted only after the user turned voice mode on (`voice-arm`), and only
 // for audio, to the app's own page.
 let microphoneArmed = false;
@@ -652,6 +654,35 @@ function register() {
     voice!.transcribe(recording, hint),
   );
   handleWithEnvironment("voice-speaker", (op) => voice!.speakerControl(op));
+  // Settings › Read-aloud voice (desktop/voices.ts): the config edit goes through the
+  // companion's locked, hash-checked save, like Settings › Configuration.
+  voices = new DesktopVoices(
+    () => binaries.twr,
+    env,
+    () => ({
+      read: () => companion().call("desktop.config.read"),
+      save: async (content, hash) => {
+        await companion().call("desktop.config.save", { content, hash });
+      },
+    }),
+    emit,
+  );
+  handleWithEnvironment("voices-list", () => voices!.list());
+  handleWithEnvironment("voices-install", (model) => voices!.install(model));
+  handleWithEnvironment("voices-select", (lang, voice) =>
+    voices!.select(lang, voice),
+  );
+  handleWithEnvironment("voices-preview", (voice, lang) =>
+    voices!.preview(voice, lang),
+  );
+  handle("voices-preview-stop", () => voices?.stopPreview());
+  handle("voices-system", () => {
+    // macOS's Spoken Content settings, where its Premium and Enhanced voices download.
+    if (process.platform !== "darwin") throw new Error("Only on macOS");
+    return shell.openExternal(
+      "x-apple.systempreferences:com.apple.Accessibility-Settings.extension?SpokenContent",
+    );
+  });
   let catalog: ReturnType<typeof discoverCatalog> | undefined;
   handleWithEnvironment(
     "catalog",
@@ -1463,5 +1494,6 @@ else {
   app.on("before-quit", () => {
     quitRequested = true;
     voice?.dispose();
+    voices?.dispose();
   });
 }

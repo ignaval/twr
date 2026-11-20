@@ -128,6 +128,9 @@ impl OwnSpeaker {
             let opts = SpeakerOpts {
                 tty_keys_once_attached: false,
                 observe: None,
+                // A voice chosen meanwhile (the desktop app's settings, an edit of
+                // `[speech]`) is heard from the next sentence on.
+                voices_source: Some(twr_speech::config_voices(root.config_file.clone())),
                 name: speaker_name(&crate::speech::host()),
                 config,
                 voice: None,

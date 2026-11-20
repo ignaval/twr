@@ -795,6 +795,8 @@ pub async fn speak(args: Speak, paths: &Paths) -> anyhow::Result<()> {
         report: Some(report),
         tty_keys_once_attached: tty,
         observe: args.control_stdio.then(stdio_observer),
+        // A voice chosen in the desktop app's settings is heard at once.
+        voices_source: Some(twr_speech::config_voices(root.config_file.clone())),
     };
     // The device id this speaker speaks as, shared by every speaker of this machine (the
     // TUI's own too): a driver aims `speech.control` at it when this one stands by.

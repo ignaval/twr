@@ -9,6 +9,10 @@
 //! - `remove MODEL`.
 //! - `try VOICE [TEXT]`: says a sentence with a voice, as a speaker would; `--out FILE` writes
 //!   a WAV file instead (twr's voices).
+//! - `render`: makes speech with twr's voices for another program, which plays it elsewhere
+//!   (the mobile gateway, for a phone that reads aloud with one of them): requests as JSON
+//!   lines on stdin, each sentence's audio as a JSON line on stdout ([`render`]). Nothing
+//!   plays here.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -47,6 +51,10 @@ pub enum VoicesCmd {
         /// The model.
         model: String,
     },
+    /// Make speech with twr's voices for another program (the mobile gateway): requests as
+    /// JSON lines on stdin, audio as JSON lines on stdout. Nothing plays here.
+    #[command(hide = true)]
+    Render,
     /// Say a sentence with a voice, as a speaker would (`kokoro/af_heart`, `Ava (Premium)`).
     Try {
         /// The voice.
@@ -368,7 +376,19 @@ pub async fn run(cmd: VoicesCmd, paths: &Paths) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
         #[cfg(not(feature = "neural"))]
-        VoicesCmd::Install { .. } | VoicesCmd::Remove { .. } => bail!(NO_NEURAL),
+        VoicesCmd::Install { .. } | VoicesCmd::Remove { .. } | VoicesCmd::Render => {
+            bail!(NO_NEURAL)
+        }
+        #[cfg(feature = "neural")]
+        VoicesCmd::Render => {
+            let espeak = twr_neural::phonemes::find_espeak(&config.speech.espeak, path.as_deref());
+            render(
+                twr_neural::synth::Synth::start(data_dir.clone(), espeak),
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+            )
+            .await?;
+        }
         VoicesCmd::Try { voice, text, out } => {
             let text = text.unwrap_or_else(|| sample_text(&voice).to_string());
             match out {
@@ -493,6 +513,152 @@ fn write_sample(
         took.as_secs_f32(),
         out.display()
     );
+    Ok(())
+}
+
+/// The sample rate of [`render`]'s audio, whatever the model's: 24 kHz mono 16-bit is 48 KB
+/// a second, and enough for speech.
+#[cfg(feature = "neural")]
+pub const RENDER_RATE: u32 = 24_000;
+
+/// The longest request line [`render`] takes, and the longest text in one.
+#[cfg(feature = "neural")]
+const RENDER_LINE_MAX: usize = 64 * 1024;
+#[cfg(feature = "neural")]
+const RENDER_TEXT_MAX: usize = 4096;
+
+/// A request to [`render`].
+#[cfg(feature = "neural")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderRequest {
+    id: u64,
+    #[serde(default)]
+    voice: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    lang: Option<String>,
+    /// Words per minute; 0: the model's own speed.
+    #[serde(default)]
+    rate: u32,
+    /// Stop making request `id`: nothing more comes for it.
+    #[serde(default)]
+    cancel: bool,
+}
+
+/// The speed a model speaks at for `rate` words per minute (0: its own), as a speaker's.
+#[cfg(feature = "neural")]
+fn render_speed(rate: u32) -> f32 {
+    if rate == 0 {
+        1.0
+    } else {
+        (rate as f32 / twr_core::speech::DEFAULT_WPM as f32).clamp(0.5, 2.0)
+    }
+}
+
+/// `twr voices render`: each request line `{"id":N,"voice":"kokoro/af_heart","text":"...",
+/// "lang":"en","rate":0}` is made a sentence at a time, each sentence one line
+/// `{"id":N,"seq":K,"rate":24000,"pcm":"<base64 of 16-bit little-endian mono>"}`, then
+/// `{"id":N,"done":true}` (or `{"id":N,"error":"..."}`). `{"id":N,"cancel":true}` stops one.
+/// Requests are made in the order they come (one model thread); it ends with its stdin.
+#[cfg(feature = "neural")]
+pub async fn render(
+    synth: twr_neural::synth::Synth,
+    input: impl tokio::io::AsyncRead + Unpin,
+    output: impl tokio::io::AsyncWrite + Unpin + Send + 'static,
+) -> anyhow::Result<()> {
+    use base64::Engine as _;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let writer = tokio::spawn(async move {
+        let mut output = output;
+        while let Some(line) = rx.recv().await {
+            let mut text = line.to_string();
+            text.push('\n');
+            if output.write_all(text.as_bytes()).await.is_err() || output.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut running: std::collections::HashMap<u64, tokio::task::AbortHandle> =
+        std::collections::HashMap::new();
+    let mut lines = tokio::io::BufReader::new(input).lines();
+    while let Some(line) = lines.next_line().await? {
+        running.retain(|_, task| !task.is_finished());
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.len() > RENDER_LINE_MAX {
+            let _ = tx.send(json!({"error": "request too long"}));
+            continue;
+        }
+        let req: RenderRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(json!({"error": format!("bad request: {e}")}));
+                continue;
+            }
+        };
+        if req.cancel {
+            if let Some(task) = running.remove(&req.id) {
+                task.abort();
+            }
+            continue;
+        }
+        let id = req.id;
+        let Some((model, voice)) = twr_neural::voice(&req.voice) else {
+            let _ = tx.send(json!({"id": id, "error": format!("voice {:?}: no such voice of twr's", req.voice)}));
+            continue;
+        };
+        if req.text.trim().is_empty() || req.text.chars().count() > RENDER_TEXT_MAX {
+            let _ = tx.send(json!({"id": id, "error": "nothing to say, or too much"}));
+            continue;
+        }
+        let mut speech = synth.say(twr_neural::synth::Say {
+            model,
+            voice,
+            lang: req
+                .lang
+                .filter(|l| twr_core::speech::LANGUAGES.contains(&l.as_str())),
+            text: req.text,
+            speed: render_speed(req.rate),
+        });
+        let tx = tx.clone();
+        let task = tokio::spawn(async move {
+            let mut seq = 0u64;
+            while let Some(clip) = speech.clips.recv().await {
+                match clip {
+                    Ok(clip) => {
+                        let samples = twr_neural::audio::resample(
+                            &clip.samples,
+                            clip.sample_rate,
+                            RENDER_RATE,
+                        );
+                        let mut pcm = Vec::with_capacity(samples.len() * 2);
+                        for s in samples {
+                            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                            pcm.extend_from_slice(&v.to_le_bytes());
+                        }
+                        let pcm = base64::engine::general_purpose::STANDARD.encode(pcm);
+                        let _ =
+                            tx.send(json!({"id": id, "seq": seq, "rate": RENDER_RATE, "pcm": pcm}));
+                        seq += 1;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(json!({"id": id, "error": format!("{e:#}")}));
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(json!({"id": id, "done": true}));
+        });
+        running.insert(id, task.abort_handle());
+    }
+    // Stdin closed: what is still being made is finished and written, then it ends.
+    drop(tx);
+    let _ = writer.await;
     Ok(())
 }
 
@@ -744,6 +910,58 @@ not a voice line
         let mut c = ArchiveCheck::new(spec);
         c.got = spec.bytes;
         assert!(c.update(&[0]).is_err());
+    }
+
+    /// What `render` answers without a model: an error per request, by its id, and nothing
+    /// for a request it can't read but a line saying so.
+    #[cfg(feature = "neural")]
+    #[tokio::test]
+    async fn render_answers_each_request_by_its_id() {
+        use tokio::io::AsyncWriteExt;
+        let dir = tempfile::tempdir().unwrap();
+        let synth = twr_neural::synth::Synth::start(dir.path().to_path_buf(), None);
+        let (mut input, stdin) = tokio::io::duplex(64 * 1024);
+        let (stdout, mut output) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(render(synth, stdin, stdout));
+        input
+            .write_all(
+                b"{\"id\":1,\"voice\":\"nope/x\",\"text\":\"Hi.\"}\n\
+                  not json\n\
+                  {\"id\":2,\"voice\":\"supertonic/F1\",\"text\":\"  \"}\n\
+                  {\"id\":3,\"voice\":\"supertonic/F1\",\"text\":\"Hello.\",\"lang\":\"en\"}\n\
+                  {\"id\":4,\"cancel\":true}\n",
+            )
+            .await
+            .unwrap();
+        drop(input);
+        task.await.unwrap().unwrap();
+        let mut text = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut output, &mut text)
+            .await
+            .unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let by = |id: u64| lines.iter().find(|l| l["id"] == id).cloned();
+        assert!(by(1).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("no such voice"));
+        assert!(lines
+            .iter()
+            .any(|l| l["id"].is_null() && l["error"].as_str().unwrap().starts_with("bad request")));
+        assert!(by(2).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("nothing to say"));
+        // Not installed here: said by its id, never as audio.
+        assert!(by(3).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .contains("not installed"));
+        assert!(by(4).is_none(), "a cancel answers nothing");
+        assert!(lines.iter().all(|l| l.get("pcm").is_none()));
     }
 
     #[test]
