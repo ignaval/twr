@@ -9,6 +9,8 @@
 //!   [`engine::from_config`] picks the one `[speech] engine` names (`auto`: `say` on macOS,
 //!   `spd-say` on Linux), [`engine::engine_available`] says whether there is one, and
 //!   [`engine::FakeEngine`] makes none (tests).
+//! - [`neural`]: twr's own voices (`<model>/<voice>`, `twr_neural`) and the `auto` engine
+//!   that sends each chunk to them or to the system's engine by its voice.
 //! - [`player`]: the queue and what is being said ([`player::Machine`], pure), and the driver
 //!   that makes an engine say it ([`player::Player`]).
 //! - [`state`]: what the device keeps (`speech-state.json`): its id, live switches,
@@ -26,6 +28,8 @@
 
 pub mod engine;
 pub mod link;
+#[cfg(feature = "neural")]
+pub mod neural;
 pub mod player;
 pub mod service;
 pub mod speaker;

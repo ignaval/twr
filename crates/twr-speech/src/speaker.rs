@@ -55,6 +55,8 @@ pub struct SpeakerOpts {
     pub voice: Option<String>,
     /// A rate that beats the saved one and `[speech] rate` (`--rate`).
     pub rate: Option<u32>,
+    /// Voices per language that beat `[speech] voices`' (`--voice-for LANG=VOICE`).
+    pub voices: std::collections::BTreeMap<String, String>,
     /// The device's state file.
     pub state: StateStore,
     /// Where notes go; `None`: the log (`tracing`).
@@ -183,6 +185,12 @@ pub async fn run(
             .clone()
             .or_else(|| state.voice.clone())
             .or_else(|| (!cfg.voice.is_empty()).then(|| cfg.voice.clone())),
+        voices: {
+            let mut v = cfg.voices.clone();
+            v.extend(opts.voices.clone());
+            v
+        },
+        lang: None,
         rate: opts.rate.or(state.rate).unwrap_or(cfg.rate),
         volume: cfg.volume,
     };
@@ -734,6 +742,7 @@ mod tests {
             config: SpeechConfig::default(),
             voice: None,
             rate: None,
+            voices: Default::default(),
             state: store.clone(),
             report: Some(Arc::new(move |n: &str| {
                 notes.lock().unwrap().push(n.to_string())

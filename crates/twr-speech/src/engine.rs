@@ -12,6 +12,7 @@
 //! option or a file. Each runs in a process group of its own, killed whole when the chunk is
 //! stopped.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,12 @@ pub type QuietFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub struct Prefs {
     /// The engine's voice; `None`: its default.
     pub voice: Option<String>,
+    /// A voice per language (`[speech] voices`): the player gives an engine the one of the
+    /// chunk's language as `voice` ([`Prefs::for_language`]).
+    pub voices: BTreeMap<String, String>,
+    /// The language of the message the chunk is of, when known
+    /// ([`twr_core::speech::language`]): a voice that reads several reads it so.
+    pub lang: Option<String>,
     /// Words per minute; 0: the engine's default.
     pub rate: u32,
     /// Volume, 0.0 to 1.0, where the engine has one.
@@ -44,9 +51,24 @@ impl Default for Prefs {
     fn default() -> Self {
         Prefs {
             voice: None,
+            voices: BTreeMap::new(),
+            lang: None,
             rate: 0,
             volume: 1.0,
         }
+    }
+}
+
+impl Prefs {
+    /// These prefs for a chunk in `lang`: its voice that language's (`voices`), else
+    /// `voice`.
+    pub fn for_language(&self, lang: Option<&str>) -> Prefs {
+        let mut p = self.clone();
+        p.lang = lang.map(str::to_string);
+        if let Some(v) = lang.and_then(|l| self.voices.get(l)) {
+            p.voice = Some(v.clone());
+        }
+        p
     }
 }
 
@@ -75,22 +97,40 @@ pub trait Engine: Send {
     fn after_stop(&mut self) -> QuietFuture {
         Box::pin(async {})
     }
+
+    /// The chunk the player says after the one being said, with its prefs: an engine that
+    /// takes time to make speech may start on it now. Nothing by default.
+    fn prepare(&mut self, _next: &str, _prefs: &Prefs) {}
 }
 
 /// The engine `[speech]` names (`engine` overrides `cfg.engine`): `auto` is `say` on macOS and
-/// `spd` on Linux when `spd-say` is installed. Fails when there is none, or its program is not
-/// there.
+/// `spd` on Linux when `spd-say` is installed, and twr's own engine for its voices
+/// (`<model>/<voice>`, installed under `data_dir`: [`crate::neural::AutoEngine`]). Fails when
+/// there is none, or its program is not there.
 pub fn from_config(
     cfg: &SpeechConfig,
     engine: Option<SpeechEngine>,
+    data_dir: &Path,
 ) -> anyhow::Result<Box<dyn Engine>> {
-    let kind = resolve(
-        engine.unwrap_or(cfg.engine),
-        &cfg.command,
-        std::env::consts::OS,
-        std::env::var_os("PATH").as_deref(),
-    )?;
-    Ok(match kind {
+    let path = std::env::var_os("PATH");
+    let engine = engine.unwrap_or(cfg.engine);
+    let kind = resolve(engine, &cfg.command, std::env::consts::OS, path.as_deref());
+    #[cfg(not(feature = "neural"))]
+    let _ = data_dir;
+    #[cfg(feature = "neural")]
+    if engine == SpeechEngine::Auto {
+        let neural = crate::neural::neural_engine(data_dir, &cfg.espeak, path.as_deref());
+        let system: Option<Box<dyn Engine>> = match kind {
+            Ok(Kind::Say(p)) => Some(Box::new(SayEngine::with_program(p))),
+            Ok(Kind::Spd(p)) => Some(Box::new(SpdEngine::with_program(p))),
+            _ => None,
+        };
+        if system.is_none() && !crate::neural::any_installed(data_dir) {
+            bail!(NO_ENGINE);
+        }
+        return Ok(Box::new(crate::neural::AutoEngine::new(system, neural)));
+    }
+    Ok(match kind? {
         Kind::Say(p) => Box::new(SayEngine::with_program(p)),
         Kind::Spd(p) => Box::new(SpdEngine::with_program(p)),
         Kind::Command(argv) => Box::new(CommandEngine::new(argv)?),
@@ -98,8 +138,9 @@ pub fn from_config(
     })
 }
 
-/// Whether `[speech]` names an engine this machine has ([`from_config`] would make one).
-pub fn engine_available(cfg: &SpeechConfig) -> bool {
+/// Whether `[speech]` names an engine this machine has ([`from_config`] would make one): for
+/// `auto`, the system's or one of twr's voices installed under `data_dir`.
+pub fn engine_available(cfg: &SpeechConfig, data_dir: &Path) -> bool {
     resolve(
         cfg.engine,
         &cfg.command,
@@ -107,10 +148,48 @@ pub fn engine_available(cfg: &SpeechConfig) -> bool {
         std::env::var_os("PATH").as_deref(),
     )
     .is_ok()
+        || neural_available(cfg, data_dir)
+}
+
+#[cfg(feature = "neural")]
+fn neural_available(cfg: &SpeechConfig, data_dir: &Path) -> bool {
+    cfg.engine == SpeechEngine::Auto && crate::neural::any_installed(data_dir)
+}
+
+#[cfg(not(feature = "neural"))]
+fn neural_available(_cfg: &SpeechConfig, _data_dir: &Path) -> bool {
+    false
+}
+
+/// Says `text` with `voice` now (`twr voices try`) through `engine`, as a speaker would: in
+/// utterances, the next one told to the engine while one plays, the language told from
+/// `text`.
+pub async fn try_voice(engine: &mut dyn Engine, voice: &str, text: &str) -> anyhow::Result<()> {
+    if text.trim().is_empty() {
+        bail!("nothing to say");
+    }
+    let prefs = Prefs {
+        voice: Some(voice.to_string()),
+        lang: twr_core::speech::language(text).map(str::to_string),
+        ..Prefs::default()
+    };
+    let mut chunks: std::collections::VecDeque<String> =
+        twr_core::speech::utterances(text, &Default::default()).into();
+    while let Some(chunk) = chunks.pop_front() {
+        let speak = engine.speak(&chunk, &prefs);
+        if let Some(next) = chunks.front() {
+            engine.prepare(next, &prefs);
+        }
+        speak.await?;
+    }
+    // The device's own buffer, which a process that exits now would cut.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(())
 }
 
 /// The error of `auto` on a machine with no engine.
-pub const NO_ENGINE: &str = "no speech engine: install speech-dispatcher or set [speech] engine";
+pub const NO_ENGINE: &str = "no speech engine: install a voice (`twr voices list`), install \
+                             speech-dispatcher, or set [speech] engine";
 
 /// An engine chosen, with its program.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +279,7 @@ const SILENCE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Runs `program` with `args` (no shell, its own process group, stdout discarded) with `text`
 /// and a newline on its stdin, until it ends. `label` names it in errors. Dropping the future
 /// kills its process group.
-async fn run_program(
+pub(crate) async fn run_program(
     label: &str,
     program: &Path,
     args: &[String],
@@ -805,6 +884,7 @@ mod tests {
             voice: voice.map(str::to_string),
             rate,
             volume,
+            ..Prefs::default()
         }
     }
 

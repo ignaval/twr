@@ -694,6 +694,67 @@ pub fn estimate_secs(chunks: &[String], wpm: u32) -> u64 {
     words * 60 / wpm.max(1)
 }
 
+/// The languages [`language`] tells apart, as `[speech] voices` names them.
+pub const LANGUAGES: &[&str] = &["en", "es"];
+
+/// The most common words of each of [`LANGUAGES`] that the other rarely uses: a message's
+/// language is the one whose words it has more of ([`language`]).
+const MARKERS: &[(&str, &[&str])] = &[
+    (
+        "en",
+        &[
+            "the", "and", "is", "are", "was", "were", "you", "your", "it", "this", "that", "of",
+            "to", "in", "for", "with", "on", "have", "has", "not", "be", "will", "can", "do",
+            "what", "which", "there", "they", "we", "i", "if", "or", "but", "so", "all", "now",
+            "want", "need", "should", "would", "from", "at", "by", "an", "my", "me", "its",
+        ],
+    ),
+    (
+        "es",
+        &[
+            "el", "la", "los", "las", "y", "es", "son", "está", "están", "que", "de", "del", "en",
+            "un", "una", "por", "para", "con", "no", "se", "su", "sus", "lo", "al", "como", "pero",
+            "más", "ya", "hay", "este", "esta", "eso", "esto", "tu", "te", "mi", "yo", "quieres",
+            "puedo", "puedes", "ahora", "también", "muy", "cuando", "donde", "qué",
+        ],
+    ),
+];
+
+/// The language of `text`, one of [`LANGUAGES`], when its words make it clear: the language
+/// with the most of its [`MARKERS`] among them, counting `¿`, `¡` and `ñ` as Spanish, if it
+/// leads by enough. `None` for text too short, mixed or in another language: the speaker's
+/// default voice says it. Words a code block or a path left (`code`, file names) count for
+/// neither.
+pub fn language(text: &str) -> Option<&'static str> {
+    let mut scores = [0u32; 2];
+    for c in text.chars() {
+        if matches!(c, '¿' | '¡' | 'ñ' | 'Ñ') {
+            scores[1] += 2;
+        }
+    }
+    let mut words = 0u32;
+    for word in text
+        .split(|c: char| !c.is_alphabetic() && c != '\'')
+        .filter(|w| !w.is_empty())
+    {
+        words += 1;
+        let w = word.to_lowercase();
+        for (i, (_, list)) in MARKERS.iter().enumerate() {
+            if list.contains(&w.as_str()) {
+                scores[i] += 1;
+            }
+        }
+    }
+    let (best, other) = if scores[0] >= scores[1] {
+        (0, scores[1])
+    } else {
+        (1, scores[0])
+    };
+    let lead = scores[best];
+    // Two marker words at least, and twice the other language's: "no" or "a" alone is both.
+    (words >= 3 && lead >= 2 && lead >= 2 * other.max(1)).then(|| MARKERS[best].0)
+}
+
 /// `text` cut to at most `max` bytes on a character boundary; whether it was cut.
 pub fn cap_text(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
@@ -1186,6 +1247,36 @@ mod tests {
 
     fn says(md: &str) -> Vec<String> {
         sentences(md, &SpeakOpts::default())
+    }
+
+    #[test]
+    fn a_messages_language_is_told_from_its_words() {
+        let en = "I reviewed the change. The new speaker engine compiles on both platforms, \
+                  and all seventy-four tests pass. Want me to fix both now?";
+        let es = "Revisé el cambio. El nuevo motor de voz compila en las dos plataformas y \
+                  pasan las setenta y cuatro pruebas. ¿Quieres que arregle ambas ahora?";
+        assert_eq!(language(en), Some("en"));
+        assert_eq!(language(es), Some("es"));
+        // Short, Spanish by its marks alone.
+        assert_eq!(language("¿Listo? Sí, mañana"), Some("es"));
+        assert_eq!(
+            language("Done. Tests pass and the build is green."),
+            Some("en")
+        );
+        // Too short, mixed, or neither: the default voice.
+        assert_eq!(language("ok"), None);
+        assert_eq!(language("No"), None);
+        assert_eq!(language("src/main.rs compiles"), None);
+        assert_eq!(language("Le chat est sur la table, mais pas ici."), None);
+        assert_eq!(
+            language("The build is green. El script de instalación está listo."),
+            None
+        );
+        // English words in a Spanish message (a file, a command) don't make it English.
+        assert_eq!(
+            language("Ya está: el script install-omarchy.sh descarga espeak y la app compila."),
+            Some("es")
+        );
     }
 
     fn turn(from: TurnFrom, twr: Option<Value>) -> TurnStarted {

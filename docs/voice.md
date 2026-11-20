@@ -143,8 +143,24 @@ This provisions `voice/ggml-base.bin` in twr's data directory. Set `[voice] mode
 absolute path and `language = "auto"` to detect the language of each recording, or choose
 `"en"` or `"es"`. With `TWR_HOME=/absolute/home`, the model is at
 `/absolute/home/data/voice/ggml-base.bin`. `--model base.en` explicitly provisions the English
-model. Both choices use pinned size and SHA-256 metadata; setup does not edit configuration.
+model. Every choice uses pinned size and SHA-256 metadata; setup does not edit configuration.
 Setup without flags keeps its English default and refuses a nonempty configured model path.
+
+For fewer wrong words, download whisper's `small` models (488 MB each): `--model small`
+(multilingual, `voice/ggml-small.bin`) or `--model small.en` (English, `voice/ggml-small.en.bin`),
+then name it in `[voice] model`. They recognize clearly better than `base`, and tell the
+language of a short recording apart more reliably with `language = "auto"`, at about three
+times the size and twice the time (a two-second message takes about 0.4 s instead of 0.2 s on
+an Apple M6). A recording's language is always surer when `language` names it (`"es"`) than
+with `"auto"`.
+
+Naming the language is also faster, on slow machines most of all. With `"auto"`, whisper runs
+its encoder twice: once to guess the language, once to recognize. And with a language named,
+twr shows whisper only the recording and three seconds after it (`-ac`) instead of its whole
+30-second window. Together, a five-second command took about 1.7 s on four CPU threads with
+`"auto"`, 0.95 s with `"en"` alone, and 0.35 s with both; on 14 spoken commands in English
+and Spanish the words were the same. With `"auto"` the window stays whole, since a shorter
+one made whisper mishear how commands begin.
 
 `twr voice status --json` includes `setup_model` when a missing canonical model can be
 provisioned with `setup --model <name>`. Its existing `setup` flag still means setup without

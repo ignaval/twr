@@ -1,0 +1,19 @@
+[package]
+name = "twr-neural"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr's local neural voices: the voice catalog, spelling words out with espeak-ng, and speech from Kokoro, Supertonic and Piper models through sherpa-onnx"
+
+[dependencies]
+anyhow.workspace = true
+cpal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sherpa-onnx.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tracing.workspace = true

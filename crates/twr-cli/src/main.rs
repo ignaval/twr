@@ -12,6 +12,7 @@ mod runner_update;
 mod speech;
 #[cfg(test)]
 mod test_support;
+mod voices;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -472,6 +473,10 @@ enum Cmd {
         /// rate`.
         #[arg(long, value_name = "WPM", value_parser = clap::value_parser!(u32).range(80..=500))]
         rate: Option<u32>,
+        /// The voice for messages in one language, over `[speech] voices`: `es=kokoro/ef_dora`,
+        /// `en=Ava (Premium)` (`twr voices list`). Repeat it for each language.
+        #[arg(long, value_name = "LANG=VOICE")]
+        voice_for: Vec<String>,
         /// Print a LaunchAgent (macOS) or systemd user unit (Linux) that runs this `twr speak`,
         /// and the commands to install it; installs nothing.
         #[arg(long)]
@@ -491,6 +496,12 @@ enum Cmd {
     Voice {
         #[command(subcommand)]
         cmd: VoiceCmd,
+    },
+    /// The voices that read messages aloud (docs/read-aloud.md#voices): this machine's own
+    /// (macOS's) and twr's local neural ones, which `install` downloads.
+    Voices {
+        #[command(subcommand)]
+        cmd: voices::VoicesCmd,
     },
     /// `mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak
     /// --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's
@@ -902,8 +913,9 @@ enum VoiceCmd {
     },
     /// Download a pinned whisper.cpp model to the data directory (no config changes).
     Setup {
-        /// Catalogue model. Omit for base.en; explicit selection ignores [voice] model.
-        #[arg(long, value_parser = ["base.en", "base"])]
+        /// Catalogue model: base.en, base (multilingual), or small.en and small (more accurate,
+        /// 488 MB, slower). Omit for base.en; explicit selection ignores [voice] model.
+        #[arg(long, value_parser = ["base.en", "base", "small.en", "small"])]
         model: Option<String>,
     },
     /// The text of one recording: a 16 kHz mono 16-bit WAV on stdin (at most two minutes),
@@ -2054,6 +2066,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             engine,
             voice,
             rate,
+            voice_for,
             print_service,
             control,
             announce,
@@ -2071,6 +2084,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     engine,
                     voice,
                     rate,
+                    voice_for,
                     print_service,
                     control_stdio: control.is_some(),
                     announce,
@@ -2079,6 +2093,17 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             )
             .await?;
             return Ok(ExitCode::SUCCESS);
+        }
+        // The root's voices (`[speech]`, its data directory): no hub. Installing one downloads
+        // it, which an agent need not do on its own.
+        Some(Cmd::Voices { cmd }) => {
+            if matches!(
+                cmd,
+                voices::VoicesCmd::Install { .. } | voices::VoicesCmd::Remove { .. }
+            ) {
+                refuse_agent_action("install or remove a voice")?;
+            }
+            return voices::run(cmd, &paths).await;
         }
         // The machine's own `[voice]` (the root's), as a speaker's `[speech]`: no hub. It
         // records nothing (the app with the microphone does) and sends nothing anywhere: it
@@ -2323,6 +2348,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
         | Cmd::Speech { .. }
         | Cmd::Speak { .. }
         | Cmd::Voice { .. }
+        | Cmd::Voices { .. }
         | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
         | Cmd::Completions { .. }
@@ -9332,6 +9358,7 @@ mod tests {
             url: "https://example.invalid/model",
             bytes: bytes.len() as u64,
             sha256: Box::leak(sha256_hex(bytes).into_boxed_str()),
+            size: "17 B",
         };
         std::fs::write(&target, b"original").unwrap();
         let mut one = ModelDownload::new(&target, &spec).unwrap();

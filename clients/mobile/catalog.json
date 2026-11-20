@@ -3718,7 +3718,7 @@
         "key": "rate",
         "label": "rate",
         "type": "text",
-        "description": "Words per minute (80 to 500), over the rate kept by `/read rate` and `[speech] rate`",
+        "description": "Words per minute (80 to 500), over the rate kept by `/read rate` and `[speech] rate` --voice-for <LANG=VOICE>  The voice for messages in one language, over `[speech] voices`: `es=kokoro/ef_dora`, `en=Ava (Premium)` (`twr voices list`). Repeat it for each language",
         "advanced": false
       },
       {
@@ -4586,11 +4586,13 @@
         "key": "model",
         "label": "model",
         "type": "select",
-        "description": "Catalogue model. Omit for base.en; explicit selection ignores [voice] model [possible values: base.en, base]",
+        "description": "Catalogue model: base.en, base (multilingual), or small.en and small (more accurate, 488 MB, slower). Omit for base.en; explicit selection ignores [voice] model [possible values: base.en, base, small.en, small]",
         "advanced": false,
         "options": [
           "base.en",
-          "base"
+          "base",
+          "small.en",
+          "small"
         ]
       }
     ],
@@ -4629,6 +4631,166 @@
       {
         "key": "json",
         "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices install",
+    "title": "twr voices install",
+    "description": "Download and install one of twr's voice models (`twr voices list` names them)",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "model",
+        "label": "model",
+        "type": "text",
+        "required": true,
+        "description": "The model: kokoro, supertonic, piper-en or piper-es"
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "Progress as JSON lines on stdout (`{\"type\":\"progress\",...}`), then the result",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "voices",
+      "install"
+    ],
+    "cliFields": [
+      {
+        "key": "model",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices list",
+    "title": "twr voices list",
+    "description": "The voices for reading aloud: this machine's and twr's own (installed or not)",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "all",
+        "label": "all",
+        "type": "boolean",
+        "description": "Every language of this machine's voices, not only the ones twr tells apart",
+        "advanced": false
+      },
+      {
+        "key": "json",
+        "label": "json",
+        "type": "boolean",
+        "description": "One JSON object on stdout",
+        "advanced": true
+      }
+    ],
+    "cli": [
+      "voices",
+      "list"
+    ],
+    "cliFields": [
+      {
+        "key": "all",
+        "flag": "--all",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "json",
+        "flag": "--json",
+        "many": false,
+        "separator": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices remove",
+    "title": "twr voices remove",
+    "description": "Remove one of twr's voice models",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "model",
+        "label": "model",
+        "type": "text",
+        "required": true,
+        "description": "The model"
+      }
+    ],
+    "cli": [
+      "voices",
+      "remove"
+    ],
+    "cliFields": [
+      {
+        "key": "model",
+        "many": false,
+        "separator": false,
+        "literal": false
+      }
+    ]
+  },
+  {
+    "id": "cli:voices try",
+    "title": "twr voices try",
+    "description": "Say a sentence with a voice, as a speaker would (`kokoro/af_heart`, `Ava (Premium)`)",
+    "group": "CLI · voices",
+    "fields": [
+      {
+        "key": "voice",
+        "label": "voice",
+        "type": "text",
+        "required": true,
+        "description": "The voice"
+      },
+      {
+        "key": "text",
+        "label": "text",
+        "type": "textarea",
+        "required": false,
+        "description": "What to say; a sentence in the voice's language by default"
+      },
+      {
+        "key": "out",
+        "label": "out",
+        "type": "text",
+        "description": "Write the audio to this WAV file instead of playing it (twr's voices only)",
+        "advanced": false
+      }
+    ],
+    "cli": [
+      "voices",
+      "try"
+    ],
+    "cliFields": [
+      {
+        "key": "voice",
+        "many": false,
+        "separator": false,
+        "literal": false
+      },
+      {
+        "key": "text",
+        "many": false,
+        "separator": false,
+        "literal": true
+      },
+      {
+        "key": "out",
+        "flag": "--out",
         "many": false,
         "separator": false
       }

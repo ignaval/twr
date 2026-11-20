@@ -1,0 +1,97 @@
+{
+  "about": "The C and C++ libraries linked into twr with its own voices (the `neural` feature of twr-cli): sherpa-onnx-sys 2.0.1's prebuilt static libraries and what they were built from. cargo-about lists Rust crates only; scripts render this list (licenses/native/section.mjs).",
+  "components": [
+    {
+      "name": "sherpa-onnx",
+      "version": "2.0.1",
+      "url": "https://github.com/k2-fsa/sherpa-onnx",
+      "license": "Apache-2.0",
+      "files": ["sherpa-onnx.txt"]
+    },
+    {
+      "name": "ONNX Runtime",
+      "version": "1.28.2",
+      "url": "https://onnxruntime.ai",
+      "license": "MIT, and the components in its ThirdPartyNotices",
+      "files": ["onnxruntime.txt", "onnxruntime-third-party-notices.txt"],
+      "note": "The licence and ThirdPartyNotices.txt are those of the onnxruntime 1.28.0 Python wheel on PyPI, the same release line (sherpa-onnx links csukuangfj/onnxruntime-libs' 1.28.2 static build, which carries no notices of its own)."
+    },
+    {
+      "name": "kaldi-native-fbank",
+      "version": "1.22.4",
+      "url": "https://github.com/csukuangfj/kaldi-native-fbank",
+      "license": "Apache-2.0",
+      "files": ["kaldi-native-fbank.txt"]
+    },
+    {
+      "name": "KISS FFT",
+      "version": "febd4caeed32e33ad8b2e0bb5ea77542c40f18ec",
+      "url": "https://github.com/mborgerding/kissfft",
+      "license": "BSD-3-Clause",
+      "files": ["kissfft.txt", "kissfft-bsd-3-clause.txt"]
+    },
+    {
+      "name": "kaldi-decoder",
+      "version": "0.3.0",
+      "url": "https://github.com/k2-fsa/kaldi-decoder",
+      "license": "Apache-2.0",
+      "files": ["kaldi-decoder.txt"]
+    },
+    {
+      "name": "kaldifst",
+      "version": "1.8.0",
+      "url": "https://github.com/k2-fsa/kaldifst",
+      "license": "Apache-2.0",
+      "files": ["kaldifst.txt"]
+    },
+    {
+      "name": "OpenFst",
+      "version": "1.8.5 (csukuangfj/openfst v1.8.5-2026-07-09)",
+      "url": "https://github.com/csukuangfj/openfst",
+      "license": "Apache-2.0",
+      "files": ["openfst.txt"]
+    },
+    {
+      "name": "Eigen",
+      "version": "3.4.0",
+      "url": "https://gitlab.com/libeigen/eigen",
+      "license": "MPL-2.0 (most files; some BSD-3-Clause, MINPACK, Apache-2.0)",
+      "files": [
+        "eigen-COPYING.README.txt",
+        "eigen-COPYING.MPL2.txt",
+        "eigen-COPYING.BSD.txt",
+        "eigen-COPYING.MINPACK.txt",
+        "eigen-COPYING.APACHE.txt"
+      ],
+      "note": "Header-only; used unmodified. Its source is at the URL above (MPL-2.0 section 3.2)."
+    },
+    {
+      "name": "simple-sentencepiece",
+      "version": "0.7",
+      "url": "https://github.com/pkufool/simple-sentencepiece",
+      "license": "Apache-2.0",
+      "files": ["simple-sentencepiece.txt"]
+    },
+    {
+      "name": "utf8proc",
+      "version": "2.12.0",
+      "url": "https://github.com/JuliaStrings/utf8proc",
+      "license": "MIT, Unicode-3.0 (its data)",
+      "files": ["utf8proc.txt"]
+    },
+    {
+      "name": "JSON for Modern C++ (nlohmann/json)",
+      "version": "3.12.0",
+      "url": "https://github.com/nlohmann/json",
+      "license": "MIT",
+      "files": ["nlohmann-json.txt"]
+    },
+    {
+      "name": "hclust-cpp",
+      "version": "2026-02-25",
+      "url": "https://github.com/csukuangfj/hclust-cpp",
+      "license": "BSD-2-Clause",
+      "files": ["hclust-cpp.txt"]
+    }
+  ]
+}

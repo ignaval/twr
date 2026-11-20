@@ -21,6 +21,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { nativeSection } from "../../licenses/native/section.mjs";
 
 const clients = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const root = resolve(clients, "..");
@@ -217,7 +218,8 @@ if (rust) {
       intro,
       `<h1>Third-party licences</h1>\n${INTRO}\n<h2 id="rust-crates">Rust crates</h2>`,
     )
-    .replace("</main>", `${npm}</main>`);
+    // The app's CLI is built with twr's own voices: sherpa-onnx's C and C++ libraries.
+    .replace("</main>", `${nativeSection()}${npm}</main>`);
 } else if (process.env.TWR_NOTICES_WITHOUT_RUST === "1") {
   console.warn(
     "WARNING: cargo-about is not installed; THIRD-PARTY-LICENSES.html lists only the npm packages and says so. Do not distribute this build.",
