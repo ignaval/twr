@@ -4228,6 +4228,18 @@ impl Hub {
             // Two steps, not one batch: the stop is `thread.stop`'s own (it may have to wait
             // for the runtime's exit). If creating the new thread fails after it, the old one
             // stays the orchestrator, stopped, and `orchestrator.use` can be repeated.
+            // The user's own queued messages, whole, read under the lock the stop drops them
+            // under: the result gives them back, so the user can send them again.
+            let dropped_messages: Vec<String> = core
+                .store
+                .pending_list(old, usize::MAX)
+                .map_err(internal)?
+                .into_iter()
+                .filter(|r| {
+                    r.from == TurnFrom::User && matches!(r.source, Source::User(_)) && r.user_sent
+                })
+                .map(|r| r.prompt)
+                .collect();
             let stop = core.stop_thread(&self.inner, old, caller)?;
             prev = json!({
                 "thread": old,
@@ -4238,6 +4250,7 @@ impl Hub {
                 "effort": view.effort,
                 "stopping": stop["stopping"],
                 "dropped_prompts": stop["dropped_prompts"],
+                "dropped_messages": dropped_messages,
             });
             if !reset {
                 handoff = Some(core.handoff(&view, &to, &summary).map_err(internal)?);

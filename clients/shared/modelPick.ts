@@ -281,3 +281,68 @@ export function opensPicker(
     (event.key || "").toLowerCase() === "m"
   );
 }
+
+const messages = (n: number) =>
+  n === 1 ? "1 queued message" : `${n} queued messages`;
+
+/** The orchestrator switch's confirmation text. `queued`: the messages waiting in the
+ * orchestrator's queue, as the conversation shows them; the switch drops them (without the
+ * summary, all of them; with it, those the orchestrator has not started when it is asked). */
+export function switchDetail(queued: number): string {
+  let detail =
+    "This starts a new orchestrator session that begins with a handoff: what the log " +
+    "shows, and with the summary, the current orchestrator's own (it is asked first, " +
+    "and waited for up to 60 seconds while it is busy). Workers are not touched.";
+  if (queued > 0)
+    detail +=
+      ` ${messages(queued)} to the orchestrator ${queued === 1 ? "is" : "are"} dropped: ` +
+      "without the summary, at once; with it, any it hasn't started by the time it is " +
+      "asked. You can put yours back in the message box afterwards.";
+  return detail;
+}
+
+/** What an orchestrator switch (`orchestrator.use`'s result) dropped: how many queued
+ * messages (`previous.dropped_prompts`), and the text of those the user sent, whole
+ * (`previous.dropped_messages`), to put back in the message box. */
+export function droppedBySwitch(result: Json): {
+  count: number;
+  mine: string[];
+} {
+  const previous = result?.previous || {};
+  const count = Number(previous.dropped_prompts) || 0;
+  const mine = Array.isArray(previous.dropped_messages)
+    ? previous.dropped_messages.filter(
+        (m: unknown): m is string => typeof m === "string" && m.trim() !== "",
+      )
+    : [];
+  return { count, mine };
+}
+
+/** What the app says about a switch that dropped `count` queued messages, `mine` of them
+ * the user's own: none, a notice, or an offer to put the user's back in the message box. */
+export function droppedWords(
+  count: number,
+  mine: number,
+): { notice: string } | { title: string; detail: string } | undefined {
+  if (count <= 0) return undefined;
+  const dropped = `The switch dropped ${messages(count)} the previous orchestrator hadn't started.`;
+  if (mine <= 0) return { notice: dropped };
+  return {
+    title:
+      mine === 1
+        ? "Put your queued message back in the message box?"
+        : `Put your ${mine} queued messages back in the message box?`,
+    detail:
+      `${dropped} ${mine === count ? (mine === 1 ? "It was yours" : "They were yours") : `${mine} of them were yours`}` +
+      ": put back, with their files, you can send them to the new orchestrator.",
+  };
+}
+
+/** A switch's result as the app shows it: the dropped messages' text left out (the app
+ * offers them back instead), so no file's `Uploaded file:` lines show. */
+export function withoutDroppedText(result: Json): Json {
+  if (!result?.previous || !("dropped_messages" in result.previous))
+    return result;
+  const { dropped_messages: _, ...previous } = result.previous;
+  return { ...result, previous };
+}

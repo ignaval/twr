@@ -7134,6 +7134,28 @@ fn orchestrator_session_text(r: &Value, reset: bool) -> String {
         out.push_str(&format!(" ({dropped} queued prompt(s) dropped)"));
     }
     out.push_str(".\n");
+    // The user's own, whole, so they can be sent again.
+    let mine: Vec<&str> = p["dropped_messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !mine.is_empty() {
+        out.push_str("Your dropped message(s), to send again:\n");
+        for m in mine {
+            // Its files by name, never their `Uploaded file:` lines.
+            let (text, files) = twr_core::upload::split_attachments(m);
+            for (i, line) in text.lines().enumerate() {
+                out.push_str(if i == 0 { "  - " } else { "    " });
+                out.push_str(line);
+                out.push('\n');
+            }
+            if !files.is_empty() {
+                out.push_str(&format!("    attached: {}\n", files.join(", ")));
+            }
+        }
+    }
     let h = &r["handoff"];
     if !h.is_object() {
         if !reset {
@@ -10880,7 +10902,9 @@ mod tests {
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": "o5",
             "started": true,
             "previous": {"thread": "01OLD", "runtime": "claude-code", "model": null,
-                         "stopping": true, "dropped_prompts": 2},
+                         "stopping": true, "dropped_prompts": 2,
+                         "dropped_messages": [
+                             "and the deploys\nplease\nUploaded file: a.png\n/w/.twr-uploads/u1/a.png"]},
         }));
         assert!(
             switched.starts_with(
@@ -10894,6 +10918,13 @@ mod tests {
         );
         assert!(
             switched.contains("was retired and is being stopped (2 queued prompt(s) dropped)."),
+            "{switched}"
+        );
+        assert!(
+            switched.contains(
+                "Your dropped message(s), to send again:\n  - and the deploys\n    please\n    \
+                 attached: a.png\n"
+            ),
             "{switched}"
         );
         assert!(switched.contains("No handoff"), "{switched}");

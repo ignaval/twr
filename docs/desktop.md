@@ -269,7 +269,11 @@ it only another runtime. For the orchestrator every change is a switch
 (`orchestrator.use`), a new orchestrator session with a handoff, even on the same runtime, so
 the app always asks: **Switch with summary** first asks the current orchestrator for its own
 summary, **Switch without summary** hands over only what the log shows
-([orchestrator.md](orchestrator.md#switching-the-orchestrator)).
+([orchestrator.md](orchestrator.md#switching-the-orchestrator)). A switch drops the messages
+queued for the orchestrator, so with messages waiting the question says how many. When the
+switch dropped some, the app says so, and when some were yours it offers **Put back**: they
+return to the orchestrator's message box, their files as attachments, to send to the new
+orchestrator.
 
 What you pick is planned against what runs as the picker opens. If that changes underneath
 it (another client switches the orchestrator, sets or moves the thread, or deletes it), the

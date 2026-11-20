@@ -22,6 +22,7 @@ import {
   planChange,
   runsCommandLine,
   runtimeMark,
+  switchDetail,
   triggerText,
   type ModelRow,
   type Nav,
@@ -56,6 +57,8 @@ export function ModelPicker({
   withdraw,
   fail,
   input,
+  queued = 0,
+  switched,
 }: {
   /** Where the composer sends: the orchestrator, or the dived thread. None: hidden. */
   target?: Thread;
@@ -77,6 +80,11 @@ export function ModelPicker({
   fail: (error: unknown) => void;
   /** The message field: Esc gives it the focus back. */
   input: RefObject<HTMLTextAreaElement | null>;
+  /** The orchestrator's queued messages, as the conversation shows them: a switch drops
+   * them, and its confirmation says so. */
+  queued?: number;
+  /** Given `orchestrator.use`'s result once a switch went through (what it dropped). */
+  switched?: (result: Json) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -296,10 +304,15 @@ export function ModelPicker({
   const shown = triggerText(target);
   const name = kind === "orchestrator" ? "the orchestrator" : target.name;
 
-  const call = async (method: string, params: Json) => {
+  const call = async (
+    method: string,
+    params: Json,
+    then?: (result: Json) => void,
+  ) => {
     setBusy(true);
     try {
-      await rpc(method, params);
+      const result = await rpc(method, params);
+      then?.(result);
     } catch (error) {
       fail(error);
     } finally {
@@ -348,16 +361,17 @@ export function ModelPicker({
     if (plan.kind === "orchestrator") {
       ask({
         title: `Switch the orchestrator to ${what}?`,
-        detail:
-          "This starts a new orchestrator session that begins with a handoff: what the log " +
-          "shows, and with the summary, the current orchestrator's own (it is asked first, " +
-          "and waited for up to 60 seconds while it is busy). Workers are not touched.",
+        detail: switchDetail(queued),
         action: "Switch with summary",
-        run: () => void call("orchestrator.use", plan.params),
+        run: () => void call("orchestrator.use", plan.params, switched),
         alt: {
           action: "Switch without summary",
           run: () =>
-            void call("orchestrator.use", { ...plan.params, summary: false }),
+            void call(
+              "orchestrator.use",
+              { ...plan.params, summary: false },
+              switched,
+            ),
         },
       });
       return;

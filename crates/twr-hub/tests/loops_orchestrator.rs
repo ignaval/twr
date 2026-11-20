@@ -1210,6 +1210,56 @@ async fn a_first_single_pass_shows_the_card_and_its_answer_starts_one() {
     hub.shutdown().await;
 }
 
+/// A full loop's card left open, then the orchestrator asked for a single pass of the same
+/// thread (or the other way round): the card is not offered as this request's, since
+/// answering it would start other work; the result says what the card starts. A request for
+/// the card's own work is told about it as before.
+#[tokio::test]
+async fn an_open_card_for_other_work_is_not_offered_as_the_orchestrators_request() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    // The first loop's card: a full review loop, left open.
+    let r = request(&hub, &t, json!({}), &orch()).await.unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    assert!(r.get("other").is_none(), "{r}");
+    assert!(!setup(&hub, &t, &r["attn_id"]).once);
+    // A single pass asked for: the same card, said to be other work.
+    let again = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(again["existing"], true, "{again}");
+    assert_eq!(again["attn_id"], r["attn_id"]);
+    assert_eq!(
+        again["other"],
+        json!({"kind": "review", "once": false, "scope": "uncommitted", "task": null}),
+        "{again}"
+    );
+    // A scope the request names otherwise, too; the card's own work is not.
+    let scoped = request(&hub, &t, json!({"scope": "branch"}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(scoped["other"]["scope"], "uncommitted", "{scoped}");
+    for same in [json!({}), json!({"scope": "uncommitted"})] {
+        let same = request(&hub, &t, same, &orch()).await.unwrap();
+        assert_eq!(same["existing"], true, "{same}");
+        assert!(same.get("other").is_none(), "{same}");
+    }
+    // Neither raised the card again nor started anything.
+    assert_eq!(raises(&hub, &t, &r["attn_id"]), 1);
+    assert!(started(&hub, &t).is_empty());
+    // The user asks for the single pass themselves: the card becomes theirs, a single pass.
+    let mine = request(&hub, &t, json!({"once": true}), &user())
+        .await
+        .unwrap();
+    assert_eq!(mine["attn_id"], r["attn_id"]);
+    assert!(setup(&hub, &t, &r["attn_id"]).once);
+    // Now a full loop asked for by the orchestrator is the other work.
+    let full = request(&hub, &t, json!({}), &orch()).await.unwrap();
+    assert_eq!(full["other"]["once"], true, "{full}");
+    hub.shutdown().await;
+}
+
 /// A single pass needs only the effort it runs at: a profile whose verification asks for an
 /// effort the reviewer does not take (Claude Code has no `ultra`) still runs one pass, its
 /// card showing no problem, and answering it starts the pass. A full loop on the same

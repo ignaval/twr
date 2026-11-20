@@ -1939,6 +1939,39 @@ async fn direct_commands_name_threads_as_they_arrive() {
     hub.shutdown().await;
 }
 
+/// A typed command sent with a file (the apps' `Uploaded file:` pair after it): the hub
+/// applies nothing on its own, so the file is never left behind; the orchestrator gets the
+/// message and the file, and the change it relays, which the typed command covers, applies
+/// without a card. One it does not cover still goes on the card.
+#[tokio::test]
+async fn a_command_with_a_file_goes_to_the_orchestrator_which_applies_it() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let api = env.worker(&hub, "api").await;
+    let web = env.worker(&hub, "web").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t, "Watching.");
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    let file = "\nUploaded file: notes.md\n/w/.twr-uploads/01ABC/notes.md";
+    let m = format!("set api to plan mode{file}");
+    let r = hub.say_to_orchestrator(&m, Some(seen), &tui()).unwrap();
+    assert_ne!(r["action"], "command", "{r}");
+    assert_ne!(hub.thread_view(&api).unwrap().mode, "plan");
+    let (prompt, t) = rt.next_turn().await;
+    assert!(prompt.ends_with(&m), "{prompt}");
+    let out = hub.set_mode(&api, "plan", &Caller::Orchestrator).unwrap();
+    assert_ne!(out["status"], "needs_confirmation", "{out}");
+    assert_eq!(hub.thread_view(&api).unwrap().mode, "plan");
+    // A thread the command did not name: the card.
+    let out = hub.set_mode(&web, "plan", &Caller::Orchestrator).unwrap();
+    assert_eq!(out["status"], "needs_confirmation", "{out}");
+    rt.end_turn(t, "done");
+    drop(rt);
+    hub.shutdown().await;
+}
+
 /// The relay guard and the `set_mode` gate read the user's message with the names threads had
 /// when it arrived, and never apply it directly when a thread a word of it could name was made
 /// or renamed after the frame the client last drew: those calls go on the card. A word one

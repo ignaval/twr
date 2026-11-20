@@ -2574,22 +2574,38 @@ impl Core {
             .map(str::to_string);
         // The orchestrator never starts a loop over a card the thread has open, nor raises it
         // again: the card is the user's, as they may have changed it. Its request is told
-        // about that card.
+        // about that card, and, when the card asks for other work than this request (another
+        // kind, a single pass or a whole loop, a scope or task the request names otherwise),
+        // what the card would start instead (`other`), since answering it starts that.
         if !user {
             if let Some((attn_id, card)) = self.setup_card_of(id) {
                 if from.baseline_digests != card.setup.baseline_digests {
                     drop_from(hub, &from);
                 }
+                let s = &card.setup;
+                let other = s.kind != kind
+                    || s.once != req.once
+                    || (req.scope.is_some() && s.scope != from.scope)
+                    || task.as_ref().is_some_and(|t| s.task.as_ref() != Some(t));
                 let revision = self.attention.get(&attn_id).map(|i| i.revision);
-                return Ok(json!({
+                let mut out = json!({
                     "status": "needs_setup",
                     "thread": id,
                     "thread_name": view.name,
                     "attn_id": attn_id,
                     "revision": revision,
-                    "why": card.setup.why,
+                    "why": s.why,
                     "existing": true,
-                }));
+                });
+                if other {
+                    out["other"] = json!({
+                        "kind": s.kind.as_str(),
+                        "once": s.once,
+                        "scope": s.scope.as_ref().map(ToString::to_string),
+                        "task": s.task,
+                    });
+                }
+                return Ok(out);
             }
         }
         let Some(why) = why else {

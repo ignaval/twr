@@ -9,7 +9,11 @@ import {
   pickerRuntimes,
   planChange,
   runtimeMark,
+  droppedBySwitch,
+  droppedWords,
+  switchDetail,
   triggerText,
+  withoutDroppedText,
   type Nav,
 } from "../shared/modelPick";
 import {
@@ -276,7 +280,7 @@ describe("the popup, rendered", () => {
         rpc: async (method: string, params: Json) => {
           calls.push({ method, params });
           if (props.refuse) throw new Error("refused");
-          return {};
+          return props.reply ?? {};
         },
         confirm: (c: Json) => confirms.push(c),
         withdraw: (c: Json) => {
@@ -463,6 +467,48 @@ describe("the popup, rendered", () => {
         params: { runtime: "claude-code", effort: "max", summary: false },
       },
     ]);
+    // An empty queue: nothing said about dropped messages.
+    expect(c.detail).not.toContain("dropped");
+  });
+
+  it("says a switch drops the orchestrator's queued messages, and hands on what it dropped", async () => {
+    const orch = thread({
+      id: "o",
+      name: "orchestrator",
+      is_orchestrator: true,
+    });
+    const reply = {
+      thread: "o2",
+      previous: {
+        dropped_prompts: 2,
+        dropped_messages: [
+          "look at this\nUploaded file: a.png\n/w/.twr-uploads/u1/a.png",
+        ],
+      },
+    };
+    const results: Json[] = [];
+    const m = await mount({
+      target: orch,
+      kind: "orchestrator",
+      queued: 2,
+      reply,
+      switched: (r: Json) => results.push(r),
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    const max = m.root
+      .querySelectorAll(".model-picker-efforts [role=radio]")
+      .find((n: FakeElement) => n.textContent === "Max")!;
+    await m.act(() => click(max));
+    const c = m.confirms[0];
+    expect(c.detail).toContain(
+      "2 queued messages to the orchestrator are dropped: without the summary, at once",
+    );
+    await m.act(() => c.alt.run());
+    expect(results).toEqual([reply]);
+    // With the summary, the same.
+    await m.act(() => c.run());
+    expect(results).toHaveLength(2);
   });
 
   /** What the screen reader was last told (the announcer speaks after 150 ms). */
@@ -854,6 +900,51 @@ describe("the popup without a catalog", () => {
       kind: "thread",
       params: { thread: "t1", model: "sonnet" },
       move: false,
+    });
+  });
+});
+
+describe("what an orchestrator switch drops", () => {
+  it("says so before, in the confirmation", () => {
+    expect(switchDetail(0)).not.toContain("dropped");
+    expect(switchDetail(1)).toContain(
+      "1 queued message to the orchestrator is dropped",
+    );
+  });
+
+  it("reads the switch's result, and offers to put the user's own back", () => {
+    expect(droppedBySwitch({ previous: null })).toEqual({ count: 0, mine: [] });
+    expect(droppedWords(0, 0)).toBeUndefined();
+    const r = droppedBySwitch({
+      previous: {
+        dropped_prompts: 3,
+        dropped_messages: ["one", " ", 7, "two"],
+      },
+    });
+    expect(r).toEqual({ count: 3, mine: ["one", "two"] });
+    expect(droppedWords(r.count, r.mine.length)).toEqual({
+      title: "Put your 2 queued messages back in the message box?",
+      detail:
+        "The switch dropped 3 queued messages the previous orchestrator hadn't started. " +
+        "2 of them were yours: put back, with their files, you can send them to the new " +
+        "orchestrator.",
+    });
+    expect(droppedWords(1, 1)).toMatchObject({
+      title: "Put your queued message back in the message box?",
+    });
+    expect((droppedWords(1, 1) as Json).detail).toContain("It was yours:");
+    // Shown without their text.
+    expect(
+      withoutDroppedText({
+        thread: "o2",
+        previous: { dropped_prompts: 1, dropped_messages: ["x"] },
+      }),
+    ).toEqual({ thread: "o2", previous: { dropped_prompts: 1 } });
+    expect(withoutDroppedText({ previous: null })).toEqual({ previous: null });
+    // None of them the user's: a notice only.
+    expect(droppedWords(2, 0)).toEqual({
+      notice:
+        "The switch dropped 2 queued messages the previous orchestrator hadn't started.",
     });
   });
 });

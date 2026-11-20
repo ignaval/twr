@@ -4020,7 +4020,9 @@ impl AppState {
                 self.view.selection = None;
                 self.view.repaint = true;
                 self.back();
+                self.keep_dropped(result);
             }
+            "orchestrator.use" => self.keep_dropped(result),
             "trash.list" => {
                 // The commands its message quotes run in this view's workspace.
                 let mut result = result.clone();
@@ -5380,12 +5382,27 @@ impl AppState {
         } else {
             format!(" ({})", with.join(", "))
         };
+        // The orchestrator's queued messages, as last read (only while its conversation is
+        // on the main pane): the switch drops them.
+        let orch = self.orchestrator().map(|o| o.id.clone());
+        let queued = self
+            .queue
+            .as_ref()
+            .filter(|q| Some(&q.thread) == orch.as_ref())
+            .map_or(0, |q| q.total);
+        let dropped = match queued {
+            0 => String::new(),
+            n => format!(
+                " It drops {n} queued message(s): all of them without the summary, those not \
+                 started by then with it; yours go to the history."
+            ),
+        };
         self.view.status = None;
         self.view.confirm = Some(Confirm {
             prompt: format!(
                 "switch the orchestrator to {shown}{with}? A new session that starts with a \
-                 handoff. y: with the current one's summary (waits up to 60s if it is busy) · \
-                 s: without it · any other key cancels"
+                 handoff.{dropped} y: with the current one's summary (waits up to 60s if it is \
+                 busy) · s: without it · any other key cancels"
             ),
             pending: format!(
                 "switching the orchestrator to {shown}: asking the current one for a handoff \
@@ -7184,6 +7201,15 @@ impl AppState {
         }
         let msg = self.no_unsend(why, Some(&w.thread));
         self.set_timed_status(msg, Instant::now());
+    }
+
+    /// The user's own queued messages an orchestrator switch or reset (`result`) dropped: in
+    /// the history, to send again (`↑`), as a message taken back that the box can't take.
+    fn keep_dropped(&mut self, result: &Value) {
+        let dropped = result["previous"]["dropped_messages"].as_array();
+        for m in dropped.into_iter().flatten().filter_map(Value::as_str) {
+            self.keep_taken_back(&literal_line(m));
+        }
     }
 
     /// Makes `text`, a message taken back that could not go back in the box, the newest
@@ -12103,6 +12129,37 @@ pub(crate) mod tests {
         assert!(type_line(&mut st, "/orch codex o5").is_empty());
         let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
         assert!(prompt.contains("codex (o5)"), "{prompt}");
+        assert!(!prompt.contains("queued"), "{prompt}");
+    }
+
+    /// A switch drops the orchestrator's queued messages: its question says how many, and
+    /// the user's own the hub gives back go to the history, to send again.
+    #[test]
+    fn an_orchestrator_switch_says_what_it_drops_and_keeps_the_users_messages() {
+        let mut st = with_orch();
+        let orch = st.orchestrator().unwrap().id.clone();
+        st.queue = Some(crate::queue::QueueView {
+            thread: orch,
+            total: 2,
+            ..Default::default()
+        });
+        assert!(type_line(&mut st, "/orch codex").is_empty());
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.contains("It drops 2 queued message(s): all of them without the summary"),
+            "{prompt}"
+        );
+        st.handle_key(key(KeyCode::Char('n')));
+        st.apply_result(
+            "orchestrator.use",
+            &serde_json::json!({"runtime": "codex", "previous": {
+                "dropped_prompts": 2, "dropped_messages": ["and the deploys", "/not a command"]}}),
+        );
+        let h = &st.view.history;
+        assert_eq!(
+            h[h.len() - 2..],
+            ["and the deploys".to_string(), "//not a command".to_string()]
+        );
     }
 
     /// Types `line` on a cleared input line and presses Enter.

@@ -149,6 +149,23 @@ pub fn access_status(r: &Value) -> Option<String> {
     ))
 }
 
+/// What an orchestrator switch or reset (`result`) dropped, for its status line: empty when
+/// nothing; the user's own come back in the history ([`crate::app::AppState::apply_result`]).
+fn dropped_by_switch(result: &Value) -> String {
+    let p = &result["previous"];
+    let Some(n) = p["dropped_prompts"].as_u64().filter(|n| *n > 0) else {
+        return String::new();
+    };
+    let mut out = format!("; dropped {n} queued message(s) the previous one hadn't started");
+    let mine = p["dropped_messages"].as_array().map_or(0, Vec::len);
+    if mine > 0 {
+        out.push_str(&format!(
+            " ({mine} of yours: in the history, ↑ to send again)"
+        ));
+    }
+    out
+}
+
 pub fn result_status(method: &str, result: &Value) -> Option<String> {
     // The hub's advisory on a call that makes, changes, restarts or starts a thread's runtime
     // (its box reports the runtime's CLI missing): said after what was done, alone when
@@ -389,6 +406,7 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                 }
                 None => "conversation cleared; fresh session, no handoff (history kept)".into(),
             };
+            msg.push_str(&dropped_by_switch(result));
             if let Some(w) = result["warning"].as_str() {
                 msg.push_str(&format!("; warning: {w}"));
             }
@@ -413,6 +431,7 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                 _ => rt.to_string(),
             };
             let mut msg = format!("the orchestrator is now {runtime} (a new session{handoff})");
+            msg.push_str(&dropped_by_switch(result));
             if let Some(w) = result["warning"].as_str() {
                 msg.push_str(&format!("; warning: {w}"));
             }
@@ -6076,6 +6095,18 @@ mod tests {
         assert_eq!(
             result_status("orchestrator.use", &json!({"runtime": "codex"})).as_deref(),
             Some("the orchestrator is now codex (a new session)")
+        );
+        assert_eq!(
+            result_status(
+                "orchestrator.use",
+                &json!({"runtime": "codex", "previous": {"dropped_prompts": 2,
+                        "dropped_messages": ["and the deploys"]}})
+            )
+            .as_deref(),
+            Some(
+                "the orchestrator is now codex (a new session); dropped 2 queued message(s) the \
+                 previous one hadn't started (1 of yours: in the history, ↑ to send again)"
+            )
         );
         assert_eq!(
             result_status(

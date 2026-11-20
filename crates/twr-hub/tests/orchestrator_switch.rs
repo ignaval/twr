@@ -488,6 +488,11 @@ async fn switching_runtimes_makes_a_new_orchestrator_each_time() {
     assert_eq!(r["previous"]["runtime"], "claude-code");
     assert_eq!(r["previous"]["model"], "haiku");
     assert_eq!(r["previous"]["dropped_prompts"], 1);
+    // The user's own message the switch dropped comes back whole, to be sent again.
+    assert_eq!(
+        r["previous"]["dropped_messages"],
+        json!(["and the deploys"])
+    );
     let second = r["thread"].as_str().unwrap().to_string();
     assert_ne!(second, first);
     claude.wait_stopped().await;

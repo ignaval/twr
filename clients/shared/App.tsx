@@ -19,6 +19,7 @@ import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
 import { onSaveNow } from "./save-now";
+import { droppedBySwitch, droppedWords, withoutDroppedText } from "./modelPick";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
@@ -1619,7 +1620,13 @@ export default function App({
             params.desktop_cwd = values._cwd;
           }
           const value = await rpc(operation.method!, params);
-          setResult(value);
+          // A switch or reset: what it dropped is said, and the user's own offered back
+          // (`afterSwitch`), never shown as raw text with its files' lines.
+          const switched = ["orchestrator.use", "orchestrator.reset"].includes(
+            operation.method!,
+          );
+          setResult(switched ? withoutDroppedText(value) : value);
+          if (switched) afterSwitch(value);
           setRefresh((n) => n + 1);
           if (operation.method === "orchestrator.access")
             void refreshInfo().catch(() => {});
@@ -2601,6 +2608,27 @@ export default function App({
     const timer = setTimeout(() => setNotice(""), 6000);
     return () => clearTimeout(timer);
   }, [notice]);
+  // An orchestrator switch that dropped queued messages says so, and offers to put the
+  // user's own back in the orchestrator's message box, files and all (as Take back does).
+  const afterSwitch = (result: Json) => {
+    const { count, mine } = droppedBySwitch(result);
+    const words = droppedWords(count, mine.length);
+    if (!words) return;
+    if ("notice" in words) {
+      setNotice(words.notice);
+      return;
+    }
+    const key = workspace + ":orchestrator";
+    setConfirmation({
+      title: words.title,
+      detail: words.detail,
+      action: "Put back",
+      run: () => {
+        for (const message of mine) restoreDraft(key, message);
+        input.current?.focus();
+      },
+    });
+  };
   const loopNavigation = useRef({
     destination,
     section,
@@ -3922,6 +3950,12 @@ export default function App({
                       }}
                       fail={fail}
                       input={input}
+                      queued={
+                        destination
+                          ? 0
+                          : Number(queueInfo.total) || queued.length
+                      }
+                      switched={afterSwitch}
                     />
                   }
                 />
