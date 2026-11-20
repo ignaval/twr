@@ -2976,6 +2976,13 @@
         "advanced": false
       },
       {
+        "key": "effort",
+        "label": "effort",
+        "type": "text",
+        "description": "Reasoning effort, one the runtime takes (`twr orchestrator show --json` lists them under `models`), or `default`: the runtime's own (the default)",
+        "advanced": false
+      },
+      {
         "key": "no-summary",
         "label": "no summary",
         "type": "boolean",
@@ -3004,6 +3011,12 @@
       {
         "key": "model",
         "flag": "--model",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "effort",
+        "flag": "--effort",
         "many": false,
         "separator": false
       },
