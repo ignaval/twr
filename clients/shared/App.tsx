@@ -370,6 +370,8 @@ export default function App({
     const reset = (event: Event) => {
       if ((event as CustomEvent).detail?.hostId === hostId) {
         drafts.update(() => ({}));
+        // The box's files go too: the next save would write their names and paths again.
+        for (const item of uploads.getSnapshot()) void uploads.remove(item.id);
         setJournal(offlineJournal(hostApi, hostId));
         setOfflineNotice("");
       }

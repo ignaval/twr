@@ -1871,6 +1871,26 @@ describe("attached files", () => {
     });
   });
 
+  it("empties the box's files when offline storage is reset, and saves none of them", async () => {
+    await start();
+    await app().type("See attached");
+    await attach();
+    expect(chips()).toHaveLength(1);
+    await app().act(async () => {
+      window.dispatchEvent(
+        new FakeEvent("twr:offline-reset", {
+          detail: { hostId: "composer-test" },
+        }) as unknown as Event,
+      );
+    });
+    await app().settle();
+    expect(chips()).toEqual([]);
+    await app().wait(450);
+    const stored = [...app().host.secure.values()].join("\n");
+    expect(stored).not.toContain("notes.txt");
+    expect(stored).not.toContain("/uploads/");
+  });
+
   it("keeps a taken-back message's files over a restart", async () => {
     await start();
     app().host.queues.w1 = [
