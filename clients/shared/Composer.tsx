@@ -3,7 +3,8 @@
 // as you type: the drafts live in a store outside React state (`Drafts`), and only this
 // component subscribes to the one on screen, so a keystroke re-renders the box, not the
 // whole app. App reads the drafts when it acts on them (sending, slash commands) and
-// writes them when something else fills the box (take back, uploads, the outbox).
+// writes them when something else fills the box (take back, the outbox). Attached files
+// show inside the box (ComposerAttachments) and join the text only as it is sent.
 import {
   useEffect,
   useLayoutEffect,
@@ -16,7 +17,8 @@ import {
 } from "react";
 import { ArrowUp, ChevronDown, Paperclip, X } from "lucide-react";
 import { appendDraft, type OfflineJournal } from "./offline";
-import type { UploadController } from "./uploads";
+import { unfinished, type UploadController } from "./uploads";
+import { ComposerAttachments, attachmentWait } from "./ComposerAttachments";
 import { takesSuggestion, type useAssistance } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { Spinner } from "./ui";
@@ -229,6 +231,20 @@ export function Composer({
   modelPicker?: ReactNode;
 }) {
   const draft = useDraft(drafts, draftKey);
+  // The conversation's attached files: a message carries the uploaded ones (not a
+  // command or a shell line), and waits while any is still on its way.
+  const attached = useSyncExternalStore(
+    uploads.subscribe,
+    uploads.getSnapshot,
+  ).filter(
+    (item) => item.thread === target?.id && item.workspace === workspace,
+  );
+  const carriesFiles =
+    !(draft.startsWith("/") && !draft.startsWith("//")) &&
+    !(draft.startsWith("!") && !draft.startsWith("!!!"));
+  const filesWait = carriesFiles && attached.some(unfinished);
+  const filesReady =
+    carriesFiles && attached.some((item) => item.phase === "ready");
   const [voiceStatusContainer, setVoiceStatusContainer] =
     useState<HTMLDivElement | null>(null);
   const spokenDraft = useSyncExternalStore(drafts.subscribe, () =>
@@ -349,6 +365,11 @@ export function Composer({
             </button>
           )}
         </div>
+        <ComposerAttachments
+          controller={uploads}
+          thread={target?.id}
+          workspace={workspace}
+        />
         <textarea
           ref={input}
           aria-label={
@@ -572,7 +593,8 @@ export function Composer({
               type="submit"
               disabled={
                 !operate ||
-                !draft.trim() ||
+                (!draft.trim() && !filesReady) ||
+                filesWait ||
                 (!connected &&
                   (spokenDraft ||
                     !journal ||
@@ -582,12 +604,15 @@ export function Composer({
                 sending
               }
               aria-label={connected ? "Send message" : "Save message for later"}
+              aria-describedby={filesWait ? "twr-attachment-wait" : undefined}
               title={
-                !connected && spokenDraft
-                  ? "Reconnect to send dictated text"
-                  : connected
-                    ? "Send message"
-                    : "Save on this device until the hub reconnects"
+                filesWait
+                  ? attachmentWait(attached)
+                  : !connected && spokenDraft
+                    ? "Reconnect to send dictated text"
+                    : connected
+                      ? "Send message"
+                      : "Save on this device until the hub reconnects"
               }
             >
               {sending ? <Spinner /> : <ArrowUp size={18} />}

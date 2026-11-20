@@ -6,6 +6,8 @@ import {
 } from "./offline";
 import type { Json, Thread } from "./types";
 import { useHostAPI } from "./host";
+import { splitAttachments } from "./attachmentText";
+import { SentAttachments } from "./ComposerAttachments";
 
 export function Outbox({
   journal,
@@ -81,19 +83,9 @@ export function Outbox({
                   ? "Waiting to send"
                   : "Saved on this device"}
           </b>
-          <p>
-            {String(message.params.prompt || message.params.message).slice(
-              0,
-              300,
-            )}
-          </p>
-          {String(message.params.prompt || message.params.message).length >
-            300 && (
-            <details>
-              <summary>Full message</summary>
-              <p>{String(message.params.prompt || message.params.message)}</p>
-            </details>
-          )}
+          <OutboxText
+            text={String(message.params.prompt || message.params.message)}
+          />
           <small>
             {message.method === "thread.send"
               ? `To ${
@@ -171,4 +163,22 @@ export function Outbox({
       ))}
     </section>
   ) : null;
+}
+
+/** A saved message's text (its first 300 characters, the rest on request) and the files
+ * it names, as chips with the name only. */
+function OutboxText({ text }: { text: string }) {
+  const { body, files } = splitAttachments(text);
+  return (
+    <>
+      {body && <p>{body.slice(0, 300)}</p>}
+      {body.length > 300 && (
+        <details>
+          <summary>Full message</summary>
+          <p>{body}</p>
+        </details>
+      )}
+      <SentAttachments files={files} />
+    </>
+  );
 }

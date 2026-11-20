@@ -1477,29 +1477,6 @@ describe("the message box, at its edges", () => {
     expect(app().box().value).toBe("orchestrator words");
   });
 
-  it("adds an uploaded file's path to the draft", async () => {
-    await start({ uploads: true });
-    await app().type("see");
-    const input = app().find(".attachment-button input") as FakeElement & {
-      files: unknown[];
-    };
-    input.files = [
-      {
-        name: "notes.txt",
-        size: 5,
-        type: "application/octet-stream",
-        slice: () => ({ text: async () => "hello" }),
-      },
-    ];
-    await app().act(async () => {
-      input.dispatchEvent(new FakeEvent("change", { bubbles: true }));
-    });
-    await app().wait(50);
-    expect(app().box().value).toBe(
-      "see\nUploaded file: notes.txt\n/uploads/notes.txt\n",
-    );
-  });
-
   it("shows the drafts saved on the device when it starts again", async () => {
     await start();
     await app().type("survive restart");
@@ -1590,6 +1567,362 @@ describe("the message box, at its edges", () => {
     expect(app().box().value).toBe("queued and more");
     await app().wait(450);
     expect(saved()?.["default:orchestrator"]).toBe("queued and more");
+  });
+});
+
+/* Attached files (docs/attachments.md): they show inside the message box, never as paths, and
+ * a message names them (`Uploaded file: <name>` and the path) only as it is sent. */
+describe("attached files", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: Parameters<typeof mount>[0] = {}) => {
+    vi.resetModules();
+    mounted = await mount({ uploads: true, ...options });
+  };
+  /** Picks a file with the paperclip, and lets its upload finish. */
+  const attach = async (name = "notes.txt", type = "text/plain") => {
+    const input = app().find(".attachment-button input") as FakeElement & {
+      files: unknown[];
+    };
+    input.files = [
+      {
+        name,
+        size: 5,
+        type,
+        slice: () => ({ text: async () => "hello" }),
+      },
+    ];
+    await app().act(async () => {
+      input.dispatchEvent(new FakeEvent("change", { bubbles: true }));
+    });
+    await app().wait(50);
+  };
+  const chips = () =>
+    app()
+      .all(".composer-attachments li")
+      .map((li) => li.textContent);
+  /** Every text and attribute of the message box: where a path must never show. */
+  const shown = () =>
+    app()
+      .all("form.composer, form.composer *")
+      .flatMap((node) => [
+        ...node.attributes
+          .filter((a) => a.name !== "value")
+          .map((a) => a.value),
+      ])
+      .concat(app().find("form.composer").textContent, app().box().value)
+      .join("\n");
+  const sendButton = () => app().find(".send-button");
+  const submit = async () => {
+    await app().act(async () => {
+      app()
+        .find("form.composer")
+        .dispatchEvent(
+          new FakeEvent("submit", { bubbles: true, cancelable: true }),
+        );
+    });
+    await app().settle();
+  };
+
+  it("shows a file inside the box, without its path, and keeps it out of the draft", async () => {
+    await start();
+    await app().type("see");
+    await attach();
+    expect(app().box().value).toBe("see");
+    expect(chips()).toHaveLength(1);
+    expect(chips()[0]).toContain("notes.txt");
+    expect(shown()).not.toContain("/uploads");
+    // The old full-width bar is gone.
+    expect(app().all(".attachment-manager, .attachment-item")).toHaveLength(0);
+    await app().wait(450);
+    expect(JSON.stringify([...app().host.secure.values()])).not.toContain(
+      "/uploads/notes.txt",
+    );
+  });
+
+  it("names the files after the text it sends, then clears them", async () => {
+    await start();
+    await app().type("see");
+    await attach();
+    await app().press("Enter");
+    expect(app().host.sent).toEqual([
+      {
+        method: "say",
+        params: expect.objectContaining({
+          message: "see\nUploaded file: notes.txt\n/uploads/notes.txt",
+        }),
+      },
+    ]);
+    expect(app().box().value).toBe("");
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("sends files with no text, to the conversation they belong to", async () => {
+    await start();
+    await app().talkTo("builder");
+    await attach("a.txt");
+    expect(sendButton().disabled).toBe(false);
+    await app().talkTo("tester");
+    expect(chips()).toHaveLength(0);
+    await app().talkTo("builder");
+    expect(chips()).toHaveLength(1);
+    await submit();
+    expect(app().host.sent).toEqual([
+      {
+        method: "thread.send",
+        params: {
+          thread: "w1",
+          prompt: "Uploaded file: a.txt\n/uploads/a.txt",
+        },
+      },
+    ]);
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("waits, with Send disabled and saying why, while a file uploads", async () => {
+    await start();
+    let finish!: () => void;
+    app().host.uploadFile = (async (file: { name: string }) => {
+      await new Promise<void>((resolve) => (finish = resolve));
+      return { path: "/uploads/" + file.name };
+    }) as any;
+    await app().type("soon");
+    await attach();
+    expect(sendButton().disabled).toBe(true);
+    expect(sendButton().getAttribute("aria-describedby")).toBe(
+      "twr-attachment-wait",
+    );
+    expect(app().find("#twr-attachment-wait").textContent).toContain(
+      "finish uploading",
+    );
+    await app().press("Enter");
+    expect(app().host.sent).toEqual([]);
+    expect(app().box().value).toBe("soon");
+    await app().act(async () => finish());
+    await app().wait(50);
+    expect(sendButton().disabled).toBe(false);
+    await app().press("Enter");
+    expect(app().host.sent[0].params.message).toBe(
+      "soon\nUploaded file: notes.txt\n/uploads/notes.txt",
+    );
+  });
+
+  it("attaches nothing to a composer command or a shell line", async () => {
+    await start();
+    await attach();
+    await app().type("!ls");
+    await app().press("Enter");
+    expect(app().host.sent).toEqual([]);
+    expect(chips()).toHaveLength(1);
+    await app().replace("now");
+    await app().press("Enter");
+    expect(app().host.sent[0].params.message).toBe(
+      "now\nUploaded file: notes.txt\n/uploads/notes.txt",
+    );
+  });
+
+  it("saves the paths with a message kept for later, and shows only the names", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await attach();
+    await app().connection(false);
+    await app().type("later");
+    await app().press("Enter");
+    expect(app().host.sent).toHaveLength(0);
+    expect(chips()).toHaveLength(0);
+    const outbox = app().find(".outbox-message");
+    expect(outbox.textContent).toContain("later");
+    expect(outbox.textContent).toContain("notes.txt");
+    expect(outbox.textContent).not.toContain("/uploads");
+    await app().wait(450);
+    expect([...app().host.secure.values()].join("\n")).toContain(
+      "later\\nUploaded file: notes.txt\\n/uploads/notes.txt",
+    );
+    // Moved back to the draft: the text to the box, the file to the box's files.
+    await app().click(
+      app().find(".outbox-message button", "Move to original draft"),
+    );
+    expect(app().box().value).toBe("later");
+    expect(chips()).toHaveLength(1);
+    expect(shown()).not.toContain("/uploads");
+  });
+
+  it("puts a queued message's files back on Take back, and shows them by name", async () => {
+    await start();
+    app().host.queues.w1 = [
+      {
+        ref: 7,
+        prompt: "queued words\nUploaded file: a.png\n/w/a.png",
+        mine: true,
+      },
+    ];
+    await app().talkTo("builder");
+    const queued = app().find(".queued-message");
+    expect(queued.textContent).toContain("a.png");
+    expect(queued.textContent).not.toContain("/w/a.png");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("queued words");
+    expect(chips()).toEqual([expect.stringContaining("a.png")]);
+    await app().press("Enter");
+    expect(app().host.sent.at(-1)).toEqual({
+      method: "thread.send",
+      params: {
+        thread: "w1",
+        prompt: "queued words\nUploaded file: a.png\n/w/a.png",
+      },
+    });
+  });
+
+  it("sends the orchestrator's files with a hands-free message", async () => {
+    await start({ voice: true });
+    await attach();
+    await app().click(app().find("[data-voice-hands-free]"));
+    await app().act(async () => app().host.voiceEvent({ type: "speechStart" }));
+    await app().act(async () =>
+      app().host.voiceEvent({ type: "final", text: "What is in it?" }),
+    );
+    await app().settle();
+    expect(app().host.sent.at(-1)).toMatchObject({
+      method: "say",
+      params: {
+        voice: true,
+        message: "What is in it?\nUploaded file: notes.txt\n/uploads/notes.txt",
+      },
+    });
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("makes the files part of an implementation loop's task", async () => {
+    const asked: Json[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "loop.request") {
+          asked.push(params);
+          return Promise.resolve({ status: "started", loop: { line: "x" } });
+        }
+        if (method === "loop.get")
+          return Promise.resolve({ started: null, id: "l1" });
+        return undefined;
+      },
+    });
+    await app().talkTo("builder");
+    await attach("spec.md");
+    await app().type("build this");
+    await app().click(app().find(".send-caret"));
+    await app().click(
+      app().find(".send-loop-panel button", "Send as implementation loop"),
+    );
+    expect(asked).toEqual([
+      {
+        thread: "w1",
+        kind: "implement",
+        task: "build this\nUploaded file: spec.md\n/uploads/spec.md",
+      },
+    ]);
+    expect(chips()).toHaveLength(0);
+  });
+});
+
+/* Usage limits (docs/desktop.md › Usage limits): `/usage` opens them above the message box,
+ * the header's gauge in a popover; both read `usage.get` when they open and when the hub's
+ * live view says an account's usage changed. */
+describe("usage limits", () => {
+  let reads = 0;
+  const usage = {
+    now: "2026-11-20T12:00:00Z",
+    runtimes: [
+      {
+        runtime: "claude-code",
+        account: null,
+        label: "Claude",
+        plan: "max",
+        age_secs: 5,
+        stale: false,
+        windows: [
+          {
+            window: "five_hour",
+            label: "5h",
+            used_pct: 80,
+            remaining_pct: 20,
+            minutes: 300,
+          },
+        ],
+      },
+    ],
+  };
+  beforeEach(async () => {
+    vi.resetModules();
+    reads = 0;
+    mounted = await mount({
+      rpc: (method) => {
+        if (method === "usage.get") {
+          reads++;
+          return Promise.resolve(usage);
+        }
+        return undefined;
+      },
+    });
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+
+  it("opens with /usage above the message box, and closes", async () => {
+    expect(reads).toBe(0);
+    await app().type("/usage");
+    await app().press("Enter");
+    const panel = app().find(".usage-panel");
+    expect(panel.textContent).toContain("Usage limits");
+    expect(panel.textContent).toContain("Claude");
+    expect(panel.textContent).toContain("20% left");
+    expect(panel.querySelector(".usage-row")!.getAttribute("data-level")).toBe(
+      "warn",
+    );
+    expect(app().box().value).toBe("");
+    expect(app().host.sent).toEqual([]);
+    expect(reads).toBe(1);
+    await app().click(
+      app().find('.usage-panel button[aria-label="Close usage limits"]'),
+    );
+    expect(app().all(".usage-panel")).toHaveLength(0);
+  });
+
+  it("reads again when the hub's live view says usage changed", async () => {
+    await app().type("/usage");
+    await app().press("Enter");
+    expect(reads).toBe(1);
+    await app().act(async () => {
+      app().host.emit({
+        type: "state",
+        state: {
+          threads: views.default,
+          attention: [],
+          decisions: [],
+          decisions_seen: 0,
+          head: 2,
+          usage: [{ runtime: "claude-code", windows: [] }],
+        },
+      } as DesktopEvent);
+    });
+    await app().wait(60);
+    expect(reads).toBe(2);
+  });
+
+  it("opens from the header's gauge as a popover, with the way to the Usage page", async () => {
+    const gauge = app().find(
+      '.conversation-actions button[aria-label="Usage limits"]',
+    );
+    expect(gauge.getAttribute("aria-expanded")).toBe("false");
+    await app().click(gauge);
+    expect(gauge.getAttribute("aria-expanded")).toBe("true");
+    const popover = app().find(".usage-popover");
+    expect(popover.getAttribute("role")).toBe("dialog");
+    expect(popover.textContent).toContain("20% left");
+    await app().click(app().find(".usage-popover .usage-page-link"));
+    expect(app().all(".usage-popover")).toHaveLength(0);
+    expect(app().find(".manager h1").textContent).toBe("Usage");
+    expect(app().find(".usage-cards").textContent).toContain("20% left");
   });
 });
 

@@ -135,7 +135,7 @@ as code with a copy button instead of a link that does nothing.
 | Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
 | Boxes, SSH/container/dial-in setup, login, projects, tokens | Boxes page and generated interactive CLI forms |
 | Jobs, slots, timeouts, output and cancellation | Jobs table, launch form, live log and cancellation actions |
-| Usage and grouping/time windows | Usage meters and typed reporting form; CLI forms retain duration flags |
+| Usage and grouping/time windows | Usage limits (`/usage` above the message box, the header's gauge, the Usage page) and typed reporting form; CLI forms retain duration flags |
 | Next-message suggestions, routine summaries | Shared hub small-model calls (`suggest.next`, `summary.thread`), first-use disclosure, the suggestion as the empty message box's placeholder taken with Tab or → (tap it on a phone), expandable routine updates |
 | Context and memory | Revision-aware editors, note cards and standing-context editor |
 | Speech, remote sessions, speaker controls | Read-aloud page and embedded CLI forms |
@@ -215,6 +215,13 @@ that (a short one at a large text size, or with a notice above the conversation)
 where the composer still fits, so Send, the microphone and Upload stay in view. It shrinks
 again when the text is deleted or sent.
 
+Files you attach with the paperclip show inside the message box, above the text: an image as
+a 64-pixel tile, any other file as a chip with its name and size, each with a ✕ that cancels
+or removes it. No path shows, and nothing is written into the draft: the message names the
+conversation's uploaded files (`Uploaded file: <name>` and the path) as it is sent, and a sent
+message shows them as chips with the name only. Send waits, disabled and saying why, while a
+file is still uploading. See [thread attachments](attachments.md).
+
 ### Model and effort
 
 The message box's footer row shows, at its right before the microphone and Send, what its
@@ -259,6 +266,30 @@ made elsewhere (by the orchestrator, `twr model`, the TUI) shows as soon as the 
 updates. The command palette's **Change model, runtime or account** and **Switch
 orchestrator** forms still work, and are where accounts are chosen; **Switch orchestrator**
 has a reasoning effort field too.
+
+### Usage limits
+
+How much of each subscription window is left, per runtime and account, as the TUI's status
+bar shows it ([where the numbers come from](runtimes.md#subscription-usage)). Each window is a
+row: its name (`5-hour`, `Weekly`, `Monthly`) and the share left, a bar filled to that share,
+and when it resets (`resets in 2h`; the local time is in its tooltip). A thin tick on the bar
+marks even pace, the share of the window's time still to run, where the share left would be
+if you spent it evenly; it shows only for a window whose length and reset time the runtime
+reports. The bar turns amber at 25% left or less and red at 10% or less. Data 10 minutes old
+or more is dimmed and says its age (`as of 12m ago`). A runtime with several accounts names
+each as threads do (`Claude:work`). Before any session has reported usage, it says so.
+
+- **`/usage`** in the message box opens the limits in a panel above it. Close it with its ✕
+  or Escape.
+- **The gauge** in the conversation's header, beside the read-aloud and tool-call buttons,
+  opens them in a popover. On a phone, **Usage limits** in the conversation's menu opens the
+  panel.
+- **The Usage page** in the side navigation shows them in full, with the usage by thread,
+  project or runtime. The panel and the popover link to it.
+
+The panel and the popover read `usage.get` when they open, again when the hub's live view
+says an account's usage changed (an agent reported new numbers), and once a minute while they
+are open; never while closed.
 
 ### Loops
 

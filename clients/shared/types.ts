@@ -58,6 +58,9 @@ export interface ViewState {
   decisions_seen: number;
   head: number;
   went_on?: string[];
+  /** Every account's latest subscription usage (twr-core `UsageEntry`s), as the hub
+   * folds `account.usage`: its change is the cue to read `usage.get` again. */
+  usage?: Json[];
 }
 export interface HubEvent {
   id: string;

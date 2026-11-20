@@ -951,3 +951,54 @@ select {
   min-height: 44px;
   min-width: 44px;
 }
+/* Attached files (shared/ComposerAttachments.tsx) sit in the message box above the text,
+ * across its width: the text and the controls move down a row. The ✕ on a tile or chip,
+ * and a chip itself, are 44-point targets. */
+[data-mobile="true"] .composer-attachments {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+[data-mobile="true"] .composer:has(> .composer-attachments) > textarea,
+[data-mobile="true"] .composer:has(> .composer-attachments) > .composer-bottom {
+  grid-row: 3;
+}
+[data-mobile="true"]
+  .composer:has(> .composer-attachments)
+  > .composer-voice-status {
+  grid-row: 5;
+}
+@media (max-width: 519px) {
+  [data-mobile="true"]
+    .composer:has(> .composer-attachments)
+    > .composer-bottom {
+    grid-row: 4;
+  }
+}
+[data-mobile="true"][data-fold="vertical"]
+  .composer:has(> .composer-attachments)
+  > .composer-bottom {
+  grid-row: 4;
+}
+[data-mobile="true"] .composer-attachments > ul {
+  max-height: 128px;
+  padding: 8px 8px 0;
+}
+[data-mobile="true"] .attachment-remove {
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+}
+[data-mobile="true"] .attachment-chip {
+  height: 44px;
+}
+[data-mobile="true"] .attachment-chip > .attachment-open {
+  min-height: 44px;
+  padding-right: 44px;
+}
+[data-mobile="true"] .attachment-chip > .attachment-remove {
+  top: 0;
+  right: 0;
+  align-items: center;
+  justify-content: center;
+}

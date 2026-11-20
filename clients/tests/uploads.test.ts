@@ -64,49 +64,91 @@ describe("shared attachment transfers", () => {
     expect(request).not.toHaveBeenCalled();
     expect(progress).not.toHaveBeenCalled();
   });
-  it("keeps previews for paths absent from the sent draft", async () => {
+  it("keeps a conversation's files until a message takes them", async () => {
     vi.stubGlobal("crypto", webcrypto);
     let next = 0;
-    const controller = new UploadController(
-      { uploadFile: async () => ({ path: "/worker/" + ++next }) },
-      () => {},
-    );
-    controller.add([file(), file()], "worker", "work");
-    await vi.waitFor(() =>
-      expect(
-        controller.getSnapshot().filter((item) => item.phase === "ready"),
-      ).toHaveLength(2),
-    );
-    controller.dismissReady("worker", "work", "sent /worker/1 only");
-    expect(controller.getSnapshot().map((item) => item.path)).toEqual([
-      "/worker/2",
-    ]);
-    controller.dispose();
-  });
-  it("releases completed previews before accepting more files", async () => {
-    vi.stubGlobal("crypto", webcrypto);
     const uploaded = vi.fn();
     const controller = new UploadController(
-      { uploadFile: async () => ({ path: "/worker/file" }) },
+      { uploadFile: async () => ({ path: "/worker/" + ++next }) },
       uploaded,
     );
+    controller.add([file(), file()], "worker", "work");
+    controller.add([file()], "other", "work");
+    await vi.waitFor(() =>
+      expect(controller.ready("worker", "work")).toHaveLength(2),
+    );
+    expect(uploaded).toHaveBeenCalledTimes(3);
+    const [first] = controller.ready("worker", "work");
+    controller.take([first.id]);
+    expect(controller.of("worker", "work").map((item) => item.path)).toEqual([
+      controller.ready("worker", "work")[0].path,
+    ]);
+    // Another conversation's files are its own.
+    expect(controller.of("other", "work")).toHaveLength(1);
+    expect(controller.of("worker", "elsewhere")).toHaveLength(0);
+    controller.dispose();
+  });
+  it("never evicts a file waiting for its message to make room", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const controller = new UploadController({
+      uploadFile: async () => ({ path: "/worker/file" }),
+    });
     controller.add(
       Array.from({ length: 8 }, () => file()),
       "worker",
       "work",
     );
     await vi.waitFor(() =>
-      expect(
-        controller.getSnapshot().filter((item) => item.phase === "ready"),
-      ).toHaveLength(8),
+      expect(controller.ready("worker", "work")).toHaveLength(8),
     );
+    expect(() => controller.add([file()], "worker", "work")).toThrow(
+      "at most 8",
+    );
+    expect(controller.of("worker", "work")).toHaveLength(8);
+    // Another conversation still has room.
     expect(() => controller.add([file()], "another", "work")).not.toThrow();
-    await vi.waitFor(() => expect(uploaded).toHaveBeenCalledTimes(9));
-    expect(controller.getSnapshot().length).toBeLessThanOrEqual(8);
-    controller.dismissReady("worker", "work", "/worker/file");
+    controller.take(controller.of("worker", "work").map((item) => item.id));
+    expect(controller.of("worker", "work")).toHaveLength(0);
+    controller.dispose();
+  });
+  it("puts a taken-back message's files back, once, with the preview it still holds", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const controller = new UploadController({
+      uploadFile: async (file) => ({ path: "/w/" + file.name }),
+    });
+    const image = new File(["png"], "a.png", {
+      type: "image/png",
+    }) as unknown as globalThis.File;
+    controller.add([image], "worker", "work");
+    await vi.waitFor(() =>
+      expect(controller.ready("worker", "work")).toHaveLength(1),
+    );
+    const preview = controller.of("worker", "work")[0].image;
+    expect(preview).toMatch(/^blob:/);
+    controller.take([controller.of("worker", "work")[0].id]);
+    // The sent message's chip can still show it.
+    expect(controller.sentImage("/w/a.png")).toBe(preview);
+    controller.restore(
+      [
+        { name: "a.png", path: "/w/a.png" },
+        { name: "b.txt", path: "/w/b.txt" },
+        { name: "a.png", path: "/w/a.png" },
+      ],
+      "worker",
+      "work",
+    );
+    const items = controller.of("worker", "work");
     expect(
-      controller.getSnapshot().filter((item) => item.thread === "worker"),
-    ).toHaveLength(0);
+      items.map((item) => [item.file.name, item.path, item.phase]),
+    ).toEqual([
+      ["a.png", "/w/a.png", "ready"],
+      ["b.txt", "/w/b.txt", "ready"],
+    ]);
+    expect(items.every((item) => item.restored)).toBe(true);
+    expect(items[0].image).toBe(preview);
+    expect(controller.sentImage("/w/a.png")).toBeUndefined();
+    controller.restore([{ name: "b.txt", path: "/w/b.txt" }], "worker", "work");
+    expect(controller.of("worker", "work")).toHaveLength(2);
     controller.dispose();
   });
   it("keeps an already committed file visible after a lost commit acknowledgement is cancelled", async () => {
@@ -144,7 +186,8 @@ describe("shared attachment transfers", () => {
     );
     await controller.remove(controller.getSnapshot()[0].id);
     expect(controller.getSnapshot()[0].phase).toBe("ready");
-    expect(controller.getSnapshot()[0].error).toContain("file kept");
+    expect(controller.getSnapshot()[0].error).toContain("stays attached");
+    expect(controller.getSnapshot()[0].error).not.toContain("/");
     expect(uploaded).not.toHaveBeenCalled();
     controller.dispose();
   });

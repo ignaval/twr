@@ -1,5 +1,6 @@
 import { fileDigest, requestId } from "./remote-crypto";
 import type { Json } from "./types";
+import type { NamedFile } from "./attachmentText";
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 export interface UploadResume {
@@ -205,6 +206,15 @@ export interface Attachment {
   image?: string;
   text?: string;
   textTruncated?: boolean;
+  /** Put back from a message taken back to the draft: the file is not in memory, only
+   * its name and its uploaded copy's path. */
+  restored?: boolean;
+}
+/** The most attachments one conversation holds, and the most uploads unfinished at once. */
+export const MAX_ATTACHMENTS = 8;
+/** Whether an attachment is still on its way: a message waits for it (Send is disabled). */
+export function unfinished(item: Attachment) {
+  return item.phase !== "ready";
 }
 interface UploadHost {
   uploadFile?: UploadFile;
@@ -216,13 +226,21 @@ type Job = {
   running?: Promise<void>;
   cancelled?: boolean;
 };
-/** Queue state is independent of a mounted composer: navigating threads preserves progress. */
+/**
+ * The attachments of every conversation: each belongs to the thread (and workspace) it was
+ * picked in, and stays there, uploaded or not, until a message to that conversation takes
+ * it ([`UploadController.take`]) or you remove it. Queue state is independent of a mounted
+ * composer: navigating threads preserves progress.
+ */
 export class UploadController {
   private jobs = new Map<string, Job>();
   private listeners = new Set<() => void>();
   private snapshot: Attachment[] = [];
   private disposed = false;
   private workspace?: string;
+  /** Image previews of sent attachments, by uploaded path, for the sent message's chips:
+   * the newest few, released as newer ones arrive and on dispose. */
+  private sentImages = new Map<string, string>();
   setWorkspace(workspace: string) {
     this.workspace = workspace;
     for (const job of this.jobs.values())
@@ -231,7 +249,8 @@ export class UploadController {
   }
   constructor(
     private host: UploadHost,
-    private uploaded: (attachment: Attachment) => void,
+    /** Told when an upload finishes. It no longer writes anything into a draft. */
+    private uploaded: (attachment: Attachment) => void = () => {},
   ) {}
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -247,23 +266,18 @@ export class UploadController {
   add(files: File[], thread: string, workspace: string) {
     if (!this.host.uploadFile)
       throw new Error("File uploads are unavailable on this connection");
+    // A ready attachment waits for its message: it is never evicted to make room.
     if (
-      [...this.jobs.values()].filter((job) => job.item.phase !== "ready")
-        .length +
+      this.of(thread, workspace).length + files.length > MAX_ATTACHMENTS ||
+      [...this.jobs.values()].filter((job) => unfinished(job.item)).length +
         files.length >
-      8
+        MAX_ATTACHMENTS
     )
-      throw new Error("Keep at most 8 attachments in the queue");
+      throw new Error(
+        `Attach at most ${MAX_ATTACHMENTS} files at a time: send or remove some first`,
+      );
     if (files.some((file) => file.size > MAX_UPLOAD_BYTES))
       throw new Error("Files can be at most 25 MiB");
-    // Completed previews can be evicted; they never consume pending-upload capacity.
-    for (const [id, job] of this.jobs) {
-      if (this.jobs.size + files.length <= 8) break;
-      if (job.item.phase === "ready") {
-        if (job.item.image) URL.revokeObjectURL(job.item.image);
-        this.jobs.delete(id);
-      }
-    }
     for (const file of files) {
       const item: Attachment = {
         id: requestId(),
@@ -321,19 +335,75 @@ export class UploadController {
     }
     this.emit();
   }
-  dismissReady(thread: string, workspace: string, sentDraft: string) {
-    for (const [id, job] of this.jobs)
-      if (
-        job.item.phase === "ready" &&
-        job.item.thread === thread &&
-        job.item.workspace === workspace &&
-        job.item.path &&
-        sentDraft.includes(job.item.path)
-      ) {
-        if (job.item.image) URL.revokeObjectURL(job.item.image);
-        this.jobs.delete(id);
-      }
+  /** One conversation's attachments, in the order they were picked. */
+  of(thread: string, workspace: string): Attachment[] {
+    return this.snapshot.filter(
+      (item) => item.thread === thread && item.workspace === workspace,
+    );
+  }
+  /** One conversation's uploaded attachments: what its next message carries. */
+  ready(thread: string, workspace: string): Attachment[] {
+    return this.of(thread, workspace).filter(
+      (item) => item.phase === "ready" && item.path,
+    );
+  }
+  /**
+   * Takes these attachments off their conversation: the message that names them was
+   * accepted (sent, queued, or saved on this device). An image's preview is kept for the
+   * sent message's chip.
+   */
+  take(ids: readonly string[]) {
+    for (const id of ids) {
+      const job = this.jobs.get(id);
+      if (!job) continue;
+      this.jobs.delete(id);
+      if (job.item.image && job.item.path)
+        this.keepImage(job.item.path, job.item.image);
+      else if (job.item.image) URL.revokeObjectURL(job.item.image);
+    }
     this.emit();
+  }
+  /**
+   * Puts files a message named back on a conversation, uploaded (a message taken back to
+   * the draft): its next message names them again. A file already there is not added twice.
+   */
+  restore(files: readonly NamedFile[], thread: string, workspace: string) {
+    const known = new Set(this.of(thread, workspace).map((item) => item.path));
+    for (const named of files) {
+      if (known.has(named.path)) continue;
+      known.add(named.path);
+      const item: Attachment = {
+        id: requestId(),
+        file: new File([], named.name),
+        thread,
+        workspace,
+        phase: "ready",
+        loaded: 0,
+        path: named.path,
+        restored: true,
+      };
+      const image = this.sentImages.get(named.path);
+      if (image) {
+        // The conversation's chip owns the preview again.
+        this.sentImages.delete(named.path);
+        item.image = image;
+      }
+      this.jobs.set(item.id, { item });
+    }
+    this.emit();
+  }
+  /** The image preview this client still holds for a sent attachment's path, if any. */
+  sentImage = (path: string): string | undefined => this.sentImages.get(path);
+  private keepImage(path: string, url: string) {
+    const old = this.sentImages.get(path);
+    if (old && old !== url) URL.revokeObjectURL(old);
+    this.sentImages.delete(path);
+    this.sentImages.set(path, url);
+    while (this.sentImages.size > 16) {
+      const [oldest, image] = this.sentImages.entries().next().value!;
+      URL.revokeObjectURL(image);
+      this.sentImages.delete(oldest);
+    }
   }
   private async run(job: Job) {
     try {
@@ -395,7 +465,8 @@ export class UploadController {
           job.cancelled = false;
           job.item.phase = "ready";
           job.item.path = result.path;
-          job.item.error = `Already uploaded; file kept at ${result.path}. Dismiss only removes this preview.`;
+          job.item.error =
+            "Already uploaded, so it stays attached. Remove it again to leave it out of your message.";
           this.emit();
           return;
         }
@@ -417,6 +488,8 @@ export class UploadController {
       job.abort?.abort();
       if (job.item.image) URL.revokeObjectURL(job.item.image);
     }
+    for (const image of this.sentImages.values()) URL.revokeObjectURL(image);
+    this.sentImages.clear();
     this.listeners.clear();
   }
 }

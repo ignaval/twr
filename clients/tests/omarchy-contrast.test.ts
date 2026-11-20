@@ -490,6 +490,7 @@ describe("the stylesheet draws only checked pairs", () => {
   const sheets = [
     "shared/style.css",
     "shared/attachments.css",
+    "shared/usage.css",
     "shared/inbox-search.css",
     "desktop/app-shell.css",
     "desktop/connections.css",
@@ -524,6 +525,8 @@ describe("the stylesheet draws only checked pairs", () => {
     "var(--warning)",
     "var(--thread-color)",
     "var(--destination)",
+    // The usage bars' even-pace tick: a line, nothing to read.
+    "var(--text)",
     "color-mix(in srgb, var(--accent) 90%, var(--text))",
     "color-mix(in srgb, var(--danger) 88%, var(--text))",
     "color-mix(in srgb, var(--destination) 12%, transparent)",

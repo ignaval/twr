@@ -470,8 +470,32 @@ describe("styles that keep controls usable", () => {
       rule(mobile, '[data-mobile="true"] select:not([multiple]):not([size])'),
     ).toContain("height: max(44px");
   });
+  it("gives the phone's attached files 44-point targets inside the message box", () => {
+    const remove = rule(mobile, '[data-mobile="true"] .attachment-remove');
+    for (const size of [
+      "min-width: 44px",
+      "min-height: 44px",
+      "width: 44px",
+      "height: 44px",
+    ])
+      expect(remove).toContain(size);
+    expect(
+      rule(mobile, '[data-mobile="true"] .attachment-chip > .attachment-open'),
+    ).toContain("min-height: 44px");
+    // The files take the box's width, above the text, and wrap rather than overflow.
+    expect(
+      rule(mobile, '[data-mobile="true"] .composer-attachments'),
+    ).toContain("grid-column: 1 / -1");
+    const attachments = readFileSync(
+      join(root, "shared/attachments.css"),
+      "utf8",
+    );
+    expect(attachments).toMatch(
+      /\.composer-attachments > ul \{[^}]*flex-wrap: wrap;/,
+    );
+    expect(attachments).toMatch(/\.attachment-tile \{[^}]*width: 64px;/);
+  });
 });
-
 describe("loop surfaces", () => {
   const css = readFileSync(join(root, "shared/style.css"), "utf8");
   it("lets a long held task scroll inside the setup card, and be scrolled by keyboard", () => {

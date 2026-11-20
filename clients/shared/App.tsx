@@ -7,8 +7,10 @@ import {
 import { TerminalSnapshots } from "./terminalSnapshots";
 import { Outbox } from "./Outbox";
 import { ReadAloudControl } from "./ReadAloudControl";
-import { UploadController } from "./uploads";
-import { AttachmentManager } from "./AttachmentManager";
+import { UploadController, unfinished } from "./uploads";
+import { QueuedText, SentMessage, attachmentWait } from "./ComposerAttachments";
+import { splitAttachments, withAttachments } from "./attachmentText";
+import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
 import { MessageBody } from "./MessageBody";
@@ -76,6 +78,7 @@ import {
   ExternalLink,
   Download,
   Eye,
+  Gauge,
   EyeOff,
   Filter,
   AlertCircle,
@@ -392,22 +395,30 @@ export default function App({
   }, [hostId]);
   const liveView = useRef(false);
   const hasLiveSnapshot = useRef(false);
-  const [uploads] = useState(
-    () =>
-      new UploadController(hostApi, (attachment) => {
-        const key = attachment.workspace + ":" + attachment.thread;
-        const orchKey = attachment.workspace + ":orchestrator";
-        const targetKey =
-          attachment.thread ===
-          currentOrchestrator.current[attachment.workspace]
-            ? orchKey
-            : key;
-        drafts.set(targetKey, (old) =>
-          `${old || ""}\nUploaded file: ${attachment.file.name}\n${attachment.path}\n`.trimStart(),
-        );
-      }),
-  );
+  // Attached files stay on their conversation (ComposerAttachments shows them in the
+  // message box): a message names the uploaded ones as it is sent (`withAttachments`).
+  const [uploads] = useState(() => new UploadController(hostApi));
   const currentOrchestrator = useRef<Record<string, string | undefined>>({});
+  /**
+   * Puts a message's text back in a draft (`key`: `<workspace>:orchestrator` or
+   * `<workspace>:<thread>`), as Take back and the outbox do: the files it names go back on
+   * the conversation as attachments, the rest of its text into the draft.
+   */
+  const restoreDraft = (key: string, text: string) => {
+    if (!text.trim()) return;
+    const { body, files } = splitAttachments(text);
+    const at = key.lastIndexOf(":");
+    const space = key.slice(0, at);
+    const id = key.slice(at + 1);
+    const thread =
+      id === "orchestrator" ? currentOrchestrator.current[space] : id;
+    if (!files.length || !thread) {
+      drafts.set(key, (old) => appendDraft(old, text));
+      return;
+    }
+    uploads.restore(files, thread, space);
+    if (body.trim()) drafts.set(key, (old) => appendDraft(old, body));
+  };
   useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
   // Saves the drafts on this device 350 ms after the last change to any of them, into
@@ -457,6 +468,9 @@ export default function App({
   const [slashCommands, setSlashCommands] = useState<
     { id: string; title: string }[]
   >([]);
+  // `/usage` opens the usage limits above the message box (UsageLimits.tsx); the hub's
+  // live view carries every account's usage, so a change there reads them again.
+  const [usagePanel, setUsagePanel] = useState(false);
   useEffect(() => {
     if (connected)
       void hostApi
@@ -519,6 +533,16 @@ export default function App({
     (method: string, params: Json = {}) => hostApi.rpc(method, params),
     [],
   );
+  const usageRevision = useMemo(
+    () => workspace + ":" + JSON.stringify(view.usage ?? null),
+    [workspace, view.usage],
+  );
+  const composerCommands = useMemo(() => {
+    const listed = slashCommands.length ? slashCommands : commands;
+    return listed.some((command) => command.id === "usage")
+      ? listed
+      : [...listed, { id: "usage", title: "Usage limits: how much is left" }];
+  }, [slashCommands, commands]);
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
   currentOrchestrator.current[workspace] = orchestrator?.id;
   const target = destination
@@ -1605,7 +1629,24 @@ export default function App({
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
     const draft = drafts.get(draftKey);
-    if (!permitted("operate") || !draft.trim() || sending) return;
+    // The conversation's uploaded files go with the message, named after its text
+    // (`withAttachments`); a composer command and a shell line take none. A message waits
+    // while a file is still on its way (Send is disabled, and says why).
+    const attached =
+      target &&
+      !(draft.startsWith("/") && !draft.startsWith("//")) &&
+      !(draft.startsWith("!") && !draft.startsWith("!!!"))
+        ? uploads.of(target.id, workspace)
+        : [];
+    if (attached.some(unfinished)) {
+      announce(attachmentWait(attached));
+      return;
+    }
+    const files = attached.flatMap((item) =>
+      item.path ? [{ id: item.id, name: item.file.name, path: item.path }] : [],
+    );
+    if (!permitted("operate") || (!draft.trim() && !files.length) || sending)
+      return;
     const spoken = drafts.isSpoken(draftKey);
     if (spoken && !connected) return;
     if (spoken && (draft.startsWith("/") || draft.startsWith("!"))) {
@@ -1630,6 +1671,16 @@ export default function App({
     setSending(true);
     const key = draftKey;
     const text = draft.startsWith("//") ? draft.slice(1) : draft;
+    // What is sent, and what the outbox keeps to put back in the draft: with the files.
+    const outgoing = withAttachments(text, files);
+    const kept = withAttachments(draft, files);
+    // Once the message holds them (sent, or saved in the outbox), they leave the box.
+    let taken = false;
+    const takeFiles = () => {
+      if (taken) return;
+      taken = true;
+      uploads.take(files.map((file) => file.id));
+    };
     try {
       let response: Json;
       if (text.startsWith("!") && !text.startsWith("!!!")) {
@@ -1666,9 +1717,9 @@ export default function App({
       } else {
         const method = destination ? "thread.send" : "say";
         const params = destination
-          ? { thread: destination, prompt: text }
+          ? { thread: destination, prompt: outgoing }
           : {
-              message: text,
+              message: outgoing,
               seen_gseq: view.head,
               to: "orchestrator",
               ...(spoken
@@ -1696,7 +1747,7 @@ export default function App({
           clearTimeout(draftSaveTimer.current);
           draftSaveTimer.current = undefined;
           const message = await journal
-            .enqueue(workspace, method, params, draft)
+            .enqueue(workspace, method, params, files.length ? kept : draft)
             .catch((error) => {
               if (pendingEnqueue.current === pending)
                 pendingEnqueue.current = undefined;
@@ -1706,6 +1757,7 @@ export default function App({
               throw error;
             });
           pending.saved = true;
+          takeFiles();
           drafts.set(key, (old) => (old === draft ? "" : old));
           if (connected) response = await journal.deliver(message);
           else response = { saved_offline: true };
@@ -1717,17 +1769,18 @@ export default function App({
         return;
       }
       for (const restored of response.restored_drafts || [])
-        drafts.set(restored.key, (old) => appendDraft(old, restored.text));
+        restoreDraft(restored.key, restored.text);
       if (response.action === "pending") {
-        drafts.set(key, (old) => appendDraft(old, draft));
+        // Files the outbox took go back on the conversation; others never left it.
+        if (taken) restoreDraft(key, kept);
+        else drafts.set(key, (old) => appendDraft(old, draft));
         setSection("attention");
         throw new Error(
           "Message not sent. Review the waiting requests and answer the exact item shown.",
         );
       }
       drafts.set(key, (old) => (old === draft ? "" : old));
-      if (!response.saved_offline && target)
-        uploads.dismissReady(target.id, workspace, draft);
+      takeFiles();
       announce(
         response.saved_offline
           ? "Message saved on this device. It sends when the hub reconnects."
@@ -1757,9 +1810,23 @@ export default function App({
       reviewDictation(key, draft);
       return;
     }
+    // The thread's uploaded files are part of the task, named after its text.
+    const attached = uploads.of(thread.id, workspace);
+    if (attached.some(unfinished)) {
+      announce(attachmentWait(attached));
+      return;
+    }
+    const files = attached.flatMap((item) =>
+      item.path ? [{ id: item.id, name: item.file.name, path: item.path }] : [],
+    );
     let plan: ReturnType<typeof sendAsLoop>;
     try {
-      plan = sendAsLoop(draft);
+      plan = sendAsLoop(
+        (draft.startsWith("/") && !draft.startsWith("//")) ||
+          (draft.startsWith("!") && !draft.startsWith("!!!"))
+          ? draft
+          : withAttachments(draft, files),
+      );
     } catch (error) {
       fail(error);
       return;
@@ -1769,8 +1836,10 @@ export default function App({
       try {
         if (
           await startImplement(thread.id, plan.task ? { task: plan.task } : {})
-        )
+        ) {
           drafts.set(key, (old) => (old === draft ? "" : old));
+          uploads.take(files.map((file) => file.id));
+        }
       } finally {
         setSending(false);
         input.current?.focus();
@@ -1788,11 +1857,17 @@ export default function App({
   // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
   // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
   // not through the offline outbox: it is said now, about what is on screen now.
+  // The orchestrator conversation's uploaded files go with it, as with a typed message;
+  // one still uploading waits for a later message (speech is not held back for it).
   const submitVoice = async (text: string): Promise<Json> => {
     if (!orchestrator)
       throw new Error("Choose an orchestrator before talking to it.");
+    const files = uploads.ready(orchestrator.id, workspace);
     const response = await rpc("say", {
-      message: text,
+      message: withAttachments(
+        text,
+        files.map((item) => ({ name: item.file.name, path: item.path! })),
+      ),
       seen_gseq: view.head,
       to: "orchestrator",
       voice: true,
@@ -1803,6 +1878,8 @@ export default function App({
         "Not sent: review the waiting requests and answer the exact item shown.",
       );
     }
+    if (response.action !== "confirm")
+      uploads.take(files.map((item) => item.id));
     setQueueRefresh((n) => n + 1);
     return response;
   };
@@ -1830,10 +1907,15 @@ export default function App({
     setSending(true);
     try {
       const rawName = text.slice(1).trim().split(/\s/)[0];
+      if (rawName === "usage") {
+        setSection("chat");
+        setUsagePanel(true);
+        drafts.set(draftKey, "");
+        return;
+      }
       const extraRoutes: Record<string, Section> = {
         boxes: "boxes",
         jobs: "jobs",
-        usage: "usage",
         memory: "memory",
         maintenance: "maintenance",
       };
@@ -2233,10 +2315,8 @@ export default function App({
         throw new Error(
           response.message || "This message can no longer be taken back.",
         );
-      drafts.set(
-        draftKey,
-        (old) => (old ? old + "\n\n" : "") + response.prompt,
-      );
+      // Its files go back on the conversation, its text into the draft.
+      restoreDraft(draftKey, String(response.prompt ?? ""));
       setQueueRefresh((n) => n + 1);
       input.current?.focus();
     } catch (error) {
@@ -3261,6 +3341,13 @@ export default function App({
                       <Eye size={16} />
                       Reasoning
                     </button>
+                    <button
+                      disabled={!connected}
+                      onClick={() => setUsagePanel(true)}
+                    >
+                      <Gauge size={16} />
+                      Usage limits
+                    </button>
                     {target && (
                       <button onClick={() => void exportConversation()}>
                         <Download size={16} />
@@ -3372,6 +3459,12 @@ export default function App({
                       rpc={rpc}
                       workspace={workspace}
                       connected={connected}
+                    />
+                    <UsageButton
+                      rpc={rpc}
+                      revision={usageRevision}
+                      connected={connected}
+                      onOpenPage={() => setSection("usage")}
                     />
                     <button
                       className={`icon-button ${showTools ? "on" : ""}`}
@@ -3502,6 +3595,7 @@ export default function App({
                   connected={connected}
                   summaries={assistance.summaries}
                   onError={fail}
+                  sentImage={uploads.sentImage}
                   onVisibleRoutines={setVisibleRoutines}
                   offer={
                     destination &&
@@ -3554,9 +3648,7 @@ export default function App({
                       ...(result.restored_drafts || []),
                       ...(result.restored_draft ? [result.restored_draft] : []),
                     ])
-                      drafts.set(restored.key, (old) =>
-                        appendDraft(old, restored.text),
-                      );
+                      restoreDraft(restored.key, restored.text);
                   }}
                   onCopy={(message) => {
                     const key =
@@ -3565,17 +3657,9 @@ export default function App({
                       (message.method === "say"
                         ? "orchestrator"
                         : message.params.thread);
-                    const text = messageDraft(message);
-                    drafts.set(key, (old) => appendDraft(old, text));
+                    restoreDraft(key, messageDraft(message));
                   }}
                 />
-                {target && (
-                  <AttachmentManager
-                    controller={uploads}
-                    thread={target.id}
-                    workspace={workspace}
-                  />
-                )}
                 {queued.length > 0 && (
                   <section className="queue" aria-label="Queued messages">
                     <div className="eyebrow">
@@ -3587,11 +3671,13 @@ export default function App({
                         className="queued-message"
                         key={message.ref || message.id || i}
                       >
-                        <span>
-                          {message.prompt ||
+                        <QueuedText
+                          text={
+                            message.prompt ||
                             message.message ||
-                            JSON.stringify(message)}
-                        </span>
+                            JSON.stringify(message)
+                          }
+                        />
                         <button
                           disabled={
                             !message.mine || queueBusy.includes(message.ref)
@@ -3675,6 +3761,20 @@ export default function App({
                     </button>
                   </div>
                 )}
+                {usagePanel && (
+                  <UsagePanel
+                    rpc={rpc}
+                    revision={usageRevision}
+                    onClose={() => {
+                      setUsagePanel(false);
+                      input.current?.focus();
+                    }}
+                    onOpenPage={() => {
+                      setUsagePanel(false);
+                      setSection("usage");
+                    }}
+                  />
+                )}
                 <Composer
                   drafts={drafts}
                   draftKey={draftKey}
@@ -3692,9 +3792,7 @@ export default function App({
                   setDestination={setDestination}
                   orchestrator={orchestrator}
                   workers={workers}
-                  slashCommands={
-                    slashCommands.length ? slashCommands : commands
-                  }
+                  slashCommands={composerCommands}
                   shellCwd={shellCwd}
                   assistance={assistance}
                   acceptSuggestion={acceptSuggestion}
@@ -5170,9 +5268,12 @@ const Conversation = memo(function Conversation({
   onVisibleRoutines,
   onError,
   offer,
+  sentImage,
 }: {
   /** The thread whose finished turn with changes the conversation offers a review loop. */
   offer?: Thread;
+  /** The preview this client still holds of a file a message named, by its path. */
+  sentImage?: (path: string) => string | undefined;
   onVisibleRoutines: (threads: string[]) => void;
   onError: (error: unknown) => void;
   summaries: Summary[];
@@ -5317,8 +5418,13 @@ const Conversation = memo(function Conversation({
   const previousIndex = userIndexes.findLast((index) => index < beforeIndex);
   const previousUser =
     previousIndex == null ? undefined : blocks[previousIndex];
+  // A message of files only reads as their names (never their paths).
   const previousUserLine = previousUser
-    ? previousUser.text.split(/\r\n|\r|\n/, 1)[0].trim() || "Blank first line"
+    ? ((sent) =>
+        sent.body.split(/\r\n|\r|\n/, 1)[0].trim() ||
+        (sent.files.length
+          ? "Attached " + sent.files.map((file) => file.name).join(", ")
+          : "Blank first line"))(splitAttachments(previousUser.text))
     : "";
   const boundaryText =
     loading || (earlier && !error && connected)
@@ -5621,10 +5727,17 @@ const Conversation = memo(function Conversation({
                     onExpandedChange={(open) => setOpen(block.id, open)}
                   />
                 </details>
+              ) : block.kind === "user" ? (
+                <SentMessage
+                  text={block.text}
+                  sentImage={sentImage}
+                  expanded={opened.get(block.id) ?? false}
+                  onExpandedChange={(open) => setOpen(block.id, open)}
+                />
               ) : (
                 <MessageBody
                   text={block.text}
-                  clamp={block.kind === "user" || block.kind === "notice"}
+                  clamp={block.kind === "notice"}
                   streaming={block.kind === "assistant" && !!block.pending}
                   threadTags={
                     block.kind === "assistant" && !!target?.is_orchestrator
