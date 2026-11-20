@@ -2963,6 +2963,13 @@
         "advanced": false
       },
       {
+        "key": "effort",
+        "label": "effort",
+        "type": "text",
+        "description": "Reasoning effort, in the runtime's vocabulary (default: the runtime's default)",
+        "advanced": false
+      },
+      {
         "key": "no-summary",
         "label": "no summary",
         "type": "boolean",
@@ -2991,6 +2998,12 @@
       {
         "key": "model",
         "flag": "--model",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "effort",
+        "flag": "--effort",
         "many": false,
         "separator": false
       },
