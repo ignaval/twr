@@ -90,7 +90,7 @@ jobs:
             fi
           fi
           git lfs version
-      - name: Install ALSA's headers (Linux: the audio output of twr's own voices)
+      - name: Install ALSA's headers (Linux, for the audio output of twr's own voices)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
