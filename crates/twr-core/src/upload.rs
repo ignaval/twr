@@ -121,8 +121,12 @@ fn dir_at(parent: &File, name: &str) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 impl Upload {
+    /// Stages a file of `size` bytes as `name`, without the spaces at either end: the apps
+    /// write its path on a message's line (`Uploaded file: <name>`, then the path), and a
+    /// space ending a path would not survive the line. An older app sends a name with them.
     pub fn begin(root: &Path, name: &str, size: usize, expected: &str) -> Result<Self> {
         anyhow::ensure!(size <= MAX_FILE, "Files can be at most 25 MiB");
+        let name = name.trim_matches(' ');
         anyhow::ensure!(
             !name.is_empty()
                 && name.len() <= 120
@@ -350,6 +354,30 @@ impl Drop for Upload {
         }
     }
 }
+/// A message without the whitespace around it, except for an uploaded file's path that
+/// ends it: the apps name a message's files after its text, an `Uploaded file: <name>`
+/// line and then the path's, and that last line is kept exactly, a trailing space too (an
+/// older app stored names ending in one, and the path names that file). Only the line breaks
+/// after it go.
+pub fn trim_message(message: &str) -> &str {
+    let message = message.trim_start();
+    let lines = message.trim_end_matches(['\n', '\r']);
+    let Some((rest, last)) = lines.rsplit_once('\n') else {
+        return message.trim_end();
+    };
+    let named = rest
+        .rsplit('\n')
+        .next()
+        .is_some_and(|line| line.starts_with("Uploaded file: "));
+    let path = last.starts_with('/')
+        || matches!(last.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
+    if named && path {
+        lines
+    } else {
+        message.trim_end()
+    }
+}
+
 /// Requests travel only over an authenticated hub/runner connection. The hub supplies the
 /// thread root and the authenticated caller's scope; a client cannot select a filesystem path.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1178,6 +1206,43 @@ mod tests {
         file.chunk(b"hello").unwrap();
         let path = file.commit().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"hello");
+    }
+    #[test]
+    fn a_path_ending_a_message_is_kept_exactly() {
+        assert_eq!(trim_message("  hello there \n\n"), "hello there");
+        assert_eq!(trim_message(" \n "), "");
+        // An attachment's path ends the message: its trailing space is part of it.
+        assert_eq!(
+            trim_message("see\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt \n"),
+            "see\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt "
+        );
+        assert_eq!(
+            trim_message("Uploaded file: a\r\nC:\\w\\a \r\n"),
+            "Uploaded file: a\r\nC:\\w\\a "
+        );
+        // A path line after anything else is ordinary text, trimmed as before.
+        assert_eq!(trim_message("look at\n/etc/hosts  "), "look at\n/etc/hosts");
+        assert_eq!(
+            trim_message("Uploaded file: a\nnot a path  "),
+            "Uploaded file: a\nnot a path"
+        );
+    }
+
+    #[test]
+    fn names_lose_the_spaces_at_their_ends() {
+        let root = tempdir();
+        let hash = hex::encode(Sha256::digest(b"hello"));
+        let mut file = Upload::begin(root.path(), " notes.txt ", 5, &hash).unwrap();
+        file.chunk(b"hello").unwrap();
+        let path = file.commit().unwrap();
+        assert_eq!(path.file_name().unwrap(), "notes.txt");
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+        for blank in ["   ", " . ", " .. "] {
+            assert!(
+                Upload::begin(root.path(), blank, 0, &hash).is_err(),
+                "{blank:?}"
+            );
+        }
     }
     #[test]
     fn symlink_destination_is_refused() {

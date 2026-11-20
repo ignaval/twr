@@ -311,6 +311,79 @@ describe("shared attachment transfers", () => {
   });
 });
 
+describe("resetting offline storage", () => {
+  it("forgets every file at once, whatever their transfers do next", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    let commit!: () => void;
+    const committing = new Promise<void>((resolve) => (commit = resolve));
+    const uploaded = vi.fn();
+    const cancelUpload = vi.fn(async (resume: UploadResume) => {
+      // Another workspace's transfer can't be cancelled from here; the other one had
+      // committed just before.
+      if (resume.workspace === "other") throw new Error("Workspace changed");
+      return { committed: true, path: "/w/late.txt" };
+    });
+    const controller = new UploadController(
+      {
+        cancelUpload,
+        uploadFile: async (file, thread, options) => {
+          const resume = {
+            id: file.name,
+            thread,
+            workspace: options!.workspace!,
+            sha256: "a".repeat(64),
+            offset: 1,
+          };
+          options?.onProgress?.({
+            phase: "uploading",
+            loaded: 1,
+            total: 5,
+            resume,
+          });
+          if (resume.workspace === "other") {
+            await new Promise((_, reject) =>
+              options!.signal!.addEventListener("abort", () =>
+                reject(new DOMException("paused", "AbortError")),
+              ),
+            );
+          }
+          await committing;
+          return { path: "/w/late.txt" };
+        },
+      },
+      uploaded,
+    );
+    const named = (name: string) =>
+      new File(["hello"], name, {
+        type: "text/plain",
+      }) as unknown as globalThis.File;
+    controller.setWorkspace("other");
+    controller.add([named("paused.txt")], "t", "other");
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot()[0].resume).toBeDefined(),
+    );
+    // Switching away pauses it.
+    controller.setWorkspace("w");
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot()[0].phase).toBe("paused"),
+    );
+    controller.add([named("late.txt")], "t", "w");
+    controller.restore([{ name: "kept.txt", path: "/w/kept.txt" }], "t", "w");
+    await vi.waitFor(() =>
+      expect(controller.of("t", "w")[0].resume).toBeDefined(),
+    );
+    controller.clear();
+    expect(controller.getSnapshot()).toEqual([]);
+    commit();
+    await vi.waitFor(() => expect(cancelUpload).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(controller.getSnapshot()).toEqual([]);
+    expect(controller.committed()).toEqual({});
+    expect(uploaded).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+});
+
 describe("a conversation's attachments and its messages", () => {
   /** A controller whose uploads finish when `finish` is called, in order. */
   const held = () => {

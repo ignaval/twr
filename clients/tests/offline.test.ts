@@ -9,6 +9,7 @@ import {
   recordSize,
 } from "../shared/offline";
 import { MessageReceipts } from "../desktop/message-receipts";
+import { withAttachments } from "../shared/attachmentText";
 import type { DesktopAPI } from "../shared/types";
 
 function storage() {
@@ -251,6 +252,65 @@ describe("encrypted offline recovery", () => {
     });
     expect(journal.snapshot.drafts["work:w1"]).toBe("");
     expect(journal.snapshot.draftFiles).toEqual({});
+  });
+  it("keeps every file a message moved back puts on its draft, over a restart", async () => {
+    const disk = storage();
+    const host = {
+      ...disk,
+      sendMessage: async () => ({}),
+    } as unknown as DesktopAPI;
+    const journal = new OfflineJournal(host, "many-files");
+    const of = (prefix: string) =>
+      Array.from({ length: 8 }, (_, i) => ({
+        name: `${prefix}${i}.txt`,
+        path: `/w/${prefix}${i}.txt`,
+      }));
+    const queued = withAttachments("queued", of("q"));
+    const message = await journal.enqueue(
+      "work",
+      "thread.send",
+      { thread: "w1", prompt: queued },
+      queued,
+    );
+    // Eight more files were attached meanwhile: the box's limit for new ones.
+    await journal.drafts({}, journal.epoch, {}, { "work:w1": of("box") });
+    await journal.moveToDraft(message.id);
+    expect(journal.snapshot.outbox).toEqual([]);
+    expect(journal.snapshot.draftFiles!["work:w1"]).toHaveLength(16);
+    const reopened = new OfflineJournal(host, "many-files");
+    await reopened.load();
+    expect(reopened.snapshot.draftFiles).toEqual({
+      "work:w1": [...of("box"), ...of("q")],
+    });
+  });
+  it("takes from the draft only the files the queued message names", async () => {
+    const disk = storage();
+    const journal = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "reserved-files",
+    );
+    const a = { name: "a.txt", path: "/w/a.txt" };
+    const b = { name: "b.txt", path: "/w/b.txt" };
+    await journal.drafts(
+      {},
+      journal.epoch,
+      {},
+      { "work:orchestrator": [a, b] },
+    );
+    // A hands-free message holds both: a typed one goes to the outbox with neither.
+    await journal.enqueue("work", "say", { message: "typed" }, "typed");
+    expect(journal.snapshot.draftFiles).toEqual({
+      "work:orchestrator": [a, b],
+    });
+    const one = withAttachments("one", [a]);
+    await journal.enqueue("work", "say", { message: one }, one);
+    expect(journal.snapshot.draftFiles).toEqual({ "work:orchestrator": [b] });
+    const reopened = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "reserved-files",
+    );
+    await reopened.load();
+    expect(reopened.snapshot.draftFiles).toEqual({ "work:orchestrator": [b] });
   });
   it("marks expiry during a session and definite rejections for review", async () => {
     const disk = storage();

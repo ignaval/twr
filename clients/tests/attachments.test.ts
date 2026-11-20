@@ -16,7 +16,7 @@ import {
   attachmentWait,
   uploadPercent,
 } from "../shared/ComposerAttachments";
-import type { Attachment } from "../shared/uploads";
+import { filename, type Attachment } from "../shared/uploads";
 
 const named = [
   { name: "shot.png", path: "/home/me/.twr-uploads/a/shot.png" },
@@ -82,6 +82,31 @@ describe("a message's attachment lines", () => {
       });
     }
     expect(lineName("\n\r")).toBe("attachment");
+  });
+
+  it("uploads a name without spaces at its ends, and reads an older path exactly", () => {
+    expect(filename({ name: " notes.txt " })).toBe("notes.txt");
+    expect(filename({ name: "my notes.txt" })).toBe("my notes.txt");
+    expect(filename({ name: "   " })).toBe("attachment");
+    expect(filename({ name: " . " })).toBe("attachment");
+    // Cut to 120 bytes at a space: the space goes too.
+    expect(filename({ name: "a".repeat(119) + " b" })).toBe("a".repeat(119));
+    // An older app stored `notes.txt `: that path, space and all, is the file's.
+    const legacy = { name: "notes.txt ", path: "/w/.twr-uploads/1/notes.txt " };
+    const sent = withAttachments("see", [legacy]);
+    expect(splitAttachments(sent)).toEqual({
+      body: "see",
+      files: [{ name: "notes.txt", path: legacy.path }],
+    });
+    expect(splitAttachments(sent + "\nafter").files).toEqual([
+      { name: "notes.txt", path: legacy.path },
+    ]);
+    // A path line holding a tab or a carriage return is still text.
+    for (const text of [
+      "Uploaded file: a\n/w/a\tb",
+      "Uploaded file: a\r\n/w/a\r",
+    ])
+      expect(splitAttachments(text)).toEqual({ body: text, files: [] });
   });
 
   it("names kinds and sizes for the chips", () => {

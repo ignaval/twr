@@ -137,26 +137,34 @@ export function activateOfflineHost(hostId: string) {
 function blank(): OfflineRecord {
   return { version: 1, drafts: {}, workspaces: {}, outbox: [] };
 }
-/** Saved draft files that are well formed: a list of names and paths per key. */
+/**
+ * Saved draft files that are well formed: a list of names and paths per key, each path
+ * once. All of them, however many: a message taken back may put a conversation over the
+ * box's limit for new files (`MAX_ATTACHMENTS`), and what it put back stays.
+ */
 function draftFilesOf(value: unknown): Record<string, NamedFile[]> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>)
-      .map(([key, files]): [string, NamedFile[]] => [
-        key,
-        Array.isArray(files)
-          ? files
-              .filter(
-                (file): file is NamedFile =>
-                  !!file &&
-                  typeof file.name === "string" &&
-                  typeof file.path === "string" &&
-                  !!file.path,
-              )
-              .slice(0, 8)
-              .map(({ name, path }) => ({ name, path }))
-          : [],
-      ])
+      .map(([key, files]): [string, NamedFile[]] => {
+        const seen = new Set<string>();
+        return [
+          key,
+          Array.isArray(files)
+            ? files
+                .filter(
+                  (file): file is NamedFile =>
+                    !!file &&
+                    typeof file.name === "string" &&
+                    typeof file.path === "string" &&
+                    !!file.path &&
+                    !seen.has(file.path) &&
+                    !!seen.add(file.path),
+                )
+                .map(({ name, path }) => ({ name, path }))
+            : [],
+        ];
+      })
       .filter(([, files]) => files.length),
   );
 }
@@ -533,12 +541,18 @@ export class OfflineJournal {
         throw new Error("Outbox is full (100 messages)");
       const key =
         workspace + ":" + (method === "say" ? "orchestrator" : params.thread);
-      // The message names the conversation's files now: they leave its draft with the text.
-      const { [key]: _, ...draftFiles } = record.draftFiles || {};
+      // The files the message names leave its draft with the text. Only those: another
+      // message on its way (a hands-free one) may hold the others, and they stay saved
+      // until it takes them.
+      const sent = new Set(
+        splitAttachments(messageDraft(message)).files.map((file) => file.path),
+      );
+      const { [key]: saved = [], ...draftFiles } = record.draftFiles || {};
+      const kept = saved.filter((file) => !sent.has(file.path));
       return {
         ...record,
         drafts: { ...record.drafts, [key]: "" },
-        draftFiles,
+        draftFiles: kept.length ? { ...draftFiles, [key]: kept } : draftFiles,
         outbox: [...record.outbox, message],
       };
     });

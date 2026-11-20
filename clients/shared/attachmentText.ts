@@ -11,9 +11,13 @@ export interface NamedFile {
 
 const PREFIX = "Uploaded file: ";
 
-/** A path line as uploads write it: absolute on the box (POSIX or a Windows drive). */
+/**
+ * A path line as uploads write it: absolute on the box (POSIX or a Windows drive), on one
+ * line. Taken exactly as it is, trailing spaces too: an older app stored a name ending in
+ * one (`notes.txt `), and that is its file's path.
+ */
 function isPath(line: string) {
-  return /^(?:\/|[A-Za-z]:[\\/])\S/.test(line) && line.trim() === line;
+  return /^(?:\/|[A-Za-z]:[\\/])\S[^\p{Cc}]*$/u.test(line);
 }
 
 /**

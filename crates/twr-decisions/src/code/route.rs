@@ -40,7 +40,7 @@ type RuleResult = Option<Option<RouteOutcome>>;
 
 /// Applies the code routing rules. `None` = abstain.
 pub fn route(ctx: &RouteContext) -> Option<RouteOutcome> {
-    let msg = ctx.message.trim();
+    let msg = twr_core::upload::trim_message(&ctx.message);
     if msg.is_empty() {
         return None;
     }
@@ -86,7 +86,7 @@ fn new_thread(msg: &str) -> RuleResult {
     }
     Some(Some(RouteOutcome::NewThreadRequest {
         project: project.to_string(),
-        message: body.trim().to_string(),
+        message: twr_core::upload::trim_message(body).to_string(),
     }))
 }
 
@@ -157,7 +157,7 @@ fn address_forms(msg: &str) -> Vec<(&str, &str, bool, bool)> {
 /// see the module docs), if any. An unknown target is not an address; the first form whose
 /// target resolves (or is ambiguous) wins.
 pub fn addressee<'a>(ctx: &'a RouteContext, msg: &'a str) -> Option<Addressee<'a>> {
-    let msg = msg.trim();
+    let msg = twr_core::upload::trim_message(msg);
     for (target, body, prefix, at) in address_forms(msg) {
         match ctx.resolve(target, prefix) {
             Ok(thread) => {
@@ -179,7 +179,7 @@ pub fn addressee<'a>(ctx: &'a RouteContext, msg: &'a str) -> Option<Addressee<'a
 /// Sends to an addressed thread: an empty body abstains; a strict answer to the thread's open
 /// item answers it; an attempt at one that is not strict abstains.
 fn send_addressed(thread: &ThreadInfo, body: &str) -> Option<RouteOutcome> {
-    let body = body.trim();
+    let body = twr_core::upload::trim_message(body);
     if body.is_empty() {
         return None;
     }

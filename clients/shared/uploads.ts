@@ -29,10 +29,16 @@ export type UploadFile = (
 ) => Promise<{ path: string }>;
 export type UploadRequest = (method: string, params: Json) => Promise<any>;
 const paused = () => new DOMException("Upload paused", "AbortError");
-function filename(file: File) {
+/**
+ * The name the hub stores a file under: letters, digits and `_. -`, at most 120 bytes, and
+ * no space at either end, since the path ends a message's line (`Uploaded file:`) and a
+ * space there would not survive it.
+ */
+export function filename(file: Pick<File, "name">) {
   let name = file.name.normalize("NFC").replace(/[^\p{L}\p{N}_. -]/gu, "_");
   while (new TextEncoder().encode(name).length > 120)
     name = Array.from(name).slice(0, -1).join("");
+  name = name.replace(/^ +| +$/g, "");
   return !name || name === "." || name === ".." ? "attachment" : name;
 }
 async function base64(blob: Blob): Promise<string> {
@@ -566,6 +572,29 @@ export class UploadController {
     this.jobs.delete(id);
     this.reserved.delete(id);
     this.emit();
+  }
+  /**
+   * Forgets every attachment at once (Reset offline storage): they leave the box now,
+   * whatever their transfers do. A transfer on its way is stopped and cancelled on the hub
+   * when it can be, but nothing that comes back puts one in the box again: not an upload
+   * that finished meanwhile, nor a cancellation that failed or found it committed.
+   */
+  clear() {
+    const jobs = [...this.jobs.values()];
+    this.jobs.clear();
+    this.reserved.clear();
+    for (const job of jobs) {
+      job.cancelled = true;
+      job.abort?.abort();
+      if (job.item.image) URL.revokeObjectURL(job.item.image);
+    }
+    this.emit();
+    for (const job of jobs)
+      void (async () => {
+        await job.running;
+        if (job.item.resume && !job.item.path)
+          await this.host.cancelUpload?.(job.item.resume);
+      })().catch(() => {});
   }
   dispose() {
     this.disposed = true;
