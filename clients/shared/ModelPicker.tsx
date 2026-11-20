@@ -205,6 +205,13 @@ export function ModelPicker({
           ? undefined
           : optionId("models", nav.model)
         : optionId("efforts", nav.effort);
+  // The highlighted row stays in view as the keys move it (the search keeps the focus, so
+  // the list would not scroll by itself), in the rail and the efforts too, and as the
+  // popup opens on the row in effect.
+  useEffect(() => {
+    if (!open || !active) return;
+    document.getElementById(active)?.scrollIntoView?.({ block: "nearest" });
+  }, [open, active]);
   // The focus on a row (no search to hold it: a runtime that runs its own command line)
   // follows the highlighted one.
   useEffect(() => {

@@ -8042,11 +8042,13 @@ impl AppState {
         }
         let Some((thread, name)) = m.thread.clone() else {
             // The orchestrator: its runtime and model (and for a switch, its effort) are
-            // chosen.
+            // chosen. With no effort to pick (an ACP agent's, which the catalog doesn't list),
+            // a switch on the same runtime keeps the effort in effect: `orchestrator.use`
+            // without one would start the new session at the runtime's default.
             let runtime = m.runtime.clone();
             let (value, effort) = match m.chosen.take() {
                 Some(model) => (model, value),
-                None => (value, None),
+                None => (value, m.current_effort.clone()),
             };
             self.view.picker = None;
             let shown = orch_label(&runtime, &self.accounts);
@@ -16867,6 +16869,52 @@ pub(crate) mod tests {
                 "orchestrator.use",
                 serde_json::json!({"runtime": "codex", "effort": "high"})
             ))
+        );
+    }
+
+    /// An orchestrator on an ACP agent, whose efforts the catalog doesn't list: changing only
+    /// its model keeps the effort it runs at (`orchestrator.use` without one would reset it
+    /// to the agent's default). Another runtime starts at that runtime's default.
+    #[test]
+    fn the_orch_picker_keeps_an_acp_effort_on_a_model_change() {
+        let mut st = three_threads();
+        let mut o = ThreadScript::new("t-orch");
+        o.at(40);
+        let mut created = o.created("orch");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "acp".into();
+            p.ext = serde_json::json!({"twr": {
+                "role": "orchestrator", "model": "m1", "effort": "Deep",
+                "acp_command": "my-agent --acp",
+            }})
+            .as_object()
+            .cloned();
+        }
+        control(&mut st, &[created]);
+        let mut choices = catalog();
+        choices["acp"] = serde_json::json!({"models": [{"id": "m1"}, {"id": "m2"}]});
+        st.view.model_choices = choices;
+        assert_eq!(
+            st.orchestrator().and_then(|o| o.effort.as_deref()),
+            Some("Deep")
+        );
+        st.handle_key(mods(KeyCode::Char('m'), KeyModifiers::ALT));
+        let m = st.view.picker.as_ref().unwrap().step.clone().unwrap();
+        assert_eq!(m.runtime, "acp");
+        assert!(m.efforts.is_empty());
+        // m2, the row after m1.
+        st.handle_key(key(KeyCode::Down));
+        assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(prompt.contains("(m2, effort Deep)"), "{prompt}");
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('y'))),
+            [Action::UseOrchestrator {
+                runtime: "acp".into(),
+                model: Some("m2".into()),
+                effort: Some("Deep".into()),
+                summary: true,
+            }]
         );
     }
 

@@ -20,10 +20,13 @@
 //! again); when it ends, a new line waits a full grace. A failed turn fires nothing, on its report or when its tasks end (its error
 //! card already notifies, and an automatic retry may follow); neither do reports written by
 //! the orchestrator or a user. A rewrite of an interim report stays interim while the turn's
-//! tasks run (`Hub::write_report`), so the worker going idle still fires. A loop's report (a
-//! review pass or loop ended, `ext.twr.loop` with `step: report`) fires only watches without `repeat`: a
-//! standing rule ("review every worker's work") fired on the finish the loop followed, and
-//! firing it on the loop's own report would start a pass on that pass.
+//! tasks run (`Hub::write_report`), so the worker going idle still fires. A loop's steps fire
+//! nothing, on their reports or idle: the loop's report (`ext.twr.loop` with `step: report`)
+//! is the finish. A review loop's or pass's report fires only watches without `repeat`: a
+//! standing rule ("review every worker's work") fired on the finish the review followed, and
+//! firing it on the review's own report would start a pass on that pass. An implementation
+//! loop's report is the finish of the work it did and fires every watch; its notice line says
+//! `kind=implement`, so a standing review rule knows the loop reviewed it.
 //!
 //! Firing queues a notice line ([`super::orch`]) with the report, the watch id and its note;
 //! a non-success report's own notice line carries them instead. A notice turn fires a watch
@@ -172,7 +175,8 @@ impl Core {
         let Some(v) = self
             .registry
             .get(&ev.thread)
-            .filter(|v| !v.is_orchestrator() && !v.has_work() && v.reported)
+            // A loop's step: the loop goes on, and its report is the finish.
+            .filter(|v| !v.is_orchestrator() && !v.has_work() && v.reported && v.r#loop.is_none())
         else {
             return;
         };

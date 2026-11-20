@@ -873,7 +873,7 @@ Details:
   its start line in the orchestrator's conversation says `…, which the orchestrator asked
   for`, and `loop.get`'s `started.requested_by` says it. Its rounds and phases stay routine
   updates. Its end is a notice line, whatever the grade: the loop's last report (`- thread=<name>
-  report turn=<n> loop=<id> ended … summary="review loop clean after 2 rounds; report: <path>"`), or, for one that
+  report turn=<n> loop=<id> kind=<kind> ended … summary="review loop clean after 2 rounds; report: <path>"`), or, for one that
   failed without a report, `- thread=<name> loop=<id> ended outcome=failed reason=…` (urgent);
   a stuck item is an urgent notice as any `error` item is. A setup card queues no notice (as
   a question does: the conversation shows it). The orchestrator may stop a loop
@@ -1580,10 +1580,12 @@ Behaviors worth knowing when you follow the stream:
   wake's record drops it. A failed turn,
   and a report the orchestrator or a user wrote, fire nothing (an idle worker fires only after
   a turn that completed; a rewrite of an interim report stays interim while the turn's tasks
-  run). A loop's report (a review pass or loop ended: its notice line says `loop=<id> ended`)
-  fires watches without `repeat` only: a repeating watch, a standing rule such as "review
-  every worker's work", fired on the finish the loop followed, and firing it on the loop's own
-  report would start a pass on that pass. Firing adds ` watch=<id> note="<note>"` to the report's notice line (or queues one for
+  run). A loop's steps fire nothing, on their reports or idle; its report (the loop ended:
+  its notice line says `loop=<id> kind=<review|implement> ended`) is the finish. A review
+  pass's or review loop's report fires watches without `repeat` only: a repeating watch, a
+  standing rule such as "review every worker's work", fired on the finish the review followed,
+  and firing it on the review's own report would start a pass on that pass. An implementation
+  loop's report fires every watch (it is the finish of the loop's work; the loop reviewed it). Firing adds ` watch=<id> note="<note>"` to the report's notice line (or queues one for
   a success report), so the orchestrator gets a notice turn. A notice turn shows at most 40
   lines and leaves the rest queued for the next one; a watch without `repeat` fires on the
   first line that carries it only. Its `turn.started` records what it chose:

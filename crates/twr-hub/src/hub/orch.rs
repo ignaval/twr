@@ -143,10 +143,12 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::config::{Config, OrchestratorAccess};
 use twr_core::event::*;
+use twr_core::loops::LoopKind;
 use twr_core::proto::{codes, RpcError};
 use twr_core::reduce::ThreadStatus;
 use twr_core::reduce::{AttentionItem, ThreadView};
@@ -395,6 +397,20 @@ fn asked_by_orchestrator(v: &ThreadView, id: &str) -> bool {
         _ => return false,
     };
     by == twr_core::loops::ControlBy::Orchestrator
+}
+
+/// The kind of the loop whose report carries `mark` (`ext.twr.loop`): its `kind`, else (a log
+/// from before the mark said it) the thread's loop of that id, running or last, else review.
+fn loop_kind(v: &ThreadView, mark: &Value) -> LoopKind {
+    if let Some(kind) = mark.get("kind").and_then(|k| LoopKind::deserialize(k).ok()) {
+        return kind;
+    }
+    let id = mark["id"].as_str().unwrap_or_default();
+    match (&v.r#loop, &v.last_loop) {
+        (Some(l), _) if l.id == id => l.kind,
+        (_, Some(l)) if l.id == id => l.kind,
+        _ => LoopKind::Review,
+    }
 }
 
 /// Whether `turn.started` is a hub notice (`ext.twr.notice = true`).
@@ -2344,14 +2360,18 @@ impl Core {
                 }
                 // The hub's report of a turn that completed is a finish: it fires the thread's
                 // watches (`hub::watches`). A failed turn's error card notifies anyway. A
-                // loop's report (the loop ended) fires no repeating watch: a standing rule such
-                // as "review every worker's work" fired on the finish the loop followed, and
-                // firing again on the loop's own end would start a pass on that pass.
+                // review loop's or pass's report fires no repeating watch: a standing rule such
+                // as "review every worker's work" fired on the finish the review followed, and
+                // firing again on the review's own end would start a pass on that pass. An
+                // implementation loop's report is the finish of the work it did (its steps'
+                // reports fired nothing, above): it fires every watch, and its line says the
+                // kind, so a standing review rule knows the loop reviewed that work.
                 let loop_id = loop_mark.and_then(|l| l["id"].as_str());
+                let kind = loop_mark.map(|l| loop_kind(view, l));
                 let hits =
                     if p.written_by == "hub" && watch::turn_completed(view, p.turn.or(ev.turn)) {
                         let mut hits = self.matching_watches(&ev.thread);
-                        if loop_mark.is_some() {
+                        if kind == Some(LoopKind::Review) {
                             hits.retain(|w| !w.repeat);
                         }
                         hits
@@ -2371,7 +2391,10 @@ impl Core {
                     .and_then(|t| t.get(report::REPLY_SEQ_KEY))
                     .and_then(Value::as_u64)
                     .map_or(String::new(), |s| format!(" {}={s}", report::REPLY_SEQ_KEY));
-                let ended = loop_id.map_or(String::new(), |id| format!(" loop={id} ended"));
+                let ended = loop_id.map_or(String::new(), |id| {
+                    let kind = kind.unwrap_or_default().as_str();
+                    format!(" loop={id} kind={kind} ended")
+                });
                 let excerpt = twr_ext(&p.ext)
                     .and_then(|t| t.get("reply_excerpt"))
                     .and_then(Value::as_str)
@@ -5120,8 +5143,8 @@ mod tests {
         let (text, _) = notice_now(&hub).unwrap();
         assert!(
             text.contains(&format!(
-                "- thread=api report turn=3 loop=L1 ended grade=success summary=\"review pass: \
-                 done\" watch={once} "
+                "- thread=api report turn=3 loop=L1 kind=review ended grade=success summary=\"review \
+                 pass: done\" watch={once} "
             )),
             "{text}"
         );
@@ -5132,6 +5155,114 @@ mod tests {
         let (text, _) = notice_now(&hub).unwrap();
         assert!(text.contains(&format!("watch={standing} ")), "{text}");
         assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![standing]));
+        drop(hub);
+    }
+
+    /// A loop's report, `kind` its loop's kind, or none (a log from before the mark said it).
+    fn loop_report(hub: &Hub, turn: u64, id: &str, kind: Option<&str>) {
+        let append = |turn: Option<u64>, body: EventBody| {
+            hub.append("api", turn, Source::Hub, body, None).unwrap();
+        };
+        let mut mark = json!({"id": id, "step": "report"});
+        if let Some(kind) = kind {
+            mark["kind"] = json!(kind);
+        }
+        append(Some(turn), EventBody::TurnStarted(TurnStarted::default()));
+        append(Some(turn), EventBody::TurnEnded(TurnEnded::default()));
+        append(
+            Some(turn),
+            EventBody::ReportReady(ReportReady {
+                summary: "implementation loop clean".into(),
+                grade: Grade::Success,
+                turn: Some(turn),
+                written_by: "hub".into(),
+                ext: twr_ext_map(json!({ LOOP_REPORT_KEY: mark })),
+                ..Default::default()
+            }),
+        );
+    }
+
+    /// An implementation loop's report is the finish of the work it did (its steps fired
+    /// nothing): it fires repeating watches too, such as "send each finished branch to the
+    /// integrator", and its line says the kind, so a standing review rule knows the loop
+    /// reviewed that work. A log whose mark has no kind takes it from the thread's loop.
+    #[tokio::test]
+    async fn an_implementation_loop_report_fires_repeating_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let standing = set_watch(&hub, "*", true);
+        loop_report(&hub, 1, "L1", Some("implement"));
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(
+            text.contains(&format!(
+                "- thread=api report turn=1 loop=L1 kind=implement ended grade=success \
+                 summary=\"implementation loop clean\" watch={standing} "
+            )),
+            "{text}"
+        );
+
+        // The thread's loop says the kind.
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "L2".into(),
+                kind: LoopKind::Implement,
+                profile: twr_core::loops::config::Profile::builtin("low").unwrap(),
+                ..Default::default()
+            })),
+            None,
+        )
+        .unwrap();
+        loop_report(&hub, 2, "L2", None);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(
+            text.contains(" loop=L2 kind=implement ended ") && text.contains(&standing),
+            "{text}"
+        );
+        // A review loop's, with no kind and no loop of that id: a review.
+        loop_report(&hub, 3, "L3", None);
+        assert_eq!(hub.inner.core().notice_turn(Utc::now()), None);
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![standing]));
+        drop(hub);
+    }
+
+    /// A loop's step that ends with background work and goes idle fires no watch: the loop
+    /// goes on, and its report is the finish.
+    #[tokio::test]
+    async fn a_loop_step_going_idle_fires_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let w1 = set_watch(&hub, "api", true);
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "L1".into(),
+                kind: LoopKind::Implement,
+                profile: twr_core::loops::config::Profile::builtin("low").unwrap(),
+                ..Default::default()
+            })),
+            None,
+        )
+        .unwrap();
+        assert!(hub.inner.core().view("api").unwrap().r#loop.is_some());
+        worker_turn(
+            &hub,
+            "api",
+            1,
+            TurnFrom::User,
+            TurnResult::Completed,
+            Grade::Success,
+            &["tests"],
+        );
+        hub.append("api", None, Source::Hub, task_updated("tests", false), None)
+            .unwrap();
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![w1]));
         drop(hub);
     }
 

@@ -124,6 +124,27 @@ function WindowRow({
   );
 }
 
+/**
+ * The Usage page's limits: `data`, a `usage.get` answer read at `fetchedAt`, as it is now.
+ * The clock goes on between reads and while a read fails, as in the panel and the popover:
+ * countdowns, ages and pace advance, and a window that has reset since goes.
+ */
+export function UsagePage({
+  data,
+  fetchedAt,
+}: {
+  data: Json;
+  fetchedAt: number;
+}) {
+  // Redrawn every tick; the page's own reads redraw it too.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const tick = setInterval(() => setTick((n) => n + 1), TICK_MS);
+    return () => clearInterval(tick);
+  }, []);
+  return <UsageLimits accounts={accountsOf(data, Date.now(), fetchedAt)} />;
+}
+
 /** Every account's windows, or why there are none. */
 export function UsageLimits({
   accounts,

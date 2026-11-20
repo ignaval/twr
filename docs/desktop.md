@@ -245,7 +245,8 @@ message box:
 The focus starts in the search. ↑ and ↓ move, Enter picks a model, and the highlight moves
 on to the efforts with the popup still open; Enter or a click on an effort applies both at
 once. ← and → move between the columns, ← from an empty search to the runtimes. **Done**
-applies what is picked so far. Esc or **Cancel** closes the picker with nothing changed and
+applies what is picked so far. A long list scrolls to keep the highlighted row in view, in
+every column. Esc or **Cancel** closes the picker with nothing changed and
 puts the focus back in the message box; so does a click outside, leaving the focus where you
 clicked. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. On a
 `pty` thread there is no search: the focus starts on its runtime in the rail and follows the
@@ -291,7 +292,9 @@ each as threads do (`Claude:work`). Before any session has reported usage, it sa
   project or runtime. The panel and the popover link to it.
 
 Resets, countdowns and the pace tick go by the hub's clock (`usage.get` says what time it is
-there), so a device whose clock is off still shows the windows that haven't reset. The panel
+there), so a device whose clock is off still shows the windows that haven't reset. The clock
+goes on from the hub's last answer, also while reading it again fails: the countdowns move
+and a window that resets meanwhile goes. The panel
 and the popover read `usage.get` when they open, again when the hub's live view
 says an account's usage changed (an agent reported new numbers), and once a minute while they
 are open; never while closed.

@@ -13,6 +13,7 @@ import {
   type Nav,
 } from "../shared/modelPick";
 import {
+  FakeElement as FakeElementClass,
   FakeEvent,
   installFakeDOM,
   press,
@@ -354,6 +355,34 @@ describe("the popup, rendered", () => {
       { method: "thread.set_model", params: { thread: "t1", model: "sonnet" } },
     ]);
     expect(document.activeElement === m.field).toBe(true);
+  });
+
+  it("keeps the highlighted row in view as the keys move it, in every column", async () => {
+    const scrolled: string[] = [];
+    const proto = FakeElementClass.prototype as any;
+    const was = proto.scrollIntoView;
+    proto.scrollIntoView = function (this: FakeElement) {
+      scrolled.push(this.getAttribute("id") || "");
+    };
+    try {
+      const m = await mount({ target: thread({ model: "opus" }) });
+      await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+      // It opens on the row in effect, scrolled to.
+      expect(scrolled.at(-1)).toMatch(/models-1$/);
+      await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+      expect(activeId(m.root)).toMatch(/models-2$/);
+      expect(scrolled.at(-1)).toMatch(/models-2$/);
+      await m.act(() => void press(search(m.root) as any, "ArrowRight"));
+      expect(scrolled.at(-1)).toMatch(/efforts-\d+$/);
+      await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
+      await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
+      expect(scrolled.at(-1)).toMatch(/rail-\d+$/);
+      await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+      expect(scrolled.at(-1)).toBe(activeId(m.root));
+      expect(activeId(m.root)).toMatch(/rail-\d+$/);
+    } finally {
+      proto.scrollIntoView = was;
+    }
   });
 
   it("searches, and closes with Esc, the focus back in the message box", async () => {

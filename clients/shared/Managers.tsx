@@ -37,8 +37,7 @@ import {
   ResourceTable,
 } from "./ui";
 import { useEditorSessions } from "./editors";
-import { UsageLimits } from "./UsageLimits";
-import { accountsOf } from "./usage-limits";
+import { UsagePage } from "./UsageLimits";
 import { setTerminalScreenReader, terminalScreenReader } from "./a11y";
 export type Section =
   | "chat"
@@ -121,6 +120,8 @@ export function Manager(props: ManagerProps) {
   const { section, rpc, action, cliAction, fail } = props;
   const info = meta[section];
   const [data, setData] = useState<Json>();
+  // When `data` was read: the Usage page reckons its clock from it.
+  const [fetchedAt, setFetchedAt] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [detail, setDetail] = useState<Json>();
@@ -130,6 +131,7 @@ export function Manager(props: ManagerProps) {
     setError("");
     try {
       setData(await rpc(info.method));
+      setFetchedAt(Date.now());
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -412,7 +414,7 @@ export function Manager(props: ManagerProps) {
       )}
       {section === "usage" && data && (
         <div className="usage-cards">
-          <UsageLimits accounts={accountsOf(data, Date.now())} />
+          <UsagePage data={data} fetchedAt={fetchedAt} />
         </div>
       )}
       {section === "memory" && data && (

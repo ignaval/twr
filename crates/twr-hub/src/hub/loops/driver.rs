@@ -2069,6 +2069,7 @@ impl Core {
                     written_by: "hub".into(),
                     ext: twr_ext_map(json!({ LOOP_REPORT_KEY: {
                         "id": state.id,
+                        "kind": state.kind,
                         "step": "report",
                         "outcome": outcome,
                         "report_path": shown,
