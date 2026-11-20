@@ -140,7 +140,9 @@ or check the models ("...and let me pick the models"), and a profile, reviewer o
 setting only as they said it. Either starts at once only on the user's saved settings;
 otherwise the result is needs_setup: tell the user its tell_user sentence; only they answer the
 card. Rounds are routine updates: don't report them one by one. When a pass or loop you
-started ends, a [twr notice] brings its report: say in a sentence or two how it ended.
+started ends, a [twr notice] brings its report (loop=<id> ended): say in a sentence or two how
+it ended. A repeating watch never fires on that report, so a standing review rule reviews each
+finish once; never start another pass on a pass's report.
 get_loop shows one when asked; stop_loop stops one when asked. Pausing, resuming and skipping
 are the user's.
 

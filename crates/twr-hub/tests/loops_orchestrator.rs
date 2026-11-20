@@ -1209,3 +1209,57 @@ async fn a_first_single_pass_shows_the_card_and_its_answer_starts_one() {
     assert_eq!(twr_core::loops::line(l), "high · single pass · scope");
     hub.shutdown().await;
 }
+
+/// A single pass needs only the effort it runs at: a profile whose verification asks for an
+/// effort the reviewer does not take (Claude Code has no `ultra`) still runs one pass, its
+/// card showing no problem, and answering it starts the pass. A full loop on the same
+/// settings does not hold.
+#[tokio::test]
+async fn a_single_pass_checks_only_the_effort_it_runs_at() {
+    use twr_core::loops::config::{ProfileConfig, TierConfig, VerifyConfig};
+    let mut env = Env::new();
+    env.config.loops.profiles.insert(
+        "quick".into(),
+        ProfileConfig {
+            tiers: Some(vec![TierConfig::Effort("medium".into())]),
+            verify: Some(VerifyConfig {
+                rounds: 1,
+                effort: "ultra".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    let overrides = json!({"profile": "quick", "reviewer": "claude-code/claude-opus-5-5"});
+    let full = request(&hub, &t, json!({"overrides": overrides}), &user())
+        .await
+        .unwrap();
+    let card = setup(&hub, &t, &full["attn_id"]);
+    assert!(
+        card.problems
+            .iter()
+            .any(|p| p.contains("no effort ultra") && p.contains("profile quick asks for it")),
+        "{:?}",
+        card.problems
+    );
+    answer(&hub, &full, LOOP_SETUP_CANCEL, &user()).unwrap();
+
+    let r = request(
+        &hub,
+        &t,
+        json!({"once": true, "overrides": overrides}),
+        &user(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    let card = setup(&hub, &t, &r["attn_id"]);
+    assert!(card.once);
+    assert_eq!(card.problems, Vec::<String>::new());
+    answer(&hub, &r, START, &user()).unwrap();
+    let s = started(&hub, &t);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].once);
+    hub.shutdown().await;
+}

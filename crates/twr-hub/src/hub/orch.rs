@@ -2343,10 +2343,18 @@ impl Core {
                     return;
                 }
                 // The hub's report of a turn that completed is a finish: it fires the thread's
-                // watches (`hub::watches`). A failed turn's error card notifies anyway.
+                // watches (`hub::watches`). A failed turn's error card notifies anyway. A
+                // loop's report (the loop ended) fires no repeating watch: a standing rule such
+                // as "review every worker's work" fired on the finish the loop followed, and
+                // firing again on the loop's own end would start a pass on that pass.
+                let loop_id = loop_mark.and_then(|l| l["id"].as_str());
                 let hits =
                     if p.written_by == "hub" && watch::turn_completed(view, p.turn.or(ev.turn)) {
-                        self.matching_watches(&ev.thread)
+                        let mut hits = self.matching_watches(&ev.thread);
+                        if loop_mark.is_some() {
+                            hits.retain(|w| !w.repeat);
+                        }
+                        hits
                     } else {
                         Vec::new()
                     };
@@ -2363,6 +2371,7 @@ impl Core {
                     .and_then(|t| t.get(report::REPLY_SEQ_KEY))
                     .and_then(Value::as_u64)
                     .map_or(String::new(), |s| format!(" {}={s}", report::REPLY_SEQ_KEY));
+                let ended = loop_id.map_or(String::new(), |id| format!(" loop={id} ended"));
                 let excerpt = twr_ext(&p.ext)
                     .and_then(|t| t.get("reply_excerpt"))
                     .and_then(Value::as_str)
@@ -2382,8 +2391,8 @@ impl Core {
                     attn_id: None,
                     thread: Some(ev.thread.clone()),
                     line: format!(
-                        "- thread={name} report turn={turn}{follow_up} grade={} summary={}\
-                         {reply}{excerpt} thread_id={}",
+                        "- thread={name} report turn={turn}{follow_up}{ended} grade={} \
+                         summary={}{reply}{excerpt} thread_id={}",
                         twr_decisions::grade_str(p.grade),
                         quoted(&cut(&p.summary, NOTICE_SUMMARY_MAX)),
                         ev.thread
@@ -2784,6 +2793,22 @@ impl Core {
     /// ([`Core::orchestrator_account`], chosen under the same lock), recorded as a worker's is
     /// (`ext.twr.account`, `account_dir`, `account_reason`), so its starts get the account's
     /// environment and refusals (`hub::thread_account`).
+    /// Whether `spec`, the runtime an `orchestrator.use` names, keeps the orchestrator's
+    /// agent: a bare `acp` while it runs an ACP agent (`acp:<command>` or a `[runtimes]`
+    /// preset). The model picker names the runtime a thread runs, which is `acp` for every
+    /// agent; the new orchestrator gets the agent's command, attach template and preset as
+    /// they are recorded, as a reset does, with the model and effort asked. Elsewhere a bare
+    /// `acp` is refused (it names no agent).
+    pub(super) fn keeps_orch_agent(&self, spec: &str) -> bool {
+        spec.trim() == twr_adapters::acp::NAME
+            && self
+                .orch
+                .thread
+                .as_deref()
+                .and_then(|t| self.registry.get(t))
+                .is_some_and(|v| v.runtime == twr_adapters::acp::NAME)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_orchestrator(
         &mut self,
@@ -2816,10 +2841,13 @@ impl Core {
             .thread
             .as_deref()
             .and_then(|t| self.registry.get(t));
-        let recorded_acp = reset && old.is_some_and(|v| v.runtime == twr_adapters::acp::NAME);
         // The account part of `claude-code:work` is split off first (`runtime_spec`): the
         // account is `account`, chosen from it.
         let (base, _) = runtime_spec::split_account(&runtime)?;
+        // A reset, or a switch to a bare `acp` ([`Core::keeps_orch_agent`]), keeps the agent
+        // the orchestrator runs.
+        let recorded_acp = (reset || base == twr_adapters::acp::NAME)
+            && old.is_some_and(|v| v.runtime == twr_adapters::acp::NAME);
         let acp = if recorded_acp {
             None
         } else {
@@ -2843,18 +2871,17 @@ impl Core {
             twr["conversation_reset"] = json!(true);
             if let Some(v) = old {
                 twr["effort"] = json!(v.effort);
-                if recorded_acp {
-                    twr["acp_command"] = json!(v.acp_command);
-                    if let Some(ev) =
-                        store::first_of_kind(self.store.conn(), &v.id, "thread.created")
-                            .map_err(internal)?
-                    {
-                        if let EventBody::ThreadCreated(p) = self.full(ev).body {
-                            for key in ["acp_attach", "acp_preset"] {
-                                if let Some(value) = twr_ext(&p.ext).and_then(|t| t.get(key)) {
-                                    twr[key] = value.clone();
-                                }
-                            }
+            }
+        }
+        if let Some(v) = old.filter(|_| recorded_acp) {
+            twr["acp_command"] = json!(v.acp_command);
+            if let Some(ev) = store::first_of_kind(self.store.conn(), &v.id, "thread.created")
+                .map_err(internal)?
+            {
+                if let EventBody::ThreadCreated(p) = self.full(ev).body {
+                    for key in ["acp_attach", "acp_preset"] {
+                        if let Some(value) = twr_ext(&p.ext).and_then(|t| t.get(key)) {
+                            twr[key] = value.clone();
                         }
                     }
                 }
@@ -4075,11 +4102,21 @@ impl Hub {
         // configured one for a first orchestrator.
         let (runtime, model, effort, from) = match choice {
             Some((runtime, model)) => {
+                // A bare `acp` keeps the orchestrator's agent, as a reset does
+                // ([`Core::keeps_orch_agent`]): no command line is chosen, and the account
+                // is the current one's.
+                let keep = self.inner.core().keeps_orch_agent(runtime);
                 // A device names a command line only with `terminal` (`hub::device_scope`).
-                self.inner.check_caller_runtime(caller, runtime.trim())?;
+                if !keep {
+                    self.inner.check_caller_runtime(caller, runtime.trim())?;
+                }
                 let (runtime, model, effort) =
-                    self.check_switch(runtime, model, opts.effort.as_deref(), caller)?;
-                (runtime, model, effort, OrchAccountFrom::Switch)
+                    self.check_switch(runtime, model, opts.effort.as_deref(), caller, keep)?;
+                let from = match keep {
+                    true => OrchAccountFrom::Keep,
+                    false => OrchAccountFrom::Switch,
+                };
+                (runtime, model, effort, from)
             }
             None => {
                 let core = self.inner.core();
@@ -4095,7 +4132,7 @@ impl Hub {
                     (runtime, model, None, OrchAccountFrom::Keep)
                 } else {
                     let (runtime, model, _) =
-                        self.check_switch(&runtime, model.as_deref(), None, caller)?;
+                        self.check_switch(&runtime, model.as_deref(), None, caller, false)?;
                     (runtime, model, None, OrchAccountFrom::Config)
                 }
             }
@@ -4108,8 +4145,9 @@ impl Hub {
         // A runtime whose program is not there cannot start: said now, the switch still
         // happens (it may be installed before the orchestrator starts). An ACP agent's program
         // is its command's first word; a built-in runtime's is what its adapter would start
-        // (its `TWR_*_BIN` override, else its binary name), with its start error's hint.
-        let warning = if reset {
+        // (its `TWR_*_BIN` override, else its binary name), with its start error's hint. The
+        // orchestrator's agent kept (a reset, a bare `acp`): its recorded program.
+        let warning = if from == OrchAccountFrom::Keep {
             let view = {
                 let core = self.inner.core();
                 core.orch
@@ -4262,6 +4300,7 @@ impl Hub {
         model: Option<&str>,
         effort: Option<&str>,
         caller: &Caller,
+        keep_agent: bool,
     ) -> Result<(String, Option<String>, Option<Option<String>>), RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
@@ -4283,15 +4322,17 @@ impl Hub {
         }
         let hosts = self.inner.orchestrator_runtimes();
         // The adapter the spec names: `acp:<command>` or a `[runtimes]` preset the `acp`
-        // runtime (a bare `acp` is refused), `pty:<command>` the `pty` one, `<runtime>:<account>`
-        // that runtime.
+        // runtime (a bare `acp` is refused, unless it keeps the orchestrator's agent),
+        // `pty:<command>` the `pty` one, `<runtime>:<account>` that runtime.
         let (base, _) = runtime_spec::split_account(runtime)?;
-        let adapter = match runtime_spec::resolve_acp(base, &self.inner.config)? {
-            Some(spec) => spec.runtime,
-            None if base.starts_with(twr_adapters::pty::RUNTIME_PREFIX) => {
+        let adapter = match runtime_spec::resolve_acp(base, &self.inner.config) {
+            _ if keep_agent => twr_adapters::acp::NAME.to_string(),
+            Err(e) => return Err(e),
+            Ok(Some(spec)) => spec.runtime,
+            Ok(None) if base.starts_with(twr_adapters::pty::RUNTIME_PREFIX) => {
                 twr_adapters::pty::NAME.to_string()
             }
-            None => base.to_string(),
+            Ok(None) => base.to_string(),
         };
         let local = self.inner.host(LOCAL_BOX);
         if !local.as_ref().is_some_and(|h| h.has_runtime(&adapter)) {
@@ -5030,6 +5071,67 @@ mod tests {
         assert!(text.contains("- thread=api report turn=5"), "{text}");
         assert_eq!(ext[watch::WATCHES_FIRED_KEY], json!([w3]));
         assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![w3]));
+        drop(hub);
+    }
+
+    /// A loop's report (its end) fires watches without repeat, not repeating ones: a standing
+    /// "review every worker's work" fired on the finish the pass followed, and must not fire
+    /// on the pass's own report. Its line says the loop ended. An ordinary finish still fires
+    /// the repeating watch.
+    #[tokio::test]
+    async fn a_loop_report_fires_no_repeating_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let standing = set_watch(&hub, "*", true);
+        finish(&hub, "api", 1, Grade::Success);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(text.contains(&format!("watch={standing} ")), "{text}");
+
+        // The review pass's report.
+        let loop_report = |turn: u64| {
+            let append = |turn: Option<u64>, body: EventBody| {
+                hub.append("api", turn, Source::Hub, body, None).unwrap();
+            };
+            append(Some(turn), EventBody::TurnStarted(TurnStarted::default()));
+            append(Some(turn), EventBody::TurnEnded(TurnEnded::default()));
+            append(
+                Some(turn),
+                EventBody::ReportReady(ReportReady {
+                    summary: "review pass: done".into(),
+                    grade: Grade::Success,
+                    turn: Some(turn),
+                    written_by: "hub".into(),
+                    ext: twr_ext_map(json!({ LOOP_REPORT_KEY: {"id": "L1", "step": "report"} })),
+                    ..Default::default()
+                }),
+            );
+        };
+        loop_report(2);
+        assert_eq!(
+            hub.inner.core().notice_turn(Utc::now()),
+            None,
+            "the standing watch does not fire on the pass"
+        );
+
+        // A watch without repeat (e.g. "merge api once its review is done") does.
+        let once = set_watch(&hub, "api", false);
+        loop_report(3);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(
+            text.contains(&format!(
+                "- thread=api report turn=3 loop=L1 ended grade=success summary=\"review pass: \
+                 done\" watch={once} "
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&format!("watch={standing} ")), "{text}");
+
+        // New work's finish fires the standing watch again.
+        finish(&hub, "api", 4, Grade::Success);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(text.contains(&format!("watch={standing} ")), "{text}");
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![standing]));
         drop(hub);
     }
 

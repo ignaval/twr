@@ -20,7 +20,10 @@
 //! again); when it ends, a new line waits a full grace. A failed turn fires nothing, on its report or when its tasks end (its error
 //! card already notifies, and an automatic retry may follow); neither do reports written by
 //! the orchestrator or a user. A rewrite of an interim report stays interim while the turn's
-//! tasks run (`Hub::write_report`), so the worker going idle still fires.
+//! tasks run (`Hub::write_report`), so the worker going idle still fires. A loop's report (a
+//! review pass or loop ended, `ext.twr.loop` with `step: report`) fires only watches without `repeat`: a
+//! standing rule ("review every worker's work") fired on the finish the loop followed, and
+//! firing it on the loop's own report would start a pass on that pass.
 //!
 //! Firing queues a notice line ([`super::orch`]) with the report, the watch id and its note;
 //! a non-success report's own notice line carries them instead. A notice turn fires a watch

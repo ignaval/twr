@@ -247,7 +247,9 @@ on to the efforts with the popup still open; Enter or a click on an effort appli
 once. ← and → move between the columns, ← from an empty search to the runtimes. **Done**
 applies what is picked so far. Esc or **Cancel** closes the picker with nothing changed and
 puts the focus back in the message box; so does a click outside, leaving the focus where you
-clicked. On a phone the picker is a sheet
+clicked. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. On a
+`pty` thread there is no search: the focus starts on its runtime in the rail and follows the
+highlight, so ↑, ↓ and Enter pick another runtime. On a phone the picker is a sheet
 at the bottom of the screen, its columns stacked, every row a full-size touch target.
 
 Only what changed is sent. For a thread on its own runtime that is `thread.set_model` with
@@ -288,7 +290,9 @@ each as threads do (`Claude:work`). Before any session has reported usage, it sa
 - **The Usage page** in the side navigation shows them in full, with the usage by thread,
   project or runtime. The panel and the popover link to it.
 
-The panel and the popover read `usage.get` when they open, again when the hub's live view
+Resets, countdowns and the pace tick go by the hub's clock (`usage.get` says what time it is
+there), so a device whose clock is off still shows the windows that haven't reset. The panel
+and the popover read `usage.get` when they open, again when the hub's live view
 says an account's usage changed (an agent reported new numbers), and once a minute while they
 are open; never while closed.
 

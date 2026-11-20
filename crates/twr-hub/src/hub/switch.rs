@@ -251,6 +251,16 @@ impl Core {
     ) -> Result<Option<Switch>, RpcError> {
         let name = &view.name;
         let new = match spec {
+            // The runtime it runs, as a thread names it (`acp` for every agent): no move.
+            Some(spec)
+                if spec.trim() == twr_adapters::acp::NAME
+                    && view.runtime == twr_adapters::acp::NAME =>
+            {
+                RuntimeSpec {
+                    runtime: view.runtime.clone(),
+                    ..Default::default()
+                }
+            }
             Some(spec) => {
                 if caller.is_orchestrator() {
                     orch::check_orchestrator_runtime(spec, &hub.config)?;

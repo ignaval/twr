@@ -163,9 +163,21 @@ export interface AccountView {
 }
 
 /**
+ * The hub's clock `now` (this device's clock) for a `usage.get` answer read at `fetchedAt`
+ * (also this device's): the answer's own `now` plus the time since. The resets are the
+ * providers' times, which the hub's clock is compared with; this device's may be off. An
+ * answer without `now` (an older hub): this device's clock.
+ */
+export function hubNow(data: Json | undefined, now: number, fetchedAt = now) {
+  const served = Date.parse(data?.now ?? "");
+  return Number.isFinite(served) ? served + Math.max(0, now - fetchedAt) : now;
+}
+
+/**
  * The accounts of a `usage.get` answer, as they are `now`: the answer was read at
  * `fetchedAt`, so ages have grown since by the time between. Windows that have reset since
- * are left out, as the hub does when it answers.
+ * are left out, as the hub does when it answers. Resets, countdowns and pace are reckoned
+ * on the hub's clock ([`hubNow`]), not this device's.
  */
 export function accountsOf(
   data: Json | undefined,
@@ -173,6 +185,7 @@ export function accountsOf(
   fetchedAt = now,
 ): AccountView[] {
   const runtimes: Json[] = Array.isArray(data?.runtimes) ? data.runtimes : [];
+  const at = hubNow(data, now, fetchedAt);
   return runtimes
     .map((runtime) => {
       const age =
@@ -180,9 +193,9 @@ export function accountsOf(
       const windows = (Array.isArray(runtime.windows) ? runtime.windows : [])
         .filter(
           (window: Json) =>
-            !window.resets_at || Date.parse(window.resets_at) > now,
+            !window.resets_at || Date.parse(window.resets_at) > at,
         )
-        .map((window: Json) => windowView(window, now));
+        .map((window: Json) => windowView(window, at));
       return {
         key: `${runtime.runtime}:${runtime.account ?? ""}`,
         label: String(runtime.label || runtime.runtime),

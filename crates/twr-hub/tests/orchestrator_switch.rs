@@ -2275,3 +2275,75 @@ async fn reset_is_user_only_and_preserves_a_recorded_acp_agent() {
     assert!(rt.next_turn().await.0.contains("fresh ACP prompt"));
     hub.shutdown().await;
 }
+
+/// A switch to a bare `acp` (what the model picker names for every agent) while the
+/// orchestrator runs an ACP agent keeps that agent, as a reset does: its command, attach
+/// template and preset as recorded, with the model and effort asked. Without an ACP agent
+/// running, a bare `acp` is refused: it names no agent.
+#[tokio::test]
+async fn a_bare_acp_switch_keeps_the_orchestrators_agent() {
+    let env = Env::new();
+    let opts = env.opts(|c| {
+        c.runtimes.insert(
+            "agent".into(),
+            twr_core::config::RuntimePreset {
+                acp: "opencode acp".into(),
+                attach: Some("opencode --resume {session}".into()),
+                ..Default::default()
+            },
+        );
+    });
+    let hub = Hub::open(opts).await.unwrap();
+    let e = hub
+        .use_orchestrator("acp", Some("m"), quick(), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+    switch(&hub, "codex", None, quick()).await;
+    let e = hub
+        .use_orchestrator("acp", Some("m"), quick(), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+
+    let created = |id: &str| {
+        events_of(&hub, id)
+            .into_iter()
+            .find_map(|e| match e.body {
+                EventBody::ThreadCreated(p) => p.ext.and_then(|x| x.get("twr").cloned()),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let first = switch(&hub, "agent", Some("a-model"), quick()).await;
+    let old = first["thread"].as_str().unwrap().to_string();
+    let command = hub.thread_view(&old).unwrap().acp_command;
+    let mut opts = quick();
+    opts.effort = Some("high".into());
+    let r = switch(&hub, "acp", Some("b-model"), opts).await;
+    let id = r["thread"].as_str().unwrap();
+    assert_ne!(id, old);
+    assert_eq!(r["runtime"], "acp");
+    assert_eq!(r["model"], "b-model");
+    assert_eq!(r["effort"], "high");
+    assert_eq!(hub.thread_view(id).unwrap().acp_command, command);
+    let twr = created(id);
+    assert_eq!(twr["acp_preset"], "agent", "{twr}");
+    assert_eq!(twr["acp_attach"], created(&old)["acp_attach"], "{twr}");
+    assert!(
+        twr.get("conversation_reset").is_none(),
+        "a switch, not a reset: {twr}"
+    );
+    // And again, on the agent recorded by the switch.
+    let again = hub
+        .use_orchestrator("acp", None, quick(), &tui())
+        .await
+        .unwrap();
+    assert_eq!(
+        hub.thread_view(again["thread"].as_str().unwrap())
+            .unwrap()
+            .acp_command,
+        command
+    );
+    hub.shutdown().await;
+}

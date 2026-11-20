@@ -118,9 +118,9 @@ use twr_core::loops::config::{
     check_profile_name, ModelChoice, ReviewerChoice, WorkersChoice, REVIEWER_RUNTIMES,
 };
 use twr_core::loops::settings::{
-    presets, propose, validate, Availability, LoopSettings, Overrides, ProblemKind,
-    RuntimeAvailability, SaveFor, SavedBy, SavedFrom, Scope, SettingsOf, SettingsSource,
-    ThreadModel,
+    presets, propose, propose_run, validate, validate_run, Availability, LoopSettings, Overrides,
+    ProblemKind, RuntimeAvailability, SaveFor, SavedBy, SavedFrom, Scope, SettingsOf,
+    SettingsSource, ThreadModel,
 };
 use twr_core::loops::{
     line, ControlAction, ControlBy, Input, LoopKind, LoopState, StartError, StepError,
@@ -1369,7 +1369,7 @@ impl Hub {
             if setup.requested_by == ControlBy::Orchestrator {
                 setup.overrides = Overrides::default();
             }
-            let proposal = propose(&s, &avail, config);
+            let proposal = propose_run(&s, &avail, config, setup.once);
             setup.settings = proposal.settings;
             setup.warnings = proposal.warnings;
             setup.problems = proposal
@@ -2540,7 +2540,7 @@ impl Core {
             None => Some(SetupWhy::FirstRun),
             Some(_) if req.setup => Some(SetupWhy::Asked),
             Some((s, _)) => {
-                let problems = validate(&s.settings, &avail, config);
+                let problems = validate_run(&s.settings, &avail, config, req.once);
                 if problems.iter().any(|p| p.kind == ProblemKind::OtherRuntime) {
                     Some(SetupWhy::OtherRuntime)
                 } else if !problems.is_empty() {
@@ -2580,7 +2580,7 @@ impl Core {
         }
         let Some(why) = why else {
             // Saved settings that hold: the run's own overrides must hold too.
-            let problems = validate(&run, &avail, config);
+            let problems = validate_run(&run, &avail, config, req.once);
             if !problems.is_empty() {
                 return Err(rpc(
                     codes::BAD_REQUEST,
@@ -2649,7 +2649,7 @@ impl Core {
             Some(_) => (base, overrides),
             None => (run, Overrides::default()),
         };
-        let mut proposal = propose(&shown, &avail, config);
+        let mut proposal = propose_run(&shown, &avail, config, req.once);
         // This run's own reviewer (an override) whose review runs would fail where the loop runs
         // (Codex's sandbox): said too, as for the saved one.
         if let Some(w) = avail
@@ -2960,7 +2960,7 @@ impl Core {
         let view = self.view(&thread)?.clone();
         let config = &hub.config.loops;
         let avail = availability(hub, &self.accounts, Some(&view));
-        let problems = validate(&setup.settings, &avail, config);
+        let problems = validate_run(&setup.settings, &avail, config, setup.once);
         if !problems.is_empty() {
             return Err(rpc(
                 codes::CONFLICT,
@@ -2975,7 +2975,7 @@ impl Core {
             .overrides
             .apply(&setup.settings, setup.kind)
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
-        let problems = validate(&run, &avail, config);
+        let problems = validate_run(&run, &avail, config, setup.once);
         if !problems.is_empty() {
             return Err(rpc(
                 codes::CONFLICT,

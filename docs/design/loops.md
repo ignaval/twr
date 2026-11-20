@@ -316,7 +316,7 @@ A verification that could only repeat the round before it does not run. When the
 
 ### A single pass (review)
 
-A review loop can run as a **single pass**: `setup → scope → ladder (one round) → report`. The reviewer reviews once, at the profile's strongest ladder tier; if it found anything, the thread triages the findings in one turn, exactly as in a ladder round (verify, fix or dismiss, gates, triage block); then the report, and the loop ends. There is no second round, no transition, no sweep and no verification, so no review checks the fixes, and the report says so. It ends `clean` when the round found nothing and `triaged` once the triage is accepted ([implementation notes](#single-pass-implementation-notes)). It is what the orchestrator runs when you ask it to review a thread's work without asking for a loop.
+A review loop can run as a **single pass**: `setup → scope → ladder (one round) → report`. The reviewer reviews once, at the profile's strongest ladder tier; if it found anything, the thread triages the findings in one turn, exactly as in a ladder round (verify, fix or dismiss, gates, triage block); then the report, and the loop ends. There is no second round, no transition, no sweep and no verification, so no review checks the fixes, and the report says so. It ends `clean` when the round found nothing and `triaged` once the triage is accepted ([implementation notes](#single-pass-implementation-notes)). It is what the orchestrator runs when you ask it to review a thread's work without asking for a loop. Its settings are checked for the pass alone (`settings::validate_run` with `once`): the reviewer must take the effort of the tier the pass runs, not the profile's other efforts.
 
 ### Report
 

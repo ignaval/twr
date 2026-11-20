@@ -104,6 +104,11 @@ export function ModelPicker({
   const efforts = effortRows(catalog, runtime);
   const locked = runsCommandLine(runtime);
 
+  const optionId = (column: string, i: number) => `${id}-${column}-${i}`;
+  const focusOption = (option?: string) => {
+    if (option) document.getElementById(option)?.focus();
+  };
+
   const rowOf = (rows: ModelRow[], model?: string) =>
     Math.max(
       0,
@@ -156,12 +161,20 @@ export function ModelPicker({
     return () => window.removeEventListener("keydown", keyboard);
   }, []);
   // Focus goes to the search as it opens (on a phone, to the sheet: no keyboard pops up).
+  // A runtime that runs its own command line has no search: the focus goes to its runtime
+  // in the rail, and follows the highlighted row there (below).
   useEffect(() => {
     if (!open) return;
     if (mobile())
       root.current?.querySelector<HTMLElement>(".model-picker-popup")?.focus();
+    else if (locked) focusOption(optionId("rail", nav.rail));
     else search.current?.focus();
   }, [open]);
+  // From a runtime without a search to one with it: the search takes the focus once it is
+  // enabled.
+  useEffect(() => {
+    if (open && !locked && !mobile()) search.current?.focus();
+  }, [locked]);
   useEffect(() => {
     if (custom !== null) customField.current?.focus();
   }, [custom !== null]);
@@ -184,6 +197,28 @@ export function ModelPicker({
     if (disabled && open) close(false);
   }, [disabled, target?.id]);
 
+  const active =
+    nav.column === "rail"
+      ? optionId("rail", nav.rail)
+      : nav.column === "models"
+        ? locked
+          ? undefined
+          : optionId("models", nav.model)
+        : optionId("efforts", nav.effort);
+  // The focus on a row (no search to hold it: a runtime that runs its own command line)
+  // follows the highlighted one.
+  useEffect(() => {
+    if (!open || !active) return;
+    const focused = document.activeElement;
+    if (
+      focused instanceof HTMLElement &&
+      focused.id !== active &&
+      focused.matches(
+        ".model-picker-popup [role=option], .model-picker-popup [role=radio]",
+      )
+    )
+      focusOption(active);
+  }, [open, active]);
   if (!target) return null;
   const shown = triggerText(target);
   const name = kind === "orchestrator" ? "the orchestrator" : target.name;
@@ -258,7 +293,11 @@ export function ModelPicker({
       model: rowOf(rows, pick.model),
       effort: Math.max(0, effortRows(catalog, r).indexOf(pick.effort ?? null)),
     });
-    if (runsCommandLine(r)) return;
+    // No search to type in: the keys go on from the runtime picked.
+    if (runsCommandLine(r)) {
+      if (!mobile()) focusOption(optionId("rail", runtimes.indexOf(r)));
+      return;
+    }
     if (!mobile()) search.current?.focus();
   };
   const chooseModel = (model: string | undefined) => {
@@ -289,15 +328,6 @@ export function ModelPicker({
       locked ? { runtime } : { ...pending, runtime, effort: pending.effort },
     );
 
-  const optionId = (column: string, i: number) => `${id}-${column}-${i}`;
-  const active =
-    nav.column === "rail"
-      ? optionId("rail", nav.rail)
-      : nav.column === "models"
-        ? locked
-          ? undefined
-          : optionId("models", nav.model)
-        : optionId("efforts", nav.effort);
   const keyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     const field = event.currentTarget as HTMLInputElement;
     const caretAtEnd =
@@ -359,7 +389,19 @@ export function ModelPicker({
           aria-label={`Model and effort for ${name}`}
           tabIndex={-1}
           onKeyDown={(event) => {
-            if (event.target === event.currentTarget) keyDown(event);
+            // The popup and its rows (the search and the custom id field handle their own
+            // keys); elsewhere (Cancel, Done) Esc still closes it.
+            const from = event.target as HTMLElement;
+            if (
+              from === event.currentTarget ||
+              from.matches("[role=option], [role=radio]")
+            )
+              keyDown(event);
+            else if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              close();
+            }
           }}
         >
           <div

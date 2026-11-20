@@ -458,6 +458,35 @@ describe("the popup, rendered", () => {
     expect(q(m.root, ".model-picker-models [role=listbox]")).toBeNull();
     expect(activeId(m.root)).toMatch(/rail-0$/);
   });
+
+  it("on a pty thread, puts the focus on the rail and lets the keys pick a runtime", async () => {
+    const m = await mount({ target: thread({ runtime: "pty", name: "sh" }) });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    const focused = () => document.activeElement as FakeElement | null;
+    // The search is disabled: the focus is on the current runtime in the rail.
+    expect(search(m.root).getAttribute("disabled")).not.toBeNull();
+    expect(focused()?.getAttribute("id")).toMatch(/rail-0$/);
+    expect(focused()?.getAttribute("role")).toBe("option");
+    // → has no models to go to; ↓ moves the focus with the highlight.
+    await m.act(() => void press(focused()!, "ArrowRight"));
+    expect(focused()?.getAttribute("id")).toMatch(/rail-0$/);
+    await m.act(() => void press(focused()!, "ArrowDown"));
+    expect(focused()?.getAttribute("id")).toMatch(/rail-1$/);
+    expect(focused()?.getAttribute("class")).toContain("active");
+    // Esc closes it from any of its controls, Done too.
+    const done = q(m.root, ".model-picker-efforts footer .primary")!;
+    done.focus();
+    await m.act(() => void press(done, "Escape"));
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(focused() === m.field).toBe(true);
+    // Enter on a runtime picks it: its models' search has the focus.
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => void press(focused()!, "ArrowDown"));
+    await m.act(() => void press(focused()!, "Enter"));
+    expect(search(m.root).getAttribute("disabled")).toBeNull();
+    expect(focused() === (search(m.root) as unknown as FakeElement)).toBe(true);
+    expect(m.calls).toHaveLength(0);
+  });
 });
 
 describe("the picker on a phone", () => {

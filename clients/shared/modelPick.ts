@@ -148,7 +148,9 @@ export type NavEffect =
  * A key pressed in the popup, whose focus stays in the search field (the highlighted row
  * is its `aria-activedescendant`): ↑/↓ move in the column, Enter picks the row (a model
  * moves on to the efforts), → goes to the next column and ← to the previous one (from the
- * models only while the search is empty, else it moves the caret), Esc closes. Returns
+ * models only while the search is empty, else it moves the caret; → from the rail only to a
+ * column with models), Esc closes. Without a search (a runtime that runs its own command
+ * line), the focus is on the highlighted row instead. Returns
  * the new position and what to do, or `undefined` for a key it leaves alone.
  */
 export function navigate(
@@ -178,8 +180,12 @@ export function navigate(
       return { nav: set(c, (at(c) + step) % n), effect: undefined };
     }
     case "ArrowRight":
+      // (No models to go to: a runtime that runs its own command line stays in the rail.)
       if (c === "rail")
-        return { nav: { ...nav, column: "models" }, effect: undefined };
+        return {
+          nav: sizes.models > 0 ? { ...nav, column: "models" } : nav,
+          effect: undefined,
+        };
       if (c === "models" && caretAtEnd && sizes.efforts > 0)
         return { nav: { ...nav, column: "efforts" }, effect: undefined };
       return c === "models" ? undefined : { nav, effect: undefined };

@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   accountsOf,
   ageText,
+  hubNow,
   levelOf,
   paceLeftPct,
   remainingPct,
@@ -115,6 +116,41 @@ describe("usage limits arithmetic", () => {
     expect(claude.age).toBe(660);
     expect(claude.stale).toBe(true);
     expect(accountsOf(data, now, now)[0].stale).toBe(false);
+  });
+
+  it("reckons resets on the hub's clock, not this device's", () => {
+    // The hub answered at 12:00 by its clock; this device's reads 12:10 then, ten minutes
+    // ahead, and two minutes have passed since. The 5-hour window resets at 12:05.
+    const device = now + 10 * 60_000;
+    const data = {
+      now: new Date(now).toISOString(),
+      runtimes: [
+        {
+          runtime: "claude-code",
+          label: "Claude",
+          age_secs: 0,
+          windows: [
+            {
+              window: "five_hour",
+              used_pct: 50,
+              minutes: 300,
+              resets_at: at(5),
+            },
+          ],
+        },
+      ],
+    };
+    expect(hubNow(data, device + 120_000, device)).toBe(now + 120_000);
+    const [claude] = accountsOf(data, device + 120_000, device);
+    expect(claude.windows.map((w) => w.reset)).toEqual(["resets in 3m"]);
+    expect(claude.windows[0].pace).toBeCloseTo(1, 5);
+    expect(claude.age).toBe(120);
+    // Past its reset by the hub's clock: gone.
+    expect(accountsOf(data, device + 6 * 60_000, device)).toEqual([]);
+    // An answer without `now`: this device's clock.
+    const { now: _, ...older } = data;
+    expect(hubNow(older, device, device)).toBe(device);
+    expect(accountsOf(older, device, device)).toEqual([]);
   });
 });
 
