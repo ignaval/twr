@@ -979,8 +979,13 @@ select {
   > .composer-bottom {
   grid-row: 4;
 }
+/* The strip scrolls past two rows of chips, and sooner on a short screen (a phone sideways
+ * with the keyboard open): it gets the height the keyboard leaves after the top bar, the
+ * conversation at its least and the rest of the composer (the destination, the message at
+ * its least, the controls' row), 220 points in all, and at least one row of chips. So Send
+ * and the model stay on screen. */
 [data-mobile="true"] .composer-attachments > ul {
-  max-height: 128px;
+  max-height: clamp(52px, calc(var(--viewport-height, 100dvh) - 220px), 128px);
   padding: 8px 8px 0;
 }
 [data-mobile="true"] .attachment-remove {

@@ -317,7 +317,9 @@ export function ModelPicker({
     window.addEventListener("resize", fit);
     return () => window.removeEventListener("resize", fit);
   }, [open]);
-  // A click outside closes it.
+  // A click outside closes it, and so does the focus moving outside (Tab past Done, or
+  // Shift+Tab before the first column): it is not modal, and left open over the composer it
+  // would hide the controls the focus went to, where Esc no longer reaches it.
   useEffect(() => {
     if (!open) return;
     const outside = (event: Event) => {
@@ -329,7 +331,11 @@ export function ModelPicker({
         close(false);
     };
     document.addEventListener("pointerdown", outside);
-    return () => document.removeEventListener("pointerdown", outside);
+    document.addEventListener("focusin", outside);
+    return () => {
+      document.removeEventListener("pointerdown", outside);
+      document.removeEventListener("focusin", outside);
+    };
   }, [open]);
   // Gone (the destination changed, the hub went away): closed. Changed underneath (above):
   // closed, saying so, and a confirmation it asked taken back.

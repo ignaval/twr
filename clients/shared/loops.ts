@@ -3,7 +3,7 @@
  * loop, the New thread form's switch, the setup card and the settings editor. Nothing here decides what the hub decides: who may start a loop,
  * on which settings, whether settings hold, the loop line. The hub says; this reads it. */
 import { trimMessage } from "./attachmentText";
-import { messageText } from "./offline";
+import { isShellDraft, isSlashDraft, messageText } from "./offline";
 import type { Attention, Json, Thread } from "./types";
 
 /** `runtime[:account]/model[:effort]`: a named implementer (twr-core `ModelChoice`). */
@@ -1139,11 +1139,11 @@ export function sendAsLoop(draft: string): {
   confirm: boolean;
 } {
   const text = messageText(draft);
-  if (draft.startsWith("/") && !draft.startsWith("//"))
+  if (isSlashDraft(draft))
     throw new Error(
       "A command is no task: send it with Send, or write what to build (start it with // to send a leading /).",
     );
-  if (draft.startsWith("!") && !draft.startsWith("!!!"))
+  if (isShellDraft(draft))
     throw new Error(
       "A shell command is no task: send it with Send, or write what to build.",
     );

@@ -28,12 +28,23 @@ export function appendDraft(current: string | undefined, text: string) {
   const head = isCommandDraft(current) ? literalDraft(current) : current;
   return head + "\n\n" + message;
 }
-/** A draft Send runs as a `/` command or a `!` shell line rather than sending it. */
+/** A draft Send runs as a `/` command (`//` escapes a leading `/`). */
+export function isSlashDraft(draft: string) {
+  return draft.startsWith("/") && !draft.startsWith("//");
+}
+/** A draft Send runs as a `!` shell line (`!!` shares its result; `\!`, or the apps'
+ * `!!!`, sends a message that starts with `!`). */
+export function isShellDraft(draft: string) {
+  return draft.startsWith("!") && !draft.startsWith("!!!");
+}
+/**
+ * A draft Send runs as a `/` command or a `!` shell line rather than sending it: it takes
+ * no files and can't be saved offline. Every check of a draft's kind goes through these
+ * three, so an escaped message (`//…`, `\!…`, as Take back puts one back) is a message
+ * everywhere.
+ */
 export function isCommandDraft(draft: string) {
-  return (
-    (draft.startsWith("/") || draft.startsWith("!")) &&
-    messageText(draft) === draft
-  );
+  return isSlashDraft(draft) || isShellDraft(draft);
 }
 /**
  * The message a composer draft sends, as the TUI's `message_text` reads a line: `//...`

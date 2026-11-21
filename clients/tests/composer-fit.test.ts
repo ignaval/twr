@@ -152,3 +152,31 @@ describe("where the message field stops growing", () => {
     expect(rule).not.toContain("40dvh");
   });
 });
+
+/* Attached files scroll in a strip above the text. Its height comes from what the window
+ * leaves (on a phone, the keyboard) after the rest of the column and of the composer, so a
+ * screen of long file names never pushes Send and the model below the edge. (Measured in a
+ * real browser at 844×200 and 390×320 on a phone, 1200×480 on a computer: Send in view.) */
+describe("where the attachment strip stops growing", () => {
+  const attachments = readFileSync(
+    join(root, "shared/attachments.css"),
+    "utf8",
+  );
+  const mobile = readFileSync(join(root, "mobile/src/mobile.css"), "utf8");
+  const rule = (css: string, selector: string) => {
+    const at = css.lastIndexOf(selector + " {");
+    return css.slice(at, css.indexOf("}", at));
+  };
+  it("gives it what the keyboard leaves on a phone, at least one row of chips", () => {
+    expect(
+      rule(mobile, '[data-mobile="true"] .composer-attachments > ul'),
+    ).toMatch(
+      /max-height: clamp\(\s*52px,\s*calc\(var\(--viewport-height, 100dvh\) - 220px\),\s*128px\s*\)/,
+    );
+  });
+  it("gives it what the window leaves on a computer, at least one row of chips", () => {
+    expect(rule(attachments, ".composer-attachments > ul")).toMatch(
+      /max-height: clamp\(44px, calc\(100dvh - 440px\), 168px\)/,
+    );
+  });
+});

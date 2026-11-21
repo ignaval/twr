@@ -1810,6 +1810,40 @@ describe("attached files", () => {
     });
   });
 
+  it("saves a taken-back / message with its file offline, as the message it is", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    app().host.queues.w1 = [
+      {
+        ref: 7,
+        prompt:
+          "/etc is the folder\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
+        mine: true,
+      },
+    ];
+    await app().talkTo("builder");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("//etc is the folder");
+    expect(chips()).toEqual([expect.stringContaining("a.txt")]);
+    await app().connection(false);
+    // Escaped, it is a message, not a command: it can be saved for later, its file with it.
+    expect(sendButton().disabled).toBe(false);
+    await app().press("Enter");
+    expect(app().host.sent).toHaveLength(0);
+    expect(app().box().value).toBe("");
+    expect(chips()).toHaveLength(0);
+    const outbox = app().find(".outbox-message");
+    expect(outbox.textContent).toContain("/etc is the folder");
+    expect(outbox.textContent).toContain("a.txt");
+    await app().wait(450);
+    expect([...app().host.secure.values()].join("\n")).toContain(
+      "/etc is the folder\\nUploaded file: a.txt\\n/w/.twr-uploads/q/a.txt",
+    );
+    // A command itself still can't be saved offline.
+    await app().type("/usage");
+    expect(sendButton().disabled).toBe(true);
+  });
+
   it("sends the orchestrator's files with a hands-free message", async () => {
     await start({ voice: true });
     await attach();
@@ -2231,6 +2265,23 @@ describe("usage limits", () => {
     expect(app().find(".manager h1").textContent).toBe("Usage");
     expect(app().find(".usage-cards").textContent).toContain("20% left");
   });
+
+  it("closes the popover when the focus moves outside it", async () => {
+    const gauge = app().find(
+      '.conversation-actions button[aria-label="Usage limits"]',
+    );
+    await app().click(gauge);
+    expect(app().all(".usage-popover")).toHaveLength(1);
+    // Tab past its last control, to the message box: closed, Esc would no longer reach it.
+    await app().act(async () => {
+      app().box().focus();
+      app()
+        .box()
+        .dispatchEvent(new FakeEvent("focusin", { bubbles: true }));
+    });
+    expect(app().all(".usage-popover")).toHaveLength(0);
+    expect(gauge.getAttribute("aria-expanded")).toBe("false");
+  });
 });
 
 /* Send as implementation loop and /implement (docs/design/loops.md › Desktop and mobile):
@@ -2280,6 +2331,20 @@ describe("implementation loops from the message box", () => {
       app().find(".send-loop-panel button", "Send as implementation loop"),
     );
   };
+
+  it("closes the choice when the focus moves outside it", async () => {
+    await app().talkTo("builder");
+    await app().click(app().find(".send-caret"));
+    expect(app().all(".send-loop-panel")).toHaveLength(1);
+    await app().act(async () => {
+      app().box().focus();
+      app()
+        .box()
+        .dispatchEvent(new FakeEvent("focusin", { bubbles: true }));
+    });
+    expect(app().all(".send-loop-panel")).toHaveLength(0);
+    expect(asked).toEqual([]);
+  });
 
   it("offers it only when the message goes to a thread", async () => {
     expect(app().all(".send-caret")).toHaveLength(0);

@@ -16,7 +16,13 @@ import {
   type RefObject,
 } from "react";
 import { ArrowUp, ChevronDown, Paperclip, X } from "lucide-react";
-import { appendDraft, type OfflineJournal } from "./offline";
+import {
+  appendDraft,
+  isCommandDraft,
+  isShellDraft,
+  isSlashDraft,
+  type OfflineJournal,
+} from "./offline";
 import { unfinished, type UploadController } from "./uploads";
 import { ComposerAttachments, attachmentWait } from "./ComposerAttachments";
 import { takesSuggestion, type useAssistance } from "./assistance";
@@ -244,9 +250,7 @@ export function Composer({
       item.conversation === conversation &&
       item.workspace === workspace,
   );
-  const carriesFiles =
-    !(draft.startsWith("/") && !draft.startsWith("//")) &&
-    !(draft.startsWith("!") && !draft.startsWith("!!!"));
+  const carriesFiles = !isCommandDraft(draft);
   const filesWait = carriesFiles && attached.some(unfinished);
   const filesReady =
     carriesFiles && attached.some((item) => item.phase === "ready");
@@ -303,12 +307,11 @@ export function Composer({
         .filter((t) => t.name.startsWith(draft.match(/@([\w-]*)$/)?.[1] || ""))
         .slice(0, 6)
     : [];
-  const slashMatches =
-    draft.startsWith("/") && !draft.startsWith("//")
-      ? slashCommands
-          .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
-          .slice(0, 6)
-      : [];
+  const slashMatches = isSlashDraft(draft)
+    ? slashCommands
+        .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
+        .slice(0, 6)
+    : [];
   return (
     <>
       {!draft &&
@@ -321,7 +324,7 @@ export function Composer({
           </button>
         )}
       <form
-        className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
+        className={`composer ${isShellDraft(draft) ? "shell-mode" : ""}`}
         aria-label="Message composer"
         onSubmit={(event) => void send(event)}
       >
@@ -330,7 +333,7 @@ export function Composer({
             <span className="destination-dot" aria-hidden="true" />
             To:{" "}
             <b>
-              {draft.startsWith("!") && !draft.startsWith("!!!")
+              {isShellDraft(draft)
                 ? "Shell · " +
                   (destination
                     ? target?.name
@@ -601,11 +604,8 @@ export function Composer({
                 (!draft.trim() && !filesReady) ||
                 filesWait ||
                 (!connected &&
-                  (spokenDraft ||
-                    !journal ||
-                    draft.startsWith("/") ||
-                    draft.startsWith("!"))) ||
-                (!target && !draft.startsWith("/")) ||
+                  (spokenDraft || !journal || isCommandDraft(draft))) ||
+                (!target && !isSlashDraft(draft)) ||
                 sending
               }
               aria-label={connected ? "Send message" : "Save message for later"}

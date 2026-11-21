@@ -11,7 +11,10 @@
   margin: 0;
   padding: 10px 12px 2px;
   list-style: none;
-  max-height: 168px;
+  /* Past four rows of chips it scrolls, and sooner in a short window: it gets the height the
+   * window leaves after the top bar, the conversation's header and least height and the rest
+   * of the composer, 440 pixels in all, and at least one row of chips, so Send stays in it. */
+  max-height: clamp(44px, calc(100dvh - 440px), 168px);
   overflow-y: auto;
   min-width: 0;
 }

@@ -268,8 +268,8 @@ applies what is picked so far, an id typed in the custom field included, as an e
 while the field is open does; with the field empty, the picker stays open and asks you to type
 an id or pick a model. A long list scrolls to keep the highlighted row in view, in
 every column. Esc or **Cancel** closes the picker with nothing changed and
-puts the focus back in the message box; so does a click outside, leaving the focus where you
-clicked. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. The
+puts the focus back in the message box; so does a click outside, or the focus leaving it
+(Tab past **Done**), leaving the focus where you clicked or tabbed. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. The
 popup opens above the message box, as tall as the room there within the conversation
 column; with a tall draft in a short window that room is too small, and it opens over the
 message box instead. On a
@@ -343,7 +343,7 @@ each as threads do (`Claude:work`). Before any session has reported usage, it sa
   or Escape.
 - **The gauge** in the conversation's header, beside the read-aloud and tool-call buttons,
   opens them in a popover under the header's right edge, kept inside the conversation however
-  narrow the window. On a phone, **Usage limits** in the conversation's menu opens the
+  narrow the window. Escape, a click outside it or the focus leaving it closes it. On a phone, **Usage limits** in the conversation's menu opens the
   panel.
 - **The Usage page** in the side navigation shows them in full, with the usage by thread,
   project or runtime. The panel and the popover link to it.
@@ -366,7 +366,7 @@ machine.
 
 - **Send as implementation loop.** When you talk to a thread, Send has a caret (a `↻`
   button beside Send on a phone) with **Send as implementation loop**: what you wrote is the
-  loop's task. Sent with nothing written, it asks first, since the task is then what your
+  loop's task. A click outside the choice, or the focus leaving it, closes it. Sent with nothing written, it asks first, since the task is then what your
   conversation with the thread already settled. It needs a live connection, like every loop
   action: without one, or on a read-only device, the choice says why and nothing is saved
   for later.
@@ -843,6 +843,6 @@ Settings → Layout & text offers Compact and Comfortable density, independent i
 
 Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings. Configuration/editor drafts stay in memory because they may contain credentials.
 
-When a saved hub is offline, the app shows dated cached history with request buttons disabled. Plain messages can be saved in the outbox for their original workspace and destination. Reopening the app preserves the original request ID; reconnecting retries that ID within 23 hours. An expired receipt or an unknown delivery outcome requires review in the conversation before a new message is sent. Removing an outbox entry never recalls a message already delivered to the hub. Shell commands, slash commands and permission answers require a live connection. Forgetting a hub removes its local encrypted history, drafts, outbox and bootstrap metadata.
+When a saved hub is offline, the app shows dated cached history with request buttons disabled. Plain messages can be saved in the outbox for their original workspace and destination, their attached files with them; a message escaped with `//` or `\!` (as Take back puts one back) is a plain message. Reopening the app preserves the original request ID; reconnecting retries that ID within 23 hours. An expired receipt or an unknown delivery outcome requires review in the conversation before a new message is sent. Removing an outbox entry never recalls a message already delivered to the hub. Shell commands, slash commands and permission answers require a live connection. Forgetting a hub removes its local encrypted history, drafts, outbox and bootstrap metadata.
 
 See [remote setup and QR pairing](remote-clients.md) and [thread attachments](attachments.md) for the shared desktop/mobile flows.

@@ -2,6 +2,9 @@ import {
   appendDraft,
   appendMessage,
   draftsWithFiles,
+  isCommandDraft,
+  isShellDraft,
+  isSlashDraft,
   literalDraft,
   messageDraft,
   messageText,
@@ -1730,9 +1733,7 @@ export default function App({
     // while a file is still on its way (Send is disabled, and says why).
     // Files another message on its way reserved are not this one's.
     const attached =
-      target &&
-      !(draft.startsWith("/") && !draft.startsWith("//")) &&
-      !(draft.startsWith("!") && !draft.startsWith("!!!"))
+      target && !isCommandDraft(draft)
         ? uploads.available(destination || "orchestrator", workspace)
         : [];
     if (attached.some(unfinished)) {
@@ -1750,12 +1751,8 @@ export default function App({
       reviewDictation(draftKey, draft);
       return;
     }
-    if (
-      !connected &&
-      (!journal || draft.startsWith("/") || draft.startsWith("!"))
-    )
-      return;
-    if (draft.startsWith("/") && !draft.startsWith("//")) {
+    if (!connected && (!journal || isCommandDraft(draft))) return;
+    if (isSlashDraft(draft)) {
       await submitSlash(draft);
       return;
     }
@@ -1784,7 +1781,7 @@ export default function App({
     };
     try {
       let response: Json;
-      if (draft.startsWith("!") && !draft.startsWith("!!!")) {
+      if (isShellDraft(draft)) {
         const share = text.startsWith("!!");
         const command = text.slice(share ? 2 : 1).trim();
         if (!command)
@@ -1895,7 +1892,7 @@ export default function App({
       announce(
         response.saved_offline
           ? "Message saved on this device. It sends when the hub reconnects."
-          : draft.startsWith("!") && !draft.startsWith("!!!")
+          : isShellDraft(draft)
             ? "Shell command started"
             : "Message sent",
       );
@@ -1934,10 +1931,7 @@ export default function App({
     let plan: ReturnType<typeof sendAsLoop>;
     try {
       plan = sendAsLoop(
-        (draft.startsWith("/") && !draft.startsWith("//")) ||
-          (draft.startsWith("!") && !draft.startsWith("!!!"))
-          ? draft
-          : withAttachments(draft, files),
+        isCommandDraft(draft) ? draft : withAttachments(draft, files),
       );
     } catch (error) {
       fail(error);

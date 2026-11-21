@@ -1580,13 +1580,18 @@ export function SendAsLoop({
       panel.current?.querySelectorAll<HTMLButtonElement>("button") || [],
     ).find((b) => !b.disabled);
     (choice || panel.current)?.focus();
-    const away = (event: MouseEvent) => {
+    // A click or the focus (Tab) outside it closes it: left open, Esc no longer reaches it.
+    const away = (event: Event) => {
       const target = event.target as Node;
       if (!panel.current?.contains(target) && !opener.current?.contains(target))
         setOpen(false);
     };
     document.addEventListener("mousedown", away);
-    return () => document.removeEventListener("mousedown", away);
+    document.addEventListener("focusin", away);
+    return () => {
+      document.removeEventListener("mousedown", away);
+      document.removeEventListener("focusin", away);
+    };
   }, [open]);
   const close = () => {
     setOpen(false);

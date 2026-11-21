@@ -613,6 +613,28 @@ describe("the popup, rendered", () => {
     expect(document.activeElement === m.field).toBe(true);
   });
 
+  it("closes when the focus moves outside it, as a click outside does", async () => {
+    const m = await mount({ target: thread({}) });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    // Within the popup (Tab to Done) it stays open.
+    const doneButton = m.root
+      .querySelectorAll(".model-picker-popup footer button")
+      .at(-1) as FakeElement;
+    await m.act(() => {
+      doneButton.focus();
+      doneButton.dispatchEvent(new FakeEvent("focusin", { bubbles: true }));
+    });
+    expect(q(m.root, "[role=dialog]")).not.toBeNull();
+    // Tab past Done, to a control behind it: closed, the focus left where it went.
+    await m.act(() => {
+      m.field.focus();
+      m.field.dispatchEvent(new FakeEvent("focusin", { bubbles: true }));
+    });
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(document.activeElement === m.field).toBe(true);
+    expect(m.calls).toEqual([]);
+  });
+
   it("asks before moving a thread to another runtime", async () => {
     const m = await mount({ target: thread({ model: "opus" }) });
     await m.act(() => click(q(m.root, ".model-picker-trigger")!));

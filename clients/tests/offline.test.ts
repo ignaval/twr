@@ -8,6 +8,8 @@ import {
   appendDraft,
   appendMessage,
   isCommandDraft,
+  isShellDraft,
+  isSlashDraft,
   messageText,
   recordSize,
 } from "../shared/offline";
@@ -185,6 +187,19 @@ describe("encrypted offline recovery", () => {
     expect(appendDraft("hello", "x")).toBe("hello\n\nx");
     expect(isCommandDraft("/usage")).toBe(true);
     expect(isCommandDraft("//usage")).toBe(false);
+  });
+  it("reads a draft's kind as Send does: a command, a shell line, or a message", () => {
+    expect(isSlashDraft("/usage")).toBe(true);
+    expect(isSlashDraft("//usage")).toBe(false);
+    expect(isShellDraft("!ls")).toBe(true);
+    expect(isShellDraft("!!ls")).toBe(true);
+    expect(isShellDraft("!!!wow")).toBe(false);
+    expect(isShellDraft("\\!ls")).toBe(false);
+    // Only a command or a shell line is one; every escaped message is a message.
+    for (const draft of ["/usage", "!ls", "!!ls"])
+      expect(isCommandDraft(draft)).toBe(true);
+    for (const draft of ["//usage", "\\!ls", "!!!wow", "hello", ""])
+      expect(isCommandDraft(draft)).toBe(false);
   });
   it("adds a draft after other text as the message it sends", () => {
     // Send decodes escapes only at the start of the box: kept after other text, the
