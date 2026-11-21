@@ -448,6 +448,45 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
     assert!(!rt.token().is_empty());
 }
 
+/// A switch gives back as many of the user's dropped messages as fit, each whole, in the
+/// order they were queued, well under a response's size limit, and counts the rest: a queue
+/// of big messages never makes the result too big to read.
+#[tokio::test]
+async fn a_switch_gives_back_the_dropped_messages_that_fit() {
+    let mut env = Env::new();
+    let hub = Hub::open(env.opts(|_| {})).await.unwrap();
+    env.worker(&hub, "api").await;
+    env.worker(&hub, "web").await;
+    let r = hub.say("watch the builds", None, &tui()).await.unwrap();
+    assert_eq!(r["action"], "delegate");
+    let mut claude = env.orch().await;
+    claude.next_turn().await;
+    // Busy: these queue behind its open turn, each as long as a message may be, more of
+    // them than a response could hold.
+    let big = |i: usize| format!("{i:03}{}", "x".repeat((256 << 10) - 3));
+    let mut sent = vec!["first".to_string()];
+    sent.extend((0..20).map(big));
+    sent.push("last".into());
+    for m in &sent {
+        hub.say(m, None, &tui()).await.unwrap();
+    }
+    let r = switch(&hub, "codex", None, quick()).await;
+    let p = &r["previous"];
+    assert_eq!(p["dropped_prompts"], 22, "{}", p["dropped_prompts"]);
+    let back: Vec<String> = serde_json::from_value(p["dropped_messages"].clone()).unwrap();
+    let omitted = p["dropped_messages_omitted"].as_u64().unwrap() as usize;
+    assert!(
+        omitted > 0 && back.len() + omitted == sent.len(),
+        "{omitted}"
+    );
+    // Whole, in order: the first big ones that fit, then the small last one.
+    let mut expected = sent[..back.len() - 1].to_vec();
+    expected.push("last".into());
+    assert!(back == expected, "{} back", back.len());
+    assert!(serde_json::to_string(&r).unwrap().len() < twr_core::proto::MAX_FRAME / 2);
+    hub.shutdown().await;
+}
+
 /// claude-code → codex → grok-build: each switch stops and retires the running orchestrator
 /// (its turn interrupted, its queued prompts dropped) and starts a new orchestrator thread
 /// with the new runtime and model and the same restrictions. The old ones get no notice or
@@ -493,6 +532,7 @@ async fn switching_runtimes_makes_a_new_orchestrator_each_time() {
         r["previous"]["dropped_messages"],
         json!(["and the deploys"])
     );
+    assert_eq!(r["previous"]["dropped_messages_omitted"], 0);
     let second = r["thread"].as_str().unwrap().to_string();
     assert_ne!(second, first);
     claude.wait_stopped().await;

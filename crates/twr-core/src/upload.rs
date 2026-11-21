@@ -413,6 +413,17 @@ fn fence_of(line: &str) -> Option<&str> {
 /// blocks; the pairs that end the message count even in a fence left open, since the apps
 /// write them there. Anything else stays text.
 pub fn split_attachments(message: &str) -> (String, Vec<String>) {
+    let (text, pairs) = attachment_pairs(message);
+    let names = pairs
+        .into_iter()
+        .map(|(name, _)| name.trim().to_string())
+        .collect();
+    (text, names)
+}
+
+/// [`split_attachments`], each file as the message holds it: its name (after `Uploaded
+/// file: `, untrimmed) and its path line, exact.
+pub fn attachment_pairs(message: &str) -> (String, Vec<(&str, &str)>) {
     if !message.contains(NAMED) {
         return (message.to_string(), Vec::new());
     }
@@ -441,7 +452,7 @@ pub fn split_attachments(message: &str) -> (String, Vec<String>) {
             None
         };
         if let Some(name) = named {
-            names.push(name.trim().to_string());
+            names.push((name, lines[i + 1]));
             i += 2;
             continue;
         }

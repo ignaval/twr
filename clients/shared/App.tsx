@@ -2627,8 +2627,8 @@ export default function App({
   // says that too.
   const afterSwitch = (result: Json) => {
     const problem = changeProblem(result);
-    const { count, mine } = droppedBySwitch(result);
-    const words = droppedWords(count, mine.length);
+    const { count, mine, lost } = droppedBySwitch(result);
+    const words = droppedWords(count, mine.length, lost);
     if (words && "notice" in words) {
       setNotice(problem ? `${problem} ${words.notice}` : words.notice);
       return;

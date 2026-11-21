@@ -158,10 +158,20 @@ fn dropped_by_switch(result: &Value) -> String {
     };
     let mut out = format!("; dropped {n} queued message(s) the previous one hadn't started");
     let mine = p["dropped_messages"].as_array().map_or(0, Vec::len);
-    if mine > 0 {
-        out.push_str(&format!(
+    // Left out by the hub, too long for its answer: in no history.
+    let lost = p["dropped_messages_omitted"].as_u64().unwrap_or(0);
+    match (mine, lost) {
+        (0, 0) => {}
+        (_, 0) => out.push_str(&format!(
             " ({mine} of yours: in the history, ↑ to send again)"
-        ));
+        )),
+        (0, _) => out.push_str(&format!(
+            " ({lost} of yours, too long to return: they can't be sent again)"
+        )),
+        _ => out.push_str(&format!(
+            " ({mine} of yours: in the history, ↑ to send again; {lost} more of yours, too \
+             long to return, can't be)"
+        )),
     }
     out
 }
@@ -6108,6 +6118,26 @@ mod tests {
                  previous one hadn't started (1 of yours: in the history, ↑ to send again)"
             )
         );
+        assert_eq!(
+            result_status(
+                "orchestrator.use",
+                &json!({"runtime": "codex", "previous": {"dropped_prompts": 5,
+                        "dropped_messages": ["and the deploys"], "dropped_messages_omitted": 3}})
+            )
+            .as_deref(),
+            Some(
+                "the orchestrator is now codex (a new session); dropped 5 queued message(s) the \
+                 previous one hadn't started (1 of yours: in the history, ↑ to send again; 3 \
+                 more of yours, too long to return, can't be)"
+            )
+        );
+        assert!(result_status(
+            "orchestrator.use",
+            &json!({"runtime": "codex", "previous": {"dropped_prompts": 2,
+                    "dropped_messages": [], "dropped_messages_omitted": 2}})
+        )
+        .unwrap()
+        .ends_with("(2 of yours, too long to return: they can't be sent again)"));
         assert_eq!(
             result_status(
                 "orchestrator.use",

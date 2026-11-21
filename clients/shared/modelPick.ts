@@ -336,11 +336,13 @@ export function switchDetail(queued: number): string {
 }
 
 /** What an orchestrator switch (`orchestrator.use`'s result) dropped: how many queued
- * messages (`previous.dropped_prompts`), and the text of those the user sent, whole
- * (`previous.dropped_messages`), to put back in the message box. */
+ * messages (`previous.dropped_prompts`), the text of those the user sent, whole
+ * (`previous.dropped_messages`), to put back in the message box, and how many more of the
+ * user's the hub left out, too long for its answer (`previous.dropped_messages_omitted`). */
 export function droppedBySwitch(result: Json): {
   count: number;
   mine: string[];
+  lost: number;
 } {
   const previous = result?.previous || {};
   const count = Number(previous.dropped_prompts) || 0;
@@ -349,26 +351,42 @@ export function droppedBySwitch(result: Json): {
         (m: unknown): m is string => typeof m === "string" && m.trim() !== "",
       )
     : [];
-  return { count, mine };
+  const lost = Number(previous.dropped_messages_omitted) || 0;
+  return { count, mine, lost };
 }
 
 /** What the app says about a switch that dropped `count` queued messages, `mine` of them
- * the user's own: none, a notice, or an offer to put the user's back in the message box. */
+ * the user's own and `lost` more of theirs it can't give back: none, a notice, or an offer
+ * to put the user's back in the message box. */
 export function droppedWords(
   count: number,
   mine: number,
+  lost = 0,
 ): { notice: string } | { title: string; detail: string } | undefined {
   if (count <= 0) return undefined;
-  const dropped = `The switch dropped ${messages(count)} the previous orchestrator hadn't started.`;
-  if (mine <= 0) return { notice: dropped };
+  let dropped = `The switch dropped ${messages(count)} the previous orchestrator hadn't started.`;
+  if (mine <= 0) {
+    if (lost > 0)
+      dropped +=
+        lost === 1
+          ? " One was yours, too long to return: it can't be put back."
+          : ` ${lost} of them were yours, too long to return: they can't be put back.`;
+    return { notice: dropped };
+  }
+  const tooLong =
+    lost > 0
+      ? ` ${lost} more of yours ${lost === 1 ? "was" : "were"} too long to return and ` +
+        "can't be put back."
+      : "";
   return {
     title:
       mine === 1
         ? "Put your queued message back in the message box?"
         : `Put your ${mine} queued messages back in the message box?`,
     detail:
-      `${dropped} ${mine === count ? (mine === 1 ? "It was yours" : "They were yours") : `${mine} of them were yours`}` +
-      ": put back, with their files, you can send them to the new orchestrator.",
+      `${dropped} ${mine === count ? (mine === 1 ? "It was yours" : "They were yours") : `${mine} of them ${mine === 1 ? "was" : "were"} yours`}` +
+      ": put back, with their files, you can send them to the new orchestrator." +
+      tooLong,
   };
 }
 

@@ -7156,6 +7156,12 @@ fn orchestrator_session_text(r: &Value, reset: bool) -> String {
             }
         }
     }
+    if let Some(n) = p["dropped_messages_omitted"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "{n} more of your dropped message(s) were too long to return and can't be sent \
+             again from here.\n"
+        ));
+    }
     let h = &r["handoff"];
     if !h.is_object() {
         if !reset {
@@ -10928,6 +10934,22 @@ mod tests {
             "{switched}"
         );
         assert!(switched.contains("No handoff"), "{switched}");
+        assert!(!switched.contains("too long to return"), "{switched}");
+        // Those the hub left out, too long for its answer, are counted.
+        let omitted = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
+            "started": true,
+            "previous": {"thread": "01OLD", "runtime": "claude-code", "model": null,
+                         "dropped_prompts": 3, "dropped_messages": ["one"],
+                         "dropped_messages_omitted": 2},
+        }));
+        assert!(
+            omitted.contains(
+                "  - one\n2 more of your dropped message(s) were too long to return and can't \
+                 be sent again from here.\n"
+            ),
+            "{omitted}"
+        );
         let handed = orchestrator_use_text(&json!({
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
             "started": true,

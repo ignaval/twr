@@ -1260,6 +1260,38 @@ async fn an_open_card_for_other_work_is_not_offered_as_the_orchestrators_request
     hub.shutdown().await;
 }
 
+/// A card left open on a scope the user chose, then the orchestrator asked for the same work
+/// naming no scope: the hub resolves the request's own scope (the default), and a card on
+/// another is said to be other work, not offered as this request's.
+#[tokio::test]
+async fn an_open_card_on_another_scope_is_other_work_when_the_request_names_none() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    let r = request(&hub, &t, json!({"once": true, "scope": "branch"}), &user())
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    // The request names none: its own scope is the default, the uncommitted changes.
+    let again = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(again["existing"], true, "{again}");
+    assert_eq!(again["attn_id"], r["attn_id"]);
+    assert_eq!(
+        again["other"],
+        json!({"kind": "review", "once": true, "scope": "branch", "task": null}),
+        "{again}"
+    );
+    // Naming the card's own scope is its own work.
+    let same = request(&hub, &t, json!({"once": true, "scope": "branch"}), &orch())
+        .await
+        .unwrap();
+    assert!(same.get("other").is_none(), "{same}");
+    assert!(started(&hub, &t).is_empty());
+    hub.shutdown().await;
+}
+
 /// A single pass needs only the effort it runs at: a profile whose verification asks for an
 /// effort the reviewer does not take (Claude Code has no `ultra`) still runs one pass, its
 /// card showing no problem, and answering it starts the pass. A full loop on the same

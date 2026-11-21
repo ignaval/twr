@@ -3900,6 +3900,26 @@ pub(super) fn remove_stale_mcp_files(data_dir: &std::path::Path) {
     }
 }
 
+/// Most bytes of the user's dropped messages `orchestrator.use` returns, as JSON
+/// (`previous.dropped_messages`): well under a response's [`twr_core::proto::MAX_FRAME`].
+pub const DROPPED_MESSAGES_MAX: usize = 4 << 20;
+
+/// The `messages` that fit, each whole, in queue order, in `max` bytes of JSON, and how many
+/// were left out.
+fn dropped_mine(messages: impl Iterator<Item = String>, max: usize) -> (Vec<String>, usize) {
+    let (mut kept, mut omitted, mut used) = (Vec::new(), 0, 0);
+    for m in messages {
+        let size = serde_json::to_string(&m).map_or(usize::MAX, |j| j.len() + 1);
+        if size <= max - used {
+            used += size;
+            kept.push(m);
+        } else {
+            omitted += 1;
+        }
+    }
+    (kept, omitted)
+}
+
 /// `s` cut to at most `max` bytes (at a char boundary), with `...` when cut.
 pub(super) fn cut(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -4229,17 +4249,21 @@ impl Hub {
             // for the runtime's exit). If creating the new thread fails after it, the old one
             // stays the orchestrator, stopped, and `orchestrator.use` can be repeated.
             // The user's own queued messages, whole, read under the lock the stop drops them
-            // under: the result gives them back, so the user can send them again.
-            let dropped_messages: Vec<String> = core
-                .store
-                .pending_list(old, usize::MAX)
-                .map_err(internal)?
-                .into_iter()
-                .filter(|r| {
-                    r.from == TurnFrom::User && matches!(r.source, Source::User(_)) && r.user_sent
-                })
-                .map(|r| r.prompt)
-                .collect();
+            // under: the result gives them back, so the user can send them again, as many as
+            // fit in [`DROPPED_MESSAGES_MAX`] (the rest are counted: they are in no log).
+            let (dropped_messages, dropped_messages_omitted) = dropped_mine(
+                core.store
+                    .pending_list(old, usize::MAX)
+                    .map_err(internal)?
+                    .into_iter()
+                    .filter(|r| {
+                        r.from == TurnFrom::User
+                            && matches!(r.source, Source::User(_))
+                            && r.user_sent
+                    })
+                    .map(|r| r.prompt),
+                DROPPED_MESSAGES_MAX,
+            );
             let stop = core.stop_thread(&self.inner, old, caller)?;
             prev = json!({
                 "thread": old,
@@ -4251,6 +4275,7 @@ impl Hub {
                 "stopping": stop["stopping"],
                 "dropped_prompts": stop["dropped_prompts"],
                 "dropped_messages": dropped_messages,
+                "dropped_messages_omitted": dropped_messages_omitted,
             });
             if !reset {
                 handoff = Some(core.handoff(&view, &to, &summary).map_err(internal)?);
@@ -4670,6 +4695,20 @@ fn sets_memory_dir(dir: &std::path::Path) -> Option<PathBuf> {
 mod tests {
     use super::super::{AnswerFor, HubOptions, Response};
     use super::*;
+
+    /// The dropped messages that fit, each whole, in order (a later small one too), the
+    /// rest counted; the budget counts each as JSON, escapes included.
+    #[test]
+    fn dropped_messages_are_given_back_as_they_fit() {
+        let all = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (kept, omitted) = dropped_mine(all(&["ab", "cdef", "g"]).into_iter(), 12);
+        assert_eq!((kept, omitted), (all(&["ab", "cdef"]), 1));
+        let (kept, omitted) = dropped_mine(all(&["abcdefgh", "a"]).into_iter(), 8);
+        assert_eq!((kept, omitted), (all(&["a"]), 1));
+        // `"\n"` is two bytes of JSON for one of text.
+        let (kept, _) = dropped_mine(all(&["\n\n"]).into_iter(), 6);
+        assert!(kept.is_empty());
+    }
 
     #[test]
     fn the_read_budget_is_per_turn() {

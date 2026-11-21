@@ -1049,7 +1049,11 @@ describe("what an orchestrator switch drops", () => {
   });
 
   it("reads the switch's result, and offers to put the user's own back", () => {
-    expect(droppedBySwitch({ previous: null })).toEqual({ count: 0, mine: [] });
+    expect(droppedBySwitch({ previous: null })).toEqual({
+      count: 0,
+      mine: [],
+      lost: 0,
+    });
     expect(droppedWords(0, 0)).toBeUndefined();
     const r = droppedBySwitch({
       previous: {
@@ -1057,13 +1061,34 @@ describe("what an orchestrator switch drops", () => {
         dropped_messages: ["one", " ", 7, "two"],
       },
     });
-    expect(r).toEqual({ count: 3, mine: ["one", "two"] });
+    expect(r).toEqual({ count: 3, mine: ["one", "two"], lost: 0 });
     expect(droppedWords(r.count, r.mine.length)).toEqual({
       title: "Put your 2 queued messages back in the message box?",
       detail:
         "The switch dropped 3 queued messages the previous orchestrator hadn't started. " +
         "2 of them were yours: put back, with their files, you can send them to the new " +
         "orchestrator.",
+    });
+    // Those the hub left out, too long for its answer, are said to be lost.
+    const big = droppedBySwitch({
+      previous: {
+        dropped_prompts: 5,
+        dropped_messages: ["one"],
+        dropped_messages_omitted: 3,
+      },
+    });
+    expect(big).toEqual({ count: 5, mine: ["one"], lost: 3 });
+    expect(
+      (droppedWords(big.count, big.mine.length, big.lost) as Json).detail,
+    ).toBe(
+      "The switch dropped 5 queued messages the previous orchestrator hadn't started. " +
+        "1 of them was yours: put back, with their files, you can send them to the new " +
+        "orchestrator. 3 more of yours were too long to return and can't be put back.",
+    );
+    expect(droppedWords(2, 0, 2)).toEqual({
+      notice:
+        "The switch dropped 2 queued messages the previous orchestrator hadn't started. " +
+        "2 of them were yours, too long to return: they can't be put back.",
     });
     expect(droppedWords(1, 1)).toMatchObject({
       title: "Put your queued message back in the message box?",

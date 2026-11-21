@@ -2575,8 +2575,9 @@ impl Core {
         // The orchestrator never starts a loop over a card the thread has open, nor raises it
         // again: the card is the user's, as they may have changed it. Its request is told
         // about that card, and, when the card asks for other work than this request (another
-        // kind, a single pass or a whole loop, a scope or task the request names otherwise),
-        // what the card would start instead (`other`), since answering it starts that.
+        // kind, a single pass or a whole loop, another scope than the request's, resolved as
+        // its start would be when it names none, a task the request names otherwise), what
+        // the card would start instead (`other`), since answering it starts that.
         if !user {
             if let Some((attn_id, card)) = self.setup_card_of(id) {
                 if from.baseline_digests != card.setup.baseline_digests {
@@ -2585,7 +2586,7 @@ impl Core {
                 let s = &card.setup;
                 let other = s.kind != kind
                     || s.once != req.once
-                    || (req.scope.is_some() && s.scope != from.scope)
+                    || s.scope != from.scope
                     || task.as_ref().is_some_and(|t| s.task.as_ref() != Some(t));
                 let revision = self.attention.get(&attn_id).map(|i| i.revision);
                 let mut out = json!({

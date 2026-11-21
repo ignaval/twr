@@ -284,7 +284,8 @@ does a thread move's warning. A switch drops the messages
 queued for the orchestrator, so with messages waiting the question says how many. When the
 switch dropped some, the app says so, and when some were yours it offers **Put back**: they
 return to the orchestrator's message box, their files as attachments, to send to the new
-orchestrator.
+orchestrator. A switch gives back at most 4 MiB of them; the app says how many more of yours
+it dropped that can't be put back.
 
 What you pick is planned against what runs as the picker opens. If that changes underneath
 it (another client switches the orchestrator, sets or moves the thread, or deletes it), the
