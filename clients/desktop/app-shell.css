@@ -1,35 +1,48 @@
+/* The update notice floats on its own only while no app is shown (UpdateBanner.tsx);
+ * otherwise it is a notice in the app's status strip. */
 .update-banner {
   position: fixed;
   right: 20px;
   bottom: 20px;
   z-index: 90;
-  display: flex;
-  gap: 16px;
-  align-items: center;
   max-width: min(520px, calc(100vw - 32px));
-  padding: 12px 14px;
-  background: var(--overlay);
+  overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 10px;
   box-shadow: var(--shadow-pop);
 }
-.update-banner p {
+.update-banner > .status-strip {
+  border-bottom: 0;
+  background: var(--overlay);
+}
+.update-notice p {
   margin: 2px 0 0;
   color: var(--muted);
 }
-.update-banner .update-error {
+.update-notice .update-error {
   color: var(--danger);
-}
-.update-actions {
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
 }
 @media (max-width: 560px) {
   .update-banner {
     left: 16px;
     right: 16px;
-    flex-direction: column;
-    align-items: stretch;
   }
+}
+/* The topbar's computer switcher: which computer's hub this window shows. */
+.hub-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  min-width: 0;
+}
+.hub-switcher > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hub-switcher > svg {
+  flex-shrink: 0;
+  color: var(--muted);
 }

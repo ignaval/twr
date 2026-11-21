@@ -622,9 +622,7 @@ async function exerciseRemoteForget(page, history) {
     });
     throw error;
   }
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   let dialog = page.getByRole("dialog", {
     name: "Computers",
     exact: true,
@@ -647,7 +645,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Pair and connect", exact: true })
     .click();
   await expect(
-    page.getByRole("button", { name: "Hubs and remote access", exact: true }),
+    page.getByRole("button", { name: /^Computer: .+ — switch$/ }),
   ).toHaveText("Disposable forget QA");
   await page
     .locator(".connection-status")
@@ -679,9 +677,7 @@ async function exerciseRemoteForget(page, history) {
     )
     .toBe("REMOTE_FORGET_DRAFT_MARKER");
   // Revisit the same saved hub to create another mounted journal before forgetting.
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
     name: "Computers",
     exact: true,
@@ -693,9 +689,7 @@ async function exerciseRemoteForget(page, history) {
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
     .waitFor();
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
     name: "Computers",
     exact: true,
@@ -706,7 +700,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Connect", exact: true })
     .click();
   await expect(
-    page.getByRole("button", { name: "Hubs and remote access", exact: true }),
+    page.getByRole("button", { name: /^Computer: .+ — switch$/ }),
   ).toHaveText(hub.name);
   await page
     .locator(".connection-status")
@@ -730,9 +724,7 @@ async function exerciseRemoteForget(page, history) {
   await expect
     .poll(async () => JSON.parse((await records())[1]).outbox.length)
     .toBe(1);
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
     name: "Computers",
     exact: true,
@@ -744,9 +736,7 @@ async function exerciseRemoteForget(page, history) {
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
     .waitFor();
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
     name: "Computers",
     exact: true,

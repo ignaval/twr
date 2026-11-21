@@ -1650,12 +1650,10 @@ kbd {
   font-size: 1rem;
 }
 .inspector-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px;
-  border-top: 1px solid var(--border);
-  padding-top: 16px;
-  margin: 20px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 0;
 }
 .inspector-actions > button {
   text-align: left;
@@ -1663,6 +1661,7 @@ kbd {
   background: none;
   padding: 8px;
   font-size: 0.923077rem;
+  gap: 6px;
 }
 .terminal-dock {
   min-height: 160px;
@@ -2701,41 +2700,24 @@ meter::-webkit-meter-optimum-value {
   position: relative;
   display: flex;
 }
-.send-caret {
-  width: 20px;
-  min-width: 20px;
+/* Run as loop: a switch beside Send (shared/LoopViews.tsx › SendAsLoop). */
+.send-loop-toggle {
   height: 32px;
-  padding: 0;
-  margin-left: -5px;
-  border-radius: 0 6px 6px 0;
+  min-height: 32px;
+  padding: 4px 8px;
+  gap: 6px;
+  font-size: 0.923077rem;
   color: var(--muted);
+  white-space: nowrap;
 }
 .send-loop-button {
   color: var(--loop);
 }
-.send-loop-panel {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 6px);
-  z-index: 5;
-  width: min(320px, calc(100vw - 32px));
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px;
-  background: var(--raised);
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  box-shadow: var(--shadow-pop);
-}
-.send-loop-panel > button {
-  justify-content: flex-start;
+.send-loop-toggle[aria-checked="true"],
+.send-loop-button[aria-checked="true"] {
   color: var(--loop);
-}
-.send-loop-panel > small {
-  color: var(--muted);
-  font-size: 0.846154rem;
-  line-height: 1.4;
+  border-color: var(--loop);
+  background: var(--loop-soft);
 }
 /* A phone's inspector shows a notice in its flow, where no toast covers its controls. */
 .inspector-notice {
@@ -2765,28 +2747,6 @@ meter::-webkit-meter-optimum-value {
 .toast.notice-toast > svg {
   color: var(--success);
   flex-shrink: 0;
-}
-.connection-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-  flex-shrink: 0;
-  background: var(--panel);
-  padding: 8px 20px;
-  font-size: 0.923077rem;
-}
-.connection-banner.warning {
-  color: var(--warning);
-}
-.connection-banner > span {
-  flex: 1;
-  overflow-wrap: anywhere;
-}
-.connection-banner > button {
-  font-size: 0.923077rem;
-  padding: 4px 8px;
 }
 .operation-error.error-banner {
   margin: 0 24px 12px;
@@ -3368,23 +3328,6 @@ meter::-webkit-meter-optimum-value {
   margin-right: 6px;
   padding: 4px 8px;
 }
-.assistance-status {
-  margin: 4px 24px;
-  font-size: 0.923077rem;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: calc(100% - 48px);
-  max-width: var(--content-width);
-  margin-left: auto;
-  margin-right: auto;
-}
-.assistance-status button {
-  padding: 2px;
-  background: transparent;
-  border: 0;
-}
 .suggested-message {
   margin: 4px 24px;
   background: transparent;
@@ -3560,13 +3503,18 @@ meter::-webkit-meter-optimum-value {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+/* The topbar's copy of the conversation's actions menu: only on a phone, where the
+ * conversation's header is hidden (mobile.css). */
 .conversation-menu {
   display: none;
+}
+
+.actions-menu {
   position: relative;
   flex-shrink: 0;
 }
 
-.conversation-menu > summary {
+.actions-menu > summary {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3578,11 +3526,11 @@ meter::-webkit-meter-optimum-value {
   color: var(--muted);
 }
 
-.conversation-menu > summary::-webkit-details-marker {
+.actions-menu > summary::-webkit-details-marker {
   display: none;
 }
 
-.conversation-menu > div {
+.actions-menu > div {
   position: absolute;
   right: 0;
   top: calc(100% + 6px);
@@ -3595,7 +3543,7 @@ meter::-webkit-meter-optimum-value {
   box-shadow: var(--shadow-pop);
 }
 
-.conversation-menu > div > button {
+.actions-menu > div > button {
   width: 100%;
   justify-content: flex-start;
   border: 0;
@@ -3605,11 +3553,11 @@ meter::-webkit-meter-optimum-value {
   font-size: 1rem;
 }
 
-.conversation-menu > div > button:hover {
+.actions-menu > div > button:hover {
   background: var(--hover);
 }
 /* Tool calls and Reasoning are on: a check at the row's end. */
-.conversation-menu > div > button[aria-pressed="true"]::after {
+.actions-menu > div > button[aria-pressed="true"]::after {
   content: "";
   width: 8px;
   height: 4px;
@@ -3747,7 +3695,6 @@ meter::-webkit-meter-optimum-value {
   .queue,
   .shell-runs,
   .assistance-notice,
-  .assistance-status,
   .suggested-message {
     width: calc(100% - 32px);
   }
@@ -3843,9 +3790,6 @@ meter::-webkit-meter-optimum-value {
 }
 
 .mobile-runtime {
-  display: none;
-}
-.grid-new-thread {
   display: none;
 }
 
@@ -3957,14 +3901,6 @@ meter::-webkit-meter-optimum-value {
   height: auto;
 }
 
-.offline-banner {
-  flex-shrink: 0;
-  padding: 8px 16px;
-  background: var(--warning-soft);
-  color: var(--text);
-  border-bottom: 1px solid var(--border);
-  font-size: 0.923077rem;
-}
 .outbox {
   width: 100%;
   max-width: var(--content-width);

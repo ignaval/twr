@@ -865,7 +865,7 @@ describe("dictation in the shared desktop and mobile composer", () => {
     expect(app().box().value).toBe("Typed by holding by shortcut");
     expect(app().host.sent).toEqual([]);
   });
-  it("guards slash suggestions and Send as implementation loop against unreviewed dictation", async () => {
+  it("guards slash suggestions and Run as loop against unreviewed dictation", async () => {
     const methods: string[] = [];
     await start({
       rpc: (method) => {
@@ -884,11 +884,10 @@ describe("dictation in the shared desktop and mobile composer", () => {
     await app().click(app().find(".dialog button", "Cancel"));
     await app().talkTo("builder");
     await dictate("Implement a task");
-    await app().click(app().find(".send-caret"));
-    await app().click(
-      app().find(".send-loop-panel button", "Send as implementation loop"),
-    );
+    await app().click(app().find('[role="switch"]', "Run as loop"));
+    await app().press("Enter");
     expect(methods).not.toContain("thread.implement");
+    expect(methods).not.toContain("loop.request");
     expect(app().find(".dialog").textContent).toContain(
       "Confirm spoken message",
     );
@@ -1593,8 +1592,8 @@ describe("the message box, at its edges", () => {
   });
 });
 
-/* Send as implementation loop and /implement (docs/design/loops.md › Desktop and mobile):
- * the message box's other way to send, while its destination is a thread. */
+/* Run as loop and /implement (docs/design/loops.md › Desktop and mobile): the message box's
+ * other way to send, while its destination is a thread. */
 describe("implementation loops from the message box", () => {
   /** What the hub was asked for, by method. */
   const asked: { method: string; params: Json }[] = [];
@@ -1634,19 +1633,25 @@ describe("implementation loops from the message box", () => {
   afterEach(async () => {
     await mounted.unmount();
   });
+  const toggle = () => app().find('[role="switch"]', "Run as loop");
   const sendAsLoop = async () => {
-    await app().click(app().find(".send-caret"));
-    await app().click(
-      app().find(".send-loop-panel button", "Send as implementation loop"),
+    await app().click(toggle());
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(app().find(".send-button").getAttribute("aria-label")).toBe(
+      "Start implementation loop",
     );
+    // Enter sends as Send does (this test DOM submits no form on a click).
+    await app().press("Enter");
   };
 
   it("offers it only when the message goes to a thread", async () => {
-    expect(app().all(".send-caret")).toHaveLength(0);
+    expect(app().all(".send-loop-toggle")).toHaveLength(0);
     await app().talkTo("builder");
-    const caret = app().find(".send-caret");
-    expect(caret.getAttribute("aria-label")).toBe("More ways to send");
-    expect(caret.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    // It goes with the conversation it was turned on in.
+    await app().click(toggle());
+    await app().talkTo("tester");
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
   });
 
   it("sends the message as the task of a loop on that thread, live", async () => {
@@ -1659,9 +1664,10 @@ describe("implementation loops from the message box", () => {
         params: { thread: "w1", kind: "implement", task: "add a CSV export" },
       },
     ]);
-    // Never an ordinary message, never the outbox.
+    // Never an ordinary message, never the outbox; the switch turns off once used.
     expect(app().host.sent).toEqual([]);
     expect(app().box().value).toBe("");
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
     expect(app().find(".notice-toast").textContent).toContain(
       "builder started an implementation loop: high · plan.",
     );
@@ -1696,15 +1702,10 @@ describe("implementation loops from the message box", () => {
     await app().talkTo("builder");
     await app().type("add a CSV export");
     await app().connection(false);
-    await app().click(app().find(".send-caret"));
-    const choice = app().find(
-      ".send-loop-panel button",
-      "Send as implementation loop",
-    );
-    expect(choice.hasAttribute("disabled")).toBe(true);
-    expect(app().find(".send-loop-panel small").textContent).toContain(
-      "Loop actions need a live connection",
-    );
+    expect(toggle().hasAttribute("disabled")).toBe(true);
+    expect(
+      app().find(`#${toggle().getAttribute("aria-describedby")}`).textContent,
+    ).toContain("Loop actions need a live connection");
     expect(asked).toEqual([]);
     expect(app().box().value).toBe("add a CSV export");
   });

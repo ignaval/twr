@@ -1,5 +1,5 @@
 /* Loops in the apps (docs/design/loops.md › Desktop and mobile): the loop chip on a
- * thread's sidebar card, the Review loop offer, Send as implementation loop, the inspector's
+ * thread's sidebar card, the Review loop offer, Run as loop beside Send, the inspector's
  * Loops section with its Implementation loop… form, the New thread form's switch, the setup
  * card, the settings editor and Settings › Loops. Logic lives in loops.ts; App provides the
  * actions through LoopContext, so cards rendered anywhere reach the same ones. */
@@ -15,14 +15,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import {
-  AlertCircle,
-  Check,
-  ChevronDown,
-  RefreshCw,
-  Repeat,
-  RotateCw,
-} from "lucide-react";
+import { AlertCircle, Check, RefreshCw, Repeat, RotateCw } from "lucide-react";
 import { createPortal } from "react-dom";
 import type { Attention, Json, Thread } from "./types";
 import { CopyButton, Dialog, Markdown, ModelSelect, Spinner } from "./ui";
@@ -431,9 +424,12 @@ export function LoopsSection({
               type="button"
               disabled={!start.act || !!busy}
               title={start.why}
-              aria-describedby={
-                start.why && act ? `${headingId}-start-why` : undefined
-              }
+              aria-describedby={[
+                `${headingId}-review-what`,
+                start.why && act ? `${headingId}-start-why` : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
               onClick={() => run("review", () => loops.startReview(thread.id))}
             >
               {busy === "review" ? (
@@ -447,9 +443,12 @@ export function LoopsSection({
               type="button"
               ref={implementOpener}
               disabled={!start.act || !!busy}
-              aria-describedby={
-                start.why && act ? `${headingId}-start-why` : undefined
-              }
+              aria-describedby={[
+                `${headingId}-implement-what`,
+                start.why && act ? `${headingId}-start-why` : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
               title={
                 start.why ||
                 "Plan, build and review a task: the thread plans and implements it, a reviewer model checks the work round by round, and the loop commits at the end."
@@ -465,6 +464,16 @@ export function LoopsSection({
               Implementation loop…
             </button>
           </div>
+          <ul className="loop-start-what muted">
+            <li id={`${headingId}-review-what`}>
+              <b>Review loop:</b> a reviewer model checks this thread’s changes
+              and it fixes what they find.
+            </li>
+            <li id={`${headingId}-implement-what`}>
+              <b>Implementation loop:</b> give it a task; it plans, builds, gets
+              reviewed and commits.
+            </li>
+          </ul>
           {start.why && act && (
             <p className="muted loop-start-why" id={`${headingId}-start-why`}>
               {start.why}
@@ -541,12 +550,12 @@ export function LoopsSection({
               title={
                 loops.access.why ||
                 skip.why ||
-                "End the ladder after the current round and go on to the capped verification"
+                "Skip to verify: end the review rounds after the current one and go on to the final verification"
               }
               onClick={() => control("skip_to_verify")}
             >
               {busy === "skip_to_verify" && <Spinner />}
-              Skip to verify
+              Finish early
             </button>
           )}
           <button
@@ -1482,110 +1491,57 @@ function SetupCardBody({
 // ---------------------------------------------------------------------------------------
 
 /**
- * The composer's other way to send, when its destination is a thread: a caret beside Send
- * (a `↻` button on a phone) that opens **Send as implementation loop**: the message is the
- * task. It needs a live connection and `operate`, as starting any loop does: otherwise the
- * choice shows why it can't be made. Nothing goes to the outbox.
+ * The composer's other way to send, when its destination is a thread: a switch beside Send,
+ * **Run as loop** (a `↻` button on a phone, named the same). While it is on, Send starts an
+ * implementation loop whose task is the message (an empty one asks first), and the switch
+ * turns off. It needs a live connection and `operate`, as starting any loop does: otherwise
+ * it is off and says why. Nothing goes to the outbox.
  */
 export function SendAsLoop({
   thread,
   phone,
   busy,
-  onSend,
+  on,
+  onChange,
 }: {
   thread: Thread;
   phone: boolean;
   busy: boolean;
-  onSend: () => void;
+  on: boolean;
+  onChange: (on: boolean) => void;
 }) {
   const loops = useLoops();
   const ids = useId();
-  const [open, setOpen] = useState(false);
-  const opener = useRef<HTMLButtonElement>(null);
-  const panel = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) return;
-    // Focus goes into the choice, or, when it can't be made, to the panel that says why:
-    // a disabled button takes no focus, and Escape must still reach the panel to close it.
-    const choice = Array.from(
-      panel.current?.querySelectorAll<HTMLButtonElement>("button") || [],
-    ).find((b) => !b.disabled);
-    (choice || panel.current)?.focus();
-    const away = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!panel.current?.contains(target) && !opener.current?.contains(target))
-        setOpen(false);
-    };
-    document.addEventListener("mousedown", away);
-    return () => document.removeEventListener("mousedown", away);
-  }, [open]);
-  const close = () => {
-    setOpen(false);
-    opener.current?.focus();
-  };
-  // A loop on a thread whose box is away can't start: the choice says so.
+  // A loop on a thread whose box is away can't start: the switch says so.
   const access = startAccess(loops.access, thread);
   const why = access.why;
+  const what = `${thread.name} plans your message as a task, implements it, and a reviewer model checks the work round by round. The loop commits at the end.`;
+  // A loop that can't start (offline, the box away) turns the switch off: Send sends.
+  useEffect(() => {
+    if (on && !access.act) onChange(false);
+  }, [on, access.act]);
   return (
     <div className={`send-as-loop ${phone ? "phone" : ""}`}>
       <button
         type="button"
-        ref={opener}
-        className={phone ? "send-loop-button" : "send-caret"}
-        aria-label={
-          phone
-            ? `Send as implementation loop to ${thread.name}…`
-            : "More ways to send"
+        role="switch"
+        className={phone ? "send-loop-button" : "send-loop-toggle"}
+        aria-checked={on && access.act}
+        aria-label={phone ? "Run as loop" : undefined}
+        aria-describedby={`${ids}-what`}
+        title={
+          why ||
+          "Send starts an implementation loop with your message as its task"
         }
-        title={phone ? "Send as implementation loop…" : "More ways to send"}
-        aria-haspopup="true"
-        aria-expanded={open}
-        aria-controls={`${ids}-panel`}
-        disabled={busy}
-        onClick={() => setOpen((v) => !v)}
+        disabled={busy || !access.act}
+        onClick={() => onChange(!on)}
       >
-        {phone ? (
-          <RotateCw size={18} aria-hidden="true" />
-        ) : (
-          <ChevronDown size={14} aria-hidden="true" />
-        )}
+        <RotateCw size={phone ? 18 : 14} aria-hidden="true" />
+        {!phone && "Run as loop"}
       </button>
-      {open && (
-        <div
-          className="send-loop-panel"
-          id={`${ids}-panel`}
-          ref={panel}
-          role="group"
-          aria-label="Send as"
-          tabIndex={-1}
-          aria-describedby={access.act ? undefined : `${ids}-what`}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              e.preventDefault();
-              e.stopPropagation();
-              close();
-            }
-          }}
-        >
-          <button
-            type="button"
-            disabled={!access.act}
-            aria-describedby={`${ids}-what`}
-            onClick={() => {
-              setOpen(false);
-              onSend();
-            }}
-          >
-            <RotateCw size={15} aria-hidden="true" />
-            Send as implementation loop
-          </button>
-          <small id={`${ids}-what`}>
-            {why
-              ? why
-              : `${thread.name} plans your message as a task, implements it, and a reviewer model checks the work round by round. The loop commits at the end.`}
-          </small>
-        </div>
-      )}
+      <span className="visually-hidden" id={`${ids}-what`}>
+        {why || what}
+      </span>
     </div>
   );
 }

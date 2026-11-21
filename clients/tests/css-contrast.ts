@@ -436,7 +436,7 @@ export function controlPairs(
     }
   });
   part("pressed icon toggle", () => {
-    // A pressed icon toggle (Toggle tool calls, Toggle reasoning, Focus): its edge on its
+    // A pressed icon toggle (Focus, the thread details): its edge on its
     // fill, where it sits on the page or the panel.
     for (const where of ["bg", "panel"]) {
       const fill = paint(
@@ -451,13 +451,13 @@ export function controlPairs(
     }
   });
   part("menu toggle", () => {
-    // A narrow window's menu: an on toggle's check, on the menu.
+    // An actions menu (the conversation's ⋯): an on toggle's check, on the menu.
     check(
-      "conversation menu's check on the menu",
+      "actions menu's check on the menu",
       paint(
         colorOf(
           style(
-            '.conversation-menu > div > button[aria-pressed="true"]::after',
+            '.actions-menu > div > button[aria-pressed="true"]::after',
             "border",
           ),
         ),

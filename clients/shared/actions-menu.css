@@ -1,0 +1,51 @@
+/* Actions menus (shared/ActionsMenu.tsx). The base look of the button and its list is in
+ * style.css (`.actions-menu`); this adds groups, hints and the in-flow variant. */
+.actions-menu > div > button {
+  gap: 8px;
+  text-align: start;
+}
+.actions-menu > div > button.danger-quiet {
+  color: var(--danger);
+}
+.actions-menu > div > button.actions-menu-group {
+  margin-top: 4px;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 6px 6px;
+  padding-top: 12px;
+}
+.actions-menu-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.actions-menu-text > small {
+  color: var(--muted);
+  font-size: 0.923077rem;
+  line-height: 1.4;
+  white-space: normal;
+}
+.actions-menu > summary.actions-menu-labelled {
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  font-size: 1rem;
+  color: var(--text);
+  cursor: pointer;
+}
+.actions-menu > summary:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+/* In the flow (the inspector's More): the actions open under the button and push what
+ * follows down, so a scrolling pane never clips them. */
+.actions-menu.inline > div {
+  position: static;
+  margin-top: 6px;
+  min-width: 0;
+  box-shadow: none;
+}
+.actions-menu.inline > summary {
+  justify-content: flex-start;
+  width: fit-content;
+}

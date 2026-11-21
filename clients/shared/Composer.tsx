@@ -13,7 +13,7 @@ import {
   type FormEvent,
   type RefObject,
 } from "react";
-import { ArrowUp, ChevronDown, Paperclip, X } from "lucide-react";
+import { ArrowUp, ChevronDown, Paperclip, RotateCw } from "lucide-react";
 import { appendDraft, type OfflineJournal } from "./offline";
 import type { UploadController } from "./uploads";
 import { takesSuggestion, type useAssistance } from "./assistance";
@@ -236,6 +236,20 @@ export function Composer({
   const [mentionIndex, setMentionIndex] = useState(memory.mentionIndex);
   const [mentionHidden, setMentionHidden] = useState(memory.mentionHidden);
   const [slashIndex, setSlashIndex] = useState(memory.slashIndex);
+  // Run as loop: Send starts an implementation loop with the message as its task. It
+  // goes with the conversation it was turned on in, and turns off once used.
+  const [asLoop, setAsLoop] = useState(false);
+  useEffect(() => setAsLoop(false), [draftKey]);
+  const loopOn = asLoop && !!sendAsLoop && !!target && !target.is_orchestrator;
+  const submit = (event?: FormEvent) => {
+    if (loopOn) {
+      event?.preventDefault();
+      setAsLoop(false);
+      sendAsLoop();
+      return;
+    }
+    void send(event);
+  };
   // The field grows and shrinks with its text (fitToText): on every change of the text
   // (typing, sending, a draft put back), of its width (a resized window, a rotated phone)
   // and of the text size.
@@ -298,7 +312,7 @@ export function Composer({
       <form
         className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
         aria-label="Message composer"
-        onSubmit={(event) => void send(event)}
+        onSubmit={submit}
       >
         <div className="composer-label">
           <span className="destination-chip">
@@ -315,16 +329,6 @@ export function Composer({
                   ? target?.name
                   : "Orchestrator"}
             </b>
-            {destination && (
-              <button
-                type="button"
-                aria-label="Return to orchestrator"
-                title="Return to orchestrator"
-                onClick={() => setDestination(undefined)}
-              >
-                <X size={12} />
-              </button>
-            )}
           </span>
 
           <span>
@@ -475,7 +479,7 @@ export function Composer({
               !e.nativeEvent.isComposing
             ) {
               e.preventDefault();
-              void send();
+              submit();
             }
           }}
         />
@@ -506,24 +510,27 @@ export function Composer({
               />
             </label>
           )}
+          {/* The hints show while the box is empty (they describe what typing can do), and
+              once it starts with `!`, what the shell prefixes do. */}
           <span id="twr-composer-hints">
-            <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd> reference a thread{" "}
-            <span>·</span> Shift Enter for a new line
-            {!draft && assistance.suggestion && (
-              <span>
-                {" "}
-                · <kbd>Tab</kbd> or <kbd>→</kbd> takes the suggestion
-              </span>
-            )}
-            {assistance.stats && (
-              <small
-                title={`${assistance.stats.calls} calls · ${assistance.stats.failures} failed`}
-              >
-                {" "}
-                · {assistance.stats.source} $
-                {Number(assistance.stats.cost_usd || 0).toFixed(4)} USD
-              </small>
-            )}
+            {draft.startsWith("!") ? (
+              <>
+                <kbd>!</kbd> runs a shell command <span>·</span> <kbd>!!</kbd>{" "}
+                also shares its output <span>·</span> <kbd>!!!</kbd> sends it as
+                a message
+              </>
+            ) : !draft ? (
+              <>
+                <kbd>/</kbd> commands <span>·</span> <kbd>@</kbd> reference a
+                thread <span>·</span> Shift Enter for a new line
+                {assistance.suggestion && (
+                  <span>
+                    {" "}
+                    · <kbd>Tab</kbd> or <kbd>→</kbd> takes the suggestion
+                  </span>
+                )}
+              </>
+            ) : null}
           </span>
           <div className="composer-actions">
             <VoiceControl
@@ -562,39 +569,56 @@ export function Composer({
               }}
               onError={fail}
             />
-            <button
-              className="send-button"
-              type="submit"
-              disabled={
-                !operate ||
-                !draft.trim() ||
-                (!connected &&
-                  (spokenDraft ||
-                    !journal ||
-                    draft.startsWith("/") ||
-                    draft.startsWith("!"))) ||
-                (!target && !draft.startsWith("/")) ||
-                sending
-              }
-              aria-label={connected ? "Send message" : "Save message for later"}
-              title={
-                !connected && spokenDraft
-                  ? "Reconnect to send dictated text"
-                  : connected
-                    ? "Send message"
-                    : "Save on this device until the hub reconnects"
-              }
-            >
-              {sending ? <Spinner /> : <ArrowUp size={18} />}
-            </button>
             {sendAsLoop && target && !target.is_orchestrator && (
               <SendAsLoop
                 thread={target}
                 phone={document.documentElement.dataset.mobile === "true"}
                 busy={sending}
-                onSend={sendAsLoop}
+                on={asLoop}
+                onChange={setAsLoop}
               />
             )}
+            <button
+              className={`send-button ${loopOn ? "as-loop" : ""}`}
+              type="submit"
+              disabled={
+                loopOn
+                  ? !operate || !connected || sending
+                  : !operate ||
+                    !draft.trim() ||
+                    (!connected &&
+                      (spokenDraft ||
+                        !journal ||
+                        draft.startsWith("/") ||
+                        draft.startsWith("!"))) ||
+                    (!target && !draft.startsWith("/")) ||
+                    sending
+              }
+              aria-label={
+                loopOn
+                  ? "Start implementation loop"
+                  : connected
+                    ? "Send message"
+                    : "Save message for later"
+              }
+              title={
+                loopOn
+                  ? "Start an implementation loop with this message as its task"
+                  : !connected && spokenDraft
+                    ? "Reconnect to send dictated text"
+                    : connected
+                      ? "Send message"
+                      : "Save on this device until the hub reconnects"
+              }
+            >
+              {sending ? (
+                <Spinner />
+              ) : loopOn ? (
+                <RotateCw size={18} />
+              ) : (
+                <ArrowUp size={18} />
+              )}
+            </button>
           </div>
         </div>
         <div className="composer-voice-status" ref={setVoiceStatusContainer} />

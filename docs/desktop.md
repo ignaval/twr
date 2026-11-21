@@ -57,9 +57,13 @@ Choosing an orchestrator or a thread in another workspace switches to that works
 opens it there, with no separate switch. A single click opens a thread's conversation,
 and `+N more` opens that workspace's grid. Each workspace's
 `+` starts a new thread in it. Its name collapses or expands it, and the app remembers
-that on this device. **New workspace** at the end of the list, and the folder button
-beside the heading, create or remove workspaces. Needs you and the thread grid stay at
-the top.
+that on this device. **New workspace** at the end of the list creates or removes
+workspaces. Needs you and the thread grid stay at the top.
+
+Under the workspaces, **Manage** lists **Machines & accounts** (the hub's boxes and your
+accounts; it needs `admin` on a paired device), **Activity** (jobs and usage), **Context &
+memory**, **Trash** and **Decisions**. At the foot, **Commands** (Cmd/Ctrl-K) opens the
+command palette and **Settings** the settings, Read aloud and Hub & storage among them.
 
 Drag the sidebar's right edge to resize it (200 to 440 px, default 260, and at most
 about a third of the window). Double-click the edge to reset it. With the edge focused,
@@ -69,9 +73,28 @@ the other layout settings (Settings › Layout & text) and restored on the next 
 ## Workflows and CLI coverage
 
 The orchestrator conversation is primary. Selecting a thread opens its conversation; the
-**Show thread details** button beside its heading toggles its inspector. The
-composer always names its destination. Mentions reference threads without changing it.
-Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
+**Show thread details** button beside its heading toggles its inspector. Beside it are
+read aloud and the conversation's **⋯** menu: **Show tool calls** and **Show reasoning**
+(each checked while on), **Export conversation**, **Model & runtime…** and, in a thread's
+conversation, **Rename…**, **Park…**, **Compact…** and **Move to trash…**. The header
+above has search, **Open shell** and **New thread**; each action has one place. On a phone
+the conversation's header is hidden, and the same menu, with New thread and Open shell,
+is the **⋯** at the top.
+
+The composer always names its destination; **Back to orchestrator** in the conversation's
+header (the back arrow on a phone) returns to the orchestrator. Mentions reference threads
+without changing it. Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//`
+sends a literal slash. The hints under the box show while it is empty. A message that
+starts with `!` runs a shell command (in the thread's worktree, or the workspace's folder),
+`!!` also shares its output, and `!!!` sends the line as a message; while the box starts
+with `!` the hints say so.
+
+The app's notices share one strip under the header and show one at a time, the most
+pressing first: the connection (connecting, or why it dropped, with **Reconnect**, and
+what this device saved meanwhile), offline, an app whose engine is newer than the
+running hub (**Stop hub…**), an update (**Restart to update**, **Download**, **Dismiss**),
+then the assistance notices. **+N** shows the others under it; dismissing the one shown
+brings up the next.
 
 Above the history, the orchestrator and each thread's conversation show the first line
 of your preceding message, on desktop and phone. At the bottom, this is your latest
@@ -126,10 +149,10 @@ as code with a copy button instead of a link that does nothing.
 | CLI capability | Desktop workflow |
 | --- | --- |
 | Conversations, send, orchestrator selection/reset | Conversation, explicit destination, orchestrator actions |
-| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
-| Stop, park/resume, compact, trim, delete | Inspector actions; deletion uses the hub's confirmation card |
+| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; the inspector's **Permission mode** is a dropdown of the modes in words that changes the mode at once (narrowed to the safe ones without `admin`), and its **Model** has **Change…**; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
+| Stop, park/resume, compact, trim, delete | The inspector shows **Stop…** while a thread works or **Resume…** when it is parked, with **Pin** and **Rename…**; **More** holds **Park…** (stop it and free its worktree; keep the branch), **Trim…** (delete its build output), **Compact…** (summarize its context to free space) and **Move to trash…**; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
-| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Send as implementation loop, the Review loop button on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
+| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Run as loop beside Send, the Review loop button on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |
 | Attach, PTY fallback, arbitrary shell | Embedded xterm.js terminals using the matching real CLI or login shell |
 | Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
@@ -162,8 +185,11 @@ accounts and their logins; storage sizes; usage; a box's agents and projects; an
 check, with its download or Restart to update; a memory note's text), with the data itself
 under **Details**; anything else shows as data.
 
-The command palette discovers commands, arguments and options from the **bundled binary's
-own help**, including clap's multiline help. Arguments are preflighted with the bundled CLI’s actual clap parser before a terminal
+The command palette (**Commands**, Cmd/Ctrl-K) lists the app's actions. The CLI's own
+commands show when the search names one, or all of them with **Show CLI commands** on; an
+action that asks for an id another screen shows (an event, a device, a job) also shows only
+when searched, and update checks are Settings'. The palette discovers the CLI's commands,
+arguments and options from the **bundled binary's own help**, including clap's multiline help. Arguments are preflighted with the bundled CLI’s actual clap parser before a terminal
 opens; invalid arguments leave the form intact. CLI forms show their working directory,
 and project paths in the New form use its explicit working directory. It generates forms rather than asking you to
 construct a command line. Interactive operations run in embedded terminals, so login,
@@ -240,15 +266,15 @@ the same review runs on its work, and the loop commits it at the end ([the
 design](design/loops.md)). The app starts and follows both kinds in threads on the hub's own
 machine.
 
-- **Send as implementation loop.** When you talk to a thread, Send has a caret (a `↻`
-  button beside Send on a phone) with **Send as implementation loop**: what you wrote is the
-  loop's task. Sent with nothing written, it asks first, since the task is then what your
-  conversation with the thread already settled. It needs a live connection, like every loop
-  action: without one, or on a read-only device, the choice says why and nothing is saved
-  for later.
+- **Run as loop.** When you talk to a thread, a **Run as loop** switch sits beside Send (a
+  `↻` button on a phone). With it on, Send (**Start implementation loop**) makes what you
+  wrote the task of an implementation loop, and the switch turns off. Sent with nothing
+  written, it asks first, since the task is then what your conversation with the thread
+  already settled. It needs a live connection, like every loop action: without one, or on a
+  read-only device, the switch is off and says why, and nothing is saved for later.
 - **Start one.** Select a thread: its inspector has a **Loops** section with **Review
   loop** and **Implementation loop…** (which asks for the task, empty meaning what the
-  conversation settled) and, under them, the settings a loop would run on (profile,
+  conversation settled), a line under them saying what each does and, under that, the settings a loop would run on (profile,
   implementer, reviewer, and whether they are this project's) or `first run: you will be
   asked to choose models`, with **Change…**. When a thread's turn ends with changes in its worktree (files not committed, or
   commits ahead of its base) and no loop has reviewed them, its sidebar card, its
@@ -301,9 +327,11 @@ machine.
   `auditing 3 of 5 rules` and the loop line `sweep · auditing 2/5`. An
   implementation loop also shows its plan (revision, contract risk yes or no with the reason,
   and where `plan.md` is), its implement turn's result and gates, and what it commits.
-  **Pause** or **Resume**, **Skip to verify** and **Stop** (after a confirmation) control
-  it, as do `/loop pause|resume|skip|stop`; Skip to verify waits for the ladder in an
-  implementation loop, which has built nothing to verify before it, and says so. A stuck
+  **Pause** or **Resume**, **Finish early** (skip to verify: end the review rounds after the
+  current one and go on to the final verification) and **Stop** (after a confirmation)
+  control it, as do `/loop pause|resume|skip|stop`; Finish early waits for the review
+  rounds in an implementation loop, which has built nothing to verify before them, and says
+  so. A stuck
   loop raises a card with **Resume** and **Stop**. A loop started from the app says what it
   runs on (`api started a review loop: low · implementer … · reviewer … (saved
   settings)`), and a screen reader hears a setup card, a stuck loop and a loop that ends
@@ -699,9 +727,10 @@ by conversation to narrow the results. Search older events continues through old
 pages, including pages without matches. The first archive read after an upgrade may take
 longer while an existing archive receives its search index.
 
-Selecting a result opens its exact event and surrounding history, labeled with the
-hub, workspace, thread and event sequence. It keeps your current message destination
-and draft. Large context fields carry a display-truncated marker. The bounded view
+Each result names its conversation, who it came from (You, Agent, Tool, Reasoning,
+Orchestrator, Decision or Update) and when. Selecting a result opens its exact event and
+surrounding history, labeled the same way with the hub and workspace. It keeps your current
+message destination and draft. Large context fields carry a display-truncated marker. The bounded view
 retains the event id and sequence and omits runtime extras and blob references.
 Use `twr events THREAD --hydrate` to read the full recorded data. Search runs on
 the hub, so it requires a connection to that workspace.

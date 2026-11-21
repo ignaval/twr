@@ -1385,3 +1385,13 @@ function AccessibilityOptions() {
     </section>
   );
 }
+
+// TEMPORARY (agent N): the same mapping agent S exports from this file in a parallel
+// branch; drop this copy in favour of agent S's when the branches merge.
+/** The Manage entry (or Settings) a section is shown under. */
+export function navSection(section: Section): Section {
+  if (section === "boxes") return "accounts";
+  if (section === "usage") return "jobs";
+  if (section === "speech" || section === "maintenance") return "settings";
+  return section;
+}

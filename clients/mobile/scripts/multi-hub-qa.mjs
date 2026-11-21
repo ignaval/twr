@@ -251,7 +251,7 @@ export async function multiHubQA({
     await notification(secondGateway, "work", "twr · offline hub QA");
     // The previously visited hub can reopen its encrypted cache even though
     // its gateway is unavailable. Verify its identity and disabled authority.
-    await expect(page.locator(".offline-banner")).toContainText("Offline", {
+    await expect(page.locator(".status-strip")).toContainText("Offline", {
       timeout: 40000,
     });
     await expect(

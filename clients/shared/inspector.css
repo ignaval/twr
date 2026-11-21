@@ -1,0 +1,51 @@
+/* The thread inspector's actions and details (shared/ThreadActions.tsx). */
+.inspector-actions > .inspector-more {
+  flex-basis: 100%;
+}
+.inspector-more > summary.actions-menu-labelled {
+  font-size: 0.923077rem;
+  padding: 8px;
+  color: var(--muted);
+}
+.inspector-more[open] > summary > svg {
+  transform: rotate(180deg);
+}
+.inspector-more > div > button {
+  align-items: flex-start;
+  font-size: 0.923077rem;
+}
+.inspector-value {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+}
+.inspector-value > b {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.inspector-meta > label {
+  color: var(--faint);
+}
+select.inspector-mode {
+  width: 100%;
+  min-width: 0;
+  font-size: 0.923077rem;
+}
+b.inspector-mode {
+  font-weight: 500;
+}
+/* What each loop start does, one line each, under the buttons (LoopViews › LoopsSection). */
+.loop-start-what {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 0.846154rem;
+  line-height: 1.4;
+}
+.loop-start-what b {
+  font-weight: 500;
+}
