@@ -563,12 +563,34 @@ export class OfflineJournal {
       return Promise.reject(
         new Error("Offline storage changed before saving this draft"),
       );
-    return this.update((record) => ({
-      ...record,
-      drafts,
-      spokenDrafts: spokenDrafts ?? record.spokenDrafts,
-      draftFiles: draftFiles ?? record.draftFiles,
-    }));
+    return this.update((record) => {
+      let next: OfflineRecord = {
+        ...record,
+        drafts,
+        spokenDrafts: spokenDrafts ?? record.spokenDrafts,
+        draftFiles: draftFiles ?? record.draftFiles,
+      };
+      // A message put back that the box has not taken yet ([`acknowledge`]) stays, so a
+      // save from the box as it was (as the app closes, say) never writes over it.
+      for (const restored of this.unacknowledged)
+        next = { ...next, ...backToDraft(next, restored.key, restored.text) };
+      return next;
+    });
+  }
+  /**
+   * Messages the outbox put back in their drafts (the hub held them for a waiting request)
+   * that the message box has not taken yet: [`drafts`] keeps them until it has.
+   */
+  private unacknowledged: { key: string; text: string }[] = [];
+  /** The message box took these messages the outbox put back ([`restoredOf`], a delivery's
+   * `restored_draft` and `restored_drafts`): saves no longer add them for it. */
+  acknowledge(restored: readonly { key: string; text: string }[]) {
+    for (const done of restored) {
+      const at = this.unacknowledged.findIndex(
+        (item) => item.key === done.key && item.text === done.text,
+      );
+      if (at >= 0) this.unacknowledged.splice(at, 1);
+    }
   }
   cache(
     workspace: string,
@@ -706,6 +728,7 @@ export class OfflineJournal {
   async reset() {
     ++this.generation;
     this.active = false;
+    this.unacknowledged = [];
     await Promise.allSettled([this.tail, this.loaded]);
     this.deliveryTail = Promise.resolve();
     await this.host.secureDelete?.(this.key);
@@ -825,6 +848,15 @@ export class OfflineJournal {
                 outbox: record.outbox.filter((item) => item.id !== message.id),
                 ...backToDraft(record, key, text),
               };
+            });
+            this.unacknowledged.push({
+              key:
+                message.workspace +
+                ":" +
+                (message.method === "say"
+                  ? "orchestrator"
+                  : message.params.thread),
+              text,
             });
             const key =
               message.workspace +

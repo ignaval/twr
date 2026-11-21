@@ -1879,10 +1879,13 @@ export default function App({
       }
       for (const restored of response.restored_drafts || [])
         restoreDraft(restored.key, restored.text);
+      journal?.acknowledge(response.restored_drafts || []);
       if (response.action === "pending") {
         // Files the outbox took go back on the conversation; others never left it.
         if (taken) restoreDraft(key, kept);
         else drafts.set(key, (old) => appendDraft(old, draft));
+        if (response.restored_draft)
+          journal?.acknowledge([response.restored_draft]);
         setSection("attention");
         throw new Error(
           "Message not sent. Review the waiting requests and answer the exact item shown.",
@@ -1902,6 +1905,7 @@ export default function App({
       // Earlier saved messages the hub held went back to their drafts before this failed.
       for (const restored of restoredOf(e))
         restoreDraft(restored.key, restored.text);
+      journal?.acknowledge(restoredOf(e));
       fail(e);
     } finally {
       uploads.release(fileIds);
@@ -3793,11 +3797,13 @@ export default function App({
                   threads={view.threads}
                   onSent={(result) => {
                     setQueueRefresh((n) => n + 1);
-                    for (const restored of [
+                    const back = [
                       ...(result.restored_drafts || []),
                       ...(result.restored_draft ? [result.restored_draft] : []),
-                    ])
+                    ];
+                    for (const restored of back)
                       restoreDraft(restored.key, restored.text);
+                    journal?.acknowledge(back);
                   }}
                   onCopy={(message) => {
                     const key =

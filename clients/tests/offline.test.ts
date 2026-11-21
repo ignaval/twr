@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   OfflineJournal,
   parseOffline,
@@ -498,6 +498,53 @@ describe("encrypted offline recovery", () => {
       { key: "work:orchestrator", text: "first" },
     ]);
     expect(restoredOf(new Error("plain"))).toEqual([]);
+  });
+  it("keeps a message put back through a save from the box until the box takes it", async () => {
+    const disk = storage();
+    let calls = 0;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: async () => {
+          calls += 1;
+          if (calls === 1) return { action: "pending" };
+          return new Promise(() => {}); // the later message's delivery stalls
+        },
+      } as unknown as DesktopAPI,
+      "restored-while-pending",
+    );
+    await journal.load();
+    await journal.enqueue("work", "say", {
+      message: "first\nUploaded file: a.txt\n/w/.twr-uploads/u1/a.txt",
+    });
+    const second = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "second",
+    });
+    void journal.deliver(second);
+    await vi.waitFor(() =>
+      expect(journal.snapshot.drafts["work:orchestrator"]).toBe("first"),
+    );
+    // The app closes: the box, which never heard of it, saves what it holds.
+    await journal.drafts({ "work:orchestrator": "" }, journal.epoch, {}, {});
+    const reopened = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "restored-while-pending",
+    );
+    await reopened.load();
+    expect(reopened.snapshot.drafts["work:orchestrator"]).toBe("first");
+    expect(reopened.snapshot.draftFiles?.["work:orchestrator"]).toEqual([
+      { name: "a.txt", path: "/w/.twr-uploads/u1/a.txt" },
+    ]);
+    // Once the box took it, what it saves is what it holds.
+    journal.acknowledge([
+      {
+        key: "work:orchestrator",
+        text: "first\nUploaded file: a.txt\n/w/.twr-uploads/u1/a.txt",
+      },
+    ]);
+    await journal.drafts({ "work:orchestrator": "" }, journal.epoch, {}, {});
+    expect(journal.snapshot.drafts["work:orchestrator"]).toBe("");
   });
   it("never carries cached permission visibility into saved messages", async () => {
     const disk = storage();
