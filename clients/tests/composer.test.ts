@@ -2012,15 +2012,16 @@ describe("attached files", () => {
       writes += 1;
       return write(key, value);
     };
-    const { saveNow } = await import("../shared/save-now");
-    await app().act(() => saveNow());
     await app().act(async () => {
       window.dispatchEvent(new FakeEvent("pagehide") as unknown as Event);
     });
     await app().settle();
     expect(writes).toBe(0);
     await app().type(" and more");
-    await app().act(() => saveNow());
+    await app().act(async () => {
+      window.dispatchEvent(new FakeEvent("pagehide") as unknown as Event);
+    });
+    await app().settle();
     expect(writes).toBeGreaterThan(0);
   });
 

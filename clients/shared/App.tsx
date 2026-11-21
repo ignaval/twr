@@ -504,10 +504,12 @@ export default function App({
       files = now;
       changed(0);
     });
-    const saveNow = async () => {
-      // Only a save still waiting: one with nothing to save would write the whole record
-      // from memory over anything stored since (the outbox included).
-      if (timer === undefined && !pendingEnqueue.current) return;
+    // `waitingOnly`: only a save still waiting (the page unloading, as on a reload): one with
+    // nothing to save would write the whole record from memory over anything stored since
+    // (the outbox included). The app going away (`save-now.ts`) saves either way: the desktop
+    // holds its close for the answer, and an answer at once can find its quit still under way.
+    const saveNow = async (waitingOnly = false) => {
+      if (waitingOnly && timer === undefined && !pendingEnqueue.current) return;
       stop();
       // A message on its way into the outbox clears its draft first (up to 1.5 s, inside
       // the 2 s a closing desktop window waits); one still on its way keeps the drafts
@@ -516,8 +518,8 @@ export default function App({
         await new Promise((resolve) => setTimeout(resolve, 100));
       if (!pendingEnqueue.current) await save(journal.epoch);
     };
-    const unregister = onSaveNow(saveNow);
-    const unloading = () => void saveNow();
+    const unregister = onSaveNow(() => saveNow());
+    const unloading = () => void saveNow(true);
     window.addEventListener("pagehide", unloading);
     return () => {
       unsubscribe();
