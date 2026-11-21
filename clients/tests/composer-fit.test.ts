@@ -207,6 +207,14 @@ describe("the /usage panel in a short window", () => {
     expect(panel).toMatch(/min-height: 0;/);
     expect(panel).toMatch(/overflow-y: auto;/);
   });
+  it("lets the header gauge's popover text wrap, not the header's one-line style", () => {
+    // `.conversation-heading p` is one monospace line cut with an ellipsis (the header's
+    // model line); the popover sits in that header, so its own rule must outrank it.
+    const popover = rule(usage, ".conversation-heading .usage-popover p");
+    expect(popover).toMatch(/white-space: normal;/);
+    expect(popover).toMatch(/font-family: var\(--font-ui\);/);
+    expect(popover).toMatch(/overflow: visible;/);
+  });
   it("steps aside while you type in a tiny phone viewport", () => {
     expect(
       rule(

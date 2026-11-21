@@ -190,6 +190,15 @@
   background: var(--overlay);
   box-shadow: var(--shadow-pop);
 }
+/* The popover sits in the conversation's header, whose own lines are one monospace line cut
+ * with an ellipsis: its sentences wrap in the app's font. */
+.conversation-heading .usage-popover p {
+  margin-top: 0;
+  overflow: visible;
+  font-family: var(--font-ui);
+  text-overflow: clip;
+  white-space: normal;
+}
 .usage-popover:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
