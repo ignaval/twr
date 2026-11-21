@@ -224,6 +224,8 @@ function ChoiceSelect({
   return (
     <select
       id={id}
+      // Named by the field alone: a wrapping label would add the chosen option's text.
+      aria-label={field.label}
       aria-required={field.required || undefined}
       aria-busy={field.loading || undefined}
       disabled={field.loading}

@@ -38,6 +38,8 @@ export function Toggle({
         id={id}
         type="checkbox"
         role="switch"
+        // Named by the label alone; the detail is its description.
+        aria-label={label}
         checked={checked}
         disabled={disabled}
         aria-describedby={described || undefined}
