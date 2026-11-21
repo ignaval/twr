@@ -8188,8 +8188,10 @@ impl AppState {
             // a switch on the same runtime keeps the effort in effect: `orchestrator.use`
             // without one would start the new session at the runtime's default.
             let runtime = m.runtime.clone();
+            // The effort's Default row picked is `default`, the runtime's own: left out, the
+            // hub would take `[orchestrator] effort` from the config instead.
             let (value, effort) = match m.chosen.take() {
-                Some(model) => (model, value),
+                Some(model) => (model, Some(value.unwrap_or_else(|| "default".into()))),
                 None => (value, m.current_effort.clone()),
             };
             self.view.picker = None;
@@ -17113,12 +17115,14 @@ pub(crate) mod tests {
         st.handle_key(key(KeyCode::Enter));
         st.handle_key(key(KeyCode::Char('1')));
         st.handle_key(key(KeyCode::Enter));
+        // The effort's Default row is the runtime's own: `default`, never left out, which
+        // would start the new session at `[orchestrator] effort` from the config.
         assert_eq!(
             st.handle_key(key(KeyCode::Char('y'))),
             [Action::UseOrchestrator {
                 runtime: "claude-code".into(),
                 model: Some("opus".into()),
-                effort: None,
+                effort: Some("default".into()),
                 summary: true,
                 keep_account: true,
             }]

@@ -33,10 +33,17 @@ function withRestored(error: unknown, restored: Json[]) {
   return carried;
 }
 /** The drafts a failed [`OfflineJournal.deliver`] had already moved back ([`withRestored`]). */
-export function restoredOf(error: unknown): { key: string; text: string }[] {
+export function restoredOf(error: unknown): Restored[] {
   const carried = (error as { restored_drafts?: unknown } | null)
     ?.restored_drafts;
   return Array.isArray(carried) ? carried : [];
+}
+/** A saved message the outbox put back in its draft: its outbox id, its draft's key and its
+ * draft. */
+export interface Restored {
+  id: string;
+  key: string;
+  text: string;
 }
 export function appendDraft(current: string | undefined, text: string) {
   if (!current) return text;
@@ -570,7 +577,7 @@ export class OfflineJournal {
         spokenDrafts: spokenDrafts ?? record.spokenDrafts,
         draftFiles: draftFiles ?? record.draftFiles,
       };
-      // A message put back that the box has not taken yet ([`acknowledge`]) stays, so a
+      // A message put back that the box has not taken yet ([`claim`]) stays, so a
       // save from the box as it was (as the app closes, say) never writes over it.
       for (const restored of this.unacknowledged)
         next = { ...next, ...backToDraft(next, restored.key, restored.text) };
@@ -579,18 +586,26 @@ export class OfflineJournal {
   }
   /**
    * Messages the outbox put back in their drafts (the hub held them for a waiting request)
-   * that the message box has not taken yet: [`drafts`] keeps them until it has.
+   * that the message box has not taken yet, by their outbox id: [`drafts`] keeps them until
+   * it has, and [`claim`] gives each to the box once. A reset forgets them.
    */
-  private unacknowledged: { key: string; text: string }[] = [];
-  /** The message box took these messages the outbox put back ([`restoredOf`], a delivery's
-   * `restored_draft` and `restored_drafts`): saves no longer add them for it. */
-  acknowledge(restored: readonly { key: string; text: string }[]) {
-    for (const done of restored) {
-      const at = this.unacknowledged.findIndex(
-        (item) => item.key === done.key && item.text === done.text,
-      );
-      if (at >= 0) this.unacknowledged.splice(at, 1);
+  private unacknowledged: Restored[] = [];
+  /**
+   * The message box takes the messages a delivery put back (its `restored_draft`, its
+   * `restored_drafts`, [`restoredOf`] its error): only those not taken yet, each once, and
+   * none from before a reset. Two deliveries waiting on the same message both carry it, and
+   * one from storage since reset carries one that is gone: the box applies only what this
+   * returns, so a message never comes back twice, nor after a reset.
+   */
+  claim(restored: readonly Restored[]): Restored[] {
+    const taken: Restored[] = [];
+    for (const item of restored) {
+      const at = this.unacknowledged.findIndex((u) => u.id === item.id);
+      if (at < 0) continue;
+      taken.push(this.unacknowledged[at]);
+      this.unacknowledged.splice(at, 1);
     }
+    return taken;
   }
   cache(
     workspace: string,
@@ -849,25 +864,15 @@ export class OfflineJournal {
                 ...backToDraft(record, key, text),
               };
             });
-            this.unacknowledged.push({
-              key:
-                message.workspace +
-                ":" +
-                (message.method === "say"
-                  ? "orchestrator"
-                  : message.params.thread),
-              text,
-            });
             const key =
               message.workspace +
               ":" +
               (message.method === "say"
                 ? "orchestrator"
                 : message.params.thread);
-            return {
-              ...result,
-              restored_draft: { key, text },
-            };
+            const restored: Restored = { id: message.id, key, text };
+            this.unacknowledged.push(restored);
+            return { ...result, restored_draft: restored };
           }
           await this.remove(message.id);
           return result;

@@ -480,7 +480,7 @@ describe("encrypted offline recovery", () => {
       "restored-on-failure",
     );
     await journal.load();
-    await journal.enqueue("work", "say", { message: "first" });
+    const first = await journal.enqueue("work", "say", { message: "first" });
     const second = await journal.enqueue("work", "thread.send", {
       thread: "w1",
       prompt: "second",
@@ -495,7 +495,7 @@ describe("encrypted offline recovery", () => {
     // the box's next save would write over it.
     expect(journal.snapshot.drafts["work:orchestrator"]).toBe("first");
     expect(restoredOf(failed)).toEqual([
-      { key: "work:orchestrator", text: "first" },
+      { id: first.id, key: "work:orchestrator", text: "first" },
     ]);
     expect(restoredOf(new Error("plain"))).toEqual([]);
   });
@@ -514,7 +514,7 @@ describe("encrypted offline recovery", () => {
       "restored-while-pending",
     );
     await journal.load();
-    await journal.enqueue("work", "say", {
+    const first = await journal.enqueue("work", "say", {
       message: "first\nUploaded file: a.txt\n/w/.twr-uploads/u1/a.txt",
     });
     const second = await journal.enqueue("work", "thread.send", {
@@ -537,14 +537,82 @@ describe("encrypted offline recovery", () => {
       { name: "a.txt", path: "/w/.twr-uploads/u1/a.txt" },
     ]);
     // Once the box took it, what it saves is what it holds.
-    journal.acknowledge([
-      {
-        key: "work:orchestrator",
-        text: "first\nUploaded file: a.txt\n/w/.twr-uploads/u1/a.txt",
-      },
-    ]);
+    expect(
+      journal.claim([
+        {
+          id: first.id,
+          key: "work:orchestrator",
+          text: "first\nUploaded file: a.txt\n/w/.twr-uploads/u1/a.txt",
+        },
+      ]),
+    ).toHaveLength(1);
     await journal.drafts({ "work:orchestrator": "" }, journal.epoch, {}, {});
     expect(journal.snapshot.drafts["work:orchestrator"]).toBe("");
+  });
+  it("gives a message put back to the box once, whichever delivery brings it", async () => {
+    const disk = storage();
+    let release!: (value: unknown) => void;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      } as unknown as DesktopAPI,
+      "claimed-once",
+    );
+    await journal.load();
+    const held = await journal.enqueue("work", "say", { message: "held" });
+    // The outbox's drain and a send both wait on the same delivery.
+    const a = journal.deliver(held);
+    const b = journal.deliver(held);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    release({ action: "pending" });
+    const [ra, rb] = await Promise.all([a, b]);
+    expect(ra.restored_draft).toEqual(rb.restored_draft);
+    expect(journal.claim([ra.restored_draft])).toEqual([
+      { id: held.id, key: "work:orchestrator", text: "held" },
+    ]);
+    // The second sees it taken: the box never puts it back again.
+    expect(journal.claim([rb.restored_draft])).toEqual([]);
+  });
+  it("gives nothing back from storage since reset", async () => {
+    const disk = storage();
+    let calls = 0;
+    let release!: (value: unknown) => void;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        secureDelete: async (key: string) => void disk.values.delete(key),
+        sendMessage: () => {
+          calls += 1;
+          if (calls === 1) return Promise.resolve({ action: "pending" });
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        },
+      } as unknown as DesktopAPI,
+      "claimed-after-reset",
+    );
+    await journal.load();
+    await journal.enqueue("work", "say", { message: "held" });
+    const later = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "later",
+    });
+    const delivery = journal.deliver(later).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const resetting = journal.reset();
+    release({ action: "sent" });
+    await resetting;
+    const failed = await delivery;
+    // The failure still names what it had put back, but that storage is gone.
+    expect(restoredOf(failed)).toHaveLength(1);
+    expect(journal.claim(restoredOf(failed))).toEqual([]);
   });
   it("never carries cached permission visibility into saved messages", async () => {
     const disk = storage();
