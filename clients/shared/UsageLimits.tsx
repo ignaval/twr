@@ -167,10 +167,17 @@ export function UsageLimits({
     );
   if (!accounts.length)
     return (
-      <p className="usage-empty">
-        No current limits to show. A window shows here once an agent session
-        reports it, and goes when it resets until a session reports it again.
-      </p>
+      <>
+        {error && (
+          <p className="usage-error" role="status">
+            {error}
+          </p>
+        )}
+        <p className="usage-empty">
+          No current limits to show. A window shows here once an agent session
+          reports it, and goes when it resets until a session reports it again.
+        </p>
+      </>
     );
   return (
     <div className={`usage-limits ${compact ? "compact" : ""}`}>

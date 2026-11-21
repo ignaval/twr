@@ -1489,7 +1489,10 @@ export default function App({
         if (event.target instanceof HTMLTextAreaElement && event.target.value)
           return;
         if (event.target instanceof HTMLInputElement) return;
-        if (selected) setSelected(undefined);
+        // The `/usage` panel above the message box closes first: Esc from the box would
+        // otherwise leave the conversation with the panel still open.
+        if (usagePanel) setUsagePanel(false);
+        else if (selected) setSelected(undefined);
         else if (destination) setDestination(undefined);
         input.current?.focus();
       }
@@ -1510,7 +1513,7 @@ export default function App({
       window.removeEventListener("keydown", keyboard);
       window.removeEventListener("pointerdown", closeMenu);
     };
-  }, [selected, destination]);
+  }, [selected, destination, usagePanel]);
   useEffect(() => {
     if (connected)
       void rpc("desktop.preferences", {

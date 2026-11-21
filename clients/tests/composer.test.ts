@@ -2229,6 +2229,18 @@ describe("usage limits", () => {
     expect(app().all(".usage-panel")).toHaveLength(0);
   });
 
+  it("closes with Esc from the empty message box, staying in the thread's conversation", async () => {
+    await app().talkTo("builder");
+    await app().type("/usage");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(1);
+    await app().press("Escape");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+  });
+
   it("reads again when the hub's live view says usage changed", async () => {
     await app().type("/usage");
     await app().press("Enter");

@@ -361,20 +361,27 @@ impl Drop for Upload {
 /// after it go.
 pub fn trim_message(message: &str) -> &str {
     let message = message.trim_start();
-    let lines = message.trim_end_matches(['\n', '\r']);
-    let Some((rest, last)) = lines.rsplit_once('\n') else {
-        return message.trim_end();
+    let trimmed = message.trim_end();
+    let Some(nl) = trimmed.rfind('\n') else {
+        return trimmed;
     };
-    let named = rest
+    // The last line that isn't blank, as written up to its line break: blank lines after it
+    // (a space on one, say) go, its own trailing spaces stay.
+    let start = nl + 1;
+    let end = message[start..]
+        .find(['\n', '\r'])
+        .map_or(message.len(), |i| start + i);
+    let last = &message[start..end];
+    let named = trimmed[..nl]
         .rsplit('\n')
         .next()
         .is_some_and(|line| line.starts_with("Uploaded file: "));
     let path = last.starts_with('/')
         || matches!(last.as_bytes(), [d, b':', b'\\' | b'/', ..] if d.is_ascii_alphabetic());
     if named && path {
-        lines
+        &message[..end]
     } else {
-        message.trim_end()
+        trimmed
     }
 }
 
@@ -1320,6 +1327,11 @@ mod tests {
         assert_eq!(
             trim_message("Uploaded file: a\r\nC:\\w\\a \r\n"),
             "Uploaded file: a\r\nC:\\w\\a "
+        );
+        // Blank lines after it, a space on one, go; the path's own space stays.
+        assert_eq!(
+            trim_message("see\nUploaded file: n \n/w/.twr-uploads/1/n \n \n\t\n"),
+            "see\nUploaded file: n \n/w/.twr-uploads/1/n "
         );
         // A path line after anything else is ordinary text, trimmed as before.
         assert_eq!(trim_message("look at\n/etc/hosts  "), "look at\n/etc/hosts");

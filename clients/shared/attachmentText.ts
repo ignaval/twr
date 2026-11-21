@@ -116,10 +116,19 @@ export function splitAttachments(text: string): {
  */
 export function trimMessage(text: string) {
   const start = text.replace(/^\s+/, "");
-  const lines = start.replace(/[\r\n]+$/, "").split("\n");
-  const last = lines.at(-1) ?? "";
-  const named = lines.at(-2)?.startsWith(PREFIX) ?? false;
-  return named && isPath(last) ? lines.join("\n") : start.replace(/\s+$/, "");
+  const trimmed = start.replace(/\s+$/, "");
+  const nl = trimmed.lastIndexOf("\n");
+  if (nl < 0) return trimmed;
+  // The last line that isn't blank, as written up to its line break: blank lines after it
+  // (a space on one, say) go, its own trailing spaces stay.
+  const from = nl + 1;
+  const brk = start.slice(from).search(/[\r\n]/);
+  const end = brk < 0 ? start.length : from + brk;
+  const last = start.slice(from, end);
+  const named = (trimmed.slice(0, nl).split("\n").at(-1) ?? "").startsWith(
+    PREFIX,
+  );
+  return named && isPath(last) ? start.slice(0, end) : trimmed;
 }
 
 /** `text` to read where no chip can show: its files by name on a last line

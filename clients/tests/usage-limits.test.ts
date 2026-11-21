@@ -219,6 +219,8 @@ describe("usage limits rendering", () => {
     // `usage.get` leaves out windows that have reset, so none reported and all reset look
     // alike: the sentence holds for both.
     expect(render([])).toContain("No current limits to show");
+    // A refresh that failed says so beside it.
+    expect(render([], "Not connected")).toContain("Not connected");
     expect(render(undefined)).toContain("Reading usage");
     expect(render(undefined, "Not connected")).toContain("Not connected");
   });

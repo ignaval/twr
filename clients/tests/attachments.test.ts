@@ -110,6 +110,13 @@ describe("a message's attachment lines", () => {
     expect(trimMessage(`  see\nUploaded file: notes.txt\n${path}\n\n`)).toBe(
       `see\nUploaded file: notes.txt\n${path}`,
     );
+    // Blank lines after it, a space on one, go; the path's own space stays.
+    expect(trimMessage(`see\nUploaded file: notes.txt\n${path}\n \n\t\n`)).toBe(
+      `see\nUploaded file: notes.txt\n${path}`,
+    );
+    expect(trimMessage("Uploaded file: a\r\n/w/.twr-uploads/1/a \r\n")).toBe(
+      "Uploaded file: a\r\n/w/.twr-uploads/1/a ",
+    );
     expect(trimMessage("  hello \n")).toBe("hello");
     expect(trimMessage(`look\n${path}`)).toBe(`look\n${path.trim()}`);
     expect(trimMessage("Uploaded file: a\n/tmp/a ")).toBe(
