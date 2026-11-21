@@ -668,13 +668,18 @@ try {
   console.log(
     "PASS: [loops] offer_review = false hides the Review loop button",
   );
-  const offer = sidebarCard().locator(".thread-card-offer");
+  // The card offers a single pass and a whole loop.
+  const offers = sidebarCard().locator(".thread-card-offer");
+  const offer = offers.getByRole("button", { name: "Review loop: api" });
   // The hub's shutdown stopped the thread, which goes on when it is sent something: it is
   // offered a review all the same.
   assert.equal(thread("api").stopped, true);
   await offer.waitFor({ timeout: 30000 });
   assert.equal(await offer.innerText(), "Review loop");
-  assert.equal(await offer.getAttribute("aria-label"), "Review loop: api");
+  assert.equal(
+    await offers.getByRole("button", { name: "Review once: api" }).innerText(),
+    "Review once",
+  );
   // In the conversation, under the report.
   const conversationOffer = page.locator(".loop-offer-row");
   await conversationOffer.waitFor();

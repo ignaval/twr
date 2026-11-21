@@ -1329,6 +1329,12 @@ impl Core {
                         let shown = path.display().to_string();
                         mark["outcome"] = json!(outcome);
                         mark["report_path"] = json!(shown);
+                        // As the report the hub writes itself has them (below): whether the
+                        // loop changed the work (every round's fixes, its commits) decides the
+                        // watches its report fires (`hub::orch`).
+                        mark["kind"] = json!(state.kind);
+                        mark["fixed"] = json!(log.fixed().len().max(state.fixed as usize));
+                        mark["commits"] = json!(state.commits);
                         Input::ReportWritten { report_path: shown }
                     }
                     Err(e) => Input::Fail {
@@ -2072,7 +2078,9 @@ impl Core {
                         "kind": state.kind,
                         "step": "report",
                         "outcome": outcome,
-                        "fixed": state.fixed,
+                        // Every round's fixes, verification's too (`state.fixed` counts the
+                        // ladder's only, for the sweep): whether the loop changed the work.
+                        "fixed": log.fixed().len().max(state.fixed as usize),
                         "report_path": shown,
                         "commits": committed.commits,
                         "commit_problem": committed.problem,
