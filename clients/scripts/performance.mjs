@@ -239,7 +239,13 @@ export async function performanceAudit(page, label, application) {
   }
   expect(report.renderedBlocks).toBeLessThan(80);
   // Verify virtualization with all 1,000 tool calls visible as well as the default view.
-  const tools = page.locator('button[aria-label="Toggle tool calls"]');
+  // Show tool calls, in the conversation's ⋯ menu (clicked without opening the menu).
+  const tools = page.locator(
+    ".conversation-heading .actions-menu-items > button",
+    {
+      hasText: "Show tool calls",
+    },
+  );
   await tools.evaluate((button) => button.click());
   await expect
     .poll(() => page.locator(".block-tool").count())

@@ -223,7 +223,7 @@ function UsageBody({
     <>
       <UsageLimits accounts={usage.accounts} error={usage.error} compact />
       <button type="button" className="usage-page-link" onClick={onOpenPage}>
-        Open Usage page <ArrowUpRight size={13} aria-hidden="true" />
+        Open in Activity <ArrowUpRight size={13} aria-hidden="true" />
       </button>
     </>
   );

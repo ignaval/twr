@@ -169,13 +169,19 @@ try {
     window.fixtureListeners = listeners;
   });
   await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
-  await page.getByRole("tab", { name: "Share this computer" }).click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
+  await page.getByRole("tab", { name: "Let other devices connect" }).click();
   await page
     .getByLabel("Public HTTPS address")
     .fill("https://host.example:47321");
+  // The fixture has no file dialog, so the paths are typed (Edit path).
+  for (const [kind, path] of [
+    ["certificate", "/tmp/fullchain.pem"],
+    ["private key", "/tmp/private.pem"],
+  ]) {
+    const edit = page.getByRole("button", { name: `Edit path to the ${kind}` });
+    if (await edit.count()) await edit.click();
+  }
   await page.getByLabel("TLS certificate path").fill("/tmp/fullchain.pem");
   await page.getByLabel("TLS private key path").fill("/tmp/private.pem");
   await page.getByLabel("Device access").selectOption("read");
@@ -240,28 +246,26 @@ try {
     .toBe(true);
   if (process.env.TWR_CONNECTIONS_SCREENSHOT)
     await page.screenshot({ path: process.env.TWR_CONNECTIONS_SCREENSHOT });
-  await page.getByRole("tab", { name: "Saved hubs" }).click();
+  await page.getByRole("tab", { name: "Connect to another computer" }).click();
   await page
     .getByRole("article")
     .filter({ hasText: "Saved workstation" })
     .getByRole("button", { name: "Connect", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
+    .getByRole("button", { name: /^Computer: .+ — switch$/ })
     .filter({ hasText: "Saved workstation" })
     .waitFor();
   assert.equal(await page.evaluate(() => window.fixtureListeners.size), 1);
   await page.evaluate(() => {
     window.fixtureOldRemote = window.twr;
   });
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   await page
     .getByRole("button", { name: "This computer", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
+    .getByRole("button", { name: /^Computer: .+ — switch$/ })
     .filter({ hasText: "This computer" })
     .waitFor();
   assert.equal(await page.evaluate(() => window.fixtureListeners.size), 0);

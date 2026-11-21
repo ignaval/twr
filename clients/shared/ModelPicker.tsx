@@ -49,6 +49,15 @@ export interface PickerConfirmation {
 
 const mobile = () => document.documentElement.dataset.mobile === "true";
 
+/** The event that opens the composer's picker from elsewhere (a conversation's ⋯ menu,
+ * the inspector's Model), so model and effort change in one place. */
+const OPEN_EVENT = "twr:model-picker";
+
+/** Opens the composer's picker, for the conversation shown. */
+export function openModelPicker() {
+  window.dispatchEvent(new Event(OPEN_EVENT));
+}
+
 /** The least room above the composer the popup opens in: about its height with a runtime's
  * six efforts and Done in view. With less it opens over the composer. */
 const PICKER_LEAST_ROOM = 300;
@@ -246,7 +255,8 @@ export function ModelPicker({
     if (refocus) input.current?.focus();
   };
 
-  // Ctrl+Shift+M (⌘+Shift+M on a Mac) opens it, unless a dialog is open.
+  // Ctrl+Shift+M (⌘+Shift+M on a Mac) opens it, unless a dialog is open, and so does
+  // `openModelPicker`.
   const showRef = useRef(show);
   showRef.current = show;
   useEffect(() => {
@@ -261,8 +271,13 @@ export function ModelPicker({
       event.preventDefault();
       showRef.current();
     };
+    const opened = () => showRef.current();
     window.addEventListener("keydown", keyboard);
-    return () => window.removeEventListener("keydown", keyboard);
+    window.addEventListener(OPEN_EVENT, opened);
+    return () => {
+      window.removeEventListener("keydown", keyboard);
+      window.removeEventListener(OPEN_EVENT, opened);
+    };
   }, []);
   // Focus goes to the search as it opens (on a phone, to the sheet: no keyboard pops up).
   // A runtime that runs its own command line has no search: the focus goes to its runtime

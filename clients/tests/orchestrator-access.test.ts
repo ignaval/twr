@@ -318,11 +318,21 @@ describe("Settings › Orchestrator access and the admin scope", () => {
 
   it("is offered to the user's own clients and admin devices only", async () => {
     const admin = await settings(true);
+    // Settings › Agents.
+    await admin.click(admin.find("[role=tab]", "Agents"));
+    expect(
+      admin.find("[role=tab]", "Agents").getAttribute("aria-selected"),
+    ).toBe("true");
     expect(admin.text()).toContain("Orchestrator access");
     expect(admin.find(".segmented button", "Full")).toBeDefined();
     await admin.unmount();
     const device = await settings(false);
-    expect(device.text()).not.toContain("Orchestrator access");
+    // A device without admin has no Agents tab.
+    expect(device.find("[role=tab]", "Agents")).toBeUndefined();
+    for (const tab of device.all("[role=tab]")) {
+      await device.click(tab);
+      expect(device.text()).not.toContain("Orchestrator access");
+    }
     expect(device.find(".segmented button", "Full")).toBeUndefined();
     await device.unmount();
   });

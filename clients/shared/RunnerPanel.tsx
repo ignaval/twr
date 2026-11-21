@@ -1,6 +1,47 @@
 import { useEffect, useRef, useState } from "react";
 import type { Json } from "./types";
 import { errorMessage } from "./errors";
+import { CopyButton } from "./ui";
+import "./runner-panel.css";
+
+/** A command to run in a terminal on the other machine, copyable, after what it does. */
+function CommandLine({ text, children }: { text: string; children: string }) {
+  return (
+    <div className="runner-command">
+      <p>{children}</p>
+      <div className="code-block">
+        <pre>
+          <code>{text}</code>
+        </pre>
+        <CopyButton
+          className="copy-code"
+          label={`Copy ${text}`}
+          text={() => text}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** A runner control's failure in words, with the hub's own text as its detail when the
+ * words replace it. The runner service (twr-link) is what pairs and manages runners from
+ * this computer: the hub starts it when it can; "Use this machine as a runner" (or
+ * `twr runner up`) starts it otherwise. */
+export function runnerErrorText(
+  raw: string,
+  canHost: boolean,
+): { message: string; detail?: string } {
+  const text = raw.replace(/^internal:\s*/i, "");
+  if (/runner service is not running/i.test(text))
+    return {
+      message: `The runner service isn't running on this computer. Start it with ${
+        canHost ? "Use this machine as a runner" : "twr runner up in a terminal"
+      }, then try again.`,
+      detail: raw,
+    };
+  if (text !== raw) return { message: text, detail: raw };
+  return { message: raw };
+}
 
 type PairSession = { session: string; runner?: string };
 function retireSession(
@@ -15,6 +56,22 @@ function retireSession(
       })
     : rpc("desktop.runner.cancel", { session: pair.session });
   void call.catch(() => {});
+}
+
+/** A runner control's failure, said in words; the raw text under Details. */
+function RunnerError({ raw, canHost }: { raw: string; canHost: boolean }) {
+  const { message, detail } = runnerErrorText(raw, canHost);
+  return (
+    <div role="alert" className="runner-error">
+      <p>{message}</p>
+      {detail && (
+        <details>
+          <summary>Details</summary>
+          <pre>{detail}</pre>
+        </details>
+      )}
+    </div>
+  );
 }
 
 export function RunnerPanel({
@@ -40,6 +97,9 @@ export function RunnerPanel({
   const [selfMachine, setSelfMachine] = useState("");
   const [revokeTarget, setRevokeTarget] = useState("");
   const [hubs, setHubs] = useState<Json[]>([]);
+  /** The hub's runner boxes (`hub.info` `boxes` over a link), for Manage runner access;
+   * undefined until read, null when they can't be. */
+  const [runners, setRunners] = useState<string[] | null>();
   const generation = useRef(0);
   const session = useRef<PairSession | null>(null);
   const rpcRef = useRef(rpc);
@@ -83,6 +143,27 @@ export function RunnerPanel({
     setRevokeTarget("");
     setSelfMachine("");
     setReplace(false);
+    if (next === "access") {
+      const request = generation.current;
+      setRunners(undefined);
+      void rpcRef
+        .current("hub.info")
+        .then((info) => {
+          if (generation.current !== request) return;
+          const boxes = (Array.isArray(info?.boxes) ? info.boxes : []).filter(
+            (b: Json) => typeof b?.name === "string",
+          );
+          const linked = boxes.filter((b: Json) => b.transport === "link");
+          const names = (linked.length ? linked : boxes).map(
+            (b: Json) => b.name as string,
+          );
+          setRunners(names.length ? names : null);
+          if (names.length === 1) setName(names[0]);
+        })
+        .catch(() => {
+          if (generation.current === request) setRunners(null);
+        });
+    }
     return generation.current;
   };
   const showRunner = async () => {
@@ -193,80 +274,163 @@ export function RunnerPanel({
                 : "Contacting runner…"}
             </p>
           )}
-          {error && <p role="alert">{error}</p>}
-          {code && mode !== "connect" && (
+          {error && <RunnerError raw={error} canHost={canHost} />}
+          {code && mode === "runner" && (
+            <ol className="setup-steps runner-steps">
+              <li>
+                <h4>Give the other hub this code</h4>
+                <p>
+                  On the other hub machine, open Boxes, choose{" "}
+                  <strong>Connect a runner</strong>, name this machine and
+                  enter:
+                </p>
+                <p>
+                  <code aria-label="Pairing code" className="runner-code">
+                    {code}
+                  </code>
+                </p>
+                <p>It works once and expires in 15 minutes.</p>
+                <CommandLine text="twr box pair <name>">
+                  Or, in a terminal on the other hub, run this with the name it
+                  should use for this machine:
+                </CommandLine>
+              </li>
+              <li>
+                <h4>Wait for it to connect</h4>
+                <p>
+                  This machine connects once the other hub pairs. Agents keep
+                  working when this window closes; this machine must stay awake.
+                </p>
+              </li>
+            </ol>
+          )}
+          {code && mode === "access" && (
             <>
               <p>
                 On the other hub machine, choose{" "}
                 <strong>Connect a runner</strong> and enter:
               </p>
               <p>
-                <code aria-label="Pairing code">{code}</code>
+                <code aria-label="Pairing code" className="runner-code">
+                  {code}
+                </code>
               </p>
-              <p>
-                This code works once and expires in 15 minutes. From a terminal
-                on the other hub, run <code>twr box pair &lt;name&gt;</code>.
-              </p>
-              <p>
-                Agents keep working when this window closes. The runner machine
-                must stay awake.
-              </p>
+              <p>This code works once and expires in 15 minutes.</p>
+              <CommandLine text="twr box pair <name>">
+                Or, in a terminal on the other hub:
+              </CommandLine>
             </>
           )}
           {mode === "connect" && !paired && (
             <form onSubmit={connect} autoComplete="off">
-              <label>
-                Runner name
-                <input
-                  value={name}
-                  maxLength={64}
-                  onChange={(e) => setName(e.target.value)}
-                  required
-                  disabled={busy}
-                />
-              </label>
-              <label>
-                Pairing code
-                <input
-                  type="password"
-                  autoComplete="off"
-                  spellCheck={false}
-                  value={code}
-                  maxLength={64}
-                  onChange={(e) => setCode(e.target.value)}
-                  required
-                  disabled={busy}
-                />
-              </label>
-              <p>
-                On the runner machine, choose Use this machine as a runner, or
-                run <code>twr runner up</code>.
-              </p>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={replace}
-                  disabled={busy}
-                  onChange={(e) => setReplace(e.target.checked)}
-                />
-                Replace this machine’s existing access if recovery is
-                unavailable. This stops its running workers.
-              </label>
-              <button type="submit" disabled={busy}>
-                Pair runner
-              </button>
+              <ol className="setup-steps runner-steps">
+                <li>
+                  <h4>Name the box</h4>
+                  <label>
+                    Runner name
+                    <input
+                      value={name}
+                      maxLength={64}
+                      onChange={(e) => setName(e.target.value)}
+                      required
+                      disabled={busy}
+                    />
+                  </label>
+                  <p>
+                    On the runner machine, open Boxes and choose{" "}
+                    <strong>Use this machine as a runner</strong> to get a code.
+                  </p>
+                  <CommandLine text="twr runner up">
+                    Or, in a terminal on the runner machine:
+                  </CommandLine>
+                </li>
+                <li>
+                  <h4>Enter its code</h4>
+                  <label>
+                    Pairing code
+                    <input
+                      type="password"
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={code}
+                      maxLength={64}
+                      onChange={(e) => setCode(e.target.value)}
+                      required
+                      disabled={busy}
+                    />
+                  </label>
+                  <button type="submit" className="primary" disabled={busy}>
+                    Pair runner
+                  </button>
+                </li>
+              </ol>
+              <details className="runner-advanced">
+                <summary>Advanced</summary>
+                <label className="runner-replace">
+                  <input
+                    type="checkbox"
+                    checked={replace}
+                    disabled={busy}
+                    onChange={(e) => setReplace(e.target.checked)}
+                  />
+                  Replace an existing pairing. Use it only when recovery is
+                  unavailable: it stops the machine’s running workers.
+                </label>
+                <button
+                  type="button"
+                  disabled={busy || !name.trim()}
+                  onClick={() => {
+                    const request = generation.current;
+                    setBusy(true);
+                    setError("");
+                    void rpc("runner.recover", { name: name.trim() })
+                      .then(() => {
+                        refresh();
+                        if (generation.current === request) {
+                          setCode("");
+                          setPaired(true);
+                        }
+                      })
+                      .catch((e) => {
+                        if (generation.current === request)
+                          setError(errorMessage(e));
+                      })
+                      .finally(() => {
+                        if (generation.current === request) setBusy(false);
+                      });
+                  }}
+                >
+                  Recover a saved pairing
+                </button>
+              </details>
             </form>
           )}
           {mode === "access" && (
             <>
               <label>
-                Connected runner name
-                <input
-                  value={name}
-                  maxLength={64}
-                  onChange={(e) => setName(e.target.value)}
-                  disabled={busy}
-                />
+                Connected runner
+                {runners ? (
+                  <select
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    disabled={busy}
+                  >
+                    <option value="">Choose…</option>
+                    {runners.map((runner) => (
+                      <option key={runner} value={runner}>
+                        {runner}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    value={name}
+                    maxLength={64}
+                    onChange={(e) => setName(e.target.value)}
+                    disabled={busy || runners === undefined}
+                    placeholder={runners === undefined ? "Loading…" : ""}
+                  />
+                )}
               </label>
               <button
                 disabled={busy || !name.trim()}
@@ -324,34 +488,11 @@ export function RunnerPanel({
               </button>
             </div>
           )}
-          {mode === "connect" && !paired && name.trim() && (
-            <button
-              disabled={busy}
-              onClick={() => {
-                const request = generation.current;
-                setBusy(true);
-                setError("");
-                void rpc("runner.recover", { name: name.trim() })
-                  .then(() => {
-                    refresh();
-                    if (generation.current === request) {
-                      setCode("");
-                      setPaired(true);
-                    }
-                  })
-                  .catch((e) => {
-                    if (generation.current === request)
-                      setError(errorMessage(e));
-                  })
-                  .finally(() => {
-                    if (generation.current === request) setBusy(false);
-                  });
-              }}
-            >
-              Recover a saved pairing
-            </button>
+          {paired && (
+            <p role="status">
+              Runner paired. Its agents appear under Boxes once it connects.
+            </p>
           )}
-          {paired && <p role="status">Runner paired.</p>}
           <button onClick={() => changeMode("closed")}>Close</button>
         </section>
       )}

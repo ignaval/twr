@@ -70,12 +70,11 @@ export async function captureMobileUI(page, { label, thread }) {
     });
     if (await more.isVisible()) await more.click();
     else if (await show.isVisible()) await show.click();
-    else {
-      await page.locator(".conversation-menu > summary").click();
+    else
       await page
-        .getByRole("button", { name: "Threads and navigation", exact: true })
+        .locator(".compact-nav")
+        .getByRole("button", { name: "More", exact: true })
         .click();
-    }
     await expect(page.locator(".sidebar")).toBeVisible();
   };
   const returnThread = async () => {
@@ -109,6 +108,7 @@ export async function captureMobileUI(page, { label, thread }) {
       .locator(".sidebar-footer")
       .getByRole("button", { name: "Settings", exact: true })
       .click();
+    await page.getByRole("tab", { name: "General", exact: true }).click();
     await page
       .getByRole("heading", { name: "Appearance", exact: true })
       .waitFor();

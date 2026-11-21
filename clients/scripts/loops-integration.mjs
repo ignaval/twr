@@ -199,6 +199,17 @@ const twr = (...args) =>
   });
 const twrJson = (...args) => JSON.parse(twr(...args, "--json"));
 const thread = (name) => twrJson("thread", "list").find((t) => t.name === name);
+/** Unfolds a loop settings editor's Customize, the controls past the preset (folded when
+ * its settings are a preset's), once the editor in `scope` has loaded. */
+async function customize(scope) {
+  await scope.locator("fieldset.loop-editor").first().waitFor();
+  const toggle = scope.locator(".loop-customize-toggle");
+  if (
+    (await toggle.count()) &&
+    (await toggle.getAttribute("aria-expanded")) === "false"
+  )
+    await toggle.click();
+}
 async function until(check, message, ms = 30000) {
   const deadline = Date.now() + ms;
   for (;;) {
@@ -865,6 +876,7 @@ try {
   const editor = page.getByRole("dialog", { name: "Loop settings · api" });
   await editor.waitFor();
   await editor.getByText("Loading loop settings…").waitFor({ state: "hidden" });
+  await customize(editor);
   const presets = editor.getByRole("group", { name: "Preset" });
   assert.equal(await presets.getByRole("button").count(), 4);
   const field = (name, group) =>
@@ -880,7 +892,7 @@ try {
         document.getElementById(n.getAttribute("aria-describedby"))
           ?.textContent || "",
     ),
-    /^A named implementer runs on the thread's own runtime/,
+    /^Choose a model, or let each thread use its own\./,
   );
   await field("Runtime", "Reviewer").waitFor();
   await field("Model", "Reviewer").waitFor();
@@ -897,6 +909,7 @@ try {
   await page.keyboard.press("Enter");
   await editor.waitFor();
   await editor.getByText("Loading loop settings…").waitFor({ state: "hidden" });
+  await customize(editor);
   // A preset names the implementer: its model and effort pickers and its workers show.
   await presets.getByRole("button").first().click();
   assert.equal(
@@ -998,7 +1011,7 @@ try {
     .getByText("m1 under review")
     .waitFor();
   const controls = loopsSection.getByRole("group", { name: "Loop controls" });
-  for (const name of ["Pause", "Skip to verify", "Stop…"])
+  for (const name of ["Pause", "Finish early", "Stop…"])
     await controls.getByRole("button", { name, exact: true }).waitFor();
   await ariaOf("11-inspector-running", loopsSection);
   await capture("11-inspector-running", null, {
@@ -1013,7 +1026,7 @@ try {
   assert.equal(now.text, "Pause");
   assert(now.visible, "Keyboard focus is visible on Pause");
   await page.keyboard.press("Tab");
-  assert.equal((await focused()).text, "Skip to verify");
+  assert.equal((await focused()).text, "Finish early");
   await page.keyboard.press("Tab");
   assert.equal((await focused()).text, "Stop…");
   await page.keyboard.press("Enter");
@@ -1311,6 +1324,7 @@ try {
   await projectEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(projectEditor);
   await projectEditor
     .getByRole("group", { name: "Save for" })
     .getByRole("button", { name: "demo only" })
@@ -1347,6 +1361,7 @@ try {
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
+  await page.getByRole("tab", { name: "Loops", exact: true }).click();
   const panel = page
     .locator(".settings-section")
     .filter({ has: page.getByRole("heading", { name: "Loops", exact: true }) });
@@ -1362,6 +1377,7 @@ try {
   });
   await projects.getByRole("button", { name: "Open" }).click();
   await panel.getByRole("heading", { name: "demo's settings" }).waitFor();
+  await customize(panel);
   await panel
     .getByRole("combobox", { name: "Profile", exact: true })
     .selectOption("high");
@@ -1379,7 +1395,7 @@ try {
   );
 
   // ---------------------------------------------------------------------------------
-  // 8. Implementation loops. With no saved settings, Send as implementation loop raises
+  // 8. Implementation loops. With no saved settings, Run as loop raises
   //    the setup card holding the task; Run without a loop sends it as an ordinary
   //    message. Again with Start and save: plan, implement, a round, the report and the
   //    commit. The New thread form's switch starts one on saved settings.
@@ -1403,32 +1419,35 @@ try {
   await webBox.waitFor();
   await page.getByText("Loading conversation…").waitFor({ state: "hidden" });
   const task = "add a CSV export to the reports page";
-  /** Types the task and picks Send as implementation loop from Send's caret. */
+  /** Types the task and turns on Run as loop beside Send: Send then starts the loop. */
+  const runAsLoop = page.getByRole("switch", {
+    name: "Run as loop",
+    exact: true,
+  });
   const sendAsLoop = async () => {
     await webBox.fill(task);
-    const caret = page.getByRole("button", { name: "More ways to send" });
-    assert.equal(await caret.getAttribute("aria-expanded"), "false");
-    await caret.click();
-    assert.equal(await caret.getAttribute("aria-expanded"), "true");
-    const choice = page.getByRole("button", {
-      name: "Send as implementation loop",
+    assert.equal(await runAsLoop.getAttribute("aria-checked"), "false");
+    await runAsLoop.click();
+    assert.equal(await runAsLoop.getAttribute("aria-checked"), "true");
+    const start = page.getByRole("button", {
+      name: "Start implementation loop",
       exact: true,
     });
-    await choice.waitFor();
-    return choice;
+    await start.waitFor();
+    return start;
   };
-  // The choice is keyboard-reachable and Escape closes it, giving focus back to the caret.
+  // The switch is keyboard-reachable, and Space turns it off again: Send sends a message.
   await sendAsLoop();
-  assert.equal((await focused()).text, "Send as implementation loop");
-  await page.keyboard.press("Escape");
-  assert.equal((await focused()).text, "More ways to send");
-  await sendAsLoop();
+  assert.equal((await focused()).text, "Run as loop");
+  await page.keyboard.press("Space");
+  assert.equal(await runAsLoop.getAttribute("aria-checked"), "false");
+  await page
+    .getByRole("button", { name: "Send message", exact: true })
+    .waitFor();
+  const startLoop = await sendAsLoop();
   await ariaOf("20-send-as-loop", page.locator(".composer"));
   await capture("20-send-as-loop", null);
-  const sendCaret = page.getByRole("button", { name: "More ways to send" });
-  if ((await sendCaret.getAttribute("aria-expanded")) === "true")
-    await sendCaret.click();
-  (await sendAsLoop()).click();
+  await startLoop.click();
   const webSetup = setupIn(page.locator(".conversation-attention"));
   await webSetup.waitFor({ timeout: 15000 });
   assert.equal(await webBox.inputValue(), "", "The task left the composer");
@@ -1499,7 +1518,7 @@ try {
     "Run without a loop saves nothing",
   );
   console.log(
-    "PASS: Send as implementation loop raises the card holding the task; Run without a loop sends it as a message",
+    "PASS: Run as loop raises the card holding the task; Run without a loop sends it as a message",
   );
 
   // Again, with Start and save: the loop runs. Its plan and implement turns take a while
@@ -1936,6 +1955,7 @@ try {
   await sweepEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(sweepEditor);
   const sweepField = sweepEditor.getByRole("combobox", {
     name: "Sweep",
     exact: true,
@@ -2384,6 +2404,7 @@ exit 1
   await boxEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(boxEditor);
   await boxEditor
     .getByText("Runtimes as found on box lab: its reviewer runs there.")
     .waitFor();
@@ -2632,9 +2653,9 @@ exit 1
   await boxerBox.waitFor();
   await page.getByText("Loading conversation…").waitFor({ state: "hidden" });
   await boxerBox.fill("add a CSV export to the reports page");
-  await page.getByRole("button", { name: "More ways to send" }).click();
+  await page.getByRole("switch", { name: "Run as loop", exact: true }).click();
   await page
-    .getByRole("button", { name: "Send as implementation loop", exact: true })
+    .getByRole("button", { name: "Start implementation loop", exact: true })
     .click();
   await until(
     () => boxer().loop?.kind === "implement",
@@ -2696,30 +2717,26 @@ exit 1
   await capture("46-box-offline-start", boxLoops, { narrow: false });
   await page.getByRole("button", { name: "Talk to this thread" }).click();
   await boxerBox.fill("another task");
-  await page.getByRole("button", { name: "More ways to send" }).click();
-  const awayChoice = page.getByRole("button", {
-    name: "Send as implementation loop",
+  // Run as loop can't be turned on, and says why (its description and its tooltip).
+  const awaySwitch = page.getByRole("switch", {
+    name: "Run as loop",
     exact: true,
   });
-  assert(await awayChoice.isDisabled(), "Send as implementation loop waits");
-  await page
-    .locator(".send-loop-panel small")
-    .filter({ hasText: "Box lab is away: a loop can start once it is back." })
-    .waitFor();
-  // The choice can't be made: the focus goes to its panel, which says why, and Escape
-  // closes it, giving the focus back to the caret (not leaving the conversation).
-  assert(
-    await page
-      .locator(".send-loop-panel")
-      .evaluate((n) => n === document.activeElement),
-    "The panel that says why has the focus",
+  assert(await awaySwitch.isDisabled(), "Run as loop waits");
+  assert.equal(await awaySwitch.getAttribute("aria-checked"), "false");
+  assert.equal(
+    await awaySwitch.getAttribute("title"),
+    "Box lab is away: a loop can start once it is back.",
   );
-  await page.keyboard.press("Escape");
-  await page.locator(".send-loop-panel").waitFor({ state: "hidden" });
-  assert.equal((await focused()).text, "More ways to send");
+  assert.equal(
+    await page
+      .locator(`#${await awaySwitch.getAttribute("aria-describedby")}`)
+      .textContent(),
+    "Box lab is away: a loop can start once it is back.",
+  );
   await boxerBox.fill("");
   console.log(
-    "PASS: with the box away, Review loop, Implementation loop… and Send as implementation loop say why they wait",
+    "PASS: with the box away, Review loop, Implementation loop… and Run as loop say why they wait",
   );
 
   // ---------------------------------------------------------------------------------
@@ -2824,6 +2841,7 @@ exit 1
   await acpEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(acpEditor);
   const cardReviewer = await pickers(acpEditor, "The card's editor");
   await cardReviewer.focus();
   await cardReviewer.selectOption("ex");
@@ -2913,10 +2931,12 @@ exit 1
     .getByRole("button", { name: "Settings", exact: true })
     .first()
     .click();
+  await page.getByRole("tab", { name: "Loops", exact: true }).click();
   const loopsPanel = page
     .locator(".settings-section")
     .filter({ has: page.getByRole("heading", { name: "Loops", exact: true }) });
   await loopsPanel.waitFor();
+  await customize(loopsPanel);
   await loopsPanel
     .getByRole("group", { name: "Reviewer" })
     .waitFor({ timeout: 15000 });
@@ -2936,6 +2956,7 @@ exit 1
   await demoEditor
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden" });
+  await customize(demoEditor);
   await pickers(demoEditor, "A project's editor");
   await capture("54-acp-project", demoEditor, { narrow: false });
   await page.keyboard.press("Escape");

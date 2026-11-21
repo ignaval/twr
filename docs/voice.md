@@ -74,7 +74,7 @@ message box, where you send it as typed, or edit it; **Discard** drops it. Sayin
 drops it too in hands-free mode. Dictated text keeps its spoken origin through edits and
 encrypted draft saves/reloads: the first **Send** still uses the hub's spoken-message check.
 If it requires review, **Review in message box** explicitly makes that draft typed; a separate
-**Send** then submits it. Dictated slash/shell commands and **Send as implementation loop**
+**Send** then submits it. Dictated slash/shell commands and **Run as loop**
 also require this explicit review before they can run. A direct worker message is a prompt,
 not an answer to the hub's waiting permission or question.
 

@@ -1,5 +1,6 @@
 import { expect, it, vi } from "vitest";
 import { routeRunnerControls } from "../desktop/runner-controls";
+import { runnerErrorText } from "../shared/RunnerPanel";
 
 it("hosts and cancels on this desktop while pairing and access stay on the viewed hub", async () => {
   const local = vi.fn(async () => "local");
@@ -44,4 +45,23 @@ it("retires an exact local code after the old hub view is closed, without reopen
   }
   expect(local).toHaveBeenCalledTimes(1);
   expect(remote).not.toHaveBeenCalled();
+});
+
+it("says a stopped runner service in words, its raw text under Details", () => {
+  const raw =
+    "internal: runner service is not running: No such file or directory (os error 2)";
+  expect(runnerErrorText(raw, true)).toEqual({
+    message:
+      "The runner service isn't running on this computer. Start it with Use this machine as a runner, then try again.",
+    detail: raw,
+  });
+  expect(runnerErrorText(raw, false).message).toContain("twr runner up");
+  // The hub's code word goes; a plain message stays as it is.
+  expect(runnerErrorText("internal: pairing code expired", true)).toEqual({
+    message: "pairing code expired",
+    detail: "internal: pairing code expired",
+  });
+  expect(runnerErrorText("This code has expired.", true)).toEqual({
+    message: "This code has expired.",
+  });
 });

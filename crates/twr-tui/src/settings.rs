@@ -199,6 +199,7 @@ pub fn scalar_text(v: &crate::config_edit::Scalar) -> String {
         Scalar::Int(i) => i.to_string(),
         Scalar::Float(_) => v.text(),
         Scalar::Str(s) => format!("{s:?}"),
+        Scalar::Strs(_) => v.text(),
     }
 }
 

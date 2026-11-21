@@ -57,6 +57,7 @@ const api: DesktopAPI = {
   terminalClose: (id) => ipcRenderer.invoke("twr:terminal-close", id),
   terminalRead: (id) => ipcRenderer.invoke("twr:terminal-read", id),
   pickDirectory: () => ipcRenderer.invoke("twr:pick-directory"),
+  pickFile: (request) => ipcRenderer.invoke("twr:pick-file", request),
   openExternal: (url) => ipcRenderer.invoke("twr:open-external", url),
   reveal: (path) => ipcRenderer.invoke("twr:reveal", path),
   configRead: () => ipcRenderer.invoke("twr:config-read"),

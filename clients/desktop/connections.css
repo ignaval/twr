@@ -93,3 +93,87 @@
   background: var(--accent-soft);
   color: var(--accent);
 }
+/* Let other devices connect: three numbered steps, each a small group of fields. */
+.setup-steps {
+  display: grid;
+  gap: 20px;
+  margin: 0;
+  padding-left: 24px;
+}
+.setup-steps > li {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.setup-steps > li::marker {
+  font-weight: 600;
+  color: var(--muted);
+}
+.setup-steps h3,
+.connection-form h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.setup-steps p {
+  margin: 0;
+  line-height: 1.5;
+}
+.setup-steps .primary {
+  justify-self: start;
+}
+.pem-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.pem-path {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+.pem-actions,
+.gateway-status .button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.gateway-status {
+  display: grid;
+  gap: 8px;
+}
+.gateway-status > p {
+  margin: 0;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.connection-manual > summary,
+.connection-advanced > summary,
+.gateway-log > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.connection-manual-fields {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+.connection-advanced > label {
+  margin-top: 12px;
+}
+.connection-form label > small {
+  color: var(--muted);
+}
+.connection-advanced > small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+}
+.connection-form textarea {
+  width: 100%;
+  padding: 8px;
+  font-family: var(--font-mono);
+  resize: vertical;
+}
+.gateway-log pre {
+  max-height: 30vh;
+  overflow: auto;
+}
