@@ -446,15 +446,16 @@ describe("styles that keep controls usable", () => {
     expect(rule(css, `${sw}:checked::before`)).toContain(
       "transform: translateX",
     );
-    expect(rule(mobile, `[data-mobile="true"] ${sw}`)).toContain(
-      "min-width: 44px",
-    );
-    // The track is 26 high; its ::after reaches 10 past it above and below.
-    expect(rule(mobile, `[data-mobile="true"] ${sw}`)).toContain(
-      "min-height: 26px",
-    );
-    expect(rule(mobile, `[data-mobile="true"] ${sw}::after`)).toContain(
-      "inset: -10px 0",
+    // The input itself is the 44-point target (what is measured and tapped); its ::after
+    // draws the 26-high track inside it, and turns the accent when on.
+    const target = rule(mobile, `[data-mobile="true"] ${sw}:checked`);
+    expect(target).toContain("min-width: 44px");
+    expect(target).toContain("min-height: 44px");
+    const track = rule(mobile, `[data-mobile="true"] ${sw}::after`);
+    expect(track).toContain("height: 26px");
+    expect(track).toContain("border-radius: 999px");
+    expect(rule(mobile, `[data-mobile="true"] ${sw}:checked::after`)).toContain(
+      "background: var(--accent)",
     );
   });
   it("gives the phone's disclosure rows and the model picker's list switch 44 points", () => {
