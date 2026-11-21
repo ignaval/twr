@@ -3238,35 +3238,6 @@ meter::-webkit-meter-optimum-value {
   white-space: pre;
   font-size: 0.923077rem;
 }
-.setting-row {
-  display: grid;
-  grid-template-columns: minmax(150px, 1fr) minmax(100px, 180px) 60px;
-  gap: 12px;
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  padding: 12px 0;
-}
-.setting-row > label {
-  font-size: 1rem;
-}
-.setting-row small {
-  display: block;
-  margin-top: 4px;
-  font-size: 0.923077rem;
-  color: var(--muted);
-}
-.setting-row input,
-.setting-row select {
-  font-size: 0.923077rem;
-  padding: 8px;
-}
-.setting-row > input[type="checkbox"] {
-  justify-self: end;
-}
-.setting-row > button {
-  font-size: 0.923077rem;
-  padding: 8px;
-}
 .shell-runs:empty {
   display: none;
 }
@@ -3739,10 +3710,6 @@ meter::-webkit-meter-optimum-value {
   .compact-nav .count {
     margin-left: 4px;
   }
-  .setting-row {
-    grid-template-columns: minmax(110px, 1fr) minmax(90px, 140px) 56px;
-    gap: 8px;
-  }
   .reports,
   .queue,
   .shell-runs,
@@ -3914,23 +3881,6 @@ meter::-webkit-meter-optimum-value {
   flex-direction: column;
   gap: 12px;
 }
-.layout-options label {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-.layout-options select {
-  margin-inline-start: auto;
-}
-.layout-options input[type="range"] {
-  width: min(240px, 100%);
-  margin-inline-start: auto;
-}
-.layout-options output {
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
 .layout-options > button {
   align-self: flex-start;
 }
@@ -4038,12 +3988,6 @@ meter::-webkit-meter-optimum-value {
 }
 [data-density="compact"] .inspector-body > section {
   margin-block: 8px;
-}
-[data-mobile="true"] .pane-width-controls {
-  display: none;
-}
-.pane-width-controls {
-  display: contents;
 }
 
 .attachment-button {
