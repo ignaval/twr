@@ -1,6 +1,7 @@
 import { useEffect, useId, useState } from "react";
 import { announce } from "./a11y";
-import { modelChoices } from "./models";
+import { effortChoices, modelChoices } from "./models";
+import { changeProblem } from "./modelPick";
 import { OrchestratorAccessOptions } from "./OrchestratorAccessOptions";
 import {
   SettingSwitch,
@@ -10,29 +11,40 @@ import {
 import type { Json } from "./types";
 import { ModelSelect, Spinner } from "./ui";
 
-/** What Apply sends to `orchestrator.use`: the runtime (with the current account while
- * the runtime stays the same), the model (none: the runtime's default), the effort while
- * the runtime stays the same, and a handoff summary. */
-export function orchestratorSwitch(
+/** What Apply does (as the composer's model picker does, `modelPick.ts`): on the runtime it
+ * runs, the orchestrator's model and effort change in place, `thread.set_model` on its
+ * thread with only what changed (`default` for a setting cleared), on the account and agent
+ * it runs; another runtime (or no orchestrator yet) is a switch, `orchestrator.use`, which
+ * opens the Switch orchestrator form with the choice filled in. */
+export function orchestratorChange(
   show: Json,
   runtime: string,
   model: string,
-): Json {
+  effort: string,
+):
+  | { kind: "none" }
+  | { kind: "in-place"; params: Json }
+  | { kind: "switch"; initial: Json } {
   const same = runtime === show?.runtime;
-  const spec =
-    same && show?.account_shown && show?.account
-      ? `${runtime}:${show.account}`
-      : runtime;
-  return {
-    runtime: spec,
-    ...(model ? { model } : {}),
-    ...(same && show?.effort ? { effort: show.effort } : {}),
-    summary: true,
-  };
+  if (!same || !show?.thread)
+    return {
+      kind: "switch",
+      initial: {
+        runtime,
+        ...(model ? { model } : {}),
+        ...(effort ? { effort } : {}),
+      },
+    };
+  const params: Json = { thread: show.thread };
+  if (model !== (show.model || "")) params.model = model || "default";
+  if (effort !== (show.effort || "")) params.effort = effort || "default";
+  if (!("model" in params) && !("effort" in params)) return { kind: "none" };
+  return { kind: "in-place", params };
 }
 
-/** Settings › Agents › Orchestrator: its runtime and model, switched in place (with a
- * handoff), a fresh conversation, its access, and whether it starts with the hub. */
+/** Settings › Agents › Orchestrator: its runtime, model and effort (changed in place on its
+ * runtime, switched with a handoff to another), a fresh conversation, its access, and
+ * whether it starts with the hub. */
 export function OrchestratorSettings({
   rpc,
   action,
@@ -61,29 +73,46 @@ export function OrchestratorSettings({
   const current = {
     runtime: show?.runtime || "",
     model: show?.model || "",
+    effort: show?.effort || "",
   };
   const [runtime, setRuntime] = useState(current.runtime);
   const [model, setModel] = useState(current.model);
+  const [effort, setEffort] = useState(current.effort);
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState("");
   useEffect(() => {
     setRuntime(current.runtime);
     setModel(current.model);
-  }, [current.runtime, current.model]);
+    setEffort(current.effort);
+  }, [current.runtime, current.model, current.effort]);
   const runtimes: string[] = Array.isArray(show?.runtimes)
     ? show.runtimes.filter((r: unknown) => typeof r === "string")
     : [];
   if (runtime && !runtimes.includes(runtime)) runtimes.push(runtime);
-  const changed = runtime !== current.runtime || model !== current.model;
+  const efforts = effortChoices(show?.models, runtime);
+  const plan = orchestratorChange(show, runtime, model, effort);
   const apply = () => {
+    if (plan.kind === "none") return;
+    // Another runtime is a new orchestrator session: the Switch orchestrator form says so,
+    // and what the switch drops is offered back from there.
+    if (plan.kind === "switch") {
+      action("orch", plan.initial);
+      return;
+    }
     setBusy(true);
     setStatus("");
-    void rpc("orchestrator.use", orchestratorSwitch(show, runtime, model))
+    void rpc("thread.set_model", plan.params)
       .then((result) => {
-        const text = `The orchestrator now runs on ${result?.runtime || runtime}${
-          result?.model || model ? ` with ${result?.model || model}` : ""
-        }.`;
-        setStatus(text);
+        const said = (key: "model" | "effort", picked: string) =>
+          (result && key in result ? result[key] : picked) || "";
+        const now = said("model", model) || "its runtime's default model";
+        const at = said("effort", effort);
+        const text =
+          `The orchestrator now runs ${now}` +
+          (at ? ` at ${at} effort` : "") +
+          ", on the same session.";
+        const problem = changeProblem(result);
+        setStatus(problem ? `${text} ${problem}` : text);
         announce(text);
         infoChanged?.();
         reload();
@@ -95,8 +124,8 @@ export function OrchestratorSettings({
     <section className="settings-section orchestrator-settings">
       <h2>Orchestrator</h2>
       <p>
-        The agent you talk to. Switching hands the conversation over with a
-        summary.
+        The agent you talk to. A model or effort changes in place; another
+        runtime is a new orchestrator that gets a handoff summary.
       </p>
       {show && runtimes.length > 0 && (
         <div className="orchestrator-pick">
@@ -108,10 +137,10 @@ export function OrchestratorSettings({
               disabled={busy}
               onChange={(e) => {
                 setRuntime(e.target.value);
-                // Another runtime's models: start from its default.
-                setModel(
-                  e.target.value === current.runtime ? current.model : "",
-                );
+                // Another runtime's models and efforts: start from its defaults.
+                const same = e.target.value === current.runtime;
+                setModel(same ? current.model : "");
+                setEffort(same ? current.effort : "");
               }}
             >
               {runtimes.map((r) => (
@@ -135,14 +164,27 @@ export function OrchestratorSettings({
               choices={modelChoices(show?.models, runtime)}
             />
           </div>
+          {efforts.length > 0 && (
+            <div className="field">
+              <label htmlFor={`${ids}-effort`}>Effort</label>
+              <ModelSelect
+                id={`${ids}-effort`}
+                value={effort}
+                onChange={setEffort}
+                choices={efforts}
+                custom={false}
+              />
+            </div>
+          )}
           <button
             type="button"
             className="primary"
-            disabled={!changed || busy || !runtime}
+            disabled={plan.kind === "none" || busy || !runtime}
+            aria-haspopup={plan.kind === "switch" ? "dialog" : undefined}
             onClick={apply}
           >
             {busy && <Spinner />}
-            Apply
+            {plan.kind === "switch" ? "Switch…" : "Apply"}
           </button>
         </div>
       )}

@@ -1,0 +1,321 @@
+/* The composer's model and effort picker (shared/ModelPicker.tsx): a compact button at the
+ * right of the composer's footer row, before the voice and send buttons, and a popup above
+ * the composer (`.composer` is its positioned box) with three columns: the runtimes, their
+ * models, the efforts. On a phone the popup is a bottom sheet, its columns stacked, every row
+ * a 44-point target. */
+
+/* The hints share the row: they shorten first, then hide, before the picker does. */
+.composer-bottom:has(.model-picker) > #twr-composer-hints {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-picker {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.model-picker-trigger {
+  gap: 6px;
+  min-width: 0;
+  max-width: 260px;
+  padding: 4px 8px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.923077rem;
+  white-space: nowrap;
+}
+.model-picker-trigger:hover:not(:disabled) {
+  background: var(--hover);
+}
+.model-picker-trigger[aria-expanded="true"] {
+  background: var(--active);
+}
+.model-picker-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.model-picker-effort {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.model-picker-mark {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--text);
+  font-size: 0.769231rem;
+  font-weight: 600;
+  line-height: 1;
+}
+@media (max-width: 720px) {
+  .composer-bottom:has(.model-picker) > #twr-composer-hints {
+    display: none;
+  }
+  .composer-bottom:has(.model-picker) {
+    justify-content: flex-end;
+  }
+}
+@media (max-width: 460px) {
+  .model-picker-effort {
+    display: none;
+  }
+}
+
+.model-picker-popup {
+  position: absolute;
+  right: 8px;
+  bottom: calc(100% + 6px);
+  z-index: 20;
+  display: grid;
+  /* Their least widths fit the composer of a 420-pixel window, and the one row is the
+   * popup's height at most, so each column scrolls its own rows rather than running past
+   * the popup's edge, which clips. */
+  grid-template-columns: minmax(88px, 150px) minmax(150px, 1fr) minmax(
+      120px,
+      180px
+    );
+  grid-template-rows: minmax(0, 1fr);
+  /* The composer's width at most: past it the column clips the popup (a sidebar beside). */
+  width: min(640px, calc(100% - 16px));
+  /* The room above the composer within the boxes that clip it (ModelPicker.tsx measures it
+   * as it opens): past it a tall draft ran the search out of the conversation column. */
+  max-height: min(420px, 60vh, var(--model-picker-room, 420px));
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+  color: var(--text);
+}
+/* Too little room above the composer (a tall draft in a short window): over the composer,
+ * its room from the column's top to the composer's bottom. */
+.model-picker-popup[data-over="true"] {
+  bottom: 8px;
+  max-height: min(420px, var(--model-picker-room, 420px));
+}
+.model-picker-popup:focus {
+  outline: none;
+}
+.model-picker-popup button {
+  justify-content: flex-start;
+  width: 100%;
+  border: 0;
+  background: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  text-align: left;
+}
+.model-picker-popup button:hover,
+.model-picker-popup button.active {
+  background: var(--hover);
+}
+.model-picker-popup button.active {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+.model-picker-popup button[aria-selected="true"],
+.model-picker-popup button[aria-checked="true"] {
+  background: var(--accent-soft);
+}
+.model-picker-popup .current {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.model-picker-rail,
+.model-picker-models,
+.model-picker-efforts {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+  gap: 2px;
+}
+.model-picker-rail {
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+}
+.model-picker-rail-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* An orchestrator runtime the hub doesn't find installed: still listed, said under it. */
+.model-picker-rail > button {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.model-picker-rail-note {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 0.846154rem;
+}
+.model-picker-search {
+  margin: 0 0 4px;
+  width: 100%;
+}
+.model-picker-models > [role="listbox"] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-picker-models button {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.model-picker-name {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+.model-picker-about {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 0.846154rem;
+}
+.model-picker-about:empty {
+  display: none;
+}
+.model-picker-models button .current {
+  position: absolute;
+  right: 8px;
+}
+.model-picker-models button {
+  position: relative;
+  padding-right: 26px;
+}
+.model-picker-custom {
+  display: flex;
+  gap: 6px;
+}
+.model-picker-custom > input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.model-picker-popup .model-picker-custom > button {
+  flex: 0 0 auto;
+  width: auto;
+  justify-content: center;
+  border: 1px solid var(--border);
+}
+/* A runtime this device may not move the thread to (it needs admin): listed, not chosen. */
+.model-picker-popup button[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+/* Why the last choice was refused; empty (and taking no room) otherwise. */
+.model-picker-notice {
+  margin: 0 8px;
+  color: var(--text);
+  font-size: 0.846154rem;
+}
+.model-picker-notice:not(:empty) {
+  margin-bottom: 4px;
+}
+.model-picker-efforts {
+  border-left: 1px solid var(--border);
+}
+.model-picker-efforts > header {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 8px 6px;
+}
+.model-picker-efforts > header > span {
+  color: var(--muted);
+  font-size: 0.846154rem;
+  overflow-wrap: anywhere;
+}
+.model-picker-efforts > [role="radiogroup"] {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-picker-radio {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1px solid var(--field-border);
+}
+[aria-checked="true"] > .model-picker-radio {
+  border: 4px solid var(--accent);
+}
+.model-picker-efforts > footer {
+  display: flex;
+  gap: 6px;
+  margin-top: auto;
+  padding-top: 8px;
+}
+.model-picker-popup .model-picker-efforts > footer > button {
+  justify-content: center;
+  border: 1px solid var(--border);
+}
+.model-picker-popup .model-picker-efforts > footer > button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.model-picker-note {
+  margin: 4px 8px;
+  color: var(--muted);
+  font-size: 0.846154rem;
+}
+
+/* A phone: a bottom sheet, the runtimes a row of chips over the models and the efforts. */
+[data-mobile="true"] .model-picker-trigger {
+  min-height: 44px;
+  max-width: 150px;
+  padding: 4px 6px;
+}
+[data-mobile="true"] .model-picker-effort {
+  display: none;
+}
+[data-mobile="true"] .model-picker-popup {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: auto;
+  max-height: 80dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+  border-radius: 14px 14px 0 0;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+[data-mobile="true"] .model-picker-rail,
+[data-mobile="true"] .model-picker-models,
+[data-mobile="true"] .model-picker-efforts {
+  /* Each its full height, which the sheet scrolls through: shrunk, their rows ran over the
+   * next section's. */
+  flex-shrink: 0;
+  overflow: visible;
+  border: 0;
+}
+[data-mobile="true"] .model-picker-rail {
+  flex-direction: row;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+}
+[data-mobile="true"] .model-picker-rail > button {
+  width: auto;
+}
+[data-mobile="true"] .model-picker-efforts {
+  border-top: 1px solid var(--border);
+}
+[data-mobile="true"] .model-picker-popup button,
+[data-mobile="true"] .model-picker-search,
+[data-mobile="true"] .model-picker-custom > input {
+  min-height: 44px;
+  min-width: 44px;
+}

@@ -1,15 +1,37 @@
 import {
   appendDraft,
+  appendMessage,
+  draftsWithFiles,
+  isCommandDraft,
+  isShellDraft,
+  isSlashDraft,
+  literalDraft,
   messageDraft,
+  messageText,
   offlineJournal,
+  restoredOf,
   type OfflineJournal,
 } from "./offline";
 import { TerminalSnapshots } from "./terminalSnapshots";
 import { Outbox } from "./Outbox";
 import { ReadAloudControl } from "./ReadAloudControl";
-import { UploadController } from "./uploads";
-import { AttachmentManager } from "./AttachmentManager";
+import { UploadController, unfinished } from "./uploads";
+import { QueuedText, SentMessage, attachmentWait } from "./ComposerAttachments";
+import {
+  splitAttachments,
+  withAttachments,
+  type NamedFile,
+} from "./attachmentText";
+import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
+import { ModelPicker, openModelPicker } from "./ModelPicker";
+import { onSaveNow } from "./save-now";
+import {
+  changeProblem,
+  droppedBySwitch,
+  droppedWords,
+  withoutDroppedText,
+} from "./modelPick";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
@@ -70,6 +92,7 @@ import {
   ExternalLink,
   Download,
   Eye,
+  Gauge,
   Filter,
   AlertCircle,
   Cpu,
@@ -359,7 +382,7 @@ export default function App({
   );
   const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
-  const [destination, setDestination] = useState<string>();
+  const [opened, setDestination] = useState<string>();
   const detailsToggle = useRef<HTMLButtonElement>(null);
   const observedDestination = useRef<string | undefined>(undefined);
   // The message drafts, by destination: outside React state, so that typing re-renders
@@ -369,15 +392,18 @@ export default function App({
   const draftSaveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
-  const pendingEnqueue = useRef<
-    { key: string; text: string; saved: boolean } | undefined
-  >(undefined);
+  // A message on its way into the outbox: the drafts wait to save until it is there and
+  // its draft is cleared, so a save never writes back the text the outbox just took.
+  const pendingEnqueue = useRef<{ key: string } | undefined>(undefined);
   const [journal, setJournal] = useState<OfflineJournal>();
   const [offlineNotice, setOfflineNotice] = useState("");
   useEffect(() => {
     const reset = (event: Event) => {
       if ((event as CustomEvent).detail?.hostId === hostId) {
         drafts.update(() => ({}));
+        // The box's files go too, at once and for good: the next save would write their
+        // names and paths again.
+        uploads.clear();
         setJournal(offlineJournal(hostApi, hostId));
         setOfflineNotice("");
       }
@@ -393,6 +419,7 @@ export default function App({
             ...saved.snapshot.drafts,
             ...current,
           }));
+          restoreFiles(saved.snapshot.draftFiles);
           setJournal(saved);
           setOfflineNotice("");
         })
@@ -407,33 +434,64 @@ export default function App({
   }, [hostId]);
   const liveView = useRef(false);
   const hasLiveSnapshot = useRef(false);
-  const [uploads] = useState(
-    () =>
-      new UploadController(hostApi, (attachment) => {
-        const key = attachment.workspace + ":" + attachment.thread;
-        const orchKey = attachment.workspace + ":orchestrator";
-        const targetKey =
-          attachment.thread ===
-          currentOrchestrator.current[attachment.workspace]
-            ? orchKey
-            : key;
-        drafts.set(targetKey, (old) =>
-          `${old || ""}\nUploaded file: ${attachment.file.name}\n${attachment.path}\n`.trimStart(),
-        );
-      }),
-  );
-  const currentOrchestrator = useRef<Record<string, string | undefined>>({});
+  // Attached files stay on their conversation (ComposerAttachments shows them in the
+  // message box): a message names the uploaded ones as it is sent (`withAttachments`).
+  // They are keyed as drafts are, by conversation (`orchestrator` or a thread's id), and
+  // saved with them on this device: names and paths of the uploaded ones.
+  const [uploads] = useState(() => new UploadController(hostApi));
+  /** A draft key's workspace and conversation: `<workspace>:<conversation>`. */
+  const draftPlace = (key: string) => {
+    const at = key.lastIndexOf(":");
+    return { space: key.slice(0, at), conversation: key.slice(at + 1) };
+  };
+  /** Puts files saved with the drafts back on their conversations, uploaded. */
+  const restoreFiles = (saved: Record<string, NamedFile[]> = {}) => {
+    for (const [key, files] of Object.entries(saved)) {
+      const { space, conversation } = draftPlace(key);
+      if (files.length) uploads.restore(files, conversation, space);
+    }
+  };
+  /**
+   * Puts a message's text back in a draft (`key`: `<workspace>:orchestrator` or
+   * `<workspace>:<thread>`), as Take back and the outbox do: the files it names go back on
+   * the conversation as attachments, the rest of its text into the draft. `sent`: the text
+   * is a message as the hub has it (Take back, Put back), not a draft as typed: escaped
+   * where it starts the draft (`appendMessage`), so it is still a message, never a command
+   * or a shell line.
+   */
+  const restoreDraft = (key: string, text: string, sent = false) => {
+    if (!text.trim()) return;
+    const { body, files } = splitAttachments(text);
+    const add = sent ? appendMessage : appendDraft;
+    if (!files.length) {
+      drafts.set(key, (old) => add(old, text));
+      return;
+    }
+    const { space, conversation } = draftPlace(key);
+    uploads.restore(files, conversation, space);
+    if (body.trim()) drafts.set(key, (old) => add(old, body));
+  };
   useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
-  // Saves the drafts on this device 350 ms after the last change to any of them, into
-  // the storage epoch of that change.
+  // Saves the drafts on this device 350 ms after the last change to any of them, into the
+  // storage epoch of that change. A change to a conversation's uploaded files (one uploaded,
+  // sent, removed or put back) saves at once, and as the app goes away (`save-now.ts`: the
+  // desktop window closing, the phone app going to the background, the page unloading)
+  // whatever still waits for its delay saves now.
   useEffect(() => {
     if (!journal) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const changed = () => {
-      const pending = pendingEnqueue.current;
-      if (pending?.saved && drafts.get(pending.key) !== pending.text)
-        pendingEnqueue.current = undefined;
+    const stop = () => {
+      clearTimeout(timer);
+      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      timer = undefined;
+    };
+    const save = (epoch: number) =>
+      journal
+        .drafts(drafts.all(), epoch, drafts.spoken(), uploads.committed())
+        .then(() => setOfflineNotice(""))
+        .catch((error) => setOfflineNotice(errorMessage(error)));
+    const changed = (delay = 350) => {
       const epoch = journal.epoch;
       const persist = () => {
         if (pendingEnqueue.current) {
@@ -441,24 +499,52 @@ export default function App({
           draftSaveTimer.current = timer;
           return;
         }
-        void journal
-          .drafts(drafts.all(), epoch, drafts.spoken())
-          .then(() => setOfflineNotice(""))
-          .catch((error) => setOfflineNotice(errorMessage(error)));
+        if (draftSaveTimer.current === timer)
+          draftSaveTimer.current = undefined;
+        timer = undefined;
+        void save(epoch);
       };
-      clearTimeout(timer);
-      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
-      timer = setTimeout(persist, 350);
+      stop();
+      timer = setTimeout(persist, delay);
       draftSaveTimer.current = timer;
     };
     changed();
-    const unsubscribe = drafts.subscribe(changed);
+    const unsubscribe = drafts.subscribe(() => changed());
+    // Upload progress changes nothing saved: only a file uploaded, sent or removed does.
+    // At once means once what changed it is done (a message put back restores its files,
+    // then its text): a save between the two would write the files without the text.
+    let files = JSON.stringify(uploads.committed());
+    const stopFiles = uploads.subscribe(() => {
+      const now = JSON.stringify(uploads.committed());
+      if (now === files) return;
+      files = now;
+      changed(0);
+    });
+    // `waitingOnly`: only a save still waiting (the page unloading, as on a reload): one with
+    // nothing to save would write the whole record from memory over anything stored since
+    // (the outbox included). The app going away (`save-now.ts`) saves either way: the desktop
+    // holds its close for the answer, and an answer at once can find its quit still under way.
+    const saveNow = async (waitingOnly = false) => {
+      if (waitingOnly && timer === undefined && !pendingEnqueue.current) return;
+      stop();
+      // A message on its way into the outbox clears its draft first (up to 1.5 s, inside
+      // the 2 s a closing desktop window waits); one still on its way keeps the drafts
+      // saved before it, never writing back what it took.
+      for (let i = 0; i < 15 && pendingEnqueue.current; i++)
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      if (!pendingEnqueue.current) await save(journal.epoch);
+    };
+    const unregister = onSaveNow(() => saveNow());
+    const unloading = () => void saveNow(true);
+    window.addEventListener("pagehide", unloading);
     return () => {
       unsubscribe();
-      clearTimeout(timer);
-      if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      stopFiles();
+      unregister();
+      window.removeEventListener("pagehide", unloading);
+      stop();
     };
-  }, [journal, drafts]);
+  }, [journal, drafts, uploads]);
   const [sending, setSending] = useState(false);
   const slashPending = useRef(false);
   const [queued, setQueued] = useState<Json[]>([]);
@@ -472,6 +558,12 @@ export default function App({
   const [slashCommands, setSlashCommands] = useState<
     { id: string; title: string }[]
   >([]);
+  // `/usage` opens the usage limits above the message box (UsageLimits.tsx); the hub's
+  // live view carries every account's usage, so a change there reads them again.
+  const [usagePanel, setUsagePanel] = useState(false);
+  // A workspace switch closes it: until the connection serves the new workspace, a read
+  // could still answer for the one left.
+  useEffect(() => setUsagePanel(false), [workspace]);
   useEffect(() => {
     if (connected)
       void hostApi
@@ -499,6 +591,8 @@ export default function App({
     /** Something stops, goes or is interrupted: the button says so in danger style. */
     destructive?: boolean;
     run: () => void;
+    /** A second way to go on, beside the confirming button (a switch without its summary). */
+    alt?: { action: string; run: () => void };
   }>();
   const [workspaceModal, setWorkspaceModal] = useState(false);
   const [newWorkspace, setNewWorkspace] = useState("");
@@ -532,8 +626,35 @@ export default function App({
     (method: string, params: Json = {}) => hostApi.rpc(method, params),
     [],
   );
+  const usageRevision = useMemo(
+    () => workspace + ":" + JSON.stringify(view.usage ?? null),
+    [workspace, view.usage],
+  );
+  const composerCommands = useMemo(() => {
+    const listed = slashCommands.length ? slashCommands : commands;
+    return listed.some((command) => command.id === "usage")
+      ? listed
+      : [...listed, { id: "usage", title: "Usage limits: how much is left" }];
+  }, [slashCommands, commands]);
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
-  currentOrchestrator.current[workspace] = orchestrator?.id;
+  // Where the composer sends: a worker thread, or none for the orchestrator. Opening the
+  // orchestrator's own thread (`/open orchestrator`, its row, a workspace's opened before
+  // its threads are known) opens its main conversation, so every path that reads
+  // `destination` (the send, the model picker, the header, the drafts and files) treats it
+  // as the orchestrator, never as a worker; and the choice is dropped, so a later switch
+  // doesn't leave it on the retired thread.
+  const destination =
+    opened !== undefined && opened === orchestrator?.id ? undefined : opened;
+  useEffect(() => {
+    if (opened !== undefined && opened === orchestrator?.id)
+      setDestination(undefined);
+  }, [opened, orchestrator?.id]);
+  // A switch of the orchestrator's model or effort gives it a new thread: its files stay
+  // on its conversation, and those whose upload has not begun go to the new thread.
+  useEffect(() => {
+    if (orchestrator)
+      uploads.retarget("orchestrator", workspace, orchestrator.id);
+  }, [uploads, workspace, orchestrator?.id]);
   const target = destination
     ? view.threads.find((t) => t.id === destination)
     : orchestrator;
@@ -618,7 +739,8 @@ export default function App({
   const acceptedSuggestion = useRef<{ key: string; text: string }>(undefined);
   function acceptSuggestion() {
     if (!assistance.suggestion) return;
-    drafts.set(draftKey, assistance.suggestion);
+    // Escaped as Take back does: a suggestion is a message, never a command.
+    drafts.set(draftKey, literalDraft(assistance.suggestion));
     acceptedSuggestion.current = { key: draftKey, text: assistance.suggestion };
     input.current?.focus();
   }
@@ -1067,15 +1189,26 @@ export default function App({
             try {
               legacy = JSON.parse(localStorage.getItem(oldKey) || "{}");
             } catch {}
-            const previous = Object.fromEntries(
-              Object.entries(legacy || {}).filter(
-                (entry): entry is [string, string] =>
-                  typeof entry[1] === "string",
+            // Their files' pairs, as an older app wrote them into a draft, move onto
+            // the conversations' files (the journal does the same for its own drafts).
+            const previous = draftsWithFiles(
+              Object.fromEntries(
+                Object.entries(legacy || {}).filter(
+                  (entry): entry is [string, string] =>
+                    typeof entry[1] === "string",
+                ),
               ),
             );
-            const restored = { ...previous, ...saved.snapshot.drafts };
-            if (Object.keys(previous).length) {
-              await saved.drafts(restored);
+            const restored = { ...previous.drafts, ...saved.snapshot.drafts };
+            restoreFiles(previous.draftFiles);
+            restoreFiles(saved.snapshot.draftFiles);
+            if (Object.keys(previous.drafts).length) {
+              await saved.drafts(
+                restored,
+                undefined,
+                undefined,
+                uploads.committed(),
+              );
               localStorage.removeItem(oldKey);
             }
             drafts.restoreSpoken(saved.snapshot.spokenDrafts);
@@ -1434,6 +1567,14 @@ export default function App({
         setSection("settings");
       }
       if (event.key === "Escape") {
+        // The `/usage` panel above the message box closes first, a draft in the box or not
+        // (a menu of the box's own that took the Esc has prevented it): Esc from the box
+        // would otherwise leave the conversation with the panel still open.
+        if (usagePanel && !event.defaultPrevented) {
+          setUsagePanel(false);
+          input.current?.focus();
+          return;
+        }
         if (event.target instanceof HTMLTextAreaElement && event.target.value)
           return;
         if (event.target instanceof HTMLInputElement) return;
@@ -1456,7 +1597,7 @@ export default function App({
       window.removeEventListener("keydown", keyboard);
       window.removeEventListener("pointerdown", closeMenu);
     };
-  }, [selected, destination]);
+  }, [selected, destination, usagePanel]);
   useEffect(() => {
     if (connected)
       void rpc("desktop.preferences", {
@@ -1597,7 +1738,13 @@ export default function App({
             params.desktop_cwd = values._cwd;
           }
           const value = await rpc(operation.method!, params);
-          setResult(value);
+          // A switch or reset: what it dropped is said, and the user's own offered back
+          // (`afterSwitch`), never shown as raw text with its files' lines.
+          const switched = ["orchestrator.use", "orchestrator.reset"].includes(
+            operation.method!,
+          );
+          setResult(switched ? withoutDroppedText(value) : value);
+          if (switched) afterSwitch(value);
           setRefresh((n) => n + 1);
           if (operation.method === "orchestrator.access")
             void refreshInfo().catch(() => {});
@@ -1625,7 +1772,7 @@ export default function App({
               }).catch((error) => {
                 // Kept in its box, to send again.
                 drafts.set(workspace + ":" + value.id, (old) =>
-                  appendDraft(old, firstPrompt!),
+                  appendMessage(old, firstPrompt!),
                 );
                 fail(
                   `${name} was made, but its first prompt was not sent: ${errorMessage(error)}`,
@@ -1678,19 +1825,31 @@ export default function App({
   const send = async (event?: FormEvent) => {
     event?.preventDefault();
     const draft = drafts.get(draftKey);
-    if (!permitted("operate") || !draft.trim() || sending) return;
+    // The conversation's uploaded files go with the message, named after its text
+    // (`withAttachments`); a composer command and a shell line take none. A message waits
+    // while a file is still on its way (Send is disabled, and says why).
+    // Files another message on its way reserved are not this one's.
+    const attached =
+      target && !isCommandDraft(draft)
+        ? uploads.available(destination || "orchestrator", workspace)
+        : [];
+    if (attached.some(unfinished)) {
+      announce(attachmentWait(attached));
+      return;
+    }
+    const files = attached.flatMap((item) =>
+      item.path ? [{ id: item.id, name: item.file.name, path: item.path }] : [],
+    );
+    if (!permitted("operate") || (!draft.trim() && !files.length) || sending)
+      return;
     const spoken = drafts.isSpoken(draftKey);
     if (spoken && !connected) return;
     if (spoken && (draft.startsWith("/") || draft.startsWith("!"))) {
       reviewDictation(draftKey, draft);
       return;
     }
-    if (
-      !connected &&
-      (!journal || draft.startsWith("/") || draft.startsWith("!"))
-    )
-      return;
-    if (draft.startsWith("/") && !draft.startsWith("//")) {
+    if (!connected && (!journal || isCommandDraft(draft))) return;
+    if (isSlashDraft(draft)) {
       await submitSlash(draft);
       return;
     }
@@ -1700,12 +1859,26 @@ export default function App({
       );
       return;
     }
+    // Reserved before anything is awaited: a hands-free message sent meanwhile can't name
+    // them too. Released in the end unless this message took them.
+    const fileIds = files.map((file) => file.id);
+    if (!uploads.reserve(fileIds)) return;
     setSending(true);
     const key = draftKey;
-    const text = draft.startsWith("//") ? draft.slice(1) : draft;
+    const text = messageText(draft);
+    // What is sent, and what the outbox keeps to put back in the draft: with the files.
+    const outgoing = withAttachments(text, files);
+    const kept = withAttachments(draft, files);
+    // Once the message holds them (sent, or saved in the outbox), they leave the box.
+    let taken = false;
+    const takeFiles = () => {
+      if (taken) return;
+      taken = true;
+      uploads.take(fileIds);
+    };
     try {
       let response: Json;
-      if (text.startsWith("!") && !text.startsWith("!!!")) {
+      if (isShellDraft(draft)) {
         const share = text.startsWith("!!");
         const command = text.slice(share ? 2 : 1).trim();
         if (!command)
@@ -1739,9 +1912,9 @@ export default function App({
       } else {
         const method = destination ? "thread.send" : "say";
         const params = destination
-          ? { thread: destination, prompt: text }
+          ? { thread: destination, prompt: outgoing }
           : {
-              message: text,
+              message: outgoing,
               seen_gseq: view.head,
               to: "orchestrator",
               ...(spoken
@@ -1763,23 +1936,34 @@ export default function App({
               item.reason === "permission" || item.reason === "question",
           );
         if (journal && hostApi.sendMessage && !liveReply && !spoken) {
-          const pending = { key, text: draft, saved: false };
+          const pending = { key };
           pendingEnqueue.current = pending;
           const epoch = journal.epoch;
           clearTimeout(draftSaveTimer.current);
           draftSaveTimer.current = undefined;
           const message = await journal
-            .enqueue(workspace, method, params, draft)
+            .enqueue(workspace, method, params, files.length ? kept : draft)
             .catch((error) => {
               if (pendingEnqueue.current === pending)
                 pendingEnqueue.current = undefined;
+              // The save this send stopped, done now: with the box's files, which may
+              // hold one uploaded since the last save.
               void journal
-                .drafts(drafts.all(), epoch, drafts.spoken())
+                .drafts(
+                  drafts.all(),
+                  epoch,
+                  drafts.spoken(),
+                  uploads.committed(),
+                )
                 .catch(() => {});
               throw error;
             });
-          pending.saved = true;
+          takeFiles();
           drafts.set(key, (old) => (old === draft ? "" : old));
+          // The outbox holds the message and the box is cleared: the drafts save again,
+          // even when that cleared nothing (a message of files alone).
+          if (pendingEnqueue.current === pending)
+            pendingEnqueue.current = undefined;
           if (connected) response = await journal.deliver(message);
           else response = { saved_offline: true };
         } else response = await rpc(method, params);
@@ -1789,29 +1973,41 @@ export default function App({
         reviewDictation(key, draft);
         return;
       }
-      for (const restored of response.restored_drafts || [])
-        drafts.set(restored.key, (old) => appendDraft(old, restored.text));
+      // What the outbox put back goes in the box once (`claim`): another delivery waiting
+      // on the same message may have put it there already.
+      for (const restored of journal?.claim(response.restored_drafts || []) ||
+        [])
+        restoreDraft(restored.key, restored.text);
       if (response.action === "pending") {
-        drafts.set(key, (old) => appendDraft(old, draft));
+        // Files the outbox took go back on the conversation; others never left it. Once:
+        // from the outbox, only if no other delivery put it back first.
+        const back = response.restored_draft
+          ? journal?.claim([response.restored_draft]).length
+          : 1;
+        if (back && taken) restoreDraft(key, kept);
+        else if (back) drafts.set(key, (old) => appendDraft(old, draft));
         setSection("attention");
         throw new Error(
           "Message not sent. Review the waiting requests and answer the exact item shown.",
         );
       }
       drafts.set(key, (old) => (old === draft ? "" : old));
-      if (!response.saved_offline && target)
-        uploads.dismissReady(target.id, workspace, draft);
+      takeFiles();
       announce(
         response.saved_offline
           ? "Message saved on this device. It sends when the hub reconnects."
-          : text.startsWith("!") && !text.startsWith("!!!")
+          : isShellDraft(draft)
             ? "Shell command started"
             : "Message sent",
       );
       setQueueRefresh((n) => n + 1);
     } catch (e) {
+      // Earlier saved messages the hub held went back to their drafts before this failed.
+      for (const restored of journal?.claim(restoredOf(e)) || [])
+        restoreDraft(restored.key, restored.text);
       fail(e);
     } finally {
+      uploads.release(fileIds);
       setSending(false);
       input.current?.focus();
     }
@@ -1830,23 +2026,42 @@ export default function App({
       reviewDictation(key, draft);
       return;
     }
+    // The thread's uploaded files are part of the task, named after its text.
+    const attached = uploads.available(thread.id, workspace);
+    if (attached.some(unfinished)) {
+      announce(attachmentWait(attached));
+      return;
+    }
+    const files = attached.flatMap((item) =>
+      item.path ? [{ id: item.id, name: item.file.name, path: item.path }] : [],
+    );
     let plan: ReturnType<typeof sendAsLoop>;
     try {
-      plan = sendAsLoop(draft);
+      plan = sendAsLoop(
+        isCommandDraft(draft) ? draft : withAttachments(draft, files),
+      );
     } catch (error) {
       fail(error);
       return;
     }
+    const fileIds = files.map((file) => file.id);
     const run = async () => {
+      // Taken by another message since (the task names them): ask again.
+      if (!uploads.reserve(fileIds)) {
+        announce("Your files went with another message. Check the task again.");
+        return;
+      }
       setSending(true);
       try {
         if (
           await startImplement(thread.id, plan.task ? { task: plan.task } : {})
         ) {
           drafts.set(key, (old) => (old === draft ? "" : old));
+          uploads.take(fileIds);
           started();
         }
       } finally {
+        uploads.release(fileIds);
         setSending(false);
         input.current?.focus();
       }
@@ -1863,23 +2078,38 @@ export default function App({
   // Voice mode (shared/voice.ts): a transcript goes to the orchestrator as it was heard,
   // marked spoken, so the hub never takes it for an answer or a mode change. Sent at once,
   // not through the offline outbox: it is said now, about what is on screen now.
+  // The orchestrator conversation's uploaded files go with it, as with a typed message;
+  // one still uploading waits for a later message (speech is not held back for it).
   const submitVoice = async (text: string): Promise<Json> => {
     if (!orchestrator)
       throw new Error("Choose an orchestrator before talking to it.");
-    const response = await rpc("say", {
-      message: text,
-      seen_gseq: view.head,
-      to: "orchestrator",
-      voice: true,
-    });
-    if (response.action === "pending") {
-      setSection("attention");
-      throw new Error(
-        "Not sent: review the waiting requests and answer the exact item shown.",
-      );
+    // Reserved at once, as a typed message does: a file goes with one message only.
+    const files = uploads.ready("orchestrator", workspace);
+    const fileIds = files.map((item) => item.id);
+    if (!uploads.reserve(fileIds))
+      throw new Error("Your files are going with another message.");
+    try {
+      const response = await rpc("say", {
+        message: withAttachments(
+          text,
+          files.map((item) => ({ name: item.file.name, path: item.path! })),
+        ),
+        seen_gseq: view.head,
+        to: "orchestrator",
+        voice: true,
+      });
+      if (response.action === "pending") {
+        setSection("attention");
+        throw new Error(
+          "Not sent: review the waiting requests and answer the exact item shown.",
+        );
+      }
+      if (response.action !== "confirm") uploads.take(fileIds);
+      setQueueRefresh((n) => n + 1);
+      return response;
+    } finally {
+      uploads.release(fileIds);
     }
-    setQueueRefresh((n) => n + 1);
-    return response;
   };
   const voiceHintWords = useMemo(() => voiceHint(view.threads), [view.threads]);
   // What this device may have read aloud lately, for voice mode's echo check: the
@@ -1905,10 +2135,15 @@ export default function App({
     setSending(true);
     try {
       const rawName = text.slice(1).trim().split(/\s/)[0];
+      if (rawName === "usage") {
+        setSection("chat");
+        setUsagePanel(true);
+        drafts.set(draftKey, "");
+        return;
+      }
       const extraRoutes: Record<string, Section> = {
         boxes: "boxes",
         jobs: "jobs",
-        usage: "usage",
         memory: "memory",
         maintenance: "maintenance",
       };
@@ -2331,10 +2566,8 @@ export default function App({
         throw new Error(
           response.message || "This message can no longer be taken back.",
         );
-      drafts.set(
-        draftKey,
-        (old) => (old ? old + "\n\n" : "") + response.prompt,
-      );
+      // Its files go back on the conversation, its text into the draft: still a message.
+      restoreDraft(draftKey, String(response.prompt ?? ""), true);
       setQueueRefresh((n) => n + 1);
       input.current?.focus();
     } catch (error) {
@@ -2577,6 +2810,31 @@ export default function App({
       observer?.disconnect();
     };
   }, [error, notice, section, destination]);
+  // An orchestrator switch that dropped queued messages says so, and offers to put the
+  // user's own back in the orchestrator's message box, files and all (as Take back does).
+  // One whose new orchestrator can't start (its program is missing, its start failed)
+  // says that too.
+  const afterSwitch = (result: Json) => {
+    const problem = changeProblem(result);
+    const { count, mine, lost } = droppedBySwitch(result);
+    const words = droppedWords(count, mine.length, lost);
+    if (words && "notice" in words) {
+      setNotice(problem ? `${problem} ${words.notice}` : words.notice);
+      return;
+    }
+    if (problem) setNotice(problem);
+    if (!words) return;
+    const key = workspace + ":orchestrator";
+    setConfirmation({
+      title: words.title,
+      detail: words.detail,
+      action: "Put back",
+      run: () => {
+        for (const message of mine) restoreDraft(key, message, true);
+        input.current?.focus();
+      },
+    });
+  };
   const loopNavigation = useRef({
     destination,
     section,
@@ -2629,7 +2887,14 @@ export default function App({
           );
           const words = startedWords(detail?.started, found);
           const line = words || result.loop?.line;
-          setNotice(startedNotice(name, request.kind, line));
+          setNotice(
+            startedNotice(
+              name,
+              request.kind,
+              line,
+              request.kind === "review" && !!request.once,
+            ),
+          );
         } else if (result?.status === "needs_setup") {
           // The card is the user's to answer: bring it into view, never answer it here.
           if (!found) setSection("attention");
@@ -3013,15 +3278,28 @@ export default function App({
                   label: "Model & runtime…",
                   icon: <Cpu size={16} aria-hidden="true" />,
                   dialog: true,
+                  // The composer's model picker, the one place for its model and
+                  // effort (and a move to another runtime); before there is a thread to
+                  // pick for (no orchestrator yet), the form.
+                  disabled: !!target && (!connected || !permitted("operate")),
                   onSelect: () =>
-                    action(
-                      destination ? "model" : "orch",
-                      destination ? { thread: destination } : {},
-                      { fixed: true },
-                    ),
+                    target
+                      ? openModelPicker()
+                      : action(
+                          destination ? "model" : "orch",
+                          destination ? { thread: destination } : {},
+                          { fixed: true },
+                        ),
                 },
               ]
             : []),
+          {
+            key: "usage",
+            label: "Usage limits",
+            icon: <Gauge size={16} aria-hidden="true" />,
+            disabled: !connected,
+            onSelect: () => setUsagePanel(true),
+          },
           ...(destination && target && !target.is_orchestrator
             ? threadMenu(target.id).map((item, i) => ({
                 ...item,
@@ -3603,6 +3881,15 @@ export default function App({
                       workspace={workspace}
                       connected={connected}
                     />
+                    <UsageButton
+                      // Each workspace's limits from its own hub: a switch starts afresh.
+                      // (Its own key: the read-aloud control beside it is keyed by workspace.)
+                      key={`usage:${workspace}`}
+                      rpc={rpc}
+                      revision={usageRevision}
+                      connected={connected}
+                      onOpenPage={() => setSection("usage")}
+                    />
                     {destination &&
                       target &&
                       document.documentElement.dataset.mobile !== "true" && (
@@ -3686,6 +3973,7 @@ export default function App({
                   connected={connected}
                   summaries={assistance.summaries}
                   onError={fail}
+                  sentImage={uploads.sentImage}
                   onVisibleRoutines={setVisibleRoutines}
                   offer={
                     destination &&
@@ -3734,13 +4022,12 @@ export default function App({
                   threads={view.threads}
                   onSent={(result) => {
                     setQueueRefresh((n) => n + 1);
-                    for (const restored of [
+                    const back = [
                       ...(result.restored_drafts || []),
                       ...(result.restored_draft ? [result.restored_draft] : []),
-                    ])
-                      drafts.set(restored.key, (old) =>
-                        appendDraft(old, restored.text),
-                      );
+                    ];
+                    for (const restored of journal?.claim(back) || [])
+                      restoreDraft(restored.key, restored.text);
                   }}
                   onCopy={(message) => {
                     const key =
@@ -3749,17 +4036,9 @@ export default function App({
                       (message.method === "say"
                         ? "orchestrator"
                         : message.params.thread);
-                    const text = messageDraft(message);
-                    drafts.set(key, (old) => appendDraft(old, text));
+                    restoreDraft(key, messageDraft(message));
                   }}
                 />
-                {target && (
-                  <AttachmentManager
-                    controller={uploads}
-                    thread={target.id}
-                    workspace={workspace}
-                  />
-                )}
                 {queued.length > 0 && (
                   <section className="queue" aria-label="Queued messages">
                     <div className="eyebrow">
@@ -3771,11 +4050,13 @@ export default function App({
                         className="queued-message"
                         key={message.ref || message.id || i}
                       >
-                        <span>
-                          {message.prompt ||
+                        <QueuedText
+                          text={
+                            message.prompt ||
                             message.message ||
-                            JSON.stringify(message)}
-                        </span>
+                            JSON.stringify(message)
+                          }
+                        />
                         <button
                           disabled={
                             !message.mine || queueBusy.includes(message.ref)
@@ -3832,6 +4113,22 @@ export default function App({
                     </div>
                   ))}
                 </div>
+                {usagePanel && (
+                  <UsagePanel
+                    // Each workspace's limits from its own hub: a switch starts afresh.
+                    key={`usage:${workspace}`}
+                    rpc={rpc}
+                    revision={usageRevision}
+                    onClose={() => {
+                      setUsagePanel(false);
+                      input.current?.focus();
+                    }}
+                    onOpenPage={() => {
+                      setUsagePanel(false);
+                      setSection("usage");
+                    }}
+                  />
+                )}
                 <Composer
                   drafts={drafts}
                   draftKey={draftKey}
@@ -3849,9 +4146,7 @@ export default function App({
                   setDestination={setDestination}
                   orchestrator={orchestrator}
                   workers={workers}
-                  slashCommands={
-                    slashCommands.length ? slashCommands : commands
-                  }
+                  slashCommands={composerCommands}
                   shellCwd={shellCwd}
                   assistance={assistance}
                   acceptSuggestion={acceptSuggestion}
@@ -3869,6 +4164,33 @@ export default function App({
                   spokenLately={spokenLately}
                   onDismissKeyboard={onDismissKeyboard}
                   fail={fail}
+                  modelPicker={
+                    <ModelPicker
+                      target={target}
+                      kind={target?.is_orchestrator ? "orchestrator" : "thread"}
+                      catalog={modelCatalog}
+                      rpc={rpc}
+                      connected={connected}
+                      operate={permitted("operate")}
+                      // The local app has no device scopes: it is the user, with all of them.
+                      admin={permitted("admin")}
+                      confirm={setConfirmation}
+                      withdraw={(asked) => {
+                        if (confirmation !== asked) return false;
+                        setConfirmation(undefined);
+                        return true;
+                      }}
+                      fail={fail}
+                      input={input}
+                      queued={
+                        destination
+                          ? 0
+                          : Number(queueInfo.total) || queued.length
+                      }
+                      switched={afterSwitch}
+                      notify={setNotice}
+                    />
+                  }
                 />
               </>
             )}
@@ -4138,11 +4460,14 @@ export default function App({
                         aria-haspopup="dialog"
                         aria-label={`Change model of ${selectedThread.name}`}
                         onClick={() =>
-                          action(
-                            "model",
-                            { thread: selectedThread.id },
-                            { fixed: true },
-                          )
+                          // The conversation shown: its composer's model picker.
+                          section === "chat" && target?.id === selectedThread.id
+                            ? openModelPicker()
+                            : action(
+                                "model",
+                                { thread: selectedThread.id },
+                                { fixed: true },
+                              )
                         }
                       >
                         Change…
@@ -4507,6 +4832,7 @@ export default function App({
             admin: permitted("admin"),
             modelCatalog,
             lists: pickerLists,
+            orchestrator: Boolean(orchestrator),
           };
           const shown = operation.fields.filter(
             (field) =>
@@ -4699,6 +5025,17 @@ export default function App({
             <span />
             <div>
               <button onClick={() => setConfirmation(undefined)}>Cancel</button>
+              {confirmation.alt && (
+                <button
+                  onClick={() => {
+                    const run = confirmation.alt!.run;
+                    setConfirmation(undefined);
+                    run();
+                  }}
+                >
+                  {confirmation.alt.action}
+                </button>
+              )}
               <button
                 className={confirmation.destructive ? "danger" : "primary"}
                 onClick={() => {
@@ -5302,9 +5639,12 @@ const Conversation = memo(function Conversation({
   onVisibleRoutines,
   onError,
   offer,
+  sentImage,
 }: {
   /** The thread whose finished turn with changes the conversation offers a review loop. */
   offer?: Thread;
+  /** The preview this client still holds of a file a message named, by its path. */
+  sentImage?: (path: string) => string | undefined;
   onVisibleRoutines: (threads: string[]) => void;
   onError: (error: unknown) => void;
   summaries: Summary[];
@@ -5449,8 +5789,13 @@ const Conversation = memo(function Conversation({
   const previousIndex = userIndexes.findLast((index) => index < beforeIndex);
   const previousUser =
     previousIndex == null ? undefined : blocks[previousIndex];
+  // A message of files only reads as their names (never their paths).
   const previousUserLine = previousUser
-    ? previousUser.text.split(/\r\n|\r|\n/, 1)[0].trim() || "Blank first line"
+    ? ((sent) =>
+        sent.body.split(/\r\n|\r|\n/, 1)[0].trim() ||
+        (sent.files.length
+          ? "Attached " + sent.files.map((file) => file.name).join(", ")
+          : "Blank first line"))(splitAttachments(previousUser.text))
     : "";
   const boundaryText =
     loading || (earlier && !error && connected)
@@ -5753,10 +6098,18 @@ const Conversation = memo(function Conversation({
                     onExpandedChange={(open) => setOpen(block.id, open)}
                   />
                 </details>
+              ) : block.kind === "user" || block.kind === "notice" ? (
+                // A prompt the orchestrator forwarded is a notice: the files it names show as
+                // chips too, never their paths.
+                <SentMessage
+                  text={block.text}
+                  sentImage={sentImage}
+                  expanded={opened.get(block.id) ?? false}
+                  onExpandedChange={(open) => setOpen(block.id, open)}
+                />
               ) : (
                 <MessageBody
                   text={block.text}
-                  clamp={block.kind === "user" || block.kind === "notice"}
                   streaming={block.kind === "assistant" && !!block.pending}
                   threadTags={
                     block.kind === "assistant" && !!target?.is_orchestrator

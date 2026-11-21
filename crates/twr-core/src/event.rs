@@ -2381,6 +2381,9 @@ pub struct LoopSetup {
     pub overrides: crate::loops::settings::Overrides,
     /// Who asked for the loop.
     pub requested_by: crate::loops::ControlBy,
+    /// The loop it starts is a single pass ([`LoopStarted::once`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub once: bool,
     /// The card's warnings (replacements, same family).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -2494,6 +2497,11 @@ pub struct LoopStarted {
     /// settings are the user's either way: saved by the user, or chosen on the setup card.
     #[serde(skip_serializing_if = "crate::loops::ControlBy::is_user")]
     pub requested_by: crate::loops::ControlBy,
+    /// A single pass of a review loop: one review run at the profile's strongest ladder tier,
+    /// one triage turn if it found anything, then the report (no second round, no sweep, no
+    /// verification). Absent in older logs: a full loop.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub once: bool,
     /// The loop folder.
     pub folder: Option<String>,
     /// Runtime-specific extras.

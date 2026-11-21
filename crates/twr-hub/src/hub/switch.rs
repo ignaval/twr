@@ -251,6 +251,16 @@ impl Core {
     ) -> Result<Option<Switch>, RpcError> {
         let name = &view.name;
         let new = match spec {
+            // The runtime it runs, as a thread names it (`acp` for every agent): no move.
+            Some(spec)
+                if spec.trim() == twr_adapters::acp::NAME
+                    && view.runtime == twr_adapters::acp::NAME =>
+            {
+                RuntimeSpec {
+                    runtime: view.runtime.clone(),
+                    ..Default::default()
+                }
+            }
             Some(spec) => {
                 if caller.is_orchestrator() {
                     orch::check_orchestrator_runtime(spec, &hub.config)?;
@@ -797,7 +807,7 @@ impl Core {
         let first = store::first_of_kind(conn, thread, "turn.started")?.map(|e| self.full(e));
         match first.as_ref().map(|e| &e.body) {
             Some(EventBody::TurnStarted(p)) => {
-                body.push_str(&cut(p.prompt.trim(), TASK_MAX));
+                body.push_str(&cut(twr_core::upload::trim_message(&p.prompt), TASK_MAX));
                 body.push('\n');
             }
             _ => body.push_str("(no turn yet)\n"),
@@ -1052,7 +1062,7 @@ impl Core {
             let entry = format!(
                 "### turn {turn} ({from}, {result}, {})\nprompt: {}\nreply: {reply}\n",
                 ev.ts.format("%Y-%m-%d %H:%M UTC"),
-                cut(p.prompt.trim(), ENTRY_MAX),
+                cut(twr_core::upload::trim_message(&p.prompt), ENTRY_MAX),
             );
             // The newest turn always goes in; the oldest go first.
             if !kept.is_empty() && used + entry.len() > TURNS_MAX {

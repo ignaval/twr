@@ -79,6 +79,8 @@ type HostOptions = {
   /** The connection takes uploads. */
   uploads?: boolean;
   voice?: boolean;
+  /** This computer's speaker bridge, which shows the header's read-aloud control. */
+  speaker?: boolean;
   voiceStatus?: () => Promise<VoiceCaptureStatus>;
   voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
@@ -114,6 +116,17 @@ function fakeHost(options: HostOptions = {}) {
   const host = {
     sent,
     nativeVoice: options.voice ? nativeVoice : undefined,
+    voiceSpeaker: options.speaker
+      ? async () => ({
+          device: "computer",
+          running: true,
+          active: false,
+          name: "desktop",
+          playing: false,
+          paused: false,
+          queued: 0,
+        })
+      : undefined,
     voiceSetup: options.voiceSetup,
     voiceOps,
     voiceEvent: (event: NativeVoiceEvent) =>
@@ -193,7 +206,7 @@ function fakeHost(options: HostOptions = {}) {
     terminalRead: async () => ({ data: "", sequence: 0 }),
     uploadFile: options.uploads
       ? async (file: { name: string }, thread: string) => ({
-          path: "/uploads/" + file.name,
+          path: "/w/.twr-uploads/u/" + file.name,
           thread,
         })
       : undefined,
@@ -1209,6 +1222,29 @@ describe("the message box", () => {
     expect(app().box().value).toBe("in the other workspace");
   });
 
+  it("keeps one of each header control across workspace switches", async () => {
+    await mounted.unmount();
+    mounted = await mount({ speaker: true });
+    const count = (label: string) =>
+      app().all(`.conversation-actions [aria-label="${label}"]`).length;
+    const readAloud =
+      "Automatically read orchestrator replies aloud on this computer";
+    const before = [count(readAloud), count("Usage limits")];
+    await app().switchTo("other");
+    await app().switchTo("default");
+    await app().switchTo("other");
+    expect([count(readAloud), count("Usage limits")]).toEqual(before);
+    expect(before).toEqual([1, 1]);
+  });
+
+  it("closes the /usage panel when you switch workspaces", async () => {
+    await app().type("/usage");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(1);
+    await app().switchTo("other");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+  });
+
   it("clears only the sent destination's draft", async () => {
     await app().talkTo("builder");
     await app().type("kept for the builder");
@@ -1313,6 +1349,29 @@ describe("the message box, at its edges", () => {
       suggested: true,
     });
     expect(app().box().value).toBe("");
+  });
+
+  it("takes a suggestion that starts with / as a message, escaped", async () => {
+    await start({
+      ...suggesting,
+      rpc: (method: string) =>
+        method === "suggest.next"
+          ? Promise.resolve({ suggestion: "/usage is what I'd check" })
+          : undefined,
+    });
+    for (let i = 0; i < 40; i++) {
+      if (app().box().getAttribute("placeholder")?.startsWith("/usage")) break;
+      await app().wait(100);
+    }
+    await app().wait(SUGGEST_SETTLE_MS + 50);
+    await app().press("Tab");
+    expect(app().box().value).toBe("//usage is what I'd check");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().host.sent[0].params).toMatchObject({
+      message: "/usage is what I'd check",
+      suggested: true,
+    });
   });
 
   it("forgets a taken suggestion once it is edited, even back to the same words", async () => {
@@ -1476,29 +1535,6 @@ describe("the message box, at its edges", () => {
     expect(app().box().value).toBe("orchestrator words");
   });
 
-  it("adds an uploaded file's path to the draft", async () => {
-    await start({ uploads: true });
-    await app().type("see");
-    const input = app().find(".attachment-button input") as FakeElement & {
-      files: unknown[];
-    };
-    input.files = [
-      {
-        name: "notes.txt",
-        size: 5,
-        type: "application/octet-stream",
-        slice: () => ({ text: async () => "hello" }),
-      },
-    ];
-    await app().act(async () => {
-      input.dispatchEvent(new FakeEvent("change", { bubbles: true }));
-    });
-    await app().wait(50);
-    expect(app().box().value).toBe(
-      "see\nUploaded file: notes.txt\n/uploads/notes.txt\n",
-    );
-  });
-
   it("shows the drafts saved on the device when it starts again", async () => {
     await start();
     await app().type("survive restart");
@@ -1589,6 +1625,754 @@ describe("the message box, at its edges", () => {
     expect(app().box().value).toBe("queued and more");
     await app().wait(450);
     expect(saved()?.["default:orchestrator"]).toBe("queued and more");
+  });
+});
+
+/* Attached files (docs/attachments.md): they show inside the message box, never as paths, and
+ * a message names them (`Uploaded file: <name>` and the path) only as it is sent. */
+describe("attached files", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options: Parameters<typeof mount>[0] = {}) => {
+    vi.resetModules();
+    mounted = await mount({ uploads: true, ...options });
+  };
+  /** Picks a file with the paperclip, and lets its upload finish. */
+  const attach = async (name = "notes.txt", type = "text/plain") => {
+    const input = app().find(".attachment-button input") as FakeElement & {
+      files: unknown[];
+    };
+    input.files = [
+      {
+        name,
+        size: 5,
+        type,
+        slice: () => ({ text: async () => "hello" }),
+      },
+    ];
+    await app().act(async () => {
+      input.dispatchEvent(new FakeEvent("change", { bubbles: true }));
+    });
+    await app().wait(50);
+  };
+  const chips = () =>
+    app()
+      .all(".composer-attachments li")
+      .map((li) => li.textContent);
+  /** Every text and attribute of the message box: where a path must never show. */
+  const shown = () =>
+    app()
+      .all("form.composer, form.composer *")
+      .flatMap((node) => [
+        ...node.attributes
+          .filter((a) => a.name !== "value")
+          .map((a) => a.value),
+      ])
+      .concat(app().find("form.composer").textContent, app().box().value)
+      .join("\n");
+  const sendButton = () => app().find(".send-button");
+  /** What the device saved of drafts and the outbox. */
+  const pending = () =>
+    JSON.parse(app().host.secure.get("offline-pending:composer-test") || "{}");
+  /** Quits and starts again on this device's saved storage. */
+  const restart = async (options: Parameters<typeof mount>[0] = {}) => {
+    const secure = Object.fromEntries(app().host.secure);
+    await app().unmount();
+    await start({ secure, ...options });
+  };
+  const submit = async () => {
+    await app().act(async () => {
+      app()
+        .find("form.composer")
+        .dispatchEvent(
+          new FakeEvent("submit", { bubbles: true, cancelable: true }),
+        );
+    });
+    await app().settle();
+  };
+
+  it("shows a file inside the box, without its path, and keeps it out of the draft", async () => {
+    await start();
+    await app().type("see");
+    await attach();
+    expect(app().box().value).toBe("see");
+    expect(chips()).toHaveLength(1);
+    expect(chips()[0]).toContain("notes.txt");
+    expect(shown()).not.toContain(".twr-uploads");
+    // The old full-width bar is gone.
+    expect(app().all(".attachment-manager, .attachment-item")).toHaveLength(0);
+    // The draft saved on the device is the text alone; the file is saved beside it.
+    await app().wait(450);
+    expect(pending().drafts).toEqual({ "default:orchestrator": "see" });
+    expect(pending().draftFiles).toEqual({
+      "default:orchestrator": [
+        { name: "notes.txt", path: "/w/.twr-uploads/u/notes.txt" },
+      ],
+    });
+  });
+
+  it("names the files after the text it sends, then clears them", async () => {
+    await start();
+    await app().type("see");
+    await attach();
+    await app().press("Enter");
+    expect(app().host.sent).toEqual([
+      {
+        method: "say",
+        params: expect.objectContaining({
+          message: "see\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
+        }),
+      },
+    ]);
+    expect(app().box().value).toBe("");
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("sends files with no text, to the conversation they belong to", async () => {
+    await start();
+    await app().talkTo("builder");
+    await attach("a.txt");
+    expect(sendButton().disabled).toBe(false);
+    await app().talkTo("tester");
+    expect(chips()).toHaveLength(0);
+    await app().talkTo("builder");
+    expect(chips()).toHaveLength(1);
+    await submit();
+    expect(app().host.sent).toEqual([
+      {
+        method: "thread.send",
+        params: {
+          thread: "w1",
+          prompt: "Uploaded file: a.txt\n/w/.twr-uploads/u/a.txt",
+        },
+      },
+    ]);
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("waits, with Send disabled and saying why, while a file uploads", async () => {
+    await start();
+    let finish!: () => void;
+    app().host.uploadFile = (async (file: { name: string }) => {
+      await new Promise<void>((resolve) => (finish = resolve));
+      return { path: "/w/.twr-uploads/u/" + file.name };
+    }) as any;
+    await app().type("soon");
+    await attach();
+    expect(sendButton().disabled).toBe(true);
+    expect(sendButton().getAttribute("aria-describedby")).toBe(
+      "twr-attachment-wait",
+    );
+    expect(app().find("#twr-attachment-wait").textContent).toContain(
+      "finish uploading",
+    );
+    await app().press("Enter");
+    expect(app().host.sent).toEqual([]);
+    expect(app().box().value).toBe("soon");
+    await app().act(async () => finish());
+    await app().wait(50);
+    expect(sendButton().disabled).toBe(false);
+    await app().press("Enter");
+    expect(app().host.sent[0].params.message).toBe(
+      "soon\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
+    );
+  });
+
+  it("attaches nothing to a composer command or a shell line", async () => {
+    await start();
+    await attach();
+    await app().type("!ls");
+    await app().press("Enter");
+    expect(app().host.sent).toEqual([]);
+    expect(chips()).toHaveLength(1);
+    await app().replace("now");
+    await app().press("Enter");
+    expect(app().host.sent[0].params.message).toBe(
+      "now\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
+    );
+  });
+
+  it("saves the paths with a message kept for later, and shows only the names", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await attach();
+    await app().connection(false);
+    await app().type("later");
+    await app().press("Enter");
+    expect(app().host.sent).toHaveLength(0);
+    expect(chips()).toHaveLength(0);
+    const outbox = app().find(".outbox-message");
+    expect(outbox.textContent).toContain("later");
+    expect(outbox.textContent).toContain("notes.txt");
+    expect(outbox.textContent).not.toContain(".twr-uploads");
+    await app().wait(450);
+    expect([...app().host.secure.values()].join("\n")).toContain(
+      "later\\nUploaded file: notes.txt\\n/w/.twr-uploads/u/notes.txt",
+    );
+    // Moved back to the draft: the text to the box, the file to the box's files.
+    await app().click(
+      app().find(".outbox-message button", "Move to original draft"),
+    );
+    expect(app().box().value).toBe("later");
+    expect(chips()).toHaveLength(1);
+    expect(shown()).not.toContain(".twr-uploads");
+  });
+
+  it("puts a queued message's files back on Take back, and shows them by name", async () => {
+    await start();
+    app().host.queues.w1 = [
+      {
+        ref: 7,
+        prompt: "queued words\nUploaded file: a.png\n/w/.twr-uploads/q/a.png",
+        mine: true,
+      },
+    ];
+    await app().talkTo("builder");
+    const queued = app().find(".queued-message");
+    expect(queued.textContent).toContain("a.png");
+    expect(queued.textContent).not.toContain("/w/.twr-uploads/q/a.png");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("queued words");
+    expect(chips()).toEqual([expect.stringContaining("a.png")]);
+    await app().press("Enter");
+    expect(app().host.sent.at(-1)).toEqual({
+      method: "thread.send",
+      params: {
+        thread: "w1",
+        prompt: "queued words\nUploaded file: a.png\n/w/.twr-uploads/q/a.png",
+      },
+    });
+  });
+
+  it("saves a taken-back / message with its file offline, as the message it is", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    app().host.queues.w1 = [
+      {
+        ref: 7,
+        prompt:
+          "/etc is the folder\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
+        mine: true,
+      },
+    ];
+    await app().talkTo("builder");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("//etc is the folder");
+    expect(chips()).toEqual([expect.stringContaining("a.txt")]);
+    await app().connection(false);
+    // Escaped, it is a message, not a command: it can be saved for later, its file with it.
+    expect(sendButton().disabled).toBe(false);
+    await app().press("Enter");
+    expect(app().host.sent).toHaveLength(0);
+    expect(app().box().value).toBe("");
+    expect(chips()).toHaveLength(0);
+    const outbox = app().find(".outbox-message");
+    expect(outbox.textContent).toContain("/etc is the folder");
+    expect(outbox.textContent).toContain("a.txt");
+    await app().wait(450);
+    expect([...app().host.secure.values()].join("\n")).toContain(
+      "/etc is the folder\\nUploaded file: a.txt\\n/w/.twr-uploads/q/a.txt",
+    );
+    // A command itself still can't be saved offline.
+    await app().type("/usage");
+    expect(sendButton().disabled).toBe(true);
+  });
+
+  it("sends the orchestrator's files with a hands-free message", async () => {
+    await start({ voice: true });
+    await attach();
+    await app().click(app().find("[data-voice-hands-free]"));
+    await app().act(async () => app().host.voiceEvent({ type: "speechStart" }));
+    await app().act(async () =>
+      app().host.voiceEvent({ type: "final", text: "What is in it?" }),
+    );
+    await app().settle();
+    expect(app().host.sent.at(-1)).toMatchObject({
+      method: "say",
+      params: {
+        voice: true,
+        message:
+          "What is in it?\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
+      },
+    });
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("makes the files part of an implementation loop's task", async () => {
+    const asked: Json[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "loop.request") {
+          asked.push(params);
+          return Promise.resolve({ status: "started", loop: { line: "x" } });
+        }
+        if (method === "loop.get")
+          return Promise.resolve({ started: null, id: "l1" });
+        return undefined;
+      },
+    });
+    await app().talkTo("builder");
+    await attach("spec.md");
+    await app().type("build this");
+    // Run as loop on, Send (Enter: this test DOM submits no form on a click) starts it.
+    await app().click(app().find('[role="switch"]', "Run as loop"));
+    await app().press("Enter");
+    expect(asked).toEqual([
+      {
+        thread: "w1",
+        kind: "implement",
+        task: "build this\nUploaded file: spec.md\n/w/.twr-uploads/u/spec.md",
+      },
+    ]);
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("keeps saving drafts after a message of files alone goes to the outbox", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await attach();
+    await app().connection(false);
+    await submit();
+    expect(app().find(".outbox-message").textContent).toContain("notes.txt");
+    expect(chips()).toHaveLength(0);
+    await app().talkTo("builder");
+    await app().type("second draft");
+    await app().wait(450);
+    expect(pending().drafts["default:w1"]).toBe("second draft");
+    expect(pending().draftFiles).toEqual({});
+  });
+
+  it("keeps a draft's files over a restart, with text and alone", async () => {
+    await start();
+    await app().type("See attached");
+    await attach();
+    await app().talkTo("builder");
+    await attach("a.txt");
+    await app().wait(450);
+    await restart();
+    expect(app().box().value).toBe("See attached");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    await app().talkTo("builder");
+    expect(app().box().value).toBe("");
+    expect(chips()).toEqual([expect.stringContaining("a.txt")]);
+    await submit();
+    expect(app().host.sent.at(-1)).toEqual({
+      method: "thread.send",
+      params: {
+        thread: "w1",
+        prompt: "Uploaded file: a.txt\n/w/.twr-uploads/u/a.txt",
+      },
+    });
+  });
+
+  it("saves a file the moment it is uploaded or removed, without typing's delay", async () => {
+    await start();
+    await attach();
+    // Quit at once, well within the 350 ms the drafts wait after typing stops.
+    await restart();
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    await app().click(app().find(".attachment-remove"));
+    expect(chips()).toEqual([]);
+    await restart();
+    expect(chips()).toEqual([]);
+  });
+
+  it("saves what waits for its delay as the app goes away, or the page unloads", async () => {
+    await start();
+    await app().type("quick words");
+    await attach();
+    await app().type(" and a file");
+    // The desktop window closing, or the phone app going to the background.
+    const { saveNow } = await import("../shared/save-now");
+    await app().act(() => saveNow());
+    await restart();
+    expect(app().box().value).toBe("quick words and a file");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    await app().type(", then more");
+    await app().act(async () => {
+      window.dispatchEvent(new FakeEvent("pagehide") as unknown as Event);
+    });
+    await app().settle();
+    await restart();
+    expect(app().box().value).toBe("quick words and a file, then more");
+  });
+
+  it("writes nothing as the page unloads when every draft is saved already", async () => {
+    await start();
+    await app().type("saved words");
+    await app().wait(450);
+    // Written whole from memory, a needless save would undo what was stored since (an
+    // outbox message another writer added, say).
+    const write = app().host.secureWrite!;
+    let writes = 0;
+    app().host.secureWrite = async (key: string, value: string) => {
+      writes += 1;
+      return write(key, value);
+    };
+    await app().act(async () => {
+      window.dispatchEvent(new FakeEvent("pagehide") as unknown as Event);
+    });
+    await app().settle();
+    expect(writes).toBe(0);
+    await app().type(" and more");
+    await app().act(async () => {
+      window.dispatchEvent(new FakeEvent("pagehide") as unknown as Event);
+    });
+    await app().settle();
+    expect(writes).toBeGreaterThan(0);
+  });
+
+  it("keeps a file attached just before a send the outbox refuses, over a restart", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await app().connection(false);
+    await app().type("later");
+    await app().wait(450);
+    // The outbox refuses the message (it is full); every other save goes through.
+    const write = app().host.secureWrite;
+    app().host.secureWrite = async (key: string, value: string) => {
+      if (JSON.parse(value).outbox?.length)
+        throw new Error("Outbox is full (100 messages)");
+      return write(key, value);
+    };
+    // Sent before the file's own save (350 ms after it uploaded) comes.
+    await attach();
+    await app().press("Enter");
+    expect(app().all(".outbox-message")).toHaveLength(0);
+    expect(app().box().value).toBe("later");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+    expect(pending().draftFiles).toEqual({
+      "default:orchestrator": [
+        { name: "notes.txt", path: "/w/.twr-uploads/u/notes.txt" },
+      ],
+    });
+    app().host.secureWrite = write;
+    await restart();
+    expect(app().box().value).toBe("later");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+  });
+
+  it("moves an older app's file lines out of a saved draft, into the box's files", async () => {
+    await start();
+    await app().type("x");
+    await app().wait(450);
+    // The previous composer wrote each uploaded file's pair into the draft itself.
+    const record = pending();
+    record.drafts["default:orchestrator"] =
+      "See\nUploaded file: old.txt \n/w/.twr-uploads/9/old.txt \nmore\n```\nUploaded file: mock.txt\n/w/.twr-uploads/1/mock.txt\n```";
+    app().host.secure.set(
+      "offline-pending:composer-test",
+      JSON.stringify(record),
+    );
+    await restart();
+    expect(app().box().value).toBe(
+      "See\nmore\n```\nUploaded file: mock.txt\n/w/.twr-uploads/1/mock.txt\n```",
+    );
+    expect(chips()).toEqual([expect.stringContaining("old.txt")]);
+    expect(shown()).not.toContain("/w/.twr-uploads/9");
+    await app().wait(450);
+    expect(pending().draftFiles["default:orchestrator"]).toEqual([
+      { name: "old.txt ", path: "/w/.twr-uploads/9/old.txt " },
+    ]);
+    // Sent, the file goes with the message as it was uploaded: its path exactly.
+    await submit();
+    expect(app().host.sent.at(-1)?.params.message).toBe(
+      "See\nmore\n```\nUploaded file: mock.txt\n/w/.twr-uploads/1/mock.txt\n```\nUploaded file: old.txt\n/w/.twr-uploads/9/old.txt ",
+    );
+  });
+
+  it("moves the old mobile app's file lines into the box's files", async () => {
+    await start({
+      hub: "h1",
+      local: {
+        "twr.mobile.drafts.h1": JSON.stringify({
+          "default:orchestrator":
+            "old words\nUploaded file: a.png\n/w/.twr-uploads/3/a.png",
+        }),
+      },
+    });
+    expect(app().box().value).toBe("old words");
+    expect(chips()).toEqual([expect.stringContaining("a.png")]);
+    expect(pending().drafts["default:orchestrator"]).toBe("old words");
+    expect(pending().draftFiles["default:orchestrator"]).toEqual([
+      { name: "a.png", path: "/w/.twr-uploads/3/a.png" },
+    ]);
+  });
+
+  it("empties the box's files when offline storage is reset, and saves none of them", async () => {
+    await start();
+    await app().type("See attached");
+    await attach();
+    expect(chips()).toHaveLength(1);
+    // As Settings' reset does: the storage is emptied (the file was saved as it uploaded),
+    // then the app is told.
+    app().host.secure.clear();
+    await app().act(async () => {
+      window.dispatchEvent(
+        new FakeEvent("twr:offline-reset", {
+          detail: { hostId: "composer-test" },
+        }) as unknown as Event,
+      );
+    });
+    await app().settle();
+    expect(chips()).toEqual([]);
+    await app().wait(450);
+    const stored = [...app().host.secure.values()].join("\n");
+    expect(stored).not.toContain("notes.txt");
+    expect(stored).not.toContain("/w/.twr-uploads/u/");
+  });
+
+  it("keeps a taken-back message's files over a restart", async () => {
+    await start();
+    app().host.queues.w1 = [
+      {
+        ref: 7,
+        prompt: "See attached\nUploaded file: a.png\n/w/.twr-uploads/q/a.png",
+        mine: true,
+      },
+    ];
+    await app().talkTo("builder");
+    await app().click(app().find(".queued-message button", "Take back"));
+    await app().wait(450);
+    await restart();
+    await app().talkTo("builder");
+    expect(app().box().value).toBe("See attached");
+    expect(chips()).toEqual([expect.stringContaining("a.png")]);
+  });
+
+  it("keeps a message's files over a restart once it is moved back from the outbox", async () => {
+    await start();
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await attach();
+    await app().connection(false);
+    await app().type("later");
+    await app().press("Enter");
+    await app().click(
+      app().find(".outbox-message button", "Move to original draft"),
+    );
+    // Saved split at once, before the drafts' own save: a restart now loses nothing.
+    expect(pending().drafts["default:orchestrator"]).toBe("later");
+    expect(pending().draftFiles["default:orchestrator"]).toEqual([
+      { name: "notes.txt", path: "/w/.twr-uploads/u/notes.txt" },
+    ]);
+    await restart();
+    expect(app().box().value).toBe("later");
+    expect(chips()).toEqual([expect.stringContaining("notes.txt")]);
+  });
+
+  it("keeps the orchestrator's files when a switch gives it a new thread", async () => {
+    await start();
+    const uploadedTo: string[] = [];
+    let finish!: () => void;
+    app().host.uploadFile = (async (file: { name: string }, thread: string) => {
+      uploadedTo.push(thread);
+      if (file.name === "late.txt")
+        await new Promise<void>((resolve) => (finish = resolve));
+      return { path: "/w/.twr-uploads/u/" + file.name };
+    }) as any;
+    await attach();
+    await attach("late.txt");
+    await app().type("draft");
+    const switched = [
+      thread({ id: "orch-new", name: "orchestrator", is_orchestrator: true }),
+      ...views.default.filter((t) => !t.is_orchestrator),
+    ];
+    await app().live("default", switched);
+    expect(app().box().value).toBe("draft");
+    expect(chips()).toHaveLength(2);
+    // The transfer that began goes on to the thread its receipt names.
+    await app().act(async () => finish());
+    await app().wait(50);
+    expect(uploadedTo).toEqual(["orch", "orch"]);
+    await app().press("Enter");
+    expect(app().host.sent.at(-1)?.params.message).toBe(
+      "draft\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt\nUploaded file: late.txt\n/w/.twr-uploads/u/late.txt",
+    );
+    expect(chips()).toHaveLength(0);
+  });
+
+  it("names a file in one message when hands-free speech and Send go at once", async () => {
+    let deliver!: () => void;
+    await start({
+      voice: true,
+      rpc: (method, params) => {
+        if (method !== "say" || params.voice) return undefined;
+        app().host.sent.push({ method, params });
+        return new Promise((resolve) => {
+          deliver = () => resolve({ action: "sent" });
+        });
+      },
+    });
+    await attach();
+    await app().type("typed");
+    await app().press("Enter");
+    await app().click(app().find("[data-voice-hands-free]"));
+    await app().act(async () => app().host.voiceEvent({ type: "speechStart" }));
+    await app().act(async () =>
+      app().host.voiceEvent({ type: "final", text: "spoken" }),
+    );
+    await app().settle();
+    await app().act(async () => deliver());
+    await app().settle();
+    const messages = app().host.sent.map((sent) => sent.params.message);
+    expect(messages).toEqual([
+      "typed\nUploaded file: notes.txt\n/w/.twr-uploads/u/notes.txt",
+      "spoken",
+    ]);
+    expect(chips()).toHaveLength(0);
+  });
+});
+
+/* Usage limits (docs/desktop.md › Usage limits): `/usage` opens them above the message box,
+ * the header's gauge in a popover; both read `usage.get` when they open and when the hub's
+ * live view says an account's usage changed. */
+describe("usage limits", () => {
+  let reads = 0;
+  const usage = {
+    now: "2026-11-20T12:00:00Z",
+    runtimes: [
+      {
+        runtime: "claude-code",
+        account: null,
+        label: "Claude",
+        plan: "max",
+        age_secs: 5,
+        stale: false,
+        windows: [
+          {
+            window: "five_hour",
+            label: "5h",
+            used_pct: 80,
+            remaining_pct: 20,
+            minutes: 300,
+          },
+        ],
+      },
+    ],
+  };
+  beforeEach(async () => {
+    vi.resetModules();
+    reads = 0;
+    mounted = await mount({
+      rpc: (method) => {
+        if (method === "usage.get") {
+          reads++;
+          return Promise.resolve(usage);
+        }
+        return undefined;
+      },
+    });
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+
+  it("opens with /usage above the message box, and closes", async () => {
+    expect(reads).toBe(0);
+    await app().type("/usage");
+    await app().press("Enter");
+    const panel = app().find(".usage-panel");
+    expect(panel.textContent).toContain("Usage limits");
+    expect(panel.textContent).toContain("Claude");
+    expect(panel.textContent).toContain("20% left");
+    expect(panel.querySelector(".usage-row")!.getAttribute("data-level")).toBe(
+      "warn",
+    );
+    expect(app().box().value).toBe("");
+    expect(app().host.sent).toEqual([]);
+    expect(reads).toBe(1);
+    await app().click(
+      app().find('.usage-panel button[aria-label="Close usage limits"]'),
+    );
+    expect(app().all(".usage-panel")).toHaveLength(0);
+  });
+
+  it("closes with Esc from the empty message box, staying in the thread's conversation", async () => {
+    await app().talkTo("builder");
+    await app().type("/usage");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(1);
+    await app().press("Escape");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+  });
+
+  it("closes with Esc while the message box holds a draft, keeping the draft", async () => {
+    await app().type("/usage");
+    await app().press("Enter");
+    await app().type("half a thought");
+    await app().press("Escape");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().box().value).toBe("half a thought");
+  });
+
+  it("reads again when the hub's live view says usage changed", async () => {
+    await app().type("/usage");
+    await app().press("Enter");
+    expect(reads).toBe(1);
+    await app().act(async () => {
+      app().host.emit({
+        type: "state",
+        state: {
+          threads: views.default,
+          attention: [],
+          decisions: [],
+          decisions_seen: 0,
+          head: 2,
+          usage: [{ runtime: "claude-code", windows: [] }],
+        },
+      } as DesktopEvent);
+    });
+    await app().wait(60);
+    expect(reads).toBe(2);
+  });
+
+  it("opens from the header's gauge as a popover, with the way to the Activity page's usage", async () => {
+    const gauge = app().find(
+      '.conversation-actions button[aria-label="Usage limits"]',
+    );
+    expect(gauge.getAttribute("aria-expanded")).toBe("false");
+    await app().click(gauge);
+    expect(gauge.getAttribute("aria-expanded")).toBe("true");
+    const popover = app().find(".usage-popover");
+    expect(popover.getAttribute("role")).toBe("dialog");
+    expect(popover.textContent).toContain("20% left");
+    await app().click(app().find(".usage-popover .usage-page-link"));
+    expect(app().all(".usage-popover")).toHaveLength(0);
+    expect(app().find(".manager h1").textContent).toBe("Activity");
+    expect(app().find(".usage-cards").textContent).toContain("20% left");
+  });
+
+  it("closes the popover with Esc from the gauge too", async () => {
+    const gauge = app().find(
+      '.conversation-actions button[aria-label="Usage limits"]',
+    );
+    await app().click(gauge);
+    expect(app().all(".usage-popover")).toHaveLength(1);
+    // Shift-Tab from the popover lands on the gauge, which the focus check leaves alone.
+    await app().act(async () => void press(gauge, "Escape"));
+    expect(app().all(".usage-popover")).toHaveLength(0);
+    expect(gauge.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("closes the popover when the focus moves outside it", async () => {
+    const gauge = app().find(
+      '.conversation-actions button[aria-label="Usage limits"]',
+    );
+    await app().click(gauge);
+    expect(app().all(".usage-popover")).toHaveLength(1);
+    // Tab past its last control, to the message box: closed, Esc would no longer reach it.
+    await app().act(async () => {
+      app().box().focus();
+      app()
+        .box()
+        .dispatchEvent(new FakeEvent("focusin", { bubbles: true }));
+    });
+    expect(app().all(".usage-popover")).toHaveLength(0);
+    expect(gauge.getAttribute("aria-expanded")).toBe("false");
   });
 });
 
@@ -1797,6 +2581,42 @@ describe("implementation loops from the message box", () => {
   });
 });
 
+/* The palette's Switch orchestrator form: `[orchestrator] effort` applies to the first
+ * orchestrator only, so with one running, an unset effort is the runtime's own and says so. */
+describe("Switch orchestrator's effort", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mounted = await mount({
+      rpc: (method, params) => {
+        if (method === "orchestrator.show")
+          return Promise.resolve({
+            thread: "orch",
+            models: { fake: { models: [{ id: "m1" }], efforts: ["low"] } },
+          });
+        if (method === "desktop.parse_slash" && params.line.trim() === "/orch")
+          return Promise.resolve({ kind: "OrchPick" });
+        return undefined;
+      },
+    });
+    await app().wait(50);
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+
+  it("offers Runtime default, not As configured, while an orchestrator runs", async () => {
+    await app().type("/orch");
+    await app().press("Enter");
+    const form = app().find("[role=dialog]", "Switch orchestrator");
+    const options = form
+      .querySelectorAll("option")
+      .map((o: FakeElement) => o.textContent);
+    expect(options).toContain("low");
+    expect(options.join("|")).not.toContain("As configured");
+    expect(options).toContain("Runtime default");
+  });
+});
+
 /* `/access [limited|full]` (docs/orchestrator.md › Full access): the shared slash table's
  * command opens the palette's Orchestrator access form on the level named, and Full still
  * asks before anything reaches the hub. */
@@ -1944,5 +2764,197 @@ describe("a thread action's form", () => {
       app().find("[role=dialog] button[aria-label='Close dialog']"),
     );
     expect(app().document.activeElement).toBe(more);
+  });
+});
+
+describe("messages put back in the box stay messages", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options?: Parameters<typeof mount>[0]) => {
+    vi.resetModules();
+    mounted = await mount(options);
+  };
+  const sentMessages = () =>
+    app().host.sent.map((s) => s.params.message ?? s.params.prompt);
+
+  it("sends a leading ! with \\!, and a leading \\! with one more backslash", async () => {
+    await start();
+    await app().type("\\!ls is what I ran");
+    await app().press("Enter");
+    await app().type("\\\\!x");
+    await app().press("Enter");
+    await app().type("!!!wow");
+    await app().press("Enter");
+    expect(sentMessages()).toEqual(["!ls is what I ran", "\\!x", "!!!wow"]);
+  });
+
+  it("takes back a queued / or ! message escaped, and sends it as a message again", async () => {
+    await start({
+      rpc: (method) =>
+        method === "shell.run" ? Promise.resolve({ job: "j1" }) : undefined,
+    });
+    app().host.queues.w1 = [
+      { ref: 1, prompt: "/usage", mine: true },
+      { ref: 2, prompt: "!ls", mine: true },
+    ];
+    await app().talkTo("builder");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("//usage");
+    await app().press("Enter");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("\\!ls");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().host.sent.map((s) => s.method)).toEqual([
+      "thread.send",
+      "thread.send",
+    ]);
+    expect(sentMessages()).toEqual(["/usage", "!ls"]);
+  });
+
+  it("keeps a taken-back message when the box holds a command, sending both as text", async () => {
+    await start();
+    app().host.queues.w1 = [{ ref: 1, prompt: "taken back", mine: true }];
+    await app().talkTo("builder");
+    await app().type("/usage");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("//usage\n\ntaken back");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(sentMessages()).toEqual(["/usage\n\ntaken back"]);
+  });
+
+  it("opens the orchestrator's main conversation for /open orchestrator, its picker changing it in place", async () => {
+    const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
+    const calls: { method: string; params: Json }[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.parse_slash")
+          return Promise.resolve({ kind: "Open", args: "orchestrator" });
+        if (method === "orchestrator.show")
+          return Promise.resolve({ models: catalog, thread: "orch" });
+        if (method === "orchestrator.use" || method === "thread.set_model") {
+          calls.push({ method, params });
+          return Promise.resolve({ thread: "orch" });
+        }
+        return undefined;
+      },
+    });
+    await app().talkTo("builder");
+    await app().type("/open orchestrator");
+    await app().press("Enter");
+    // Its main conversation, not a thread's: no way back to it, sent with `say`.
+    expect(app().all(".destination-symbol.worker").length).toBe(0);
+    await app().type("hello");
+    await app().press("Enter");
+    expect(app().host.sent.map((s) => s.method)).toEqual(["say"]);
+    // Its picker changes the orchestrator's own thread, in place, with nothing to confirm.
+    await app().click(app().find(".model-picker-trigger"));
+    const search = app().find(".model-picker-search");
+    await app().act(async () => void press(search, "Enter"));
+    await app().click(
+      app()
+        .all(".model-picker-efforts [role=radio]")
+        .find((n) => n.textContent.includes("Low"))! as FakeElement,
+    );
+    expect(
+      app()
+        .all("button")
+        .some((b) => b.textContent === "Switch without summary"),
+    ).toBe(false);
+    expect(calls).toEqual([
+      { method: "thread.set_model", params: { thread: "orch", effort: "low" } },
+    ]);
+  });
+
+  it("opens the picker from the conversation's ⋯ menu and the inspector's Model, and /usage from the menu", async () => {
+    const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
+    await start({
+      rpc: (method) => {
+        if (method === "orchestrator.show")
+          return Promise.resolve({ models: catalog, thread: "orch" });
+        if (method === "usage.get") return Promise.resolve({ runtimes: [] });
+        return undefined;
+      },
+    });
+    const menuItem = (label: string) =>
+      app().find(".conversation-actions .actions-menu-items button", label);
+    // The one place for a model: the message box's picker, not a form.
+    await app().click(menuItem("Model & runtime…"));
+    expect(app().all(".model-picker-popup").length).toBe(1);
+    expect(app().all("[role=dialog] form").length).toBe(0);
+    const closePicker = () =>
+      app().act(
+        async () => void press(app().find(".model-picker-search"), "Escape"),
+      );
+    await closePicker();
+    expect(app().all(".model-picker-popup").length).toBe(0);
+    await app().talkTo("builder");
+    await app().click(app().find("button[title='Show thread details']"));
+    await app().click(
+      app().find("button[aria-label='Change model of builder']"),
+    );
+    expect(app().all(".model-picker-popup").length).toBe(1);
+    await closePicker();
+    await app().click(menuItem("Usage limits"));
+    expect(app().all(".usage-panel").length).toBe(1);
+  });
+
+  it("puts back what a switch dropped escaped, and says the new orchestrator can't start", async () => {
+    const catalog = {
+      fake: { models: [{ id: "m1" }], efforts: ["low"] },
+      codex: { models: [{ id: "gpt-5" }], efforts: ["low"] },
+    };
+    const uses: Json[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "orchestrator.show")
+          return Promise.resolve({
+            models: catalog,
+            thread: "orch",
+            account: "default",
+            installed: { fake: true, codex: true },
+          });
+        if (method === "orchestrator.use") {
+          uses.push(params);
+          return Promise.resolve({
+            thread: "orch",
+            previous: {
+              dropped_prompts: 2,
+              dropped_messages: ["/usage", "!ls"],
+            },
+            warning:
+              "fake is not on PATH: the new orchestrator cannot start until it is there (install it)",
+          });
+        }
+        return undefined;
+      },
+    });
+    // A switch to another runtime, confirmed without the summary.
+    await app().click(app().find(".model-picker-trigger"));
+    await app().click(
+      app()
+        .all(".model-picker-rail [role=option]")
+        .find((n) => n.textContent.includes("codex"))! as FakeElement,
+    );
+    const search = app().find(".model-picker-search");
+    await app().act(async () => void press(search, "Enter"));
+    await app().click(
+      app()
+        .all(".model-picker-efforts [role=radio]")
+        .find((n) => n.textContent.includes("Low"))! as FakeElement,
+    );
+    await app().click(app().find("button", "Switch without summary"));
+    expect(uses).toEqual([{ runtime: "codex", effort: "low", summary: false }]);
+    expect(app().find(".notice-toast").textContent).toContain(
+      "fake is not on PATH: the new orchestrator cannot start until it is there (install it).",
+    );
+    await app().click(app().find("button", "Put back"));
+    // Escaped only where it starts the box: after other text a / or ! is a message's.
+    expect(app().box().value).toBe("//usage\n\n!ls");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(sentMessages()).toEqual(["/usage\n\n!ls"]);
   });
 });

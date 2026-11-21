@@ -1,5 +1,6 @@
 import { fileDigest, requestId } from "./remote-crypto";
 import type { Json } from "./types";
+import type { NamedFile } from "./attachmentText";
 
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 export interface UploadResume {
@@ -28,10 +29,16 @@ export type UploadFile = (
 ) => Promise<{ path: string }>;
 export type UploadRequest = (method: string, params: Json) => Promise<any>;
 const paused = () => new DOMException("Upload paused", "AbortError");
-function filename(file: File) {
+/**
+ * The name the hub stores a file under: letters, digits and `_. -`, at most 120 bytes, and
+ * no space at either end, since the path ends a message's line (`Uploaded file:`) and a
+ * space there would not survive it.
+ */
+export function filename(file: Pick<File, "name">) {
   let name = file.name.normalize("NFC").replace(/[^\p{L}\p{N}_. -]/gu, "_");
   while (new TextEncoder().encode(name).length > 120)
     name = Array.from(name).slice(0, -1).join("");
+  name = name.replace(/^ +| +$/g, "");
   return !name || name === "." || name === ".." ? "attachment" : name;
 }
 async function base64(blob: Blob): Promise<string> {
@@ -189,7 +196,13 @@ export function createCancelUpload(
 export interface Attachment {
   id: string;
   file: File;
+  /** The thread the upload goes to: the one its transfer began with (its resume receipt
+   * names it), so it never changes once the transfer has begun. */
   thread: string;
+  /** The conversation it belongs to, as its draft is keyed (`<workspace>:<conversation>`):
+   * `orchestrator` for the orchestrator's, which outlives a switch of the orchestrator's
+   * thread, else the thread's id. */
+  conversation: string;
   workspace: string;
   phase:
     | "queued"
@@ -205,6 +218,15 @@ export interface Attachment {
   image?: string;
   text?: string;
   textTruncated?: boolean;
+  /** Put back from a message taken back to the draft: the file is not in memory, only
+   * its name and its uploaded copy's path. */
+  restored?: boolean;
+}
+/** The most attachments one conversation holds, and the most uploads unfinished at once. */
+export const MAX_ATTACHMENTS = 8;
+/** Whether an attachment is still on its way: a message waits for it (Send is disabled). */
+export function unfinished(item: Attachment) {
+  return item.phase !== "ready";
 }
 interface UploadHost {
   uploadFile?: UploadFile;
@@ -216,13 +238,24 @@ type Job = {
   running?: Promise<void>;
   cancelled?: boolean;
 };
-/** Queue state is independent of a mounted composer: navigating threads preserves progress. */
+/**
+ * The attachments of every conversation: each belongs to the conversation (and workspace)
+ * it was picked in, and stays there, uploaded or not, until a message to that conversation
+ * takes it ([`UploadController.take`]) or you remove it. Queue state is independent of a
+ * mounted composer: navigating threads preserves progress. A message about to be sent
+ * reserves its files first ([`UploadController.reserve`]), so that no other message names
+ * them while it is on its way.
+ */
 export class UploadController {
   private jobs = new Map<string, Job>();
   private listeners = new Set<() => void>();
   private snapshot: Attachment[] = [];
+  private reserved = new Set<string>();
   private disposed = false;
   private workspace?: string;
+  /** Image previews of sent attachments, by uploaded path, for the sent message's chips:
+   * the newest few, released as newer ones arrive and on dispose. */
+  private sentImages = new Map<string, string>();
   setWorkspace(workspace: string) {
     this.workspace = workspace;
     for (const job of this.jobs.values())
@@ -231,7 +264,8 @@ export class UploadController {
   }
   constructor(
     private host: UploadHost,
-    private uploaded: (attachment: Attachment) => void,
+    /** Told when an upload finishes. It no longer writes anything into a draft. */
+    private uploaded: (attachment: Attachment) => void = () => {},
   ) {}
   subscribe = (listener: () => void) => {
     this.listeners.add(listener);
@@ -244,31 +278,30 @@ export class UploadController {
     this.snapshot = [...this.jobs.values()].map((job) => ({ ...job.item }));
     this.listeners.forEach((listener) => listener());
   }
-  add(files: File[], thread: string, workspace: string) {
+  /** Picks `files` in a conversation (`thread` when it is not given): they upload to
+   * `thread`. */
+  add(files: File[], thread: string, workspace: string, conversation = thread) {
     if (!this.host.uploadFile)
       throw new Error("File uploads are unavailable on this connection");
+    // A ready attachment waits for its message: it is never evicted to make room.
     if (
-      [...this.jobs.values()].filter((job) => job.item.phase !== "ready")
-        .length +
+      this.of(conversation, workspace).length + files.length >
+        MAX_ATTACHMENTS ||
+      [...this.jobs.values()].filter((job) => unfinished(job.item)).length +
         files.length >
-      8
+        MAX_ATTACHMENTS
     )
-      throw new Error("Keep at most 8 attachments in the queue");
+      throw new Error(
+        `Attach at most ${MAX_ATTACHMENTS} files at a time: send or remove some first`,
+      );
     if (files.some((file) => file.size > MAX_UPLOAD_BYTES))
       throw new Error("Files can be at most 25 MiB");
-    // Completed previews can be evicted; they never consume pending-upload capacity.
-    for (const [id, job] of this.jobs) {
-      if (this.jobs.size + files.length <= 8) break;
-      if (job.item.phase === "ready") {
-        if (job.item.image) URL.revokeObjectURL(job.item.image);
-        this.jobs.delete(id);
-      }
-    }
     for (const file of files) {
       const item: Attachment = {
         id: requestId(),
         file,
         thread,
+        conversation,
         workspace,
         phase: "queued",
         loaded: 0,
@@ -321,19 +354,146 @@ export class UploadController {
     }
     this.emit();
   }
-  dismissReady(thread: string, workspace: string, sentDraft: string) {
-    for (const [id, job] of this.jobs)
+  /** One conversation's attachments, in the order they were picked. */
+  of(conversation: string, workspace: string): Attachment[] {
+    return this.snapshot.filter(
+      (item) =>
+        item.conversation === conversation && item.workspace === workspace,
+    );
+  }
+  /** One conversation's attachments that no message on its way has reserved: what the next
+   * message may carry. */
+  available(conversation: string, workspace: string): Attachment[] {
+    return this.of(conversation, workspace).filter(
+      (item) => !this.reserved.has(item.id),
+    );
+  }
+  /** One conversation's uploaded, unreserved attachments: what its next message carries. */
+  ready(conversation: string, workspace: string): Attachment[] {
+    return this.available(conversation, workspace).filter(
+      (item) => item.phase === "ready" && item.path,
+    );
+  }
+  /**
+   * Reserves these attachments for one message, before it is sent: all of them or, when
+   * one is gone or another message reserved it first, none (`false`). Synchronous, so two
+   * messages sent at once can't both name a file. The message then takes them
+   * ([`take`](#take)) or, not delivered, releases them ([`release`](#release)).
+   */
+  reserve(ids: readonly string[]) {
+    if (ids.some((id) => !this.jobs.has(id) || this.reserved.has(id)))
+      return false;
+    for (const id of ids) this.reserved.add(id);
+    return true;
+  }
+  /** Gives back what [`reserve`](#reserve) took that the message did not take. */
+  release(ids: readonly string[]) {
+    for (const id of ids) this.reserved.delete(id);
+  }
+  /**
+   * Points a conversation's attachments whose transfer has not begun at `thread` (the
+   * orchestrator's new thread after a switch). One that began keeps its thread: its
+   * receipt names it, and the hub still resolves the retired orchestrator, to the same
+   * directory (`orchestrator.cwd`).
+   */
+  retarget(conversation: string, workspace: string, thread: string) {
+    let changed = false;
+    for (const job of this.jobs.values()) {
+      const item = job.item;
       if (
-        job.item.phase === "ready" &&
-        job.item.thread === thread &&
-        job.item.workspace === workspace &&
-        job.item.path &&
-        sentDraft.includes(job.item.path)
-      ) {
-        if (job.item.image) URL.revokeObjectURL(job.item.image);
-        this.jobs.delete(id);
-      }
+        item.conversation !== conversation ||
+        item.workspace !== workspace ||
+        item.thread === thread ||
+        job.running ||
+        item.resume ||
+        item.path ||
+        !["queued", "paused", "error"].includes(item.phase)
+      )
+        continue;
+      item.thread = thread;
+      changed = true;
+    }
+    if (changed) this.emit();
+  }
+  /**
+   * Every conversation's uploaded attachments, by draft key (`<workspace>:<conversation>`):
+   * names and paths only, which is what the drafts save on the device with their text.
+   */
+  committed(): Record<string, NamedFile[]> {
+    const out: Record<string, NamedFile[]> = {};
+    for (const item of this.snapshot)
+      if (item.phase === "ready" && item.path)
+        (out[item.workspace + ":" + item.conversation] ??= []).push({
+          name: item.file.name,
+          path: item.path,
+        });
+    return out;
+  }
+  /**
+   * Takes these attachments off their conversation: the message that names them was
+   * accepted (sent, queued, or saved on this device). An image's preview is kept for the
+   * sent message's chip.
+   */
+  take(ids: readonly string[]) {
+    for (const id of ids) {
+      this.reserved.delete(id);
+      const job = this.jobs.get(id);
+      if (!job) continue;
+      this.jobs.delete(id);
+      if (job.item.image && job.item.path)
+        this.keepImage(job.item.path, job.item.image);
+      else if (job.item.image) URL.revokeObjectURL(job.item.image);
+    }
     this.emit();
+  }
+  /**
+   * Puts files a message named back on a conversation, uploaded (a message taken back to
+   * the draft): its next message names them again. A file already there is not added twice.
+   */
+  restore(
+    files: readonly NamedFile[],
+    conversation: string,
+    workspace: string,
+  ) {
+    const known = new Set(
+      this.of(conversation, workspace).map((item) => item.path),
+    );
+    for (const named of files) {
+      if (known.has(named.path)) continue;
+      known.add(named.path);
+      const item: Attachment = {
+        id: requestId(),
+        file: new File([], named.name),
+        thread: conversation,
+        conversation,
+        workspace,
+        phase: "ready",
+        loaded: 0,
+        path: named.path,
+        restored: true,
+      };
+      const image = this.sentImages.get(named.path);
+      if (image) {
+        // The conversation's chip owns the preview again.
+        this.sentImages.delete(named.path);
+        item.image = image;
+      }
+      this.jobs.set(item.id, { item });
+    }
+    this.emit();
+  }
+  /** The image preview this client still holds for a sent attachment's path, if any. */
+  sentImage = (path: string): string | undefined => this.sentImages.get(path);
+  private keepImage(path: string, url: string) {
+    const old = this.sentImages.get(path);
+    if (old && old !== url) URL.revokeObjectURL(old);
+    this.sentImages.delete(path);
+    this.sentImages.set(path, url);
+    while (this.sentImages.size > 16) {
+      const [oldest, image] = this.sentImages.entries().next().value!;
+      URL.revokeObjectURL(image);
+      this.sentImages.delete(oldest);
+    }
   }
   private async run(job: Job) {
     try {
@@ -395,7 +555,8 @@ export class UploadController {
           job.cancelled = false;
           job.item.phase = "ready";
           job.item.path = result.path;
-          job.item.error = `Already uploaded; file kept at ${result.path}. Dismiss only removes this preview.`;
+          job.item.error =
+            "Already uploaded, so it stays attached. Remove it again to leave it out of your message.";
           this.emit();
           return;
         }
@@ -409,7 +570,31 @@ export class UploadController {
     }
     if (job.item.image) URL.revokeObjectURL(job.item.image);
     this.jobs.delete(id);
+    this.reserved.delete(id);
     this.emit();
+  }
+  /**
+   * Forgets every attachment at once (Reset offline storage): they leave the box now,
+   * whatever their transfers do. A transfer on its way is stopped and cancelled on the hub
+   * when it can be, but nothing that comes back puts one in the box again: not an upload
+   * that finished meanwhile, nor a cancellation that failed or found it committed.
+   */
+  clear() {
+    const jobs = [...this.jobs.values()];
+    this.jobs.clear();
+    this.reserved.clear();
+    for (const job of jobs) {
+      job.cancelled = true;
+      job.abort?.abort();
+      if (job.item.image) URL.revokeObjectURL(job.item.image);
+    }
+    this.emit();
+    for (const job of jobs)
+      void (async () => {
+        await job.running;
+        if (job.item.resume && !job.item.path)
+          await this.host.cancelUpload?.(job.item.resume);
+      })().catch(() => {});
   }
   dispose() {
     this.disposed = true;
@@ -417,6 +602,8 @@ export class UploadController {
       job.abort?.abort();
       if (job.item.image) URL.revokeObjectURL(job.item.image);
     }
+    for (const image of this.sentImages.values()) URL.revokeObjectURL(image);
+    this.sentImages.clear();
     this.listeners.clear();
   }
 }

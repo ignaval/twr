@@ -49,8 +49,9 @@ pub(super) struct AccessRt {
     pub(super) level: OrchestratorAccess,
     /// The orchestrator runtime (its generation) that started last, and with which level.
     pub(super) runtime: Option<(u64, OrchestratorAccess)>,
-    /// A settings restart for an access change stopped the orchestrator's runtime: its exit
-    /// starts it again on its session ([`Core::restart_after_settings_change`]).
+    /// A settings restart for an access change, or a model or effort change (`hub::model`),
+    /// stopped the orchestrator's runtime: its exit starts it again on its session
+    /// ([`Core::restart_after_settings_change`]).
     pub(super) restarting: bool,
 }
 

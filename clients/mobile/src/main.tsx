@@ -12,6 +12,7 @@ import { App as NativeApp } from "@capacitor/app";
 import App from "../../shared/App";
 import { Dialog } from "../../shared/ui";
 import { ErrorBoundary } from "../../shared/ErrorBoundary";
+import { saveNow } from "../../shared/save-now";
 import {
   EditorSessionsProvider,
   useEditorSessions,
@@ -205,6 +206,9 @@ function Mobile() {
   useEffect(() => {
     void clearDeliveredNotifications();
     const listener = NativeApp.addListener("appStateChange", ({ isActive }) => {
+      // In the background the system may end the app at any time: the drafts that wait
+      // for their save's delay are saved now.
+      if (!isActive) void saveNow();
       if (isActive) void clearDeliveredNotifications();
       if (host.current) {
         host.current.setForeground(isActive);

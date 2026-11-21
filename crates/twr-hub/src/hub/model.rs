@@ -65,15 +65,28 @@
 //! ([`twr_adapters::mode_level_for`]), which no runtime lets do more than read: that move is
 //! applied directly; so is its move between accounts of one runtime (within the pins: the
 //! thread may do the same there). The orchestrator may only choose an agent runtime or a
-//! configured preset, never a command line. Refused for the orchestrator itself (`twr
-//! orchestrator use <runtime> --model M` switches it) and, without a new runtime, `pty` threads
+//! configured preset, never a command line. Refused, without a new runtime, for `pty` threads
 //! (their command line is their own).
+//!
+//! The orchestrator's own model and effort change the same way, in place: the user's
+//! `thread.set_model` on its thread (the apps' and the TUI's pickers, `twr model orch`) records
+//! `thread.model_changed` there, and its live runtime is restarted on its session once it is
+//! free ([`super::restart`], `model_change`), as a worker's is; notices queued meanwhile go to
+//! the restarted runtime. Its runtime named alone (a bare `acp` on an ACP agent too) is no
+//! move. A reset keeps what was set (`orchestrator reset` starts the new conversation with the
+//! current model and effort), and so does a hub restart (the log). Refused: a move to another
+//! runtime or account (`bad_request`: that is a new orchestrator with a handoff, `twr
+//! orchestrator use`), the orchestrator's call on itself (`unauthorized`: only the user
+//! changes the orchestrator), and any while `orchestrator.use` or `reset` replaces it
+//! (`conflict`). A device needs `operate` for it, as for a worker's model: choosing a model
+//! is no permission.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
+use twr_core::reduce::ThreadView;
 
 use super::switch::Switch;
 use super::withdraw::OrchCall;
@@ -116,7 +129,8 @@ impl Hub {
     /// `thread.set_model {thread, model?, effort?}`: sets the thread's model and/or reasoning
     /// effort (see the module docs; at least one must be given, `bad_request` otherwise).
     /// Refused while the hub shuts down (`conflict`), for a retired orchestrator (`conflict`),
-    /// the orchestrator (`bad_request`), a `pty` thread (`bad_request`), a model over 128
+    /// the orchestrator's call on itself (`unauthorized`), the orchestrator while it is being
+    /// replaced (`conflict`), a `pty` thread (`bad_request`), a model over 128
     /// bytes or with control characters, an effort the runtime does not take
     /// (`bad_request`, listing the ones it does), and a clear back to the runtime's default
     /// that a resumed session would not take (`bad_request`, see the module docs).
@@ -143,8 +157,9 @@ impl Hub {
     /// `thread.set_model {thread, runtime?, model?, effort?}`: [`Hub::set_model`], also moving
     /// the thread to `runtime` when it is another one ([`super::switch`]; blank: none). Also
     /// refused: a runtime the thread's box lacks, a `pty` one, one whose permission modes do not
-    /// include the thread's (`bad_request`), an attached thread (`conflict`), and for the
-    /// orchestrator anything but an agent runtime or a configured preset (`bad_request`).
+    /// include the thread's (`bad_request`), an attached thread (`conflict`), for the
+    /// orchestrator's call anything but an agent runtime or a configured preset, and any move
+    /// of the orchestrator itself (`bad_request`: `twr orchestrator use` switches it).
     ///
     /// The result also has `runtime`, `previous_runtime`, `runtime_changed` and `resumes` (the
     /// session of the new runtime the move resumes, else null); with a move, `message` says
@@ -404,20 +419,32 @@ impl Core {
         if let Some(m) = mode {
             view.mode = m.to_string();
         }
-        if view.is_orchestrator() {
-            return Err(rpc(
-                codes::BAD_REQUEST,
-                format!(
-                    "{} is the orchestrator: to change its runtime or model, switch it with \
-                     `twr orchestrator use <runtime> --model <model>`",
-                    view.name
-                ),
-            ));
+        let orchestrator = view.is_orchestrator();
+        if orchestrator {
+            self.check_orchestrator_change(&view, caller)?;
         }
         let runtime = runtime.map(str::trim).filter(|r| !r.is_empty());
         let account = account.map(str::trim);
+        // The orchestrator's own runtime (a bare `acp` on an ACP agent too) is no move; any
+        // other is a switch, refused before a worker's move checks (below: another agent of
+        // its runtime, or another account).
+        if let Some(r) = runtime.filter(|_| orchestrator) {
+            let bare_acp = r == twr_adapters::acp::NAME && view.runtime == r;
+            let other =
+                runtime_spec::resolve(r, &hub.config).map_or(true, |s| s.runtime != view.runtime);
+            if !bare_acp && other {
+                return Err(orchestrator_move_refusal(&view));
+            }
+        }
         let switch = if runtime.is_some() || account.is_some() {
-            self.runtime_switch(hub, &view, runtime, account, outside_pin, caller)?
+            match self.runtime_switch(hub, &view, runtime, account, outside_pin, caller) {
+                // On its own runtime by now: a move, or an account it cannot move to (a worker
+                // is told about its pins), is a switch for the orchestrator.
+                Ok(Some(_)) | Err(_) if orchestrator => {
+                    return Err(orchestrator_move_refusal(&view))
+                }
+                r => r?,
+            }
         } else {
             None
         };
@@ -554,6 +581,19 @@ impl Core {
             if let Some(why) =
                 runtime_spec::clear_refusal(&target, &view.name, resumes, what, from, to)
             {
+                // The orchestrator can also start over on the runtime's default.
+                let why = match orchestrator {
+                    true => format!(
+                        "{why}, or give the orchestrator a new session with the runtime's \
+                         default: `twr orchestrator use {}{}`",
+                        view.runtime,
+                        view.account
+                            .as_deref()
+                            .map(|a| format!(":{a}"))
+                            .unwrap_or_default()
+                    ),
+                    false => why,
+                };
                 return Err(rpc(codes::BAD_REQUEST, why));
             }
         }
@@ -691,6 +731,51 @@ impl Core {
             switch,
         })
     }
+}
+
+impl Core {
+    /// Refuses a `thread.set_model` of the orchestrator `view` that `caller` may not make now:
+    /// the orchestrator's own (`unauthorized`: only the user changes the orchestrator), and
+    /// any while an `orchestrator.use` or `reset` replaces it (`conflict`: the change would
+    /// land on the orchestrator being retired).
+    fn check_orchestrator_change(
+        &self,
+        view: &ThreadView,
+        caller: &Caller,
+    ) -> Result<(), RpcError> {
+        if caller.is_orchestrator() {
+            return Err(rpc(
+                codes::UNAUTHORIZED,
+                "the orchestrator cannot change its own model or effort; the user does (the \
+                 model picker, or `twr model orch <model> --effort <effort>`)",
+            ));
+        }
+        if self.orch.switching {
+            return Err(rpc(
+                codes::CONFLICT,
+                format!(
+                    "{} is being replaced (`twr orchestrator use` or `reset`): change its model \
+                     or effort once the new one is in place",
+                    view.name
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The refusal of a `thread.set_model` that would move orchestrator `view` to another runtime
+/// or account: that is a switch, a new orchestrator with a handoff (`hub::orch`).
+fn orchestrator_move_refusal(view: &ThreadView) -> RpcError {
+    rpc(
+        codes::BAD_REQUEST,
+        format!(
+            "{} is the orchestrator: its model and effort change in place, but another runtime \
+             or account is a new orchestrator: switch it with `twr orchestrator use \
+             <runtime>[:<account>] --model <model>`",
+            view.name
+        ),
+    )
 }
 
 /// `model M and effort E` for a message, each `the runtime's default ...` when unset.

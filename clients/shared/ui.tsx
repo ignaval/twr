@@ -129,6 +129,7 @@ export function FieldInput({
           onChange={onChange}
           choices={field.choices}
           keep={field.keep}
+          unset={field.unset}
           custom={field.type === "model"}
           required={field.required}
           describedBy={describedBy}
@@ -334,6 +335,7 @@ export function ModelSelect({
   onChange,
   choices,
   keep = false,
+  unset,
   custom = true,
   required = false,
   label,
@@ -344,16 +346,24 @@ export function ModelSelect({
   onChange: (v: string) => void;
   choices: { value: string; description?: string }[];
   keep?: boolean;
+  /** The empty choice takes a configured value, labelled this; `default` is then its own. */
+  unset?: string;
   custom?: boolean;
   required?: boolean;
   label?: string;
   describedBy?: string;
 }) {
+  const named = keep || Boolean(unset);
   const listed =
     value === "" ||
-    (keep && value === "default") ||
+    (named && value === "default") ||
     choices.some((c) => c.value === value);
   const [typing, setTyping] = useState(!listed);
+  // A value this list doesn't have, with no custom id to show it in (an effort another
+  // runtime took, its runtime since changed), would go out unseen: it goes.
+  useEffect(() => {
+    if (!custom && value && !listed) onChange("");
+  }, [custom, value, listed]);
   if (custom && (typing || !listed))
     return (
       <div className="input-with-button">
@@ -396,8 +406,10 @@ export function ModelSelect({
         } else onChange(e.target.value);
       }}
     >
-      <option value="">{keep ? "Keep current" : "Runtime default"}</option>
-      {keep && <option value="default">Runtime default</option>}
+      <option value="">
+        {keep ? "Keep current" : unset || "Runtime default"}
+      </option>
+      {named && <option value="default">Runtime default</option>}
       {choices.map((c) => (
         <option key={c.value} value={c.value}>
           {c.description ? `${c.value} — ${c.description}` : c.value}

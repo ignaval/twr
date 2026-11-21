@@ -1094,3 +1094,298 @@ async fn a_stuck_loop_the_orchestrator_started_is_no_routine_update() {
     assert_eq!(got["state"]["waiting_on"], "user", "{got}");
     hub.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// A single pass
+// ---------------------------------------------------------------------------------------------
+
+/// "Review it": the orchestrator's `once` request runs one review pass in that thread, on the
+/// saved settings, and wakes it with the pass's report; an implementation loop has none.
+#[tokio::test]
+async fn the_orchestrator_runs_one_review_pass_in_the_thread_itself() {
+    let env = Env::drive();
+    let hub = env.hub().await;
+    save(&hub, None, settings("high", "codex/gpt-6.1-sol")).await;
+    let t = changed(&env, &hub, "api").await;
+    let r = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "started", "{r}");
+    assert_eq!(r["loop"]["once"], true, "{r}");
+    let last = ended(&hub, &t).await;
+    assert_eq!(last.outcome, Outcome::Clean);
+    assert!(last.once);
+    let s = started(&hub, &t);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].once);
+    // One review run, at the profile's strongest tier, and no other.
+    let runs: Vec<(String, String)> = events(&hub, &t)
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::LoopReviewStarted(p) => Some((p.round, p.effort)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(runs, [("x1".to_string(), "xhigh".to_string())]);
+    assert!(events(&hub, &t)
+        .iter()
+        .all(|e| !matches!(e.body, EventBody::LoopTransition(_))));
+    until(&hub, "the notice of the pass's report", |h| {
+        notices(h).iter().any(|n| n.contains("thread=api report"))
+    })
+    .await;
+    let n = notices(&hub);
+    let notice = n.iter().find(|n| n.contains("thread=api report")).unwrap();
+    assert!(
+        notice.contains("single review pass clean: no findings"),
+        "{notice}"
+    );
+    let ls = lines(&hub);
+    assert!(
+        ls.iter().any(|(l, _)| l.starts_with(
+            "api started a single review pass, which the orchestrator asked for: high"
+        )),
+        "{ls:?}"
+    );
+    // The report says it was one pass.
+    let report = hub
+        .loop_report(serde_json::from_value(json!({"thread": t})).unwrap())
+        .unwrap();
+    let text = report["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("# Review pass report: api\n\nSingle review pass clean: no findings"),
+        "{text}"
+    );
+    assert!(
+        text.contains("## Single pass") && !text.contains("## Sweep"),
+        "{text}"
+    );
+    // On a notice (a standing review rule fired by the pass's own report), no review again
+    // before the thread has done more work: the hub refuses the orchestrator's.
+    let o = hub.orchestrator_thread().unwrap();
+    until(&hub, "the orchestrator's notice turn to end", |h| {
+        h.thread_view(&o).unwrap().current_turn.is_none()
+    })
+    .await;
+    let next = hub.thread_view(&o).unwrap().turns + 1;
+    let mut notice = TurnStarted {
+        prompt: "[twr notice] watch=w1 repeat=true".into(),
+        ..Default::default()
+    };
+    notice.ext = Some(serde_json::from_value(json!({"twr": {"notice": true}})).unwrap());
+    hub.append(
+        &o,
+        Some(next),
+        Source::Hub,
+        EventBody::TurnStarted(notice),
+        None,
+    )
+    .unwrap();
+    let e = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+    assert!(
+        e.message.contains("has done nothing since"),
+        "{}",
+        e.message
+    );
+    hub.append(
+        &o,
+        Some(next),
+        Source::Hub,
+        EventBody::TurnEnded(TurnEnded::default()),
+        None,
+    )
+    .unwrap();
+    // A turn the user's message started ("review it again") is the user's request: it goes.
+    let again = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(again["status"], "started", "{again}");
+    ended(&hub, &t).await;
+    // An implementation loop runs no single pass.
+    let e = hub
+        .loop_request(
+            serde_json::from_value(json!({"thread": t, "kind": "implement", "once": true}))
+                .unwrap(),
+            &orch(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+    hub.shutdown().await;
+}
+
+/// The first single pass shows the setup card as any first loop does; the card says it is a
+/// single pass, and answering it starts one.
+#[tokio::test]
+async fn a_first_single_pass_shows_the_card_and_its_answer_starts_one() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    let r = request(&hub, &t, json!({"once": true}), &user())
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    assert_eq!(r["why"], "first_run");
+    let card = setup(&hub, &t, &r["attn_id"]);
+    assert!(card.once);
+    let summary = item(&hub, &r["attn_id"]).unwrap()["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        summary.contains("Run          single pass: one review at xhigh, its triage, the report"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("Reviewer     codex · gpt-6.1-sol · xhigh\n"),
+        "{summary}"
+    );
+    answer(&hub, &r, START, &user()).unwrap();
+    let s = started(&hub, &t);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].once);
+    let view = hub.thread_view(&t).unwrap();
+    let l = view.r#loop.as_ref().unwrap();
+    assert!(l.once);
+    assert_eq!(twr_core::loops::line(l), "high · single pass · scope");
+    hub.shutdown().await;
+}
+
+/// A full loop's card left open, then the orchestrator asked for a single pass of the same
+/// thread (or the other way round): the card is not offered as this request's, since
+/// answering it would start other work; the result says what the card starts. A request for
+/// the card's own work is told about it as before.
+#[tokio::test]
+async fn an_open_card_for_other_work_is_not_offered_as_the_orchestrators_request() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    // The first loop's card: a full review loop, left open.
+    let r = request(&hub, &t, json!({}), &orch()).await.unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    assert!(r.get("other").is_none(), "{r}");
+    assert!(!setup(&hub, &t, &r["attn_id"]).once);
+    // A single pass asked for: the same card, said to be other work.
+    let again = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(again["existing"], true, "{again}");
+    assert_eq!(again["attn_id"], r["attn_id"]);
+    assert_eq!(
+        again["other"],
+        json!({"kind": "review", "once": false, "scope": "uncommitted", "task": null}),
+        "{again}"
+    );
+    // A scope the request names otherwise, too; the card's own work is not.
+    let scoped = request(&hub, &t, json!({"scope": "branch"}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(scoped["other"]["scope"], "uncommitted", "{scoped}");
+    for same in [json!({}), json!({"scope": "uncommitted"})] {
+        let same = request(&hub, &t, same, &orch()).await.unwrap();
+        assert_eq!(same["existing"], true, "{same}");
+        assert!(same.get("other").is_none(), "{same}");
+    }
+    // Neither raised the card again nor started anything.
+    assert_eq!(raises(&hub, &t, &r["attn_id"]), 1);
+    assert!(started(&hub, &t).is_empty());
+    // The user asks for the single pass themselves: the card becomes theirs, a single pass.
+    let mine = request(&hub, &t, json!({"once": true}), &user())
+        .await
+        .unwrap();
+    assert_eq!(mine["attn_id"], r["attn_id"]);
+    assert!(setup(&hub, &t, &r["attn_id"]).once);
+    // Now a full loop asked for by the orchestrator is the other work.
+    let full = request(&hub, &t, json!({}), &orch()).await.unwrap();
+    assert_eq!(full["other"]["once"], true, "{full}");
+    hub.shutdown().await;
+}
+
+/// A card left open on a scope the user chose, then the orchestrator asked for the same work
+/// naming no scope: the hub resolves the request's own scope (the default), and a card on
+/// another is said to be other work, not offered as this request's.
+#[tokio::test]
+async fn an_open_card_on_another_scope_is_other_work_when_the_request_names_none() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    let r = request(&hub, &t, json!({"once": true, "scope": "branch"}), &user())
+        .await
+        .unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    // The request names none: its own scope is the default, the uncommitted changes.
+    let again = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap();
+    assert_eq!(again["existing"], true, "{again}");
+    assert_eq!(again["attn_id"], r["attn_id"]);
+    assert_eq!(
+        again["other"],
+        json!({"kind": "review", "once": true, "scope": "branch", "task": null}),
+        "{again}"
+    );
+    // Naming the card's own scope is its own work.
+    let same = request(&hub, &t, json!({"once": true, "scope": "branch"}), &orch())
+        .await
+        .unwrap();
+    assert!(same.get("other").is_none(), "{same}");
+    assert!(started(&hub, &t).is_empty());
+    hub.shutdown().await;
+}
+
+/// A single pass needs only the effort it runs at: a profile whose verification asks for an
+/// effort the reviewer does not take (Claude Code has no `ultra`) still runs one pass, its
+/// card showing no problem, and answering it starts the pass. A full loop on the same
+/// settings does not hold.
+#[tokio::test]
+async fn a_single_pass_checks_only_the_effort_it_runs_at() {
+    use twr_core::loops::config::{ProfileConfig, TierConfig, VerifyConfig};
+    let mut env = Env::new();
+    env.config.loops.profiles.insert(
+        "quick".into(),
+        ProfileConfig {
+            tiers: Some(vec![TierConfig::Effort("medium".into())]),
+            verify: Some(VerifyConfig {
+                rounds: 1,
+                effort: "ultra".into(),
+            }),
+            ..Default::default()
+        },
+    );
+    let hub = env.hub().await;
+    let t = changed(&env, &hub, "api").await;
+    let overrides = json!({"profile": "quick", "reviewer": "claude-code/claude-opus-5-5"});
+    let full = request(&hub, &t, json!({"overrides": overrides}), &user())
+        .await
+        .unwrap();
+    let card = setup(&hub, &t, &full["attn_id"]);
+    assert!(
+        card.problems
+            .iter()
+            .any(|p| p.contains("no effort ultra") && p.contains("profile quick asks for it")),
+        "{:?}",
+        card.problems
+    );
+    answer(&hub, &full, LOOP_SETUP_CANCEL, &user()).unwrap();
+
+    let r = request(
+        &hub,
+        &t,
+        json!({"once": true, "overrides": overrides}),
+        &user(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r["status"], "needs_setup", "{r}");
+    let card = setup(&hub, &t, &r["attn_id"]);
+    assert!(card.once);
+    assert_eq!(card.problems, Vec::<String>::new());
+    answer(&hub, &r, START, &user()).unwrap();
+    let s = started(&hub, &t);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].once);
+    hub.shutdown().await;
+}

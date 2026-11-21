@@ -351,6 +351,11 @@ pub struct StartLoopParams {
     /// `since <ref>` or `last <n>`. Default: the thread's branch, else its uncommitted work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// A review loop's single pass: one review run, the thread's triage of what it found, then
+    /// the report, with no second round. Use it when the user asks for the thread's work to be
+    /// reviewed and not for a loop. Not for an implementation loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub once: Option<bool>,
     #[serde(flatten)]
     pub settings: LoopSettingsParams,
 }
@@ -1679,7 +1684,11 @@ impl TwrMcp {
         "implementation loop (kind implement: the thread plans, implements, then the same ",
         "review rounds, and commits at the end) in a worker thread, only when the user asks ",
         "for one, by name or in clear words (\"run a review loop on api\"). Never on your own ",
-        "initiative. ",
+        "initiative. When the user asks for a thread's work to be reviewed but not for a loop ",
+        "(\"review it\", \"then review their work\", \"have it reviewed\"), pass kind review ",
+        "with once: true on that thread itself: one review run, the thread verifies and fixes ",
+        "or dismisses what it found, then the report, and it ends. Never review a thread's ",
+        "work from another thread, and never run review rounds by hand. ",
         loop_rule!(),
         " Returns {thread_name, thread, status: \"started\", loop, kind, line, settings, ",
         "settings_of?} or {thread_name, thread, status: \"needs_setup\", attn_id, why, ",
@@ -1695,6 +1704,9 @@ impl TwrMcp {
         }
         if let Some(scope) = &p.scope {
             req["scope"] = json!(scope);
+        }
+        if p.once == Some(true) {
+            req["once"] = json!(true);
         }
         if p.settings.setup == Some(true) {
             req["setup"] = json!(true);

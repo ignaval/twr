@@ -130,5 +130,14 @@ const application: DesktopAppAPI = {
     ipcRenderer.on("twr:app-update", listener);
     return () => ipcRenderer.removeListener("twr:app-update", listener);
   },
+  onSaveNow: (save) => {
+    const listener = (_: unknown, id: number) =>
+      void Promise.resolve()
+        .then(save)
+        .catch(() => {})
+        .finally(() => ipcRenderer.send("twr:app-saved", id));
+    ipcRenderer.on("twr:app-save-now", listener);
+    return () => ipcRenderer.removeListener("twr:app-save-now", listener);
+  },
 };
 contextBridge.exposeInMainWorld("twrApp", application);

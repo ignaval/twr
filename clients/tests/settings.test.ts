@@ -16,7 +16,7 @@ import {
   type Section,
 } from "../shared/settingsModel";
 import { textSizeChoices } from "../shared/layoutPreferences";
-import { orchestratorSwitch } from "../shared/OrchestratorSettings";
+import { orchestratorChange } from "../shared/OrchestratorSettings";
 import { FakeEvent, installFakeDOM, type FakeElement } from "./fake-dom";
 
 /* Settings in tabs and the merged Manage pages (docs/desktop.md): which tab a section opens
@@ -168,22 +168,37 @@ describe("the New thread defaults' choices", () => {
     });
   });
 
-  it("switches the orchestrator with a summary, keeping its account and effort", () => {
+  it("changes the orchestrator's model and effort in place, and switches only to another runtime", () => {
     const show = {
       runtime: "claude-code",
       account: "work",
       account_shown: true,
+      model: "sonnet",
       effort: "high",
+      thread: "o1",
     };
-    expect(orchestratorSwitch(show, "claude-code", "opus")).toEqual({
-      runtime: "claude-code:work",
-      model: "opus",
-      effort: "high",
-      summary: true,
+    // Only what changed, on its own thread: no runtime, no account, no handoff.
+    expect(orchestratorChange(show, "claude-code", "opus", "high")).toEqual({
+      kind: "in-place",
+      params: { thread: "o1", model: "opus" },
     });
-    expect(orchestratorSwitch(show, "codex", "")).toEqual({
-      runtime: "codex",
-      summary: true,
+    expect(orchestratorChange(show, "claude-code", "sonnet", "")).toEqual({
+      kind: "in-place",
+      params: { thread: "o1", effort: "default" },
+    });
+    expect(orchestratorChange(show, "claude-code", "sonnet", "high")).toEqual({
+      kind: "none",
+    });
+    // Another runtime opens the Switch orchestrator form with the choice.
+    expect(orchestratorChange(show, "codex", "", "")).toEqual({
+      kind: "switch",
+      initial: { runtime: "codex" },
+    });
+    expect(
+      orchestratorChange({ runtime: "codex" }, "codex", "gpt-5", "low"),
+    ).toEqual({
+      kind: "switch",
+      initial: { runtime: "codex", model: "gpt-5", effort: "low" },
     });
   });
 });

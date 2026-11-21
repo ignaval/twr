@@ -1316,6 +1316,52 @@ async fn a_review_loop_under_match_commits_as_the_thread_did() {
 // The card with a task, and new threads
 // ---------------------------------------------------------------------------------------------
 
+/// A card that holds a task is never replaced by a request for other work, the user's own
+/// included (Review once from the inspector, another task): the task would go with it. The
+/// same request again raises the same card.
+#[tokio::test]
+async fn a_card_holding_a_task_is_not_replaced_by_other_work() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = worker(&env, &hub, "api").await;
+    let card = request(&hub, &t, json!({"task": "add the export"}))
+        .await
+        .unwrap();
+    assert_eq!(card["status"], "needs_setup");
+    // Review once from the inspector, the card still open: refused, the task kept.
+    let e = request(
+        &hub,
+        &t,
+        json!({"kind": "review", "once": true, "task": null}),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, "conflict", "{}", e.message);
+    assert!(
+        e.message.contains("holds an implementation task"),
+        "{}",
+        e.message
+    );
+    // Another task too.
+    let e = request(&hub, &t, json!({"task": "something else"}))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "conflict");
+    let got = hub
+        .loop_setup_get(
+            serde_json::from_value(json!({"attn_id": card["attn_id"]})).unwrap(),
+            &user(),
+        )
+        .unwrap();
+    assert_eq!(got["setup"]["task"], "add the export");
+    assert_eq!(got["setup"]["kind"], "implement");
+    // The same request again raises the same card, as before.
+    let again = request(&hub, &t, json!({"task": "add the export"}))
+        .await
+        .unwrap();
+    assert_eq!(again["attn_id"], card["attn_id"]);
+}
+
 /// The first implementation loop raises the card holding its task: three options, the task
 /// shown (cut, with a count of the rest), the plan check and commit rows; `loop.setup.update`
 /// keeps the task. `cancel` sends and saves nothing; `run without a loop` sends the task once,
@@ -1432,6 +1478,45 @@ async fn the_card_holds_the_task() {
         )
         .unwrap_err();
     assert_eq!(e.code, codes::RELAY_FORBIDDEN);
+    hub.shutdown().await;
+}
+
+/// A task that ends with a file the apps attached keeps that file's path exactly, a trailing
+/// space too (an older app's upload), from the request to the card, the loop and its plan
+/// prompt; the card's summary names the file and never shows the path.
+#[tokio::test]
+async fn a_task_keeps_its_files_path_and_the_card_shows_its_name() {
+    let env = Env::new();
+    let hub = env.hub().await;
+    let t = worker(&env, &hub, "api").await;
+    let path = "/w/.twr-uploads/1/notes.txt ";
+    let task = format!("{TASK}\nUploaded file: notes.txt\n{path}");
+    let card = request(&hub, &t, json!({"task": format!("  {task}\n\n")}))
+        .await
+        .unwrap();
+    assert_eq!(card["status"], "needs_setup");
+    let summary = item(&hub, &card["attn_id"]).unwrap()["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(summary.contains("Attached: notes.txt"), "{summary}");
+    assert!(!summary.contains(".twr-uploads"), "{summary}");
+    assert!(!summary.contains("Uploaded file"), "{summary}");
+    let got = hub
+        .loop_setup_get(
+            serde_json::from_value(json!({"attn_id": card["attn_id"]})).unwrap(),
+            &user(),
+        )
+        .unwrap();
+    assert_eq!(got["setup"]["task"], task);
+    respond(&hub, &card, START, &user()).unwrap();
+    assert_eq!(ended(&hub, &t).await.outcome, Outcome::Clean);
+    assert_eq!(get(&hub, &t)["started"]["task"], task);
+    let turns = of_kind(&hub, &t, "turn.started");
+    let EventBody::TurnStarted(p) = &turns[0].body else {
+        unreachable!()
+    };
+    assert!(p.prompt.contains(&format!("{path}\n")), "{}", p.prompt);
     hub.shutdown().await;
 }
 

@@ -1,5 +1,6 @@
 import type { DesktopAPI, HubEvent, Json, ViewState } from "./types";
 import { requestId } from "./remote-crypto";
+import { splitAttachments, type NamedFile } from "./attachmentText";
 
 export interface DurableMessage {
   id: string;
@@ -13,16 +14,98 @@ export interface OutboxMessage extends DurableMessage {
   state: "queued" | "sending" | "review";
   error?: string;
 }
+/**
+ * `text`, a draft (a saved one, one taken back), added to the box's `current` draft. After
+ * other text it goes as the message it sends ([`messageText`]): Send reads escapes only at
+ * the start of the box, so a `\!` or `//` that kept it a message there would be sent too.
+ */
+/**
+ * An earlier message the outbox moved back to its draft (the hub held it for a waiting
+ * request) is in the saved drafts already, but not yet in the message box: when a later
+ * delivery fails, the error carries it (`restored_drafts`), so the caller puts it in the box
+ * as a success would. Otherwise the box's next save would write over it.
+ */
+function withRestored(error: unknown, restored: Restored[]) {
+  if (!restored.length) return error;
+  // A new error for each caller: callers waiting on the same delivery share its error, and
+  // each carries what its own delivery put back. The failure itself is its `cause`.
+  const carried = new Error(
+    error instanceof Error ? error.message : String(error ?? "Not sent"),
+    { cause: error },
+  ) as Error & { restored_drafts?: Restored[] };
+  carried.restored_drafts = [...restoredOf(error), ...restored];
+  return carried;
+}
+/** The drafts a failed [`OfflineJournal.deliver`] had already moved back ([`withRestored`]). */
+export function restoredOf(error: unknown): Restored[] {
+  const carried = (error as { restored_drafts?: unknown } | null)
+    ?.restored_drafts;
+  return Array.isArray(carried) ? carried : [];
+}
+/** A saved message the outbox put back in its draft: its outbox id, its draft's key and its
+ * draft. */
+export interface Restored {
+  id: string;
+  key: string;
+  text: string;
+}
 export function appendDraft(current: string | undefined, text: string) {
   if (!current) return text;
-  return current === text || current.endsWith("\n\n" + text)
-    ? current
-    : current + "\n\n" + text;
+  const message = messageText(text);
+  if (current === text || current.endsWith("\n\n" + message)) return current;
+  // A draft that is a `/` command or a `!` shell line would send none of the text added
+  // after it (Send runs the command and clears the box): it becomes a message too.
+  const head = isCommandDraft(current) ? literalDraft(current) : current;
+  return head + "\n\n" + message;
+}
+/** A draft Send runs as a `/` command (`//` escapes a leading `/`). */
+export function isSlashDraft(draft: string) {
+  return draft.startsWith("/") && !draft.startsWith("//");
+}
+/** A draft Send runs as a `!` shell line (`!!` shares its result; `\!`, or the apps'
+ * `!!!`, sends a message that starts with `!`). */
+export function isShellDraft(draft: string) {
+  return draft.startsWith("!") && !draft.startsWith("!!!");
+}
+/**
+ * A draft Send runs as a `/` command or a `!` shell line rather than sending it: it takes
+ * no files and can't be saved offline. Every check of a draft's kind goes through these
+ * three, so an escaped message (`//…`, `\!…`, as Take back puts one back) is a message
+ * everywhere.
+ */
+export function isCommandDraft(draft: string) {
+  return isSlashDraft(draft) || isShellDraft(draft);
+}
+/**
+ * The message a composer draft sends, as the TUI's `message_text` reads a line: `//...`
+ * sends `/...` and `\!...` sends `!...` (one backslash of those before a `!` goes);
+ * anything else as it is. (A draft that starts with a single `/` or a `!` is a command, or a
+ * shell line, and sends no message.)
+ */
+export function messageText(draft: string) {
+  if (draft.startsWith("\\") && draft.replace(/^\\+/, "").startsWith("!"))
+    return draft.slice(1);
+  return draft.startsWith("//") ? draft.slice(1) : draft;
+}
+/**
+ * The draft that sends `message` as it is ([`messageText`]'s inverse), as the TUI's
+ * `literal_line` writes it: what Take back, Put back and the outbox put back in the box,
+ * so Send sends it again as a message, never as a `/` command or a `!` shell line.
+ */
+export function literalDraft(message: string) {
+  if (message.replace(/^\\+/, "").startsWith("!")) return "\\" + message;
+  return message.startsWith("/") ? "/" + message : message;
+}
+/** [`appendDraft`] for a message as sent: escaped ([`literalDraft`]) when it starts the
+ * draft, where a `/` or `!` would make it a command; as it is after other text. */
+export function appendMessage(current: string | undefined, message: string) {
+  return appendDraft(current, literalDraft(message));
 }
 export function messageDraft(message: OutboxMessage) {
   if (typeof message.draft === "string") return message.draft;
-  const text = String(message.params.prompt || message.params.message || "");
-  return text.startsWith("/") ? "/" + text : text;
+  return literalDraft(
+    String(message.params.prompt || message.params.message || ""),
+  );
 }
 export interface CachedWorkspace {
   savedAt: number;
@@ -35,6 +118,13 @@ export interface OfflineRecord {
   drafts: Record<string, string>;
   /** Drafts containing unreviewed speech; saved atomically with their text. */
   spokenDrafts?: Record<string, boolean>;
+  /**
+   * The uploaded files on each draft's conversation, by draft key: names and paths, saved
+   * with the text, so a restart puts them back in the box. Optional, like `spokenDrafts`:
+   * a record without it (an older app's) loads with none, and an older app reading this
+   * one keeps the text and drops the files.
+   */
+  draftFiles?: Record<string, NamedFile[]>;
   workspaces: Record<string, CachedWorkspace>;
   outbox: OutboxMessage[];
 }
@@ -77,6 +167,7 @@ export function recordSize(record: OfflineRecord) {
   const pending = bytes({
     drafts: record.drafts,
     spokenDrafts: record.spokenDrafts,
+    draftFiles: record.draftFiles,
     outbox: record.outbox,
   });
   const history = Object.entries(record.workspaces).reduce(
@@ -128,6 +219,99 @@ export function activateOfflineHost(hostId: string) {
 function blank(): OfflineRecord {
   return { version: 1, drafts: {}, workspaces: {}, outbox: [] };
 }
+/**
+ * Saved draft files that are well formed: a list of names and paths per key, each path
+ * once. All of them, however many: a message taken back may put a conversation over the
+ * box's limit for new files (`MAX_ATTACHMENTS`), and what it put back stays.
+ */
+function draftFilesOf(value: unknown): Record<string, NamedFile[]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .map(([key, files]): [string, NamedFile[]] => {
+        const seen = new Set<string>();
+        return [
+          key,
+          Array.isArray(files)
+            ? files
+                .filter(
+                  (file): file is NamedFile =>
+                    !!file &&
+                    typeof file.name === "string" &&
+                    typeof file.path === "string" &&
+                    !!file.path &&
+                    !seen.has(file.path) &&
+                    !!seen.add(file.path),
+                )
+                .map(({ name, path }) => ({ name, path }))
+            : [],
+        ];
+      })
+      .filter(([, files]) => files.length),
+  );
+}
+/**
+ * `text` taken back into a draft, split as the app's box holds it: the text without its
+ * `Uploaded file:` lines into the draft, the files it names onto the conversation's saved
+ * files (once each).
+ */
+function backToDraft(
+  record: OfflineRecord,
+  key: string,
+  text: string,
+): Pick<OfflineRecord, "drafts" | "draftFiles"> {
+  const { body, files } = splitAttachments(text);
+  if (!files.length)
+    return {
+      drafts: {
+        ...record.drafts,
+        [key]: appendDraft(record.drafts[key], text),
+      },
+      draftFiles: record.draftFiles,
+    };
+  const saved = record.draftFiles?.[key] || [];
+  const known = new Set(saved.map((file) => file.path));
+  return {
+    drafts: body.trim()
+      ? { ...record.drafts, [key]: appendDraft(record.drafts[key], body) }
+      : record.drafts,
+    draftFiles: {
+      ...record.draftFiles,
+      [key]: [...saved, ...files.filter((file) => !known.has(file.path))],
+    },
+  };
+}
+/**
+ * Drafts as the box holds them: an older app wrote a file's `Uploaded file:` pair into its
+ * draft, so each such pair (an upload's path, as `splitAttachments` reads it) moves out of
+ * the text onto the conversation's files, once each. Drafts without one stay as they are.
+ */
+export function draftsWithFiles(
+  drafts: Record<string, string>,
+  draftFiles: Record<string, NamedFile[]> = {},
+): Pick<OfflineRecord, "drafts"> & {
+  draftFiles: Record<string, NamedFile[]>;
+} {
+  let files = draftFiles;
+  const out = { ...drafts };
+  for (const [key, text] of Object.entries(drafts)) {
+    const { body, files: named } = splitAttachments(text);
+    if (!named.length) continue;
+    const saved = files[key] || [];
+    const known = new Set(saved.map((file) => file.path));
+    out[key] = body;
+    files = {
+      ...files,
+      [key]: [
+        ...saved,
+        ...named.filter(
+          (file) => !known.has(file.path) && known.add(file.path),
+        ),
+      ],
+    };
+  }
+  return { drafts: out, draftFiles: files };
+}
 export function parseOffline(
   value: string | null,
   now = Date.now(),
@@ -163,23 +347,23 @@ export function parseOffline(
           }
         : {}),
     }));
-  return {
-    version: 1,
-    drafts: Object.fromEntries(
+  const { drafts, draftFiles } = draftsWithFiles(
+    Object.fromEntries(
       Object.entries(record.drafts).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
       ),
     ),
+    draftFilesOf(record.draftFiles),
+  );
+  return {
+    version: 1,
+    drafts,
     spokenDrafts: Object.fromEntries(
       Object.entries(record.spokenDrafts || {})
-        .filter(
-          ([key, value]) =>
-            value === true &&
-            typeof record.drafts[key] === "string" &&
-            record.drafts[key],
-        )
+        .filter(([key, value]) => value === true && drafts[key])
         .map(([key]) => [key, true]),
     ),
+    draftFiles,
     workspaces: Object.fromEntries(
       Object.entries(record.workspaces as Record<string, CachedWorkspace>)
         .filter(
@@ -281,6 +465,7 @@ export class OfflineJournal {
           ...history,
           drafts: pending.drafts,
           spokenDrafts: pending.spokenDrafts,
+          draftFiles: pending.draftFiles,
           outbox: pending.outbox,
         };
         if (!this.active || forgottenHosts.has(this.hostId))
@@ -308,6 +493,7 @@ export class OfflineJournal {
               ...history,
               drafts: {},
               spokenDrafts: {},
+              draftFiles: {},
               outbox: [],
             }),
           );
@@ -357,7 +543,13 @@ export class OfflineJournal {
           );
         const payload =
           lane === "history"
-            ? { ...next, drafts: {}, spokenDrafts: {}, outbox: [] }
+            ? {
+                ...next,
+                drafts: {},
+                spokenDrafts: {},
+                draftFiles: {},
+                outbox: [],
+              }
             : { ...next, workspaces: {} };
         await this.host.secureWrite!(
           lane === "history" ? this.key : this.pendingKey,
@@ -374,16 +566,50 @@ export class OfflineJournal {
     drafts: Record<string, string>,
     epoch = this.generation,
     spokenDrafts?: Record<string, boolean>,
+    /** Every conversation's uploaded files (`UploadController.committed`); left out, the
+     * saved ones stay. */
+    draftFiles?: Record<string, NamedFile[]>,
   ) {
     if (epoch !== this.generation)
       return Promise.reject(
         new Error("Offline storage changed before saving this draft"),
       );
-    return this.update((record) => ({
-      ...record,
-      drafts,
-      spokenDrafts: spokenDrafts ?? record.spokenDrafts,
-    }));
+    return this.update((record) => {
+      let next: OfflineRecord = {
+        ...record,
+        drafts,
+        spokenDrafts: spokenDrafts ?? record.spokenDrafts,
+        draftFiles: draftFiles ?? record.draftFiles,
+      };
+      // A message put back that the box has not taken yet ([`claim`]) stays, so a
+      // save from the box as it was (as the app closes, say) never writes over it.
+      for (const restored of this.unacknowledged)
+        next = { ...next, ...backToDraft(next, restored.key, restored.text) };
+      return next;
+    });
+  }
+  /**
+   * Messages the outbox put back in their drafts (the hub held them for a waiting request)
+   * that the message box has not taken yet, by their outbox id: [`drafts`] keeps them until
+   * it has, and [`claim`] gives each to the box once. A reset forgets them.
+   */
+  private unacknowledged: Restored[] = [];
+  /**
+   * The message box takes the messages a delivery put back (its `restored_draft`, its
+   * `restored_drafts`, [`restoredOf`] its error): only those not taken yet, each once, and
+   * none from before a reset. Two deliveries waiting on the same message both carry it, and
+   * one from storage since reset carries one that is gone: the box applies only what this
+   * returns, so a message never comes back twice, nor after a reset.
+   */
+  claim(restored: readonly Restored[]): Restored[] {
+    const taken: Restored[] = [];
+    for (const item of restored) {
+      const at = this.unacknowledged.findIndex((u) => u.id === item.id);
+      if (at < 0) continue;
+      taken.push(this.unacknowledged[at]);
+      this.unacknowledged.splice(at, 1);
+    }
+    return taken;
   }
   cache(
     workspace: string,
@@ -457,9 +683,18 @@ export class OfflineJournal {
         throw new Error("Outbox is full (100 messages)");
       const key =
         workspace + ":" + (method === "say" ? "orchestrator" : params.thread);
+      // The files the message names leave its draft with the text. Only those: another
+      // message on its way (a hands-free one) may hold the others, and they stay saved
+      // until it takes them.
+      const sent = new Set(
+        splitAttachments(messageDraft(message)).files.map((file) => file.path),
+      );
+      const { [key]: saved = [], ...draftFiles } = record.draftFiles || {};
+      const kept = saved.filter((file) => !sent.has(file.path));
       return {
         ...record,
         drafts: { ...record.drafts, [key]: "" },
+        draftFiles: kept.length ? { ...draftFiles, [key]: kept } : draftFiles,
         outbox: [...record.outbox, message],
       };
     });
@@ -505,16 +740,14 @@ export class OfflineJournal {
       return {
         ...record,
         outbox: record.outbox.filter((item) => item.id !== id),
-        drafts: {
-          ...record.drafts,
-          [key]: appendDraft(record.drafts[key], messageDraft(message)),
-        },
+        ...backToDraft(record, key, messageDraft(message)),
       };
     });
   }
   async reset() {
     ++this.generation;
     this.active = false;
+    this.unacknowledged = [];
     await Promise.allSettled([this.tail, this.loaded]);
     this.deliveryTail = Promise.resolve();
     await this.host.secureDelete?.(this.key);
@@ -533,7 +766,7 @@ export class OfflineJournal {
     const index = this.record.outbox.findIndex(
       (item) => item.id === requested.id,
     );
-    const restored: Json[] = [];
+    const restored: Restored[] = [];
     for (const prior of this.record.outbox
       .slice(0, Math.max(0, index))
       .filter(
@@ -545,10 +778,16 @@ export class OfflineJournal {
         if (result.restored_draft) restored.push(result.restored_draft);
       } catch (error) {
         const current = this.record.outbox.find((item) => item.id === prior.id);
-        if (current && current.state !== "review") throw error;
+        if (current && current.state !== "review")
+          throw withRestored(error, restored);
       }
     }
-    const result = await this.deliverOne(requested, retryReview);
+    let result: Json;
+    try {
+      result = await this.deliverOne(requested, retryReview);
+    } catch (error) {
+      throw withRestored(error, restored);
+    }
     return restored.length ? { ...result, restored_drafts: restored } : result;
   }
   private deliverOne(requested: OutboxMessage, retryReview = false) {
@@ -626,10 +865,7 @@ export class OfflineJournal {
               return {
                 ...record,
                 outbox: record.outbox.filter((item) => item.id !== message.id),
-                drafts: {
-                  ...record.drafts,
-                  [key]: appendDraft(record.drafts[key], text),
-                },
+                ...backToDraft(record, key, text),
               };
             });
             const key =
@@ -638,10 +874,9 @@ export class OfflineJournal {
               (message.method === "say"
                 ? "orchestrator"
                 : message.params.thread);
-            return {
-              ...result,
-              restored_draft: { key, text },
-            };
+            const restored: Restored = { id: message.id, key, text };
+            this.unacknowledged.push(restored);
+            return { ...result, restored_draft: restored };
           }
           await this.remove(message.id);
           return result;

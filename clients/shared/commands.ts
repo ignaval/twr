@@ -28,6 +28,10 @@ export interface Field {
   empty?: string;
   /** A picker whose choices are still loading: drawn as a disabled select. */
   loading?: boolean;
+  /** A `model` or `effort` field whose empty value takes a configured one (the
+   * orchestrator's `[orchestrator] effort`): this labels that choice, and `default`, the
+   * runtime's own, is a choice of its own. */
+  unset?: string;
   placeholder?: string;
   description?: string;
   initial?: any;
@@ -345,6 +349,10 @@ export const commands: Command[] = [
   cmd("orch", "Switch orchestrator", "Orchestrator", "orchestrator.use", [
     runtime,
     f("model", "Model", { type: "model" }),
+    f("effort", "Reasoning effort", {
+      type: "effort",
+      unset: "As configured ([orchestrator] effort)",
+    }),
     f("summary", "Include a handoff summary", {
       type: "boolean",
       initial: true,

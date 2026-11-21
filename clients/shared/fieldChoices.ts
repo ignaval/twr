@@ -272,6 +272,9 @@ export interface PickerContext {
   modelCatalog?: Json;
   /** What each of `pickerSources` read: undefined while loading, null when it failed. */
   lists: Record<string, Json>;
+  /** An orchestrator runs: `[orchestrator] effort` applied to the first one only, so a
+   * switch's model or effort field drops its "As configured" choice (`Field.unset`). */
+  orchestrator?: boolean;
 }
 
 /** `field` as `FieldInput` draws it in `ctx`'s form: a picker with its choices (loading,
@@ -310,6 +313,7 @@ export function resolveField(field: Field, ctx: PickerContext): Field {
       );
       return {
         ...field,
+        unset: ctx.orchestrator ? undefined : field.unset,
         choices: (field.type === "model" ? modelChoices : effortChoices)(
           ctx.modelCatalog,
           runtime,

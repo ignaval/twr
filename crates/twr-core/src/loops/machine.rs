@@ -74,6 +74,11 @@
 //!   the ladder (`no_new_class`, `backstop`, `max_rounds`, `skipped`), a sweep, or another
 //!   effort runs the verification as usual.
 //! - **report**: one thread turn; the hub writes `report.md` and `loop.ended`.
+//! - **single pass** (`loop.started.once`): scope, then one round at the profile's strongest
+//!   ladder tier ([`super::config::Profile::pass_tier`]), its triage if it found anything,
+//!   then the report. No second round, no transition, no sweep, no verification. It ends
+//!   `clean` when the round found nothing, else `triaged` once the triage is accepted. Skip to
+//!   verify is refused: there is no verification to skip to.
 //! - **controls**: `pause` holds the next step (what runs finishes) until `resume`, which
 //!   asks for a held or stuck step again with fresh retry and correction budgets; `stop` ends
 //!   the loop `stopped`; `skip_to_verify` (scope or ladder only) ends the ladder at the end of
@@ -703,6 +708,9 @@ pub enum StartError {
     /// The profile has no tier, no verification round, or a tier capped at zero rounds.
     #[error("profile {0} has no ladder or no verification round to run")]
     EmptyProfile(String),
+    /// A single pass of an implementation loop: only a review loop runs one.
+    #[error("a single pass is a review loop's: an implementation loop runs its whole ladder")]
+    OnceImplement,
 }
 
 /// Why the machine did not take an input.
@@ -775,6 +783,9 @@ pub struct LoopState {
     /// Who asked for it (`loop.started`'s `requested_by`): left out for the user.
     #[serde(skip_serializing_if = "ControlBy::is_user")]
     pub requested_by: ControlBy,
+    /// A single pass (`loop.started.once`): one review round, its triage, the report.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub once: bool,
 
     /// An implementation loop's plan check setting: the settings' `plan_check`, else the
     /// profile's.
@@ -832,7 +843,15 @@ impl LoopState {
         {
             return Err(StartError::EmptyProfile(profile.name.clone()));
         }
-        let efforts: Vec<&str> = profile.tiers.iter().map(|t| t.effort.as_str()).collect();
+        if p.once && p.kind == LoopKind::Implement {
+            return Err(StartError::OnceImplement);
+        }
+        // A single pass runs one tier, the strongest, for one round, and no verification.
+        let tiers = match profile.pass_tier().filter(|_| p.once) {
+            Some(t) => vec![t],
+            None => profile.tiers.clone(),
+        };
+        let efforts: Vec<&str> = tiers.iter().map(|t| t.effort.as_str()).collect();
         let (phase, wait) = match p.kind {
             LoopKind::Review => (Phase::Scope, Wait::Goal),
             LoopKind::Implement => (Phase::Plan, Wait::Plan),
@@ -844,7 +863,7 @@ impl LoopState {
             phase,
             verify: VerifyProgress {
                 done: 0,
-                cap: profile.verify.rounds,
+                cap: if p.once { 0 } else { profile.verify.rounds },
             },
             reviewer: ReviewerView {
                 runtime: p.settings.reviewer.runtime.clone(),
@@ -853,11 +872,12 @@ impl LoopState {
             },
             commit: CommitMode::of(p),
             requested_by: p.requested_by,
+            once: p.once,
             plan_check: p.settings.plan_check.unwrap_or(profile.plan_check),
             plan: LoopPlan {
-                tiers: profile.tiers.clone(),
                 tags: tier_tags(&efforts),
-                sweep: profile.sweep,
+                tiers,
+                sweep: profile.sweep && !p.once,
                 audit_runs: p.settings.sweep == super::config::SweepMode::Runs,
                 audit_effort: if p.settings.sweep == super::config::SweepMode::Runs {
                     profile.verify.effort.clone()
@@ -1388,6 +1408,9 @@ impl LoopState {
             ControlAction::SkipToVerify if !matches!(self.phase, Phase::Scope | Phase::Ladder) => {
                 no("the loop is past its ladder")
             }
+            ControlAction::SkipToVerify if self.once => {
+                no("a single pass has no verification to skip to")
+            }
             ControlAction::SkipToVerify if self.skip => no("the loop already skips to verify"),
             _ => Ok(()),
         }
@@ -1785,6 +1808,11 @@ impl LoopState {
             if self.phase == Phase::PlanCheck {
                 return self.enter_implement();
             }
+            if self.once {
+                // A single pass that found nothing: its report, clean.
+                self.converged = Some(Convergence::Empty);
+                return self.enter_report(Outcome::Clean);
+            }
             return self.converged(Convergence::Empty, unchanged);
         }
         self.findings = findings.to_vec();
@@ -1829,6 +1857,13 @@ impl LoopState {
             r.new_class = u32::try_from(new_class).unwrap_or(u32::MAX);
         }
         self.findings.clear();
+        if self.once {
+            // A single pass's one triage: its report. (Nothing can be a duplicate: its ledger
+            // was empty when the round ran.)
+            self.fixed += u32::try_from(fixed).unwrap_or(u32::MAX);
+            out.extend(self.enter_report(Outcome::Triaged));
+            return out;
+        }
         let all_duplicate =
             !items.is_empty() && items.iter().all(|i| i.verdict == Verdict::Duplicate);
         if all_duplicate {

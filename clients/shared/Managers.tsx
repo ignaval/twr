@@ -28,6 +28,7 @@ import {
 import type { Json } from "./types";
 import { DataView, Empty, Spinner, ResourceTable } from "./ui";
 import { useEditorSessions } from "./editors";
+import { UsagePage } from "./UsageLimits";
 
 export { navSection } from "./settingsModel";
 export type { Section } from "./settingsModel";
@@ -91,6 +92,10 @@ function ManagePageView(props: ManagerProps & { page: ManagePage }) {
   const { page, section, rpc, action, cliAction, fail } = props;
   const [data, setData] = useState<Partial<Record<ManagePart, Json>>>({});
   const [errors, setErrors] = useState<Partial<Record<ManagePart, string>>>({});
+  // When each part was read: the Usage part reckons its clock from it.
+  const [fetched, setFetched] = useState<Partial<Record<ManagePart, number>>>(
+    {},
+  );
   const [loading, setLoading] = useState(false);
   const [detail, setDetail] = useState<Json>();
   const headings = useRef<Partial<Record<ManagePart, HTMLHeadingElement>>>({});
@@ -99,6 +104,7 @@ function ManagePageView(props: ManagerProps & { page: ManagePage }) {
       try {
         const value = await rpc(PART_METHOD[part]);
         setData((old) => ({ ...old, [part]: value }));
+        setFetched((old) => ({ ...old, [part]: Date.now() }));
         setErrors((old) => ({ ...old, [part]: "" }));
       } catch (e) {
         setErrors((old) => ({ ...old, [part]: errorMessage(e) }));
@@ -192,6 +198,7 @@ function ManagePageView(props: ManagerProps & { page: ManagePage }) {
                 part={part}
                 data={value}
                 props={props}
+                fetchedAt={fetched[part] ?? 0}
                 reload={() => void load([part])}
                 inspect={inspect}
                 showLog={(job) => setDetail({ kind: "job-log", job })}
@@ -301,6 +308,7 @@ function PartContent({
   part,
   data,
   props,
+  fetchedAt,
   reload,
   inspect,
   showLog,
@@ -308,6 +316,8 @@ function PartContent({
   part: ManagePart;
   data: Json;
   props: ManagerProps;
+  /** When `data` was read (`Date.now()`). */
+  fetchedAt: number;
   reload: () => void;
   inspect: (method: string, params?: Json) => Promise<void>;
   showLog: (job: string) => void;
@@ -442,49 +452,8 @@ function PartContent({
     );
   if (part === "usage")
     return (
-      <div className="cards">
-        {(data.runtimes || []).map((runtime: Json) => (
-          <article
-            className="resource-card"
-            key={runtime.runtime + ":" + runtime.account}
-          >
-            <div className="card-heading">
-              <h3>{runtime.label || runtime.runtime}</h3>
-              {runtime.stale && <span className="pill">Out of date</span>}
-            </div>
-            <p>
-              {runtime.plan || "Subscription"}
-              {runtime.account ? " · " + runtime.account : ""}
-            </p>
-            {runtime.windows.map((w: Json) => (
-              <div className="usage-window" key={w.window}>
-                <div>
-                  <span>{w.label}</span>
-                  <b>
-                    {Math.round(
-                      w.remaining_pct ?? Math.max(0, 100 - w.used_pct),
-                    )}
-                    % left
-                  </b>
-                </div>
-                <meter
-                  min={0}
-                  max={100}
-                  value={Math.max(0, Math.min(100, w.used_pct))}
-                />
-                {w.resets_at && (
-                  <small>Resets {new Date(w.resets_at).toLocaleString()}</small>
-                )}
-              </div>
-            ))}
-          </article>
-        ))}
-        {!data.runtimes?.length && (
-          <p className="muted">
-            Your agents have not reported subscription limits yet. Usage appears
-            after a session reports it.
-          </p>
-        )}
+      <div className="usage-cards">
+        <UsagePage data={data} fetchedAt={fetchedAt} />
       </div>
     );
   if (part === "memory")

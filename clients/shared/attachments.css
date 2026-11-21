@@ -1,80 +1,297 @@
-.attachment-manager {
-  display: grid;
-  gap: 8px;
-  padding: 8px 0;
-  max-height: 320px;
-  overflow-y: auto;
-}
-.attachment-item {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px;
+/* Attachments (shared/ComposerAttachments.tsx): the files of the message being written,
+ * inside the message box above its text (an image as a 64-pixel tile, any other file as a
+ * chip), and the files a sent message named, as chips. No path shows anywhere. */
+.composer-attachments {
   min-width: 0;
 }
-.attachment-preview {
+.composer-attachments > ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px 2px;
+  list-style: none;
+  /* Past four rows of chips it scrolls, and sooner in a short window: it gets the height the
+   * window leaves after the top bar, the conversation's header and least height and the rest
+   * of the composer, 440 pixels in all, and at least one row of chips, so Send stays in it. */
+  max-height: clamp(44px, calc(100dvh - 440px), 168px);
+  overflow-y: auto;
+  min-width: 0;
+}
+.composer-attachments > ul > li {
+  position: relative;
+  min-width: 0;
+}
+
+/* An image: a 64-pixel tile, its preview cropped to fill it. */
+.attachment-tile {
   width: 64px;
   height: 64px;
-  object-fit: contain;
-  border-radius: 4px;
-  background: var(--panel);
+  flex-shrink: 0;
 }
-.attachment-details {
-  display: grid;
-  gap: 4px;
-  flex: 1;
+.attachment-tile > .attachment-open {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
   min-width: 0;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--raised);
+}
+.attachment-tile > .attachment-open:hover {
+  border-color: var(--border-strong);
+}
+.attachment-tile img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.attachment-tile:is(
+    [data-phase="queued"],
+    [data-phase="hashing"],
+    [data-phase="uploading"],
+    [data-phase="committing"],
+    [data-phase="paused"],
+    [data-phase="cancelling"]
+  )
+  img {
+  opacity: 0.6;
+}
+.attachment-tile[data-phase="error"] > .attachment-open {
+  border-color: var(--danger);
+}
+/* Retry or Resume: a round badge over the middle of the preview. */
+.attachment-state {
+  position: absolute;
+  top: calc(50% - 14px);
+  left: calc(50% - 14px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  color: var(--text);
+  background: var(--overlay);
+}
+.attachment-tile[data-phase="error"] .attachment-state {
+  color: var(--danger);
+}
+/* While it uploads, a strip along the bottom says how far. */
+.attachment-percent {
+  position: absolute;
+  inset: auto 0 0;
+  padding: 1px 0;
+  font-size: 0.769231rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  text-align: center;
+  color: var(--text);
+  background: var(--overlay);
+}
+.attachment-bar {
+  position: absolute;
+  left: 1px;
+  bottom: 1px;
+  height: 2px;
+  width: calc(100% - 2px);
+  transform: scaleX(var(--progress, 0));
+  transform-origin: left;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+/* Any other file: icon, name (cut short; the whole name is its tooltip), size or progress. */
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  max-width: min(260px, 100%);
+  height: 32px;
+}
+.attachment-chip > .attachment-open {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 0 28px 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--raised);
+  color: var(--text);
   font-size: 0.923077rem;
 }
-.attachment-details strong {
-  overflow-wrap: anywhere;
+.attachment-chip > .attachment-open:hover {
+  border-color: var(--border-strong);
 }
-.attachment-details > span {
-  opacity: 0.7;
+.attachment-chip > .attachment-open > svg {
+  flex-shrink: 0;
+  color: var(--muted);
 }
-.attachment-details progress {
-  width: 100%;
-  height: 6px;
-  accent-color: var(--accent);
+.attachment-chip[data-phase="error"] > .attachment-open {
+  border-color: var(--danger);
 }
-.attachment-details details {
+.attachment-chip[data-phase="error"] > .attachment-open > svg {
+  color: var(--danger);
+}
+.attachment-name {
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.attachment-details pre {
-  max-height: 160px;
+.attachment-meta {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 0.846154rem;
+  font-variant-numeric: tabular-nums;
+}
+.attachment-meta:empty {
+  display: none;
+}
+
+/* The ✕: a small round button at the top right. */
+.attachment-remove {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  width: 24px;
+  height: 24px;
+  min-width: 0;
+  min-height: 0;
+  padding: 3px;
+  border: 0;
+  background: none;
+  color: var(--text);
+}
+.attachment-remove > span {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--border-strong);
+  background: var(--overlay);
+}
+.attachment-remove:hover > span {
+  background: var(--danger-soft);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+.attachment-remove:focus-visible {
+  outline: none;
+}
+.attachment-remove:focus-visible > span {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+.attachment-chip > .attachment-remove {
+  top: 4px;
+  right: 4px;
+}
+
+/* A file's preview and controls. */
+.attachment-dialog {
+  display: grid;
+  gap: 10px;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 24px 20px;
+}
+.attachment-dialog img {
+  display: block;
+  max-width: 100%;
+  max-height: 60vh;
+  margin: 0 auto;
+  object-fit: contain;
+  border-radius: 6px;
+  background: var(--panel);
+}
+.attachment-dialog pre {
+  max-height: 50vh;
+  margin: 0;
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font-size: 0.846154rem;
-}
-.attachment-details p {
-  color: var(--danger, #d66);
-  overflow-wrap: anywhere;
-  margin: 0;
-}
-.attachment-actions {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-}
-.attachment-actions button {
-  min-height: 32px;
-  padding: 4px 8px;
-  font-size: 0.923077rem;
-}
-@media (max-width: 560px) {
-  .attachment-item {
-    flex-wrap: wrap;
-  }
-  .attachment-actions {
-    width: 100%;
-    justify-content: flex-end;
-  }
-}
-
-.attachment-details pre {
   font-size: var(--code-size, 13px);
   line-height: 1.5;
+}
+.attachment-dialog p {
+  margin: 0;
+}
+.attachment-error {
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+/* A sent message's files: chips with the name only. */
+.sent-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+.sent-attachments > li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(260px, 100%);
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--raised);
+  color: var(--text);
+  font-size: 0.923077rem;
+}
+.sent-attachments > li > svg {
+  flex-shrink: 0;
+  margin-left: 2px;
+  color: var(--muted);
+}
+.sent-attachments > li > img {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+.sent-attachments > li > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* While a file is on its way, why Send waits. */
+.attachment-wait {
+  margin: 0;
+  padding: 4px 14px 0;
+  color: var(--muted);
+  font-size: 0.846154rem;
+}
+/* A queued message's files, after its text on its one line. */
+.queued-text > .queued-files {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+}
+.queued-text > .queued-files:first-child {
+  margin-left: 0;
 }

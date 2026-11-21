@@ -314,8 +314,9 @@ enum Cmd {
     /// handoff of what the previous session did; a model or effort left out is the new
     /// runtime's default. Moving back to a runtime it left a session of resumes that session
     /// instead, told what the thread did since, with the settings it had (`default` starts a new
-    /// one). Not for the orchestrator (switch it with `twr orchestrator use`); a pty thread can
-    /// only move to another runtime.
+    /// one). The orchestrator's model and effort change the same way, in place (`twr model
+    /// orch opus --effort high`); another runtime or account for it is `twr orchestrator use`.
+    /// A pty thread can only move to another runtime.
     Model {
         /// Thread id, name, alias or unique prefix.
         thread: String,
@@ -1265,7 +1266,8 @@ enum OrchestratorCmd {
         /// Model (default: the runtime's default).
         #[arg(long)]
         model: Option<String>,
-        /// Reasoning effort, in the runtime's vocabulary (default: the runtime's default).
+        /// Reasoning effort, one the runtime takes (`twr orchestrator show --json` lists them
+        /// under `models`), or `default`: the runtime's own (the default).
         #[arg(long)]
         effort: Option<String>,
         /// Do not ask the current orchestrator for a handoff summary: the new one gets only
@@ -6855,6 +6857,13 @@ fn trash_empty_text(r: &Value) -> String {
 
 // --- thread list -------------------------------------------------------------------------------
 
+/// `, effort <e>` for a reasoning effort, nothing for the runtime's default (null).
+fn effort_text(effort: &Value) -> String {
+    effort
+        .as_str()
+        .map_or_else(String::new, |e| format!(", effort {e}"))
+}
+
 /// The model part of an orchestrator line: ` model <m>` or ` (the runtime's default model)`.
 fn model_text(model: &Value) -> String {
     match model.as_str() {
@@ -6961,8 +6970,9 @@ fn orchestrator_runtime(o: &Value) -> String {
 fn orchestrator_text(o: &Value) -> String {
     let runtime = orchestrator_runtime(o);
     let mut out = format!(
-        "orchestrator: {runtime}{}{}\n",
+        "orchestrator: {runtime}{}{}{}\n",
         models_text(&o["model"], &o["model_actual"]),
+        effort_text(&o["effort"]),
         if o["available"].as_bool() == Some(true) {
             ""
         } else {
@@ -7088,9 +7098,10 @@ fn orchestrator_use_text(r: &Value) -> String {
 
 fn orchestrator_session_text(r: &Value, reset: bool) -> String {
     let mut out = format!(
-        "orchestrator is now {}{}: thread {} ({})",
+        "orchestrator is now {}{}{}: thread {} ({})",
         orchestrator_runtime(r),
         model_text(&r["model"]),
+        effort_text(&r["effort"]),
         str_of(&r["name"]),
         str_of(&r["thread"])
     );
@@ -7124,6 +7135,31 @@ fn orchestrator_session_text(r: &Value, reset: bool) -> String {
         out.push_str(&format!(" ({dropped} queued prompt(s) dropped)"));
     }
     out.push_str(".\n");
+    // The user's own, whole, so they can be sent again.
+    let mine: Vec<&str> = p["dropped_messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if !mine.is_empty() {
+        out.push_str("Your dropped message(s), to send again:\n");
+        for m in mine {
+            // Each line as it was sent, its files' `Uploaded file:` lines and paths too (a
+            // path's own trailing space included), so it can be sent again exactly.
+            for (i, line) in m.split('\n').enumerate() {
+                out.push_str(if i == 0 { "  - " } else { "    " });
+                out.push_str(line.strip_suffix('\r').unwrap_or(line));
+                out.push('\n');
+            }
+        }
+    }
+    if let Some(n) = p["dropped_messages_omitted"].as_u64().filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "{n} more of your dropped message(s) were too long to return and can't be sent \
+             again from here.\n"
+        ));
+    }
     let h = &r["handoff"];
     if !h.is_object() {
         if !reset {
@@ -10778,13 +10814,13 @@ mod tests {
                 cmd: OrchestratorCmd::Use { ref runtime, ref model, effort: None, no_summary: false, wait: None }
             }) if runtime == "codex" && model.as_deref() == Some("o5")
         ));
-        let c = Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--effort", "low"])
+        let c = Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--effort", "high"])
             .unwrap();
         assert!(matches!(
             c.cmd,
             Some(Cmd::Orchestrator {
                 cmd: OrchestratorCmd::Use { ref effort, model: None, .. }
-            }) if effort.as_deref() == Some("low")
+            }) if effort.as_deref() == Some("high")
         ));
         let c =
             Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--no-summary"]).unwrap();
@@ -10865,11 +10901,23 @@ mod tests {
         ));
         assert!(Cli::try_parse_from(["twr", "orchestrator", "use"]).is_err());
 
+        let with_effort = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": "o5",
+            "effort": "high", "started": false, "previous": null,
+        }));
+        assert!(
+            with_effort.starts_with(
+                "orchestrator is now codex model o5, effort high: thread orchestrator (01NEW),"
+            ),
+            "{with_effort}"
+        );
         let switched = orchestrator_use_text(&json!({
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": "o5",
             "started": true,
             "previous": {"thread": "01OLD", "runtime": "claude-code", "model": null,
-                         "stopping": true, "dropped_prompts": 2},
+                         "stopping": true, "dropped_prompts": 2,
+                         "dropped_messages": [
+                             "and the deploys\nplease\nUploaded file: a.png\n/w/.twr-uploads/u1/a.png"]},
         }));
         assert!(
             switched.starts_with(
@@ -10885,7 +10933,30 @@ mod tests {
             switched.contains("was retired and is being stopped (2 queued prompt(s) dropped)."),
             "{switched}"
         );
+        assert!(
+            switched.contains(
+                "Your dropped message(s), to send again:\n  - and the deploys\n    please\n    \
+                 Uploaded file: a.png\n    /w/.twr-uploads/u1/a.png\n"
+            ),
+            "{switched}"
+        );
         assert!(switched.contains("No handoff"), "{switched}");
+        assert!(!switched.contains("too long to return"), "{switched}");
+        // Those the hub left out, too long for its answer, are counted.
+        let omitted = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
+            "started": true,
+            "previous": {"thread": "01OLD", "runtime": "claude-code", "model": null,
+                         "dropped_prompts": 3, "dropped_messages": ["one"],
+                         "dropped_messages_omitted": 2},
+        }));
+        assert!(
+            omitted.contains(
+                "  - one\n2 more of your dropped message(s) were too long to return and can't \
+                 be sent again from here.\n"
+            ),
+            "{omitted}"
+        );
         let handed = orchestrator_use_text(&json!({
             "thread": "01NEW", "name": "orchestrator", "runtime": "codex", "model": null,
             "started": true,
@@ -10950,6 +11021,14 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("retired:      1 earlier"), "{shown}");
+        let shown = orchestrator_text(&json!({
+            "available": true, "runtime": "codex", "model": "o5", "effort": "xhigh",
+            "thread": null, "configured": {"runtime": "codex"}, "runtimes": ["codex"],
+        }));
+        assert!(
+            shown.starts_with("orchestrator: codex model o5, effort xhigh\n"),
+            "{shown}"
+        );
     }
 
     /// The orchestrator's runtime is labelled with its account only while `account_shown`:

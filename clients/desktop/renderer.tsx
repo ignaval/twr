@@ -18,6 +18,7 @@ import { errorMessage } from "../shared/errors";
 import { withLocalUploads } from "../shared/local-uploads";
 import { withInboxCache } from "../shared/inbox-cache";
 import { UpdateBanner, useUpdateNotice } from "./UpdateBanner";
+import { saveNow } from "../shared/save-now";
 import "./app-shell.css";
 // Renderer failures go to the local diagnostics log (bounded and redacted in the main process).
 function reportError(message: string, stack?: string, source?: string) {
@@ -44,6 +45,8 @@ window.addEventListener("unhandledrejection", (event) => {
     "unhandled rejection",
   );
 });
+// The window asks the page to save its drafts before it closes or the app quits.
+window.twrApp?.onSaveNow(saveNow);
 const local = withInboxCache(
   withLocalUploads(window.twrLocal, window.twrUploadRequest),
   () => window.twrRemote.listHubs(),

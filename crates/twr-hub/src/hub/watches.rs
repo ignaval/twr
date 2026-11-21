@@ -20,7 +20,14 @@
 //! again); when it ends, a new line waits a full grace. A failed turn fires nothing, on its report or when its tasks end (its error
 //! card already notifies, and an automatic retry may follow); neither do reports written by
 //! the orchestrator or a user. A rewrite of an interim report stays interim while the turn's
-//! tasks run (`Hub::write_report`), so the worker going idle still fires.
+//! tasks run (`Hub::write_report`), so the worker going idle still fires. A loop's steps fire
+//! nothing, on their reports or idle: the loop's report (`ext.twr.loop` with `step: report`)
+//! is the finish. A review loop's or pass's report that changed nothing fires only watches
+//! without `repeat`: a standing rule ("review every worker's work") fired on the finish the
+//! review followed, and firing it on the review's own report would start a pass on that pass.
+//! One that fixed findings (`fixed` in its mark) or made commits fires them all. An implementation
+//! loop's report is the finish of the work it did and fires every watch; its notice line says
+//! `kind=implement`, so a standing review rule knows the loop reviewed it.
 //!
 //! Firing queues a notice line ([`super::orch`]) with the report, the watch id and its note;
 //! a non-success report's own notice line carries them instead. A notice turn fires a watch
@@ -77,11 +84,20 @@ pub(super) struct Watch {
     pub(super) repeat: bool,
 }
 
-/// ` watch=<id> note="..."` for each of `watches`, as a notice line carries them.
+/// ` watch=<id> note="..."` for each of `watches`, as a notice line carries them, with
+/// ` repeat=true` after the id of one that repeats: the orchestrator acts on a repeating
+/// review or loop watch only when its note quotes the user's standing request.
 pub(super) fn hit_text(watches: &[&Watch]) -> String {
     watches
         .iter()
-        .map(|w| format!(" watch={} note={}", w.id, quoted(&w.note)))
+        .map(|w| {
+            format!(
+                " watch={}{} note={}",
+                w.id,
+                if w.repeat { " repeat=true" } else { "" },
+                quoted(&w.note)
+            )
+        })
         .collect()
 }
 
@@ -169,7 +185,8 @@ impl Core {
         let Some(v) = self
             .registry
             .get(&ev.thread)
-            .filter(|v| !v.is_orchestrator() && !v.has_work() && v.reported)
+            // A loop's step: the loop goes on, and its report is the finish.
+            .filter(|v| !v.is_orchestrator() && !v.has_work() && v.reported && v.r#loop.is_none())
         else {
             return;
         };

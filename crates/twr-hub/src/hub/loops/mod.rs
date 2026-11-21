@@ -104,7 +104,7 @@ mod report;
 use twr_runner::loops::{acp_review, git, review};
 
 pub(super) use driver::{reap_reviews, watch, LoopRuns};
-pub(super) use report::{kind_words, outcome_words, transition_words};
+pub(super) use report::{kind_words, outcome_words, transition_words, PASS_WORDS};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -118,9 +118,9 @@ use twr_core::loops::config::{
     check_profile_name, ModelChoice, ReviewerChoice, WorkersChoice, REVIEWER_RUNTIMES,
 };
 use twr_core::loops::settings::{
-    presets, propose, validate, Availability, LoopSettings, Overrides, ProblemKind,
-    RuntimeAvailability, SaveFor, SavedBy, SavedFrom, Scope, SettingsOf, SettingsSource,
-    ThreadModel,
+    presets, propose, propose_run, validate, validate_run, Availability, LoopSettings, Overrides,
+    ProblemKind, RuntimeAvailability, SaveFor, SavedBy, SavedFrom, Scope, SettingsOf,
+    SettingsSource, ThreadModel,
 };
 use twr_core::loops::{
     line, ControlAction, ControlBy, Input, LoopKind, LoopState, StartError, StepError,
@@ -243,6 +243,9 @@ pub struct LoopRequest {
     /// when the thread has commits beyond its base, else `uncommitted`. Refused for an
     /// implementation loop.
     pub scope: Option<String>,
+    /// A single pass of a review loop: one review run, its triage, the report
+    /// ([`LoopStarted::once`]). Refused for an implementation loop.
+    pub once: bool,
     /// What this run changes, as the user typed it.
     pub overrides: Overrides,
 }
@@ -694,6 +697,17 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
             .as_ref()
             .map_or_else(|| s.profile.clone(), |p| p.summary())
     ));
+    if setup.once {
+        rows.push(format!(
+            "Run          single pass: one review{}, its triage, the report",
+            setup
+                .profile
+                .as_ref()
+                .and_then(|p| p.pass_tier())
+                .map(|t| format!(" at {}", t.effort))
+                .unwrap_or_default()
+        ));
+    }
     if let Some(scope) = &setup.scope {
         rows.push(format!(
             "Scope        {}",
@@ -738,7 +752,14 @@ fn card_text(name: &str, setup: &LoopSetup, view: &ThreadView) -> String {
         rows.push(format!("Workers      {workers}"));
     }
     let mut efforts: Vec<String> = Vec::new();
-    if let Some(p) = &setup.profile {
+    if let Some(t) = setup
+        .profile
+        .as_ref()
+        .and_then(|p| p.pass_tier())
+        .filter(|_| setup.once)
+    {
+        efforts.push(t.effort);
+    } else if let Some(p) = &setup.profile {
         for e in p.tiers.iter().map(|t| &t.effort).chain([&p.verify.effort]) {
             if !efforts.contains(e) {
                 efforts.push(e.clone());
@@ -809,12 +830,14 @@ const TASK_ROWS: usize = 3;
 const TASK_ROW_CHARS: usize = 100;
 
 /// A held task as the card's rows: its first lines, each cut, and a count of what is not
-/// shown; `what the conversation already settled` without one.
+/// shown; `what the conversation already settled` without one. The files it names show by
+/// name on a last row (`Attached: …`), never their paths.
 fn task_rows(task: Option<&str>) -> Vec<String> {
     let Some(task) = task.map(str::trim).filter(|t| !t.is_empty()) else {
         return vec!["what the conversation already settled".into()];
     };
-    let lines: Vec<&str> = task.lines().filter(|l| !l.trim().is_empty()).collect();
+    let (body, files) = twr_core::upload::split_attachments(task);
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut out: Vec<String> = lines
         .iter()
         .take(TASK_ROWS)
@@ -833,6 +856,17 @@ fn task_rows(task: Option<&str>) -> Vec<String> {
             "(+{more} more line{})",
             if more == 1 { "" } else { "s" }
         ));
+    }
+    if !files.is_empty() {
+        let names = prompts::one_line(&files.join(", "));
+        out.push(if names.chars().count() > TASK_ROW_CHARS {
+            format!(
+                "Attached: {}…",
+                names.chars().take(TASK_ROW_CHARS).collect::<String>()
+            )
+        } else {
+            format!("Attached: {names}")
+        });
     }
     out
 }
@@ -864,7 +898,9 @@ fn start_of(ext: &Option<JsonMap>) -> StartFacts {
 /// A start the machine refused.
 fn start_err(e: StartError) -> RpcError {
     match e {
-        StartError::EmptyProfile(_) => rpc(codes::BAD_REQUEST, e.to_string()),
+        StartError::EmptyProfile(_) | StartError::OnceImplement => {
+            rpc(codes::BAD_REQUEST, e.to_string())
+        }
     }
 }
 
@@ -1058,6 +1094,8 @@ struct Origin {
     task: Option<String>,
     /// Who asked for it.
     requested_by: ControlBy,
+    /// A single pass.
+    once: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1153,6 +1191,7 @@ impl Hub {
             task: Some(l.task),
             setup: l.setup,
             scope: None,
+            once: false,
             overrides: l.overrides,
         };
         match self.loop_request(req, caller).await {
@@ -1218,6 +1257,9 @@ impl Hub {
         let kind = parse_kind(&p.kind)?;
         twr_core::loops::settings::check_run(kind, p.scope.as_deref(), p.task.as_deref())
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        if p.once && kind == LoopKind::Implement {
+            return Err(start_err(StartError::OnceImplement));
+        }
         let scope = parse_scope(p.scope.as_deref())?;
         let id = {
             let core = self.inner.core();
@@ -1340,7 +1382,7 @@ impl Hub {
             if setup.requested_by == ControlBy::Orchestrator {
                 setup.overrides = Overrides::default();
             }
-            let proposal = propose(&s, &avail, config);
+            let proposal = propose_run(&s, &avail, config, setup.once);
             setup.settings = proposal.settings;
             setup.warnings = proposal.warnings;
             setup.problems = proposal
@@ -2049,6 +2091,7 @@ fn loop_detail(view: &ThreadView, id: &str, events: &[Event]) -> Value {
                     "task": p.task,
                     "commit_fixes": p.commit_fixes,
                     "requested_by": p.requested_by,
+                    "once": p.once,
                     "baseline": twr_ext(&p.ext)
                         .and_then(|t| t.get(LOOP_START_KEY))
                         .and_then(|s| s.get("baseline"))
@@ -2499,6 +2542,36 @@ impl Core {
             .apply(&base, kind)
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
         let user = !caller.is_orchestrator();
+        // On a hub notice (a fired watch), the orchestrator never reviews a thread again before
+        // it has done more work: a review whose report fired a standing review rule (one that
+        // fixed findings fires repeating watches, for rules like "send each finished branch
+        // on") would otherwise review that review, round after round. A turn the user's
+        // message started ("review it again") goes, as the user's own request does.
+        if !user && kind == LoopKind::Review && self.orch_in_notice_turn() {
+            if let Some(last) = view
+                .last_loop
+                .as_ref()
+                .filter(|l| l.kind == LoopKind::Review)
+                // One that reviewed to its end: a stopped or failed one reviewed nothing.
+                .filter(|l| {
+                    !matches!(
+                        l.outcome,
+                        twr_core::loops::Outcome::Stopped | twr_core::loops::Outcome::Failed
+                    )
+                })
+            {
+                if last.ended_turn.is_some_and(|t| view.turns <= t) {
+                    return Err(rpc(
+                        codes::CONFLICT,
+                        format!(
+                            "{}'s work was reviewed and it has done nothing since: on a \
+                             notice, a new review needs new work; the user can still ask for one",
+                            view.name
+                        ),
+                    ));
+                }
+            }
+        }
         // The orchestrator starts a loop only on the user's saved settings as they are: an
         // override of its that changes any of them raises the card; one that names what is
         // saved changes nothing, and is not recorded as this run's.
@@ -2510,7 +2583,7 @@ impl Core {
             None => Some(SetupWhy::FirstRun),
             Some(_) if req.setup => Some(SetupWhy::Asked),
             Some((s, _)) => {
-                let problems = validate(&s.settings, &avail, config);
+                let problems = validate_run(&s.settings, &avail, config, req.once);
                 if problems.iter().any(|p| p.kind == ProblemKind::OtherRuntime) {
                     Some(SetupWhy::OtherRuntime)
                 } else if !problems.is_empty() {
@@ -2522,35 +2595,76 @@ impl Core {
                 }
             }
         };
+        // Trimmed as a message is: a file's path that ends the task stays exact.
         let task = req
             .task
             .as_deref()
-            .map(str::trim)
+            .map(twr_core::upload::trim_message)
             .filter(|t| !t.is_empty())
             .map(str::to_string);
         // The orchestrator never starts a loop over a card the thread has open, nor raises it
         // again: the card is the user's, as they may have changed it. Its request is told
-        // about that card.
+        // about that card, and, when the card asks for other work than this request (another
+        // kind, a single pass or a whole loop, another scope than the request's, resolved as
+        // its start would be when it names none, a task the request names otherwise), what
+        // the card would start instead (`other`), since answering it starts that.
         if !user {
             if let Some((attn_id, card)) = self.setup_card_of(id) {
                 if from.baseline_digests != card.setup.baseline_digests {
                     drop_from(hub, &from);
                 }
+                let s = &card.setup;
+                let other = s.kind != kind
+                    || s.once != req.once
+                    || s.scope != from.scope
+                    || task.as_ref().is_some_and(|t| s.task.as_ref() != Some(t));
                 let revision = self.attention.get(&attn_id).map(|i| i.revision);
-                return Ok(json!({
+                let mut out = json!({
                     "status": "needs_setup",
                     "thread": id,
                     "thread_name": view.name,
                     "attn_id": attn_id,
                     "revision": revision,
-                    "why": card.setup.why,
+                    "why": s.why,
                     "existing": true,
-                }));
+                });
+                if other {
+                    out["other"] = json!({
+                        "kind": s.kind.as_str(),
+                        "once": s.once,
+                        "scope": s.scope.as_ref().map(ToString::to_string),
+                        "task": s.task,
+                    });
+                }
+                return Ok(out);
+            }
+        }
+        // A card that holds a task (an implementation loop's, sent from the message box, its
+        // files too) is never replaced by a request for other work, the user's own included:
+        // the task would be lost with it. Answering or cancelling the card comes first.
+        if user {
+            if let Some((_, card)) = self.setup_card_of(id) {
+                let s = &card.setup;
+                let held = s.task.as_ref().filter(|t| !t.is_empty());
+                if held.is_some() && (s.kind != kind || s.once != req.once || task.as_ref() != held)
+                {
+                    if from.baseline_digests != s.baseline_digests {
+                        drop_from(hub, &from);
+                    }
+                    return Err(rpc(
+                        codes::CONFLICT,
+                        format!(
+                            "{}'s loop setup card holds an implementation task: start it, run it \
+                             without a loop, or cancel it first",
+                            view.name
+                        ),
+                    ));
+                }
             }
         }
         let Some(why) = why else {
             // Saved settings that hold: the run's own overrides must hold too.
-            let problems = validate(&run, &avail, config);
+            let problems = validate_run(&run, &avail, config, req.once);
             if !problems.is_empty() {
                 return Err(rpc(
                     codes::BAD_REQUEST,
@@ -2593,6 +2707,7 @@ impl Core {
                     overrides,
                     task,
                     requested_by: requester(caller),
+                    once: req.once,
                 },
                 from,
                 caller,
@@ -2618,7 +2733,7 @@ impl Core {
             Some(_) => (base, overrides),
             None => (run, Overrides::default()),
         };
-        let mut proposal = propose(&shown, &avail, config);
+        let mut proposal = propose_run(&shown, &avail, config, req.once);
         // This run's own reviewer (an override) whose review runs would fail where the loop runs
         // (Codex's sandbox): said too, as for the saved one.
         if let Some(w) = avail
@@ -2650,6 +2765,7 @@ impl Core {
             } else {
                 ControlBy::Orchestrator
             },
+            once: req.once,
             warnings: proposal.warnings,
             problems: proposal
                 .problems
@@ -2799,6 +2915,7 @@ impl Core {
             task: origin.task,
             commit_fixes,
             requested_by: origin.requested_by,
+            once: origin.once,
             folder,
             ext: twr_ext_map(json!({ LOOP_START_KEY: facts })),
             ..Default::default()
@@ -2927,7 +3044,7 @@ impl Core {
         let view = self.view(&thread)?.clone();
         let config = &hub.config.loops;
         let avail = availability(hub, &self.accounts, Some(&view));
-        let problems = validate(&setup.settings, &avail, config);
+        let problems = validate_run(&setup.settings, &avail, config, setup.once);
         if !problems.is_empty() {
             return Err(rpc(
                 codes::CONFLICT,
@@ -2942,7 +3059,7 @@ impl Core {
             .overrides
             .apply(&setup.settings, setup.kind)
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
-        let problems = validate(&run, &avail, config);
+        let problems = validate_run(&run, &avail, config, setup.once);
         if !problems.is_empty() {
             return Err(rpc(
                 codes::CONFLICT,
@@ -2994,6 +3111,7 @@ impl Core {
                 overrides: setup.overrides.clone(),
                 task: setup.task.clone(),
                 requested_by: setup.requested_by,
+                once: setup.once,
             },
             StartFrom::card(card),
             caller,

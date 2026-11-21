@@ -505,7 +505,7 @@ async fn an_idle_worker_after_an_interim_report_fires_its_watch_after_the_grace(
     );
     assert!(line.contains("summary=\"Tests are running"), "{line}");
     assert!(
-        line.contains(" watch=w1 note=\"tell the user what finished\""),
+        line.contains(" watch=w1 repeat=true note=\"tell the user what finished\""),
         "{line}"
     );
     assert!(line.ends_with(&format!(" thread_id={api}")), "{line}");

@@ -240,6 +240,16 @@ describe("Send as implementation loop", () => {
       confirm: false,
     });
   });
+  it("keeps the path of a file named last exactly, a trailing space too", () => {
+    // An older app's upload: its name, and so its path, ends in a space.
+    const task =
+      "build it\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt ";
+    expect(sendAsLoop(`  ${task}\n\n`)).toEqual({ task, confirm: false });
+    // Anything else ending the task is trimmed as before.
+    expect(sendAsLoop("look at\n/w/.twr-uploads/1/notes.txt  ").task).toBe(
+      "look at\n/w/.twr-uploads/1/notes.txt",
+    );
+  });
   it("asks first when nothing was typed", () => {
     expect(sendAsLoop("")).toEqual({ confirm: true });
     expect(sendAsLoop("  \n ")).toEqual({ confirm: true });
@@ -770,6 +780,30 @@ describe("rendered", () => {
       ["Run without a loop", true],
       ["Cancel", true],
     ]);
+  });
+
+  it("shows the files a held task names by name, never their paths", async () => {
+    const { LoopSetupCard } = await import("../shared/LoopViews");
+    // An older hub's summary holds the task's lines as they are, the file's pair too.
+    const summary = implementCard.replace(
+      "             (+2 more lines)",
+      "             Uploaded file: spec.md\n             /w/.twr-uploads/1/spec.md",
+    );
+    const html = renderToStaticMarkup(
+      createElement(LoopSetupCard, {
+        item: card({ summary }),
+        thread: worker(),
+        readOnly: false,
+        onRespond: async () => {},
+      }),
+    );
+    expect(html).toContain(
+      '<ul class="sent-attachments" aria-label="Attached files">',
+    );
+    expect(html).toContain("<span>spec.md</span>");
+    expect(html).not.toContain(".twr-uploads");
+    expect(html).not.toContain("Uploaded file");
+    expect(html).toContain("test it with the fixtures");
   });
 
   it("has no Workers row for an implementer whose runtime runs no subagents", async () => {

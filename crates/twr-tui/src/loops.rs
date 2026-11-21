@@ -363,14 +363,21 @@ fn phases(l: &LoopView) -> Vec<(Phase, bool)> {
             t.is_some() && !swept && l.phase != Phase::Sweep,
         ));
     }
-    out.push((Phase::Verify, t.is_some_and(|t| t.verify_skipped)));
+    // A single pass has no verification (nor sweep: its plan has none).
+    if !l.once {
+        out.push((Phase::Verify, t.is_some_and(|t| t.verify_skipped)));
+    }
     out.push((Phase::Report, false));
     out
 }
 
 /// Why `skip to verify` does nothing now, or `None` when it does: before an implementation
-/// loop has implemented its plan, and once a loop is past its ladder (as the hub refuses it).
+/// loop has implemented its plan, in a single pass, and once a loop is past its ladder (as the
+/// hub refuses it).
 pub fn skip_refused(l: &LoopView) -> Option<&'static str> {
+    if l.once {
+        return Some("a single pass has no verification to skip to");
+    }
     match l.phase {
         Phase::Plan | Phase::PlanCheck | Phase::Implement => {
             Some("the loop has not implemented its plan yet: skip to verify comes after it")
@@ -531,7 +538,11 @@ pub fn status_text(t: &twr_core::reduce::ThreadView) -> String {
             let mut out = format!(
                 "{} runs no loop; its last {} ended {}",
                 t.name,
-                kind_words(last.kind),
+                if last.once {
+                    "single review pass"
+                } else {
+                    kind_words(last.kind)
+                },
                 outcome_words(last.outcome)
             );
             if let Some(c) = commit_words(last, true) {
@@ -658,6 +669,15 @@ pub fn ended_line(last: &twr_core::reduce::LastLoop, width: usize) -> Line<'stat
     Line::from(crate::ui::cut_spans(spans, width))
 }
 
+/// `loop.request`'s flags: show the setup card first, run a single pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LoopFlags {
+    /// `setup: true`.
+    pub(crate) setup: bool,
+    /// `once: true` (a review loop's single pass).
+    pub(crate) once: bool,
+}
+
 /// How a loop ended, in a word or two, as a card says it (`clean`, `cap expired`).
 fn outcome_short(o: twr_core::loops::Outcome) -> &'static str {
     use twr_core::loops::Outcome;
@@ -665,6 +685,7 @@ fn outcome_short(o: twr_core::loops::Outcome) -> &'static str {
         Outcome::Clean => "clean",
         Outcome::LedgerFixedPoint => "at a ledger fixed point",
         Outcome::CapExpired => "cap expired",
+        Outcome::Triaged => "triaged",
         Outcome::Stopped => "stopped",
         Outcome::Failed => "failed",
     }
@@ -693,6 +714,7 @@ pub fn outcome_words(o: twr_core::loops::Outcome) -> &'static str {
         Outcome::Clean => "clean",
         Outcome::LedgerFixedPoint => "at a ledger fixed point",
         Outcome::CapExpired => "with its verification cap spent",
+        Outcome::Triaged => "with its findings triaged",
         Outcome::Stopped => "stopped",
         Outcome::Failed => "failed",
     }
@@ -2020,10 +2042,12 @@ impl AppState {
         &mut self,
         thread: Option<&str>,
         setup: bool,
+        once: bool,
         scope: Option<String>,
         overrides: Vec<(&'static str, Option<String>)>,
     ) -> (Vec<Action>, bool) {
-        self.request_loop(LoopKind::Review, thread, setup, scope, None, overrides)
+        let flags = LoopFlags { setup, once };
+        self.request_loop(LoopKind::Review, thread, flags, scope, None, overrides)
     }
 
     /// `/implement [thread] [flags] [task…]`: `loop.request {thread, kind: implement, task?,
@@ -2053,20 +2077,20 @@ impl AppState {
         self.request_loop(
             LoopKind::Implement,
             thread.as_deref(),
-            setup,
+            LoopFlags { setup, once: false },
             None,
             task,
             overrides,
         )
     }
 
-    /// `loop.request {thread, kind, setup?, scope?, task?, overrides?}` on the named thread,
+    /// `loop.request {thread, kind, setup?, once?, scope?, task?, overrides?}` on the named thread,
     /// else the one dived into, else the selected card's.
     fn request_loop(
         &mut self,
         kind: LoopKind,
         thread: Option<&str>,
-        setup: bool,
+        flags: LoopFlags,
         scope: Option<String>,
         task: Option<String>,
         overrides: Vec<(&'static str, Option<String>)>,
@@ -2087,8 +2111,11 @@ impl AppState {
         if let Some(task) = task {
             p["task"] = json!(task);
         }
-        if setup {
+        if flags.setup {
             p["setup"] = json!(true);
+        }
+        if flags.once {
+            p["once"] = json!(true);
         }
         if let Some(s) = scope {
             p["scope"] = json!(s);

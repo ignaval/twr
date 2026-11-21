@@ -429,6 +429,33 @@ async fn an_idle_thread_moves_and_its_next_turn_gets_the_handoff() {
 
 /// Mid-turn, the old runtime finishes its turn first; the prompt queued meanwhile then starts
 /// the new runtime with a handoff that covers that last turn.
+/// The handoff quotes a prompt that ends with a file the apps attached with that file's path
+/// exactly, a trailing space too (an older app's upload): the new runtime reads that file.
+#[tokio::test]
+async fn the_handoff_keeps_the_path_of_a_file_a_prompt_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = Recorder::default();
+    let hub = Hub::open(opts(dir.path(), &rec)).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("web", "fake")).await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    let prompt = "build it\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt ";
+    send(&hub, &t, prompt);
+    until(&mut sub, report_of(1)).await;
+    hub.set_runtime_model("web", Some("rec"), Some("rec-big"), Some("deep"), &user())
+        .unwrap();
+    until(&mut sub, |e| restart_reason(e).is_some()).await;
+    send(&hub, &t, "go on");
+    until(&mut sub, report_of(2)).await;
+    let first = rec.sessions()[0].first.clone().expect("the handoff");
+    for part in [
+        format!("## Task (the thread's first prompt)\n{prompt}\n"),
+        format!("prompt: {prompt}\nreply:"),
+    ] {
+        assert!(first.contains(&part), "{part:?} missing from:\n{first}");
+    }
+    hub.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_running_thread_moves_after_its_turn() {
     let dir = tempfile::tempdir().unwrap();

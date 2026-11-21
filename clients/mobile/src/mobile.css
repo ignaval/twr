@@ -782,6 +782,12 @@ select {
 :root[data-mobile="true"].short-content .latest-user-message {
   display: none;
 }
+/* The `/usage` panel shrinks before the message box (shared/usage.css), down to its padding:
+   in a tiny viewport with the keyboard open even that would push the message box down, so
+   the panel steps aside while you type and comes back when the keyboard closes. */
+:root[data-mobile="true"].tiny-content[data-keyboard="true"] .usage-panel {
+  display: none;
+}
 :root[data-mobile="true"].tiny-content .toast {
   top: calc(max(env(safe-area-inset-top), var(--occlusion-top, 0px)) + 8px);
   max-height: 44px;
@@ -978,4 +984,65 @@ select {
 [data-mobile="true"] .loop-starts > button {
   min-height: 44px;
   min-width: 44px;
+}
+/* Attached files (shared/ComposerAttachments.tsx) sit in the message box above the text,
+ * across its width: the text and the controls move down a row. The ✕ on a tile or chip,
+ * and a chip itself, are 44-point targets. */
+[data-mobile="true"] .composer-attachments {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+[data-mobile="true"] .composer:has(> .composer-attachments) > textarea,
+[data-mobile="true"] .composer:has(> .composer-attachments) > .composer-bottom {
+  grid-row: 3;
+}
+[data-mobile="true"]
+  .composer:has(> .composer-attachments)
+  > .composer-voice-status {
+  grid-row: 5;
+}
+@media (max-width: 519px) {
+  [data-mobile="true"]
+    .composer:has(> .composer-attachments)
+    > .composer-bottom {
+    grid-row: 4;
+  }
+}
+[data-mobile="true"][data-fold="vertical"]
+  .composer:has(> .composer-attachments)
+  > .composer-bottom {
+  grid-row: 4;
+}
+/* The strip scrolls past two rows of chips, and sooner on a short screen (a phone sideways
+ * with the keyboard open): it gets the height the keyboard leaves after the top bar, the
+ * conversation at its least and the rest of the composer (the destination, the message at
+ * its least, the controls' row), 220 points in all, and at least one row of chips. So Send
+ * and the model stay on screen. */
+[data-mobile="true"] .composer-attachments > ul {
+  max-height: clamp(52px, calc(var(--viewport-height, 100dvh) - 220px), 128px);
+  padding: 8px 8px 0;
+}
+/* With the `/usage` panel open, the panel's least height (its padding and margin, 34
+   points) comes off the strip's room too. */
+:root[data-mobile="true"]:has(.usage-panel) .composer-attachments > ul {
+  max-height: clamp(52px, calc(var(--viewport-height, 100dvh) - 254px), 128px);
+}
+[data-mobile="true"] .attachment-remove {
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+}
+[data-mobile="true"] .attachment-chip {
+  height: 44px;
+}
+[data-mobile="true"] .attachment-chip > .attachment-open {
+  min-height: 44px;
+  padding-right: 44px;
+}
+[data-mobile="true"] .attachment-chip > .attachment-remove {
+  top: 0;
+  right: 0;
+  align-items: center;
+  justify-content: center;
 }
