@@ -2000,6 +2000,30 @@ describe("attached files", () => {
     expect(app().box().value).toBe("quick words and a file, then more");
   });
 
+  it("writes nothing as the page unloads when every draft is saved already", async () => {
+    await start();
+    await app().type("saved words");
+    await app().wait(450);
+    // Written whole from memory, a needless save would undo what was stored since (an
+    // outbox message another writer added, say).
+    const write = app().host.secureWrite!;
+    let writes = 0;
+    app().host.secureWrite = async (key: string, value: string) => {
+      writes += 1;
+      return write(key, value);
+    };
+    const { saveNow } = await import("../shared/save-now");
+    await app().act(() => saveNow());
+    await app().act(async () => {
+      window.dispatchEvent(new FakeEvent("pagehide") as unknown as Event);
+    });
+    await app().settle();
+    expect(writes).toBe(0);
+    await app().type(" and more");
+    await app().act(() => saveNow());
+    expect(writes).toBeGreaterThan(0);
+  });
+
   it("keeps a file attached just before a send the outbox refuses, over a restart", async () => {
     await start();
     app().host.sendMessage = async () => ({ action: "sent" });

@@ -468,6 +468,7 @@ export default function App({
     const stop = () => {
       clearTimeout(timer);
       if (draftSaveTimer.current === timer) draftSaveTimer.current = undefined;
+      timer = undefined;
     };
     const save = (epoch: number) =>
       journal
@@ -482,6 +483,9 @@ export default function App({
           draftSaveTimer.current = timer;
           return;
         }
+        if (draftSaveTimer.current === timer)
+          draftSaveTimer.current = undefined;
+        timer = undefined;
         void save(epoch);
       };
       stop();
@@ -501,6 +505,9 @@ export default function App({
       changed(0);
     });
     const saveNow = async () => {
+      // Only a save still waiting: one with nothing to save would write the whole record
+      // from memory over anything stored since (the outbox included).
+      if (timer === undefined && !pendingEnqueue.current) return;
       stop();
       // A message on its way into the outbox clears its draft first (up to 1.5 s, inside
       // the 2 s a closing desktop window waits); one still on its way keeps the drafts
