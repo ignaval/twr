@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   RECEIPT_WINDOW,
+  restoredOf,
   type OfflineJournal,
   type OutboxMessage,
 } from "./offline";
@@ -44,7 +45,9 @@ export function Outbox({
           try {
             const result = await journal.deliver(message);
             onSent(result);
-          } catch {
+          } catch (error) {
+            const back = restoredOf(error);
+            if (back.length) onSent({ restored_drafts: back });
             const current = journal.snapshot.outbox.find(
               (item) => item.id === message.id,
             );
@@ -119,7 +122,10 @@ export function Outbox({
                   void journal!
                     .deliver(message, true)
                     .then(onSent)
-                    .catch(() => {})
+                    .catch((error) => {
+                      const back = restoredOf(error);
+                      if (back.length) onSent({ restored_drafts: back });
+                    })
                 }
               >
                 Retry with same ID

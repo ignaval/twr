@@ -1601,7 +1601,18 @@ export function SendAsLoop({
   const access = startAccess(loops.access, thread);
   const why = access.why;
   return (
-    <div className={`send-as-loop ${phone ? "phone" : ""}`}>
+    <div
+      className={`send-as-loop ${phone ? "phone" : ""}`}
+      // Esc closes the choice from its button too (Shift-Tab from the panel lands there),
+      // and never reaches the app, which would leave the conversation.
+      onKeyDown={(e) => {
+        if (open && e.key === "Escape") {
+          e.preventDefault();
+          e.stopPropagation();
+          close();
+        }
+      }}
+    >
       <button
         type="button"
         ref={opener}
@@ -1633,13 +1644,6 @@ export function SendAsLoop({
           aria-label="Send as"
           tabIndex={-1}
           aria-describedby={access.act ? undefined : `${ids}-what`}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              e.preventDefault();
-              e.stopPropagation();
-              close();
-            }
-          }}
         >
           <button
             type="button"

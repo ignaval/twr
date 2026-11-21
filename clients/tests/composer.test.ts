@@ -2358,6 +2358,19 @@ describe("implementation loops from the message box", () => {
     expect(asked).toEqual([]);
   });
 
+  it("closes the choice with Esc from its button, staying in the conversation", async () => {
+    await app().talkTo("builder");
+    const caret = app().find(".send-caret");
+    await app().click(caret);
+    expect(app().all(".send-loop-panel")).toHaveLength(1);
+    // Shift-Tab from the panel lands on its button, the panel still open.
+    await app().act(async () => void press(caret, "Escape"));
+    expect(app().all(".send-loop-panel")).toHaveLength(0);
+    expect(app().box().getAttribute("aria-label")).toBe(
+      "Message builder directly",
+    );
+  });
+
   it("offers it only when the message goes to a thread", async () => {
     expect(app().all(".send-caret")).toHaveLength(0);
     await app().talkTo("builder");

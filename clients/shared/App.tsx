@@ -9,6 +9,7 @@ import {
   messageDraft,
   messageText,
   offlineJournal,
+  restoredOf,
   type OfflineJournal,
 } from "./offline";
 import { TerminalSnapshots } from "./terminalSnapshots";
@@ -1898,6 +1899,9 @@ export default function App({
       );
       setQueueRefresh((n) => n + 1);
     } catch (e) {
+      // Earlier saved messages the hub held went back to their drafts before this failed.
+      for (const restored of restoredOf(e))
+        restoreDraft(restored.key, restored.text);
       fail(e);
     } finally {
       uploads.release(fileIds);

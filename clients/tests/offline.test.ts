@@ -8,6 +8,7 @@ import {
   appendDraft,
   appendMessage,
   isCommandDraft,
+  restoredOf,
   isShellDraft,
   isSlashDraft,
   messageText,
@@ -463,6 +464,40 @@ describe("encrypted offline recovery", () => {
     await restored.load();
     expect(restored.snapshot.outbox).toHaveLength(1);
     expect(restored.snapshot.drafts["work:orchestrator"]).toBe("new typing");
+  });
+  it("hands back an earlier message the hub held when a later one fails", async () => {
+    const disk = storage();
+    let calls = 0;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: async () => {
+          calls += 1;
+          if (calls === 1) return { action: "pending" };
+          throw new Error("hub went away");
+        },
+      } as unknown as DesktopAPI,
+      "restored-on-failure",
+    );
+    await journal.load();
+    await journal.enqueue("work", "say", { message: "first" });
+    const second = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "second",
+    });
+    const failed = await journal.deliver(second).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failed).toBeInstanceOf(Error);
+    expect((failed as Error).message).toContain("hub went away");
+    // The first is in the saved drafts, and the error carries it to the message box, or
+    // the box's next save would write over it.
+    expect(journal.snapshot.drafts["work:orchestrator"]).toBe("first");
+    expect(restoredOf(failed)).toEqual([
+      { key: "work:orchestrator", text: "first" },
+    ]);
+    expect(restoredOf(new Error("plain"))).toEqual([]);
   });
   it("never carries cached permission visibility into saved messages", async () => {
     const disk = storage();

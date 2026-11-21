@@ -635,6 +635,16 @@ describe("the popup, rendered", () => {
     expect(m.calls).toEqual([]);
   });
 
+  it("closes with Esc from its button, where Shift-Tab from the popup lands", async () => {
+    const m = await mount({ target: thread({}) });
+    const trigger = q(m.root, ".model-picker-trigger")!;
+    await m.act(() => click(trigger));
+    expect(q(m.root, "[role=dialog]")).not.toBeNull();
+    await m.act(() => void press(trigger as any, "Escape"));
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(m.calls).toEqual([]);
+  });
+
   it("asks before moving a thread to another runtime", async () => {
     const m = await mount({ target: thread({ model: "opus" }) });
     await m.act(() => click(q(m.root, ".model-picker-trigger")!));

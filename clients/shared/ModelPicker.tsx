@@ -656,6 +656,14 @@ export function ModelPicker({
         title={reason ? `${shown.label} (${reason})` : shown.label}
         disabled={disabled}
         onClick={() => (open ? close() : show())}
+        onKeyDown={(event) => {
+          // Shift-Tab from the popup lands here, with the popup still open: Esc closes it.
+          if (open && event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            close();
+          }
+        }}
       >
         <span className="model-picker-mark" aria-hidden="true">
           {runtimeMark(target.runtime)}

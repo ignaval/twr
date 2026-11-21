@@ -19,6 +19,25 @@ export interface OutboxMessage extends DurableMessage {
  * other text it goes as the message it sends ([`messageText`]): Send reads escapes only at
  * the start of the box, so a `\!` or `//` that kept it a message there would be sent too.
  */
+/**
+ * An earlier message the outbox moved back to its draft (the hub held it for a waiting
+ * request) is in the saved drafts already, but not yet in the message box: when a later
+ * delivery fails, the error carries it (`restored_drafts`), so the caller puts it in the box
+ * as a success would. Otherwise the box's next save would write over it.
+ */
+function withRestored(error: unknown, restored: Json[]) {
+  if (!restored.length) return error;
+  const carried =
+    error instanceof Error ? error : new Error(String(error ?? "Not sent"));
+  (carried as Error & { restored_drafts?: Json[] }).restored_drafts = restored;
+  return carried;
+}
+/** The drafts a failed [`OfflineJournal.deliver`] had already moved back ([`withRestored`]). */
+export function restoredOf(error: unknown): { key: string; text: string }[] {
+  const carried = (error as { restored_drafts?: unknown } | null)
+    ?.restored_drafts;
+  return Array.isArray(carried) ? carried : [];
+}
 export function appendDraft(current: string | undefined, text: string) {
   if (!current) return text;
   const message = messageText(text);
@@ -717,10 +736,16 @@ export class OfflineJournal {
         if (result.restored_draft) restored.push(result.restored_draft);
       } catch (error) {
         const current = this.record.outbox.find((item) => item.id === prior.id);
-        if (current && current.state !== "review") throw error;
+        if (current && current.state !== "review")
+          throw withRestored(error, restored);
       }
     }
-    const result = await this.deliverOne(requested, retryReview);
+    let result: Json;
+    try {
+      result = await this.deliverOne(requested, retryReview);
+    } catch (error) {
+      throw withRestored(error, restored);
+    }
     return restored.length ? { ...result, restored_drafts: restored } : result;
   }
   private deliverOne(requested: OutboxMessage, retryReview = false) {
