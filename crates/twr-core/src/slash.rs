@@ -335,7 +335,10 @@ pub const READ_WORDS: &[(&str, &str)] = &[
         "the speakers connected, live mode on each, what is read",
     ),
     ("this", "the long message selected in the conversation"),
-    ("voice", "the speakers' voice: /read voice <name>"),
+    (
+        "voice",
+        "the speakers' voice: /read voice <name> (`twr voices list`; kokoro/af_heart is one of twr's natural voices)",
+    ),
     (
         "rate",
         "the speakers' speed: /read rate <80-500 words per minute>",
@@ -383,7 +386,9 @@ fn parse_read(args: &[String], usage: &str) -> Result<Slash, String> {
         ["status"] if on.is_none() => ReadCmd::Status,
         ["status"] => return Err("/read status lists every speaker; --on is for the others".into()),
         ["this"] => ReadCmd::This,
-        ["voice"] => return Err("usage: /read voice <name> (quote a name with spaces)".into()),
+        ["voice"] => return Err(
+            "usage: /read voice <name> (quote a name with spaces; `twr voices list` names them, and a voice per language is `[speech] voices`)".into(),
+        ),
         ["voice", name @ ..] => ReadCmd::Voice(name.join(" ")),
         ["rate", wpm] => match wpm.parse::<u32>() {
             Ok(r) if (RATE_MIN..=RATE_MAX).contains(&r) => ReadCmd::Rate(r),

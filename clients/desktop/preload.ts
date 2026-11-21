@@ -21,6 +21,26 @@ const api: DesktopAPI = {
   voiceTranscribe: (recording, hint) =>
     ipcRenderer.invoke("twr:voice-transcribe", recording, hint),
   voiceSpeaker: (op) => ipcRenderer.invoke("twr:voice-speaker", op),
+  readAloudVoices: {
+    list: () => ipcRenderer.invoke("twr:voices-list"),
+    select: (lang, voice) =>
+      ipcRenderer.invoke("twr:voices-select", lang, voice),
+    install: (model) => ipcRenderer.invoke("twr:voices-install", model),
+    preview: (voice, lang) =>
+      ipcRenderer.invoke("twr:voices-preview", voice, lang),
+    stopPreview: () => ipcRenderer.invoke("twr:voices-preview-stop"),
+    openSystemVoices: () => ipcRenderer.invoke("twr:voices-system"),
+    onEvent: (callback) => {
+      const listener = (_: unknown, event: DesktopEvent) => {
+        if (event.type === "voice-install" && event.install)
+          callback({ type: "install", install: event.install });
+        else if (event.type === "voice-preview")
+          callback({ type: "preview", voice: event.preview?.voice });
+      };
+      ipcRenderer.on("twr:event", listener);
+      return () => ipcRenderer.removeListener("twr:event", listener);
+    },
+  },
   quit: () => ipcRenderer.invoke("twr:quit"),
   copyText: (text) => ipcRenderer.invoke("twr:copy-text", text),
   bootstrap: () => ipcRenderer.invoke("twr:bootstrap"),

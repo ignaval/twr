@@ -50,6 +50,11 @@ pub struct SpeechState {
     /// The rate `/read rate` set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<u32>,
+    /// A voice per language chosen for this device itself (a phone's, in its app's settings:
+    /// `twr_app`'s gateway keeps it here, as the hub machine's `[speech] voices` are not the
+    /// phone's).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub voices: BTreeMap<String, String>,
 }
 
 /// The key of a live switch: `<host>/<ws>`.

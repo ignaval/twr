@@ -850,6 +850,58 @@ async fn only_users_switch_and_only_to_runtimes_that_attach_mcp() {
     hub.shutdown().await;
 }
 
+/// A switch's own reasoning effort (`orchestrator.use` `effort`) starts the new orchestrator
+/// with it, in its runtime's spelling, and the result says it; one the runtime does not take
+/// is refused before anything happens; the next switch without one gets the runtime's
+/// default again.
+#[tokio::test]
+async fn a_switch_sets_the_reasoning_effort() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let effort = |e: &str| SwitchOptions {
+        effort: Some(e.into()),
+        ..quick()
+    };
+    let e = hub
+        .use_orchestrator("codex", Some("o5"), effort("loud"), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert!(
+        e.message.contains("unknown reasoning effort"),
+        "{}",
+        e.message
+    );
+    assert!(hub.orchestrator_thread().is_none(), "nothing was created");
+
+    let r = switch(&hub, "codex", Some("o5"), effort(" Low ")).await;
+    assert_eq!(r["model"], "o5");
+    assert_eq!(r["effort"], "low");
+    let first = r["thread"].as_str().unwrap().to_string();
+    hub.say("anything new?", None, &tui()).await.unwrap();
+    let mut codex = env.orch().await;
+    assert_eq!(codex.cfg.model.as_deref(), Some("o5"));
+    assert_eq!(codex.cfg.effort.as_deref(), Some("low"));
+    assert_eq!(hub.info()["orchestrator"]["effort"], "low");
+    let (_, t) = codex.next_turn().await;
+    codex.end_turn(t);
+
+    // Refused while one runs: it keeps running, unchanged.
+    let e = hub
+        .use_orchestrator("grok-build", None, effort("loud"), &tui())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(first.as_str()));
+
+    let r = switch(&hub, "grok-build", None, quick()).await;
+    assert_eq!(r["effort"], Value::Null);
+    codex.wait_stopped().await;
+    let grok = env.orch().await;
+    assert_eq!(grok.cfg.effort, None);
+    hub.shutdown().await;
+}
+
 /// A worker thread that holds the name `orchestrator` keeps it: orchestrators then get
 /// `orchestrator-<n>` (and still the free alias `orch`), as before, across switches too.
 #[tokio::test]
@@ -1965,7 +2017,7 @@ async fn show_says_whether_the_runtime_was_configured_and_what_is_installed() {
     );
     assert_eq!(
         models["codex"]["models"][0]["id"],
-        json!("gpt-6.1-sol"),
+        json!("gpt-6.2-sol"),
         "{o}"
     );
     assert_eq!(

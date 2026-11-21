@@ -21,6 +21,8 @@ futures.workspace = true
 # Process groups of the engines' programs, the state file's lock (`flock`), `isatty`.
 libc.workspace = true
 serde.workspace = true
+# `[speech]` read again while a speaker runs (`speaker::config_voices`).
+toml.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

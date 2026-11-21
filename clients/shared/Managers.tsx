@@ -1,5 +1,6 @@
 import { RunnerPanel } from "./RunnerPanel";
 import { OfflineOptions } from "./OfflineOptions";
+import { ReadAloudVoiceOptions } from "./ReadAloudVoiceOptions";
 import { AppOptions } from "./AppOptions";
 import { OrchestratorAccessOptions } from "./OrchestratorAccessOptions";
 import { LayoutOptions } from "./LayoutOptions";
@@ -1298,6 +1299,7 @@ function ScalarSetting({
 }
 
 function ClientPreferences() {
+  const host = useHostAPI();
   return (
     <>
       <section className="settings-section">
@@ -1311,6 +1313,9 @@ function ClientPreferences() {
       </section>
       <LayoutOptions />
       <AccessibilityOptions />
+      {host.readAloudVoices && (
+        <ReadAloudVoiceOptions voices={host.readAloudVoices} />
+      )}
       <OfflineOptions />
       <AppOptions />
     </>

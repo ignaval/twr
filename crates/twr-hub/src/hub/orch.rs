@@ -4237,6 +4237,8 @@ impl Hub {
                     .and_then(|id| core.registry.get(id))
                     .is_some();
                 drop(core);
+                // A reset keeps the current effort (`create_orchestrator`); a first one gets
+                // the config's.
                 if exists {
                     (runtime, model, None, OrchAccountFrom::Keep)
                 } else {

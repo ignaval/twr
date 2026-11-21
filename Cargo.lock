@@ -5359,6 +5359,7 @@ name = "twr-cli"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "chrono",
  "clap",
  "clap_complete",
@@ -5562,6 +5563,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "twr-avspeech",
  "twr-core",
