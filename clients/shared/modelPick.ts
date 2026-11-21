@@ -227,22 +227,26 @@ export type Plan =
  * left out is that runtime's default). The orchestrator is switched with `orchestrator.use`
  * and the handoff summary: its runtime (with its account, on the same runtime), and the model
  * and effort picked (one left out is the runtime's default).
+ *
+ * `account`: the orchestrator's account as `orchestrator.show` names it ([`orchAccount`]).
+ * A thread records no account while it runs on the native login, and a bare runtime would
+ * get the policy's default account, which may be another one: the native login goes by
+ * its current name (`codex:default`), as the TUI's `/orch` sends it.
  */
 export function planChange(
   target: "orchestrator" | "thread",
   thread: Thread,
   pick: Pick,
+  account?: string,
 ): Plan {
   const now = currentPick(thread);
   const same = pick.runtime === now.runtime;
   if (target === "orchestrator") {
     if (same && pick.model === now.model && pick.effort === now.effort)
       return { kind: "none" };
+    const kept = thread.account || account;
     const params: Json = {
-      runtime:
-        same && thread.account
-          ? `${pick.runtime}:${thread.account}`
-          : pick.runtime,
+      runtime: same && kept ? `${pick.runtime}:${kept}` : pick.runtime,
       summary: true,
     };
     if (pick.model) params.model = pick.model;
@@ -260,6 +264,36 @@ export function planChange(
   if (pick.effort !== now.effort) params.effort = pick.effort ?? "default";
   if (!("model" in params) && !("effort" in params)) return { kind: "none" };
   return { kind: "thread", params, move: false };
+}
+
+/** The account the orchestrator `thread` runs on, from `orchestrator.show` (`show`): the
+ * native login under its current name too. `undefined` when `show` is about another
+ * orchestrator (it was switched meanwhile) or an older hub's, which names none. */
+export function orchAccount(show: Json, thread: Thread): string | undefined {
+  if (!show || show.thread !== thread.id) return undefined;
+  return typeof show.account === "string" && show.account
+    ? show.account
+    : undefined;
+}
+
+/** Whether `orchestrator.show` (`show`) says `runtime`'s program is missing on the hub's
+ * machine (`installed`): an orchestrator switched to it can't start until it is there. */
+export function notInstalled(show: Json, runtime: string): boolean {
+  return show?.installed?.[runtime] === false;
+}
+
+/** What went wrong with a change that went through, as its result says (`orchestrator.use`,
+ * `thread.set_model`): the hub's `warning` (a runtime whose program is missing), and the new
+ * orchestrator's `start_error`. `undefined`: nothing. */
+export function changeProblem(result: Json): string | undefined {
+  const said: string[] = [];
+  if (typeof result?.warning === "string" && result.warning)
+    said.push(result.warning);
+  if (typeof result?.start_error === "string" && result.start_error)
+    said.push(`The new orchestrator could not start: ${result.start_error}`);
+  // (Each a sentence: the hub's end without a stop.)
+  const sentence = (t: string) => (/[.!?]$/.test(t) ? t : t + ".");
+  return said.length ? said.map(sentence).join(" ") : undefined;
 }
 
 /** Whether `event` opens the picker: Ctrl+Shift+M, ⌘+Shift+M on a Mac. */

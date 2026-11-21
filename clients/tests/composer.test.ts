@@ -1316,6 +1316,29 @@ describe("the message box, at its edges", () => {
     expect(app().box().value).toBe("");
   });
 
+  it("takes a suggestion that starts with / as a message, escaped", async () => {
+    await start({
+      ...suggesting,
+      rpc: (method: string) =>
+        method === "suggest.next"
+          ? Promise.resolve({ suggestion: "/usage is what I'd check" })
+          : undefined,
+    });
+    for (let i = 0; i < 40; i++) {
+      if (app().box().getAttribute("placeholder")?.startsWith("/usage")) break;
+      await app().wait(100);
+    }
+    await app().wait(SUGGEST_SETTLE_MS + 50);
+    await app().press("Tab");
+    expect(app().box().value).toBe("//usage is what I'd check");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().host.sent[0].params).toMatchObject({
+      message: "/usage is what I'd check",
+      suggested: true,
+    });
+  });
+
   it("forgets a taken suggestion once it is edited, even back to the same words", async () => {
     await start(suggesting);
     await suggested();
@@ -2434,5 +2457,103 @@ describe("/access in the message box", () => {
     expect(asked).toEqual([
       { method: "orchestrator.access", params: { access: "limited" } },
     ]);
+  });
+});
+
+describe("messages put back in the box stay messages", () => {
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const start = async (options?: Parameters<typeof mount>[0]) => {
+    vi.resetModules();
+    mounted = await mount(options);
+  };
+  const sentMessages = () =>
+    app().host.sent.map((s) => s.params.message ?? s.params.prompt);
+
+  it("sends a leading ! with \\!, and a leading \\! with one more backslash", async () => {
+    await start();
+    await app().type("\\!ls is what I ran");
+    await app().press("Enter");
+    await app().type("\\\\!x");
+    await app().press("Enter");
+    await app().type("!!!wow");
+    await app().press("Enter");
+    expect(sentMessages()).toEqual(["!ls is what I ran", "\\!x", "!!!wow"]);
+  });
+
+  it("takes back a queued / or ! message escaped, and sends it as a message again", async () => {
+    await start({
+      rpc: (method) =>
+        method === "shell.run" ? Promise.resolve({ job: "j1" }) : undefined,
+    });
+    app().host.queues.w1 = [
+      { ref: 1, prompt: "/usage", mine: true },
+      { ref: 2, prompt: "!ls", mine: true },
+    ];
+    await app().talkTo("builder");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("//usage");
+    await app().press("Enter");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("\\!ls");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().host.sent.map((s) => s.method)).toEqual([
+      "thread.send",
+      "thread.send",
+    ]);
+    expect(sentMessages()).toEqual(["/usage", "!ls"]);
+  });
+
+  it("puts back what a switch dropped escaped, and says the new orchestrator can't start", async () => {
+    const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
+    const uses: Json[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "orchestrator.show")
+          return Promise.resolve({
+            models: catalog,
+            thread: "orch",
+            account: "default",
+            installed: { fake: true },
+          });
+        if (method === "orchestrator.use") {
+          uses.push(params);
+          return Promise.resolve({
+            thread: "orch",
+            previous: {
+              dropped_prompts: 2,
+              dropped_messages: ["/usage", "!ls"],
+            },
+            warning:
+              "fake is not on PATH: the new orchestrator cannot start until it is there (install it)",
+          });
+        }
+        return undefined;
+      },
+    });
+    await app().click(app().find(".model-picker-trigger"));
+    const search = app().find(".model-picker-search");
+    await app().act(async () => void press(search, "Enter"));
+    await app().click(
+      app()
+        .all(".model-picker-efforts [role=radio]")
+        .find((n) => n.textContent.includes("Low"))! as FakeElement,
+    );
+    await app().click(app().find("button", "Switch without summary"));
+    // The effort alone changed: the account it runs on goes with it, the native one too.
+    expect(uses).toEqual([
+      { runtime: "fake:default", effort: "low", summary: false },
+    ]);
+    expect(app().find(".notice-toast").textContent).toContain(
+      "fake is not on PATH: the new orchestrator cannot start until it is there (install it).",
+    );
+    await app().click(app().find("button", "Put back"));
+    // Escaped only where it starts the box: after other text a / or ! is a message's.
+    expect(app().box().value).toBe("//usage\n\n!ls");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(sentMessages()).toEqual(["/usage\n\n!ls"]);
   });
 });

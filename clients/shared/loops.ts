@@ -3,6 +3,7 @@
  * loop, the New thread form's switch, the setup card and the settings editor. Nothing here decides what the hub decides: who may start a loop,
  * on which settings, whether settings hold, the loop line. The hub says; this reads it. */
 import { trimMessage } from "./attachmentText";
+import { messageText } from "./offline";
 import type { Attention, Json, Thread } from "./types";
 
 /** `runtime[:account]/model[:effort]`: a named implementer (twr-core `ModelChoice`). */
@@ -1128,16 +1129,16 @@ export const MAX_TASK_BYTES = 16 * 1024;
 
 /**
  * What **Send as implementation loop** sends for a composer's `draft`: the message is the
- * task, as typed (`//` escapes a leading `/`, as Send does). A command or a shell line is no
- * task. An empty draft asks for what the conversation already settled, and `confirm` says so
- * first: nothing was typed. The whitespace around it goes, except in the path of a file
- * named last (`trimMessage`).
+ * task, as typed (`//` escapes a leading `/` and `\!` a leading `!`, as Send does). A
+ * command or a shell line is no task. An empty draft asks for what the conversation already
+ * settled, and `confirm` says so first: nothing was typed. The whitespace around it goes,
+ * except in the path of a file named last (`trimMessage`).
  */
 export function sendAsLoop(draft: string): {
   task?: string;
   confirm: boolean;
 } {
-  const text = draft.startsWith("//") ? draft.slice(1) : draft;
+  const text = messageText(draft);
   if (draft.startsWith("/") && !draft.startsWith("//"))
     throw new Error(
       "A command is no task: send it with Send, or write what to build (start it with // to send a leading /).",

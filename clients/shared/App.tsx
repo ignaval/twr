@@ -1,7 +1,10 @@
 import {
   appendDraft,
+  appendMessage,
   draftsWithFiles,
+  literalDraft,
   messageDraft,
+  messageText,
   offlineJournal,
   type OfflineJournal,
 } from "./offline";
@@ -19,7 +22,12 @@ import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
 import { ModelPicker } from "./ModelPicker";
 import { onSaveNow } from "./save-now";
-import { droppedBySwitch, droppedWords, withoutDroppedText } from "./modelPick";
+import {
+  changeProblem,
+  droppedBySwitch,
+  droppedWords,
+  withoutDroppedText,
+} from "./modelPick";
 import { MessageBody } from "./MessageBody";
 import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
@@ -426,18 +434,22 @@ export default function App({
   /**
    * Puts a message's text back in a draft (`key`: `<workspace>:orchestrator` or
    * `<workspace>:<thread>`), as Take back and the outbox do: the files it names go back on
-   * the conversation as attachments, the rest of its text into the draft.
+   * the conversation as attachments, the rest of its text into the draft. `sent`: the text
+   * is a message as the hub has it (Take back, Put back), not a draft as typed: escaped
+   * where it starts the draft (`appendMessage`), so it is still a message, never a command
+   * or a shell line.
    */
-  const restoreDraft = (key: string, text: string) => {
+  const restoreDraft = (key: string, text: string, sent = false) => {
     if (!text.trim()) return;
     const { body, files } = splitAttachments(text);
+    const add = sent ? appendMessage : appendDraft;
     if (!files.length) {
-      drafts.set(key, (old) => appendDraft(old, text));
+      drafts.set(key, (old) => add(old, text));
       return;
     }
     const { space, conversation } = draftPlace(key);
     uploads.restore(files, conversation, space);
-    if (body.trim()) drafts.set(key, (old) => appendDraft(old, body));
+    if (body.trim()) drafts.set(key, (old) => add(old, body));
   };
   useEffect(() => () => uploads.dispose(), [uploads]);
   useEffect(() => uploads.setWorkspace(workspace), [uploads, workspace]);
@@ -683,7 +695,8 @@ export default function App({
   const acceptedSuggestion = useRef<{ key: string; text: string }>(undefined);
   function acceptSuggestion() {
     if (!assistance.suggestion) return;
-    drafts.set(draftKey, assistance.suggestion);
+    // Escaped as Take back does: a suggestion is a message, never a command.
+    drafts.set(draftKey, literalDraft(assistance.suggestion));
     acceptedSuggestion.current = { key: draftKey, text: assistance.suggestion };
     input.current?.focus();
   }
@@ -1654,7 +1667,7 @@ export default function App({
               }).catch((error) => {
                 // Kept in its box, to send again.
                 drafts.set(workspace + ":" + value.id, (old) =>
-                  appendDraft(old, firstPrompt!),
+                  appendMessage(old, firstPrompt!),
                 );
                 fail(
                   `${name} was made, but its first prompt was not sent: ${errorMessage(error)}`,
@@ -1746,7 +1759,7 @@ export default function App({
     if (!uploads.reserve(fileIds)) return;
     setSending(true);
     const key = draftKey;
-    const text = draft.startsWith("//") ? draft.slice(1) : draft;
+    const text = messageText(draft);
     // What is sent, and what the outbox keeps to put back in the draft: with the files.
     const outgoing = withAttachments(text, files);
     const kept = withAttachments(draft, files);
@@ -1759,7 +1772,7 @@ export default function App({
     };
     try {
       let response: Json;
-      if (text.startsWith("!") && !text.startsWith("!!!")) {
+      if (draft.startsWith("!") && !draft.startsWith("!!!")) {
         const share = text.startsWith("!!");
         const command = text.slice(share ? 2 : 1).trim();
         if (!command)
@@ -1870,7 +1883,7 @@ export default function App({
       announce(
         response.saved_offline
           ? "Message saved on this device. It sends when the hub reconnects."
-          : text.startsWith("!") && !text.startsWith("!!!")
+          : draft.startsWith("!") && !draft.startsWith("!!!")
             ? "Shell command started"
             : "Message sent",
       );
@@ -2416,8 +2429,8 @@ export default function App({
         throw new Error(
           response.message || "This message can no longer be taken back.",
         );
-      // Its files go back on the conversation, its text into the draft.
-      restoreDraft(draftKey, String(response.prompt ?? ""));
+      // Its files go back on the conversation, its text into the draft: still a message.
+      restoreDraft(draftKey, String(response.prompt ?? ""), true);
       setQueueRefresh((n) => n + 1);
       input.current?.focus();
     } catch (error) {
@@ -2610,21 +2623,25 @@ export default function App({
   }, [notice]);
   // An orchestrator switch that dropped queued messages says so, and offers to put the
   // user's own back in the orchestrator's message box, files and all (as Take back does).
+  // One whose new orchestrator can't start (its program is missing, its start failed)
+  // says that too.
   const afterSwitch = (result: Json) => {
+    const problem = changeProblem(result);
     const { count, mine } = droppedBySwitch(result);
     const words = droppedWords(count, mine.length);
-    if (!words) return;
-    if ("notice" in words) {
-      setNotice(words.notice);
+    if (words && "notice" in words) {
+      setNotice(problem ? `${problem} ${words.notice}` : words.notice);
       return;
     }
+    if (problem) setNotice(problem);
+    if (!words) return;
     const key = workspace + ":orchestrator";
     setConfirmation({
       title: words.title,
       detail: words.detail,
       action: "Put back",
       run: () => {
-        for (const message of mine) restoreDraft(key, message);
+        for (const message of mine) restoreDraft(key, message, true);
         input.current?.focus();
       },
     });
@@ -3956,6 +3973,7 @@ export default function App({
                           : Number(queueInfo.total) || queued.length
                       }
                       switched={afterSwitch}
+                      notify={setNotice}
                     />
                   }
                 />

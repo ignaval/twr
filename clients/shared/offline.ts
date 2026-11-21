@@ -20,10 +20,36 @@ export function appendDraft(current: string | undefined, text: string) {
     ? current
     : current + "\n\n" + text;
 }
+/**
+ * The message a composer draft sends, as the TUI's `message_text` reads a line: `//...`
+ * sends `/...` and `\!...` sends `!...` (one backslash of those before a `!` goes);
+ * anything else as it is. (A draft that starts with a single `/` or a `!` is a command, or a
+ * shell line, and sends no message.)
+ */
+export function messageText(draft: string) {
+  if (draft.startsWith("\\") && draft.replace(/^\\+/, "").startsWith("!"))
+    return draft.slice(1);
+  return draft.startsWith("//") ? draft.slice(1) : draft;
+}
+/**
+ * The draft that sends `message` as it is ([`messageText`]'s inverse), as the TUI's
+ * `literal_line` writes it: what Take back, Put back and the outbox put back in the box,
+ * so Send sends it again as a message, never as a `/` command or a `!` shell line.
+ */
+export function literalDraft(message: string) {
+  if (message.replace(/^\\+/, "").startsWith("!")) return "\\" + message;
+  return message.startsWith("/") ? "/" + message : message;
+}
+/** [`appendDraft`] for a message as sent: escaped ([`literalDraft`]) when it starts the
+ * draft, where a `/` or `!` would make it a command; as it is after other text. */
+export function appendMessage(current: string | undefined, message: string) {
+  return appendDraft(current, current ? message : literalDraft(message));
+}
 export function messageDraft(message: OutboxMessage) {
   if (typeof message.draft === "string") return message.draft;
-  const text = String(message.params.prompt || message.params.message || "");
-  return text.startsWith("/") ? "/" + text : text;
+  return literalDraft(
+    String(message.params.prompt || message.params.message || ""),
+  );
 }
 export interface CachedWorkspace {
   savedAt: number;

@@ -12,12 +12,15 @@ import {
 } from "react";
 import { Check } from "lucide-react";
 import {
+  changeProblem,
   currentPick,
   effortName,
   effortRows,
   modelRows,
   navigate,
+  notInstalled,
   opensPicker,
+  orchAccount,
   pickerRuntimes,
   planChange,
   runsCommandLine,
@@ -59,6 +62,7 @@ export function ModelPicker({
   input,
   queued = 0,
   switched,
+  notify,
 }: {
   /** Where the composer sends: the orchestrator, or the dived thread. None: hidden. */
   target?: Thread;
@@ -83,8 +87,12 @@ export function ModelPicker({
   /** The orchestrator's queued messages, as the conversation shows them: a switch drops
    * them, and its confirmation says so. */
   queued?: number;
-  /** Given `orchestrator.use`'s result once a switch went through (what it dropped). */
+  /** Given `orchestrator.use`'s result once a switch went through (what it dropped, and
+   * what went wrong: [`changeProblem`]). */
   switched?: (result: Json) => void;
+  /** Says what went wrong with a thread's change that went through (the hub's `warning`),
+   * through the app's notices. */
+  notify?: (text: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -95,6 +103,12 @@ export function ModelPicker({
   // Why the last choice was refused (a runtime this device may not move to, an empty custom
   // id), shown in the models column until the next choice.
   const [notice, setNotice] = useState("");
+  // The orchestrator's `orchestrator.show`, read as the popup opens: which runtimes are
+  // installed (the rail says so), and its account by name (the native login's too), which
+  // a switch on its runtime keeps. `orchShown` is the read in flight, which a choice waits
+  // for.
+  const [orchShow, setOrchShow] = useState<Json>();
+  const orchShown = useRef<Promise<Json>>(undefined);
   const [nav, setNav] = useState<Nav>({
     column: "models",
     rail: 0,
@@ -153,6 +167,10 @@ export function ModelPicker({
   const locked = runsCommandLine(runtime);
   /** Another runtime than the thread's: a move, which this device may not make. */
   const blocked = (r: string) => !admin && r !== now.runtime;
+  /** An orchestrator's runtime whose program the hub doesn't find (`orchestrator.show`
+   * `installed`): listed, and the switch's confirmation says it can't start. */
+  const missing = (r: string) =>
+    kind === "orchestrator" && r !== now.runtime && notInstalled(orchShow, r);
   // A picked model the list doesn't have (a custom id): the custom row shows it, chosen.
   const customPicked =
     !!pending.model &&
@@ -195,6 +213,14 @@ export function ModelPicker({
       ),
     });
     openedOn.current = targetKey;
+    if (kind === "orchestrator") {
+      const reading = rpc("orchestrator.show").catch(() => undefined);
+      orchShown.current = reading;
+      setOrchShow(undefined);
+      void reading.then((show) => {
+        if (orchShown.current === reading) setOrchShow(show);
+      });
+    }
     setOpen(true);
   };
   const close = (refocus = true) => {
@@ -319,9 +345,12 @@ export function ModelPicker({
       setBusy(false);
     }
   };
-  const apply = (pick: Pick) => {
+  const apply = async (pick: Pick) => {
     close();
-    const plan = planChange(kind, target, pick);
+    // Asked against what runs now: it goes ahead only if that is still so.
+    const key = targetKey;
+    const show = kind === "orchestrator" ? await orchShown.current : undefined;
+    const plan = planChange(kind, target, pick, orchAccount(show, target));
     if (plan.kind === "none") return;
     if (!admin && (plan.kind === "orchestrator" || plan.move)) {
       fail(
@@ -329,8 +358,6 @@ export function ModelPicker({
       );
       return;
     }
-    // Asked against what runs now: it goes ahead only if that is still so.
-    const key = targetKey;
     const ask = (c: PickerConfirmation) => {
       const current = (run: () => void) => () => {
         if (asked.current?.confirmation === confirmation)
@@ -359,9 +386,14 @@ export function ModelPicker({
       .filter(Boolean)
       .join(", ");
     if (plan.kind === "orchestrator") {
+      const absent =
+        pick.runtime !== now.runtime && notInstalled(show, pick.runtime)
+          ? `${pick.runtime} is not installed on the hub's machine: the new ` +
+            "orchestrator can't start until it is. "
+          : "";
       ask({
         title: `Switch the orchestrator to ${what}?`,
-        detail: switchDetail(queued),
+        detail: absent + switchDetail(queued),
         action: "Switch with summary",
         run: () => void call("orchestrator.use", plan.params, switched),
         alt: {
@@ -383,11 +415,16 @@ export function ModelPicker({
           "A conversation cannot move between runtimes: the next message starts a new " +
           `${pick.runtime} session, with a handoff of what ${target.name} did so far.`,
         action: "Move thread",
-        run: () => void call("thread.set_model", plan.params),
+        run: () => void call("thread.set_model", plan.params, moved),
       });
       return;
     }
-    void call("thread.set_model", plan.params);
+    void call("thread.set_model", plan.params, moved);
+  };
+  /** A thread's change went through: what went wrong with it said ([`changeProblem`]). */
+  const moved = (result: Json) => {
+    const problem = changeProblem(result);
+    if (problem) notify?.(problem);
   };
   const needsAdmin = (what: "orchestrator" | "thread") =>
     what === "orchestrator"
@@ -434,7 +471,7 @@ export function ModelPicker({
     // No efforts to pick (a runtime the catalog doesn't list, an older hub): chosen, the
     // effort as it is.
     if (efforts.length <= 1) {
-      apply(pick);
+      void apply(pick);
       return;
     }
     setNav((n) => ({
@@ -471,12 +508,12 @@ export function ModelPicker({
   };
   const chooseEffort = (effort: string | null) => {
     const pick = picked();
-    if (pick) apply({ ...pick, effort: effort ?? undefined });
+    if (pick) void apply({ ...pick, effort: effort ?? undefined });
   };
   const done = () => {
-    if (locked) return apply({ runtime });
+    if (locked) return void apply({ runtime });
     const pick = picked();
-    if (pick) apply(pick);
+    if (pick) void apply(pick);
   };
 
   const keyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
@@ -577,7 +614,9 @@ export function ModelPicker({
                     ? `${r} (current)`
                     : blocked(r)
                       ? `${r}: moving to it needs a device with admin access`
-                      : r
+                      : missing(r)
+                        ? `${r}: not installed on the hub's machine`
+                        : r
                 }
                 onClick={() => chooseRuntime(r)}
               >
@@ -587,6 +626,9 @@ export function ModelPicker({
                 <span className="model-picker-rail-name">{r}</span>
                 {r === now.runtime && (
                   <Check size={12} aria-hidden="true" className="current" />
+                )}
+                {missing(r) && (
+                  <span className="model-picker-rail-note">not installed</span>
                 )}
               </button>
             ))}

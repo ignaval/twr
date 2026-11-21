@@ -72,6 +72,10 @@ The orchestrator conversation is primary. Selecting a thread opens its conversat
 **Show thread details** button beside its heading toggles its inspector. The
 composer always names its destination. Mentions reference threads without changing it.
 Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
+A line that starts with `!` runs a shell command; start it with `\!` to send a message that
+begins with `!`, as in the TUI. A message you take back from the queue, put back after an
+orchestrator switch, or take as a suggestion comes back escaped this way when it starts the
+box, so Send sends it as a message again, never as a command.
 
 Above the history, the orchestrator and each thread's conversation show the first line
 of your preceding message, on desktop and phone. At the bottom, this is your latest
@@ -240,7 +244,8 @@ message box:
 
 - On the left, the runtimes twr lists models for (Claude Code, Codex, Grok Build), the
   current one checked. A thread on another runtime, such as an ACP agent, lists its own
-  first.
+  first. For the orchestrator, a runtime whose program the hub doesn't find says **not
+  installed** under its name (`orchestrator.show` `installed`, read as the picker opens).
 - In the middle, **Search models…**, then the highlighted runtime's models with a few words
   on each, the current one checked: **Default** (the runtime's own), the models twr knows,
   and **Custom model id…**, where you type an id and press Enter or **Use**. The row then
@@ -269,7 +274,13 @@ it only another runtime. For the orchestrator every change is a switch
 (`orchestrator.use`), a new orchestrator session with a handoff, even on the same runtime, so
 the app always asks: **Switch with summary** first asks the current orchestrator for its own
 summary, **Switch without summary** hands over only what the log shows
-([orchestrator.md](orchestrator.md#switching-the-orchestrator)). A switch drops the messages
+([orchestrator.md](orchestrator.md#switching-the-orchestrator)). On the same runtime the
+switch names the account the orchestrator runs on (`codex:work`), the native login by its
+current name (`codex:default`, from `orchestrator.show` `account`), so changing only the
+model or effort never moves it to the runtime's default account. To a runtime that isn't
+installed, the question says the new orchestrator can't start until it is. After a switch,
+the hub's warning and a start that failed (`warning`, `start_error`) show as a notice, as
+does a thread move's warning. A switch drops the messages
 queued for the orchestrator, so with messages waiting the question says how many. When the
 switch dropped some, the app says so, and when some were yours it offers **Put back**: they
 return to the orchestrator's message box, their files as attachments, to send to the new

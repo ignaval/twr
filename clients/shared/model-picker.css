@@ -138,6 +138,16 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* An orchestrator runtime the hub doesn't find installed: still listed, said under it. */
+.model-picker-rail > button {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+.model-picker-rail-note {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 0.846154rem;
+}
 .model-picker-search {
   margin: 0 0 4px;
   width: 100%;

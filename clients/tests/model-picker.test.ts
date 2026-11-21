@@ -9,8 +9,11 @@ import {
   pickerRuntimes,
   planChange,
   runtimeMark,
+  changeProblem,
   droppedBySwitch,
   droppedWords,
+  notInstalled,
+  orchAccount,
   switchDetail,
   triggerText,
   withoutDroppedText,
@@ -186,6 +189,59 @@ describe("what a choice asks of the hub", () => {
       }),
     ).toEqual({ kind: "none" });
   });
+
+  it("keeps the native login by its name when only the effort changes", () => {
+    // On the native login the thread records no account; `orchestrator.show` names it.
+    const orch = thread({ id: "o", runtime: "codex", is_orchestrator: true });
+    const show = { thread: "o", account: "default" };
+    expect(
+      planChange(
+        "orchestrator",
+        orch,
+        { runtime: "codex", effort: "high" },
+        orchAccount(show, orch),
+      ),
+    ).toEqual({
+      kind: "orchestrator",
+      params: { runtime: "codex:default", effort: "high", summary: true },
+    });
+    // Another runtime: its own default account, as before.
+    expect(
+      planChange(
+        "orchestrator",
+        orch,
+        { runtime: "claude-code" },
+        orchAccount(show, orch),
+      ),
+    ).toEqual({
+      kind: "orchestrator",
+      params: { runtime: "claude-code", summary: true },
+    });
+    // A read about another orchestrator (switched meanwhile), or an older hub's: no name.
+    expect(orchAccount({ thread: "o9", account: "default" }, orch)).toBe(
+      undefined,
+    );
+    expect(orchAccount({ thread: "o" }, orch)).toBe(undefined);
+    expect(orchAccount(undefined, orch)).toBe(undefined);
+  });
+
+  it("reads what went wrong with a change that went through", () => {
+    expect(changeProblem({ thread: "o2" })).toBeUndefined();
+    expect(changeProblem(undefined)).toBeUndefined();
+    expect(
+      changeProblem({
+        warning: "grok is not installed: the new orchestrator cannot start",
+        start_error: "spawn grok: not found",
+      }),
+    ).toBe(
+      "grok is not installed: the new orchestrator cannot start. " +
+        "The new orchestrator could not start: spawn grok: not found.",
+    );
+    expect(notInstalled({ installed: { codex: false } }, "codex")).toBe(true);
+    expect(notInstalled({ installed: { codex: true } }, "codex")).toBe(false);
+    // Not said (an older hub, a runtime twr doesn't know): not marked.
+    expect(notInstalled({}, "codex")).toBe(false);
+  });
 });
 
 describe("the popup's keys", () => {
@@ -278,6 +334,8 @@ describe("the popup, rendered", () => {
         operate: true,
         admin: true,
         rpc: async (method: string, params: Json) => {
+          // The read as the orchestrator's popup opens: answered apart, from `show`.
+          if (method === "orchestrator.show") return props.show ?? {};
           calls.push({ method, params });
           if (props.refuse) throw new Error("refused");
           return props.reply ?? {};
@@ -613,6 +671,84 @@ describe("the popup, rendered", () => {
       kind: "orchestrator",
     });
     expect(m.withdrawn).toEqual([]);
+  });
+
+  it("keeps the native login when only the orchestrator's effort changes", async () => {
+    // `work` is Codex's default account; this orchestrator runs on the native login.
+    const m = await mount({
+      target: codexOrchestrator,
+      kind: "orchestrator",
+      show: { thread: "o1", account: "default", runtime: "codex" },
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    // Its default model, then effort Low.
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => m.confirms[0].alt.run());
+    expect(m.calls).toEqual([
+      {
+        method: "orchestrator.use",
+        params: { runtime: "codex:default", effort: "low", summary: false },
+      },
+    ]);
+  });
+
+  it("marks a runtime that isn't installed, and says so before switching to it", async () => {
+    const m = await mount({
+      target: codexOrchestrator,
+      kind: "orchestrator",
+      show: {
+        thread: "o1",
+        account: "default",
+        installed: { "claude-code": true, codex: true, "grok-build": false },
+      },
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    const rail = m.root.querySelectorAll(".model-picker-rail [role=option]");
+    const grok = rail.find((n: FakeElement) =>
+      n.textContent.includes("grok-build"),
+    )!;
+    expect(grok.textContent).toContain("not installed");
+    expect(grok.getAttribute("title")).toBe(
+      "grok-build: not installed on the hub's machine",
+    );
+    expect(
+      rail.filter((n: FakeElement) => n.textContent.includes("not installed")),
+    ).toHaveLength(1);
+    await m.act(() => click(grok));
+    // Its default model, then its default effort.
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    expect(m.confirms[0].detail).toMatch(
+      /^grok-build is not installed on the hub's machine: the new orchestrator can't start until it is\. /,
+    );
+    // A runtime that is there: nothing said.
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    const claude = m.root
+      .querySelectorAll(".model-picker-rail [role=option]")
+      .find((n: FakeElement) => n.textContent.includes("claude-code"))!;
+    await m.act(() => click(claude));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    expect(m.confirms[1].detail).not.toContain("not installed");
+  });
+
+  it("says what went wrong with a thread's move that went through", async () => {
+    const notices: string[] = [];
+    const m = await mount({
+      target: thread({ model: "opus" }),
+      reply: { thread: "t1", warning: "codex is not installed" },
+      notify: (text: string) => notices.push(text),
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => m.confirms[0].run());
+    expect(notices).toEqual(["codex is not installed."]);
   });
 
   it("shows a refusal through the app's error path", async () => {
