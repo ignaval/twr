@@ -1278,6 +1278,13 @@ enum OrchestratorCmd {
         /// when the orchestrator is busy.
         #[arg(long, value_name = "SECS", conflicts_with = "no_summary")]
         wait: Option<u64>,
+        /// Keep the account the orchestrator runs on, exactly as recorded, for a new model or
+        /// effort on its own runtime (name the runtime alone). Without it a bare runtime gets
+        /// the policy's default account, else the native login, and `runtime:<name>` the
+        /// account by that name, which is a named account when one shares the native login's
+        /// name.
+        #[arg(long)]
+        keep_account: bool,
     },
 }
 
@@ -2414,6 +2421,7 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
                     effort,
                     no_summary,
                     wait,
+                    keep_account,
                 },
         } => {
             // A terminal is asked whether to wait for a busy orchestrator; a script waits.
@@ -2426,7 +2434,13 @@ async fn run_simple(cmd: Cmd, paths: Paths, socket: PathBuf) -> anyhow::Result<(
             };
             let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
             let ask: Option<Ask<'_>> = if tty { Some(&mut ask) } else { None };
-            orchestrator_use(&socket, &runtime, model, effort, !no_summary, wait, ask).await
+            let switch = Switch {
+                runtime: &runtime,
+                model,
+                effort,
+                keep_account,
+            };
+            orchestrator_use(&socket, switch, !no_summary, wait, ask).await
         }
         Cmd::Info { json } => info(&socket, json).await,
         Cmd::Usage {
@@ -7032,22 +7046,32 @@ fn orchestrator_text(o: &Value) -> String {
 /// Asks the user a question on the terminal and returns the reply line.
 type Ask<'a> = &'a mut dyn FnMut(&str) -> anyhow::Result<String>;
 
-async fn orchestrator_use(
-    socket: &Path,
-    runtime: &str,
+/// What `twr orchestrator use` switches to.
+struct Switch<'a> {
+    runtime: &'a str,
     model: Option<String>,
     effort: Option<String>,
+    /// `--keep-account`: the current account, as recorded (`orchestrator.use` `keep_account`).
+    keep_account: bool,
+}
+
+async fn orchestrator_use(
+    socket: &Path,
+    to: Switch<'_>,
     mut summary: bool,
     wait: Option<u64>,
     ask: Option<Ask<'_>>,
 ) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
-    let mut params = json!({ "runtime": runtime });
-    if let Some(m) = model {
+    let mut params = json!({ "runtime": to.runtime });
+    if let Some(m) = to.model {
         params["model"] = json!(m);
     }
-    if let Some(e) = effort {
+    if let Some(e) = to.effort {
         params["effort"] = json!(e);
+    }
+    if to.keep_account {
+        params["keep_account"] = json!(true);
     }
     let wait_secs = wait.unwrap_or(twr_hub::hub::SUMMARY_WAIT.as_secs());
     if summary {
@@ -10804,8 +10828,27 @@ mod tests {
         assert!(matches!(
             c.cmd,
             Some(Cmd::Orchestrator {
-                cmd: OrchestratorCmd::Use { ref runtime, ref model, effort: None, no_summary: false, wait: None }
+                cmd: OrchestratorCmd::Use { ref runtime, ref model, effort: None, no_summary: false, wait: None, keep_account: false }
             }) if runtime == "codex" && model.as_deref() == Some("o5")
+        ));
+        let c = Cli::try_parse_from([
+            "twr",
+            "orchestrator",
+            "use",
+            "codex",
+            "--effort",
+            "high",
+            "--keep-account",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Orchestrator {
+                cmd: OrchestratorCmd::Use {
+                    keep_account: true,
+                    ..
+                }
+            })
         ));
         let c = Cli::try_parse_from(["twr", "orchestrator", "use", "codex", "--effort", "high"])
             .unwrap();

@@ -1040,6 +1040,7 @@ async fn a_busy_orchestrator_is_waited_for_then_skipped() {
         summary: true,
         wait: Duration::from_millis(400),
         effort: None,
+        keep_account: false,
     };
     let started = std::time::Instant::now();
     let user = tui();
@@ -1114,6 +1115,7 @@ async fn a_handoff_summary_waits_for_background_work_then_stops_it_on_timeout() 
                 summary: true,
                 wait: Duration::from_millis(100),
                 effort: None,
+                keep_account: false,
             },
             &tui(),
         )

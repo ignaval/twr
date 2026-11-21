@@ -105,6 +105,11 @@ pub struct SwitchOptions {
     /// takes, or `default` (or blank) for the runtime's own. `None`: not asked, so a switch
     /// gets the runtime's default and the first orchestrator `[orchestrator] effort`.
     pub effort: Option<String>,
+    /// Keep the current orchestrator's account, exactly as recorded (`orchestrator.use`
+    /// `keep_account`): only on its own runtime, named without an account. What the model
+    /// pickers send for a model or effort change, so the native login stays the native login
+    /// when a named account shares its name.
+    pub keep_account: bool,
 }
 
 impl Default for SwitchOptions {
@@ -113,6 +118,7 @@ impl Default for SwitchOptions {
             summary: true,
             wait: SUMMARY_WAIT,
             effort: None,
+            keep_account: false,
         }
     }
 }

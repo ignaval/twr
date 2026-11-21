@@ -281,10 +281,10 @@ it only another runtime. For the orchestrator every change is a switch
 the app always asks: **Switch with summary** first asks the current orchestrator for its own
 summary, **Switch without summary** hands over only what the log shows
 ([orchestrator.md](orchestrator.md#switching-the-orchestrator)). On the same runtime the
-switch names the account the orchestrator runs on (`codex:work`), the native login by its
-current name (`codex:default`, from `orchestrator.show` `account`), so changing only the
-model or effort never moves it to the runtime's default account. An ACP agent takes no
-account: the switch names a bare `acp`, which keeps the agent it runs. To a runtime that isn't
+switch asks the hub to keep the account the orchestrator runs on (`keep_account`), exactly
+as recorded, so changing only the model or effort never moves it to another login: not to
+the runtime's default account, and not from the native login to a named account that shares
+its name. An ACP agent's switch names a bare `acp`, which keeps the agent it runs. To a runtime that isn't
 installed, the question says the new orchestrator can't start until it is. After a switch,
 the hub's warning and a start that failed (`warning`, `start_error`) show as a notice, as
 does a thread move's warning. A switch drops the messages

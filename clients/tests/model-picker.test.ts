@@ -13,7 +13,6 @@ import {
   droppedBySwitch,
   droppedWords,
   notInstalled,
-  orchAccount,
   switchDetail,
   triggerText,
   withoutDroppedText,
@@ -156,13 +155,15 @@ describe("what a choice asks of the hub", () => {
     });
   });
 
-  it("switches the orchestrator with its summary, keeping its account on its runtime", () => {
+  it("switches the orchestrator with its summary, the hub keeping its account on its runtime", () => {
     const orch = thread({
       id: "o",
       is_orchestrator: true,
       model: "opus",
       account: "work",
     });
+    // The runtime alone, with `keep_account`: the hub keeps the account it recorded, never
+    // one rebuilt from its name here.
     expect(
       planChange("orchestrator", orch, {
         runtime: "claude-code",
@@ -172,12 +173,14 @@ describe("what a choice asks of the hub", () => {
     ).toEqual({
       kind: "orchestrator",
       params: {
-        runtime: "claude-code:work",
+        runtime: "claude-code",
         model: "opus",
         effort: "max",
         summary: true,
+        keep_account: true,
       },
     });
+    // Another runtime: its own default account.
     expect(planChange("orchestrator", orch, { runtime: "codex" })).toEqual({
       kind: "orchestrator",
       params: { runtime: "codex", summary: true },
@@ -190,57 +193,36 @@ describe("what a choice asks of the hub", () => {
     ).toEqual({ kind: "none" });
   });
 
-  it("keeps an ACP orchestrator's agent: no account goes after `acp`", () => {
-    // `orchestrator.show` names an account for an ACP orchestrator too, but after `acp:`
-    // the hub reads a command: a bare `acp` keeps the recorded agent.
+  it("keeps an ACP orchestrator's agent: a bare `acp`, no account after it", () => {
     const orch = thread({ id: "o", runtime: "acp", is_orchestrator: true });
-    const show = { thread: "o", account: "default" };
     expect(
-      planChange(
-        "orchestrator",
-        orch,
-        { runtime: "acp", model: "m2" },
-        orchAccount(show, orch),
-      ),
+      planChange("orchestrator", orch, { runtime: "acp", model: "m2" }),
     ).toEqual({
       kind: "orchestrator",
-      params: { runtime: "acp", model: "m2", summary: true },
+      params: {
+        runtime: "acp",
+        model: "m2",
+        summary: true,
+        keep_account: true,
+      },
     });
   });
 
-  it("keeps the native login by its name when only the effort changes", () => {
-    // On the native login the thread records no account; `orchestrator.show` names it.
+  it("keeps the native login when only the effort changes, never naming it", () => {
+    // On the native login the thread records no account. Its name (`default`) may be a
+    // named account's too, which `codex:default` would get: nothing names it.
     const orch = thread({ id: "o", runtime: "codex", is_orchestrator: true });
-    const show = { thread: "o", account: "default" };
     expect(
-      planChange(
-        "orchestrator",
-        orch,
-        { runtime: "codex", effort: "high" },
-        orchAccount(show, orch),
-      ),
+      planChange("orchestrator", orch, { runtime: "codex", effort: "high" }),
     ).toEqual({
       kind: "orchestrator",
-      params: { runtime: "codex:default", effort: "high", summary: true },
+      params: {
+        runtime: "codex",
+        effort: "high",
+        summary: true,
+        keep_account: true,
+      },
     });
-    // Another runtime: its own default account, as before.
-    expect(
-      planChange(
-        "orchestrator",
-        orch,
-        { runtime: "claude-code" },
-        orchAccount(show, orch),
-      ),
-    ).toEqual({
-      kind: "orchestrator",
-      params: { runtime: "claude-code", summary: true },
-    });
-    // A read about another orchestrator (switched meanwhile), or an older hub's: no name.
-    expect(orchAccount({ thread: "o9", account: "default" }, orch)).toBe(
-      undefined,
-    );
-    expect(orchAccount({ thread: "o" }, orch)).toBe(undefined);
-    expect(orchAccount(undefined, orch)).toBe(undefined);
   });
 
   it("reads what went wrong with a change that went through", () => {
@@ -540,7 +522,12 @@ describe("the popup, rendered", () => {
     expect(m.calls).toEqual([
       {
         method: "orchestrator.use",
-        params: { runtime: "claude-code", effort: "max", summary: false },
+        params: {
+          runtime: "claude-code",
+          effort: "max",
+          summary: false,
+          keep_account: true,
+        },
       },
     ]);
     // An empty queue: nothing said about dropped messages.
@@ -680,7 +667,12 @@ describe("the popup, rendered", () => {
     expect(m.calls).toEqual([
       {
         method: "orchestrator.use",
-        params: { runtime: "codex", effort: "low", summary: true },
+        params: {
+          runtime: "codex",
+          effort: "low",
+          summary: true,
+          keep_account: true,
+        },
       },
     ]);
     // The switch it made gives the orchestrator a new thread: nothing to take back.
@@ -692,7 +684,8 @@ describe("the popup, rendered", () => {
   });
 
   it("keeps the native login when only the orchestrator's effort changes", async () => {
-    // `work` is Codex's default account; this orchestrator runs on the native login.
+    // `work` is Codex's default account; this orchestrator runs on the native login, which
+    // `orchestrator.show` names `default`, a named account's name too: the hub keeps it.
     const m = await mount({
       target: codexOrchestrator,
       kind: "orchestrator",
@@ -707,7 +700,12 @@ describe("the popup, rendered", () => {
     expect(m.calls).toEqual([
       {
         method: "orchestrator.use",
-        params: { runtime: "codex:default", effort: "low", summary: false },
+        params: {
+          runtime: "codex",
+          effort: "low",
+          summary: false,
+          keep_account: true,
+        },
       },
     ]);
   });

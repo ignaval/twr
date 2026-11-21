@@ -1367,3 +1367,133 @@ async fn removing_the_orchestrators_account_asks_to_switch_it_first() {
     }
     hub.shutdown().await;
 }
+
+/// `orchestrator.use` with `keep_account` keeps the orchestrator's account exactly as
+/// recorded, where its name would choose another: the native login named `personal`, then
+/// config declaring a named `personal`, is the native `default` next to a recorded named
+/// `default`, and `claude-code:default` is the named one. A model change with `keep_account`
+/// (what the model pickers send) stays on the native login, and from the named one on the
+/// named one. It is refused before there is an orchestrator, on another runtime and with an
+/// account named, before anything stops.
+#[tokio::test]
+async fn keep_account_keeps_the_native_login_a_named_account_shares_a_name_with() {
+    let mut env = Env::new();
+    let user = tui();
+    let hub = Hub::open(env.opts(|_| {})).await.unwrap();
+    let named = env.path("acc/default");
+    std::fs::create_dir_all(&named).unwrap();
+    for (account, native, dir) in [("personal", true, None), ("default", false, Some(&named))] {
+        hub.account_add(
+            twr_hub::hub::AccountAddParams {
+                runtime: "claude-code".into(),
+                account: account.into(),
+                native,
+                dir: dir.cloned(),
+                ..Default::default()
+            },
+            &user,
+        )
+        .unwrap();
+    }
+    hub.shutdown().await;
+    drop(hub);
+    let personal = env.path("acc/personal");
+    std::fs::create_dir_all(&personal).unwrap();
+    // Opened again once the first hub's lock is gone.
+    let hub = timeout(WAIT, async {
+        loop {
+            let opts = env.opts(|c| {
+                c.accounts.get_mut("claude-code").unwrap().insert(
+                    "personal".into(),
+                    AccountConfig {
+                        dir: Some(personal.clone()),
+                        ..Default::default()
+                    },
+                );
+            });
+            match Hub::open(opts).await {
+                Ok(h) => return h,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("the hub opens again");
+    let keep = || SwitchOptions {
+        keep_account: true,
+        effort: Some("high".into()),
+        ..quick()
+    };
+    let refused = |r: Result<Value, twr_core::proto::RpcError>| {
+        let e = r.expect_err("refused");
+        assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+        e.message
+    };
+    let none = refused(
+        hub.use_orchestrator("claude-code", None, keep(), &user)
+            .await,
+    );
+    assert!(none.contains("no orchestrator yet"), "{none}");
+
+    // The first orchestrator: the native login, by its name now `default`.
+    assert_eq!(hub.info()["orchestrator"]["account"], "default");
+    hub.say("hello", None, &user).await.unwrap();
+    let mut rt = env.orch().await;
+    assert_native(&rt);
+    let first = hub.orchestrator_thread().unwrap();
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t);
+
+    // Another runtime, an account named, an ACP agent: refused, nothing stopped.
+    for spec in ["codex", "claude-code:work", "claude-code:default", "acp"] {
+        let why = refused(hub.use_orchestrator(spec, None, keep(), &user).await);
+        assert!(
+            why.contains("on its own runtime (claude-code)"),
+            "{spec}: {why}"
+        );
+    }
+    assert_eq!(hub.orchestrator_thread().as_deref(), Some(first.as_str()));
+
+    // A model and effort change keeping the account: still the native login.
+    let r = hub
+        .use_orchestrator("claude-code", Some("opus"), keep(), &user)
+        .await
+        .unwrap();
+    assert_eq!(r["account"], "default", "{r}");
+    assert_eq!(
+        (&r["model"], &r["effort"]),
+        (&json!("opus"), &json!("high"))
+    );
+    let kept = r["thread"].as_str().unwrap().to_string();
+    assert_ne!(kept, first);
+    let mut rt = env.orch().await;
+    assert_native(&rt);
+    let twr = created_twr(&hub, &kept);
+    assert_eq!(twr.get("account"), None, "{twr}");
+    let (handoff, t) = rt.next_turn().await;
+    assert!(handoff.starts_with("[twr handoff]"), "{handoff}");
+    rt.end_turn(t);
+
+    // By its name, `default` is the named account: a switch to it.
+    let r = hub
+        .use_orchestrator("claude-code:default", None, quick(), &user)
+        .await
+        .unwrap();
+    assert_eq!(r["account"], "default", "{r}");
+    let mut rt = env.orch().await;
+    assert_eq!(rt.env("CLAUDE_CONFIG_DIR"), Some(named.to_str().unwrap()));
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t);
+
+    // Kept from there, the named one stays.
+    let r = hub
+        .use_orchestrator("claude-code", Some("sonnet"), keep(), &user)
+        .await
+        .unwrap();
+    let rt = env.orch().await;
+    assert_eq!(rt.env("CLAUDE_CONFIG_DIR"), Some(named.to_str().unwrap()));
+    let twr = created_twr(&hub, r["thread"].as_str().unwrap());
+    assert_eq!(twr["account"], "default", "{twr}");
+    assert_eq!(twr["account_dir"], named.to_str().unwrap());
+    hub.shutdown().await;
+}

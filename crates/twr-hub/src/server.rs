@@ -1526,6 +1526,9 @@ struct UseOrchestratorParams {
     /// How long to wait for a busy previous orchestrator (default 60, at most 600).
     #[serde(default)]
     wait_secs: Option<u64>,
+    /// Keep the current orchestrator's account as recorded (its own runtime only).
+    #[serde(default)]
+    keep_account: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -2587,6 +2590,7 @@ async fn call_async(
             let mut opts = SwitchOptions {
                 summary: p.summary,
                 effort: p.effort,
+                keep_account: p.keep_account,
                 ..SwitchOptions::default()
             };
             if let Some(w) = p.wait_secs {

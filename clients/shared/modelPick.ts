@@ -12,10 +12,6 @@ import {
 } from "./models";
 import type { Json, Thread } from "./types";
 
-/** The runtimes that take accounts, as `twr_core::account::ACCOUNT_RUNTIMES` lists them:
- * only they take `runtime:account`. */
-const ACCOUNT_RUNTIMES = new Set(["claude-code", "codex", "grok-build"]);
-
 /** What the picker has chosen: a runtime, and its model and effort (`undefined`: the
  * runtime's own default). */
 export interface Pick {
@@ -229,34 +225,24 @@ export type Plan =
  * sends only what changed (`default` for a setting cleared), so keeping one never asks the
  * hub to clear it; on another runtime it is a move, with the model and effort picked (one
  * left out is that runtime's default). The orchestrator is switched with `orchestrator.use`
- * and the handoff summary: its runtime (with its account, on the same runtime), and the model
- * and effort picked (one left out is the runtime's default).
- *
- * `account`: the orchestrator's account as `orchestrator.show` names it ([`orchAccount`]).
- * A thread records no account while it runs on the native login, and a bare runtime would
- * get the policy's default account, which may be another one: the native login goes by
- * its current name (`codex:default`), as the TUI's `/orch` sends it.
+ * and the handoff summary: its runtime, and the model and effort picked (one left out is the
+ * runtime's default). On the same runtime it sends `keep_account`: the hub keeps the account
+ * the orchestrator runs on as it recorded it. Rebuilt from its name the account could be
+ * another one: the native login's fallback name (`default`) may be a named account's too,
+ * and the name goes to the named one. An ACP agent's `acp` keeps the agent it runs too.
  */
 export function planChange(
   target: "orchestrator" | "thread",
   thread: Thread,
   pick: Pick,
-  account?: string,
 ): Plan {
   const now = currentPick(thread);
   const same = pick.runtime === now.runtime;
   if (target === "orchestrator") {
     if (same && pick.model === now.model && pick.effort === now.effort)
       return { kind: "none" };
-    // Only a runtime with accounts takes `runtime:account`: for an ACP agent the part
-    // after the colon is a command, and a bare `acp` keeps the recorded agent.
-    const kept = ACCOUNT_RUNTIMES.has(baseRuntime(pick.runtime))
-      ? thread.account || account
-      : undefined;
-    const params: Json = {
-      runtime: same && kept ? `${pick.runtime}:${kept}` : pick.runtime,
-      summary: true,
-    };
+    const params: Json = { runtime: pick.runtime, summary: true };
+    if (same) params.keep_account = true;
     if (pick.model) params.model = pick.model;
     if (pick.effort) params.effort = pick.effort;
     return { kind: "orchestrator", params };
@@ -272,16 +258,6 @@ export function planChange(
   if (pick.effort !== now.effort) params.effort = pick.effort ?? "default";
   if (!("model" in params) && !("effort" in params)) return { kind: "none" };
   return { kind: "thread", params, move: false };
-}
-
-/** The account the orchestrator `thread` runs on, from `orchestrator.show` (`show`): the
- * native login under its current name too. `undefined` when `show` is about another
- * orchestrator (it was switched meanwhile) or an older hub's, which names none. */
-export function orchAccount(show: Json, thread: Thread): string | undefined {
-  if (!show || show.thread !== thread.id) return undefined;
-  return typeof show.account === "string" && show.account
-    ? show.account
-    : undefined;
 }
 
 /** Whether `orchestrator.show` (`show`) says `runtime`'s program is missing on the hub's

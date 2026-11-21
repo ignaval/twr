@@ -2518,6 +2518,53 @@ describe("messages put back in the box stay messages", () => {
     expect(sentMessages()).toEqual(["/usage\n\ntaken back"]);
   });
 
+  it("opens the orchestrator's main conversation for /open orchestrator, its picker switching it", async () => {
+    const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
+    const calls: { method: string; params: Json }[] = [];
+    await start({
+      rpc: (method, params) => {
+        if (method === "desktop.parse_slash")
+          return Promise.resolve({ kind: "Open", args: "orchestrator" });
+        if (method === "orchestrator.show")
+          return Promise.resolve({ models: catalog, thread: "orch" });
+        if (method === "orchestrator.use" || method === "thread.set_model") {
+          calls.push({ method, params });
+          return Promise.resolve({ thread: "orch" });
+        }
+        return undefined;
+      },
+    });
+    await app().talkTo("builder");
+    await app().type("/open orchestrator");
+    await app().press("Enter");
+    // Its main conversation, not a thread's: no way back to it, sent with `say`.
+    expect(app().all(".destination-symbol.worker").length).toBe(0);
+    await app().type("hello");
+    await app().press("Enter");
+    expect(app().host.sent.map((s) => s.method)).toEqual(["say"]);
+    // Its picker switches it (`thread.set_model` refuses the orchestrator).
+    await app().click(app().find(".model-picker-trigger"));
+    const search = app().find(".model-picker-search");
+    await app().act(async () => void press(search, "Enter"));
+    await app().click(
+      app()
+        .all(".model-picker-efforts [role=radio]")
+        .find((n) => n.textContent.includes("Low"))! as FakeElement,
+    );
+    await app().click(app().find("button", "Switch without summary"));
+    expect(calls).toEqual([
+      {
+        method: "orchestrator.use",
+        params: {
+          runtime: "fake",
+          effort: "low",
+          summary: false,
+          keep_account: true,
+        },
+      },
+    ]);
+  });
+
   it("puts back what a switch dropped escaped, and says the new orchestrator can't start", async () => {
     const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
     const uses: Json[] = [];
@@ -2554,9 +2601,11 @@ describe("messages put back in the box stay messages", () => {
         .find((n) => n.textContent.includes("Low"))! as FakeElement,
     );
     await app().click(app().find("button", "Switch without summary"));
-    // The effort alone changed. `fake` takes no accounts, so no account goes with it
-    // (an account runtime's native login does: "keeps the native login by its name…").
-    expect(uses).toEqual([{ runtime: "fake", effort: "low", summary: false }]);
+    // The effort alone changed: on its own runtime, keeping its account as the hub
+    // recorded it.
+    expect(uses).toEqual([
+      { runtime: "fake", effort: "low", summary: false, keep_account: true },
+    ]);
     expect(app().find(".notice-toast").textContent).toContain(
       "fake is not on PATH: the new orchestrator cannot start until it is there (install it).",
     );

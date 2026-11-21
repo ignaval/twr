@@ -362,7 +362,7 @@ export default function App({
   );
   const [pins, setPins] = useState<string[]>(() => storedList("twr.pins"));
   const [selected, setSelected] = useState<string>();
-  const [destination, setDestination] = useState<string>();
+  const [opened, setDestination] = useState<string>();
   const detailsToggle = useRef<HTMLButtonElement>(null);
   const observedDestination = useRef<string | undefined>(undefined);
   // The message drafts, by destination: outside React state, so that typing re-renders
@@ -605,6 +605,18 @@ export default function App({
       : [...listed, { id: "usage", title: "Usage limits: how much is left" }];
   }, [slashCommands, commands]);
   const orchestrator = view.threads.find((t) => t.is_orchestrator);
+  // Where the composer sends: a worker thread, or none for the orchestrator. Opening the
+  // orchestrator's own thread (`/open orchestrator`, its row, a workspace's opened before
+  // its threads are known) opens its main conversation, so every path that reads
+  // `destination` (the send, the model picker, the header, the drafts and files) treats it
+  // as the orchestrator, never as a worker; and the choice is dropped, so a later switch
+  // doesn't leave it on the retired thread.
+  const destination =
+    opened !== undefined && opened === orchestrator?.id ? undefined : opened;
+  useEffect(() => {
+    if (opened !== undefined && opened === orchestrator?.id)
+      setDestination(undefined);
+  }, [opened, orchestrator?.id]);
   // A switch of the orchestrator's model or effort gives it a new thread: its files stay
   // on its conversation, and those whose upload has not begun go to the new thread.
   useEffect(() => {
@@ -3952,7 +3964,7 @@ export default function App({
                   modelPicker={
                     <ModelPicker
                       target={target}
-                      kind={destination ? "thread" : "orchestrator"}
+                      kind={target?.is_orchestrator ? "orchestrator" : "thread"}
                       catalog={modelCatalog}
                       rpc={rpc}
                       connected={connected}

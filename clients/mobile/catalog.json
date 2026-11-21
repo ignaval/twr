@@ -2995,6 +2995,13 @@
         "type": "text",
         "description": "How long to wait for a busy orchestrator to finish its turn before skipping its summary, in seconds (default 60, at most 600). Without it, a terminal asks first when the orchestrator is busy",
         "advanced": false
+      },
+      {
+        "key": "keep-account",
+        "label": "keep account",
+        "type": "boolean",
+        "description": "Keep the account the orchestrator runs on, exactly as recorded, for a new model or effort on its own runtime (name the runtime alone). Without it a bare runtime gets the policy's default account, else the native login, and `runtime:<name>` the account by that name, which is a named account when one shares the native login's name",
+        "advanced": false
       }
     ],
     "cli": [
@@ -3029,6 +3036,12 @@
       {
         "key": "wait",
         "flag": "--wait",
+        "many": false,
+        "separator": false
+      },
+      {
+        "key": "keep-account",
+        "flag": "--keep-account",
         "many": false,
         "separator": false
       }

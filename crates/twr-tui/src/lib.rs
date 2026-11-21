@@ -648,8 +648,12 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             model,
             effort,
             summary,
+            keep_account,
         } => {
             let mut p = json!({ "runtime": runtime });
+            if *keep_account {
+                p["keep_account"] = json!(true);
+            }
             if let Some(m) = model {
                 p["model"] = json!(m);
             }
@@ -6085,6 +6089,7 @@ mod tests {
             model: Some("o5".into()),
             effort: None,
             summary: true,
+            keep_account: false,
         })
         .unwrap();
         assert_eq!(
@@ -6099,6 +6104,7 @@ mod tests {
             model: None,
             effort: None,
             summary: false,
+            keep_account: false,
         })
         .unwrap();
         assert_eq!(p, json!({"runtime": "grok-build", "summary": false}));

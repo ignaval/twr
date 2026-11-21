@@ -20,7 +20,6 @@ import {
   navigate,
   notInstalled,
   opensPicker,
-  orchAccount,
   pickerRuntimes,
   planChange,
   runsCommandLine,
@@ -104,9 +103,9 @@ export function ModelPicker({
   // id), shown in the models column until the next choice.
   const [notice, setNotice] = useState("");
   // The orchestrator's `orchestrator.show`, read as the popup opens: which runtimes are
-  // installed (the rail says so), and its account by name (the native login's too), which
-  // a switch on its runtime keeps. `orchShown` is the read in flight, which a choice waits
-  // for.
+  // installed (the rail says so, and a switch's confirmation). `orchShown` is the read in
+  // flight, which a choice waits for. (A switch on its runtime keeps its account: the hub
+  // does, `keep_account`.)
   const [orchShow, setOrchShow] = useState<Json>();
   const orchShown = useRef<Promise<Json>>(undefined);
   const [nav, setNav] = useState<Nav>({
@@ -350,7 +349,7 @@ export function ModelPicker({
     // Asked against what runs now: it goes ahead only if that is still so.
     const key = targetKey;
     const show = kind === "orchestrator" ? await orchShown.current : undefined;
-    const plan = planChange(kind, target, pick, orchAccount(show, target));
+    const plan = planChange(kind, target, pick);
     if (plan.kind === "none") return;
     if (!admin && (plan.kind === "orchestrator" || plan.move)) {
       fail(
