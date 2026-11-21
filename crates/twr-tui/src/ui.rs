@@ -499,7 +499,8 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     (
         "Alt-M",
         "pick the model and effort of where the line goes, named at the input box's bottom \
-         right: in a dive the thread's (/model), else the orchestrator's (a switch you confirm)",
+         right: in a dive the thread's (/model), else the orchestrator's (changed on its \
+         session; another runtime is a switch you confirm)",
     ),
     (
         "Ctrl-R",
@@ -1021,7 +1022,29 @@ fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<L
         None => crate::app::orch_label(&m.runtime, &state.accounts),
     };
     let effort = m.chosen.is_some();
+    // The orchestrator's model picker on its current runtime: a change in place.
+    let in_place = state
+        .view
+        .picker
+        .as_ref()
+        .is_some_and(|p| p.in_place && m.runtime == p.default);
     let (title, note) = match (&m.thread, effort) {
+        (None, false) if in_place => (
+            format!("Model for the orchestrator on {runtime}"),
+            if m.efforts.is_empty() {
+                "(applied at once, on its session)".to_string()
+            } else {
+                "(its reasoning effort next; applied on its session)".to_string()
+            },
+        ),
+        (None, true) if in_place => (
+            format!("Reasoning effort for the orchestrator on {runtime}"),
+            match m.chosen.as_ref().and_then(Option::as_deref) {
+                Some(model) => format!("(with model {model}; applied at once, on its session)"),
+                None => "(with the runtime's default model; applied at once, on its session)"
+                    .to_string(),
+            },
+        ),
         (None, false) if !m.efforts.is_empty() => (
             format!("Model for the orchestrator on {runtime}"),
             "(its reasoning effort next; a switch starts a new session with a handoff)".to_string(),
@@ -1190,6 +1213,11 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
             .saturating_add(2),
     );
     let switch = state.view.picker.as_ref().is_some_and(|p| p.switch);
+    let in_place = state
+        .view
+        .picker
+        .as_ref()
+        .is_some_and(|p| p.in_place && p.step.as_ref().is_some_and(|m| m.runtime == p.default));
     let step = state.view.picker.as_ref().and_then(|p| p.step.as_ref());
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1198,6 +1226,7 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
         .title(match step {
             Some(m) if m.chosen.is_some() => " reasoning effort ",
             Some(m) if m.thread.is_some() => " model ",
+            Some(_) if in_place => " the orchestrator's model ",
             Some(_) if switch => " switch the orchestrator: model ",
             Some(_) => " choose the orchestrator: model ",
             None if switch => " switch the orchestrator ",
@@ -11094,6 +11123,7 @@ mod tests {
             default: "claude-code".into(),
             model: None,
             switch: false,
+            in_place: false,
             step: None,
         });
         let lines = draw(&st, 80, 6);

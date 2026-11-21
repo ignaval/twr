@@ -288,15 +288,15 @@ pick is sent, **Default** as `default`; one you leave as it is (**Done** before 
 is left out, so a resumed session goes on with the one it had there, and a new one starts
 with the runtime's default. `default` for a setting the runtime keeps on resume starts a new
 session instead. The question says which of these can happen. A `pty` thread runs its own command line, so the picker offers
-it only another runtime. For the orchestrator every change is a switch
-(`orchestrator.use`), a new orchestrator session with a handoff, even on the same runtime, so
-the app always asks: **Switch with summary** first asks the current orchestrator for its own
-summary, **Switch without summary** hands over only what the log shows
-([orchestrator.md](orchestrator.md#switching-the-orchestrator)). On the same runtime the
-switch asks the hub to keep the account the orchestrator runs on (`keep_account`), exactly
-as recorded, so changing only the model or effort never moves it to another login: not to
-the runtime's default account, and not from the native login to a named account that shares
-its name. An ACP agent's switch names a bare `acp`, which keeps the agent it runs. To a runtime that isn't
+it only another runtime. The orchestrator on its own runtime changes the same way, at once:
+`thread.set_model` on its thread with what changed, and its runtime restarts on its session
+with them, after its turn when it is busy, with no handoff
+([orchestrator.md](orchestrator.md#changing-the-orchestrators-model-and-effort)). Nothing
+names its account or agent, so it stays on the login and ACP agent it runs. Another runtime
+is a switch (`orchestrator.use`), a new orchestrator session with a handoff, so the app asks
+first: **Switch with summary** first asks the current orchestrator for its own summary,
+**Switch without summary** hands over only what the log shows
+([orchestrator.md](orchestrator.md#switching-the-orchestrator)). To a runtime that isn't
 installed, the question says the new orchestrator can't start until it is. After a switch,
 the hub's warning and a start that failed (`warning`, `start_error`) show as a notice, as
 does a thread move's warning. A switch drops the messages
@@ -318,9 +318,9 @@ While the change is under way the button shows a spinner; a refusal from the hub
 any other error. The button is disabled while the hub is disconnected and on a device
 without the `operate` scope, and hidden while the conversation has no destination. Switching
 the orchestrator and moving a thread to another runtime need the `admin` scope, so on a paired
-device without it the orchestrator's button is disabled, its tooltip saying why, and a
-thread's picker lists the other runtimes greyed out: picking one says it needs a device with
-admin access, while the thread's own runtime's models and efforts still change. The desktop
+device without it the picker lists the other runtimes greyed out, the orchestrator's and a
+thread's alike: picking one says it needs a device with admin access, while the models and
+efforts of the runtime it runs still change, the orchestrator's too. The desktop
 app on its own hub has every scope. A change
 made elsewhere (by the orchestrator, `twr model`, the TUI) shows as soon as the thread list
 updates. The command palette's **Change model, runtime or account** and **Switch

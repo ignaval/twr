@@ -262,7 +262,7 @@ ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 
 `[orchestrator] effort` sets the first orchestrator’s reasoning effort, validated against its runtime. Unset uses the runtime default.
 
-`[orchestrator]` only picks the first orchestrator. After `twr orchestrator use`, the choice is kept in the event log and survives hub restarts. See [orchestrator.md](orchestrator.md).
+`[orchestrator]` only picks the first orchestrator. After `twr orchestrator use`, or a change of its model or effort (`twr model orch`), the choice is kept in the event log and survives hub restarts. See [orchestrator.md](orchestrator.md).
 
 When `[orchestrator] runtime` isn't set and no orchestrator exists yet, the TUI asks which agent should run it the first time it opens. See [tui.md](tui.md#choosing-the-orchestrator).
 

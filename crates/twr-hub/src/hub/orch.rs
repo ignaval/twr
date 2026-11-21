@@ -1501,8 +1501,8 @@ impl Core {
     }
 
     /// The orchestrator's runtime, model and account (`None`: the native one): the current
-    /// orchestrator thread's (a switch is kept by the log), else the configured ones
-    /// (`[orchestrator] runtime / model / account`, the account as
+    /// orchestrator thread's (a switch or a model change is kept by the log), else the
+    /// configured ones (`[orchestrator] runtime / model / account`, the account as
     /// [`Core::orchestrator_account`] picks it) that the first orchestrator gets.
     pub(super) fn orchestrator_choice(
         &self,
@@ -2518,8 +2518,8 @@ impl Core {
         if !self.may_take_turn(&orch) || self.store.pending_count(&orch)? > 0 {
             return Ok(());
         }
-        // A runtime that started with another access level is restarted first
-        // (`hub::orch_access`): the notices go to the new one.
+        // A runtime that started with another access level, model or effort is restarted
+        // first (`hub::orch_access`, `hub::model`): the notices go to the new one.
         if self.restart_for_settings(hub, &orch)? {
             return Ok(());
         }
@@ -2826,6 +2826,23 @@ impl Core {
             })
     }
 
+    /// Whether `spec`, the runtime an `orchestrator.use` names, keeps the orchestrator's
+    /// agent: a bare `acp` while it runs an ACP agent (`acp:<command>` or a `[runtimes]`
+    /// preset): `acp` is the runtime a thread shows for every agent, so `twr orchestrator use
+    /// acp --model M` is a switch to a new session of the same agent. The new orchestrator
+    /// gets the agent's command, attach template and preset as they are recorded, as a reset
+    /// does, with the model and effort asked. Elsewhere a bare `acp` is refused (it names no
+    /// agent).
+    pub(super) fn keeps_orch_agent(&self, spec: &str) -> bool {
+        spec.trim() == twr_adapters::acp::NAME
+            && self
+                .orch
+                .thread
+                .as_deref()
+                .and_then(|t| self.registry.get(t))
+                .is_some_and(|v| v.runtime == twr_adapters::acp::NAME)
+    }
+
     /// Appends `thread.created` for a new orchestrator thread running `runtime` (`model`: the
     /// runtime's default when `None`; `effort`: the one `orchestrator.use` asked for, already
     /// canonical, `Some(None)` the runtime's default; `None` when not asked: a reset keeps the
@@ -2838,55 +2855,6 @@ impl Core {
     /// ([`Core::orchestrator_account`], chosen under the same lock), recorded as a worker's is
     /// (`ext.twr.account`, `account_dir`, `account_reason`), so its starts get the account's
     /// environment and refusals (`hub::thread_account`).
-    /// Whether `spec`, the runtime an `orchestrator.use` names, keeps the orchestrator's
-    /// agent: a bare `acp` while it runs an ACP agent (`acp:<command>` or a `[runtimes]`
-    /// preset). The model picker names the runtime a thread runs, which is `acp` for every
-    /// agent; the new orchestrator gets the agent's command, attach template and preset as
-    /// they are recorded, as a reset does, with the model and effort asked. Elsewhere a bare
-    /// `acp` is refused (it names no agent).
-    pub(super) fn keeps_orch_agent(&self, spec: &str) -> bool {
-        spec.trim() == twr_adapters::acp::NAME
-            && self
-                .orch
-                .thread
-                .as_deref()
-                .and_then(|t| self.registry.get(t))
-                .is_some_and(|v| v.runtime == twr_adapters::acp::NAME)
-    }
-
-    /// Refuses an `orchestrator.use` `keep_account` that cannot keep the current
-    /// orchestrator's account: there is no orchestrator yet, or `spec` is not its recorded
-    /// runtime, alone (another runtime, an account named, an `acp:<command>`). Kept, the
-    /// account is the recorded one ([`Core::kept_orchestrator_account`]), never one chosen
-    /// again by name: the native login and a named account can share a name
-    /// (`AccountsView::native_name`), and the name goes to the named one.
-    pub(super) fn check_keeps_account(&self, spec: &str) -> Result<(), RpcError> {
-        let Some(v) = self
-            .orch
-            .thread
-            .as_deref()
-            .and_then(|t| self.registry.get(t))
-        else {
-            return Err(rpc(
-                codes::BAD_REQUEST,
-                "keep_account keeps the current orchestrator's account, and there is no \
-                 orchestrator yet: leave it out",
-            ));
-        };
-        if spec.trim() != v.runtime {
-            return Err(rpc(
-                codes::BAD_REQUEST,
-                format!(
-                    "keep_account keeps the orchestrator's account on its own runtime ({}), \
-                     named alone; {:?} is not: leave keep_account out to choose the account",
-                    v.runtime,
-                    spec.trim()
-                ),
-            ));
-        }
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn create_orchestrator(
         &mut self,
@@ -3787,7 +3755,7 @@ pub(super) enum OrchAccountFrom {
     Config,
     /// `orchestrator.use`: the account part of its runtime spec.
     Switch,
-    /// A reset, a bare `acp` on an ACP agent, `keep_account`: the current orchestrator's.
+    /// A reset, a bare `acp` on an ACP agent: the current orchestrator's.
     Keep,
 }
 
@@ -4147,9 +4115,7 @@ impl Hub {
     /// the runtime's default), on the account `runtime` names (`claude-code:work`; none: the
     /// policy's default, else the native account; unknown, removed or logged out: refused, as
     /// for a new thread; [`Core::orchestrator_account`]). Another account of the same runtime
-    /// is a switch like another runtime. `opts.keep_account` keeps the current orchestrator's
-    /// account as recorded instead, as a reset does: `runtime` is then its runtime alone
-    /// ([`Core::check_keeps_account`]). A conversation cannot move between runtimes, so this is a new
+    /// is a switch like another runtime. A conversation cannot move between runtimes, so this is a new
     /// orchestrator thread with a new session: the current orchestrator is stopped (the
     /// normal closing sequence; its queued prompts and pending notices are dropped, but the
     /// lines that fire watches, which the new one gets after its handoff turn) and
@@ -4210,18 +4176,13 @@ impl Hub {
                 // ([`Core::keeps_orch_agent`]): no command line is chosen, and the account
                 // is the current one's.
                 let keep = self.inner.core().keeps_orch_agent(runtime);
-                // `keep_account`: the current one's account too, on its own runtime only
-                // ([`Core::check_keeps_account`]).
-                if opts.keep_account && !keep {
-                    self.inner.core().check_keeps_account(runtime)?;
-                }
                 // A device names a command line only with `terminal` (`hub::device_scope`).
                 if !keep {
                     self.inner.check_caller_runtime(caller, runtime.trim())?;
                 }
                 let (runtime, model, effort) =
                     self.check_switch(runtime, model, opts.effort.as_deref(), caller, keep)?;
-                let from = match keep || opts.keep_account {
+                let from = match keep {
                     true => OrchAccountFrom::Keep,
                     false => OrchAccountFrom::Switch,
                 };

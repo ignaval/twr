@@ -1,9 +1,10 @@
 /** The composer's model and effort picker (`ModelPicker.tsx`), its logic apart from React:
  * what the trigger says, which runtimes, models and efforts it lists (from the hub's
  * catalog, `shared/models.ts`), how the keyboard moves through its columns, and which call
- * a choice makes. A worker thread changes with `thread.set_model` (another runtime is a
- * move with a handoff, confirmed first); the orchestrator with `orchestrator.use`, always
- * confirmed, since it starts a new orchestrator session. */
+ * a choice makes. On its own runtime a thread, the orchestrator too, changes its model and
+ * effort with `thread.set_model`, in place: its runtime restarts on its session. Another
+ * runtime is confirmed first: a worker's move with a handoff (`thread.set_model` with the
+ * runtime), the orchestrator's switch to a new orchestrator session (`orchestrator.use`). */
 import {
   baseRuntime,
   effortChoices,
@@ -219,23 +220,23 @@ export function navigate(
 /** The call a choice makes, or none when nothing changed. */
 export type Plan =
   | { kind: "none" }
-  /** `thread.set_model`; `move`: to another runtime, with a handoff (confirmed first). */
+  /** `thread.set_model` (the orchestrator's too, on its own runtime); `move`: to another
+   * runtime, with a handoff (confirmed first). */
   | { kind: "thread"; params: Json; move: boolean }
-  /** `orchestrator.use` (confirmed first: a new orchestrator session). */
+  /** `orchestrator.use` to another runtime (confirmed first: a new orchestrator session). */
   | { kind: "orchestrator"; params: Json };
 
 /**
- * What choosing `pick` for `thread` asks of the hub. A worker thread on the same runtime
- * sends only what changed (`default` for a setting cleared), so keeping one never asks the
- * hub to clear it; on another runtime it is a move, with the model and effort picked, Default
- * as `default`. One not picked is left out: the hub then starts that runtime's default, or,
- * back on a runtime the thread left a session of, resumes it with the setting it had there
- * (`default` for one the runtime keeps on resume starts a new session instead). The orchestrator is switched with `orchestrator.use`
- * and the handoff summary: its runtime, and the model and effort picked (one left out is the
- * runtime's default). On the same runtime it sends `keep_account`: the hub keeps the account
- * the orchestrator runs on as it recorded it. Rebuilt from its name the account could be
- * another one: the native login's fallback name (`default`) may be a named account's too,
- * and the name goes to the named one. An ACP agent's `acp` keeps the agent it runs too.
+ * What choosing `pick` for `thread` asks of the hub. On the same runtime, a worker thread or
+ * the orchestrator, it sends only what changed to its thread (`default` for a setting
+ * cleared), so keeping one never asks the hub to clear it, and nothing names the runtime or
+ * the account: the hub changes them in place, on the account and agent it runs. On another
+ * runtime a worker moves, with the model and effort picked, Default as `default`. One not
+ * picked is left out: the hub then starts that runtime's default, or, back on a runtime the
+ * thread left a session of, resumes it with the setting it had there (`default` for one the
+ * runtime keeps on resume starts a new session instead). The orchestrator on another runtime
+ * is switched with `orchestrator.use` and the handoff summary: the runtime, and the model and
+ * effort picked (one left out is that runtime's default).
  */
 export function planChange(
   target: "orchestrator" | "thread",
@@ -244,11 +245,8 @@ export function planChange(
 ): Plan {
   const now = currentPick(thread);
   const same = pick.runtime === now.runtime;
-  if (target === "orchestrator") {
-    if (same && pick.model === now.model && pick.effort === now.effort)
-      return { kind: "none" };
+  if (target === "orchestrator" && !same) {
     const params: Json = { runtime: pick.runtime, summary: true };
-    if (same) params.keep_account = true;
     if (pick.model) params.model = pick.model;
     if (pick.effort) params.effort = pick.effort;
     return { kind: "orchestrator", params };

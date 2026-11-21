@@ -234,15 +234,14 @@ describe("what a choice asks of the hub", () => {
     expect(moveDetail("api", { runtime: "pty:bash" })).not.toContain("default");
   });
 
-  it("switches the orchestrator with its summary, the hub keeping its account on its runtime", () => {
+  it("changes the orchestrator's model and effort in place on its runtime, sending only what changed", () => {
     const orch = thread({
       id: "o",
       is_orchestrator: true,
       model: "opus",
       account: "work",
     });
-    // The runtime alone, with `keep_account`: the hub keeps the account it recorded, never
-    // one rebuilt from its name here.
+    // Its own thread, no runtime and no account: the hub keeps the ones it runs.
     expect(
       planChange("orchestrator", orch, {
         runtime: "claude-code",
@@ -250,19 +249,20 @@ describe("what a choice asks of the hub", () => {
         effort: "max",
       }),
     ).toEqual({
-      kind: "orchestrator",
-      params: {
-        runtime: "claude-code",
-        model: "opus",
-        effort: "max",
-        summary: true,
-        keep_account: true,
-      },
+      kind: "thread",
+      params: { thread: "o", effort: "max" },
+      move: false,
     });
-    // Another runtime: its own default account.
-    expect(planChange("orchestrator", orch, { runtime: "codex" })).toEqual({
-      kind: "orchestrator",
-      params: { runtime: "codex", summary: true },
+    // Default picked: `default`, the runtime's own.
+    expect(
+      planChange("orchestrator", orch, {
+        runtime: "claude-code",
+        chosen: { model: true },
+      }),
+    ).toEqual({
+      kind: "thread",
+      params: { thread: "o", model: "default" },
+      move: false,
     });
     expect(
       planChange("orchestrator", orch, {
@@ -272,35 +272,33 @@ describe("what a choice asks of the hub", () => {
     ).toEqual({ kind: "none" });
   });
 
-  it("keeps an ACP orchestrator's agent: a bare `acp`, no account after it", () => {
+  it("switches the orchestrator to another runtime with its summary", () => {
+    const orch = thread({ id: "o", is_orchestrator: true, model: "opus" });
+    // Its own default account there; one not picked is that runtime's default.
+    expect(planChange("orchestrator", orch, { runtime: "codex" })).toEqual({
+      kind: "orchestrator",
+      params: { runtime: "codex", summary: true },
+    });
+    expect(
+      planChange("orchestrator", orch, {
+        runtime: "codex",
+        model: "o5",
+        effort: "high",
+      }),
+    ).toEqual({
+      kind: "orchestrator",
+      params: { runtime: "codex", model: "o5", effort: "high", summary: true },
+    });
+  });
+
+  it("changes an ACP orchestrator's model in place, naming no agent or account", () => {
     const orch = thread({ id: "o", runtime: "acp", is_orchestrator: true });
     expect(
       planChange("orchestrator", orch, { runtime: "acp", model: "m2" }),
     ).toEqual({
-      kind: "orchestrator",
-      params: {
-        runtime: "acp",
-        model: "m2",
-        summary: true,
-        keep_account: true,
-      },
-    });
-  });
-
-  it("keeps the native login when only the effort changes, never naming it", () => {
-    // On the native login the thread records no account. Its name (`default`) may be a
-    // named account's too, which `codex:default` would get: nothing names it.
-    const orch = thread({ id: "o", runtime: "codex", is_orchestrator: true });
-    expect(
-      planChange("orchestrator", orch, { runtime: "codex", effort: "high" }),
-    ).toEqual({
-      kind: "orchestrator",
-      params: {
-        runtime: "codex",
-        effort: "high",
-        summary: true,
-        keep_account: true,
-      },
+      kind: "thread",
+      params: { thread: "o", model: "m2" },
+      move: false,
     });
   });
 
@@ -765,7 +763,25 @@ describe("the popup, rendered", () => {
     });
   });
 
-  it("confirms an orchestrator switch, with or without the summary", async () => {
+  it("changes the orchestrator's model and effort on its runtime at once, on its thread", async () => {
+    const orch = thread({
+      id: "o",
+      name: "orchestrator",
+      is_orchestrator: true,
+      model: "opus",
+    });
+    const m = await mount({ target: orch, kind: "orchestrator" });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    // Opus kept, effort max (by a click): no confirmation, only the effort sent.
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => click(option(m.root, ".model-picker-efforts", "Max")));
+    expect(m.confirms).toEqual([]);
+    expect(m.calls).toEqual([
+      { method: "thread.set_model", params: { thread: "o", effort: "max" } },
+    ]);
+  });
+
+  it("confirms an orchestrator switch to another runtime, with or without the summary", async () => {
     const orch = thread({
       id: "o",
       name: "orchestrator",
@@ -773,27 +789,20 @@ describe("the popup, rendered", () => {
     });
     const m = await mount({ target: orch, kind: "orchestrator" });
     await m.act(() => click(q(m.root, ".model-picker-trigger")!));
-    // Default model, effort max (by a click).
+    // Codex: its default model, effort high (by a click).
+    await m.act(() => click(option(m.root, ".model-picker-rail", "Cxcodex")));
     await m.act(() => void press(search(m.root) as any, "Enter"));
-    const max = m.root
-      .querySelectorAll(".model-picker-efforts [role=radio]")
-      .find((n: FakeElement) => n.textContent === "Max")!;
-    await m.act(() => click(max));
+    await m.act(() => click(option(m.root, ".model-picker-efforts", "High")));
     expect(m.confirms).toHaveLength(1);
     const c = m.confirms[0];
-    expect(c.title).toBe("Switch the orchestrator to claude-code, effort Max?");
+    expect(c.title).toBe("Switch the orchestrator to codex, effort High?");
     expect(c.action).toBe("Switch with summary");
     expect(c.alt.action).toBe("Switch without summary");
     await m.act(() => c.alt.run());
     expect(m.calls).toEqual([
       {
         method: "orchestrator.use",
-        params: {
-          runtime: "claude-code",
-          effort: "max",
-          summary: false,
-          keep_account: true,
-        },
+        params: { runtime: "codex", effort: "high", summary: false },
       },
     ]);
     // An empty queue: nothing said about dropped messages.
@@ -824,11 +833,9 @@ describe("the popup, rendered", () => {
       switched: (r: Json) => results.push(r),
     });
     await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => click(option(m.root, ".model-picker-rail", "Cxcodex")));
     await m.act(() => void press(search(m.root) as any, "Enter"));
-    const max = m.root
-      .querySelectorAll(".model-picker-efforts [role=radio]")
-      .find((n: FakeElement) => n.textContent === "Max")!;
-    await m.act(() => click(max));
+    await m.act(() => click(option(m.root, ".model-picker-efforts", "High")));
     const c = m.confirms[0];
     expect(c.detail).toContain(
       "2 queued messages to the orchestrator are dropped: without the summary, at once",
@@ -857,6 +864,18 @@ describe("the popup, rendered", () => {
     runtime: "claude-code",
     is_orchestrator: true,
   });
+
+  /** Opens the codex orchestrator's picker and picks claude-code's default model, then
+   * effort low: a switch, asked to confirm. */
+  const toClaude = async (m: Awaited<ReturnType<typeof mount>>) => {
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() =>
+      click(option(m.root, ".model-picker-rail", "Clclaude-code")),
+    );
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+  };
 
   it("closes, saying why, when another client switches the orchestrator underneath it", async () => {
     const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
@@ -902,11 +921,8 @@ describe("the popup, rendered", () => {
 
   it("takes back a switch it asked to confirm when the orchestrator changes first", async () => {
     const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
-    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
-    // Codex's default model, effort low: a switch, asked to confirm.
-    await m.act(() => void press(search(m.root) as any, "Enter"));
-    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
+    // claude-code's default model, effort low: a switch, asked to confirm.
+    await toClaude(m);
     expect(m.confirms).toHaveLength(1);
     const stale = m.confirms[0];
     await m.rerender({ target: claudeOrchestrator, kind: "orchestrator" });
@@ -933,10 +949,8 @@ describe("the popup, rendered", () => {
       kind: "orchestrator",
       show,
     });
-    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
-    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
+    // claude-code's default model, effort low: a switch, asked to confirm.
+    await toClaude(m);
     expect(m.confirms).toEqual([]);
     await m.unmount();
     await m.act(() => answer({ thread: "o1" }));
@@ -947,10 +961,8 @@ describe("the popup, rendered", () => {
 
   it("takes back a switch it asked to confirm when the picker goes away", async () => {
     const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
-    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
-    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
+    // claude-code's default model, effort low: a switch, asked to confirm.
+    await toClaude(m);
     expect(m.confirms).toHaveLength(1);
     const stale = m.confirms[0];
     await m.unmount();
@@ -967,33 +979,27 @@ describe("the popup, rendered", () => {
 
   it("still switches once confirmed while nothing changed, and takes back nothing after", async () => {
     const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
-    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
-    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
+    // claude-code's default model, effort low: a switch, asked to confirm.
+    await toClaude(m);
     await m.act(() => m.confirms[0].run());
     expect(m.calls).toEqual([
       {
         method: "orchestrator.use",
-        params: {
-          runtime: "codex",
-          effort: "low",
-          summary: true,
-          keep_account: true,
-        },
+        params: { runtime: "claude-code", effort: "low", summary: true },
       },
     ]);
     // The switch it made gives the orchestrator a new thread: nothing to take back.
     await m.rerender({
-      target: { ...codexOrchestrator, id: "o3", effort: "low" },
+      target: { ...claudeOrchestrator, id: "o3", effort: "low" },
       kind: "orchestrator",
     });
     expect(m.withdrawn).toEqual([]);
   });
 
-  it("keeps the native login when only the orchestrator's effort changes", async () => {
+  it("names no account when only the orchestrator's effort changes", async () => {
     // `work` is Codex's default account; this orchestrator runs on the native login, which
-    // `orchestrator.show` names `default`, a named account's name too: the hub keeps it.
+    // `orchestrator.show` names `default`, a named account's name too: nothing names it, so
+    // the hub keeps the native login, and nothing asks to confirm.
     const m = await mount({
       target: codexOrchestrator,
       kind: "orchestrator",
@@ -1004,17 +1010,9 @@ describe("the popup, rendered", () => {
     await m.act(() => void press(search(m.root) as any, "Enter"));
     await m.act(() => void press(search(m.root) as any, "ArrowDown"));
     await m.act(() => void press(search(m.root) as any, "Enter"));
-    await m.act(() => m.confirms[0].alt.run());
+    expect(m.confirms).toEqual([]);
     expect(m.calls).toEqual([
-      {
-        method: "orchestrator.use",
-        params: {
-          runtime: "codex",
-          effort: "low",
-          summary: false,
-          keep_account: true,
-        },
-      },
+      { method: "thread.set_model", params: { thread: "o1", effort: "low" } },
     ]);
   });
 
@@ -1158,18 +1156,16 @@ describe("the popup, rendered", () => {
     expect(m.confirms).toEqual([]);
   });
 
-  it("on a device without admin, the orchestrator's picker is disabled with the reason", async () => {
+  it("on a device without admin, changes the orchestrator's model in place but offers no switch", async () => {
     const orch = thread({
       id: "o",
       name: "orchestrator",
       is_orchestrator: true,
+      model: "opus",
     });
     const m = await mount({ target: orch, kind: "orchestrator", admin: false });
     const trigger = q(m.root, ".model-picker-trigger")!;
-    expect(trigger.getAttribute("disabled")).not.toBeNull();
-    expect(trigger.getAttribute("title")).toContain(
-      "Switching the orchestrator needs a device with admin access",
-    );
+    expect(trigger.getAttribute("disabled")).toBeNull();
     await m.act(() => {
       window.dispatchEvent(
         new FakeEvent("keydown", {
@@ -1181,10 +1177,28 @@ describe("the popup, rendered", () => {
         }) as unknown as Event,
       );
     });
-    expect(q(m.root, "[role=dialog]")).toBeNull();
-    // With admin (the local app has every scope), it opens.
-    await m.rerender({ admin: true });
-    expect(trigger.getAttribute("disabled")).toBeNull();
+    expect(q(m.root, "[role=dialog]")).not.toBeNull();
+    // Another runtime is a switch: listed, disabled, with the reason.
+    const codex = option(m.root, ".model-picker-rail", "Cxcodex");
+    expect(codex.getAttribute("aria-disabled")).toBe("true");
+    expect(codex.getAttribute("title")).toBe(
+      "codex: switching to it needs a device with admin access",
+    );
+    await m.act(() => click(codex));
+    expect(notice(m.root)).toBe(
+      "Switching the orchestrator to codex needs a device with admin access.",
+    );
+    // Its own runtime's model and effort change, at once.
+    await m.act(() => click(option(m.root, ".model-picker-models", "sonnet")));
+    await m.act(() => click(option(m.root, ".model-picker-efforts", "Low")));
+    expect(m.confirms).toEqual([]);
+    expect(m.calls).toEqual([
+      {
+        method: "thread.set_model",
+        params: { thread: "o", model: "sonnet", effort: "low" },
+      },
+    ]);
+    expect(m.errors).toEqual([]);
   });
 
   it("applies a typed custom model id with Done, and refuses an empty one", async () => {

@@ -79,8 +79,8 @@ export function ModelPicker({
   /** This device may change threads (its `operate` scope). */
   operate: boolean;
   /** This device may switch the orchestrator and move a thread to another runtime (its
-   * `admin` scope; the local app always may). Without it a worker's model and effort on its
-   * own runtime still change. */
+   * `admin` scope; the local app always may). Without it a model and effort on the own
+   * runtime still change, the orchestrator's too. */
   admin: boolean;
   confirm: (c: PickerConfirmation) => void;
   /** Takes back a confirmation `confirm` asked: false when it is no longer asked (it was
@@ -110,8 +110,7 @@ export function ModelPicker({
   const [notice, setNotice] = useState("");
   // The orchestrator's `orchestrator.show`, read as the popup opens: which runtimes are
   // installed (the rail says so, and a switch's confirmation). `orchShown` is the read in
-  // flight, which a choice waits for. (A switch on its runtime keeps its account: the hub
-  // does, `keep_account`.)
+  // flight, which a choice waits for.
   const [orchShow, setOrchShow] = useState<Json>();
   const orchShown = useRef<Promise<Json>>(undefined);
   const [nav, setNav] = useState<Nav>({
@@ -163,18 +162,14 @@ export function ModelPicker({
   if (target)
     targetName.current =
       kind === "orchestrator" ? "The orchestrator" : target.name;
-  // Every orchestrator change is a switch (`orchestrator.use`), which is admin's.
-  const switchBlocked = kind === "orchestrator" && !admin;
-  const disabled = !target || !connected || !operate || switchBlocked || busy;
+  const disabled = !target || !connected || !operate || busy;
   const reason = !connected
     ? "Disconnected"
     : !operate
       ? "This device may not change models"
-      : switchBlocked
-        ? "Switching the orchestrator needs a device with admin access"
-        : busy
-          ? "Changing the model…"
-          : undefined;
+      : busy
+        ? "Changing the model…"
+        : undefined;
 
   const now = target ? currentPick(target) : { runtime: "" };
   const runtimes = pickerRuntimes(catalog, target?.runtime);
@@ -186,7 +181,8 @@ export function ModelPicker({
   );
   const efforts = effortRows(catalog, runtime);
   const locked = runsCommandLine(runtime);
-  /** Another runtime than the thread's: a move, which this device may not make. */
+  /** Another runtime than the thread's: a move (the orchestrator's: a switch), which this
+   * device may not make. */
   const blocked = (r: string) => !admin && r !== now.runtime;
   /** An orchestrator's runtime whose program the hub doesn't find (`orchestrator.show`
    * `installed`): listed, and the switch's confirmation says it can't start. */
@@ -519,7 +515,9 @@ export function ModelPicker({
   const chooseRuntime = (r: string) => {
     if (blocked(r)) {
       setNotice(
-        `Moving ${target.name} to ${r} needs a device with admin access.`,
+        kind === "orchestrator"
+          ? `Switching the orchestrator to ${r} needs a device with admin access.`
+          : `Moving ${target.name} to ${r} needs a device with admin access.`,
       );
       return;
     }
@@ -729,7 +727,7 @@ export function ModelPicker({
                   r === now.runtime
                     ? `${r} (current)`
                     : blocked(r)
-                      ? `${r}: moving to it needs a device with admin access`
+                      ? `${r}: ${kind === "orchestrator" ? "switching" : "moving"} to it needs a device with admin access`
                       : missing(r)
                         ? `${r}: not installed on the hub's machine`
                         : r

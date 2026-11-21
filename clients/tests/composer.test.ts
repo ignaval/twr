@@ -2701,7 +2701,7 @@ describe("messages put back in the box stay messages", () => {
     expect(sentMessages()).toEqual(["/usage\n\ntaken back"]);
   });
 
-  it("opens the orchestrator's main conversation for /open orchestrator, its picker switching it", async () => {
+  it("opens the orchestrator's main conversation for /open orchestrator, its picker changing it in place", async () => {
     const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
     const calls: { method: string; params: Json }[] = [];
     await start({
@@ -2725,7 +2725,7 @@ describe("messages put back in the box stay messages", () => {
     await app().type("hello");
     await app().press("Enter");
     expect(app().host.sent.map((s) => s.method)).toEqual(["say"]);
-    // Its picker switches it (`thread.set_model` refuses the orchestrator).
+    // Its picker changes the orchestrator's own thread, in place, with nothing to confirm.
     await app().click(app().find(".model-picker-trigger"));
     const search = app().find(".model-picker-search");
     await app().act(async () => void press(search, "Enter"));
@@ -2734,22 +2734,21 @@ describe("messages put back in the box stay messages", () => {
         .all(".model-picker-efforts [role=radio]")
         .find((n) => n.textContent.includes("Low"))! as FakeElement,
     );
-    await app().click(app().find("button", "Switch without summary"));
+    expect(
+      app()
+        .all("button")
+        .some((b) => b.textContent === "Switch without summary"),
+    ).toBe(false);
     expect(calls).toEqual([
-      {
-        method: "orchestrator.use",
-        params: {
-          runtime: "fake",
-          effort: "low",
-          summary: false,
-          keep_account: true,
-        },
-      },
+      { method: "thread.set_model", params: { thread: "orch", effort: "low" } },
     ]);
   });
 
   it("puts back what a switch dropped escaped, and says the new orchestrator can't start", async () => {
-    const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
+    const catalog = {
+      fake: { models: [{ id: "m1" }], efforts: ["low"] },
+      codex: { models: [{ id: "gpt-5" }], efforts: ["low"] },
+    };
     const uses: Json[] = [];
     await start({
       rpc: (method, params) => {
@@ -2758,7 +2757,7 @@ describe("messages put back in the box stay messages", () => {
             models: catalog,
             thread: "orch",
             account: "default",
-            installed: { fake: true },
+            installed: { fake: true, codex: true },
           });
         if (method === "orchestrator.use") {
           uses.push(params);
@@ -2775,7 +2774,13 @@ describe("messages put back in the box stay messages", () => {
         return undefined;
       },
     });
+    // A switch to another runtime, confirmed without the summary.
     await app().click(app().find(".model-picker-trigger"));
+    await app().click(
+      app()
+        .all(".model-picker-rail [role=option]")
+        .find((n) => n.textContent.includes("codex"))! as FakeElement,
+    );
     const search = app().find(".model-picker-search");
     await app().act(async () => void press(search, "Enter"));
     await app().click(
@@ -2784,11 +2789,7 @@ describe("messages put back in the box stay messages", () => {
         .find((n) => n.textContent.includes("Low"))! as FakeElement,
     );
     await app().click(app().find("button", "Switch without summary"));
-    // The effort alone changed: on its own runtime, keeping its account as the hub
-    // recorded it.
-    expect(uses).toEqual([
-      { runtime: "fake", effort: "low", summary: false, keep_account: true },
-    ]);
+    expect(uses).toEqual([{ runtime: "codex", effort: "low", summary: false }]);
     expect(app().find(".notice-toast").textContent).toContain(
       "fake is not on PATH: the new orchestrator cannot start until it is there (install it).",
     );

@@ -804,22 +804,27 @@ async fn autostart_starts_the_orchestrator_with_the_hub() {
     hub.shutdown().await;
 }
 
-/// `thread.set_model` refuses the orchestrator thread (switching it is `twr orchestrator
-/// use`), whoever asks, and records nothing.
+/// `thread.set_model` on the orchestrator thread: the orchestrator's own call is refused (only
+/// the user changes it), and so is the user's move to another runtime (switching it is `twr
+/// orchestrator use`); neither records anything. (The user's model change in place:
+/// `orchestrator_switch.rs`.)
 #[tokio::test]
-async fn set_model_refuses_the_orchestrator() {
+async fn set_model_refuses_the_orchestrators_own_call_and_a_move() {
     let mut env = Env::new();
     let hub = env.hub_with(|c| c.orchestrator.autostart = true).await;
     let rt = env.orch().await;
     let orch = hub.orchestrator_thread().unwrap();
     let head = hub.control_read(0, 1).unwrap().1;
-    for caller in [tui(), Caller::Orchestrator] {
-        let e = hub
-            .set_model(&orch, Some("opus"), Some("high"), &caller)
-            .unwrap_err();
-        assert_eq!(e.code, codes::BAD_REQUEST, "{e}");
-        assert!(e.message.contains("twr orchestrator use"), "{e}");
-    }
+    let e = hub
+        .set_model(&orch, Some("opus"), Some("high"), &Caller::Orchestrator)
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED, "{e}");
+    assert!(e.message.contains("cannot change its own model"), "{e}");
+    let e = hub
+        .set_runtime_model(&orch, Some("codex"), Some("o5"), None, &tui())
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e}");
+    assert!(e.message.contains("twr orchestrator use"), "{e}");
     assert_eq!(hub.control_read(0, 1).unwrap().1, head);
     assert_eq!(
         hub.thread_view(&orch).unwrap().model.as_deref(),

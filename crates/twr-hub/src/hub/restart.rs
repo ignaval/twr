@@ -51,10 +51,16 @@
 //! `thread.stop` meanwhile wins: the thread stays stopped. Nothing is killed but what the stop
 //! machinery kills (identity-checked).
 //!
-//! Not restarted: the orchestrator (its settings are its runtime's choice, `hub::orch`; the
-//! RPCs refuse it), but for a change of its access level (`hub::orch_access`: its live runtime
-//! started with the other level; the stop says `mode_change`, a narrowing is full to limited),
-//! and `pty` threads (they apply no mode; `thread.set_model` refuses them).
+//! The orchestrator is restarted for two changes only: its model or effort (`thread.set_model`
+//! by the user, [`super::model`]; the stop says `model_change`), and its access level
+//! (`hub::orch_access`: its live runtime started with the other level; the stop says
+//! `mode_change`, a narrowing is full to limited). One restart applies both: every start reads
+//! the level and the thread's model and effort. Its mode is the level's and its runtime and
+//! account change only by a switch (`orchestrator.use`, a new orchestrator), so neither is
+//! compared. Nothing restarts it while a switch or reset replaces it (`OrchState::switching`),
+//! and its exit starts it again on its session (`AccessRt::restarting`), after which the
+//! notices queued meanwhile go to it. Not restarted: `pty` threads (they apply no mode;
+//! `thread.set_model` refuses them).
 //!
 //! A runtime move is recorded on the live runtime's settings too ([`RunSettings::moved`]): a
 //! move between two agents of the same runtime (two `acp` agents or presets, or back to the
@@ -430,10 +436,9 @@ impl Core {
         let Some(view) = self.registry.get(thread) else {
             return false;
         };
-        // The orchestrator's settings are its runtime's choice; only its access level
-        // restarts it (`hub::orch_access`).
+        // The orchestrator: its access level (`hub::orch_access`) or its model and effort.
         if view.is_orchestrator() {
-            return self.access_restart_due(thread);
+            return self.access_restart_due(thread) || self.orch_model_restart_due(thread);
         }
         if !applies_settings(&view.runtime) {
             return false;
@@ -449,6 +454,27 @@ impl Core {
                 .runtime_settings
                 .as_ref()
                 .is_some_and(|s| !s.runs_in(&RunSettings::of(view)))
+    }
+
+    /// Whether the current orchestrator `thread`'s live runtime started with another model or
+    /// effort than its thread's now and is not being stopped or restarted already (see the
+    /// module docs: only those two are compared).
+    fn orch_model_restart_due(&self, thread: &str) -> bool {
+        let (Some(view), Some(rt)) = (self.registry.get(thread), self.rt.get(thread)) else {
+            return false;
+        };
+        let Some(live) = rt.live.as_ref() else {
+            return false;
+        };
+        self.orch.is_thread(thread)
+            && !(rt.restart_reason.is_some()
+                || rt.stop_requested
+                || live.stop_requested
+                || live.given_up.is_some())
+            && rt
+                .runtime_settings
+                .as_ref()
+                .is_some_and(|s| s.model != view.model || s.effort != view.effort)
     }
 
     /// Whether the restart due on `thread` ([`Core::restart_due`]) narrows what its runtime
@@ -520,13 +546,13 @@ impl Core {
             return Ok(false);
         };
         let to = RunSettings::of(view);
-        // The orchestrator's is an access change: a permission change, which its exit
-        // restarts on its session (`hub::orch_access`).
+        // The orchestrator's is an access change (a permission change: `hub::orch_access`)
+        // or a model change; either way its exit restarts it on its session.
         let orch = self.orch.is_thread(thread);
-        let reason = if orch {
-            MODE_RESTART_REASON
-        } else {
-            from.restart_reason(&to)
+        let reason = match orch {
+            true if self.access_restart_due(thread) => MODE_RESTART_REASON,
+            true => MODEL_RESTART_REASON,
+            false => from.restart_reason(&to),
         };
         if orch {
             self.orch_access.restarting = true;
@@ -572,17 +598,17 @@ impl Core {
     /// what happened since. A failure is logged: the thread is idle with no runtime, like
     /// after a stop.
     pub(super) fn restart_after_settings_change(&mut self, hub: &Arc<Inner>, thread: &str) {
-        // The orchestrator only after its access restart (`hub::orch_access`), and not while
-        // a switch replaces it.
+        // The orchestrator only after its own settings restart (an access or model change),
+        // and not while a switch replaces it.
         let orch = self.orch.is_thread(thread);
-        let access_restart = orch && std::mem::take(&mut self.orch_access.restarting);
+        let orch_restart = orch && std::mem::take(&mut self.orch_access.restarting);
         let Some(view) = self.registry.get(thread) else {
             return;
         };
         if view.stopped
             || view.handoff_pending
             || view.session_id.is_none()
-            || (view.is_orchestrator() && !access_restart)
+            || (view.is_orchestrator() && !orch_restart)
             || (orch && self.orch.switching)
         {
             return;

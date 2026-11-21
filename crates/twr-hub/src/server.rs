@@ -35,7 +35,7 @@
 //! | `summary.thread`    | `{thread, models?, every_secs}` (users only)        | `{thread, summary, basis, runtime, model, cached, reason?, next_after_secs?, stats}`: one line on where a worker thread stands, from its state, activity and routine updates, by the small model a suggestion uses (`hub::summary`, `twr_core::proto::SummaryThreadResult`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
-//! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
+//! | `thread.set_model`  | `{thread, runtime?, account?, outside_pin?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default; the orchestrator's thread: the user's model and effort only, changed in place, `hub::model`) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
 //! | `thread.rename`     | `{thread, name}` (a worker thread; the name free and valid as for `thread.new`) | `{thread, thread_name, previous, changed, worktree, branch, message}` (`thread.renamed`; the worktree and branch keep their names) |
 //! | `thread.delete`     | `{thread}` or `{threads: [string]}` (one to 32)      | `{status: "needs_confirmation", threads: [{thread, thread_name, pending, worktree?, branch?, dirty_files?, hidden_changes?, ignored?, ignored_entries?, head_only_commits?, branch_only_commits?, checkout?, checkout_only_commits?, shared?, existing_branch?, worktree_missing?, worktree_unchecked?}], thread, thread_name, attn_id, revision, summary, options, existing, replaces?, message}` (a delete card for all of them; nothing is deleted until the user confirms it; `thread` / `thread_name`: the first thread's) |
 //! | `trash.list`        | -                                                   | `{items: [{item, short, thread, thread_name, project, box, deleted_at, deleted_at_ms, purge_at, purge_at_ms, bytes, size, losses, worktree, branch, dir, incomplete?, kept?, box_offline?}], keep_days, bytes, size, unavailable: [{box, error}], message}` (oldest first) |
@@ -223,6 +223,9 @@
 //! (`hub::switch`): the same thread, worktree and branch, a new session of the new runtime
 //! from its next turn, whose prompt carries a handoff of what the previous session did. The
 //! orchestrator may only name an agent runtime or a configured preset (as for `thread.new`).
+//! On the orchestrator's own thread it changes the model and effort in place (the user's call
+//! only; its runtime restarts on its session when free): another runtime or account is
+//! `orchestrator.use`.
 //! `thread.delete` deletes nothing itself: it raises one delete card on the `hub` thread for
 //! the threads it names, which only the user answers (`hub::delete`); `Delete` deletes them
 //! one after another: stops the runtime, moves the worktree (also with uncommitted changes;
@@ -1526,9 +1529,6 @@ struct UseOrchestratorParams {
     /// How long to wait for a busy previous orchestrator (default 60, at most 600).
     #[serde(default)]
     wait_secs: Option<u64>,
-    /// Keep the current orchestrator's account as recorded (its own runtime only).
-    #[serde(default)]
-    keep_account: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -2590,7 +2590,6 @@ async fn call_async(
             let mut opts = SwitchOptions {
                 summary: p.summary,
                 effort: p.effort,
-                keep_account: p.keep_account,
                 ..SwitchOptions::default()
             };
             if let Some(w) = p.wait_secs {
