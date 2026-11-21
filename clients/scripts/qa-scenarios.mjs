@@ -25,7 +25,8 @@ export async function runMacQA(page, { fixture, hubPids }) {
   };
   const open = async (title, values = {}) => {
     await page
-      .getByRole("button", { name: "Open command palette", exact: true })
+      .locator(".sidebar-footer")
+      .getByRole("button", { name: "Commands", exact: true })
       .click();
     await page.getByRole("textbox", { name: "Search commands" }).fill(title);
     await page
@@ -66,14 +67,10 @@ export async function runMacQA(page, { fixture, hubPids }) {
 
   // Open every manager on the release app, checking that the view renders successfully.
   for (const name of [
-    "Accounts",
-    "Boxes",
-    "Jobs",
-    "Usage",
+    "Machines & accounts",
+    "Activity",
     "Context & memory",
-    "Read aloud",
     "Trash",
-    "Hub & storage",
     "Settings",
     "Decisions",
   ]) {
@@ -246,7 +243,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
     .waitFor();
   console.log("QA: queue take-back restores the original message");
 
-  await nav("Jobs");
+  await nav("Activity");
   await run("Run a job", {
     thread: "qa-agent",
     argv: "sh -c 'printf DESKTOP_JOB_OK; sleep 60'",
@@ -273,7 +270,7 @@ export async function runMacQA(page, { fixture, hubPids }) {
   await page
     .getByLabel("Note", { exact: true })
     .fill("Unsaved body that must survive navigation");
-  await nav("Jobs");
+  await nav("Activity");
   await nav("Context & memory");
   await note.getByRole("button", { name: "Read / edit", exact: true }).click();
   assert.equal(

@@ -169,9 +169,7 @@ try {
     window.fixtureListeners = listeners;
   });
   await page.goto(`http://127.0.0.1:${server.address().port}/index.html`);
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   await page.getByRole("tab", { name: "Share this computer" }).click();
   await page
     .getByLabel("Public HTTPS address")
@@ -247,21 +245,19 @@ try {
     .getByRole("button", { name: "Connect", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
+    .getByRole("button", { name: /^Computer: .+ — switch$/ })
     .filter({ hasText: "Saved workstation" })
     .waitFor();
   assert.equal(await page.evaluate(() => window.fixtureListeners.size), 1);
   await page.evaluate(() => {
     window.fixtureOldRemote = window.twr;
   });
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   await page
     .getByRole("button", { name: "This computer", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
+    .getByRole("button", { name: /^Computer: .+ — switch$/ })
     .filter({ hasText: "This computer" })
     .waitFor();
   assert.equal(await page.evaluate(() => window.fixtureListeners.size), 0);

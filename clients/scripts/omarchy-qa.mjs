@@ -341,7 +341,8 @@ const captureSurfaces = async (mode) => {
     .getByRole("button", { name: "Close dialog", exact: true })
     .click();
   await page
-    .getByRole("button", { name: "Open command palette", exact: true })
+    .locator(".sidebar-footer")
+    .getByRole("button", { name: "Commands", exact: true })
     .click();
   const palette = page.getByRole("dialog", { name: "Commands", exact: true });
   await palette.waitFor();

@@ -601,7 +601,8 @@ try {
     { env, stdio: "pipe" },
   );
   await page
-    .getByRole("button", { name: "Open command palette", exact: true })
+    .locator(".sidebar-footer")
+    .getByRole("button", { name: "Commands", exact: true })
     .click();
   await page
     .getByRole("textbox", { name: "Search commands" })
@@ -1109,9 +1110,12 @@ try {
     .evaluate((element) => (element.open = true));
   await page
     .locator(".sidebar-secondary")
-    .getByRole("button", { name: "Accounts", exact: true })
+    .getByRole("button", { name: "Machines & accounts", exact: true })
     .click();
-  await page.getByRole("heading", { name: "Accounts", exact: true }).waitFor();
+  await page
+    .getByRole("heading", { name: /accounts/i })
+    .first()
+    .waitFor();
   await page
     .locator(".compact-nav")
     .getByRole("button", { name: "Chat", exact: true })
