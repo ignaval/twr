@@ -145,6 +145,23 @@ as code with a copy button instead of a link that does nothing.
 | Runner provisioning and terminal setup | Advanced CLI forms; runner commands do not receive workspace flags |
 | Update | App-level release check and platform installer; the CLI never overwrites the app's engine |
 
+The app's own forms (New thread, Change permission mode, Run a job and the rest) ask with
+dropdowns wherever the hub knows the values: threads by name and status, installed runtimes,
+boxes (local first), the chosen runtime's accounts, permission modes in words (only the
+narrow ones on a device without admin), jobs, trash items, watches, paired devices, memory
+notes, held messages, device access levels and usage periods. A list the hub can't give
+(an older hub, a device not allowed to read it) leaves a text box. A form opened for a
+thread (the inspector's buttons, a slash command naming one) says **For <thread>** under its
+title instead of asking. Less common fields wait under **More options**, which opens by
+itself when one of them holds a value or an error names one; New thread shows Project,
+Name, First prompt and Run as an implementation loop, and keeps the runtime, box, model,
+effort, permission mode, account, aliases, base, checkout and the folder relative project
+paths resolve from under it. Common results read as a sentence or a small table (the thread
+made, with Open; a mode or model change; a rename, park, resume, stop, compaction or trim;
+accounts and their logins; storage sizes; usage; a box's agents and projects; an update
+check, with its download or Restart to update; a memory note's text), with the data itself
+under **Details**; anything else shows as data.
+
 The command palette discovers commands, arguments and options from the **bundled binary's
 own help**, including clap's multiline help. Arguments are preflighted with the bundled CLI’s actual clap parser before a terminal
 opens; invalid arguments leave the form intact. CLI forms show their working directory,
