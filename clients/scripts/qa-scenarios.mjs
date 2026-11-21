@@ -35,13 +35,35 @@ export async function runMacQA(page, { fixture, hubPids }) {
     const dialog = page.getByRole("dialog").last();
     for (const [key, value] of Object.entries(values)) {
       const field = dialog.locator("#field-" + key);
+      // Less common fields wait under More options.
+      if (!(await field.isVisible()))
+        await dialog.locator(".more-options:not([open]) > summary").click();
       if ((await field.getAttribute("type")) === "checkbox")
         await field.setChecked(value);
       else if (
         (await field.evaluate((element) => element.tagName)) === "SELECT"
-      )
-        await field.selectOption(value);
-      else await field.fill(String(value));
+      ) {
+        // Pickers list ids under names: `thread: "api"` picks "api · running". The
+        // list loads as the form opens.
+        await field.locator("option:not([disabled])").first().waitFor({
+          state: "attached",
+        });
+        await expect
+          .poll(() => field.isEnabled(), { message: `#field-${key} loads` })
+          .toBe(true);
+        const option = await field.evaluate(
+          (select, wanted) =>
+            [...select.options].find(
+              (o) =>
+                o.value === wanted ||
+                o.text === wanted ||
+                o.text.startsWith(wanted + " · "),
+            )?.value,
+          String(value),
+        );
+        assert(option !== undefined, `#field-${key} offers ${value}`);
+        await field.selectOption(option);
+      } else await field.fill(String(value));
     }
     return dialog;
   };

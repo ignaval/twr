@@ -488,7 +488,9 @@ try {
   const create = page.getByRole("dialog", { name: "New thread", exact: true });
   await create.getByLabel(/Project or repository/).fill("demo");
   await create.getByLabel("Name", { exact: true }).fill("ui-first");
-  await create.getByLabel("Runtime", { exact: true }).fill("fake");
+  // The runtime is one of the less common choices, under More options.
+  await create.getByText("More options", { exact: true }).click();
+  await create.getByLabel("Runtime", { exact: true }).selectOption("fake");
   await create.locator('button[type="submit"]').click();
   const firstComposer = page.getByRole("textbox", {
     name: "Message ui-first directly",

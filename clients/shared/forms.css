@@ -1,0 +1,46 @@
+/* Command forms: More options, and results in words (shared/CommandResult.tsx). */
+.more-options {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.more-options > summary {
+  cursor: pointer;
+  font-weight: 500;
+  color: var(--muted);
+}
+.more-options[open] > summary {
+  margin-bottom: 16px;
+}
+.more-options-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.command-result {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.command-result > p {
+  margin: 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.command-result-list {
+  margin: 0;
+  padding-left: 20px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.command-result .button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.command-result-details > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.command-result-details[open] > summary {
+  margin-bottom: 12px;
+}

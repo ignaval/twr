@@ -108,7 +108,13 @@ import {
   Markdown,
   Spinner,
 } from "./ui";
-import { effortChoices, formRuntime, modelChoices } from "./models";
+import {
+  findThread,
+  pickerSources,
+  resolveField,
+  splitFields,
+} from "./fieldChoices";
+import { CommandResult } from "./CommandResult";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
 import { announcements, voiceHint } from "./voice";
 import {
@@ -621,7 +627,18 @@ export default function App({
     (command: Command, initialValues: Json = {}) => {
       setPalette(false);
       setOperation(command);
-      setValues({
+      const threads = threadsRef.current;
+      // Opened for a thread (the inspector, a row, a slash command naming one): the form
+      // says which in its subtitle instead of asking.
+      const given =
+        !command.cli &&
+        command.fields.some((f) => f.key === "thread") &&
+        findThread(threads, initialValues.thread);
+      setFixedThread(given ? given.name : undefined);
+      // Change permission mode opens on the thread's current mode.
+      if (command.id === "mode" && given && !initialValues.mode)
+        initialValues = { ...initialValues, mode: given.mode };
+      const opened = {
         _cwd: initialValues._cwd || localWorkingDirectory(target, homePath),
         ...Object.fromEntries(
           command.fields.map((f) => [
@@ -642,7 +659,9 @@ export default function App({
               (f.type === "boolean" ? false : ""),
           ]),
         ),
-      });
+      };
+      setValues(opened);
+      setMoreOpen(splitFields(command.fields, opened).open);
       setOperationError("");
       setResult(undefined);
     },
@@ -650,6 +669,33 @@ export default function App({
   );
   const infoRef = useRef(info);
   infoRef.current = info;
+  const threadsRef = useRef(view.threads);
+  threadsRef.current = view.threads;
+  // The thread a form was opened for (its name), its More options disclosure, and the
+  // lists its pickers read once it opens (`pickerSources`): null for one that failed.
+  const [fixedThread, setFixedThread] = useState<string>();
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [pickerLists, setPickerLists] = useState<Record<string, Json>>({});
+  useEffect(() => {
+    setPickerLists({});
+    if (!operation) return;
+    let live = true;
+    for (const method of pickerSources(operation)) {
+      const allowed =
+        connected && (!deviceScopes || !!allowedMethods?.includes(method));
+      const settle = (value: Json) => {
+        if (live) setPickerLists((old) => ({ ...old, [method]: value }));
+      };
+      if (!allowed) settle(null);
+      else
+        void rpc(method)
+          .then((value) => settle(value ?? null))
+          .catch(() => settle(null));
+    }
+    return () => {
+      live = false;
+    };
+  }, [operation, connected]);
   const action = useCallback(
     (id: string, initialValues: Json = {}) => {
       const command = commands.find((c) => c.id === id);
@@ -4338,199 +4384,198 @@ export default function App({
           </footer>
         </Dialog>
       )}
-      {operation && (
-        <Dialog
-          title={operation.title}
-          subtitle={operation.description}
-          onClose={() => {
-            if (!operationBusy) setOperation(undefined);
-          }}
-          wide={operation.fields.some((f) => f.type === "textarea")}
-        >
-          {operationError && (
-            <div className="operation-error error-banner" role="alert">
-              {operationError}
-            </div>
-          )}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void execute();
-            }}
-          >
-            <div className="operation-fields">
-              {operation.fields
-                .filter(
-                  (field) =>
-                    // The setup card choice goes with the New thread form's loop only.
-                    !(
-                      operation.id === "new" &&
-                      field.key === "loop_setup" &&
-                      !values.implement
-                    ),
-                )
-                .map((field) => (
-                  <Fragment key={field.key}>
-                    <FieldInput
-                      field={
-                        field.key === "runtime"
-                          ? {
-                              ...field,
-                              options: [
-                                ...new Set([
-                                  "claude-code",
-                                  "codex",
-                                  "grok-build",
-                                  ...(info?.agents || []).map(
-                                    (a: Json) => a.runtime,
-                                  ),
-                                ]),
-                              ],
-                            }
-                          : field.type === "model" || field.type === "effort"
-                            ? {
-                                ...field,
-                                choices: (field.type === "model"
-                                  ? modelChoices
-                                  : effortChoices)(
-                                  modelCatalog,
-                                  formRuntime(
-                                    operation,
-                                    values,
-                                    view.threads,
-                                    info?.orchestrator?.configured?.explicit ===
-                                      false
-                                      ? info.orchestrator.configured.runtime
-                                      : undefined,
-                                  ),
-                                ),
-                              }
-                            : field.key === "mode" && !permitted("admin")
-                              ? {
-                                  ...field,
-                                  options: [
-                                    "manual",
-                                    "plan",
-                                    "read-only",
-                                    "dontAsk",
-                                  ],
-                                }
-                              : field
-                      }
-                      value={values[field.key]}
-                      onChange={(value) =>
-                        setValues((old) => ({ ...old, [field.key]: value }))
-                      }
-                    />
-                    {operation.id === "new" &&
-                      field.key === "implement" &&
-                      values.implement && (
-                        <NewThreadLoopLine
-                          project={values.project}
-                          connected={connected}
-                        />
-                      )}
-                  </Fragment>
-                ))}
-              {(operation.cli || operation.method === "thread.new") && (
-                <FieldInput
-                  field={{
-                    key: "_cwd",
-                    label: "Working directory",
-                    type: "directory",
-                    required: true,
-                    description:
-                      "Relative paths in this command are resolved from this folder.",
-                  }}
-                  value={values._cwd}
-                  onChange={(value) =>
-                    setValues((old) => ({ ...old, _cwd: value }))
-                  }
-                />
-              )}
-              {operation.cli && (
-                <p className="form-note">
-                  Runs in this workspace’s embedded terminal. Any interactive
-                  confirmation or login stays there.
-                </p>
-              )}
-
-              {result !== undefined && (
-                <div className="operation-result">
-                  {operation.id === "job-log" ? (
-                    <JobLog job={values.job} rpc={rpc} />
-                  ) : operation.id === "app-update" ? (
-                    <>
-                      <DataView value={result} />
-                      {result?.releaseUrl && (
-                        <button
-                          onClick={() =>
-                            void hostApi
-                              .openExternal(
-                                result.download?.url || result.releaseUrl,
-                              )
-                              .catch(fail)
-                          }
-                        >
-                          {result.download
-                            ? `Download ${result.download.name}`
-                            : "Open release page"}{" "}
-                          <ExternalLink size={14} aria-hidden="true" />
-                        </button>
-                      )}
-                      <button onClick={() => setSection("settings")}>
-                        Update settings
-                      </button>
-                    </>
-                  ) : operation.id === "access" ? (
-                    <AccessResult value={result} />
-                  ) : operation.id === "context-read" ? (
-                    <ContextEditor
-                      key={values.project + ":" + result.hash}
-                      value={result}
-                      project={values.project}
-                      rpc={rpc}
-                      fail={fail}
-                    />
-                  ) : (
-                    <DataView value={result} />
-                  )}
+      {operation &&
+        (() => {
+          const context = {
+            command: operation,
+            values,
+            threads: view.threads,
+            info,
+            admin: permitted("admin"),
+            modelCatalog,
+            lists: pickerLists,
+          };
+          const shown = operation.fields.filter(
+            (field) =>
+              // The setup card choice goes with the New thread form's loop only.
+              !(
+                operation.id === "new" &&
+                field.key === "loop_setup" &&
+                !values.implement
+              ) &&
+              // A form opened for a thread names it in its subtitle instead.
+              !(field.key === "thread" && fixedThread),
+          );
+          const { essential, advanced } = splitFields(shown, values);
+          const renderField = (field: (typeof shown)[number]) => (
+            <Fragment key={field.key}>
+              <FieldInput
+                field={resolveField(field, context)}
+                value={values[field.key]}
+                onChange={(value) =>
+                  setValues((old) => ({ ...old, [field.key]: value }))
+                }
+              />
+              {operation.id === "new" &&
+                field.key === "implement" &&
+                values.implement && (
+                  <NewThreadLoopLine
+                    project={values.project}
+                    connected={connected}
+                  />
+                )}
+            </Fragment>
+          );
+          const cwd = (operation.cli || operation.method === "thread.new") && (
+            <FieldInput
+              field={{
+                key: "_cwd",
+                label:
+                  operation.method === "thread.new"
+                    ? "Resolve project paths from"
+                    : "Working directory",
+                type: "directory",
+                required: true,
+                description:
+                  "Relative paths in this command are resolved from this folder.",
+              }}
+              value={values._cwd}
+              onChange={(value) =>
+                setValues((old) => ({ ...old, _cwd: value }))
+              }
+            />
+          );
+          // New thread's folder for relative paths goes under More options with the rest.
+          const cwdAdvanced = operation.method === "thread.new";
+          return (
+            <Dialog
+              title={operation.title}
+              subtitle={
+                fixedThread
+                  ? `For ${fixedThread}.${operation.description ? " " + operation.description : ""}`
+                  : operation.description
+              }
+              onClose={() => {
+                if (!operationBusy) setOperation(undefined);
+              }}
+              wide={operation.fields.some((f) => f.type === "textarea")}
+            >
+              {operationError && (
+                <div className="operation-error error-banner" role="alert">
+                  {operationError}
                 </div>
               )}
-            </div>
-            <footer className="dialog-footer">
-              <span>In {workspace}</span>
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setOperation(undefined)}
-                  disabled={operationBusy}
-                >
-                  {result !== undefined ? "Close" : "Cancel"}
-                </button>
-                <button
-                  className="primary"
-                  type="submit"
-                  disabled={operationBusy}
-                >
-                  {operationBusy ? (
-                    <Spinner />
-                  ) : operation.cli ? (
-                    <TerminalSquare size={15} />
-                  ) : operation.id === "new" ? (
-                    <Plus size={15} />
-                  ) : (
-                    <ArrowUpRight size={15} />
-                  )}{" "}
-                  {operation.cli
-                    ? "Open terminal"
-                    : operationAction(operation, result !== undefined)}
-                </button>
-              </div>
-            </footer>
-          </form>
-        </Dialog>
-      )}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void execute();
+                }}
+              >
+                <div className="operation-fields">
+                  {fixedThread && (
+                    // Still the form's value, for the QA suites and the hub.
+                    <input
+                      type="hidden"
+                      id="field-thread"
+                      value={values.thread ?? ""}
+                    />
+                  )}
+                  {essential.map(renderField)}
+                  {(advanced.length > 0 || (cwd && cwdAdvanced)) && (
+                    <details
+                      className="more-options"
+                      open={moreOpen}
+                      onToggle={(event) =>
+                        setMoreOpen(event.currentTarget.open)
+                      }
+                    >
+                      <summary>More options</summary>
+                      <div className="more-options-fields">
+                        {advanced.map(renderField)}
+                        {cwdAdvanced && cwd}
+                      </div>
+                    </details>
+                  )}
+                  {!cwdAdvanced && cwd}
+                  {operation.cli && (
+                    <p className="form-note">
+                      Runs in this workspace’s embedded terminal. Any
+                      interactive confirmation or login stays there.
+                    </p>
+                  )}
+
+                  {result !== undefined && (
+                    <div className="operation-result">
+                      {operation.id === "job-log" ? (
+                        <JobLog job={values.job} rpc={rpc} />
+                      ) : operation.id === "access" ? (
+                        <AccessResult value={result} />
+                      ) : operation.id === "context-read" ? (
+                        <ContextEditor
+                          key={values.project + ":" + result.hash}
+                          value={result}
+                          project={values.project}
+                          rpc={rpc}
+                          fail={fail}
+                        />
+                      ) : (
+                        <CommandResult
+                          method={operation.method}
+                          value={result}
+                          values={values}
+                          onOpenThread={(id) => {
+                            setOperation(undefined);
+                            setDestination(id);
+                            setSelected(undefined);
+                            setSection("chat");
+                          }}
+                          onOpenLink={(url) =>
+                            void hostApi.openExternal(url).catch(fail)
+                          }
+                          onUpdateSettings={() => {
+                            setOperation(undefined);
+                            setSection("settings");
+                          }}
+                          onError={fail}
+                        />
+                      )}
+                    </div>
+                  )}
+                </div>
+                <footer className="dialog-footer">
+                  <span>In {workspace}</span>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => setOperation(undefined)}
+                      disabled={operationBusy}
+                    >
+                      {result !== undefined ? "Close" : "Cancel"}
+                    </button>
+                    <button
+                      className="primary"
+                      type="submit"
+                      disabled={operationBusy}
+                    >
+                      {operationBusy ? (
+                        <Spinner />
+                      ) : operation.cli ? (
+                        <TerminalSquare size={15} />
+                      ) : operation.id === "new" ? (
+                        <Plus size={15} />
+                      ) : (
+                        <ArrowUpRight size={15} />
+                      )}{" "}
+                      {operation.cli
+                        ? "Open terminal"
+                        : operationAction(operation, result !== undefined)}
+                    </button>
+                  </div>
+                </footer>
+              </form>
+            </Dialog>
+          );
+        })()}
       {confirmation && (
         <Dialog
           title={confirmation.title}

@@ -17,6 +17,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { PluggableList } from "unified";
 import type { Field } from "./commands";
+import "./forms.css";
 export function Spinner() {
   return (
     <LoaderCircle size={16} className="spin" role="img" aria-label="Loading" />
@@ -128,20 +129,8 @@ export function FieldInput({
           custom={field.type === "model"}
           required={field.required}
         />
-      ) : field.type === "select" ? (
-        <select
-          id={id}
-          aria-required={field.required || undefined}
-          value={value ?? ""}
-          onChange={(e) => onChange(e.target.value)}
-        >
-          <option value="">
-            {field.required ? "Choose…" : "Keep default"}
-          </option>
-          {field.options?.map((o) => (
-            <option key={o}>{o}</option>
-          ))}
-        </select>
+      ) : field.type === "select" || (isPicker(field) && field.choices) ? (
+        <ChoiceSelect id={id} field={field} value={value} onChange={onChange} />
       ) : field.type === "textarea" ? (
         <textarea
           id={id}
@@ -188,6 +177,75 @@ export function FieldInput({
       )}
       {field.description && <small>{field.description}</small>}
     </label>
+  );
+}
+/** Field types drawn as a list of what the hub has (`shared/fieldChoices.ts`). */
+const PICKERS = new Set([
+  "thread",
+  "runtime",
+  "box",
+  "account",
+  "permission-mode",
+  "speaker",
+  "job",
+  "trash-item",
+  "watch",
+  "device",
+  "memory-note",
+  "held",
+  "scopes",
+]);
+function isPicker(field: Field) {
+  return !!field.type && PICKERS.has(field.type);
+}
+/** A select of `field`'s choices (labelled), or its plain `options`: an empty choice first
+ * ("Choose…" when required, else what leaving it empty does), and the current value even
+ * when the list doesn't have it, so the form sends what it shows. */
+function ChoiceSelect({
+  id,
+  field,
+  value,
+  onChange,
+}: {
+  id: string;
+  field: Field;
+  value: any;
+  onChange: (v: any) => void;
+}) {
+  const current = value === undefined || value === null ? "" : String(value);
+  const choices: NonNullable<Field["choices"]> =
+    field.choices ?? (field.options || []).map((o) => ({ value: o, label: o }));
+  const listed = current === "" || choices.some((c) => c.value === current);
+  const empty = field.required
+    ? "Choose…"
+    : field.empty || (field.keep ? "Keep current" : "Keep default");
+  // A required field whose value is set and listed needs no empty choice; a form opened
+  // with a default (`initial`) keeps its "Choose…" only while it has no value.
+  return (
+    <select
+      id={id}
+      aria-required={field.required || undefined}
+      aria-busy={field.loading || undefined}
+      disabled={field.loading}
+      value={current}
+      onChange={(e) => onChange(e.target.value)}
+    >
+      {field.loading ? (
+        <option value={current}>Loading…</option>
+      ) : (
+        <>
+          {(!field.required || current === "") && (
+            <option value="">{empty}</option>
+          )}
+          {choices.map((c) => (
+            <option key={c.value} value={c.value} title={c.description}>
+              {c.label || c.value}
+            </option>
+          ))}
+          {!listed && <option value={current}>{current}</option>}
+        </>
+      )}
+    </select>
   );
 }
 const CUSTOM = "\u0000custom";
