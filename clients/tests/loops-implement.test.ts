@@ -386,7 +386,7 @@ describe("an implementation loop's phases", () => {
     ).toEqual([]);
   });
 
-  it("refuses Skip to verify before the ladder, with the reason", () => {
+  it("refuses Finish early (skip to verify) before the ladder, with the reason", () => {
     for (const phase of ["plan", "plan_check", "implement"]) {
       const skip = skipToVerify({ phase });
       expect(skip).toMatchObject({ show: true, enabled: false });
@@ -870,12 +870,12 @@ describe("rendered", () => {
     expect(html).toContain("<dt>Plan</dt><dd>revision 1 · contract risk no");
     expect(html).toContain("<dt>Commit</dt><dd>one commit at the end</dd>");
     expect(html).toContain("<b>m1</b> 2 findings · 1 new class");
-    // In the ladder Skip to verify can be asked for (not here: no live connection).
-    expect(html).toMatch(/>Skip to verify<\/button>/);
+    // In the ladder Finish early can be asked for (not here: no live connection).
+    expect(html).toMatch(/>Finish early<\/button>/);
     expect(html).not.toContain("Nothing has been built to verify yet");
   });
 
-  it("lists the plan check's round and holds Skip to verify before the ladder", async () => {
+  it("lists the plan check's round and holds Finish early before the ladder", async () => {
     const html = await section(
       worker({
         loop: implementing({
@@ -888,7 +888,7 @@ describe("rendered", () => {
     );
     expect(html).toContain("<b>p1</b> under review");
     expect(html).toContain(
-      "Nothing has been built to verify yet: Skip to verify is available from the ladder on.",
+      "Nothing has been built to verify yet: Finish early is available from the review rounds on.",
     );
     expect(html).toMatch(/aria-describedby="[^"]*-skip-why"/);
   });
@@ -982,27 +982,30 @@ describe("rendered", () => {
     );
   });
 
-  it("draws Send's caret, and the phone's ↻ button, named", async () => {
+  it("draws Run as loop beside Send, and the phone's ↻ switch, named", async () => {
     const { SendAsLoop } = await import("../shared/LoopViews");
     const desktop = renderToStaticMarkup(
       createElement(SendAsLoop, {
         thread: worker(),
         phone: false,
         busy: false,
-        onSend: () => {},
+        on: false,
+        onChange: () => {},
       }),
     );
-    expect(desktop).toContain('aria-label="More ways to send"');
-    expect(desktop).toContain('aria-expanded="false"');
+    expect(desktop).toContain('role="switch"');
+    expect(desktop).toContain('aria-checked="false"');
+    expect(desktop).toMatch(/>Run as loop<\/button>/);
     const phone = renderToStaticMarkup(
       createElement(SendAsLoop, {
         thread: worker(),
         phone: true,
         busy: false,
-        onSend: () => {},
+        on: true,
+        onChange: () => {},
       }),
     );
-    expect(phone).toContain('aria-label="Send as implementation loop to api…"');
+    expect(phone).toContain('aria-label="Run as loop"');
     expect(phone).toContain('class="send-loop-button"');
   });
 });

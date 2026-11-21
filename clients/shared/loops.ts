@@ -822,8 +822,8 @@ export function startedNotice(name: string, kind: string, line?: string) {
 }
 
 /**
- * Whether **Skip to verify** can be pressed, and why not: an implementation loop has built
- * nothing to verify before its ladder (the hub refuses it in `plan`, `plan_check` and
+ * Whether **Finish early** (skip to verify) can be pressed, and why not: an implementation
+ * loop has built nothing to verify before its ladder (the hub refuses it in `plan`, `plan_check` and
  * `implement`); a skip already asked for waits for the round's end. `show: false`: the
  * phase is past the ladder, where it means nothing.
  */
@@ -836,7 +836,7 @@ export function skipToVerify(state: { phase: string; skip?: boolean }): {
     return {
       show: true,
       enabled: false,
-      why: "Nothing has been built to verify yet: Skip to verify is available from the ladder on.",
+      why: "Nothing has been built to verify yet: Finish early is available from the review rounds on.",
     };
   if (!["scope", "ladder"].includes(state.phase) || state.skip)
     return { show: false, enabled: false };

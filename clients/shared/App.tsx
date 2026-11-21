@@ -38,8 +38,6 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Asterisk,
   Wrench,
-  Database,
-  ListTodo,
   ArrowLeft,
   ArrowDown,
   ArrowUpRight,
@@ -59,26 +57,26 @@ import {
   ChevronRight,
   MoreHorizontal,
   GitBranch,
-  Play,
   Square,
   Pin,
   Server,
-  KeyRound,
   Activity,
   FileText,
   Trash2,
   Volume2,
-  Command as CommandIcon,
   Check,
   CheckCircle2,
   Circle,
   ExternalLink,
   Download,
   Eye,
-  EyeOff,
   Filter,
   AlertCircle,
-  FolderPlus,
+  Cpu,
+  Pencil,
+  CirclePause,
+  Scissors,
+  Shrink,
 } from "lucide-react";
 import {
   commands as applicationCommands,
@@ -117,7 +115,11 @@ import {
   foldRoutineBlocks,
   messageTime,
 } from "./transcript";
-import { Manager, JobLog, type Section } from "./Managers";
+import { Manager, JobLog, navSection, type Section } from "./Managers";
+import { ActionsMenu, type MenuItem } from "./ActionsMenu";
+import { StatusStrip, type StripItem } from "./StatusStrip";
+import { PermissionModePicker, ThreadActions } from "./ThreadActions";
+import "./palette.css";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
@@ -186,17 +188,23 @@ const initial: ViewState = {
   decisions_seen: 0,
   head: 0,
 };
+/** The Manage pages, then Settings. Other sections render one of these pages (Boxes and
+ * Usage are parts of Machines & accounts and Activity; Read aloud and Hub & storage are
+ * Settings pages): `navSection` says which entry is current for them. */
 const nav: { id: Section; label: string; icon: typeof Activity }[] = [
-  { id: "accounts", label: "Accounts", icon: KeyRound },
-  { id: "boxes", label: "Boxes", icon: Server },
-  { id: "jobs", label: "Jobs", icon: ListTodo },
-  { id: "usage", label: "Usage", icon: Activity },
+  { id: "accounts", label: "Machines & accounts", icon: Server },
+  { id: "jobs", label: "Activity", icon: Activity },
   { id: "memory", label: "Context & memory", icon: FileText },
-  { id: "speech", label: "Read aloud", icon: Volume2 },
   { id: "trash", label: "Trash", icon: Trash2 },
-  { id: "maintenance", label: "Hub & storage", icon: Database },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
+/** The words the topbar shows for a section. */
+function sectionTitle(section: Section): string {
+  if (section === "grid") return "Threads";
+  if (section === "attention") return "Needs you";
+  if (section === "decisions") return "Decisions";
+  return nav.find((n) => n.id === navSection(section))?.label || "";
+}
 const statusIcon = (status: string) =>
   status === "running" || status === "background" ? (
     <span className="working-dot" />
@@ -265,11 +273,15 @@ export default function App({
   onReady,
   headerAccessory,
   onDismissKeyboard,
+  notices: hostNotices,
 }: {
   deviceScopes?: string[];
   onReady?: () => void;
   headerAccessory?: ReactNode;
   onDismissKeyboard?: () => void;
+  /** The host's own notices for the status strip (the desktop's update), ranked after the
+   * connection's and before the assistance notices. */
+  notices?: StripItem[];
 } = {}) {
   const hostApi = useHostAPI();
   const [allowedMethods, setAllowedMethods] = useState<string[]>();
@@ -286,12 +298,9 @@ export default function App({
       ),
     [deviceScopes, allowedMethods],
   );
+  // Machines & accounts is for a device with `admin`; Settings shows what a device may change.
   const visibleNav = nav.filter(
-    (n) =>
-      !(
-        ["accounts", "boxes", "maintenance"].includes(n.id) &&
-        !permitted("admin")
-      ),
+    (n) => n.id !== "accounts" || permitted("admin"),
   );
 
   const [view, setView] = useState(initial);
@@ -1316,7 +1325,7 @@ export default function App({
         document.documentElement.dataset.platform || "",
       );
       const menu = document.querySelector<HTMLDetailsElement>(
-        ".conversation-menu[open]",
+        ".actions-menu[open]",
       );
       if (event.key === "Escape" && menu) {
         event.preventDefault();
@@ -1384,12 +1393,10 @@ export default function App({
     const closeMenu = (event: PointerEvent) => {
       if (
         event.target instanceof Element &&
-        event.target.closest(".conversation-menu")
+        event.target.closest(".actions-menu")
       )
         return;
-      document
-        .querySelector(".conversation-menu[open]")
-        ?.removeAttribute("open");
+      document.querySelector(".actions-menu[open]")?.removeAttribute("open");
     };
     window.addEventListener("keydown", keyboard);
     window.addEventListener("pointerdown", closeMenu);
@@ -2656,18 +2663,39 @@ export default function App({
   }, [paletteIndex]);
   // Orchestrator access only where the hub reports a level: an older hub has neither.
   const hasAccess = accessLevel(info?.orchestrator?.access) !== undefined;
-  const allCommands = useMemo(
-    () => [
-      ...commands.filter((c) => c.id !== "access" || hasAccess),
-      ...(permitted("terminal") ? cliCommands : []),
-    ],
-    [cliCommands, commands, hasAccess],
+  // The palette lists the app's actions; the CLI's own commands come when the search names
+  // one, or when Show CLI commands is on. An action that asks for an id no screen shows (an
+  // event, a device, a job) waits for a search too: the screen that has the id offers it.
+  // Updates are the update notice's and Settings'.
+  const [paletteCli, setPaletteCli] = useState(false);
+  const appCommands = useMemo(
+    () =>
+      commands.filter(
+        (c) => (c.id !== "access" || hasAccess) && c.id !== "app-update",
+      ),
+    [commands, hasAccess],
   );
-  const matching = allCommands.filter((c) =>
-    (c.title + " " + c.group + " " + c.id)
+  const asksForId = (c: Command) =>
+    c.fields.some(
+      (f) =>
+        f.required &&
+        f.initial == null &&
+        !f.options &&
+        /(^|_)id$|^job$/.test(f.key),
+    );
+  const searching = query.trim().toLowerCase();
+  const paletteMatches = (c: Command) =>
+    (c.title + " " + c.group + " " + c.id + " " + (c.cli?.join(" ") || ""))
       .toLowerCase()
-      .includes(query.toLowerCase()),
-  );
+      .includes(searching);
+  const matching = [
+    ...appCommands.filter(
+      (c) => paletteMatches(c) && (searching || !asksForId(c)),
+    ),
+    ...(paletteCli || searching
+      ? (permitted("terminal") ? cliCommands : []).filter(paletteMatches)
+      : []),
+  ];
   // A thread's conversation: its colour, and the ink its name is written in ("To:").
   const rootStyle = target
     ? ({
@@ -2681,6 +2709,217 @@ export default function App({
           : {}),
       } as CSSProperties)
     : {};
+  const openShell = () =>
+    void openTerminal({
+      shell: true,
+      cwd: localWorkingDirectory(target, homePath) || undefined,
+    });
+  const has = (id: string) => commands.some((c) => c.id === id);
+  /** The status strip's notices, the most pressing first: the connection, offline, a
+   * version mismatch, the host's (an update), then the assistance notices. */
+  const savedOffline = !connected
+    ? journal?.snapshot.workspaces[workspace]
+    : undefined;
+  const offlineWords = savedOffline
+    ? `Offline · saved ${new Date(savedOffline.savedAt).toLocaleString()}. Requests need a live connection before you can answer.`
+    : "";
+  const connectionNotice = !!(connectionError || connecting);
+  const notices: StripItem[] = [
+    ...(connectionNotice
+      ? [
+          {
+            key: "connection",
+            role: connecting ? ("status" as const) : ("alert" as const),
+            tone: connectionError ? ("warning" as const) : undefined,
+            busy: connecting,
+            icon: connecting ? <Spinner /> : <AlertCircle size={15} />,
+            // What this device saved shows meanwhile: one notice says both.
+            content: (
+              <>
+                {connecting ? "Connecting to your workspace…" : connectionError}
+                {offlineWords && <p>{offlineWords}</p>}
+              </>
+            ),
+            actions: !connecting && (
+              <button onClick={() => void connect(workspace)}>Reconnect</button>
+            ),
+          },
+        ]
+      : []),
+    ...(offlineWords && !connectionNotice
+      ? [
+          {
+            key: "offline",
+            role: "status" as const,
+            tone: "offline" as const,
+            content: offlineWords,
+          },
+        ]
+      : []),
+    ...(offlineNotice
+      ? [
+          {
+            key: "offline-notice",
+            role: "status" as const,
+            tone: "offline" as const,
+            content: offlineNotice,
+          },
+        ]
+      : []),
+    ...(paths?.versionMismatch
+      ? [
+          {
+            key: "version",
+            tone: "warning" as const,
+            icon: <AlertCircle size={15} />,
+            content: `The app bundles twr ${paths.version}; this hub still runs ${paths.hubVersion}. Stop and reconnect when you’re ready to use the new engine.`,
+            actions: (
+              <button onClick={() => action("hub-stop")}>Stop hub…</button>
+            ),
+          },
+        ]
+      : []),
+    ...(hostNotices || []),
+    ...(section === "chat" && assistance.needsDisclosure
+      ? [
+          {
+            key: "assistance-disclosure",
+            content: (
+              <AssistanceNotice
+                settings={assistance.settings}
+                acknowledge={assistance.acknowledge}
+                disable={() => {
+                  void Promise.all([
+                    hostApi.configSet(["tui"], "suggest", false),
+                    hostApi.configSet(["tui"], "summaries", false),
+                  ])
+                    .then(() => setRefresh((n) => n + 1))
+                    .catch(fail);
+                }}
+              />
+            ),
+          },
+        ]
+      : []),
+    ...(section === "chat" && assistance.notice
+      ? [
+          {
+            key: "assistance",
+            role: "status" as const,
+            content: assistance.notice,
+            actions: (
+              <>
+                <button onClick={assistance.retry}>Retry assistance</button>
+                <button
+                  onClick={assistance.clearNotice}
+                  aria-label="Dismiss assistance notice"
+                  title="Dismiss"
+                >
+                  <X size={12} />
+                </button>
+              </>
+            ),
+          },
+        ]
+      : []),
+  ];
+  /** The conversation's less common actions: its "⋯" menu (in the topbar on a phone). */
+  const conversationMenu: MenuItem[] =
+    section !== "chat"
+      ? []
+      : [
+          {
+            key: "tools",
+            label: "Show tool calls",
+            icon: <Wrench size={16} aria-hidden="true" />,
+            pressed: showTools,
+            onSelect: () => setShowTools((v) => !v),
+          },
+          {
+            key: "reasoning",
+            label: "Show reasoning",
+            icon: <Eye size={16} aria-hidden="true" />,
+            pressed: showThinking,
+            onSelect: () => setShowThinking((v) => !v),
+          },
+          ...(target
+            ? [
+                {
+                  key: "export",
+                  label: "Export conversation",
+                  icon: <Download size={16} aria-hidden="true" />,
+                  onSelect: () => void exportConversation(),
+                },
+              ]
+            : []),
+          ...(has(destination ? "model" : "orch")
+            ? [
+                {
+                  key: "model",
+                  label: "Model & runtime…",
+                  icon: <Cpu size={16} aria-hidden="true" />,
+                  dialog: true,
+                  onSelect: () =>
+                    action(
+                      destination ? "model" : "orch",
+                      destination ? { thread: destination } : {},
+                    ),
+                },
+              ]
+            : []),
+          ...(destination && target && !target.is_orchestrator
+            ? threadMenu(target.id).map((item, i) => ({
+                ...item,
+                group: i === 0,
+              }))
+            : []),
+        ];
+  /** A thread's less common actions, each opening its form (the hub confirms). */
+  function threadMenu(thread: string, hints = false): MenuItem[] {
+    const entries: [string, string, string, ReactNode][] = [
+      [
+        "rename",
+        "Rename…",
+        "",
+        <Pencil size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "park",
+        "Park…",
+        "Stop it and free its worktree; keep the branch.",
+        <CirclePause size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "trim",
+        "Trim…",
+        "Delete its build output.",
+        <Scissors size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "compact",
+        "Compact…",
+        "Summarize its context to free space.",
+        <Shrink size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "delete",
+        "Move to trash…",
+        "Recoverable from Trash for a while.",
+        <Trash2 size={16} aria-hidden="true" key="i" />,
+      ],
+    ];
+    return entries
+      .filter(([id]) => has(id) && (hints ? id !== "rename" : id !== "trim"))
+      .map(([id, label, hint, icon]) => ({
+        key: id,
+        label,
+        icon,
+        hint: hints ? hint : undefined,
+        dialog: true,
+        danger: id === "delete",
+        onSelect: () => action(id, { thread }),
+      }));
+  }
   const shell = (
     <div className={`app ${sidebar ? "" : "sidebar-hidden"}`} style={rootStyle}>
       <button
@@ -2724,7 +2963,6 @@ export default function App({
           <span className="wordmark">
             twr<span>_</span>
           </span>
-          <span className="brand-caption">Hub client</span>
           <button
             className="icon-button no-drag"
             aria-label="Hide sidebar"
@@ -2775,15 +3013,6 @@ export default function App({
               onClick={() => setFocus((v) => !v)}
             >
               <Filter size={13} />
-            </button>
-            <button
-              className="icon-button"
-              aria-label="Manage workspaces"
-              title="New or remove workspaces"
-              aria-haspopup="dialog"
-              onClick={() => setWorkspaceModal(true)}
-            >
-              <FolderPlus size={15} />
             </button>
           </div>
         </div>
@@ -3002,7 +3231,9 @@ export default function App({
               .map((n) => (
                 <button
                   key={n.id}
-                  aria-current={section === n.id ? "page" : undefined}
+                  aria-current={
+                    navSection(section) === n.id ? "page" : undefined
+                  }
                   onClick={() => setSection(n.id)}
                 >
                   <n.icon size={15} />
@@ -3035,7 +3266,9 @@ export default function App({
             </span>
           </button>
           <button
-            aria-current={section === "settings" ? "page" : undefined}
+            aria-current={
+              navSection(section) === "settings" ? "page" : undefined
+            }
             onClick={() => setSection("settings")}
           >
             <Settings2 size={15} />
@@ -3056,20 +3289,6 @@ export default function App({
         </div>
       </aside>
       <main className="main-shell" id="twr-main" tabIndex={-1}>
-        {!connected && journal?.snapshot.workspaces[workspace] && (
-          <div className="offline-banner" role="status">
-            Offline · saved{" "}
-            {new Date(
-              journal.snapshot.workspaces[workspace].savedAt,
-            ).toLocaleString()}
-            . Requests need a live connection before you can answer.
-          </div>
-        )}
-        {offlineNotice && (
-          <div className="offline-banner" role="status">
-            {offlineNotice}
-          </div>
-        )}
         <header className="topbar drag-region">
           <div className="topbar-left">
             {!sidebar && (
@@ -3102,11 +3321,7 @@ export default function App({
                 ? target?.name
                 : section === "chat"
                   ? "Orchestrator"
-                  : section === "grid"
-                    ? "Threads"
-                    : section === "attention"
-                      ? "Needs you"
-                      : nav.find((n) => n.id === section)?.label || "Decisions"}
+                  : sectionTitle(section)}
               {section === "chat" && target && (
                 <small className="mobile-runtime">
                   {target.runtime} ·{" "}
@@ -3147,150 +3362,35 @@ export default function App({
                   ? "This device has no terminal access"
                   : "Open shell"
               }
-              onClick={() =>
-                void openTerminal({
-                  shell: true,
-                  cwd: localWorkingDirectory(target, homePath) || undefined,
-                })
-              }
+              onClick={openShell}
             >
               <TerminalSquare size={17} />
             </button>
-            <button
-              className="icon-button"
-              aria-label="Open command palette"
-              title="Commands (⌘/Ctrl K)"
-              aria-haspopup="dialog"
-              onClick={() => {
-                setPalette(true);
-                setQuery("");
-              }}
-            >
-              <CommandIcon size={17} />
-            </button>
-            <details
+            <ActionsMenu
+              // A phone hides the conversation's header: its actions menu shows here,
+              // with New thread and Open shell, whose own buttons a phone hides.
               className="conversation-menu"
-              onToggle={(event) => {
-                const menu = event.currentTarget;
-                // Keyboard users land on the first action; pointer users keep focus.
-                if (menu.open && menu.dataset.keyboard === "true")
-                  menu
-                    .querySelector<HTMLElement>("div > button:not(:disabled)")
-                    ?.focus();
-                delete menu.dataset.keyboard;
-              }}
-            >
-              <summary
-                className="no-drag"
-                aria-label={
-                  section === "chat" ? "Thread actions" : "More actions"
-                }
-                title={section === "chat" ? "Thread actions" : "More actions"}
-                onKeyDown={(event) => {
-                  const menu = event.currentTarget
-                    .parentElement as HTMLDetailsElement;
-                  if (["Enter", " "].includes(event.key))
-                    menu.dataset.keyboard = "true";
-                  if (event.key === "ArrowDown") {
-                    event.preventDefault();
-                    menu.dataset.keyboard = "true";
-                    if (!menu.open) menu.open = true;
-                    else
-                      menu
-                        .querySelector<HTMLElement>(
-                          "div > button:not(:disabled)",
-                        )
-                        ?.focus();
-                  }
-                }}
-              >
-                <MoreHorizontal size={18} />
-              </summary>
-              <div
-                className="no-drag"
-                onKeyDown={(event) =>
-                  handleRovingKey(event, event.currentTarget, ":scope > button")
-                }
-                onClick={(event) =>
-                  (
-                    event.currentTarget.parentElement as HTMLDetailsElement
-                  ).removeAttribute("open")
-                }
-              >
-                <button
-                  aria-controls="twr-sidebar"
-                  onClick={() => setSidebar(true)}
-                >
-                  <PanelLeftOpen size={16} />
-                  Threads and navigation
-                </button>
-                <button
-                  disabled={!permitted("operate")}
-                  onClick={() => action("new")}
-                >
-                  <Plus size={16} />
-                  New thread
-                </button>
-                <button
-                  disabled={!permitted("terminal")}
-                  onClick={() =>
-                    void openTerminal({
-                      shell: true,
-                      cwd: localWorkingDirectory(target, homePath) || undefined,
-                    })
-                  }
-                >
-                  <TerminalSquare size={16} />
-                  Open shell
-                </button>
-                {section === "chat" && (
-                  <>
-                    <button
-                      aria-pressed={showTools}
-                      onClick={() => setShowTools((v) => !v)}
-                    >
-                      <Wrench size={16} />
-                      Tool calls
-                    </button>
-                    <button
-                      aria-pressed={showThinking}
-                      onClick={() => setShowThinking((v) => !v)}
-                    >
-                      <Eye size={16} />
-                      Reasoning
-                    </button>
-                    {target && (
-                      <button onClick={() => void exportConversation()}>
-                        <Download size={16} />
-                        Export conversation
-                      </button>
-                    )}
-                    <button
-                      onClick={() =>
-                        action(
-                          destination ? "model" : "orch",
-                          destination ? { thread: destination } : {},
-                        )
-                      }
-                    >
-                      <Settings2 size={16} />
-                      {destination
-                        ? "Thread settings"
-                        : "Orchestrator settings"}
-                    </button>
-                  </>
-                )}
-                <button
-                  onClick={() => {
-                    setPalette(true);
-                    setQuery("");
-                  }}
-                >
-                  <Search size={16} />
-                  Commands
-                </button>
-              </div>
-            </details>
+              label="More actions"
+              items={[
+                ...conversationMenu,
+                {
+                  key: "new",
+                  label: "New thread",
+                  icon: <Plus size={16} aria-hidden="true" />,
+                  dialog: true,
+                  disabled: !permitted("operate"),
+                  group: conversationMenu.length > 0,
+                  onSelect: () => action("new"),
+                },
+                {
+                  key: "shell",
+                  label: "Open shell",
+                  icon: <TerminalSquare size={16} aria-hidden="true" />,
+                  disabled: !permitted("terminal"),
+                  onSelect: openShell,
+                },
+              ]}
+            />
             <button
               className="topbar-new-thread"
               aria-label="New thread"
@@ -3303,31 +3403,7 @@ export default function App({
             </button>
           </div>
         </header>
-        {paths?.versionMismatch && (
-          <div className="connection-banner warning">
-            <AlertCircle size={15} />
-            <span>
-              The app bundles twr {paths.version}; this hub still runs{" "}
-              {paths.hubVersion}. Stop and reconnect when you’re ready to use
-              the new engine.
-            </span>
-            <button onClick={() => action("hub-stop")}>Stop hub…</button>
-          </div>
-        )}
-        {(connectionError || connecting) && (
-          <div
-            className={`connection-banner ${connectionError ? "warning" : ""}`}
-            aria-busy={connecting || undefined}
-          >
-            {connecting ? <Spinner /> : <AlertCircle size={15} />}
-            <span>
-              {connecting ? "Connecting to your workspace…" : connectionError}
-            </span>
-            {!connecting && (
-              <button onClick={() => void connect(workspace)}>Reconnect</button>
-            )}
-          </div>
-        )}
+        <StatusStrip items={notices} />
         <div className="work-area">
           <div className="content-column">
             {section === "chat" && (
@@ -3371,56 +3447,6 @@ export default function App({
                       workspace={workspace}
                       connected={connected}
                     />
-                    <button
-                      className={`icon-button ${showTools ? "on" : ""}`}
-                      aria-label="Toggle tool calls"
-                      aria-pressed={showTools}
-                      title="Show tool calls"
-                      onClick={() => setShowTools((v) => !v)}
-                    >
-                      <Wrench size={16} />
-                    </button>
-                    <button
-                      className={`icon-button ${showThinking ? "on" : ""}`}
-                      aria-label="Toggle reasoning"
-                      aria-pressed={showThinking}
-                      title="Show reasoning"
-                      onClick={() => setShowThinking((v) => !v)}
-                    >
-                      <Eye size={16} />
-                    </button>
-                    {target && (
-                      <button
-                        className="icon-button"
-                        aria-label="Export conversation"
-                        title="Export conversation"
-                        onClick={() => void exportConversation()}
-                      >
-                        <Download size={16} />
-                      </button>
-                    )}
-                    <button
-                      className="icon-button"
-                      aria-label={
-                        destination
-                          ? "Thread settings"
-                          : "Orchestrator settings"
-                      }
-                      title={
-                        destination
-                          ? "Thread settings"
-                          : "Orchestrator settings"
-                      }
-                      aria-haspopup="dialog"
-                      onClick={() =>
-                        action(
-                          destination ? "model" : "orch",
-                          destination ? { thread: destination } : {},
-                        )
-                      }
-                    >
-                      <MoreHorizontal size={18} />
-                    </button>
                     {destination &&
                       target &&
                       document.documentElement.dataset.mobile !== "true" && (
@@ -3452,6 +3478,10 @@ export default function App({
                           )}
                         </button>
                       )}
+                    <ActionsMenu
+                      label="Conversation actions"
+                      items={conversationMenu}
+                    />
                   </div>
                 </header>
                 <div
@@ -3646,33 +3676,6 @@ export default function App({
                     </div>
                   ))}
                 </div>
-                {assistance.needsDisclosure && (
-                  <AssistanceNotice
-                    settings={assistance.settings}
-                    acknowledge={assistance.acknowledge}
-                    disable={() => {
-                      void Promise.all([
-                        hostApi.configSet(["tui"], "suggest", false),
-                        hostApi.configSet(["tui"], "summaries", false),
-                      ])
-                        .then(() => setRefresh((n) => n + 1))
-                        .catch(fail);
-                    }}
-                  />
-                )}
-                {assistance.notice && (
-                  <div className="assistance-status" role="status">
-                    {assistance.notice}
-                    <button onClick={assistance.retry}>Retry assistance</button>
-                    <button
-                      onClick={assistance.clearNotice}
-                      aria-label="Dismiss assistance notice"
-                      title="Dismiss"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
-                )}
                 <Composer
                   drafts={drafts}
                   draftKey={draftKey}
@@ -3723,14 +3726,6 @@ export default function App({
                       Live work, clear outcomes, and the things waiting on you.
                     </p>
                   </div>
-                  <button
-                    className="primary grid-new-thread"
-                    disabled={!permitted("operate")}
-                    onClick={() => action("new")}
-                  >
-                    <Plus size={16} />
-                    New thread
-                  </button>
                 </header>
                 <div
                   className="manager-actions"
@@ -3963,17 +3958,49 @@ export default function App({
                   <TerminalSquare size={15} />
                   Attach agent terminal
                 </button>
+                <ThreadActions
+                  thread={selectedThread}
+                  has={has}
+                  pinned={pins.includes(selectedThread.id)}
+                  onPin={() => togglePin(selectedThread.id)}
+                  action={action}
+                  more={threadMenu(selectedThread.id, true)}
+                />
                 <div className="inspector-meta">
                   <span>Project</span>
                   <b>{selectedThread.project || "—"}</b>
                   <span>Model</span>
-                  <b>
-                    {selectedThread.model_actual ||
-                      selectedThread.model ||
-                      "Default"}
-                  </b>
-                  <span>Permission mode</span>
-                  <b>{selectedThread.mode}</b>
+                  <span className="inspector-value">
+                    <b>
+                      {selectedThread.model_actual ||
+                        selectedThread.model ||
+                        "Default"}
+                    </b>
+                    {has("model") && (
+                      <button
+                        className="text-button"
+                        aria-haspopup="dialog"
+                        aria-label={`Change model of ${selectedThread.name}`}
+                        onClick={() =>
+                          action("model", { thread: selectedThread.id })
+                        }
+                      >
+                        Change…
+                      </button>
+                    )}
+                  </span>
+                  <label htmlFor="twr-inspector-mode">Permission mode</label>
+                  <PermissionModePicker
+                    id="twr-inspector-mode"
+                    thread={selectedThread}
+                    admin={permitted("admin")}
+                    editable={has("mode") && connected && permitted("operate")}
+                    rpc={rpc}
+                    fail={fail}
+                    onChanged={(label) =>
+                      setNotice(`${selectedThread.name} now: ${label}.`)
+                    }
+                  />
                   <span>Worktree</span>
                   <button
                     className="text-button path"
@@ -4016,38 +4043,6 @@ export default function App({
                     <Markdown text={selectedThread.last_report.summary || ""} />
                   </section>
                 )}
-                <div className="inspector-actions">
-                  <button
-                    aria-pressed={pins.includes(selectedThread.id)}
-                    onClick={() => togglePin(selectedThread.id)}
-                  >
-                    <Pin size={14} />
-                    {pins.includes(selectedThread.id) ? "Unpin" : "Pin"} thread
-                  </button>
-                  {[
-                    "mode",
-                    "model",
-                    "rename",
-                    "compact",
-                    "resume",
-                    "stop",
-                    "park",
-                    "trim",
-                    "delete",
-                  ]
-                    .filter((id) => commands.some((c) => c.id === id))
-                    .map((id) => (
-                      <button
-                        className={id === "delete" ? "danger-quiet" : ""}
-                        key={id}
-                        onClick={() =>
-                          action(id, { thread: selectedThread.id })
-                        }
-                      >
-                        {commands.find((c) => c.id === id)?.title}
-                      </button>
-                    ))}
-                </div>
                 <details>
                   <summary>Full thread state</summary>
                   <DataView value={selectedThread} />
@@ -4172,14 +4167,6 @@ export default function App({
                   </button>
                 </div>
               ))}
-              <button
-                className="icon-button"
-                aria-label="New shell terminal"
-                title="New shell terminal"
-                onClick={() => void openTerminal({ shell: true })}
-              >
-                <Plus size={15} />
-              </button>
             </div>
             <div
               className="terminal-content"
@@ -4246,7 +4233,7 @@ export default function App({
       {palette && (
         <Dialog
           title="Commands"
-          subtitle="Every workflow, one place. CLI actions run in an embedded terminal."
+          subtitle="Search actions and settings"
           onClose={() => setPalette(false)}
         >
           <div className="palette-search">
@@ -4263,7 +4250,7 @@ export default function App({
               }
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search commands, settings, or CLI actions…"
+              placeholder="Search actions…"
               onKeyDown={(e) => {
                 if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                   e.preventDefault();
@@ -4320,22 +4307,34 @@ export default function App({
                 No matching commands.
               </p>
             )}
-            {!cliCommands.length && (
-              <button
-                onClick={() =>
-                  void hostApi.catalog().then(setCliCommands).catch(fail)
-                }
-              >
-                Reload CLI workflows
-              </button>
+            {permitted("terminal") && (
+              <div className="palette-cli">
+                <label>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={paletteCli}
+                    aria-describedby="twr-palette-cli-hint"
+                    onChange={(event) => setPaletteCli(event.target.checked)}
+                  />
+                  Show CLI commands
+                </label>
+                <small id="twr-palette-cli-hint">
+                  Each runs in a terminal here.
+                </small>
+                {(paletteCli || query.trim()) && !cliCommands.length && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void hostApi.catalog().then(setCliCommands).catch(fail)
+                    }
+                  >
+                    Reload CLI commands
+                  </button>
+                )}
+              </div>
             )}
           </div>
-          <footer className="dialog-footer">
-            <span>
-              {cliCommands.length} CLI workflows · {commands.length} application
-              actions
-            </span>
-          </footer>
         </Dialog>
       )}
       {operation && (

@@ -416,8 +416,8 @@ describe("styles that keep controls usable", () => {
     expect(
       rule(mobile, '[data-mobile="true"] .input-with-button > button'),
     ).toContain("min-width: 44px");
-    // Send as implementation loop's ↻ button and its choice, the inspector's two loop
-    // starts and the phone's in-flow notice's Dismiss.
+    // Run as loop's ↻ switch, the inspector's two loop starts and the phone's in-flow
+    // notice's Dismiss.
     expect(rule(mobile, '[data-mobile="true"] .send-loop-button')).toContain(
       "min-width: 44px",
     );
@@ -426,12 +426,12 @@ describe("styles that keep controls usable", () => {
     );
     const loopTargets = rule(
       mobile,
-      '[data-mobile="true"] .send-loop-panel > button,\n[data-mobile="true"] .inspector-notice > button,\n[data-mobile="true"] .loop-starts > button',
+      '[data-mobile="true"] .inspector-notice > button,\n[data-mobile="true"] .loop-starts > button',
     );
     expect(loopTargets).toContain("min-height: 44px");
     expect(loopTargets).toContain("min-width: 44px");
     // Every control in the composer's row: Upload, the microphone, hands-free, Send (and
-    // Send as implementation loop, above). The microphone and hands-free were 32 wide.
+    // Run as loop, above). The microphone and hands-free were 32 wide.
     const composerTargets = rule(
       mobile,
       '[data-mobile="true"] .send-button,\n[data-mobile="true"] .voice-button',

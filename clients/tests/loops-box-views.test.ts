@@ -187,8 +187,12 @@ describe("the inspector's Loops section on a box thread", () => {
     for (const name of ["Review loop", "Implementation loop…"]) {
       const button = m.find(".loop-starts button", name)!;
       expect(button.getAttribute("disabled")).not.toBeNull();
-      expect(button.getAttribute("aria-describedby")).toBe(
-        why!.getAttribute("id"),
+      // Described by what it does, then by why it waits.
+      const described = button.getAttribute("aria-describedby")!.split(" ");
+      expect(described).toHaveLength(2);
+      expect(described[1]).toBe(why!.getAttribute("id"));
+      expect(m.find(`#${described[0]}`)?.textContent).toMatch(
+        name === "Review loop" ? /^Review loop: / : /^Implementation loop: /,
       );
     }
     await m.unmount();
@@ -211,31 +215,32 @@ describe("the inspector's Loops section on a box thread", () => {
   });
 });
 
-describe("Send as implementation loop that can't be made", () => {
-  it("takes the focus to its panel, which says why, and Escape closes it", async () => {
+describe("Run as loop that can't be used", () => {
+  it("is off and disabled, and says why", async () => {
+    const changed: boolean[] = [];
     const m = await mount(
       (v, h) =>
         h(v.SendAsLoop, {
           thread: boxThread(),
           phone: false,
           busy: false,
-          onSend: () => {},
+          on: true,
+          onChange: (on: boolean) => changed.push(on),
         }),
       async () => ({}),
     );
-    const opener = m.find('button[aria-label="More ways to send"]')!;
-    await m.click(opener);
-    const panel = m.find(".send-loop-panel")!;
-    const choice = m.find("button", "Send as implementation loop")!;
-    expect(choice.getAttribute("disabled")).not.toBeNull();
-    expect(m.document.activeElement).toBe(panel);
-    const said = m.find(`#${panel.getAttribute("aria-describedby")}`);
+    const toggle = m.find('button[role="switch"]', "Run as loop")!;
+    expect(toggle.getAttribute("disabled")).not.toBeNull();
+    // Turned on before the box went away, it turns itself off: Send sends a message.
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(changed).toEqual([false]);
+    const said = m.find(`#${toggle.getAttribute("aria-describedby")}`);
     expect(said?.textContent).toBe(
       "Box devbox is away: a loop can start once it is back.",
     );
-    await m.key(panel, "Escape");
-    expect(m.find(".send-loop-panel")).toBeUndefined();
-    expect(m.document.activeElement).toBe(opener);
+    expect(toggle.getAttribute("title")).toBe(said?.textContent);
+    await m.click(toggle);
+    expect(changed).toEqual([false]);
     await m.unmount();
   });
 });
