@@ -1238,6 +1238,14 @@ describe("the message box", () => {
     expect(before).toEqual([1, 1]);
   });
 
+  it("closes the /usage panel when you switch workspaces", async () => {
+    await app().type("/usage");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(1);
+    await app().switchTo("other");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+  });
+
   it("clears only the sent destination's draft", async () => {
     await app().talkTo("builder");
     await app().type("kept for the builder");

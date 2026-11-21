@@ -7168,15 +7168,12 @@ fn orchestrator_session_text(r: &Value, reset: bool) -> String {
     if !mine.is_empty() {
         out.push_str("Your dropped message(s), to send again:\n");
         for m in mine {
-            // Its files by name, never their `Uploaded file:` lines.
-            let (text, files) = twr_core::upload::split_attachments(m);
-            for (i, line) in text.lines().enumerate() {
+            // Each line as it was sent, its files' `Uploaded file:` lines and paths too (a
+            // path's own trailing space included), so it can be sent again exactly.
+            for (i, line) in m.split('\n').enumerate() {
                 out.push_str(if i == 0 { "  - " } else { "    " });
-                out.push_str(line);
+                out.push_str(line.strip_suffix('\r').unwrap_or(line));
                 out.push('\n');
-            }
-            if !files.is_empty() {
-                out.push_str(&format!("    attached: {}\n", files.join(", ")));
             }
         }
     }
@@ -10972,7 +10969,7 @@ mod tests {
         assert!(
             switched.contains(
                 "Your dropped message(s), to send again:\n  - and the deploys\n    please\n    \
-                 attached: a.png\n"
+                 Uploaded file: a.png\n    /w/.twr-uploads/u1/a.png\n"
             ),
             "{switched}"
         );

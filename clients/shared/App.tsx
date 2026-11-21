@@ -536,6 +536,9 @@ export default function App({
   // `/usage` opens the usage limits above the message box (UsageLimits.tsx); the hub's
   // live view carries every account's usage, so a change there reads them again.
   const [usagePanel, setUsagePanel] = useState(false);
+  // A workspace switch closes it: until the connection serves the new workspace, a read
+  // could still answer for the one left.
+  useEffect(() => setUsagePanel(false), [workspace]);
   useEffect(() => {
     if (connected)
       void hostApi
