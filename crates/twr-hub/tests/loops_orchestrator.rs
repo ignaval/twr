@@ -1160,6 +1160,17 @@ async fn the_orchestrator_runs_one_review_pass_in_the_thread_itself() {
         text.contains("## Single pass") && !text.contains("## Sweep"),
         "{text}"
     );
+    // No review again before the thread has done more work: the hub refuses the
+    // orchestrator's (a standing review rule fired by the pass's own report), not the user's.
+    let e = request(&hub, &t, json!({"once": true}), &orch())
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+    assert!(
+        e.message.contains("has done nothing since"),
+        "{}",
+        e.message
+    );
     // An implementation loop runs no single pass.
     let e = hub
         .loop_request(

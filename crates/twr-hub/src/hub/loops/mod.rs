@@ -2542,6 +2542,35 @@ impl Core {
             .apply(&base, kind)
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
         let user = !caller.is_orchestrator();
+        // The orchestrator never reviews a thread again before it has done more work: a review
+        // whose report fired a standing review rule (one that fixed findings fires repeating
+        // watches, for rules like "send each finished branch on") would otherwise review that
+        // review, round after round. The user's own request is theirs.
+        if !user && kind == LoopKind::Review {
+            if let Some(last) = view
+                .last_loop
+                .as_ref()
+                .filter(|l| l.kind == LoopKind::Review)
+                // One that reviewed to its end: a stopped or failed one reviewed nothing.
+                .filter(|l| {
+                    !matches!(
+                        l.outcome,
+                        twr_core::loops::Outcome::Stopped | twr_core::loops::Outcome::Failed
+                    )
+                })
+            {
+                if last.ended_turn.is_some_and(|t| view.turns <= t) {
+                    return Err(rpc(
+                        codes::CONFLICT,
+                        format!(
+                            "{}'s work was reviewed and it has done nothing since: a new review \
+                             needs new work, or the user's own request",
+                            view.name
+                        ),
+                    ));
+                }
+            }
+        }
         // The orchestrator starts a loop only on the user's saved settings as they are: an
         // override of its that changes any of them raises the card; one that names what is
         // saved changes nothing, and is not recorded as this run's.

@@ -4028,7 +4028,8 @@ fn notice_text(lines: &[String], left: usize, dropped: usize) -> String {
              answers a permission or question. repeat=true marks a repeating watch: one whose \
              note asks for a review or a loop but doesn't quote the user's standing request \
              (\"from now on ...\") may come from a one-off request: don't start it; ask the \
-             user once whether it stands.\n",
+             user once whether it stands. On a review's own report (kind=review ended), never \
+             start a review pass or loop: act only on notes that ask for something else.\n",
         );
     }
     out.push_str(
