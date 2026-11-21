@@ -325,7 +325,7 @@ app on its own hub has every scope. A change
 made elsewhere (by the orchestrator, `twr model`, the TUI) shows as soon as the thread list
 updates. The command palette's **Change model, runtime or account** and **Switch
 orchestrator** forms still work, and are where accounts are chosen; **Switch orchestrator**
-has a reasoning effort field too.
+has a reasoning effort field too: **As configured** leaves it to `[orchestrator] effort`, **Runtime default** is the runtime's own. An effort the runtime chosen there doesn't take is cleared, so the form never sends one you can't see.
 
 ### Usage limits
 

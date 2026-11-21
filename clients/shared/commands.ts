@@ -20,6 +20,10 @@ export interface Field {
   choices?: { value: string; description?: string }[];
   /** A `model` or `effort` field left empty keeps the thread's; `default` clears it. */
   keep?: boolean;
+  /** A `model` or `effort` field whose empty value takes a configured one (the
+   * orchestrator's `[orchestrator] effort`): this labels that choice, and `default`, the
+   * runtime's own, is a choice of its own. */
+  unset?: string;
   placeholder?: string;
   description?: string;
   initial?: any;
@@ -284,7 +288,10 @@ export const commands: Command[] = [
   cmd("orch", "Switch orchestrator", "Orchestrator", "orchestrator.use", [
     runtime,
     f("model", "Model", { type: "model" }),
-    f("effort", "Reasoning effort", { type: "effort" }),
+    f("effort", "Reasoning effort", {
+      type: "effort",
+      unset: "As configured ([orchestrator] effort)",
+    }),
     f("summary", "Include a handoff summary", {
       type: "boolean",
       initial: true,

@@ -635,6 +635,38 @@ describe("the popup, rendered", () => {
     expect(m.calls).toEqual([]);
   });
 
+  it("in a form, drops an effort the runtime now chosen doesn't take, and names As configured", async () => {
+    const { act, createElement } = await import("react");
+    const { createRoot } = await import("react-dom/client");
+    const { ModelSelect } = await import("../shared/ui");
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+    const changes: string[] = [];
+    // Switch orchestrator: codex's `xhigh` picked, then the runtime changed to grok-build,
+    // which the list shows as As configured: it would go out unseen.
+    await act(async () =>
+      root.render(
+        createElement(ModelSelect, {
+          value: "xhigh",
+          onChange: (v: string) => changes.push(v),
+          choices: [{ value: "low" }, { value: "high" }],
+          custom: false,
+          unset: "As configured ([orchestrator] effort)",
+        }),
+      ),
+    );
+    expect(changes).toEqual([""]);
+    const options = container
+      .querySelectorAll("option")
+      .map((o) => [o.getAttribute("value"), o.textContent]);
+    expect(options.slice(0, 2)).toEqual([
+      ["", "As configured ([orchestrator] effort)"],
+      ["default", "Runtime default"],
+    ]);
+    await act(async () => root.unmount());
+  });
+
   it("closes with Esc from its button, where Shift-Tab from the popup lands", async () => {
     const m = await mount({ target: thread({}) });
     const trigger = q(m.root, ".model-picker-trigger")!;
