@@ -55,7 +55,10 @@ export function attachmentLines(files: readonly NamedFile[]) {
 /** `text` as sent with `files`: the text, then each file's pair on its own lines. */
 export function withAttachments(text: string, files: readonly NamedFile[]) {
   if (!files.length) return text;
-  const body = text.replace(/\s+$/, "");
+  // Trimmed as a message is (`trimMessage`), a file's path that ends it kept exactly, its
+  // leading whitespace kept as the draft has it.
+  const lead = text.match(/^\s*/)?.[0] ?? "";
+  const body = text.trim() ? lead + trimMessage(text) : "";
   return (body ? body + "\n" : "") + attachmentLines(files);
 }
 

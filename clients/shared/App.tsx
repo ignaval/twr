@@ -3626,7 +3626,8 @@ export default function App({
                     />
                     <UsageButton
                       // Each workspace's limits from its own hub: a switch starts afresh.
-                      key={workspace}
+                      // (Its own key: the read-aloud control beside it is keyed by workspace.)
+                      key={`usage:${workspace}`}
                       rpc={rpc}
                       revision={usageRevision}
                       connected={connected}
@@ -3931,7 +3932,7 @@ export default function App({
                 {usagePanel && (
                   <UsagePanel
                     // Each workspace's limits from its own hub: a switch starts afresh.
-                    key={workspace}
+                    key={`usage:${workspace}`}
                     rpc={rpc}
                     revision={usageRevision}
                     onClose={() => {

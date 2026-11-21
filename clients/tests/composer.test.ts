@@ -79,6 +79,8 @@ type HostOptions = {
   /** The connection takes uploads. */
   uploads?: boolean;
   voice?: boolean;
+  /** This computer's speaker bridge, which shows the header's read-aloud control. */
+  speaker?: boolean;
   voiceStatus?: () => Promise<VoiceCaptureStatus>;
   voiceSetup?: () => Promise<VoiceCaptureStatus>;
   inboxSources?: InboxSource[];
@@ -114,6 +116,17 @@ function fakeHost(options: HostOptions = {}) {
   const host = {
     sent,
     nativeVoice: options.voice ? nativeVoice : undefined,
+    voiceSpeaker: options.speaker
+      ? async () => ({
+          device: "computer",
+          running: true,
+          active: false,
+          name: "desktop",
+          playing: false,
+          paused: false,
+          queued: 0,
+        })
+      : undefined,
     voiceSetup: options.voiceSetup,
     voiceOps,
     voiceEvent: (event: NativeVoiceEvent) =>
@@ -1208,6 +1221,21 @@ describe("the message box", () => {
     expect(app().box().value).toBe("PRESERVE_DURING_SWITCH");
     await app().switchTo("other");
     expect(app().box().value).toBe("in the other workspace");
+  });
+
+  it("keeps one of each header control across workspace switches", async () => {
+    await mounted.unmount();
+    mounted = await mount({ speaker: true });
+    const count = (label: string) =>
+      app().all(`.conversation-actions [aria-label="${label}"]`).length;
+    const readAloud =
+      "Automatically read orchestrator replies aloud on this computer";
+    const before = [count(readAloud), count("Usage limits")];
+    await app().switchTo("other");
+    await app().switchTo("default");
+    await app().switchTo("other");
+    expect([count(readAloud), count("Usage limits")]).toEqual(before);
+    expect(before).toEqual([1, 1]);
   });
 
   it("clears only the sent destination's draft", async () => {

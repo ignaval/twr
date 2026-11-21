@@ -37,6 +37,15 @@ describe("a message's attachment lines", () => {
       attachmentLines(named.slice(1)),
     );
     expect(withAttachments("no files", [])).toBe("no files");
+    // A pasted message's older file, its path ending in a space, then a new one: the older
+    // path stays exactly as it was.
+    const older = "see\nUploaded file: spec.md \n/w/.twr-uploads/1/spec.md ";
+    expect(withAttachments(older + "\n", named.slice(0, 1))).toBe(
+      older + "\nUploaded file: shot.png\n/home/me/.twr-uploads/a/shot.png",
+    );
+    expect(withAttachments("  indented\n", named.slice(0, 1))).toBe(
+      "  indented\nUploaded file: shot.png\n/home/me/.twr-uploads/a/shot.png",
+    );
   });
 
   it("reads them back out, and only the exact two-line form", () => {
