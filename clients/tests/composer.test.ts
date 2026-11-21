@@ -2241,6 +2241,15 @@ describe("usage limits", () => {
     );
   });
 
+  it("closes with Esc while the message box holds a draft, keeping the draft", async () => {
+    await app().type("/usage");
+    await app().press("Enter");
+    await app().type("half a thought");
+    await app().press("Escape");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(app().box().value).toBe("half a thought");
+  });
+
   it("reads again when the hub's live view says usage changed", async () => {
     await app().type("/usage");
     await app().press("Enter");

@@ -1486,13 +1486,18 @@ export default function App({
         setSection("settings");
       }
       if (event.key === "Escape") {
+        // The `/usage` panel above the message box closes first, a draft in the box or not
+        // (a menu of the box's own that took the Esc has prevented it): Esc from the box
+        // would otherwise leave the conversation with the panel still open.
+        if (usagePanel && !event.defaultPrevented) {
+          setUsagePanel(false);
+          input.current?.focus();
+          return;
+        }
         if (event.target instanceof HTMLTextAreaElement && event.target.value)
           return;
         if (event.target instanceof HTMLInputElement) return;
-        // The `/usage` panel above the message box closes first: Esc from the box would
-        // otherwise leave the conversation with the panel still open.
-        if (usagePanel) setUsagePanel(false);
-        else if (selected) setSelected(undefined);
+        if (selected) setSelected(undefined);
         else if (destination) setDestination(undefined);
         input.current?.focus();
       }
@@ -3620,6 +3625,8 @@ export default function App({
                       connected={connected}
                     />
                     <UsageButton
+                      // Each workspace's limits from its own hub: a switch starts afresh.
+                      key={workspace}
                       rpc={rpc}
                       revision={usageRevision}
                       connected={connected}
@@ -3923,6 +3930,8 @@ export default function App({
                 )}
                 {usagePanel && (
                   <UsagePanel
+                    // Each workspace's limits from its own hub: a switch starts afresh.
+                    key={workspace}
                     rpc={rpc}
                     revision={usageRevision}
                     onClose={() => {
@@ -5904,7 +5913,9 @@ const Conversation = memo(function Conversation({
                     onExpandedChange={(open) => setOpen(block.id, open)}
                   />
                 </details>
-              ) : block.kind === "user" ? (
+              ) : block.kind === "user" || block.kind === "notice" ? (
+                // A prompt the orchestrator forwarded is a notice: the files it names show as
+                // chips too, never their paths.
                 <SentMessage
                   text={block.text}
                   sentImage={sentImage}
@@ -5914,7 +5925,6 @@ const Conversation = memo(function Conversation({
               ) : (
                 <MessageBody
                   text={block.text}
-                  clamp={block.kind === "notice"}
                   streaming={block.kind === "assistant" && !!block.pending}
                   threadTags={
                     block.kind === "assistant" && !!target?.is_orchestrator
