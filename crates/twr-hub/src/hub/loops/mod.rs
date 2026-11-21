@@ -2609,6 +2609,29 @@ impl Core {
                 return Ok(out);
             }
         }
+        // A card that holds a task (an implementation loop's, sent from the message box, its
+        // files too) is never replaced by a request for other work, the user's own included:
+        // the task would be lost with it. Answering or cancelling the card comes first.
+        if user {
+            if let Some((_, card)) = self.setup_card_of(id) {
+                let s = &card.setup;
+                let held = s.task.as_ref().filter(|t| !t.is_empty());
+                if held.is_some() && (s.kind != kind || s.once != req.once || task.as_ref() != held)
+                {
+                    if from.baseline_digests != s.baseline_digests {
+                        drop_from(hub, &from);
+                    }
+                    return Err(rpc(
+                        codes::CONFLICT,
+                        format!(
+                            "{}'s loop setup card holds an implementation task: start it, run it \
+                             without a loop, or cancel it first",
+                            view.name
+                        ),
+                    ));
+                }
+            }
+        }
         let Some(why) = why else {
             // Saved settings that hold: the run's own overrides must hold too.
             let problems = validate_run(&run, &avail, config, req.once);
