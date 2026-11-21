@@ -46,3 +46,15 @@
   flex-shrink: 0;
   color: var(--muted);
 }
+/* A narrow window: the switcher is its computer icon alone (its aria-label names it and
+ * the computer it shows). */
+@media (max-width: 600px) {
+  .hub-switcher > span,
+  .hub-switcher > svg:last-child {
+    display: none;
+  }
+  .hub-switcher {
+    min-width: 28px;
+    justify-content: center;
+  }
+}

@@ -237,13 +237,16 @@ export function withCurrent(choices: Choice[], current?: string | null) {
 }
 
 /** The runtimes a default runtime can be: the agents the hub found (`hub.info` `agents`)
- * and the runtimes the orchestrator can run on (`orchestrator.show`, those it says are
- * installed), plus the current value. Empty when the hub lists none (an older hub): the
- * picker is free text then. */
+ * and the runtimes the orchestrator can run on (`orchestrator.show`: the built-in ones and
+ * the `[runtimes]` presets, those it says are installed), plus the current value and the
+ * values it had before (`earlier`: one the hub doesn't list, such as `fake` or an `acp:`
+ * command, stays a choice once another is chosen). Empty when the hub lists none (an older
+ * hub): the picker is free text then. Any other is typed in (Other…). */
 export function runtimeChoices(
   info: Json | undefined,
   show: Json | undefined,
   current?: string | null,
+  earlier: string[] = [],
 ): string[] {
   const found: string[] = [];
   for (const a of Array.isArray(info?.agents) ? info.agents : [])
@@ -251,9 +254,8 @@ export function runtimeChoices(
       found.push(a.runtime);
   for (const r of Array.isArray(show?.runtimes) ? show.runtimes : [])
     if (typeof r === "string" && show?.installed?.[r] !== false) found.push(r);
-  const list = [...new Set(found)];
-  if (!list.length) return [];
-  return current && !list.includes(current) ? [...list, current] : list;
+  if (!found.length) return [];
+  return [...new Set([...found, ...earlier, ...(current ? [current] : [])])];
 }
 
 /** Whether a runtime is installed where the hub runs (Codex's own settings show only
@@ -276,17 +278,23 @@ export function hubApplied(table: string[]) {
   return table[0] !== "tui";
 }
 
-/** Words per minute a speaker can read at, with the current rate when it isn't one. */
+/** Words per minute a speaker can read at, with the current rate when it isn't one. A
+ * rate of 0 is the voice's own speed (`[speech] rate = 0`, the default): it is a choice
+ * only while the speaker reads at it, since `speech.control` sets 80 to 500 words a
+ * minute only. */
 export function speechRateChoices(current?: number | null): Choice[] {
   const presets = [150, 175, 200, 225, 250, 300];
   const values =
     current && !presets.includes(current)
       ? [...presets, current].sort((a, b) => a - b)
       : presets;
-  return values.map((n) => ({
+  const rates = values.map((n) => ({
     value: String(n),
     label: `${n} words a minute`,
   }));
+  return current === 0
+    ? [{ value: "0", label: "Default (the voice's own speed)" }, ...rates]
+    : rates;
 }
 
 /** What became of one value given to a `latestWrites` writer: written (it was the latest

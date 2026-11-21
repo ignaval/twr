@@ -162,6 +162,11 @@
 .connection-form label > small {
   color: var(--muted);
 }
+.connection-advanced > small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+}
 .connection-form textarea {
   width: 100%;
   padding: 8px;

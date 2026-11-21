@@ -1,14 +1,14 @@
 /* Settings' tabs and rows, the merged Manage pages, and the "⋯" menu. */
 
+/* The tabs wrap rather than scroll: none goes out of sight in a narrow window. */
 .settings-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 2px;
   padding: 3px;
   margin-bottom: 24px;
   max-width: 100%;
   width: fit-content;
-  overflow-x: auto;
-  scrollbar-width: thin;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--raised);
@@ -33,6 +33,18 @@
 [data-mobile="true"] .settings-tabs > [role="tab"] {
   padding-inline: 10px;
 }
+@media (max-width: 600px) {
+  .settings-tabs {
+    width: auto;
+  }
+  .settings-tabs > [role="tab"] {
+    flex: 1 1 auto;
+    padding-inline: 8px;
+  }
+  [data-mobile="true"] .settings-tabs > [role="tab"] {
+    padding-inline: 8px;
+  }
+}
 
 .settings-section-heading {
   display: flex;
@@ -50,7 +62,12 @@
   padding: 12px 0;
   border-bottom: 1px solid var(--border);
 }
+.setting-name {
+  min-width: 0;
+}
+.setting-name > label,
 .setting-field > label {
+  display: block;
   font-size: 1rem;
 }
 .setting-field small {

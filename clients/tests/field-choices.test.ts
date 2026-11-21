@@ -122,6 +122,22 @@ describe("command form pickers", () => {
     ).toBe(true);
   });
 
+  it("offers no empty choice beside a select's own default choice", () => {
+    const mode = field(command("new"), "workspace_mode");
+    const html = renderToStaticMarkup(
+      createElement(FieldInput, {
+        field: resolveField(mode, context(command("new"))),
+        value: "default",
+        onChange() {},
+      }),
+    );
+    expect(options(html).map(([value]) => value)).toEqual([
+      "default",
+      "separate",
+      "shared",
+    ]);
+  });
+
   it("takes an account pool or pattern under Other…", () => {
     const list = {
       runtimes: {

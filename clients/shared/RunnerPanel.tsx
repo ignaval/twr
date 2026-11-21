@@ -23,6 +23,26 @@ function CommandLine({ text, children }: { text: string; children: string }) {
   );
 }
 
+/** A runner control's failure in words, with the hub's own text as its detail when the
+ * words replace it. The runner service (twr-link) is what pairs and manages runners from
+ * this computer: the hub starts it when it can; "Use this machine as a runner" (or
+ * `twr runner up`) starts it otherwise. */
+export function runnerErrorText(
+  raw: string,
+  canHost: boolean,
+): { message: string; detail?: string } {
+  const text = raw.replace(/^internal:\s*/i, "");
+  if (/runner service is not running/i.test(text))
+    return {
+      message: `The runner service isn't running on this computer. Start it with ${
+        canHost ? "Use this machine as a runner" : "twr runner up in a terminal"
+      }, then try again.`,
+      detail: raw,
+    };
+  if (text !== raw) return { message: text, detail: raw };
+  return { message: raw };
+}
+
 type PairSession = { session: string; runner?: string };
 function retireSession(
   rpc: (method: string, params?: Json) => Promise<Json>,
@@ -36,6 +56,22 @@ function retireSession(
       })
     : rpc("desktop.runner.cancel", { session: pair.session });
   void call.catch(() => {});
+}
+
+/** A runner control's failure, said in words; the raw text under Details. */
+function RunnerError({ raw, canHost }: { raw: string; canHost: boolean }) {
+  const { message, detail } = runnerErrorText(raw, canHost);
+  return (
+    <div role="alert" className="runner-error">
+      <p>{message}</p>
+      {detail && (
+        <details>
+          <summary>Details</summary>
+          <pre>{detail}</pre>
+        </details>
+      )}
+    </div>
+  );
 }
 
 export function RunnerPanel({
@@ -238,7 +274,7 @@ export function RunnerPanel({
                 : "Contacting runner…"}
             </p>
           )}
-          {error && <p role="alert">{error}</p>}
+          {error && <RunnerError raw={error} canHost={canHost} />}
           {code && mode === "runner" && (
             <ol className="setup-steps runner-steps">
               <li>

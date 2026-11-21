@@ -517,8 +517,10 @@ describe("the stylesheet draws only checked pairs", () => {
     "var(--terminal-bg)",
     "var(--terminal-panel)",
     // Fills that hold a label checked above (.primary, .danger, their hovers, recording) or
-    // nothing to read (dots, meters, the resize grip, a slider's track).
+    // nothing to read (dots, meters, the resize grip, a slider's track, a switch's thumb,
+    // tests/css-contrast.ts).
     "var(--accent)",
+    "var(--accent-fg)",
     "var(--field-border)",
     "var(--danger)",
     "var(--warning)",

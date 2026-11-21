@@ -390,9 +390,7 @@ archive.commit()
     "ARCHIVED_RESULT_MARKER exact tool output",
   );
   // An event reads by who it came from and when, not by its sequence number.
-  await expect(context.locator(".search-event.selected")).toContainText(
-    "Tool",
-  );
+  await expect(context.locator(".search-event.selected")).toContainText("Tool");
   await expect(context).toContainText("This computer / default");
   await context
     .getByRole("button", { name: "Close dialog", exact: true })

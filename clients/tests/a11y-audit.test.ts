@@ -139,45 +139,75 @@ describe("accessibility audit of the shared UI", () => {
     expect(sources.flatMap(audit)).toEqual([]);
   });
 
-  // A label that holds a hint as well as its field's name would name the field with both
-  // ("Sweep The thread audits each rule itself…"): the field is named by its own word, and
-  // the hint describes it.
-  it("names a loop field by its label's word, not by the hint the label holds", () => {
-    const path = "shared/LoopViews.tsx";
-    const text = readFileSync(join(root, path), "utf8");
-    const file = ts.createSourceFile(
-      path,
-      text,
-      ts.ScriptTarget.Latest,
-      true,
-      ts.ScriptKind.TSX,
-    );
-    const problems: string[] = [];
-    const visit = (node: ts.Node) => {
-      if (ts.isJsxElement(node) && tagOf(node.openingElement) === "label") {
-        const inside: ts.JsxOpeningLikeElement[] = [];
-        const collect = (n: ts.Node) => {
-          if (ts.isJsxElement(n)) inside.push(n.openingElement);
-          else if (ts.isJsxSelfClosingElement(n)) inside.push(n);
-          ts.forEachChild(n, collect);
-        };
-        node.children.forEach(collect);
-        const hint = inside.some((e) => tagOf(e) === "small");
-        for (const field of inside.filter((e) =>
-          ["input", "textarea", "select"].includes(tagOf(e)),
-        ))
-          if (
-            hint &&
-            !namingAttributes.some((name) => attributes(field).has(name))
-          )
-            problems.push(
-              `${path}:${file.getLineAndCharacterOfPosition(field.getStart()).line + 1} <${tagOf(field)}> is named by its label's hint too`,
-            );
-      }
-      ts.forEachChild(node, visit);
+  // A label that holds a hint (or a button) as well as its field's name would name the
+  // field with both ("Sweep The thread audits each rule itself…", "Project or repository
+  // Choose folder"): the field is named by its own word, and the hint describes it.
+  it("names a field by its label's word, not by the hint or button the label holds", () => {
+    const labelled = (path: string) => {
+      const text = readFileSync(join(root, path), "utf8");
+      const file = ts.createSourceFile(
+        path,
+        text,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TSX,
+      );
+      const problems: string[] = [];
+      const visit = (node: ts.Node) => {
+        if (ts.isJsxElement(node) && tagOf(node.openingElement) === "label") {
+          const inside: ts.JsxOpeningLikeElement[] = [];
+          const collect = (n: ts.Node) => {
+            if (ts.isJsxElement(n)) inside.push(n.openingElement);
+            else if (ts.isJsxSelfClosingElement(n)) inside.push(n);
+            ts.forEachChild(n, collect);
+          };
+          node.children.forEach(collect);
+          const extra = inside.some((e) =>
+            ["small", "button"].includes(tagOf(e)),
+          );
+          for (const field of inside.filter((e) =>
+            ["input", "textarea", "select"].includes(tagOf(e)),
+          ))
+            if (
+              extra &&
+              !namingAttributes.some((name) => attributes(field).has(name))
+            )
+              problems.push(
+                `${path}:${file.getLineAndCharacterOfPosition(field.getStart()).line + 1} <${tagOf(field)}> is named by its label's hint or button too`,
+              );
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(file);
+      return problems;
     };
-    visit(file);
-    expect(problems).toEqual([]);
+    expect(sources.flatMap(labelled)).toEqual([]);
+  });
+
+  it("names a form's field by its label alone, described by its description", () => {
+    const html = renderToStaticMarkup(
+      createElement(FieldInput, {
+        field: {
+          key: "project",
+          label: "Project or repository",
+          type: "directory",
+          description: "A folder, or a repository to clone.",
+        },
+        value: "",
+        onChange() {},
+      }),
+    );
+    // The label holds the name alone: the folder button and the description are outside.
+    const label = html.match(/<label[^>]*>(.*?)<\/label>/)?.[1] ?? "";
+    expect(label).toBe("Project or repository");
+    expect(html).toContain('for="field-project"');
+    expect(html).toMatch(
+      /<input[^>]*id="field-project"[^>]*aria-describedby="field-project-description"/,
+    );
+    expect(html).toContain(
+      '<small id="field-project-description">A folder, or a repository to clone.</small>',
+    );
+    expect(html).toContain('aria-label="Choose folder"');
   });
 
   it("keeps a primary answer's accent background over the answers' raised one", () => {
@@ -408,6 +438,24 @@ describe("styles that keep controls usable", () => {
     const primary = rule(css, ".attention-options > button.primary");
     expect(primary).toContain("background: var(--accent)");
     expect(primary).toContain("color: var(--accent-fg)");
+  });
+  it("draws a switch as a track and thumb, 44 points to touch on the phone", () => {
+    const sw = 'input[type="checkbox"][role="switch"]';
+    expect(rule(css, sw)).toContain("border-radius: 999px");
+    expect(rule(css, `${sw}:checked`)).toContain("background: var(--accent)");
+    expect(rule(css, `${sw}:checked::before`)).toContain(
+      "transform: translateX",
+    );
+    expect(rule(mobile, `[data-mobile="true"] ${sw}`)).toContain(
+      "min-width: 44px",
+    );
+    // The track is 26 high; its ::after reaches 10 past it above and below.
+    expect(rule(mobile, `[data-mobile="true"] ${sw}`)).toContain(
+      "min-height: 26px",
+    );
+    expect(rule(mobile, `[data-mobile="true"] ${sw}::after`)).toContain(
+      "inset: -10px 0",
+    );
   });
   it("gives the phone's disclosure rows and the model picker's list switch 44 points", () => {
     expect(rule(mobile, '[data-mobile="true"] details > summary')).toContain(

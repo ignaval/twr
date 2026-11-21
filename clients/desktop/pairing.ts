@@ -51,6 +51,39 @@ export function missingPairFields(fields: PairFields): string | undefined {
   }.`;
 }
 
+/** Most characters of a one-use code, a hub name and a device name (what
+ * `twrRemote.pair` takes). */
+export const PAIR_LIMITS = { codeMin: 4, code: 128, name: 80 };
+
+/** What is wrong with details that are all there, in words (the limits `twrRemote.pair`
+ * checks), or nothing when they can be sent. */
+export function pairFieldProblem(fields: {
+  url: string;
+  code: string;
+  hubName: string;
+  name: string;
+}): string | undefined {
+  const code = fields.code.trim();
+  const again = " Copy it again from the invitation on the other computer.";
+  if (code.length < PAIR_LIMITS.codeMin)
+    return "The one-use code is too short." + again;
+  if (code.length > PAIR_LIMITS.code)
+    return "The one-use code is too long." + again;
+  if (fields.hubName.trim().length > PAIR_LIMITS.name)
+    return `The hub name is too long. Use at most ${PAIR_LIMITS.name} characters.`;
+  if (fields.name.trim().length > PAIR_LIMITS.name)
+    return `This device's name is too long. Use at most ${PAIR_LIMITS.name} characters.`;
+  let url: URL | undefined;
+  try {
+    url = new URL(fields.url.trim());
+  } catch {
+    url = undefined;
+  }
+  if (!url || !/^https?:$/.test(url.protocol))
+    return "The hub URL isn't a web address. Enter it as the invitation shows it, such as https://workstation.example:47321.";
+  return undefined;
+}
+
 /** The fields an invitation filled in (`filled`), emptied again: its text was cleared or
  * changed into something that isn't one. A field changed by hand since is kept. */
 export function withoutInvitation(
@@ -91,6 +124,6 @@ export function pairRequest(
       };
     }
   }
-  const missing = missingPairFields(request);
+  const missing = missingPairFields(request) ?? pairFieldProblem(request);
   return missing ? { error: missing, manual: pasted } : { fields: request };
 }

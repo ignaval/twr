@@ -120,6 +120,12 @@ describe("the New thread defaults' choices", () => {
       "codex",
       "acp:custom",
     ]);
+    // Those the file had before stay, after the hub's.
+    expect(runtimeChoices(info, show, "codex", ["fake", "codex"])).toEqual([
+      "claude-code",
+      "codex",
+      "fake",
+    ]);
     // An older hub lists nothing: the picker is free text.
     expect(runtimeChoices({}, undefined, "claude-code")).toEqual([]);
     expect(runtimeInstalled("codex", info, show)).toBe(true);
@@ -134,6 +140,12 @@ describe("the New thread defaults' choices", () => {
     expect(withCurrent(list, "b").at(-1)).toEqual({ value: "b", label: "b" });
     expect(speechRateChoices(180).map((c) => c.value)).toContain("180");
     expect(speechRateChoices(200).length).toBe(6);
+    // The voice's own speed (rate 0) is a choice while the speaker reads at it.
+    expect(speechRateChoices(0)[0]).toEqual({
+      value: "0",
+      label: "Default (the voice's own speed)",
+    });
+    expect(speechRateChoices(200).map((c) => c.value)).not.toContain("0");
   });
 
   it("names text sizes, keeping an earlier slider's size as custom", () => {
@@ -366,6 +378,58 @@ describe("Settings, mounted", () => {
       ["threads"],
       "default_mode",
       "plan",
+    );
+    await m.unmount();
+  });
+});
+
+describe("New thread defaults, mounted", () => {
+  it("keeps an unlisted default runtime a choice, and takes any other typed in", async () => {
+    const file: Json = { default_runtime: "fake" };
+    const m = await mountManager({ section: "settings" }, hubRpc, file);
+    await m.click(m.find("[role=tab]", "Agents"));
+    (window as any).twr.configSet = async (
+      _table: string[],
+      key: string,
+      value: string,
+    ) => {
+      file[key] = value;
+    };
+    const row = () => m.find(".setting-field", "Default runtime")!;
+    const options = () =>
+      row()
+        .querySelectorAll("option")
+        .map((o) => o.textContent);
+    expect(options()).toEqual(["claude-code", "codex", "fake", "Other…"]);
+    await m.choose(row().querySelector("select")!, "codex");
+    expect(file.default_runtime).toBe("codex");
+    // The runtime the file had before stays a choice.
+    expect(options()).toEqual(["claude-code", "codex", "fake", "Other…"]);
+    await m.choose(row().querySelector("select")!, "\u0000other");
+    const input = row().querySelector("input")!;
+    expect(input).toBeDefined();
+    expect((input as any).value).toBe("codex");
+    expect(
+      row().querySelector(
+        "button[aria-label='Choose default runtime from the list']",
+      ),
+    ).toBeDefined();
+    await m.unmount();
+  });
+
+  it("names a setting by its label, and describes it by its hint", async () => {
+    const m = await mountManager({ section: "settings" }, hubRpc);
+    await m.click(m.find("[role=tab]", "Agents"));
+    const stall = m.find(".setting-field", "Stall notification")!;
+    const label = stall.querySelector("label")!;
+    expect(label.textContent).toBe("Stall notification");
+    const select = stall.querySelector("select")!;
+    expect(label.getAttribute("for")).toBe(select.getAttribute("id"));
+    const hint = m.document.getElementById(
+      select.getAttribute("aria-describedby")!,
+    )!;
+    expect(hint.textContent).toBe(
+      "When a running turn makes no progress this long.",
     );
     await m.unmount();
   });

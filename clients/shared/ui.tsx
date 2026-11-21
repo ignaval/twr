@@ -85,6 +85,10 @@ export function Dialog({
     </div>
   );
 }
+/** One field of a command form: its label (naming the control alone), the control, and
+ * its description, which describes the control (`aria-describedby`). The label wraps
+ * neither the description nor a button beside the control (Choose folder), so neither
+ * becomes part of the control's name. */
 export function FieldInput({
   field,
   value,
@@ -96,12 +100,10 @@ export function FieldInput({
 }) {
   const hostApi = useHostAPI();
   const id = `field-${field.key}`;
+  const describedBy = field.description ? `${id}-description` : undefined;
   return (
-    <label
-      className={`field ${field.type === "boolean" ? "check-field" : ""}`}
-      htmlFor={id}
-    >
-      <span>
+    <div className={`field ${field.type === "boolean" ? "check-field" : ""}`}>
+      <label htmlFor={id} className="field-label">
         {field.label}
         {field.required && (
           <span className="required" aria-hidden="true">
@@ -109,13 +111,14 @@ export function FieldInput({
             *
           </span>
         )}
-      </span>
+      </label>
       {field.type === "boolean" ? (
         <input
           id={id}
           type="checkbox"
           role={field.switch ? "switch" : undefined}
           checked={!!value}
+          aria-describedby={describedBy}
           onChange={(e) => onChange(e.target.checked)}
         />
       ) : (field.type === "model" || field.type === "effort") &&
@@ -128,13 +131,21 @@ export function FieldInput({
           keep={field.keep}
           custom={field.type === "model"}
           required={field.required}
+          describedBy={describedBy}
         />
       ) : field.type === "select" || (isPicker(field) && field.choices) ? (
-        <ChoiceSelect id={id} field={field} value={value} onChange={onChange} />
+        <ChoiceSelect
+          id={id}
+          field={field}
+          value={value}
+          onChange={onChange}
+          describedBy={describedBy}
+        />
       ) : field.type === "textarea" ? (
         <textarea
           id={id}
           aria-required={field.required || undefined}
+          aria-describedby={describedBy}
           rows={5}
           value={value ?? ""}
           placeholder={field.placeholder}
@@ -145,6 +156,7 @@ export function FieldInput({
           <input
             id={id}
             aria-required={field.required || undefined}
+            aria-describedby={describedBy}
             type={field.type === "number" ? "number" : "text"}
             value={value ?? ""}
             placeholder={field.placeholder}
@@ -175,8 +187,8 @@ export function FieldInput({
           )}
         </div>
       )}
-      {field.description && <small>{field.description}</small>}
-    </label>
+      {field.description && <small id={describedBy}>{field.description}</small>}
+    </div>
   );
 }
 /** Field types drawn as a list of what the hub has (`shared/fieldChoices.ts`). */
@@ -208,11 +220,13 @@ function ChoiceSelect({
   field,
   value,
   onChange,
+  describedBy,
 }: {
   id: string;
   field: Field;
   value: any;
   onChange: (v: any) => void;
+  describedBy?: string;
 }) {
   const current = value === undefined || value === null ? "" : String(value);
   const choices: NonNullable<Field["choices"]> =
@@ -241,6 +255,7 @@ function ChoiceSelect({
           id={id}
           aria-label={field.label}
           aria-required={field.required || undefined}
+          aria-describedby={describedBy}
           type="text"
           value={current}
           placeholder={field.placeholder}
@@ -263,7 +278,13 @@ function ChoiceSelect({
       </div>
     );
   // A required field whose value is set and listed needs no empty choice; a form opened
-  // with a default (`initial`) keeps its "Choose…" only while it has no value.
+  // with a default (`initial`) keeps its "Choose…" only while it has no value. A field
+  // whose default is one of its choices ("The project's default") needs none either: an
+  // empty "Keep default" would say the same thing twice.
+  const explicitDefault =
+    field.initial !== undefined &&
+    field.initial !== "" &&
+    choices.some((c) => c.value === String(field.initial));
   return (
     <select
       ref={control}
@@ -271,6 +292,7 @@ function ChoiceSelect({
       // Named by the field alone: a wrapping label would add the chosen option's text.
       aria-label={field.label}
       aria-required={field.required || undefined}
+      aria-describedby={describedBy}
       aria-busy={field.loading || undefined}
       disabled={field.loading}
       value={current}
@@ -286,7 +308,7 @@ function ChoiceSelect({
         <option value={current}>Loading…</option>
       ) : (
         <>
-          {(!field.required || current === "") && (
+          {((!field.required && !explicitDefault) || current === "") && (
             <option value="">{empty}</option>
           )}
           {choices.map((c) => (
@@ -315,6 +337,7 @@ export function ModelSelect({
   custom = true,
   required = false,
   label,
+  describedBy,
 }: {
   id?: string;
   value: string;
@@ -324,6 +347,7 @@ export function ModelSelect({
   custom?: boolean;
   required?: boolean;
   label?: string;
+  describedBy?: string;
 }) {
   const listed =
     value === "" ||
@@ -337,6 +361,7 @@ export function ModelSelect({
           id={id}
           aria-label={label}
           aria-required={required || undefined}
+          aria-describedby={describedBy}
           type="text"
           value={value}
           placeholder="Model id, as the runtime names it"
@@ -362,6 +387,7 @@ export function ModelSelect({
       id={id}
       aria-label={label}
       aria-required={required || undefined}
+      aria-describedby={describedBy}
       value={listed ? value : ""}
       onChange={(e) => {
         if (e.target.value === CUSTOM) {

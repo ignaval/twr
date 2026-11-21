@@ -5,6 +5,7 @@ import {
   fieldsFromInvitation,
   hubNameFor,
   missingPairFields,
+  pairFieldProblem,
   pairRequest,
   withoutInvitation,
 } from "../desktop/pairing";
@@ -166,5 +167,51 @@ describe("pasting an invitation into Connect to another computer", () => {
         name: "d",
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("the connection notice", () => {
+  it("says the hub reconnecting in words, the socket path only as its detail", async () => {
+    const { connectionWords } = await import("../shared/errors");
+    const raw = "connecting to hub at /private/var/folders/x/hub.sock";
+    expect(connectionWords(raw)).toEqual({
+      text: "Connecting to the hub…",
+      detail: raw,
+    });
+    expect(connectionWords("Hub connection closed; reconnecting").text).toBe(
+      "Connecting to the hub…",
+    );
+    expect(connectionWords("Configuration needs repair")).toEqual({
+      text: "Configuration needs repair",
+    });
+  });
+});
+
+describe("details entered by hand", () => {
+  const manual = {
+    hubName: "Lab",
+    url: "https://lab.example:47321",
+    code: "zzzz-1111",
+    name: "laptop",
+  };
+  it("says what is wrong in a sentence, never zod's issue list", () => {
+    expect(pairFieldProblem(manual)).toBeUndefined();
+    expect(pairFieldProblem({ ...manual, code: "abc" })).toMatch(
+      /^The one-use code is too short\./,
+    );
+    expect(pairFieldProblem({ ...manual, code: "x".repeat(129) })).toMatch(
+      /^The one-use code is too long\./,
+    );
+    expect(pairFieldProblem({ ...manual, name: "n".repeat(81) })).toBe(
+      "This device's name is too long. Use at most 80 characters.",
+    );
+    expect(pairFieldProblem({ ...manual, url: "lab:47321" })).toMatch(
+      /^The hub URL isn't a web address\./,
+    );
+    // Pair and connect refuses it before asking the main process.
+    expect(pairRequest("", { ...manual, code: "abc" })).toEqual({
+      error: pairFieldProblem({ ...manual, code: "abc" }),
+      manual: false,
+    });
   });
 });

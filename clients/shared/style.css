@@ -233,6 +233,47 @@ input[type="range"]:disabled {
   opacity: 0.55;
   cursor: default;
 }
+/* A switch (`role="switch"`: a setting that turns something on): a track with a thumb at
+ * its end, the accent when on. Off, the thumb is the edge's colour on the page's; on, the
+ * accent's ink on the accent. The focus ring and the disabled look are the checkbox's. */
+input[type="checkbox"][role="switch"] {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  min-width: 32px;
+  height: 18px;
+  min-height: 18px;
+  border: 1px solid var(--field-border);
+  border-radius: 999px;
+  background: var(--bg);
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+input[type="checkbox"][role="switch"]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--field-border);
+  transform: none;
+  transition: transform 120ms ease;
+}
+input[type="checkbox"][role="switch"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+input[type="checkbox"][role="switch"]:checked::before {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  background: var(--accent-fg);
+  transform: translateX(14px);
+}
 input[type="range"] {
   appearance: none;
   padding: 0;
@@ -2770,7 +2811,9 @@ meter::-webkit-meter-optimum-value {
 }
 .toast {
   position: fixed;
-  top: calc(var(--header-height) + 12px);
+  /* Under the header, the status strip and the conversation's heading (App.tsx measures
+   * them): a toast never covers their controls. */
+  top: calc(var(--toast-top, var(--header-height)) + 8px);
   max-height: min(240px, calc(100dvh - 240px));
   overflow: auto;
   max-width: min(620px, calc(100vw - 44px));
@@ -2863,7 +2906,8 @@ meter::-webkit-meter-optimum-value {
   font-size: 1rem;
   gap: 6px;
 }
-.field > span {
+.field > span,
+.field > .field-label {
   font-weight: 500;
 }
 .field > small {
@@ -3677,6 +3721,9 @@ meter::-webkit-meter-optimum-value {
   .topbar-actions > button:last-child {
     padding-inline: 8px;
   }
+  .topbar {
+    gap: 8px;
+  }
   .composer-bottom > span {
     display: none;
   }
@@ -3888,12 +3935,18 @@ meter::-webkit-meter-optimum-value {
   font-size: 0.923077rem;
 }
 
+/* A narrow window: New thread is its icon alone (named by its aria-label), so the topbar
+ * fits without a horizontal scroll down to 360 px. (The label is hidden, not shrunk:
+ * `.topbar-actions > button:last-child` sets the button's font size.) */
 @media (max-width: 800px) {
   .topbar-actions > .topbar-new-thread {
-    font-size: 0;
     padding: 6px;
     gap: 0;
     min-width: 32px;
+    justify-content: center;
+  }
+  .topbar-new-thread-label {
+    display: none;
   }
 }
 

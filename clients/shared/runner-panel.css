@@ -55,3 +55,20 @@
   margin: 8px 0;
   line-height: 1.5;
 }
+.runner-error > p {
+  margin: 0;
+  color: var(--danger);
+}
+.runner-error > details {
+  margin-top: 6px;
+}
+.runner-error > details > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.runner-error pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.923077rem;
+}

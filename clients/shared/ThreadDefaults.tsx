@@ -20,6 +20,7 @@ import {
 } from "./settingsModel";
 import { Toggle } from "./Toggle";
 import type { Json } from "./types";
+import { List } from "lucide-react";
 import { ModelSelect } from "./ui";
 
 type Fail = (error: unknown) => void;
@@ -169,10 +170,12 @@ function Row({
 }) {
   return (
     <div className="setting-field" title={title}>
-      <label htmlFor={id}>
-        <span>{label}</span>
+      {/* The hint outside the label: the control is named by the label alone, and
+          described by the hint (`aria-describedby`). */}
+      <div className="setting-name">
+        <label htmlFor={id}>{label}</label>
         {hint && <small id={`${id}-hint`}>{hint}</small>}
-      </label>
+      </div>
       {children}
       {feedback}
     </div>
@@ -252,14 +255,15 @@ export function SettingSelect({
   );
 }
 
-/** A setting typed in (a model id, or a runtime when the hub lists none): a choice from
- * the list saves at once, typed text when the field is left or Enter is pressed. */
+/** A setting typed in (a model id, or a runtime): a choice from the list saves at once,
+ * typed text when the field is left or Enter is pressed. */
 function SettingText({
   table,
   name,
   label,
   initial,
   models,
+  options,
   context,
   onSaved,
 }: {
@@ -269,6 +273,8 @@ function SettingText({
   initial: Json;
   /** The model picker's choices; absent: a plain text field. */
   models?: { value: string; description?: string }[];
+  /** A list to choose from, ending with Other… (typed in); absent: a plain text field. */
+  options?: string[];
   context: SaveContext;
   onSaved?: (value: string) => void;
 }) {
@@ -315,7 +321,18 @@ function SettingText({
             commit(value);
         }}
       >
-        {models ? (
+        {options ? (
+          <OptionOrText
+            id={id}
+            label={label}
+            value={value}
+            options={options}
+            onChange={(next, chosen) => {
+              setValue(next);
+              if (chosen) commit(next);
+            }}
+          />
+        ) : models ? (
           <ModelSelect
             id={id}
             value={value}
@@ -340,6 +357,83 @@ function SettingText({
   );
 }
 
+const OTHER = "\u0000other";
+
+/** A choice from `options`, or (Other…) any value typed in a text box, which a button turns
+ * back into the list. A value the list lacks shows in the text box. `chosen`: picked from
+ * the list (saved at once), not typed. */
+function OptionOrText({
+  id,
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  options: string[];
+  onChange: (value: string, chosen: boolean) => void;
+}) {
+  const listed = value === "" || options.includes(value);
+  const [typing, setTyping] = useState(false);
+  const refocus = useRef(false);
+  const control = useRef<HTMLInputElement & HTMLSelectElement>(null);
+  const asText = typing || !listed;
+  useEffect(() => {
+    if (!refocus.current) return;
+    refocus.current = false;
+    control.current?.focus();
+  }, [asText]);
+  if (asText)
+    return (
+      <div className="input-with-button">
+        <input
+          ref={control}
+          id={id}
+          type="text"
+          value={value}
+          autoComplete="off"
+          spellCheck={false}
+          onChange={(e) => onChange(e.target.value, false)}
+        />
+        <button
+          type="button"
+          aria-label={`Choose ${label.toLowerCase()} from the list`}
+          title="Choose from the list"
+          onClick={() => {
+            refocus.current = true;
+            setTyping(false);
+            if (!options.includes(value)) onChange(options[0] ?? "", true);
+          }}
+        >
+          <List size={16} aria-hidden="true" />
+        </button>
+      </div>
+    );
+  return (
+    <select
+      ref={control}
+      id={id}
+      value={value}
+      onChange={(e) => {
+        if (e.target.value === OTHER) {
+          refocus.current = true;
+          setTyping(true);
+        } else onChange(e.target.value, true);
+      }}
+    >
+      {value === "" && <option value="">Not set</option>}
+      {options.map((o) => (
+        <option key={o} value={o}>
+          {o}
+        </option>
+      ))}
+      <option value={OTHER}>Other…</option>
+    </select>
+  );
+}
+
 /** Settings › Agents › New thread defaults: what a new thread starts with, and how long
  * the hub keeps what threads leave behind. Each row saves when it changes. */
 export function ThreadDefaults({
@@ -358,9 +452,17 @@ export function ThreadDefaults({
 }) {
   const [runtime, setRuntime] = useState<string>(loaded?.default_runtime || "");
   const [summaries, setSummaries] = useState(!!loaded?.tui?.summaries);
+  // Every default runtime the file had while Settings is open: one the hub doesn't list
+  // (`fake`, an `acp:` command) stays a choice after another is chosen.
+  const [earlier, setEarlier] = useState<string[]>([]);
   useEffect(() => setRuntime(loaded?.default_runtime || ""), [loaded]);
   useEffect(() => setSummaries(!!loaded?.tui?.summaries), [loaded]);
-  const runtimes = runtimeChoices(info, show, loaded?.default_runtime);
+  useEffect(() => {
+    const current = loaded?.default_runtime;
+    if (typeof current === "string" && current)
+      setEarlier((old) => (old.includes(current) ? old : [...old, current]));
+  }, [loaded?.default_runtime]);
+  const runtimes = runtimeChoices(info, show, loaded?.default_runtime, earlier);
   // `[threads] model` applies to threads of every runtime: the default runtime's models.
   const models = modelChoices(show?.models, runtime);
   const value = (table: string[], key: string) =>
@@ -374,26 +476,15 @@ export function ThreadDefaults({
     <section className="settings-section setting-controls">
       <h2>New thread defaults</h2>
       <p>What new threads start with. Changes save as you make them.</p>
-      {runtimes.length ? (
-        <SettingSelect
-          table={[]}
-          name="default_runtime"
-          label="Default runtime"
-          initial={value([], "default_runtime")}
-          choices={runtimes.map((r) => ({ value: r, label: r }))}
-          context={context}
-          onSaved={setRuntime}
-        />
-      ) : (
-        <SettingText
-          table={[]}
-          name="default_runtime"
-          label="Default runtime"
-          initial={value([], "default_runtime")}
-          context={context}
-          onSaved={setRuntime}
-        />
-      )}
+      <SettingText
+        table={[]}
+        name="default_runtime"
+        label="Default runtime"
+        initial={value([], "default_runtime")}
+        options={runtimes.length ? runtimes : undefined}
+        context={context}
+        onSaved={setRuntime}
+      />
       <SettingSelect
         table={["threads"]}
         name="default_mode"

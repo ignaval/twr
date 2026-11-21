@@ -15,7 +15,7 @@ import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
 import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
 import { attentionSummary } from "./attentionSummary";
-import { errorMessage } from "./errors";
+import { connectionWords, errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
@@ -1477,10 +1477,12 @@ export default function App({
     if (connected) announce(`Connected to ${workspace}`);
     else if (previous)
       announce(
-        `Disconnected from ${workspace}${connectionError ? ". " + connectionError : ""}`,
+        `Disconnected from ${workspace}${connectionError ? ". " + connectionWords(connectionError).text : ""}`,
       );
     else if (connectionError)
-      announce(`Could not connect to ${workspace}. ${connectionError}`);
+      announce(
+        `Could not connect to ${workspace}. ${connectionWords(connectionError).text}`,
+      );
   }, [connected, connecting, workspace]);
   const knownAttention = useRef<{ workspace: string; ids: Set<string> }>(
     undefined,
@@ -2523,6 +2525,58 @@ export default function App({
     const timer = setTimeout(() => setNotice(""), 6000);
     return () => clearTimeout(timer);
   }, [notice]);
+  // A success notice is about where it was given: going elsewhere clears it. (A notice
+  // given with the move that goes with it, such as a new thread opening, stays: both
+  // effects run after the same render, this place recorded first.)
+  const place = `${section}\u0000${destination ?? ""}\u0000${selected ?? ""}`;
+  const noticePlace = useRef(place);
+  useEffect(() => {
+    if (notice) noticePlace.current = place;
+    // Recorded when the notice is given, not when the place changes.
+  }, [notice]);
+  useEffect(() => {
+    if (noticePlace.current !== place) setNotice("");
+  }, [place]);
+  // Where a toast goes: under the header, the status strip and the conversation's heading,
+  // so that it never covers their controls (`--toast-top`).
+  useLayoutEffect(() => {
+    if (!error && !notice) return;
+    const main = document.getElementById("twr-main");
+    if (!main?.getBoundingClientRect) return;
+    const parts = () =>
+      [
+        ...main.querySelectorAll<HTMLElement>(
+          ":scope > .topbar, :scope > .status-strip, .conversation-heading",
+        ),
+      ].filter((part) => part.getBoundingClientRect);
+    const placeToast = () => {
+      let bottom = 0;
+      for (const part of parts())
+        bottom = Math.max(bottom, part.getBoundingClientRect().bottom);
+      if (bottom > 0)
+        document.documentElement.style.setProperty(
+          "--toast-top",
+          `${Math.round(bottom)}px`,
+        );
+    };
+    placeToast();
+    window.addEventListener("resize", placeToast);
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(placeToast);
+    // The work area too: a strip that comes or grows later shrinks it (the heading only
+    // moves, which no observer of its own size sees).
+    for (const part of [
+      ...parts(),
+      ...main.querySelectorAll<HTMLElement>(":scope > .work-area"),
+    ])
+      observer?.observe(part);
+    return () => {
+      window.removeEventListener("resize", placeToast);
+      observer?.disconnect();
+    };
+  }, [error, notice, section, destination]);
   const loopNavigation = useRef({
     destination,
     section,
@@ -2808,19 +2862,35 @@ export default function App({
     ? `Offline · saved ${new Date(savedOffline.savedAt).toLocaleString()}. Requests need a live connection before you can answer.`
     : "";
   const connectionNotice = !!(connectionError || connecting);
+  // The host reconnecting on its own (its error names the hub's socket): news, not alarm.
+  const reconnecting = !connecting && !!connectionWords(connectionError).detail;
   const notices: StripItem[] = [
     ...(connectionNotice
       ? [
           {
             key: "connection",
-            role: connecting ? ("status" as const) : ("alert" as const),
+            role:
+              connecting || reconnecting
+                ? ("status" as const)
+                : ("alert" as const),
             tone: connectionError ? ("warning" as const) : undefined,
-            busy: connecting,
-            icon: connecting ? <Spinner /> : <AlertCircle size={15} />,
+            busy: connecting || reconnecting,
+            icon:
+              connecting || reconnecting ? (
+                <Spinner />
+              ) : (
+                <AlertCircle size={15} />
+              ),
             // What this device saved shows meanwhile: one notice says both.
             content: (
               <>
-                {connecting ? "Connecting to your workspace…" : connectionError}
+                {connecting ? (
+                  "Connecting to your workspace…"
+                ) : (
+                  <span title={connectionWords(connectionError).detail}>
+                    {connectionWords(connectionError).text}
+                  </span>
+                )}
                 {offlineWords && <p>{offlineWords}</p>}
               </>
             ),
@@ -3483,8 +3553,9 @@ export default function App({
               disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
-              <Plus size={14} />
-              New thread
+              <Plus size={14} aria-hidden="true" />
+              {/* Icon alone in a narrow window (style.css); the button keeps its name. */}
+              <span className="topbar-new-thread-label">New thread</span>
             </button>
           </div>
         </header>
@@ -4718,11 +4789,11 @@ export default function App({
                   required
                   placeholder="e.g. client-project"
                 />
-                <span className="visually-hidden" id="twr-workspace-name-hint">
-                  Lowercase letters, numbers and hyphens, starting with a letter
-                  or number; up to 32 characters.
-                </span>
               </label>
+              <span className="visually-hidden" id="twr-workspace-name-hint">
+                Lowercase letters, numbers and hyphens, starting with a letter
+                or number; up to 32 characters.
+              </span>
               <button className="primary">
                 <Plus size={15} />
                 Create workspace

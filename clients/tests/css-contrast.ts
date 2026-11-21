@@ -319,6 +319,33 @@ export function controlPairs(
       checked,
     );
   });
+  part("switch", () => {
+    // A switch (`role="switch"`): its track's edge on every surface and on its fill, its
+    // thumb on the track off; on, the track on every surface and the thumb on the track.
+    const sw = 'input[type="checkbox"][role="switch"]';
+    const track = paint(style(sw, "background"), on("bg"));
+    const edge = paint(colorOf(style(sw, "border")), track);
+    check("switch track edge on its fill", edge, track);
+    for (const [where, bg] of bases)
+      check(`switch track edge on ${where}`, edge, bg);
+    check(
+      "switch thumb on its track",
+      paint(style(`${sw}::before`, "background"), track),
+      track,
+    );
+    const on_ = paint(style(`${sw}:checked`, "background"), on("bg"));
+    expect(
+      style(`${sw}:checked`, "border-color"),
+      style(`${sw}:checked`, "background"),
+    );
+    for (const [where, bg] of bases)
+      check(`switched-on track on ${where}`, on_, bg);
+    check(
+      "switched-on thumb on its track",
+      paint(style(`${sw}:checked::before`, "background"), on_),
+      on_,
+    );
+  });
   part("slider", () => {
     // A slider: its track on every surface; its thumb on its ring, which is the page.
     const range = 'input[type="range"]';

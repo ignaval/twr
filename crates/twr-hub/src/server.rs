@@ -19,7 +19,7 @@
 //! | `thread.spawn_status` | `{operation_id}` | durable operation |
 //! | `conversation.search` | `{query, thread?, before?:event_id, limit?}` | literal case-insensitive search across messages, tool output and decisions, including archive; `{items, next, more, workspace}` |
 //! | `thread.event_context` | `{thread, event_id, before?, after?, query?}` | exact event plus nearby events in its recorded workspace/thread, including archive |
-//! | `thread.transcript` | `{thread, turn?, since_seq?, limit?}` | filtered semantic events, default latest turn |
+//! | `thread.transcript` | `{thread, turn?, since_seq?, limit?}` | filtered semantic events (reasoning included, streamed deltas not), default latest turn |
 //! | `thread.new`        | `{project, runtime?, name?, mode?, model?, effort?, aliases?, box?, worktree?, no_worktree?, base?}` | thread object |
 //! | `thread.list`       | -                                                   | `[thread object]` |
 //! | `thread.get`        | `{thread}`                                          | thread object + `attention: [item]` |

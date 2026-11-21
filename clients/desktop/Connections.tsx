@@ -105,6 +105,18 @@ export function Connections({
   const [tab, setTab] = useState<"hubs" | "gateway">("hubs");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Why Pair and connect failed: said next to the button, which is where the eye is.
+  const [pairError, setPairError] = useState("");
+  const listenId = useId();
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  const pairErrorRef = useRef<HTMLParagraphElement>(null);
+  // An error said where it is out of view (the dialog scrolled) comes into view.
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [error]);
+  useEffect(() => {
+    if (pairError) pairErrorRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [pairError]);
   const [vaultError, setVaultError] = useState(false);
   const [resetHubs, setResetHubs] = useState(false);
   const [notice, setNotice] = useState("");
@@ -236,6 +248,7 @@ export function Connections({
         hubName: filled.hubName,
       };
       setError("");
+      setPairError("");
       setNotice(
         `Invitation from ${filled.hubName} loaded. Check the names under Enter details manually if you like, then pair.`,
       );
@@ -252,7 +265,10 @@ export function Connections({
     loaded.current = undefined;
     setPairFields((old) => withoutInvitation(old, filled));
     if (filled) setNotice("");
-    if (!text.trim()) setError("");
+    if (!text.trim()) {
+      setError("");
+      setPairError("");
+    }
   }
   const pairField = (
     key: keyof PairFields,
@@ -321,7 +337,9 @@ export function Connections({
           ))}
         </div>
         {error && (
-          <p role="alert">{error.replace(/^SAVED_HUBS_UNREADABLE:\s*/, "")}</p>
+          <p role="alert" ref={errorRef}>
+            {error.replace(/^SAVED_HUBS_UNREADABLE:\s*/, "")}
+          </p>
         )}
         {notice && <p role="status">{notice}</p>}
         {vaultError && (
@@ -405,20 +423,28 @@ export function Connections({
                   event.preventDefault();
                   // The invitation as its text is now, never what an earlier one filled.
                   const request = pairRequest(invitationText, pairFields);
+                  setPairError("");
                   if ("error" in request) {
                     setNotice("");
-                    setError(request.error);
+                    setError("");
+                    setPairError(request.error);
                     if (request.manual) setManual(true);
                     return;
                   }
                   const fields = request.fields;
                   void run(async () => {
-                    const hub = await window.twrRemote.pair({
-                      url: fields.url,
-                      code: fields.code.trim(),
-                      hubName: fields.hubName,
-                      name: fields.name,
-                    });
+                    let hub: Hub;
+                    try {
+                      hub = await window.twrRemote.pair({
+                        url: fields.url,
+                        code: fields.code.trim(),
+                        hubName: fields.hubName,
+                        name: fields.name,
+                      });
+                    } catch (e) {
+                      setPairError(errorMessage(e));
+                      return;
+                    }
                     await refresh();
                     await onSelect(hub);
                   });
@@ -471,6 +497,11 @@ export function Connections({
                     {pairField("name", "This device", { maxLength: 80 })}
                   </div>
                 </details>
+                {pairError && (
+                  <p role="alert" ref={pairErrorRef} className="error-text">
+                    {pairError}
+                  </p>
+                )}
                 <button className="primary" disabled={busy}>
                   {busy ? "Connecting…" : "Pair and connect"}
                 </button>
@@ -595,13 +626,16 @@ export function Connections({
                         Listen IP and port
                         <input
                           aria-required="true"
+                          aria-describedby={`${listenId}-hint`}
                           disabled={busy}
                           value={settings.listen}
                           onChange={(e) => update("listen", e.target.value)}
                           placeholder={DEFAULT_LISTEN}
                         />
-                        <small>Default: {DEFAULT_LISTEN}, every network.</small>
                       </label>
+                      <small id={`${listenId}-hint`}>
+                        Default: {DEFAULT_LISTEN}, every network.
+                      </small>
                     </details>
                   </li>
                   <li>
