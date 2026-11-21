@@ -25,11 +25,15 @@ export interface OutboxMessage extends DurableMessage {
  * delivery fails, the error carries it (`restored_drafts`), so the caller puts it in the box
  * as a success would. Otherwise the box's next save would write over it.
  */
-function withRestored(error: unknown, restored: Json[]) {
+function withRestored(error: unknown, restored: Restored[]) {
   if (!restored.length) return error;
-  const carried =
-    error instanceof Error ? error : new Error(String(error ?? "Not sent"));
-  (carried as Error & { restored_drafts?: Json[] }).restored_drafts = restored;
+  // A new error for each caller: callers waiting on the same delivery share its error, and
+  // each carries what its own delivery put back. The failure itself is its `cause`.
+  const carried = new Error(
+    error instanceof Error ? error.message : String(error ?? "Not sent"),
+    { cause: error },
+  ) as Error & { restored_drafts?: Restored[] };
+  carried.restored_drafts = [...restoredOf(error), ...restored];
   return carried;
 }
 /** The drafts a failed [`OfflineJournal.deliver`] had already moved back ([`withRestored`]). */
@@ -762,7 +766,7 @@ export class OfflineJournal {
     const index = this.record.outbox.findIndex(
       (item) => item.id === requested.id,
     );
-    const restored: Json[] = [];
+    const restored: Restored[] = [];
     for (const prior of this.record.outbox
       .slice(0, Math.max(0, index))
       .filter(

@@ -577,6 +577,57 @@ describe("encrypted offline recovery", () => {
     // The second sees it taken: the box never puts it back again.
     expect(journal.claim([rb.restored_draft])).toEqual([]);
   });
+  it("gives each caller of an overlapping delivery what its own delivery put back", async () => {
+    const disk = storage();
+    const gates = new Map<string, (value: unknown) => void>();
+    const failC = new Map<string, (error: Error) => void>();
+    const sent: string[] = [];
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: (message: any) => {
+          const text = String(message.params.message || message.params.prompt);
+          sent.push(text);
+          if (text === "a") return Promise.resolve({ action: "pending" });
+          return new Promise((resolve, reject) => {
+            gates.set(text, resolve);
+            failC.set(text, reject);
+          });
+        },
+      } as unknown as DesktopAPI,
+      "overlapping-restores",
+    );
+    await journal.load();
+    const a = await journal.enqueue("work", "say", { message: "a" });
+    const b = await journal.enqueue("work", "say", { message: "b" });
+    const c = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "c",
+    });
+    const settle = (p: Promise<unknown>) =>
+      p.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    // The first delivers a (held), then waits on b; the second joins then, from b on.
+    const first = settle(journal.deliver(c));
+    await vi.waitFor(() => expect(gates.has("b")).toBe(true));
+    const second = settle(journal.deliver(c));
+    gates.get("b")!({ action: "pending" });
+    await vi.waitFor(() => expect(failC.has("c")).toBe(true));
+    failC.get("c")!(new Error("hub went away"));
+    const [e1, e2] = await Promise.all([first, second]);
+    expect(e1).not.toBe(e2);
+    expect((e1 as Error).message).toBe("hub went away");
+    expect(restoredOf(e1).map((r) => r.id)).toEqual([a.id, b.id]);
+    expect(restoredOf(e2).map((r) => r.id)).toEqual([b.id]);
+    // Between them, each goes in the box once.
+    expect(
+      [...journal.claim(restoredOf(e2)), ...journal.claim(restoredOf(e1))].map(
+        (r) => r.id,
+      ),
+    ).toEqual([b.id, a.id]);
+  });
   it("gives nothing back from storage since reset", async () => {
     const disk = storage();
     let calls = 0;
