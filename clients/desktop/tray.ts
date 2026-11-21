@@ -23,9 +23,10 @@ export interface TrayMenuState {
 }
 
 /**
- * Linux status icons need a StatusNotifierItem host (Waybar's tray module on
- * Omarchy, KDE, GNOME with the AppIndicator extension). Without one, Electron
- * would create an icon nobody can see, so the app must not hide into it.
+ * Linux status icons need a StatusNotifierItem host (the tray of Omarchy's bar: the
+ * Omarchy shell's on current releases, Waybar's on older ones; KDE; GNOME with the
+ * AppIndicator extension). Without one, Electron would create an icon nobody can see, so
+ * the app must not hide into it.
  */
 export function statusNotifierAvailable(): Promise<boolean> {
   if (process.platform !== "linux") return Promise.resolve(true);

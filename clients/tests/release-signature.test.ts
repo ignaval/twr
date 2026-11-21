@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import {
   createPrivateKey,
   createPublicKey,
@@ -6,7 +6,7 @@ import {
   sign,
   createHash,
 } from "node:crypto";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -97,6 +97,7 @@ describe("release signature", () => {
 
   it("accepts only a download whose SHA-256 the signed list names", () => {
     const directory = mkdtempSync(join(tmpdir(), "twr-signed-"));
+    onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
     const file = join(directory, "twr-0.4.0.AppImage");
     writeFileSync(file, image);
     const list = verifySignedSums(

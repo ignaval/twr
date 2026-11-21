@@ -8,6 +8,7 @@
 // Checks: push to talk fills an editable draft; explicit Send marks it spoken; the reply is
 // read aloud by the app's own speaker (a command engine that logs what it is given); a
 // transcript that reads as a mode change is held for confirmation, nothing sent.
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { _electron as electron } from "@playwright/test";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { spawn, execFileSync } from "node:child_process";
@@ -192,6 +193,7 @@ async function launch(wav) {
     env,
     timeout: 60000,
   });
+  await floatTestWindow(app.process().pid);
   const page = await app.firstWindow();
   page.on("console", (m) => logs.push(`console.${m.type()}: ${m.text()}`));
   page.on("pageerror", (e) => logs.push(`pageerror: ${e.message}`));

@@ -1,4 +1,5 @@
 // Focused desktop layout, encrypted recovery, and outbox QA. All hub processes and SQLite rows are disposable.
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { clientProtocol } from "./client-protocol.mjs";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron, expect } from "@playwright/test";
@@ -172,6 +173,7 @@ async function launch() {
     env,
     timeout: 60000,
   });
+  await floatTestWindow(app.process().pid);
   const page = await app.firstWindow();
   page.setDefaultTimeout(10000);
   page.on("pageerror", (error) => errors.push(error.message));

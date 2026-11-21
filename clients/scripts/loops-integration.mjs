@@ -15,6 +15,7 @@
 // `TWR_LOOPS_WINDOW=<width>x<height>` runs it in a window of that content size (a CI
 // runner's screen is smaller than the default 1360×900: `1024x674`), set right after
 // launch, before anything is measured.
+import { floatTestWindow } from "./hyprland-window.mjs";
 import { stopFixture } from "./fixture-cleanup.mjs";
 import { _electron as electron } from "@playwright/test";
 import { spawn, execFileSync } from "node:child_process";
@@ -239,6 +240,7 @@ try {
     timeout: 60000,
   });
   applicationProcess = application.process();
+  await floatTestWindow(applicationProcess.pid);
   const page = await application.firstWindow();
   page.on("pageerror", (error) => errors.push(error.message));
   if (windowSize) {
@@ -345,6 +347,7 @@ try {
         window.show();
         window.focus();
       });
+      await floatTestWindow(applicationProcess.pid);
     }
   };
   const notified = (body) =>
