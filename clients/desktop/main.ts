@@ -62,6 +62,7 @@ import {
   windowStateSchema,
   type RestoredWindow,
 } from "./window-state";
+import { SaveBeforeClose } from "./save-before-close";
 
 if (process.platform === "linux" && !app.commandLine.hasSwitch("class"))
   app.commandLine.appendSwitch("class", "tools.twr.desktop");
@@ -101,6 +102,13 @@ let workspace = process.env.TWR_WORKSPACE || "default";
 let binaries: { twr: string; bridge: string; gateway: string };
 let quitting = false;
 let quitRequested = false;
+// The page saves its drafts before the window closes or the app quits.
+const saveBeforeClose = new SaveBeforeClose((id) => {
+  if (!window || window.isDestroyed() || window.webContents.isCrashed())
+    return false;
+  window.webContents.send("twr:app-save-now", id);
+  return true;
+});
 let connectTail: Promise<any> = Promise.resolve();
 let loginEnv: NodeJS.ProcessEnv = { ...process.env };
 let workspaceReady = false;
@@ -943,6 +951,12 @@ function register() {
     if (!session.exited) session.process.kill();
     terminals.delete(key);
   });
+  ipcMain.on("twr:app-saved", (event, id) => {
+    try {
+      trusted(event);
+      saveBeforeClose.saved(z.number().int().parse(id));
+    } catch {}
+  });
   ipcMain.on("twr:terminal-focus", (event, focused) => {
     try {
       trusted(event);
@@ -1101,6 +1115,7 @@ function rememberPlacement(
 }
 async function createWindow(hidden = false) {
   quitting = false;
+  saveBeforeClose.reset();
   applyNativeAppearance();
   const primary = screen.getPrimaryDisplay();
   const placement = restoreWindow(desktopSettings.window, [
@@ -1273,7 +1288,18 @@ async function createWindow(hidden = false) {
         if (quitRequested) app.quit();
         else window.close();
       } else quitRequested = false;
+      return;
     }
+    // The drafts save a moment after they change: the page saves them now, then the
+    // window closes (or the app quits) once more.
+    if (
+      !saveBeforeClose.close(() => {
+        if (window.isDestroyed()) return;
+        if (quitRequested) app.quit();
+        else window.close();
+      })
+    )
+      event.preventDefault();
   });
   window.on("closed", () => {
     services?.closed();
@@ -1327,7 +1353,9 @@ else {
           cancelQuit: () => {
             quitting = false;
             quitRequested = false;
+            saveBeforeClose.reset();
           },
+          saveBeforeClosing: () => saveBeforeClose.beforeClosing(),
           activeTerminals: () =>
             [...terminals.values()].filter((t) => !t.exited).length,
           facts: () => ({

@@ -106,7 +106,7 @@ An ACP agent takes twr's modes and its own mode ids, such as Gemini CLI's `autoE
 
 ## Models and reasoning effort
 
-A thread's model is `--model`, else `[threads] model`, else the runtime's default; its reasoning effort is `--effort`, else the runtime's default. `twr model <thread> [MODEL] [--effort E]` changes either later, or ask the orchestrator; see [usage.md](usage.md#change-a-threads-model-and-effort). `twr model <thread> --runtime R` moves a thread to another runtime: the thread keeps its worktree and branch, and its next turn starts a new session of the new runtime with a handoff of what the previous one did, or, back on a runtime it left a session of earlier, resumes that session ([Moving a thread back](#moving-a-thread-back)). How each runtime gets them, as checked on 2026-10-03:
+A thread's model is `--model`, else `[threads] model`, else the runtime's default; its reasoning effort is `--effort`, else the runtime's default. `twr model <thread> [MODEL] [--effort E]` changes either later, the orchestrator's too (`twr model orch`, on its session), or ask the orchestrator; see [usage.md](usage.md#change-a-threads-model-and-effort). `twr model <thread> --runtime R` moves a thread to another runtime: the thread keeps its worktree and branch, and its next turn starts a new session of the new runtime with a handoff of what the previous one did, or, back on a runtime it left a session of earlier, resumes that session ([Moving a thread back](#moving-a-thread-back)). How each runtime gets them, as checked on 2026-10-03:
 
 | runtime | model | effort | efforts | back to `default` once the thread has a session |
 |---|---|---|---|---|

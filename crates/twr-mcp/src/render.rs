@@ -1462,9 +1462,48 @@ pub fn loop_settings(s: &Value, kind: &str) -> String {
     out.join(" · ")
 }
 
+/// What a setup card (or a loop request) asks for, as `other` (or the request) gives it:
+/// `a single review pass`, `a review loop over last 2`, `an implementation loop`.
+fn card_work(kind: &str, once: bool, scope: Option<&str>) -> String {
+    let what = match (kind, once) {
+        ("implement", _) => "an implementation loop",
+        (_, true) => "a single review pass",
+        _ => "a review loop",
+    };
+    match scope {
+        Some(s) => format!("{what} over {s}"),
+        None => what.to_string(),
+    }
+}
+
 /// What the orchestrator tells the user when a loop it asked for on thread `name` waits for
-/// the setup card (`why`, `existing`: the card was already open).
-fn setup_words(name: &str, why: &str, existing: bool) -> String {
+/// the setup card (`why`, `existing`: the card was already open; `other`: what that card
+/// starts, when it is other work than this request's).
+fn setup_words(name: &str, why: &str, existing: bool, other: Option<&Value>) -> String {
+    if let Some(o) = other.filter(|o| o.is_object()) {
+        let work = card_work(
+            str_of(o, "kind"),
+            o["once"].as_bool() == Some(true),
+            o["scope"].as_str(),
+        );
+        // The task as the user reads it: its files by name, never their paths.
+        let task = o["task"]
+            .as_str()
+            .map(|t| {
+                let (text, files) = twr_core::upload::split_attachments(t);
+                let mut t = one_line_cut(&text, 200).0;
+                if !files.is_empty() {
+                    t.push_str(&format!(", with {}", files.join(", ")));
+                }
+                format!(" (task: {t})")
+            })
+            .unwrap_or_default();
+        return format!(
+            "{name} already has a setup card waiting for you, for {work}{task}, not what I just \
+             asked for: answering Start on it starts that. To run what I asked for instead, \
+             cancel that card and tell me, and I'll ask again."
+        );
+    }
     if existing {
         return format!(
             "{name}'s loop setup card is already waiting for you: the loop starts once you \
@@ -1507,6 +1546,9 @@ pub fn loop_request(r: &Value, name: &str) -> Value {
             if let Some(p) = r.get("settings_of").filter(|p| p.is_string()) {
                 out["settings_of"] = p.clone();
             }
+            if l.get("once").and_then(Value::as_bool) == Some(true) {
+                out["once"] = Value::Bool(true);
+            }
             out
         }
         "needs_setup" => {
@@ -1515,10 +1557,13 @@ pub fn loop_request(r: &Value, name: &str) -> Value {
                 "status": "needs_setup",
                 "attn_id": r["attn_id"],
                 "why": r["why"],
-                "tell_user": setup_words(name, str_of(r, "why"), existing),
+                "tell_user": setup_words(name, str_of(r, "why"), existing, r.get("other")),
             });
             if existing {
                 out["existing"] = Value::Bool(true);
+            }
+            if let Some(o) = r.get("other").filter(|o| o.is_object()) {
+                out["other"] = o.clone();
             }
             out
         }
@@ -1606,8 +1651,11 @@ const LOOP_ROUNDS: usize = 30;
 pub fn loop_state(r: &Value) -> String {
     let name = str_of(r, "thread_name");
     let kind = str_of(r, "kind");
+    let once = r["started"].get("once").and_then(Value::as_bool) == Some(true);
     let words_of_kind = if kind == "implement" {
         "implementation loop"
+    } else if once {
+        "single review pass"
     } else {
         "review loop"
     };
@@ -2598,5 +2646,31 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("export's loop setup card is already waiting for you"));
+        // A card for other work than the request's: what it starts, its files by name.
+        let r = loop_request(
+            &json!({"status": "needs_setup", "attn_id": "A1", "why": "first_run",
+                    "existing": true,
+                    "other": {"kind": "review", "once": false, "scope": "branch", "task": null}}),
+            "api",
+        );
+        assert_eq!(r["other"]["once"], false);
+        assert_eq!(
+            r["tell_user"],
+            "api already has a setup card waiting for you, for a review loop over branch, not \
+             what I just asked for: answering Start on it starts that. To run what I asked for \
+             instead, cancel that card and tell me, and I'll ask again."
+        );
+        let r = loop_request(
+            &json!({"status": "needs_setup", "attn_id": "A1", "why": "asked", "existing": true,
+                    "other": {"kind": "implement", "once": false, "scope": null,
+                              "task": "add CSV export\nUploaded file: spec.md\n/w/.twr-uploads/u1/spec.md"}}),
+            "api",
+        );
+        let words = r["tell_user"].as_str().unwrap();
+        assert!(
+            words.contains("for an implementation loop (task: add CSV export, with spec.md), not")
+                && !words.contains(".twr-uploads"),
+            "{words}"
+        );
     }
 }

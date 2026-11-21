@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   OfflineJournal,
   parseOffline,
@@ -6,9 +6,16 @@ import {
   forgetOfflineHost,
   offlineJournal,
   appendDraft,
+  appendMessage,
+  isCommandDraft,
+  restoredOf,
+  isShellDraft,
+  isSlashDraft,
+  messageText,
   recordSize,
 } from "../shared/offline";
 import { MessageReceipts } from "../desktop/message-receipts";
+import { withAttachments } from "../shared/attachmentText";
 import type { DesktopAPI } from "../shared/types";
 
 function storage() {
@@ -146,7 +153,7 @@ describe("encrypted offline recovery", () => {
     expect(after.historyError).toBe("");
     expect(after.snapshot.outbox).toHaveLength(1);
   });
-  it("preserves concurrent typing and escaped draft syntax on pending replies", async () => {
+  it("keeps concurrent typing and the message's own text on pending replies", async () => {
     const disk = storage();
     const journal = new OfflineJournal(
       {
@@ -163,10 +170,54 @@ describe("encrypted offline recovery", () => {
     );
     await journal.drafts({ "work:orchestrator": "new typing" });
     const result = await journal.deliver(message);
+    // The draft's `//` kept `/literal` a message at the start of the box; after other
+    // text the message goes as it is, so Send sends `/literal`, not `//literal`.
     const merged = appendDraft("new typing", result.restored_draft.text);
-    expect(merged).toBe("new typing\n\n//literal");
+    expect(merged).toBe("new typing\n\n/literal");
     expect(journal.snapshot.drafts["work:orchestrator"]).toBe(merged);
     expect(appendDraft(merged, result.restored_draft.text)).toBe(merged);
+  });
+  it("turns a command draft into text when a message is added after it", () => {
+    // Send would run `/usage` (or the `!` line) and clear the box, text added after it too.
+    expect(appendDraft("/usage", "taken back")).toBe("//usage\n\ntaken back");
+    expect(appendDraft("!ls", "taken back")).toBe("\\!ls\n\ntaken back");
+    expect(appendMessage("/usage", "/literal")).toBe("//usage\n\n/literal");
+    // A draft that already sends as a message, or plain text, is kept as it is.
+    expect(appendDraft("//usage", "x")).toBe("//usage\n\nx");
+    expect(appendDraft("\\!ls", "x")).toBe("\\!ls\n\nx");
+    expect(appendDraft("hello", "x")).toBe("hello\n\nx");
+    expect(isCommandDraft("/usage")).toBe(true);
+    expect(isCommandDraft("//usage")).toBe(false);
+  });
+  it("reads a draft's kind as Send does: a command, a shell line, or a message", () => {
+    expect(isSlashDraft("/usage")).toBe(true);
+    expect(isSlashDraft("//usage")).toBe(false);
+    expect(isShellDraft("!ls")).toBe(true);
+    expect(isShellDraft("!!ls")).toBe(true);
+    expect(isShellDraft("!!!wow")).toBe(false);
+    expect(isShellDraft("\\!ls")).toBe(false);
+    // Only a command or a shell line is one; every escaped message is a message.
+    for (const draft of ["/usage", "!ls", "!!ls"])
+      expect(isCommandDraft(draft)).toBe(true);
+    for (const draft of ["//usage", "\\!ls", "!!!wow", "hello", ""])
+      expect(isCommandDraft(draft)).toBe(false);
+  });
+  it("adds a draft after other text as the message it sends", () => {
+    // Send decodes escapes only at the start of the box: kept after other text, the
+    // saved `\!important` would send its backslash.
+    expect(appendDraft("typed", "\\!important")).toBe("typed\n\n!important");
+    expect(appendDraft("typed", "//usage")).toBe("typed\n\n/usage");
+    expect(appendDraft("typed", "\\\\!x")).toBe("typed\n\n\\!x");
+    // Alone it stays the draft that sends that message.
+    expect(appendDraft("", "\\!important")).toBe("\\!important");
+    // Added twice, it is there once.
+    const once = appendDraft("typed", "\\!important");
+    expect(appendDraft(once, "\\!important")).toBe(once);
+    // A message as sent goes as it is after text, and escaped at the start, every one.
+    for (const message of ["!x", "\\!x", "/x", "//x", "\\x", "plain"]) {
+      expect(appendMessage("typed", message)).toBe("typed\n\n" + message);
+      expect(messageText(appendMessage(undefined, message))).toBe(message);
+    }
   });
   it("moves a queued message to a draft before it can be edited and resent", async () => {
     const disk = storage();
@@ -190,6 +241,157 @@ describe("encrypted offline recovery", () => {
     expect(journal.snapshot.drafts["work:worker"]).toBe("edit me");
     await expect(journal.deliver(message)).rejects.toThrow("removed");
     expect(calls).toBe(0);
+  });
+  it("saves a draft's files beside its text, and loads a journal saved without them", async () => {
+    const disk = storage();
+    const host = disk as unknown as DesktopAPI;
+    // A journal an older app saved: version 1, no files.
+    disk.values.set(
+      "offline-pending:old-files",
+      JSON.stringify({
+        version: 1,
+        drafts: { "work:orchestrator": "kept" },
+        workspaces: {},
+        outbox: [],
+      }),
+    );
+    const old = new OfflineJournal(host, "old-files");
+    await old.load();
+    expect(old.snapshot.drafts).toEqual({ "work:orchestrator": "kept" });
+    expect(old.snapshot.draftFiles).toEqual({});
+    const files = {
+      "work:w1": [{ name: "a.txt", path: "/w/.twr-uploads/q/a.txt" }],
+    };
+    await old.drafts({ "work:orchestrator": "" }, old.epoch, {}, files);
+    const reopened = new OfflineJournal(host, "old-files");
+    await reopened.load();
+    expect(reopened.snapshot.draftFiles).toEqual(files);
+    // Left out, the saved files stay; damaged entries are dropped on load.
+    await reopened.drafts({ "work:orchestrator": "typing" });
+    expect(reopened.snapshot.draftFiles).toEqual(files);
+    expect(
+      parseOffline(
+        JSON.stringify({
+          version: 1,
+          drafts: {},
+          workspaces: {},
+          outbox: [],
+          draftFiles: { a: [{ name: 1, path: "/x" }, { name: "b" }], b: "x" },
+        }),
+      ).draftFiles,
+    ).toEqual({});
+  });
+  it("moves a message's files back beside its draft, and clears them when one is sent", async () => {
+    const disk = storage();
+    const journal = new OfflineJournal(
+      { ...disk, sendMessage: async () => ({}) } as unknown as DesktopAPI,
+      "move-files",
+    );
+    const message = await journal.enqueue(
+      "work",
+      "thread.send",
+      {
+        thread: "w1",
+        prompt: "See attached\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
+      },
+      "See attached\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
+    );
+    await journal.moveToDraft(message.id);
+    expect(journal.snapshot.drafts["work:w1"]).toBe("See attached");
+    expect(journal.snapshot.draftFiles).toEqual({
+      "work:w1": [{ name: "a.txt", path: "/w/.twr-uploads/q/a.txt" }],
+    });
+    await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "again\nUploaded file: a.txt\n/w/.twr-uploads/q/a.txt",
+    });
+    expect(journal.snapshot.drafts["work:w1"]).toBe("");
+    expect(journal.snapshot.draftFiles).toEqual({});
+  });
+  it("moves a saved literal message into a typed draft as the message it sends", async () => {
+    // Saved as `\!important` (so it sent `!important`, not a shell line), with a file; moved
+    // after typed text, it must still send `!important`, not its escape.
+    const disk = storage();
+    const journal = new OfflineJournal(
+      { ...disk, sendMessage: async () => ({}) } as unknown as DesktopAPI,
+      "move-literal",
+    );
+    const prompt = withAttachments("!important", [
+      { name: "a.txt", path: "/w/.twr-uploads/q/a.txt" },
+    ]);
+    const message = await journal.enqueue(
+      "work",
+      "thread.send",
+      { thread: "w1", prompt },
+      "\\" + prompt,
+    );
+    await journal.drafts({ "work:w1": "another line" });
+    await journal.moveToDraft(message.id);
+    expect(journal.snapshot.drafts["work:w1"]).toBe(
+      "another line\n\n!important",
+    );
+    expect(journal.snapshot.draftFiles).toEqual({
+      "work:w1": [{ name: "a.txt", path: "/w/.twr-uploads/q/a.txt" }],
+    });
+  });
+  it("keeps every file a message moved back puts on its draft, over a restart", async () => {
+    const disk = storage();
+    const host = {
+      ...disk,
+      sendMessage: async () => ({}),
+    } as unknown as DesktopAPI;
+    const journal = new OfflineJournal(host, "many-files");
+    const of = (prefix: string) =>
+      Array.from({ length: 8 }, (_, i) => ({
+        name: `${prefix}${i}.txt`,
+        path: `/w/.twr-uploads/${i}/${prefix}${i}.txt`,
+      }));
+    const queued = withAttachments("queued", of("q"));
+    const message = await journal.enqueue(
+      "work",
+      "thread.send",
+      { thread: "w1", prompt: queued },
+      queued,
+    );
+    // Eight more files were attached meanwhile: the box's limit for new ones.
+    await journal.drafts({}, journal.epoch, {}, { "work:w1": of("box") });
+    await journal.moveToDraft(message.id);
+    expect(journal.snapshot.outbox).toEqual([]);
+    expect(journal.snapshot.draftFiles!["work:w1"]).toHaveLength(16);
+    const reopened = new OfflineJournal(host, "many-files");
+    await reopened.load();
+    expect(reopened.snapshot.draftFiles).toEqual({
+      "work:w1": [...of("box"), ...of("q")],
+    });
+  });
+  it("takes from the draft only the files the queued message names", async () => {
+    const disk = storage();
+    const journal = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "reserved-files",
+    );
+    const a = { name: "a.txt", path: "/w/.twr-uploads/q/a.txt" };
+    const b = { name: "b.txt", path: "/w/.twr-uploads/q/b.txt" };
+    await journal.drafts(
+      {},
+      journal.epoch,
+      {},
+      { "work:orchestrator": [a, b] },
+    );
+    // A hands-free message holds both: a typed one goes to the outbox with neither.
+    await journal.enqueue("work", "say", { message: "typed" }, "typed");
+    expect(journal.snapshot.draftFiles).toEqual({
+      "work:orchestrator": [a, b],
+    });
+    const one = withAttachments("one", [a]);
+    await journal.enqueue("work", "say", { message: one }, one);
+    expect(journal.snapshot.draftFiles).toEqual({ "work:orchestrator": [b] });
+    const reopened = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "reserved-files",
+    );
+    await reopened.load();
+    expect(reopened.snapshot.draftFiles).toEqual({ "work:orchestrator": [b] });
   });
   it("marks expiry during a session and definite rejections for review", async () => {
     const disk = storage();
@@ -262,6 +464,206 @@ describe("encrypted offline recovery", () => {
     await restored.load();
     expect(restored.snapshot.outbox).toHaveLength(1);
     expect(restored.snapshot.drafts["work:orchestrator"]).toBe("new typing");
+  });
+  it("hands back an earlier message the hub held when a later one fails", async () => {
+    const disk = storage();
+    let calls = 0;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: async () => {
+          calls += 1;
+          if (calls === 1) return { action: "pending" };
+          throw new Error("hub went away");
+        },
+      } as unknown as DesktopAPI,
+      "restored-on-failure",
+    );
+    await journal.load();
+    const first = await journal.enqueue("work", "say", { message: "first" });
+    const second = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "second",
+    });
+    const failed = await journal.deliver(second).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failed).toBeInstanceOf(Error);
+    expect((failed as Error).message).toContain("hub went away");
+    // The first is in the saved drafts, and the error carries it to the message box, or
+    // the box's next save would write over it.
+    expect(journal.snapshot.drafts["work:orchestrator"]).toBe("first");
+    expect(restoredOf(failed)).toEqual([
+      { id: first.id, key: "work:orchestrator", text: "first" },
+    ]);
+    expect(restoredOf(new Error("plain"))).toEqual([]);
+  });
+  it("keeps a message put back through a save from the box until the box takes it", async () => {
+    const disk = storage();
+    let calls = 0;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: async () => {
+          calls += 1;
+          if (calls === 1) return { action: "pending" };
+          return new Promise(() => {}); // the later message's delivery stalls
+        },
+      } as unknown as DesktopAPI,
+      "restored-while-pending",
+    );
+    await journal.load();
+    const first = await journal.enqueue("work", "say", {
+      message: "first\nUploaded file: a.txt\n/w/.twr-uploads/u1/a.txt",
+    });
+    const second = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "second",
+    });
+    void journal.deliver(second);
+    await vi.waitFor(() =>
+      expect(journal.snapshot.drafts["work:orchestrator"]).toBe("first"),
+    );
+    // The app closes: the box, which never heard of it, saves what it holds.
+    await journal.drafts({ "work:orchestrator": "" }, journal.epoch, {}, {});
+    const reopened = new OfflineJournal(
+      disk as unknown as DesktopAPI,
+      "restored-while-pending",
+    );
+    await reopened.load();
+    expect(reopened.snapshot.drafts["work:orchestrator"]).toBe("first");
+    expect(reopened.snapshot.draftFiles?.["work:orchestrator"]).toEqual([
+      { name: "a.txt", path: "/w/.twr-uploads/u1/a.txt" },
+    ]);
+    // Once the box took it, what it saves is what it holds.
+    expect(
+      journal.claim([
+        {
+          id: first.id,
+          key: "work:orchestrator",
+          text: "first\nUploaded file: a.txt\n/w/.twr-uploads/u1/a.txt",
+        },
+      ]),
+    ).toHaveLength(1);
+    await journal.drafts({ "work:orchestrator": "" }, journal.epoch, {}, {});
+    expect(journal.snapshot.drafts["work:orchestrator"]).toBe("");
+  });
+  it("gives a message put back to the box once, whichever delivery brings it", async () => {
+    const disk = storage();
+    let release!: (value: unknown) => void;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      } as unknown as DesktopAPI,
+      "claimed-once",
+    );
+    await journal.load();
+    const held = await journal.enqueue("work", "say", { message: "held" });
+    // The outbox's drain and a send both wait on the same delivery.
+    const a = journal.deliver(held);
+    const b = journal.deliver(held);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    release({ action: "pending" });
+    const [ra, rb] = await Promise.all([a, b]);
+    expect(ra.restored_draft).toEqual(rb.restored_draft);
+    expect(journal.claim([ra.restored_draft])).toEqual([
+      { id: held.id, key: "work:orchestrator", text: "held" },
+    ]);
+    // The second sees it taken: the box never puts it back again.
+    expect(journal.claim([rb.restored_draft])).toEqual([]);
+  });
+  it("gives each caller of an overlapping delivery what its own delivery put back", async () => {
+    const disk = storage();
+    const gates = new Map<string, (value: unknown) => void>();
+    const failC = new Map<string, (error: Error) => void>();
+    const sent: string[] = [];
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        sendMessage: (message: any) => {
+          const text = String(message.params.message || message.params.prompt);
+          sent.push(text);
+          if (text === "a") return Promise.resolve({ action: "pending" });
+          return new Promise((resolve, reject) => {
+            gates.set(text, resolve);
+            failC.set(text, reject);
+          });
+        },
+      } as unknown as DesktopAPI,
+      "overlapping-restores",
+    );
+    await journal.load();
+    const a = await journal.enqueue("work", "say", { message: "a" });
+    const b = await journal.enqueue("work", "say", { message: "b" });
+    const c = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "c",
+    });
+    const settle = (p: Promise<unknown>) =>
+      p.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+    // The first delivers a (held), then waits on b; the second joins then, from b on.
+    const first = settle(journal.deliver(c));
+    await vi.waitFor(() => expect(gates.has("b")).toBe(true));
+    const second = settle(journal.deliver(c));
+    gates.get("b")!({ action: "pending" });
+    await vi.waitFor(() => expect(failC.has("c")).toBe(true));
+    failC.get("c")!(new Error("hub went away"));
+    const [e1, e2] = await Promise.all([first, second]);
+    expect(e1).not.toBe(e2);
+    expect((e1 as Error).message).toBe("hub went away");
+    expect(restoredOf(e1).map((r) => r.id)).toEqual([a.id, b.id]);
+    expect(restoredOf(e2).map((r) => r.id)).toEqual([b.id]);
+    // Between them, each goes in the box once.
+    expect(
+      [...journal.claim(restoredOf(e2)), ...journal.claim(restoredOf(e1))].map(
+        (r) => r.id,
+      ),
+    ).toEqual([b.id, a.id]);
+  });
+  it("gives nothing back from storage since reset", async () => {
+    const disk = storage();
+    let calls = 0;
+    let release!: (value: unknown) => void;
+    const journal = new OfflineJournal(
+      {
+        ...disk,
+        secureDelete: async (key: string) => void disk.values.delete(key),
+        sendMessage: () => {
+          calls += 1;
+          if (calls === 1) return Promise.resolve({ action: "pending" });
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        },
+      } as unknown as DesktopAPI,
+      "claimed-after-reset",
+    );
+    await journal.load();
+    await journal.enqueue("work", "say", { message: "held" });
+    const later = await journal.enqueue("work", "thread.send", {
+      thread: "w1",
+      prompt: "later",
+    });
+    const delivery = journal.deliver(later).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    const resetting = journal.reset();
+    release({ action: "sent" });
+    await resetting;
+    const failed = await delivery;
+    // The failure still names what it had put back, but that storage is gone.
+    expect(restoredOf(failed)).toHaveLength(1);
+    expect(journal.claim(restoredOf(failed))).toEqual([]);
   });
   it("never carries cached permission visibility into saved messages", async () => {
     const disk = storage();

@@ -3012,6 +3012,7 @@ pub(crate) mod tests {
             default: "claude-code".into(),
             model: None,
             switch: false,
+            in_place: false,
             step: None,
         };
         let mut st = in_workspaces("default");

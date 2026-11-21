@@ -347,6 +347,23 @@ mod tests {
     }
 
     #[test]
+    fn an_attachment_path_ending_a_routed_message_is_kept_exactly() {
+        let files = "\nUploaded file: notes.txt\n/w/.twr-uploads/1/notes.txt ";
+        let rc = route_ctx(&format!("@api fix it{files}\n"), two(), true);
+        let (_, outcome) = run(&Ladder::standard(), &rc);
+        assert_eq!(outcome, send_to("t1", &format!("fix it{files}")).unwrap());
+        let rc = route_ctx(&format!("new twr: fix it{files}"), two(), true);
+        let (_, outcome) = run(&Ladder::standard(), &rc);
+        assert_eq!(
+            outcome,
+            RouteOutcome::NewThreadRequest {
+                project: "twr".into(),
+                message: format!("fix it{files}"),
+            }
+        );
+    }
+
+    #[test]
     fn unrouted_messages_delegate_or_ask() {
         let rc = route_ctx("deploy the thing", two(), true);
         let (r, outcome) = run(&Ladder::standard(), &rc);

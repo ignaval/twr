@@ -114,13 +114,17 @@ impl fmt::Display for Phase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
-    /// The verification's converging round had no findings.
+    /// The last review round had no findings: the verification's converging round (or the
+    /// ladder's last, when the verification was skipped), or a single pass's one round.
     #[default]
     Clean,
     /// The verification's converging round had findings, every one a duplicate of the ledger.
     LedgerFixedPoint,
     /// The verification's cap ran out with findings still arriving.
     CapExpired,
+    /// A single pass ([`crate::event::LoopStarted::once`]) had findings and the thread triaged
+    /// them (fixed or dismissed): no review round after it checked the fixes.
+    Triaged,
     /// Someone stopped it (or its thread was stopped, parked or deleted).
     Stopped,
     /// The hub could not go on (`loop.ended` `reason` says why).
@@ -134,6 +138,7 @@ impl Outcome {
             Outcome::Clean => "clean",
             Outcome::LedgerFixedPoint => "ledger_fixed_point",
             Outcome::CapExpired => "cap_expired",
+            Outcome::Triaged => "triaged",
             Outcome::Stopped => "stopped",
             Outcome::Failed => "failed",
         }
@@ -235,7 +240,8 @@ pub enum WaitingOn {
 /// `high · plan`, `high · plan check` and `high · implementing`. With `sweep = "runs"` the
 /// sweep reads `high · sweep · rules` (the rules turn), `high · sweep · auditing 2/5` (the
 /// rules whose audit run ended, of all) and `high · sweep · verifying` (the thread's turn
-/// with the reports).
+/// with the reports). A single pass reads `high · single pass · scope`, `high · single pass ·
+/// x1` and `high · single pass · report` (short: `pass · scope`, `pass x1`).
 pub fn line(l: &LoopView) -> String {
     let [full, ..] = line_forms(l);
     full
@@ -285,6 +291,18 @@ pub fn line_forms(l: &LoopView) -> [String; 3] {
             ("sweep · verifying".into(), "sweep".into())
         }
         p => (p.as_str().to_string(), p.as_str().to_string()),
+    };
+    // A single pass says so before where it is: `single pass · x1`, short `pass x1`.
+    let (place, short_place) = if l.once {
+        match (l.phase, &l.round) {
+            (Phase::Ladder, Some(r)) => (format!("single pass · {r}"), format!("pass {r}")),
+            _ => (
+                format!("single pass · {place}"),
+                format!("pass · {short_place}"),
+            ),
+        }
+    } else {
+        (place, short_place)
     };
     let (ledger, short_ledger) = if l.ledger > 0 {
         (

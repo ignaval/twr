@@ -336,7 +336,8 @@ fn the_popups_implementation_loop_fills_the_box() {
         .iter()
         .position(|k| *k == ActionKind::LoopStart)
         .unwrap();
-    assert_eq!(rows[start + 1], ActionKind::LoopImplement);
+    assert_eq!(rows[start + 1], ActionKind::LoopOnce);
+    assert_eq!(rows[start + 2], ActionKind::LoopImplement);
     let screen = text(&draw(&mut st, 160, 40));
     assert!(screen.contains(" implementation loop…"), "{screen}");
     st.handle_key(key(KeyCode::Esc));
@@ -1058,6 +1059,7 @@ fn a_loop_that_committed_some_repositories_says_both() {
         commits: vec![commit("/w/api", "abc1234def")],
         commit_problem: Some("/w/web: 1 path is uncommitted beyond the baseline: a.rs".into()),
         requested_by: Default::default(),
+        once: false,
     };
     assert_eq!(
         crate::loops::commit_words(&last, true).as_deref(),

@@ -482,12 +482,15 @@ try {
     ),
   });
   const attachment = page
-    .locator(".attachment-item")
+    .locator(".composer-attachments li")
     .filter({ hasText: "preview.txt" });
-  await attachment.getByText("Ready to send", { exact: false }).waitFor();
-  await attachment.getByText("Preview text", { exact: false }).click();
+  await attachment.and(page.locator('[data-phase="ready"]')).waitFor();
+  await attachment
+    .getByRole("button", { name: "Show preview.txt", exact: true })
+    .click();
+  const preview = page.getByRole("dialog", { name: "preview.txt" });
   assert(
-    (await attachment.locator("pre").innerText()).includes(
+    (await preview.locator("pre").innerText()).includes(
       "<script>window.unsafePreview=true</script>",
     ),
   );
@@ -496,8 +499,12 @@ try {
     undefined,
     "Text previews must remain inert",
   );
+  await preview.getByRole("button", { name: "Done", exact: true }).click();
+  // The file shows in the message box, never as a path, and never in the draft.
+  assert.equal(await directComposer.inputValue(), "");
   assert(
-    (await directComposer.inputValue()).includes("Uploaded file: preview.txt"),
+    !(await page.locator("form.composer").innerText()).includes(".twr-uploads"),
+    "The message box must not show an attachment's path",
   );
   assert.equal(
     await page.locator(".block-assistant").count(),
@@ -505,9 +512,9 @@ try {
     "Selecting a file must not send a prompt",
   );
   await attachment
-    .getByRole("button", { name: "Dismiss", exact: true })
+    .getByRole("button", { name: "Remove preview.txt", exact: true })
     .click();
-  await directComposer.fill("");
+  await attachment.waitFor({ state: "detached" });
   console.log(
     "PASS: packaged attachment preview is inert, progresses to ready, and waits for explicit send",
   );

@@ -3,6 +3,7 @@ import { ArrowDown, ArrowUp, Search } from "lucide-react";
 import type { Attention, HubEvent, InboxSource, Json, Thread } from "./types";
 import { Dialog, Empty, Markdown, Spinner } from "./ui";
 import { requestLine } from "./loops";
+import { namedText } from "./attachmentText";
 import { errorMessage } from "./errors";
 import { announce, scrollBehavior } from "./a11y";
 import "./inbox-search.css";
@@ -311,12 +312,20 @@ interface SearchPage {
 }
 export function eventText(event: HubEvent): string {
   const data = event.data || {};
+  // A message's files show by name (`namedText`), never their paths.
   if (event.kind === "conversation.update")
-    return [data.user_message, data.text].filter(Boolean).join("\n\n");
+    return [
+      data.user_message && namedText(String(data.user_message)),
+      data.text,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   if (event.kind === "agent.tool_call")
     return [data.tool, data.input_summary].filter(Boolean).join("\n\n");
   if (event.kind === "agent.tool_result")
     return data.output_summary || JSON.stringify(data, null, 2);
+  if (data.user_message) return namedText(String(data.user_message));
+  if (!data.text && data.prompt) return namedText(String(data.prompt));
   return (
     data.user_message ||
     data.text ||

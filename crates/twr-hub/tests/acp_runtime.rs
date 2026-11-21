@@ -670,3 +670,27 @@ async fn a_thread_moves_between_two_acp_presets() {
 fn kinds(evs: &[Event]) -> Vec<&str> {
     evs.iter().map(|e| e.kind()).collect()
 }
+
+/// `thread.set_model` naming the runtime an ACP thread runs, `acp` (as the model picker names
+/// every agent), with a model: no move, the model changes on the same agent.
+#[tokio::test]
+async fn a_bare_acp_runtime_on_an_acp_thread_is_no_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(opts(dir.path())).await.unwrap();
+    let t = hub
+        .new_thread(new(dir.path(), "stub", "stays"), "test")
+        .await
+        .unwrap();
+    let id = t["id"].as_str().unwrap().to_string();
+    let command = hub.thread_view(&id).unwrap().acp_command;
+    let r = hub
+        .set_runtime_model(&id, Some("acp"), Some("m2"), None, &Caller::user("test"))
+        .unwrap();
+    assert_eq!(
+        (&r["runtime"], &r["runtime_changed"], &r["model"]),
+        (&json!("acp"), &json!(false), &json!("m2")),
+        "{r}"
+    );
+    assert_eq!(hub.thread_view(&id).unwrap().acp_command, command);
+    hub.shutdown().await;
+}

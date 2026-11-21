@@ -3,7 +3,8 @@
 // as you type: the drafts live in a store outside React state (`Drafts`), and only this
 // component subscribes to the one on screen, so a keystroke re-renders the box, not the
 // whole app. App reads the drafts when it acts on them (sending, slash commands) and
-// writes them when something else fills the box (take back, uploads, the outbox).
+// writes them when something else fills the box (take back, the outbox). Attached files
+// show inside the box (ComposerAttachments) and join the text only as it is sent.
 import {
   useEffect,
   useLayoutEffect,
@@ -11,11 +12,19 @@ import {
   useState,
   useSyncExternalStore,
   type FormEvent,
+  type ReactNode,
   type RefObject,
 } from "react";
 import { ArrowUp, ChevronDown, Paperclip, X } from "lucide-react";
-import { appendDraft, type OfflineJournal } from "./offline";
-import type { UploadController } from "./uploads";
+import {
+  appendDraft,
+  isCommandDraft,
+  isShellDraft,
+  isSlashDraft,
+  type OfflineJournal,
+} from "./offline";
+import { unfinished, type UploadController } from "./uploads";
+import { ComposerAttachments, attachmentWait } from "./ComposerAttachments";
 import { takesSuggestion, type useAssistance } from "./assistance";
 import { VoiceControl } from "./VoiceControl";
 import { Spinner } from "./ui";
@@ -185,6 +194,7 @@ export function Composer({
   spokenLately,
   onDismissKeyboard,
   fail,
+  modelPicker,
 }: {
   drafts: Drafts;
   /** The destination on screen: its draft is the box's text. */
@@ -223,8 +233,27 @@ export function Composer({
   spokenLately: () => string[];
   onDismissKeyboard?: () => void;
   fail: (error: unknown) => void;
+  /** The model and effort picker (`ModelPicker`), at the footer row's right. */
+  modelPicker?: ReactNode;
 }) {
   const draft = useDraft(drafts, draftKey);
+  // The conversation's attached files: a message carries the uploaded ones (not a
+  // command or a shell line), and waits while any is still on its way. They are keyed as
+  // the draft is: the orchestrator's stay with it when its thread changes.
+  const conversation = destination || "orchestrator";
+  const attached = useSyncExternalStore(
+    uploads.subscribe,
+    uploads.getSnapshot,
+  ).filter(
+    (item) =>
+      !!target &&
+      item.conversation === conversation &&
+      item.workspace === workspace,
+  );
+  const carriesFiles = !isCommandDraft(draft);
+  const filesWait = carriesFiles && attached.some(unfinished);
+  const filesReady =
+    carriesFiles && attached.some((item) => item.phase === "ready");
   const [voiceStatusContainer, setVoiceStatusContainer] =
     useState<HTMLDivElement | null>(null);
   const spokenDraft = useSyncExternalStore(drafts.subscribe, () =>
@@ -278,12 +307,11 @@ export function Composer({
         .filter((t) => t.name.startsWith(draft.match(/@([\w-]*)$/)?.[1] || ""))
         .slice(0, 6)
     : [];
-  const slashMatches =
-    draft.startsWith("/") && !draft.startsWith("//")
-      ? slashCommands
-          .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
-          .slice(0, 6)
-      : [];
+  const slashMatches = isSlashDraft(draft)
+    ? slashCommands
+        .filter((c) => c.id.startsWith(draft.slice(1).split(/\s/)[0]))
+        .slice(0, 6)
+    : [];
   return (
     <>
       {!draft &&
@@ -296,7 +324,7 @@ export function Composer({
           </button>
         )}
       <form
-        className={`composer ${draft.startsWith("!") && !draft.startsWith("!!!") ? "shell-mode" : ""}`}
+        className={`composer ${isShellDraft(draft) ? "shell-mode" : ""}`}
         aria-label="Message composer"
         onSubmit={(event) => void send(event)}
       >
@@ -305,7 +333,7 @@ export function Composer({
             <span className="destination-dot" aria-hidden="true" />
             To:{" "}
             <b>
-              {draft.startsWith("!") && !draft.startsWith("!!!")
+              {isShellDraft(draft)
                 ? "Shell · " +
                   (destination
                     ? target?.name
@@ -345,6 +373,11 @@ export function Composer({
             </button>
           )}
         </div>
+        <ComposerAttachments
+          controller={uploads}
+          conversation={target ? conversation : undefined}
+          workspace={workspace}
+        />
         <textarea
           ref={input}
           aria-label={
@@ -497,7 +530,7 @@ export function Composer({
                   event.target.value = "";
                   if (target) {
                     try {
-                      uploads.add(files, target.id, workspace);
+                      uploads.add(files, target.id, workspace, conversation);
                     } catch (error) {
                       fail(error);
                     }
@@ -525,6 +558,7 @@ export function Composer({
               </small>
             )}
           </span>
+          {modelPicker}
           <div className="composer-actions">
             <VoiceControl
               context={draftKey + ":" + target?.id}
@@ -567,22 +601,23 @@ export function Composer({
               type="submit"
               disabled={
                 !operate ||
-                !draft.trim() ||
+                (!draft.trim() && !filesReady) ||
+                filesWait ||
                 (!connected &&
-                  (spokenDraft ||
-                    !journal ||
-                    draft.startsWith("/") ||
-                    draft.startsWith("!"))) ||
-                (!target && !draft.startsWith("/")) ||
+                  (spokenDraft || !journal || isCommandDraft(draft))) ||
+                (!target && !isSlashDraft(draft)) ||
                 sending
               }
               aria-label={connected ? "Send message" : "Save message for later"}
+              aria-describedby={filesWait ? "twr-attachment-wait" : undefined}
               title={
-                !connected && spokenDraft
-                  ? "Reconnect to send dictated text"
-                  : connected
-                    ? "Send message"
-                    : "Save on this device until the hub reconnects"
+                filesWait
+                  ? attachmentWait(attached)
+                  : !connected && spokenDraft
+                    ? "Reconnect to send dictated text"
+                    : connected
+                      ? "Send message"
+                      : "Save on this device until the hub reconnects"
               }
             >
               {sending ? <Spinner /> : <ArrowUp size={18} />}

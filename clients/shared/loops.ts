@@ -2,6 +2,8 @@
  * inspector's Loops section, the loop chip, the Review loop offer, Send as implementation
  * loop, the New thread form's switch, the setup card and the settings editor. Nothing here decides what the hub decides: who may start a loop,
  * on which settings, whether settings hold, the loop line. The hub says; this reads it. */
+import { trimMessage } from "./attachmentText";
+import { isShellDraft, isSlashDraft, messageText } from "./offline";
 import type { Attention, Json, Thread } from "./types";
 
 /** `runtime[:account]/model[:effort]`: a named implementer (twr-core `ModelChoice`). */
@@ -168,6 +170,8 @@ export interface LoopState {
   wait?: { step?: string; [key: string]: Json };
   /** `sweep = "runs"`: the sweep's rules and their audit runs, in order. */
   audits?: AuditView[];
+  /** A single pass (`loop.started.once`): one review, its triage, the report. */
+  once?: boolean;
   [key: string]: Json;
 }
 /** The last loop that ended on a thread (`thread.last_loop`). */
@@ -182,6 +186,8 @@ export interface LastLoop {
    * each starting with the repository's path, joined by `; `. A loop can have both: some
    * repositories committed, the others not. */
   commit_problem?: string | null;
+  /** It was a single pass. */
+  once?: boolean;
 }
 /** One check of a loop's commit (`loop.get`'s `commit_checks`, twr-core `LoopCommitChecked`). */
 export interface CommitCheck {
@@ -463,10 +469,21 @@ export function startedWords(
   return `${s.profile} · implementer ${implementer} · reviewer ${s.reviewer.runtime} ${s.reviewer.model} (${from})`;
 }
 
-/** The phases a loop of `kind` goes through, in order (twr-core `Phase`). */
-export function phasesOf(kind: string): string[] {
-  return kind === "implement"
-    ? ["plan", "plan_check", "implement", "ladder", "sweep", "verify", "report"]
+/** The phases a loop of `kind` goes through, in order (twr-core `Phase`); a single pass
+ * (`once`) has no sweep and no verification. */
+export function phasesOf(kind: string, once?: boolean): string[] {
+  if (kind === "implement")
+    return [
+      "plan",
+      "plan_check",
+      "implement",
+      "ladder",
+      "sweep",
+      "verify",
+      "report",
+    ];
+  return once
+    ? ["scope", "ladder", "report"]
     : ["scope", "ladder", "sweep", "verify", "report"];
 }
 export const phaseWords = (phase: string) => phase.replace(/_/g, " ");
@@ -590,6 +607,8 @@ export function outcomeWords(outcome: string | null | undefined) {
       return "only known findings left";
     case "cap_expired":
       return "verification cap reached with findings left";
+    case "triaged":
+      return "findings triaged";
     case "stopped":
       return "stopped";
     case "failed":
@@ -690,9 +709,13 @@ export function sizeWords(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-/** `review loop` or `implementation loop`. */
-export const kindWords = (kind: string | undefined) =>
-  kind === "implement" ? "implementation loop" : "review loop";
+/** `review loop` or `implementation loop` (`single review pass` for one that is `once`). */
+export const kindWords = (kind: string | undefined, once?: boolean) =>
+  kind === "implement"
+    ? "implementation loop"
+    : once
+      ? "single review pass"
+      : "review loop";
 
 /** Rounds a loop ran, as a notification counts them: the plan check's `p1` is not one. */
 export const countedRounds = (rounds: { id: string }[] | undefined) =>
@@ -707,7 +730,7 @@ export function endedWords(last: LastLoop, rounds?: number): string {
   const how = outcomeWords(last.outcome);
   const commit = commitWords(last);
   return [
-    `${kindWords(last.kind)}${how ? ` ${how}` : " ended"}${
+    `${kindWords(last.kind, last.once)}${how ? ` ${how}` : " ended"}${
       rounds && rounds > 0
         ? ` after ${rounds} round${rounds === 1 ? "" : "s"}`
         : ""
@@ -745,11 +768,11 @@ export function endedLoops(
     const id = last?.id || "";
     next.set(t.id, id);
     if (!known || !known.has(t.id) || !id || known.get(t.id) === id) continue;
-    const kind = last!.kind === "implement" ? "implementation" : "review";
+    const kind = kindWords(last!.kind, last!.once);
     const how = outcomeWords(last!.outcome);
     const commit = commitWords(last!);
     said.push(
-      `${t.name}'s ${kind} loop ended${how ? `: ${how}` : ""}${commit ? `; ${commit}` : ""}`,
+      `${t.name}'s ${kind} ended${how ? `: ${how}` : ""}${commit ? `; ${commit}` : ""}`,
     );
   }
   return { said, known: next };
@@ -815,8 +838,13 @@ export function startAccess(
 }
 
 /** A loop that started, as a screen reader hears it and the notice says it. */
-export function startedNotice(name: string, kind: string, line?: string) {
-  return `${name} started ${kind === "implement" ? "an implementation loop" : "a review loop"}${
+export function startedNotice(
+  name: string,
+  kind: string,
+  line?: string,
+  once?: boolean,
+) {
+  return `${name} started ${kind === "implement" ? "an implementation loop" : once ? "a single review pass" : "a review loop"}${
     line ? `: ${line}` : ""
   }.`;
 }
@@ -825,13 +853,19 @@ export function startedNotice(name: string, kind: string, line?: string) {
  * Whether **Skip to verify** can be pressed, and why not: an implementation loop has built
  * nothing to verify before its ladder (the hub refuses it in `plan`, `plan_check` and
  * `implement`); a skip already asked for waits for the round's end. `show: false`: the
- * phase is past the ladder, where it means nothing.
+ * phase is past the ladder, or the loop is a single pass, where it means nothing.
  */
-export function skipToVerify(state: { phase: string; skip?: boolean }): {
+export function skipToVerify(state: {
+  phase: string;
+  skip?: boolean;
+  once?: boolean;
+}): {
   show: boolean;
   enabled: boolean;
   why?: string;
 } {
+  // A single pass has no verification to skip to (the hub refuses it).
+  if (state.once) return { show: false, enabled: false };
   if (["plan", "plan_check", "implement"].includes(state.phase))
     return {
       show: true,
@@ -915,6 +949,8 @@ export type LoopControlAction = "pause" | "resume" | "stop" | "skip_to_verify";
 export interface ReviewArgs {
   thread?: string;
   setup?: boolean;
+  /** `--once`: a single pass. */
+  once?: boolean;
   scope?: string;
   profile?: string;
   reviewer?: string;
@@ -934,6 +970,8 @@ export interface ReviewRequest {
   thread: string;
   kind: "review";
   setup?: boolean;
+  /** A single pass: one review run, the thread's triage, the report. */
+  once?: boolean;
   scope?: string;
   overrides?: {
     profile?: string;
@@ -967,6 +1005,7 @@ export function reviewRequest(
     thread,
     kind: "review",
     ...(a.setup ? { setup: true } : {}),
+    ...(a.once ? { once: true } : {}),
     ...(a.scope?.trim() ? { scope: a.scope.trim() } : {}),
     ...(Object.keys(overrides).length ? { overrides } : {}),
   };
@@ -1090,24 +1129,26 @@ export const MAX_TASK_BYTES = 16 * 1024;
 
 /**
  * What **Send as implementation loop** sends for a composer's `draft`: the message is the
- * task, as typed (`//` escapes a leading `/`, as Send does). A command or a shell line is no
- * task. An empty draft asks for what the conversation already settled, and `confirm` says so
- * first: nothing was typed.
+ * task, as typed (`//` escapes a leading `/` and `\!` a leading `!`, as Send does). A
+ * command or a shell line is no task. An empty draft asks for what the conversation already
+ * settled, and `confirm` says so first: nothing was typed. The whitespace around it goes,
+ * except in the path of a file named last (`trimMessage`).
  */
 export function sendAsLoop(draft: string): {
   task?: string;
   confirm: boolean;
 } {
-  const text = draft.startsWith("//") ? draft.slice(1) : draft;
-  if (draft.startsWith("/") && !draft.startsWith("//"))
+  const text = messageText(draft);
+  if (isSlashDraft(draft))
     throw new Error(
       "A command is no task: send it with Send, or write what to build (start it with // to send a leading /).",
     );
-  if (draft.startsWith("!") && !draft.startsWith("!!!"))
+  if (isShellDraft(draft))
     throw new Error(
       "A shell command is no task: send it with Send, or write what to build.",
     );
-  const task = text.trim();
+  // Trimmed as the hub trims it: a file's path that ends the task stays exact.
+  const task = trimMessage(text);
   if (new TextEncoder().encode(task).length > MAX_TASK_BYTES)
     throw new Error(
       "The task is longer than 16 KiB: put the details in a file and name it in the task.",

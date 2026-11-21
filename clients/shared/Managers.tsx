@@ -38,6 +38,7 @@ import {
   ResourceTable,
 } from "./ui";
 import { useEditorSessions } from "./editors";
+import { UsagePage } from "./UsageLimits";
 import { setTerminalScreenReader, terminalScreenReader } from "./a11y";
 export type Section =
   | "chat"
@@ -120,6 +121,8 @@ export function Manager(props: ManagerProps) {
   const { section, rpc, action, cliAction, fail } = props;
   const info = meta[section];
   const [data, setData] = useState<Json>();
+  // When `data` was read: the Usage page reckons its clock from it.
+  const [fetchedAt, setFetchedAt] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [detail, setDetail] = useState<Json>();
@@ -129,6 +132,7 @@ export function Manager(props: ManagerProps) {
     setError("");
     try {
       setData(await rpc(info.method));
+      setFetchedAt(Date.now());
     } catch (e) {
       setError(errorMessage(e));
     } finally {
@@ -410,51 +414,8 @@ export function Manager(props: ManagerProps) {
         </div>
       )}
       {section === "usage" && data && (
-        <div className="cards">
-          {(data.runtimes || []).map((runtime: Json) => (
-            <article
-              className="resource-card"
-              key={runtime.runtime + ":" + runtime.account}
-            >
-              <div className="card-heading">
-                <h3>{runtime.label || runtime.runtime}</h3>
-                {runtime.stale && <span className="pill">Out of date</span>}
-              </div>
-              <p>
-                {runtime.plan || "Subscription"}
-                {runtime.account ? " · " + runtime.account : ""}
-              </p>
-              {runtime.windows.map((w: Json) => (
-                <div className="usage-window" key={w.window}>
-                  <div>
-                    <span>{w.label}</span>
-                    <b>
-                      {Math.round(
-                        w.remaining_pct ?? Math.max(0, 100 - w.used_pct),
-                      )}
-                      % left
-                    </b>
-                  </div>
-                  <meter
-                    min={0}
-                    max={100}
-                    value={Math.max(0, Math.min(100, w.used_pct))}
-                  />
-                  {w.resets_at && (
-                    <small>
-                      Resets {new Date(w.resets_at).toLocaleString()}
-                    </small>
-                  )}
-                </div>
-              ))}
-            </article>
-          ))}
-          {!data.runtimes?.length && (
-            <p className="muted">
-              Your agents have not reported subscription limits yet. Usage
-              appears after a session reports it.
-            </p>
-          )}
+        <div className="usage-cards">
+          <UsagePage data={data} fetchedAt={fetchedAt} />
         </div>
       )}
       {section === "memory" && data && (

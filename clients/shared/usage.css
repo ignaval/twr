@@ -1,0 +1,225 @@
+/* Usage limits (shared/UsageLimits.tsx): per account, a row per window with the share
+ * left, a pill-shaped bar filled to it with a tick where even spending would be, and when
+ * it resets. Amber at 25% left or less, red at 10% or less, as the TUI's status bar. */
+.usage-limits {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.usage-limits.compact {
+  gap: 12px;
+}
+.usage-account {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.usage-limits.compact .usage-account {
+  gap: 8px;
+}
+.usage-account > header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 4px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.923077rem;
+}
+.usage-account > header > b {
+  color: var(--text);
+  font-weight: 600;
+}
+.usage-age {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 0.846154rem;
+}
+/* Out of date: dimmed, with its age. */
+.usage-account[data-stale] .usage-row {
+  opacity: 0.6;
+}
+.usage-row {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+.usage-row-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.923077rem;
+}
+.usage-row-head > span {
+  color: var(--muted);
+}
+.usage-row-head > b {
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.usage-row[data-level="warn"] .usage-row-head > b {
+  color: var(--warning);
+}
+.usage-row[data-level="low"] .usage-row-head > b {
+  color: var(--danger);
+}
+.usage-bar {
+  position: relative;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--active);
+}
+.usage-limits.compact .usage-bar {
+  height: 6px;
+}
+.usage-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  max-width: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+}
+.usage-row[data-level="warn"] .usage-fill {
+  background: var(--warning);
+}
+.usage-row[data-level="low"] .usage-fill {
+  background: var(--danger);
+}
+/* Even pace: the share of the window's time still to run. */
+.usage-pace {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--text);
+}
+.usage-reset {
+  color: var(--faint);
+  font-size: 0.846154rem;
+}
+.usage-empty,
+.usage-error {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.923077rem;
+  line-height: 1.5;
+}
+.usage-error {
+  color: var(--danger);
+}
+.usage-page-link {
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 0.923077rem;
+}
+.usage-page-link:hover {
+  text-decoration: underline;
+}
+
+/* `/usage`: a dismissible panel above the message box. It gives way before the message box
+ * does: in a short window (a phone with its keyboard open) it shrinks, its rows scrolling
+ * inside it, so Send stays on screen. */
+.usage-panel {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  flex-shrink: 1;
+  min-height: 0;
+  width: calc(100% - 48px);
+  max-width: var(--content-width);
+  max-height: min(320px, 40vh);
+  overflow-y: auto;
+  margin: 0 auto 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.usage-panel:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.usage-panel > header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.usage-panel > header > h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* The header's gauge: the same limits in a popover under the header, at its right edge and
+ * never wider than its column (the conversation column clips what leaves it). Aligned to the
+ * gauge itself, the buttons after it pushed the popover's left edge out of a narrow window. */
+.usage-popover-anchor {
+  display: flex;
+}
+.conversation-heading:has(> .conversation-actions .usage-popover) {
+  position: relative;
+}
+.usage-popover {
+  position: absolute;
+  top: calc(100% - 12px);
+  right: 16px;
+  z-index: 40;
+  display: grid;
+  gap: 12px;
+  width: min(320px, calc(100% - 32px));
+  max-height: min(420px, 70vh);
+  overflow-y: auto;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--overlay);
+  box-shadow: var(--shadow-pop);
+}
+/* The popover sits in the conversation's header, whose own lines are one monospace line cut
+ * with an ellipsis: its sentences wrap in the app's font. */
+.conversation-heading .usage-popover p {
+  margin-top: 0;
+  overflow: visible;
+  font-family: var(--font-ui);
+  text-overflow: clip;
+  white-space: normal;
+}
+.usage-popover:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.usage-popover > h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* The Usage page: each account a card of rows. */
+.usage-cards > .usage-limits {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
+  align-items: start;
+}
+.usage-cards .usage-account {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.usage-cards .usage-account > header {
+  font-size: 1rem;
+}

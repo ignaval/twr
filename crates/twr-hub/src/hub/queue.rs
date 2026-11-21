@@ -5,7 +5,8 @@
 //! and clients read it here:
 //!
 //! - `thread.queue {thread}` lists what waits, in order, each with its ref, sender and the
-//!   start of its text ([`QUEUE_LIST_MAX`] of them, [`QUEUE_PREVIEW_MAX`] bytes each).
+//!   start of its text ([`QUEUE_LIST_MAX`] of them, [`QUEUE_PREVIEW_MAX`] bytes each, its files'
+//!   pairs kept whole).
 //! - Taking one back is `message.withdraw` (`hub::withdraw`); editing one is taking it back
 //!   and sending the edited text as a new message (`say`, `thread.send`): it arrives anew,
 //!   with what the user has seen when sending it, at the end of the queue, and ends what an
@@ -37,11 +38,14 @@ use super::{append_err, internal, rpc, Batch, Caller, Core, Hub, Inner, LOCAL_BO
 pub const QUEUE_LIST_MAX: usize = 20;
 
 /// Most bytes of a queued message's text `thread.queue` shows (`truncated` says when cut):
-/// enough for a row of the TUI, not the whole message, which `message.withdraw` returns.
+/// enough for a row of the TUI, not the whole message, which `message.withdraw` returns. Its
+/// files' `Uploaded file:` pairs are kept whole, after the text, up to as many bytes again.
 pub const QUEUE_PREVIEW_MAX: usize = 2048;
 
-/// The start of `s`, at most `max` bytes, cut on a character boundary.
-fn preview(s: &str, max: usize) -> (&str, bool) {
+/// The start of `s`, at most `max` bytes, cut on a character boundary. A cut just after a
+/// line naming a file (`Uploaded file: <name>`, in a fenced example, say) would leave a name
+/// and part of a path, which a client could read as a file: the cut goes before that name.
+fn clip(s: &str, max: usize) -> (&str, bool) {
     if s.len() <= max {
         return (s, false);
     }
@@ -49,7 +53,44 @@ fn preview(s: &str, max: usize) -> (&str, bool) {
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    (&s[..end], true)
+    let start = &s[..end];
+    if let Some((rest, _)) = start.rsplit_once('\n') {
+        let named = rest.rsplit_once('\n').map_or(rest, |(_, line)| line);
+        if named.starts_with("Uploaded file: ") {
+            return (&rest[..rest.len() - named.len()], true);
+        }
+    }
+    (start, true)
+}
+
+/// What `thread.queue` shows of queued message `s`: all of it when it is short; else the
+/// start of its text (at most `max` bytes) and then its files' pairs, each whole (as many as
+/// fit in `max` bytes more), so a client never reads part of a path as a file, nor loses a
+/// file's name to the cut. `true` when anything was left out.
+fn preview(s: &str, max: usize) -> (std::borrow::Cow<'_, str>, bool) {
+    use std::borrow::Cow;
+    if s.len() <= max {
+        return (Cow::Borrowed(s), false);
+    }
+    let (text, pairs) = twr_core::upload::attachment_pairs(s);
+    if pairs.is_empty() {
+        let (start, cut) = clip(s, max);
+        return (Cow::Borrowed(start), cut);
+    }
+    let (start, mut cut) = clip(&text, max);
+    let mut files = String::new();
+    for (name, path) in &pairs {
+        let pair = format!("\nUploaded file: {name}\n{path}");
+        if files.len() + pair.len() > max {
+            cut = true;
+            break;
+        }
+        files.push_str(&pair);
+    }
+    if !cut {
+        return (Cow::Borrowed(s), false);
+    }
+    (Cow::Owned(format!("{}{files}", start.trim_end())), true)
 }
 
 impl Hub {
@@ -84,7 +125,7 @@ impl Hub {
                     && r.user_sent;
                 json!({
                     "ref": r.id,
-                    "prompt": text,
+                    "prompt": text.as_ref(),
                     "truncated": truncated,
                     "from": r.from,
                     "mine": mine,
@@ -303,11 +344,61 @@ impl Core {
 mod tests {
     use super::*;
 
+    fn shown(s: &str, max: usize) -> (String, bool) {
+        let (text, cut) = preview(s, max);
+        (text.into_owned(), cut)
+    }
+
     #[test]
     fn previews_cut_on_character_boundaries() {
-        assert_eq!(preview("short", 10), ("short", false));
-        assert_eq!(preview("abcdef", 3), ("abc", true));
+        assert_eq!(shown("short", 10), ("short".into(), false));
+        assert_eq!(shown("abcdef", 3), ("abc".into(), true));
         // "é" is two bytes: a cut inside it backs off to before it.
-        assert_eq!(preview("aé", 2), ("a", true));
+        assert_eq!(shown("aé", 2), ("a".into(), true));
+    }
+
+    const PATH: &str = "/home/me/.twr-uploads/7f3a/spec.md";
+
+    /// A long message's files stay whole after the cut text: never part of a path (which a
+    /// client would read as a file), nor gone (the cut falling before them).
+    #[test]
+    fn previews_keep_a_long_messages_files_whole() {
+        let files = format!("\n\nUploaded file: spec.md\n{PATH}");
+        // Its text short enough, its files too: all of it, as it is, though longer than the
+        // preview's text may be.
+        let s = format!("{}{files}", "x".repeat(2000));
+        assert!(s.len() > QUEUE_PREVIEW_MAX);
+        assert_eq!(shown(&s, QUEUE_PREVIEW_MAX), (s.clone(), false));
+        for body in [2049, 2100, 5000] {
+            let s = format!("{}{files}", "x".repeat(body));
+            let (text, cut) = shown(&s, QUEUE_PREVIEW_MAX);
+            assert!(cut, "{body}");
+            assert!(
+                text.ends_with(&format!("\nUploaded file: spec.md\n{PATH}")),
+                "{body}: {text:?}"
+            );
+            let (rest, names) = twr_core::upload::split_attachments(&text);
+            assert_eq!(names, ["spec.md"], "{body}");
+            assert!(rest.len() <= QUEUE_PREVIEW_MAX && !rest.contains(".twr-uploads"));
+        }
+        // More files than fit: those that fit, whole, and it says it was cut.
+        let many: String = (0..100)
+            .map(|i| format!("\nUploaded file: f{i}.md\n/h/.twr-uploads/{i}/f{i}.md"))
+            .collect();
+        let (text, cut) = shown(&format!("text{many}"), 300);
+        let (rest, names) = twr_core::upload::split_attachments(&text);
+        assert!(cut && rest == "text" && !names.is_empty() && names.len() < 100);
+        assert!(text.len() <= 4 + 300, "{text:?}");
+    }
+
+    /// A cut just after a line naming a file, in a fenced example, goes before that name:
+    /// what is left is never read as a file.
+    #[test]
+    fn previews_never_cut_into_a_files_path() {
+        let s = format!("see\n```\nUploaded file: spec.md\n{PATH}\n```\nmore");
+        let at = s.find("7f3a").unwrap();
+        let (text, cut) = shown(&s, at);
+        assert_eq!((text.as_str(), cut), ("see\n```\n", true));
+        assert!(twr_core::upload::split_attachments(&text).1.is_empty());
     }
 }

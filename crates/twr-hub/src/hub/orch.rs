@@ -143,10 +143,12 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::config::{Config, OrchestratorAccess};
 use twr_core::event::*;
+use twr_core::loops::LoopKind;
 use twr_core::proto::{codes, RpcError};
 use twr_core::reduce::ThreadStatus;
 use twr_core::reduce::{AttentionItem, ThreadView};
@@ -395,6 +397,28 @@ fn asked_by_orchestrator(v: &ThreadView, id: &str) -> bool {
         _ => return false,
     };
     by == twr_core::loops::ControlBy::Orchestrator
+}
+
+/// Whether a loop's report says it changed the work: its triage fixed findings (its mark's
+/// `fixed`) or it made commits. False for a mark without either (one from before `fixed` was
+/// recorded, or a review that changed nothing).
+fn loop_changed(mark: Option<&Value>) -> bool {
+    mark.is_some_and(|m| {
+        m["fixed"].as_u64().unwrap_or(0) > 0
+            || m["commits"].as_array().is_some_and(|c| !c.is_empty())
+    })
+}
+
+fn loop_kind(v: &ThreadView, mark: &Value) -> LoopKind {
+    if let Some(kind) = mark.get("kind").and_then(|k| LoopKind::deserialize(k).ok()) {
+        return kind;
+    }
+    let id = mark["id"].as_str().unwrap_or_default();
+    match (&v.r#loop, &v.last_loop) {
+        (Some(l), _) if l.id == id => l.kind,
+        (_, Some(l)) if l.id == id => l.kind,
+        _ => LoopKind::Review,
+    }
 }
 
 /// Whether `turn.started` is a hub notice (`ext.twr.notice = true`).
@@ -1396,6 +1420,11 @@ impl Inner {
 }
 
 impl Core {
+    /// Whether the orchestrator's running turn is one of the hub's notices (a fired watch, a
+    /// report), not a message of the user's.
+    pub(in crate::hub) fn orch_in_notice_turn(&self) -> bool {
+        self.orch.turn.as_ref().is_some_and(|t| t.notice)
+    }
     pub(super) fn command_mode_seen(&self, thread: &str, seen: u64) -> bool {
         self.orch
             .user_modes
@@ -1472,8 +1501,8 @@ impl Core {
     }
 
     /// The orchestrator's runtime, model and account (`None`: the native one): the current
-    /// orchestrator thread's (a switch is kept by the log), else the configured ones
-    /// (`[orchestrator] runtime / model / account`, the account as
+    /// orchestrator thread's (a switch or a model change is kept by the log), else the
+    /// configured ones (`[orchestrator] runtime / model / account`, the account as
     /// [`Core::orchestrator_account`] picks it) that the first orchestrator gets.
     pub(super) fn orchestrator_choice(
         &self,
@@ -2343,10 +2372,25 @@ impl Core {
                     return;
                 }
                 // The hub's report of a turn that completed is a finish: it fires the thread's
-                // watches (`hub::watches`). A failed turn's error card notifies anyway.
+                // watches (`hub::watches`). A failed turn's error card notifies anyway. A
+                // review loop's or pass's report that changed nothing fires no repeating watch: a
+                // standing rule such as "review every worker's work" fired on the finish the
+                // review followed, and firing again on the review's own end would start a pass on
+                // that pass. One whose triage fixed findings (`fixed=N` on its line) or that made
+                // commits changed the work, so a standing rule like "send each finished branch to
+                // the integrator" fires again (the prompt starts no pass on a pass's report). An
+                // implementation loop's report is the finish of the work it did (its steps'
+                // reports fired nothing, above): it fires every watch, and its line says the
+                // kind, so a standing review rule knows the loop reviewed that work.
+                let loop_id = loop_mark.and_then(|l| l["id"].as_str());
+                let kind = loop_mark.map(|l| loop_kind(view, l));
                 let hits =
                     if p.written_by == "hub" && watch::turn_completed(view, p.turn.or(ev.turn)) {
-                        self.matching_watches(&ev.thread)
+                        let mut hits = self.matching_watches(&ev.thread);
+                        if kind == Some(LoopKind::Review) && !loop_changed(loop_mark) {
+                            hits.retain(|w| !w.repeat);
+                        }
+                        hits
                     } else {
                         Vec::new()
                     };
@@ -2363,6 +2407,16 @@ impl Core {
                     .and_then(|t| t.get(report::REPLY_SEQ_KEY))
                     .and_then(Value::as_u64)
                     .map_or(String::new(), |s| format!(" {}={s}", report::REPLY_SEQ_KEY));
+                let ended = loop_id.map_or(String::new(), |id| {
+                    let kind = kind.unwrap_or_default().as_str();
+                    let fixed = loop_mark.and_then(|l| l["fixed"].as_u64()).unwrap_or(0);
+                    let fixed = if fixed > 0 {
+                        format!(" fixed={fixed}")
+                    } else {
+                        String::new()
+                    };
+                    format!(" loop={id} kind={kind} ended{fixed}")
+                });
                 let excerpt = twr_ext(&p.ext)
                     .and_then(|t| t.get("reply_excerpt"))
                     .and_then(Value::as_str)
@@ -2382,8 +2436,8 @@ impl Core {
                     attn_id: None,
                     thread: Some(ev.thread.clone()),
                     line: format!(
-                        "- thread={name} report turn={turn}{follow_up} grade={} summary={}\
-                         {reply}{excerpt} thread_id={}",
+                        "- thread={name} report turn={turn}{follow_up}{ended} grade={} \
+                         summary={}{reply}{excerpt} thread_id={}",
                         twr_decisions::grade_str(p.grade),
                         quoted(&cut(&p.summary, NOTICE_SUMMARY_MAX)),
                         ev.thread
@@ -2464,8 +2518,8 @@ impl Core {
         if !self.may_take_turn(&orch) || self.store.pending_count(&orch)? > 0 {
             return Ok(());
         }
-        // A runtime that started with another access level is restarted first
-        // (`hub::orch_access`): the notices go to the new one.
+        // A runtime that started with another access level, model or effort is restarted
+        // first (`hub::orch_access`, `hub::model`): the notices go to the new one.
         if self.restart_for_settings(hub, &orch)? {
             return Ok(());
         }
@@ -2772,8 +2826,28 @@ impl Core {
             })
     }
 
+    /// Whether `spec`, the runtime an `orchestrator.use` names, keeps the orchestrator's
+    /// agent: a bare `acp` while it runs an ACP agent (`acp:<command>` or a `[runtimes]`
+    /// preset): `acp` is the runtime a thread shows for every agent, so `twr orchestrator use
+    /// acp --model M` is a switch to a new session of the same agent. The new orchestrator
+    /// gets the agent's command, attach template and preset as they are recorded, as a reset
+    /// does, with the model and effort asked. Elsewhere a bare `acp` is refused (it names no
+    /// agent).
+    pub(super) fn keeps_orch_agent(&self, spec: &str) -> bool {
+        spec.trim() == twr_adapters::acp::NAME
+            && self
+                .orch
+                .thread
+                .as_deref()
+                .and_then(|t| self.registry.get(t))
+                .is_some_and(|v| v.runtime == twr_adapters::acp::NAME)
+    }
+
     /// Appends `thread.created` for a new orchestrator thread running `runtime` (`model`: the
-    /// runtime's default when `None`). It becomes the orchestrator; any previous one is
+    /// runtime's default when `None`; `effort`: the one `orchestrator.use` asked for, already
+    /// canonical, `Some(None)` the runtime's default; `None` when not asked: a reset keeps the
+    /// previous one's, the first orchestrator takes `[orchestrator] effort`, a switch the
+    /// runtime's default). It becomes the orchestrator; any previous one is
     /// retired by this very event (`ThreadView::retired`). Its name is `orchestrator` and its
     /// alias `orch`, unless a worker thread holds them (then `orchestrator-<n>` / no alias).
     /// `reset`: a new conversation (`orchestrator reset`); `notices`: the queued notices it
@@ -2787,7 +2861,7 @@ impl Core {
         hub: &Inner,
         runtime: String,
         model: Option<String>,
-        effort: Option<String>,
+        effort: Option<Option<String>>,
         handoff: Option<&str>,
         source: Source,
         reset: bool,
@@ -2813,10 +2887,13 @@ impl Core {
             .thread
             .as_deref()
             .and_then(|t| self.registry.get(t));
-        let recorded_acp = reset && old.is_some_and(|v| v.runtime == twr_adapters::acp::NAME);
         // The account part of `claude-code:work` is split off first (`runtime_spec`): the
         // account is `account`, chosen from it.
         let (base, _) = runtime_spec::split_account(&runtime)?;
+        // A reset, or a switch to a bare `acp` ([`Core::keeps_orch_agent`]), keeps the agent
+        // the orchestrator runs.
+        let recorded_acp = (reset || base == twr_adapters::acp::NAME)
+            && old.is_some_and(|v| v.runtime == twr_adapters::acp::NAME);
         let acp = if recorded_acp {
             None
         } else {
@@ -2840,28 +2917,27 @@ impl Core {
             twr["conversation_reset"] = json!(true);
             if let Some(v) = old {
                 twr["effort"] = json!(v.effort);
-                if recorded_acp {
-                    twr["acp_command"] = json!(v.acp_command);
-                    if let Some(ev) =
-                        store::first_of_kind(self.store.conn(), &v.id, "thread.created")
-                            .map_err(internal)?
-                    {
-                        if let EventBody::ThreadCreated(p) = self.full(ev).body {
-                            for key in ["acp_attach", "acp_preset"] {
-                                if let Some(value) = twr_ext(&p.ext).and_then(|t| t.get(key)) {
-                                    twr[key] = value.clone();
-                                }
-                            }
+            }
+        }
+        if let Some(v) = old.filter(|_| recorded_acp) {
+            twr["acp_command"] = json!(v.acp_command);
+            if let Some(ev) = store::first_of_kind(self.store.conn(), &v.id, "thread.created")
+                .map_err(internal)?
+            {
+                if let EventBody::ThreadCreated(p) = self.full(ev).body {
+                    for key in ["acp_attach", "acp_preset"] {
+                        if let Some(value) = twr_ext(&p.ext).and_then(|t| t.get(key)) {
+                            twr[key] = value.clone();
                         }
                     }
                 }
             }
         }
-        // A switch's own effort (`orchestrator.use` `effort`, checked by `check_switch`), else
-        // the config's for the first orchestrator only. A switch without one gets the
-        // runtime's default, just as it does for the model.
+        // An effort the switch asked for wins. Otherwise config selects the first orchestrator
+        // only, and a runtime switch gets that runtime's defaults, just as it does for the
+        // model.
         let effort = match effort {
-            Some(e) => Some(e),
+            Some(e) => e,
             None => self
                 .orch
                 .thread
@@ -3679,7 +3755,7 @@ pub(super) enum OrchAccountFrom {
     Config,
     /// `orchestrator.use`: the account part of its runtime spec.
     Switch,
-    /// A reset: the current orchestrator's.
+    /// A reset, a bare `acp` on an ACP agent: the current orchestrator's.
     Keep,
 }
 
@@ -3847,6 +3923,26 @@ pub(super) fn remove_stale_mcp_files(data_dir: &std::path::Path) {
     }
 }
 
+/// Most bytes of the user's dropped messages `orchestrator.use` returns, as JSON
+/// (`previous.dropped_messages`): well under a response's [`twr_core::proto::MAX_FRAME`].
+pub const DROPPED_MESSAGES_MAX: usize = 4 << 20;
+
+/// The `messages` that fit, each whole, in queue order, in `max` bytes of JSON, and how many
+/// were left out.
+fn dropped_mine(messages: impl Iterator<Item = String>, max: usize) -> (Vec<String>, usize) {
+    let (mut kept, mut omitted, mut used) = (Vec::new(), 0, 0);
+    for m in messages {
+        let size = serde_json::to_string(&m).map_or(usize::MAX, |j| j.len() + 1);
+        if size <= max - used {
+            used += size;
+            kept.push(m);
+        } else {
+            omitted += 1;
+        }
+    }
+    (kept, omitted)
+}
+
 /// `s` cut to at most `max` bytes (at a char boundary), with `...` when cut.
 pub(super) fn cut(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -3902,7 +3998,11 @@ fn notice_text(lines: &[String], left: usize, dropped: usize) -> String {
              the work is done (read the reply when the excerpt leaves doubt) and you have not \
              done it already; if it says work is still running, call watch_thread again to \
              wait for the next report. A watch without repeat is now used up. A note never \
-             answers a permission or question.\n",
+             answers a permission or question. repeat=true marks a repeating watch: one whose \
+             note asks for a review or a loop but doesn't quote the user's standing request \
+             (\"from now on ...\") may come from a one-off request: don't start it; ask the \
+             user once whether it stands. On a review's own report (kind=review ended), never \
+             start a review pass or loop: act only on notes that ask for something else.\n",
         );
     }
     out.push_str(
@@ -4029,6 +4129,10 @@ impl Hub {
     /// and the state the log shows. The new orchestrator starts right away when the previous
     /// one was running (or with `orchestrator.autostart`), else with the next message it gets
     /// (or notice); either way the handoff is its first turn.
+    ///
+    /// `opts.effort` is the new orchestrator's reasoning effort, checked like `thread.new`'s
+    /// (one the runtime takes, `default` its own); not given, a switch runs the runtime's
+    /// default and the first orchestrator `[orchestrator] effort`.
     pub async fn use_orchestrator(
         &self,
         runtime: &str,
@@ -4068,11 +4172,21 @@ impl Hub {
         // configured one for a first orchestrator.
         let (runtime, model, effort, from) = match choice {
             Some((runtime, model)) => {
+                // A bare `acp` keeps the orchestrator's agent, as a reset does
+                // ([`Core::keeps_orch_agent`]): no command line is chosen, and the account
+                // is the current one's.
+                let keep = self.inner.core().keeps_orch_agent(runtime);
                 // A device names a command line only with `terminal` (`hub::device_scope`).
-                self.inner.check_caller_runtime(caller, runtime.trim())?;
+                if !keep {
+                    self.inner.check_caller_runtime(caller, runtime.trim())?;
+                }
                 let (runtime, model, effort) =
-                    self.check_switch(runtime, model, opts.effort.as_deref(), caller)?;
-                (runtime, model, effort, OrchAccountFrom::Switch)
+                    self.check_switch(runtime, model, opts.effort.as_deref(), caller, keep)?;
+                let from = match keep {
+                    true => OrchAccountFrom::Keep,
+                    false => OrchAccountFrom::Switch,
+                };
+                (runtime, model, effort, from)
             }
             None => {
                 let core = self.inner.core();
@@ -4090,7 +4204,7 @@ impl Hub {
                     (runtime, model, None, OrchAccountFrom::Keep)
                 } else {
                     let (runtime, model, _) =
-                        self.check_switch(&runtime, model.as_deref(), None, caller)?;
+                        self.check_switch(&runtime, model.as_deref(), None, caller, false)?;
                     (runtime, model, None, OrchAccountFrom::Config)
                 }
             }
@@ -4103,8 +4217,9 @@ impl Hub {
         // A runtime whose program is not there cannot start: said now, the switch still
         // happens (it may be installed before the orchestrator starts). An ACP agent's program
         // is its command's first word; a built-in runtime's is what its adapter would start
-        // (its `TWR_*_BIN` override, else its binary name), with its start error's hint.
-        let warning = if reset {
+        // (its `TWR_*_BIN` override, else its binary name), with its start error's hint. The
+        // orchestrator's agent kept (a reset, a bare `acp`): its recorded program.
+        let warning = if from == OrchAccountFrom::Keep {
             let view = {
                 let core = self.inner.core();
                 core.orch
@@ -4130,10 +4245,13 @@ impl Hub {
                 .clone()
                 .filter(|t| core.registry.get(t).is_some())
         };
-        let to = match &model {
+        let mut to = match &model {
             Some(m) => format!("{runtime}, model {m}"),
             None => runtime.clone(),
         };
+        if let Some(Some(e)) = &effort {
+            to.push_str(&format!(", effort {e}"));
+        }
         let summary = match &current {
             Some(old) if opts.summary => self.handoff_summary(old, &to, opts.wait).await,
             Some(_) => Summary::Skipped("the switch was asked without it".into()),
@@ -4159,6 +4277,22 @@ impl Hub {
             // Two steps, not one batch: the stop is `thread.stop`'s own (it may have to wait
             // for the runtime's exit). If creating the new thread fails after it, the old one
             // stays the orchestrator, stopped, and `orchestrator.use` can be repeated.
+            // The user's own queued messages, whole, read under the lock the stop drops them
+            // under: the result gives them back, so the user can send them again, as many as
+            // fit in [`DROPPED_MESSAGES_MAX`] (the rest are counted: they are in no log).
+            let (dropped_messages, dropped_messages_omitted) = dropped_mine(
+                core.store
+                    .pending_list(old, usize::MAX)
+                    .map_err(internal)?
+                    .into_iter()
+                    .filter(|r| {
+                        r.from == TurnFrom::User
+                            && matches!(r.source, Source::User(_))
+                            && r.user_sent
+                    })
+                    .map(|r| r.prompt),
+                DROPPED_MESSAGES_MAX,
+            );
             let stop = core.stop_thread(&self.inner, old, caller)?;
             prev = json!({
                 "thread": old,
@@ -4166,8 +4300,11 @@ impl Hub {
                 "runtime": view.runtime,
                 "model": view.model,
                 "model_actual": view.actual_model,
+                "effort": view.effort,
                 "stopping": stop["stopping"],
                 "dropped_prompts": stop["dropped_prompts"],
+                "dropped_messages": dropped_messages,
+                "dropped_messages_omitted": dropped_messages_omitted,
             });
             if !reset {
                 handoff = Some(core.handoff(&view, &to, &summary).map_err(internal)?);
@@ -4243,16 +4380,18 @@ impl Hub {
     }
 
     /// The checks of `orchestrator.use` before anything happens: a user, a local runtime that
-    /// can host the orchestrator, a sane model, an effort its runtime takes. Returns the
-    /// trimmed runtime and model and the effort in its canonical spelling (`None`: the
-    /// runtime's default).
+    /// can host the orchestrator, a sane model, an effort the runtime takes (and its `claude`,
+    /// as far as the hub knows). Returns the trimmed runtime and model, and the canonical
+    /// effort when one was asked (`Some(None)`: the runtime's default).
+    #[allow(clippy::type_complexity)]
     fn check_switch(
         &self,
         runtime: &str,
         model: Option<&str>,
         effort: Option<&str>,
         caller: &Caller,
-    ) -> Result<(String, Option<String>, Option<String>), RpcError> {
+        keep_agent: bool,
+    ) -> Result<(String, Option<String>, Option<Option<String>>), RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
                 codes::UNAUTHORIZED,
@@ -4273,15 +4412,17 @@ impl Hub {
         }
         let hosts = self.inner.orchestrator_runtimes();
         // The adapter the spec names: `acp:<command>` or a `[runtimes]` preset the `acp`
-        // runtime (a bare `acp` is refused), `pty:<command>` the `pty` one, `<runtime>:<account>`
-        // that runtime.
+        // runtime (a bare `acp` is refused, unless it keeps the orchestrator's agent),
+        // `pty:<command>` the `pty` one, `<runtime>:<account>` that runtime.
         let (base, _) = runtime_spec::split_account(runtime)?;
-        let adapter = match runtime_spec::resolve_acp(base, &self.inner.config)? {
-            Some(spec) => spec.runtime,
-            None if base.starts_with(twr_adapters::pty::RUNTIME_PREFIX) => {
+        let adapter = match runtime_spec::resolve_acp(base, &self.inner.config) {
+            _ if keep_agent => twr_adapters::acp::NAME.to_string(),
+            Err(e) => return Err(e),
+            Ok(Some(spec)) => spec.runtime,
+            Ok(None) if base.starts_with(twr_adapters::pty::RUNTIME_PREFIX) => {
                 twr_adapters::pty::NAME.to_string()
             }
-            None => base.to_string(),
+            Ok(None) => base.to_string(),
         };
         let local = self.inner.host(LOCAL_BOX);
         if !local.as_ref().is_some_and(|h| h.has_runtime(&adapter)) {
@@ -4306,11 +4447,8 @@ impl Hub {
         let effort = effort
             .map(|e| runtime_spec::canonical_effort(e, &adapter))
             .transpose()
-            .map_err(|e| rpc(codes::BAD_REQUEST, e))?
-            .flatten();
-        if effort.is_some() {
-            // Refused now, not after the current orchestrator is stopped (a Claude Code too
-            // old to take an effort).
+            .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        if let Some(Some(_)) = &effort {
             let cwd = orchestrator_cwd(&self.inner.config);
             if let Some(why) = runtime_spec::effort_refusal(&adapter, true, &[], &cwd) {
                 return Err(rpc(codes::BAD_REQUEST, why));
@@ -4586,6 +4724,20 @@ fn sets_memory_dir(dir: &std::path::Path) -> Option<PathBuf> {
 mod tests {
     use super::super::{AnswerFor, HubOptions, Response};
     use super::*;
+
+    /// The dropped messages that fit, each whole, in order (a later small one too), the
+    /// rest counted; the budget counts each as JSON, escapes included.
+    #[test]
+    fn dropped_messages_are_given_back_as_they_fit() {
+        let all = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (kept, omitted) = dropped_mine(all(&["ab", "cdef", "g"]).into_iter(), 12);
+        assert_eq!((kept, omitted), (all(&["ab", "cdef"]), 1));
+        let (kept, omitted) = dropped_mine(all(&["abcdefgh", "a"]).into_iter(), 8);
+        assert_eq!((kept, omitted), (all(&["a"]), 1));
+        // `"\n"` is two bytes of JSON for one of text.
+        let (kept, _) = dropped_mine(all(&["\n\n"]).into_iter(), 6);
+        assert!(kept.is_empty());
+    }
 
     #[test]
     fn the_read_budget_is_per_turn() {
@@ -5023,6 +5175,223 @@ mod tests {
         assert!(text.contains("- thread=api report turn=5"), "{text}");
         assert_eq!(ext[watch::WATCHES_FIRED_KEY], json!([w3]));
         assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![w3]));
+        drop(hub);
+    }
+
+    /// A loop's report (its end) fires watches without repeat, not repeating ones: a standing
+    /// "review every worker's work" fired on the finish the pass followed, and must not fire
+    /// on the pass's own report. Its line says the loop ended. An ordinary finish still fires
+    /// the repeating watch.
+    #[tokio::test]
+    async fn a_loop_report_fires_no_repeating_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let standing = set_watch(&hub, "*", true);
+        finish(&hub, "api", 1, Grade::Success);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(
+            text.contains(&format!("watch={standing} repeat=true note=")),
+            "{text}"
+        );
+        // The legend says what a repeating review watch needs before it is acted on.
+        assert!(
+            text.contains("repeat=true marks a repeating watch")
+                && text.contains("doesn't quote the user's standing request"),
+            "{text}"
+        );
+
+        // The review pass's report.
+        let loop_report = |turn: u64| {
+            let append = |turn: Option<u64>, body: EventBody| {
+                hub.append("api", turn, Source::Hub, body, None).unwrap();
+            };
+            append(Some(turn), EventBody::TurnStarted(TurnStarted::default()));
+            append(Some(turn), EventBody::TurnEnded(TurnEnded::default()));
+            append(
+                Some(turn),
+                EventBody::ReportReady(ReportReady {
+                    summary: "review pass: done".into(),
+                    grade: Grade::Success,
+                    turn: Some(turn),
+                    written_by: "hub".into(),
+                    ext: twr_ext_map(json!({ LOOP_REPORT_KEY: {"id": "L1", "step": "report"} })),
+                    ..Default::default()
+                }),
+            );
+        };
+        loop_report(2);
+        assert_eq!(
+            hub.inner.core().notice_turn(Utc::now()),
+            None,
+            "the standing watch does not fire on the pass"
+        );
+
+        // A watch without repeat (e.g. "merge api once its review is done") does.
+        let once = set_watch(&hub, "api", false);
+        loop_report(3);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(
+            text.contains(&format!(
+                "- thread=api report turn=3 loop=L1 kind=review ended grade=success summary=\"review \
+                 pass: done\" watch={once} "
+            )),
+            "{text}"
+        );
+        assert!(!text.contains(&format!("watch={standing} ")), "{text}");
+
+        // A pass whose triage fixed findings changed the work: the standing watch fires
+        // again ("send each finished branch to the integrator"), and the line says so.
+        hub.append(
+            "api",
+            Some(5),
+            Source::Hub,
+            EventBody::TurnStarted(TurnStarted::default()),
+            None,
+        )
+        .unwrap();
+        hub.append(
+            "api",
+            Some(5),
+            Source::Hub,
+            EventBody::TurnEnded(TurnEnded::default()),
+            None,
+        )
+        .unwrap();
+        hub.append(
+            "api",
+            Some(5),
+            Source::Hub,
+            EventBody::ReportReady(ReportReady {
+                summary: "review pass: 2 fixed".into(),
+                grade: Grade::Success,
+                turn: Some(5),
+                written_by: "hub".into(),
+                ext: twr_ext_map(
+                    json!({ LOOP_REPORT_KEY: {"id": "L1", "step": "report", "fixed": 2} }),
+                ),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(text.contains("loop=L1 kind=review ended fixed=2"), "{text}");
+        assert!(text.contains(&format!("watch={standing} ")), "{text}");
+
+        // New work's finish fires the standing watch again.
+        finish(&hub, "api", 4, Grade::Success);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(text.contains(&format!("watch={standing} ")), "{text}");
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![standing]));
+        drop(hub);
+    }
+
+    /// A loop's report, `kind` its loop's kind, or none (a log from before the mark said it).
+    fn loop_report(hub: &Hub, turn: u64, id: &str, kind: Option<&str>) {
+        let append = |turn: Option<u64>, body: EventBody| {
+            hub.append("api", turn, Source::Hub, body, None).unwrap();
+        };
+        let mut mark = json!({"id": id, "step": "report"});
+        if let Some(kind) = kind {
+            mark["kind"] = json!(kind);
+        }
+        append(Some(turn), EventBody::TurnStarted(TurnStarted::default()));
+        append(Some(turn), EventBody::TurnEnded(TurnEnded::default()));
+        append(
+            Some(turn),
+            EventBody::ReportReady(ReportReady {
+                summary: "implementation loop clean".into(),
+                grade: Grade::Success,
+                turn: Some(turn),
+                written_by: "hub".into(),
+                ext: twr_ext_map(json!({ LOOP_REPORT_KEY: mark })),
+                ..Default::default()
+            }),
+        );
+    }
+
+    /// An implementation loop's report is the finish of the work it did (its steps fired
+    /// nothing): it fires repeating watches too, such as "send each finished branch to the
+    /// integrator", and its line says the kind, so a standing review rule knows the loop
+    /// reviewed that work. A log whose mark has no kind takes it from the thread's loop.
+    #[tokio::test]
+    async fn an_implementation_loop_report_fires_repeating_watches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let standing = set_watch(&hub, "*", true);
+        loop_report(&hub, 1, "L1", Some("implement"));
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(
+            text.contains(&format!(
+                "- thread=api report turn=1 loop=L1 kind=implement ended grade=success \
+                 summary=\"implementation loop clean\" watch={standing} "
+            )),
+            "{text}"
+        );
+
+        // The thread's loop says the kind.
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "L2".into(),
+                kind: LoopKind::Implement,
+                profile: twr_core::loops::config::Profile::builtin("low").unwrap(),
+                ..Default::default()
+            })),
+            None,
+        )
+        .unwrap();
+        loop_report(&hub, 2, "L2", None);
+        let (text, _) = notice_now(&hub).unwrap();
+        assert!(
+            text.contains(" loop=L2 kind=implement ended ") && text.contains(&standing),
+            "{text}"
+        );
+        // A review loop's, with no kind and no loop of that id: a review.
+        loop_report(&hub, 3, "L3", None);
+        assert_eq!(hub.inner.core().notice_turn(Utc::now()), None);
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![standing]));
+        drop(hub);
+    }
+
+    /// A loop's step that ends with background work and goes idle fires no watch: the loop
+    /// goes on, and its report is the finish.
+    #[tokio::test]
+    async fn a_loop_step_going_idle_fires_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let w1 = set_watch(&hub, "api", true);
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::LoopStarted(Box::new(LoopStarted {
+                id: "L1".into(),
+                kind: LoopKind::Implement,
+                profile: twr_core::loops::config::Profile::builtin("low").unwrap(),
+                ..Default::default()
+            })),
+            None,
+        )
+        .unwrap();
+        assert!(hub.inner.core().view("api").unwrap().r#loop.is_some());
+        worker_turn(
+            &hub,
+            "api",
+            1,
+            TurnFrom::User,
+            TurnResult::Completed,
+            Grade::Success,
+            &["tests"],
+        );
+        hub.append("api", None, Source::Hub, task_updated("tests", false), None)
+            .unwrap();
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![w1]));
         drop(hub);
     }
 
@@ -5670,6 +6039,29 @@ mod tests {
         // move to another runtime goes on the card unless the worker's mode is restricted.
         assert!(p.contains("set_model") && p.contains("effort") && p.contains("applied directly"));
         assert!(p.contains("A runtime move returns needs_confirmation"));
+        // A review request is one pass in the worker's own thread: never a review thread,
+        // never rounds by hand; loops only when asked; a one-off request is no preference.
+        assert!(p.contains("start_loop {kind:\n\"review\", once: true} on it"));
+        assert!(p.contains("Never spawn a thread to review, check or re-review"));
+        assert!(p.contains("never run review rounds by hand"));
+        assert!(p.contains("runs only when the user asks for a loop by name"));
+        assert!(p.contains("covers\nonly the work it came with"));
+        assert!(p.contains("never\ncall a one-off request a user preference"));
+        // A repeating review or loop watch acts only on the user's standing request, quoted in
+        // its note; one without (an older orchestrator's, from a one-off request) is
+        // reconfirmed with the user, and unwatched unless they confirm.
+        assert!(p.contains("A repeating watch's note quotes the user's standing\nrequest"));
+        assert!(p.contains("but quotes no such request may come from a one-off request: don't start\nit; ask the user once whether it stands"));
+        assert!(p.contains("otherwise unwatch it"));
+        // So does a memory note asking for a review or loop on every task, an older one too.
+        assert!(p.contains(
+            "The same goes for a memory note that\nasks for a review or a loop on every task"
+        ));
+        // A review's report that changed the work fires repeating watches; never a pass on it.
+        assert!(p.contains(
+            "fires a\nrepeating watch only when it changed the work (fixed=N, or commits)"
+        ));
+        assert!(p.contains("never start another pass on a pass's\nreport"));
         // Deleting goes on the user's card; the trash is read-only to it.
         assert!(p.contains("delete_thread") && p.contains("list_trash is read-only"));
         // A cut transcript line is read in full by its seq.
@@ -6056,6 +6448,11 @@ mod tests {
         assert_eq!(
             report.text(&[&w1]),
             "- report watch=w1 note=\"note w1\" thread_id=t1"
+        );
+        // A repeating watch says so, for the rule on repeating review watches.
+        assert_eq!(
+            report.text(&[&w1, &watch_on("w2", true)]),
+            "- report watch=w1 note=\"note w1\" watch=w2 repeat=true note=\"note w2\" thread_id=t1"
         );
         let kept = report.without_watches().unwrap();
         assert_eq!(kept.text(&[]), "- report thread_id=t1");

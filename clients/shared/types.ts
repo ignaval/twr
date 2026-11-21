@@ -58,6 +58,9 @@ export interface ViewState {
   decisions_seen: number;
   head: number;
   went_on?: string[];
+  /** Every account's latest subscription usage (twr-core `UsageEntry`s), as the hub
+   * folds `account.usage`: its change is the cue to read `usage.get` again. */
+  usage?: Json[];
 }
 export interface HubEvent {
   id: string;
@@ -321,6 +324,9 @@ export interface DesktopAppAPI {
   diagnostics(): Promise<string>;
   openLogs(): Promise<void>;
   onUpdate(callback: (status: UpdateStatus) => void): () => void;
+  /** Runs `save` when the window is about to close or the app to quit, and lets the close
+   * go ahead once it is done (`desktop/save-before-close.ts`). */
+  onSaveNow(save: () => Promise<void>): () => void;
 }
 declare global {
   interface Window {

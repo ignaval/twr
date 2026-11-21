@@ -760,6 +760,29 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// The tier a single pass runs ([`crate::event::LoopStarted::once`]): the ladder's
+    /// strongest, by the reviewer's effort (`minimal` < `low` < `medium` < `high` < `xhigh` <
+    /// `max` < `ultra`; an effort twr does not know ranks below them), the later one on a tie,
+    /// capped at one round. `high`'s is `xhigh`, `medium`'s and `low`'s `medium`. `None`: the
+    /// profile has no tier.
+    pub fn pass_tier(&self) -> Option<Tier> {
+        const ORDER: [&str; 7] = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+        let rank = |t: &Tier| {
+            ORDER
+                .iter()
+                .position(|e| *e == t.effort)
+                .map_or(0, |i| i + 1)
+        };
+        self.tiers
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, t)| (rank(t), *i))
+            .map(|(_, t)| Tier {
+                effort: t.effort.clone(),
+                max_rounds: Some(1),
+            })
+    }
+
     /// Built-in profile `name` ([`BUILTIN_PROFILES`]), the skills' table: `high` is a medium
     /// tier then an xhigh tier, the sweep and up to 5 verification rounds at xhigh; `medium`
     /// the medium tier only, the sweep and 2 at xhigh; `low` one medium round, no sweep and 1

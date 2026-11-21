@@ -386,8 +386,11 @@ impl UsageView {
 
     /// [`UsageView::shown`] with labels by `labels`: for a runtime, `Some(<its native
     /// account's name>)` when its entries name their account (`Claude:work`, the native one's
-    /// `Claude:<that name>`), `None` when they do not (`Claude`). What a client that knows the
-    /// accounts as the hub lists them (`account.list`'s `shown` and `native`) uses.
+    /// `Claude:<that name>`), `None` when they do not (`Claude`). When a named account shown
+    /// has that name too (the native one fell back to `default`, a named `default` exists),
+    /// the native one's says so: `Claude:default (native login)`, short `C:default (native)`.
+    /// What a client that knows the accounts as the hub lists them (`account.list`'s `shown`
+    /// and `native`) uses.
     pub fn shown_by(
         &self,
         now: DateTime<Utc>,
@@ -424,6 +427,12 @@ impl UsageView {
                 plan: e.plan.clone(),
             });
         }
+        // A named account can have the native one's name (its fallback `default`): the native
+        // entry then says so, or the two would share a label.
+        let accounts: std::collections::BTreeSet<(String, String)> = out
+            .iter()
+            .filter_map(|s| Some((s.runtime.clone(), s.account.clone()?)))
+            .collect();
         let mut named: BTreeMap<String, Option<String>> = BTreeMap::new();
         for s in &mut out {
             let native = named
@@ -433,6 +442,10 @@ impl UsageView {
                 let account = s.account.as_deref().unwrap_or(native.as_str());
                 s.label = format!("{}:{account}", s.label);
                 s.short = format!("{}:{account}", s.short);
+                if s.account.is_none() && accounts.contains(&(s.runtime.clone(), native.clone())) {
+                    s.label.push_str(" (native login)");
+                    s.short.push_str(" (native)");
+                }
             }
         }
         out.sort_by(|a, b| {
@@ -1100,6 +1113,34 @@ mod tests {
             .map(|s| s.short)
             .collect();
         assert_eq!(shorts, ["C:personal", "C:work", "G"]);
+    }
+
+    /// A native login that fell back to `default` beside a named `default` account: two
+    /// entries, two labels, the native one saying so (by the registry's rule, a client's
+    /// `account.list` one, and the old rule alike), and the line tells them apart.
+    #[test]
+    fn a_shadowed_native_login_is_labelled_apart() {
+        let now = at(NOW);
+        let mut v = view();
+        v.apply(&usage_event(
+            "codex",
+            Some("default"),
+            vec![win(SEVEN_DAY, 95.0, Some("2026-10-14T05:00:00Z"))],
+            "2026-10-09T11:59:00Z",
+        ));
+        let want = ["Claude", "GPT:default (native login)", "GPT:default"];
+        let labels =
+            |shown: Vec<Shown>| -> Vec<String> { shown.into_iter().map(|s| s.label).collect() };
+        let by = v.shown_by(now, |rt| (rt == "codex").then(|| "default".to_string()));
+        assert_eq!(labels(by.clone()), want);
+        assert_eq!(
+            segment_text(&by, Form::Compact, now, &Utc),
+            "C 78%/56% | G:default (native) 58% | G:default 5%"
+        );
+        assert_eq!(labels(v.shown(now)), want);
+        // A native login under its own name is labelled as before.
+        let by = v.shown_by(now, |rt| (rt == "codex").then(|| "personal".to_string()));
+        assert_eq!(labels(by), ["Claude", "GPT:personal", "GPT:default"]);
     }
 
     /// The observation time a record carries (a runner's capture time) wins over its `ts`.
