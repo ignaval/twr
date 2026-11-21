@@ -86,13 +86,21 @@
   grid-template-rows: minmax(0, 1fr);
   /* The composer's width at most: past it the column clips the popup (a sidebar beside). */
   width: min(640px, calc(100% - 16px));
-  max-height: min(420px, 60vh);
+  /* The room above the composer within the boxes that clip it (ModelPicker.tsx measures it
+   * as it opens): past it a tall draft ran the search out of the conversation column. */
+  max-height: min(420px, 60vh, var(--model-picker-room, 420px));
   background: var(--raised);
   border: 1px solid var(--border-strong);
   border-radius: 10px;
   box-shadow: var(--shadow-pop);
   overflow: hidden;
   color: var(--text);
+}
+/* Too little room above the composer (a tall draft in a short window): over the composer,
+ * its room from the column's top to the composer's bottom. */
+.model-picker-popup[data-over="true"] {
+  bottom: 8px;
+  max-height: min(420px, var(--model-picker-room, 420px));
 }
 .model-picker-popup:focus {
   outline: none;

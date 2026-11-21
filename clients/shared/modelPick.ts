@@ -13,11 +13,14 @@ import {
 import type { Json, Thread } from "./types";
 
 /** What the picker has chosen: a runtime, and its model and effort (`undefined`: the
- * runtime's own default). */
+ * runtime's own default). `chosen`: the settings picked in the popup, Default included; on a
+ * move one not picked is left out, so a move back to a session the thread left there goes on
+ * with that session's ([`planChange`]). */
 export interface Pick {
   runtime: string;
   model?: string;
   effort?: string;
+  chosen?: { model?: boolean; effort?: boolean };
 }
 
 /** What `thread` runs now, as a [`Pick`]. */
@@ -145,13 +148,14 @@ export type NavEffect =
   "pick-runtime" | "pick-model" | "pick-effort" | "close" | undefined;
 
 /**
- * A key pressed in the popup, whose focus stays in the search field (the highlighted row
- * is its `aria-activedescendant`): ↑/↓ move in the column, Enter picks the row (a model
- * moves on to the efforts), → goes to the next column and ← to the previous one (from the
- * models only while the search is empty, else it moves the caret; → from the rail only to a
- * column with models), Esc closes. Without a search (a runtime that runs its own command
- * line), the focus is on the highlighted row instead. Returns
- * the new position and what to do, or `undefined` for a key it leaves alone.
+ * A key pressed in the popup: in the models the focus is in the search field (the
+ * highlighted model is its `aria-activedescendant`), in the rail and the efforts on the
+ * highlighted row. ↑/↓ move in the column, Enter picks the row (a model moves on to the
+ * efforts), → goes to the next column and ← to the previous one (from the models only while
+ * the search is empty, else it moves the caret; → from the rail only to a column with
+ * models), Esc closes. Without a search (a runtime that runs its own command line), the
+ * focus stays on the rail. Returns the new position and what to do, or `undefined` for a
+ * key it leaves alone.
  */
 export function navigate(
   nav: Nav,
@@ -223,8 +227,10 @@ export type Plan =
 /**
  * What choosing `pick` for `thread` asks of the hub. A worker thread on the same runtime
  * sends only what changed (`default` for a setting cleared), so keeping one never asks the
- * hub to clear it; on another runtime it is a move, with the model and effort picked (one
- * left out is that runtime's default). The orchestrator is switched with `orchestrator.use`
+ * hub to clear it; on another runtime it is a move, with the model and effort picked, Default
+ * as `default`. One not picked is left out: the hub then starts that runtime's default, or,
+ * back on a runtime the thread left a session of, resumes it with the setting it had there
+ * (`default` for one the runtime keeps on resume starts a new session instead). The orchestrator is switched with `orchestrator.use`
  * and the handoff summary: its runtime, and the model and effort picked (one left out is the
  * runtime's default). On the same runtime it sends `keep_account`: the hub keeps the account
  * the orchestrator runs on as it recorded it. Rebuilt from its name the account could be
@@ -250,7 +256,9 @@ export function planChange(
   if (!same) {
     const params: Json = { thread: thread.id, runtime: pick.runtime };
     if (pick.model) params.model = pick.model;
+    else if (pick.chosen?.model) params.model = "default";
     if (pick.effort) params.effort = pick.effort;
+    else if (pick.chosen?.effort) params.effort = "default";
     return { kind: "thread", params, move: true };
   }
   const params: Json = { thread: thread.id };
@@ -258,6 +266,42 @@ export function planChange(
   if (pick.effort !== now.effort) params.effort = pick.effort ?? "default";
   if (!("model" in params) && !("effort" in params)) return { kind: "none" };
   return { kind: "thread", params, move: false };
+}
+
+/** The runtimes whose sessions a thread moved back resumes (docs/runtimes.md, "Moving a
+ * thread back"): an ACP agent or a `[runtimes]` preset always starts a new one. */
+const RESUMES = ["claude-code", "codex", "grok-build"];
+
+/** A move's confirmation text (`name` to `pick`). The app can't tell whether the thread left
+ * a session of that runtime earlier, so it says both: a new session with a handoff, or that
+ * earlier session resumed, with the setting it had there for one not picked
+ * ([`planChange`]), and a new session after all for a Default the runtime keeps on resume. */
+export function moveDetail(name: string, pick: Pick): string {
+  const rt = pick.runtime;
+  // (A runtime that runs its own command line has no model or effort to name.)
+  const settings: ("model" | "effort")[] = runsCommandLine(rt)
+    ? []
+    : ["model", "effort"];
+  const left = settings.filter((k) => !pick[k] && !pick.chosen?.[k]);
+  const reset = settings.some((k) => !pick[k] && pick.chosen?.[k]);
+  const both = (keys: string[]) => keys.join(" and ");
+  let detail =
+    `A conversation cannot move between runtimes: the next message starts a new ${rt} ` +
+    `session, with a handoff of what ${name} did so far` +
+    (left.length ? `, on ${rt}'s default ${both(left)}` : "") +
+    ".";
+  if (RESUMES.includes(baseRuntime(rt))) {
+    detail +=
+      ` If ${name} left a ${rt} session earlier, that session resumes instead, told what ` +
+      `${name} did since` +
+      (left.length ? `, with the ${both(left)} it had there` : "") +
+      ".";
+    if (reset)
+      detail +=
+        ` Default picked for a setting ${rt} keeps in a resumed session starts a new ` +
+        "session instead.";
+  }
+  return detail;
 }
 
 /** Whether `orchestrator.show` (`show`) says `runtime`'s program is missing on the hub's

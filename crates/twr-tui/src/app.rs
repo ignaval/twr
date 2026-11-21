@@ -841,8 +841,10 @@ pub struct OrchCurrent<'a> {
 /// whether it is installed) is a row of its own, as `runtime`, unless it shows account
 /// labels ([`crate::accounts::RuntimeAccounts::shown`]): then each of its usable accounts is
 /// one (`claude-code:work`, `claude-code:personal`), `current`'s among them (added when it
-/// is not usable: choosing it is refused by the hub, never another account in its place).
-/// `current`'s runtime without labels is `runtime:account` when it names an account, so that
+/// is not usable: choosing it is refused by the hub, never another account in its place),
+/// except a current orchestrator on the native login whose name a named account has too: its
+/// row is the runtime alone, and the name's row the named account's. `current`'s runtime
+/// without labels is `runtime:account` when it names an account, so that
 /// choosing it keeps that account; else `runtime`, the hub's default account. A `current` the
 /// rows do not have is its spec as given.
 pub fn orch_rows(
@@ -876,7 +878,18 @@ pub fn orch_rows(
                     .filter(|a| a.usable() && !a.shadowed)
                     .map(|a| a.name.as_str())
                     .collect();
-                if is_current {
+                // The current orchestrator on that native login (recorded without an
+                // account): its name is the named account's, so its row is the runtime alone
+                // ([`orch_row_label`]: `claude-code (native login)`), and the name's row
+                // stays the named account's.
+                let native_shadowed = is_current
+                    && account.is_none()
+                    && resolved.is_none()
+                    && entry.accounts.iter().any(|a| a.native && a.shadowed);
+                if native_shadowed {
+                    rows.push((runtime.clone(), *installed));
+                    default = Some(runtime.clone());
+                } else if is_current {
                     let name = account.or(resolved).unwrap_or(&entry.native);
                     if !names.contains(&name) {
                         names.push(name);
@@ -914,6 +927,22 @@ pub fn orch_label(spec: &str, accounts: &Accounts) -> String {
             runtime.to_string()
         }
         _ => spec.to_string(),
+    }
+}
+
+/// How the picker shows row `spec` of a picker whose current (or default) row is `current`
+/// ([`orch_rows`]): as [`orch_label`] says, except a switch's current row that is the runtime
+/// alone while the runtime shows account labels. That is the orchestrator on its native login
+/// whose name a named account has too: `claude-code (native login)`.
+pub fn orch_row_label(spec: &str, current: &str, switch: bool, accounts: &Accounts) -> String {
+    let native = switch
+        && spec == current
+        && twr_core::account::split_runtime(spec).1.is_none()
+        && accounts.runtime(spec).is_some_and(|r| r.shown);
+    if native {
+        format!("{spec} (native login)")
+    } else {
+        orch_label(spec, accounts)
     }
 }
 
@@ -8164,7 +8193,7 @@ impl AppState {
                 None => (value, m.current_effort.clone()),
             };
             self.view.picker = None;
-            let shown = orch_label(&runtime, &self.accounts);
+            let shown = orch_row_label(&runtime, &current_row, switch, &self.accounts);
             if switch {
                 // The current orchestrator's row keeps its account as recorded: its name may
                 // be a named account's too (the native login's fallback `default`), and the
@@ -17589,9 +17618,10 @@ pub(crate) mod tests {
     }
 
     /// The orchestrator on the native login, whose name (`default`) a named account shares:
-    /// its picker's current row is `claude-code:default`, which the hub resolves to the named
-    /// one. A model and effort change from it (Alt-M) sends the runtime alone with
-    /// `keep_account`, so the hub keeps the native login; another account's row names it.
+    /// its picker's current row is the runtime alone, `claude-code (native login)`, beside
+    /// `claude-code:default`, the named one's. A model and effort change from it (Alt-M) sends
+    /// the runtime alone with `keep_account`, so the hub keeps the native login; the named
+    /// account's row, and another account's, name it.
     #[test]
     fn the_orch_picker_keeps_the_native_login_a_named_account_shares_a_name_with() {
         let mut st = three_threads();
@@ -17608,9 +17638,36 @@ pub(crate) mod tests {
         control(&mut st, &orch_events(&mut o, "t-orch"));
         assert_eq!(st.orchestrator().unwrap().account, None);
         st.handle_key(mods(KeyCode::Char('m'), KeyModifiers::ALT));
+        let p = st.view.picker.clone().unwrap();
+        assert_eq!(p.default, "claude-code");
+        let rows: Vec<&str> = p.runtimes.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
-            st.view.picker.as_ref().unwrap().default,
-            "claude-code:default"
+            rows[..3],
+            ["claude-code", "claude-code:default", "claude-code:work"]
+        );
+        assert_eq!(p.runtimes[p.selected].0, "claude-code");
+        // Each its own: the native login as such, the named `default` by its name.
+        let saved = st.view.picker.take();
+        st.view.picker = Some(Picker {
+            step: None,
+            ..p.clone()
+        });
+        let lines: Vec<String> = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        st.view.picker = saved;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 claude-code (native login)") && l.contains("(current)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("2 claude-code:default ") && !l.contains("(current)")),
+            "{lines:?}"
         );
         // opus, in effect, then the effort `low`.
         st.handle_key(key(KeyCode::Enter));
@@ -17632,20 +17689,27 @@ pub(crate) mod tests {
             serde_json::json!({"runtime": "claude-code", "model": "opus", "effort": "low",
                                "keep_account": true})
         );
-        // Another account's row: that account, by name.
-        type_line(&mut st, "/orch");
-        let p = st.view.picker.clone().unwrap();
-        let work = p.runtimes.iter().position(|r| r.0 == "claude-code:work");
-        st.view.picker.as_mut().unwrap().selected = work.unwrap();
-        // The runtime, its model, its effort.
-        for _ in 0..3 {
-            st.handle_key(key(KeyCode::Enter));
+        // The named `default`'s row, and another account's: that account, by name.
+        for name in ["claude-code:default", "claude-code:work"] {
+            type_line(&mut st, "/orch");
+            let p = st.view.picker.clone().unwrap();
+            let row = p.runtimes.iter().position(|r| r.0 == name);
+            st.view.picker.as_mut().unwrap().selected = row.unwrap();
+            // The runtime, its model, its effort.
+            for _ in 0..3 {
+                st.handle_key(key(KeyCode::Enter));
+            }
+            let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+            assert!(
+                prompt.starts_with(&format!("switch the orchestrator to {name} ")),
+                "{prompt}"
+            );
+            assert!(matches!(
+                st.handle_key(key(KeyCode::Char('s'))).as_slice(),
+                [Action::UseOrchestrator { runtime, keep_account: false, .. }]
+                    if runtime == name
+            ));
         }
-        assert!(matches!(
-            st.handle_key(key(KeyCode::Char('s'))).as_slice(),
-            [Action::UseOrchestrator { runtime, keep_account: false, .. }]
-                if runtime == "claude-code:work"
-        ));
     }
 
     /// `/new <project> --account ` completes the accounts of the runtime the project's latest

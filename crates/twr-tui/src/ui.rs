@@ -927,8 +927,9 @@ fn render_trash(frame: &mut Frame, area: Rect, trash: &Value, scroll: u16, panes
 
 /// The orchestrator picker's lines: what it is for, one row per runtime (installed or not,
 /// the configured default marked, or for a switch the current one), the keys. A row shows
-/// its spec as [`crate::app::orch_label`] says (the runtime alone while it hides account
-/// labels), whatever account choosing it sends.
+/// its spec as [`crate::app::orch_row_label`] says (the runtime alone while it hides account
+/// labels; the native login a named account shares a name with as such), whatever account
+/// choosing it sends.
 pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     let Some(p) = &state.view.picker else {
         return Vec::new();
@@ -940,7 +941,7 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     let shown: Vec<String> = p
         .runtimes
         .iter()
-        .map(|(r, _)| crate::app::orch_label(r, &state.accounts))
+        .map(|(r, _)| crate::app::orch_row_label(r, &p.default, p.switch, &state.accounts))
         .collect();
     let name_width = shown.iter().map(|r| r.chars().count()).max().unwrap_or(0);
     let (title, note) = if p.switch {
@@ -1015,7 +1016,10 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
 fn model_lines(state: &AppState, m: &crate::app::ModelStep, back: bool) -> Vec<Line<'static>> {
     use crate::app::ModelRow;
     let dim = Style::default().fg(Color::DarkGray);
-    let runtime = crate::app::orch_label(&m.runtime, &state.accounts);
+    let runtime = match &state.view.picker {
+        Some(p) => crate::app::orch_row_label(&m.runtime, &p.default, p.switch, &state.accounts),
+        None => crate::app::orch_label(&m.runtime, &state.accounts),
+    };
     let effort = m.chosen.is_some();
     let (title, note) = match (&m.thread, effort) {
         (None, false) if !m.efforts.is_empty() => (

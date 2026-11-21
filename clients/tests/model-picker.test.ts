@@ -4,6 +4,7 @@ import {
   effortName,
   effortRows,
   modelRows,
+  moveDetail,
   navigate,
   opensPicker,
   pickerRuntimes,
@@ -153,6 +154,84 @@ describe("what a choice asks of the hub", () => {
       params: { thread: "t1", runtime: "codex", effort: "low" },
       move: true,
     });
+  });
+
+  it("sends a Default picked on a move, and leaves out a setting not picked", () => {
+    // Back on a runtime the thread left a session of, one left out is that session's: a
+    // Default picked must say `default`, or the hub restores the session's `high`.
+    expect(
+      planChange("thread", api, {
+        runtime: "codex",
+        chosen: { model: true, effort: true },
+      }),
+    ).toEqual({
+      kind: "thread",
+      params: {
+        thread: "t1",
+        runtime: "codex",
+        model: "default",
+        effort: "default",
+      },
+      move: true,
+    });
+    expect(
+      planChange("thread", api, {
+        runtime: "codex",
+        model: "gpt-5",
+        chosen: { model: true },
+      }),
+    ).toEqual({
+      kind: "thread",
+      params: { thread: "t1", runtime: "codex", model: "gpt-5" },
+      move: true,
+    });
+    // On its own runtime and for the orchestrator nothing changes: `default` clears, and a
+    // switch is always a new session.
+    expect(
+      planChange("thread", api, {
+        runtime: "claude-code",
+        model: "opus",
+        chosen: { model: true, effort: true },
+      }),
+    ).toEqual({
+      kind: "thread",
+      params: { thread: "t1", effort: "default" },
+      move: false,
+    });
+    expect(
+      planChange("orchestrator", thread({ is_orchestrator: true }), {
+        runtime: "codex",
+        chosen: { model: true, effort: true },
+      }),
+    ).toEqual({
+      kind: "orchestrator",
+      params: { runtime: "codex", summary: true },
+    });
+  });
+
+  it("says what a move starts: a new session, or the one the thread left there", () => {
+    const untouched = moveDetail("api", { runtime: "codex" });
+    expect(untouched).toBe(
+      "A conversation cannot move between runtimes: the next message starts a new codex " +
+        "session, with a handoff of what api did so far, on codex's default model and " +
+        "effort. If api left a codex session earlier, that session resumes instead, told " +
+        "what api did since, with the model and effort it had there.",
+    );
+    const reset = moveDetail("api", {
+      runtime: "claude-code",
+      model: "opus",
+      chosen: { model: true, effort: true },
+    });
+    expect(reset).toContain("a new claude-code session, with a handoff");
+    expect(reset).not.toContain("it had there");
+    expect(reset).toContain(
+      "Default picked for a setting claude-code keeps in a resumed session starts a new " +
+        "session instead.",
+    );
+    // An ACP agent, a preset and a command line always start a new session.
+    for (const runtime of ["acp:gemini --acp", "pty:bash", "myclaude"])
+      expect(moveDetail("api", { runtime })).not.toContain("resumes");
+    expect(moveDetail("api", { runtime: "pty:bash" })).not.toContain("default");
   });
 
   it("switches the orchestrator with its summary, the hub keeping its account on its runtime", () => {
@@ -309,6 +388,7 @@ describe("the popup, rendered", () => {
     root: FakeElement;
     field: FakeElement;
     rerender: (props: Json) => Promise<void>;
+    unmount: () => Promise<void>;
     act: (f: () => unknown) => Promise<void>;
   }>;
   beforeAll(async () => {
@@ -369,6 +449,10 @@ describe("the popup, rendered", () => {
           );
           await settle();
         },
+        unmount: async () => {
+          await act(async () => root.unmount());
+          await settle();
+        },
         act: async (f) => {
           await act(async () => void (await f()));
           await settle();
@@ -386,6 +470,9 @@ describe("the popup, rendered", () => {
     q(root, ".model-picker-search") as unknown as FakeInput;
   const activeId = (root: FakeElement) =>
     search(root).getAttribute("aria-activedescendant") || "";
+  /** The focused element, and its id. */
+  const focused = () => document.activeElement as unknown as FakeElement;
+  const focusedId = () => focused()?.getAttribute("id") || "";
 
   it("is hidden without a destination, and disabled without the hub", async () => {
     const m = await mount({ target: undefined });
@@ -414,12 +501,14 @@ describe("the popup, rendered", () => {
     await m.act(() => void press(search(m.root) as any, "ArrowDown"));
     await m.act(() => void press(search(m.root) as any, "Enter"));
     expect(q(m.root, "[role=dialog]")).not.toBeNull();
-    expect(activeId(m.root)).toMatch(/efforts-3$/);
+    // The focus on that effort (a screen reader says it), none in the models.
+    expect(focusedId()).toMatch(/efforts-3$/);
+    expect(activeId(m.root)).toBe("");
     expect(q(m.root, ".model-picker-efforts header")!.textContent).toContain(
       "sonnet",
     );
     expect(m.calls).toEqual([]);
-    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(focused(), "Enter"));
     expect(q(m.root, "[role=dialog]")).toBeNull();
     expect(m.calls).toEqual([
       { method: "thread.set_model", params: { thread: "t1", model: "sonnet" } },
@@ -444,15 +533,70 @@ describe("the popup, rendered", () => {
       expect(scrolled.at(-1)).toMatch(/models-2$/);
       await m.act(() => void press(search(m.root) as any, "ArrowRight"));
       expect(scrolled.at(-1)).toMatch(/efforts-\d+$/);
-      await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
-      await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
+      await m.act(() => void press(focused(), "ArrowLeft"));
+      await m.act(() => void press(focused(), "ArrowLeft"));
       expect(scrolled.at(-1)).toMatch(/rail-\d+$/);
-      await m.act(() => void press(search(m.root) as any, "ArrowDown"));
-      expect(scrolled.at(-1)).toBe(activeId(m.root));
-      expect(activeId(m.root)).toMatch(/rail-\d+$/);
+      await m.act(() => void press(focused(), "ArrowDown"));
+      expect(scrolled.at(-1)).toBe(focusedId());
+      expect(focusedId()).toMatch(/rail-\d+$/);
     } finally {
       proto.scrollIntoView = was;
     }
+  });
+
+  it("fits the room above the composer, and opens over it when that is too little", async () => {
+    // The composer (the popup's offset parent) under a column that clips at the top: a tall
+    // draft leaves `top - 0` above it. The popup's height is that room, not the window's.
+    const proto = FakeElementClass.prototype as any;
+    const win = globalThis.window as any;
+    const was = win.getComputedStyle;
+    const rect = (top: number, bottom: number) => ({ top, bottom }) as DOMRect;
+    let composer = rect(0, 0);
+    const m = await mount({ target: thread({}) });
+    Object.defineProperty(proto, "offsetParent", {
+      configurable: true,
+      get(this: FakeElement) {
+        return this.classList.contains("model-picker-popup") ? m.root : null;
+      },
+    });
+    const box = m.root.getBoundingClientRect;
+    (m.root as any).getBoundingClientRect = () => composer;
+    win.getComputedStyle = (n: FakeElement) =>
+      n === (document.body as unknown as FakeElement)
+        ? { overflowX: "clip", overflowY: "clip" }
+        : { overflowX: "visible", overflowY: "visible" };
+    const popup = () => q(m.root, ".model-picker-popup")!;
+    const room = () => popup().style.getPropertyValue("--model-picker-room");
+    try {
+      composer = rect(606, 876);
+      await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+      expect(room()).toBe(`${606 - 6 - 8}px`);
+      expect(popup().dataset.over).toBeUndefined();
+      await m.act(() => void press(search(m.root) as any, "Escape"));
+      // 266 pixels above it: too few for its efforts and Done, so it opens over the
+      // composer, from the column's top to the composer's bottom.
+      composer = rect(266, 536);
+      await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+      expect(popup().dataset.over).toBe("true");
+      expect(room()).toBe(`${536 - 8 - 8}px`);
+    } finally {
+      delete proto.offsetParent;
+      (m.root as any).getBoundingClientRect = box;
+      win.getComputedStyle = was;
+    }
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const css = readFileSync(
+      join(import.meta.dirname, "..", "shared", "model-picker.css"),
+      "utf8",
+    );
+    expect(css).toContain(
+      "max-height: min(420px, 60vh, var(--model-picker-room, 420px));",
+    );
+    const over = css.slice(
+      css.indexOf('.model-picker-popup[data-over="true"] {'),
+    );
+    expect(over.slice(0, over.indexOf("}"))).toContain("bottom: 8px;");
   });
 
   it("searches, and closes with Esc, the focus back in the message box", async () => {
@@ -474,29 +618,87 @@ describe("the popup, rendered", () => {
     await m.act(() => click(q(m.root, ".model-picker-trigger")!));
     // ← on the empty search: the rail; ↓ codex, Enter: its models.
     await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
-    expect(activeId(m.root)).toMatch(/rail-0$/);
-    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
+    expect(focusedId()).toMatch(/rail-0$/);
+    await m.act(() => void press(focused(), "ArrowDown"));
+    await m.act(() => void press(focused(), "Enter"));
     expect(
       q(m.root, ".model-picker-models [role=listbox]")!.getAttribute(
         "aria-label",
       ),
     ).toBe("Models for codex");
     // Its default model, then effort low.
-    await m.act(() => void press(search(m.root) as any, "Enter"));
-    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
-    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(focused(), "Enter"));
+    await m.act(() => void press(focused(), "ArrowDown"));
+    await m.act(() => void press(focused(), "Enter"));
     expect(m.calls).toEqual([]);
     expect(m.confirms).toHaveLength(1);
-    expect(m.confirms[0].title).toBe("Move api to codex, effort Low?");
-    expect(m.confirms[0].detail).toContain("handoff");
+    // Default picked is sent: a move back would otherwise restore the session's model.
+    expect(m.confirms[0].title).toBe(
+      "Move api to codex, model Default, effort Low?",
+    );
+    expect(m.confirms[0].detail).toBe(
+      moveDetail("api", {
+        runtime: "codex",
+        effort: "low",
+        chosen: { model: true, effort: true },
+      }),
+    );
     await m.act(() => m.confirms[0].run());
     expect(m.calls).toEqual([
       {
         method: "thread.set_model",
-        params: { thread: "t1", runtime: "codex", effort: "low" },
+        params: {
+          thread: "t1",
+          runtime: "codex",
+          model: "default",
+          effort: "low",
+        },
       },
     ]);
+  });
+
+  it("moves back with Default picked as `default`, and leaves out what Done didn't pick", async () => {
+    // On claude-code at high, moved to codex earlier; now back, Default effort picked.
+    const api = thread({ runtime: "codex", model: "gpt-5", effort: "high" });
+    const m = await mount({ target: api });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    const rail = () =>
+      m.root.querySelectorAll(".model-picker-rail [role=option]");
+    const claude = () =>
+      rail().find((n: FakeElement) => n.textContent.startsWith("Cl"))!;
+    await m.act(() => click(claude()));
+    const effort = (name: string) =>
+      m.root
+        .querySelectorAll(".model-picker-efforts [role=radio]")
+        .find((n: FakeElement) => n.textContent === name)!;
+    await m.act(() => click(effort("Default")));
+    expect(m.confirms[0].title).toBe(
+      "Move api to claude-code, effort Default?",
+    );
+    expect(m.confirms[0].detail).toContain(
+      "with the model it had there. Default picked for a setting",
+    );
+    await m.act(() => m.confirms[0].run());
+    expect(m.calls.at(-1)).toEqual({
+      method: "thread.set_model",
+      params: { thread: "t1", runtime: "claude-code", effort: "default" },
+    });
+    // Done without picking either: both left out, the session's kept on a move back.
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => click(claude()));
+    const done = m.root
+      .querySelectorAll(".model-picker-efforts footer button")
+      .find((n: FakeElement) => n.textContent === "Done")!;
+    await m.act(() => click(done));
+    expect(m.confirms[1].title).toBe("Move api to claude-code?");
+    expect(m.confirms[1].detail).toContain(
+      "with the model and effort it had there.",
+    );
+    await m.act(() => m.confirms[1].run());
+    expect(m.calls.at(-1)).toEqual({
+      method: "thread.set_model",
+      params: { thread: "t1", runtime: "claude-code" },
+    });
   });
 
   it("confirms an orchestrator switch, with or without the summary", async () => {
@@ -654,6 +856,48 @@ describe("the popup, rendered", () => {
     expect(m.calls).toEqual([]);
     expect(String(m.errors.at(-1))).toContain(
       "The orchestrator changed before you confirmed: pick again",
+    );
+  });
+
+  it("drops a pick still reading the orchestrator when the picker goes away", async () => {
+    // A slow `orchestrator.show`: the conversation is left (the picker unmounts) and another
+    // workspace opens before it answers. Nothing is asked, so nothing reaches that one.
+    let answer: (show: Json) => void = () => {};
+    const show = new Promise<Json>((r) => (answer = r));
+    const m = await mount({
+      target: codexOrchestrator,
+      kind: "orchestrator",
+      show,
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    expect(m.confirms).toEqual([]);
+    await m.unmount();
+    await m.act(() => answer({ thread: "o1" }));
+    expect(m.confirms).toEqual([]);
+    expect(m.calls).toEqual([]);
+    expect(m.errors).toEqual([]);
+  });
+
+  it("takes back a switch it asked to confirm when the picker goes away", async () => {
+    const m = await mount({ target: codexOrchestrator, kind: "orchestrator" });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    await m.act(() => void press(search(m.root) as any, "ArrowDown"));
+    await m.act(() => void press(search(m.root) as any, "Enter"));
+    expect(m.confirms).toHaveLength(1);
+    const stale = m.confirms[0];
+    await m.unmount();
+    expect(m.withdrawn).toEqual([stale]);
+    // Answered anyway (the app's dialog outlived the picker): another workspace may be
+    // open by now, and the app's calls go to it, so nothing is sent.
+    await m.act(() => stale.run());
+    await m.act(() => stale.alt.run());
+    expect(m.calls).toEqual([]);
+    expect(String(m.errors.at(-1))).toContain(
+      "The model picker closed before you confirmed: pick again",
     );
   });
 
@@ -975,7 +1219,72 @@ describe("the popup, rendered", () => {
       "runs its own command line",
     );
     expect(q(m.root, ".model-picker-models [role=listbox]")).toBeNull();
-    expect(activeId(m.root)).toMatch(/rail-0$/);
+    expect(focusedId()).toMatch(/rail-0$/);
+    expect(activeId(m.root)).toBe("");
+  });
+
+  it("puts the focus on each runtime and effort the keys reach, a Tab stop in each column", async () => {
+    const m = await mount({
+      target: thread({ model: "opus", effort: "high" }),
+    });
+    await m.act(() => click(q(m.root, ".model-picker-trigger")!));
+    const rows = (column: string) =>
+      m.root.querySelectorAll(
+        `.model-picker-${column} [role=option], .model-picker-${column} [role=radio]`,
+      );
+    const stops = (column: string) =>
+      rows(column)
+        .filter((n: FakeElement) => n.getAttribute("tabindex") === "0")
+        .map((n: FakeElement) => n.getAttribute("id"));
+    // The combobox's active descendant is always a model, in the listbox it controls.
+    const listbox = search(m.root).getAttribute("aria-controls");
+    const inModels = () =>
+      q(m.root, `[id="${listbox}"] [id="${activeId(m.root)}"]`) !== null;
+    expect(inModels()).toBe(true);
+    // The highlighted runtime and effort are each column's one Tab stop; the models' is the
+    // search.
+    expect(stops("rail")).toEqual([rows("rail")[0].getAttribute("id")]);
+    expect(stops("efforts")).toEqual([rows("efforts")[3].getAttribute("id")]);
+    expect(stops("models")).toEqual([]);
+    // → to the efforts: the focus on the effort in effect, nothing active in the models.
+    await m.act(() => void press(search(m.root) as any, "ArrowRight"));
+    expect(focusedId()).toBe(rows("efforts")[3].getAttribute("id"));
+    expect(activeId(m.root)).toBe("");
+    await m.act(() => void press(focused(), "ArrowDown"));
+    expect(focusedId()).toBe(rows("efforts")[4].getAttribute("id"));
+    expect(stops("efforts")).toEqual([focusedId()]);
+    // ← back to the models: the search again, its active descendant a model.
+    await m.act(() => void press(focused(), "ArrowLeft"));
+    expect(focused() === (search(m.root) as any)).toBe(true);
+    expect(inModels()).toBe(true);
+    // ← to the rail: the focus on the runtime; ↓ moves it.
+    await m.act(() => void press(search(m.root) as any, "ArrowLeft"));
+    expect(focusedId()).toBe(rows("rail")[0].getAttribute("id"));
+    await m.act(() => void press(focused(), "ArrowDown"));
+    expect(focusedId()).toBe(rows("rail")[1].getAttribute("id"));
+    expect(activeId(m.root)).toBe("");
+    // Typing there searches the models, from the search.
+    await m.act(() => void press(focused(), "s"));
+    expect(focused() === (search(m.root) as any)).toBe(true);
+    expect((search(m.root) as any).value).toBe("s");
+    expect(inModels()).toBe(true);
+    // Tab to an effort (its focus, as the browser says it): the keys go on there; Esc
+    // closes from it.
+    const tabTo = (n: FakeElement) => {
+      n.focus();
+      n.dispatchEvent(new FakeEvent("focusin", { bubbles: true }));
+    };
+    await m.act(() => tabTo(rows("efforts")[1]));
+    await m.act(() => void press(focused(), "ArrowDown"));
+    expect(focusedId()).toBe(rows("efforts")[2].getAttribute("id"));
+    // Shift+Tab back to the search: the keys move in the models again.
+    await m.act(() => tabTo(search(m.root) as any));
+    expect(inModels()).toBe(true);
+    await m.act(() => tabTo(rows("efforts")[2]));
+    await m.act(() => void press(focused(), "Escape"));
+    expect(q(m.root, "[role=dialog]")).toBeNull();
+    expect(focused() === m.field).toBe(true);
+    expect(m.calls).toEqual([]);
   });
 
   it("on a pty thread, puts the focus on the rail and lets the keys pick a runtime", async () => {

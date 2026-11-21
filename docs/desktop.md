@@ -257,15 +257,22 @@ message box:
 - On the right, **Effort** with the model it is for, and a row for each effort the runtime
   takes, after **Default**.
 
-The focus starts in the search. ↑ and ↓ move, Enter picks a model, and the highlight moves
-on to the efforts with the popup still open; Enter or a click on an effort applies both at
-once. ← and → move between the columns, ← from an empty search to the runtimes. **Done**
+The focus starts in the search. ↑ and ↓ move, Enter picks a model, and the focus moves on
+to the efforts with the popup still open; Enter or a click on an effort applies both at
+once. ← and → move between the columns, ← from an empty search to the runtimes. In the
+models the focus stays in the search, the highlighted model its active row; in the runtimes
+and the efforts it is on the highlighted row, so a screen reader says each one, and Tab
+reaches each column at its highlighted row. Typing on a runtime or an effort goes on in the
+search. **Done**
 applies what is picked so far, an id typed in the custom field included, as an effort picked
 while the field is open does; with the field empty, the picker stays open and asks you to type
 an id or pick a model. A long list scrolls to keep the highlighted row in view, in
 every column. Esc or **Cancel** closes the picker with nothing changed and
 puts the focus back in the message box; so does a click outside, leaving the focus where you
-clicked. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. On a
+clicked. Esc works wherever the focus is in the picker, **Done** and **Cancel** too. The
+popup opens above the message box, as tall as the room there within the conversation
+column; with a tall draft in a short window that room is too small, and it opens over the
+message box instead. On a
 `pty` thread there is no search: the focus starts on its runtime in the rail and follows the
 highlight, so ↑, ↓ and Enter pick another runtime. In a narrow window the columns narrow
 to fit the message box and each scrolls its own rows. On a phone the picker is a sheet
@@ -275,7 +282,12 @@ scrolls through, every row a full-size touch target.
 Only what changed is sent. For a thread on its own runtime that is `thread.set_model` with
 the model, the effort, or both; picking the runtime's default sends `default`. Another
 runtime moves the thread, so the app asks first: its next message starts a new session of
-that runtime with a handoff. A `pty` thread runs its own command line, so the picker offers
+that runtime with a handoff, or, back on a runtime the thread left a session of, resumes that
+session ([Moving a thread back](runtimes.md#moving-a-thread-back)). A model or effort you
+pick is sent, **Default** as `default`; one you leave as it is (**Done** before picking it)
+is left out, so a resumed session goes on with the one it had there, and a new one starts
+with the runtime's default. `default` for a setting the runtime keeps on resume starts a new
+session instead. The question says which of these can happen. A `pty` thread runs its own command line, so the picker offers
 it only another runtime. For the orchestrator every change is a switch
 (`orchestrator.use`), a new orchestrator session with a handoff, even on the same runtime, so
 the app always asks: **Switch with summary** first asks the current orchestrator for its own
@@ -298,7 +310,9 @@ What you pick is planned against what runs as the picker opens. If that changes 
 it (another client switches the orchestrator, sets or moves the thread, or deletes it), the
 picker closes and the screen reader is told why; open it again to pick from what runs now. A
 confirmation it asked is taken back the same way, and one answered anyway changes nothing and
-says to pick again.
+says to pick again. So is a choice whose confirmation the picker hasn't asked yet, or has,
+when the picker goes away first: you leave the conversation, or open another workspace. The
+app's calls go to the workspace that is open, so nothing it asked for another one is sent.
 
 While the change is under way the button shows a spinner; a refusal from the hub shows as
 any other error. The button is disabled while the hub is disconnected and on a device

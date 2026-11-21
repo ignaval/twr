@@ -5,6 +5,7 @@
 import {
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -17,6 +18,7 @@ import {
   effortName,
   effortRows,
   modelRows,
+  moveDetail,
   navigate,
   notInstalled,
   opensPicker,
@@ -46,6 +48,10 @@ export interface PickerConfirmation {
 }
 
 const mobile = () => document.documentElement.dataset.mobile === "true";
+
+/** The least room above the composer the popup opens in: about its height with a runtime's
+ * six efforts and Done in view. With less it opens over the composer. */
+const PICKER_LEAST_ROOM = 300;
 
 export function ModelPicker({
   target,
@@ -137,6 +143,22 @@ export function ModelPicker({
   const asked = useRef<{ key: string; confirmation: PickerConfirmation }>(
     undefined,
   );
+  // Mounted: a choice still waiting for `orchestrator.show`, or a confirmation it asked,
+  // goes ahead only while the picker is there. Unmounted (the conversation left, another
+  // workspace opened), its target guard no longer follows what runs, and the app's calls
+  // go to whatever workspace is open: the pick is dropped and the confirmation taken back.
+  const mounted = useRef(true);
+  const withdrawLatest = useRef(withdraw);
+  withdrawLatest.current = withdraw;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      const stale = asked.current;
+      asked.current = undefined;
+      if (stale) withdrawLatest.current(stale.confirmation);
+    };
+  }, []);
   const targetName = useRef("");
   if (target)
     targetName.current =
@@ -264,6 +286,37 @@ export function ModelPicker({
   useEffect(() => {
     if (custom !== null) customField.current?.focus();
   }, [custom !== null]);
+  // Its height is the room above the composer, within every box that clips it (the
+  // conversation column), not the window's: a tall draft in a short window ran its top, the
+  // search and the first rows, past the column's. With too little room it opens over the
+  // composer instead, within the same boxes. (On a phone it is a sheet, the window's.)
+  useLayoutEffect(() => {
+    if (!open || mobile()) return;
+    const fit = () => {
+      const popup = root.current?.querySelector<HTMLElement>(
+        ".model-picker-popup",
+      );
+      const composer = popup?.offsetParent;
+      if (!popup || !composer) return;
+      const box = composer.getBoundingClientRect();
+      let top = 0;
+      for (let n = composer.parentElement; n; n = n.parentElement) {
+        const style = window.getComputedStyle(n);
+        if (style.overflowY !== "visible" || style.overflowX !== "visible")
+          top = Math.max(top, n.getBoundingClientRect().top);
+      }
+      // (Its 6-pixel gap above the composer, and 8 pixels clear of the edge.)
+      const above = box.top - top - 6 - 8;
+      const over = above < PICKER_LEAST_ROOM;
+      const room = over ? box.bottom - 8 - (top + 8) : above;
+      popup.style.setProperty("--model-picker-room", `${Math.floor(room)}px`);
+      if (over) popup.dataset.over = "true";
+      else delete popup.dataset.over;
+    };
+    fit();
+    window.addEventListener("resize", fit);
+    return () => window.removeEventListener("resize", fit);
+  }, [open]);
   // A click outside closes it.
   useEffect(() => {
     if (!open) return;
@@ -304,27 +357,32 @@ export function ModelPicker({
           ? undefined
           : optionId("models", nav.model)
         : optionId("efforts", nav.effort);
-  // The highlighted row stays in view as the keys move it (the search keeps the focus, so
-  // the list would not scroll by itself), in the rail and the efforts too, and as the
-  // popup opens on the row in effect.
+  // The highlighted row stays in view as the keys move it (the search keeps the focus in the
+  // models, so the list would not scroll by itself), in the rail and the efforts too, and as
+  // the popup opens on the row in effect.
   useEffect(() => {
     if (!open || !active) return;
     document.getElementById(active)?.scrollIntoView?.({ block: "nearest" });
   }, [open, active]);
-  // The focus on a row (no search to hold it: a runtime that runs its own command line)
-  // follows the highlighted one.
+  // The focus follows the keys between the columns: in the models it is the search's (the
+  // highlighted model its `aria-activedescendant`), in the rail and the efforts it is on the
+  // highlighted row, so a screen reader says each runtime and effort. Only from a row or the
+  // search: the custom id field, Cancel and Done keep it.
   useEffect(() => {
-    if (!open || !active) return;
+    if (!open) return;
     const focused = document.activeElement;
-    if (
+    const onRow =
       focused instanceof HTMLElement &&
-      focused.id !== active &&
       focused.matches(
         ".model-picker-popup [role=option], .model-picker-popup [role=radio]",
-      )
-    )
+      );
+    if (!onRow && focused !== search.current) return;
+    if (nav.column === "models" && !locked) {
+      // (Not on a phone: the search would bring up its keyboard.)
+      if (focused !== search.current && !mobile()) search.current?.focus();
+    } else if (active && (focused as HTMLElement).id !== active)
       focusOption(active);
-  }, [open, active]);
+  }, [open, nav.column, active]);
   if (!target) return null;
   const shown = triggerText(target);
   const name = kind === "orchestrator" ? "the orchestrator" : target.name;
@@ -349,6 +407,16 @@ export function ModelPicker({
     // Asked against what runs now: it goes ahead only if that is still so.
     const key = targetKey;
     const show = kind === "orchestrator" ? await orchShown.current : undefined;
+    // Gone, or changed, while the read ran: nothing asked, nothing sent.
+    if (!mounted.current) return;
+    if (latestKey.current !== key) {
+      fail(
+        new Error(
+          `${targetName.current} changed before the change was made: pick again`,
+        ),
+      );
+      return;
+    }
     const plan = planChange(kind, target, pick);
     if (plan.kind === "none") return;
     if (!admin && (plan.kind === "orchestrator" || plan.move)) {
@@ -361,6 +429,14 @@ export function ModelPicker({
       const current = (run: () => void) => () => {
         if (asked.current?.confirmation === confirmation)
           asked.current = undefined;
+        if (!mounted.current) {
+          fail(
+            new Error(
+              "The model picker closed before you confirmed: pick again",
+            ),
+          );
+          return;
+        }
         if (latestKey.current !== key) {
           const whose =
             kind === "orchestrator" ? "The orchestrator" : target.name;
@@ -377,10 +453,17 @@ export function ModelPicker({
       asked.current = { key, confirmation };
       confirm(confirmation);
     };
+    // (On a move, Default picked is named too: it is sent, unlike a setting not picked.)
+    const named = (k: "model" | "effort") =>
+      plan.kind === "thread" && plan.move && pick.chosen?.[k];
     const what = [
       pick.runtime,
-      pick.model ? `model ${pick.model}` : "",
-      pick.effort ? `effort ${effortName(pick.effort)}` : "",
+      pick.model
+        ? `model ${pick.model}`
+        : named("model")
+          ? "model Default"
+          : "",
+      pick.effort || named("effort") ? `effort ${effortName(pick.effort)}` : "",
     ]
       .filter(Boolean)
       .join(", ");
@@ -410,9 +493,7 @@ export function ModelPicker({
     if (plan.move) {
       ask({
         title: `Move ${target.name} to ${what}?`,
-        detail:
-          "A conversation cannot move between runtimes: the next message starts a new " +
-          `${pick.runtime} session, with a handoff of what ${target.name} did so far.`,
+        detail: moveDetail(target.name, pick),
         action: "Move thread",
         run: () => void call("thread.set_model", plan.params, moved),
       });
@@ -463,7 +544,12 @@ export function ModelPicker({
     if (!mobile()) search.current?.focus();
   };
   const chooseModel = (model: string | undefined) => {
-    const pick = { ...pending, runtime, model };
+    const pick: Pick = {
+      ...pending,
+      runtime,
+      model,
+      chosen: { ...pending.chosen, model: true },
+    };
     setPending(pick);
     setCustom(null);
     setNotice("");
@@ -473,12 +559,10 @@ export function ModelPicker({
       void apply(pick);
       return;
     }
-    setNav((n) => ({
-      ...n,
-      column: "efforts",
-      effort: Math.max(0, efforts.indexOf(pick.effort ?? null)),
-    }));
-    if (!mobile()) search.current?.focus();
+    const effort = Math.max(0, efforts.indexOf(pick.effort ?? null));
+    setNav((n) => ({ ...n, column: "efforts", effort }));
+    // The focus on the effort in effect (from the custom id field too, which goes).
+    if (!mobile()) focusOption(optionId("efforts", effort));
   };
   const chooseRow = (row: ModelRow) => {
     if (row.kind === "custom") {
@@ -507,7 +591,12 @@ export function ModelPicker({
   };
   const chooseEffort = (effort: string | null) => {
     const pick = picked();
-    if (pick) void apply({ ...pick, effort: effort ?? undefined });
+    if (pick)
+      void apply({
+        ...pick,
+        effort: effort ?? undefined,
+        chosen: { ...pick.chosen, effort: true },
+      });
   };
   const done = () => {
     if (locked) return void apply({ runtime });
@@ -579,11 +668,21 @@ export function ModelPicker({
             // The popup and its rows (the search and the custom id field handle their own
             // keys); elsewhere (Cancel, Done) Esc still closes it.
             const from = event.target as HTMLElement;
-            if (
-              from === event.currentTarget ||
-              from.matches("[role=option], [role=radio]")
-            )
-              keyDown(event);
+            const onRow = from.matches("[role=option], [role=radio]");
+            // A character typed on a runtime or an effort searches the models.
+            const typed =
+              event.key.length === 1 &&
+              event.key !== " " &&
+              !event.ctrlKey &&
+              !event.metaKey &&
+              !event.altKey;
+            if (onRow && typed && !locked) {
+              event.preventDefault();
+              event.stopPropagation();
+              setQuery((q) => q + event.key);
+              setNav((n) => ({ ...n, column: "models", model: 0 }));
+              search.current?.focus();
+            } else if (from === event.currentTarget || onRow) keyDown(event);
             else if (event.key === "Escape") {
               event.preventDefault();
               event.stopPropagation();
@@ -602,7 +701,11 @@ export function ModelPicker({
                 role="option"
                 key={r}
                 id={optionId("rail", i)}
-                tabIndex={-1}
+                // (Its highlighted row is the rail's one Tab stop.)
+                tabIndex={nav.rail === i ? 0 : -1}
+                onFocus={() =>
+                  setNav((n) => ({ ...n, column: "rail", rail: i }))
+                }
                 aria-selected={r === runtime}
                 aria-disabled={blocked(r) || undefined}
                 className={
@@ -642,7 +745,9 @@ export function ModelPicker({
               role="combobox"
               aria-expanded="true"
               aria-controls={`${id}-models`}
-              aria-activedescendant={active}
+              aria-activedescendant={
+                nav.column === "models" ? active : undefined
+              }
               autoComplete="off"
               spellCheck={false}
               value={query}
@@ -652,6 +757,12 @@ export function ModelPicker({
                 setNav((n) => ({ ...n, column: "models", model: 0 }));
               }}
               onKeyDown={keyDown}
+              // (Tab to it from a runtime or an effort: the keys go on in the models.)
+              onFocus={() =>
+                setNav((n) =>
+                  n.column === "models" ? n : { ...n, column: "models" },
+                )
+              }
             />
             <p className="model-picker-notice" role="status">
               {notice}
@@ -780,7 +891,10 @@ export function ModelPicker({
                   role="radio"
                   key={e ?? "default"}
                   id={optionId("efforts", i)}
-                  tabIndex={-1}
+                  tabIndex={nav.effort === i ? 0 : -1}
+                  onFocus={() =>
+                    setNav((n) => ({ ...n, column: "efforts", effort: i }))
+                  }
                   aria-checked={(pending.effort ?? null) === e}
                   className={
                     nav.column === "efforts" && nav.effort === i ? "active" : ""
