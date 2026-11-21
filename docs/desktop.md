@@ -64,7 +64,7 @@ the top.
 Drag the sidebar's right edge to resize it (200 to 440 px, default 260, and at most
 about a third of the window). Double-click the edge to reset it. With the edge focused,
 Left/Right change it by 10 px and Home/End jump to the limits. The width is saved with
-the other layout settings (Settings › Layout & text) and restored on the next launch.
+the other layout settings (Settings › General › Layout & text) and restored on the next launch.
 
 ## Workflows and CLI coverage
 
@@ -132,16 +132,16 @@ as code with a copy button instead of a link that does nothing.
 | Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Send as implementation loop, the Review loop button on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |
 | Attach, PTY fallback, arbitrary shell | Embedded xterm.js terminals using the matching real CLI or login shell |
-| Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
-| Boxes, SSH/container/dial-in setup, login, projects, tokens | Boxes page and generated interactive CLI forms |
-| Jobs, slots, timeouts, output and cancellation | Jobs table, launch form, live log and cancellation actions |
-| Usage and grouping/time windows | Usage meters and typed reporting form; CLI forms retain duration flags |
+| Account list/check/add/login/remove/native naming | Machines & accounts page, typed actions and generated interactive forms |
+| Boxes, SSH/container/dial-in setup, login, projects, tokens | Machines & accounts page (each machine's **Diagnose** and **Sign in**, the rest in its **⋯** menu) and generated interactive CLI forms |
+| Jobs, slots, timeouts, output and cancellation | Activity page's jobs table, launch form, live log and cancellation actions |
+| Usage and grouping/time windows | Activity page's usage meters and typed reporting form; CLI forms retain duration flags |
 | Next-message suggestions, routine summaries | Shared hub small-model calls (`suggest.next`, `summary.thread`), first-use disclosure, the suggestion as the empty message box's placeholder taken with Tab or → (tap it on a phone), expandable routine updates |
 | Context and memory | Revision-aware editors, note cards and standing-context editor |
-| Speech, remote sessions, speaker controls | Read-aloud page and embedded CLI forms |
+| Speech, remote sessions, speaker controls | Settings › Voice (each speaker's own controls) and embedded CLI forms |
 | Workspaces | Sidebar workspace tree (every workspace, its threads nested), creation and removal forms |
 | Trash list/restore/purge | Trash table and preview-first purge form |
-| Log statistics/archive/checkpoints, info, events/control | Hub & storage, diagnostics and generated CLI forms |
+| Log statistics/archive/checkpoints, info, events/control | Settings › Advanced › Hub & storage, diagnostics and generated CLI forms |
 | Runner provisioning and terminal setup | Advanced CLI forms; runner commands do not receive workspace flags |
 | Update | App-level release check and platform installer; the CLI never overwrites the app's engine |
 
@@ -156,12 +156,30 @@ Automatic `--yes` flags and agent-only MCP entry points are deliberately not off
 Global socket/workspace overrides cannot escape the selected workspace; subprocess arguments
 after `--` remain literal. Every other user command and option remains discoverable.
 
-Settings offers common defaults plus the complete TOML editor. Writes reuse the TUI's
-comment-preserving, locked, crash-recoverable writer. Full-text saves check the text's hash
-and the merged `boxes.toml`, so an unseen change is not overwritten. Unsaved editor drafts
-stay in memory across navigation, not in browser storage. Closing/reloading asks before
-discarding them. Hub settings require a deliberate hub restart. Suggestions and summaries share `[tui]`
-preferences with the CLI and apply immediately on revisiting the conversation. Before the
+The Manage pages are **Machines & accounts** (accounts, then the machines your agents work
+on), **Activity** (jobs, then subscription usage), **Context & memory** and **Trash**. A row
+or card carries its own actions (Restore, Sign in, Diagnose…); the buttons above a list are
+only for what isn't on a row.
+
+Settings is in tabs, and opens on the one used last on this device: **General** (appearance,
+layout and text, accessibility, and on the desktop the application and its updates),
+**Agents** (the orchestrator, and **New thread defaults**), **Loops**, **Voice** (this
+device's read-aloud voice and the speakers connected to the hub, each with its own pause,
+resume, skip and stop, **Read new messages** and reading speed) and **Advanced** (offline
+history, diagnostics, **Hub & storage**, the config file and the effective configuration).
+Arrow keys move between the tabs. A device without admin access sees General, Loops, Voice
+(its own voice only) and Advanced (its own offline history). New thread defaults are
+switches and lists of the values the config takes, in words: each saves as you change it and
+says **Saved**; a hub setting adds that it applies after the hub restarts. The rarer ones
+(log retention and archiving, the background timeout, waking a thread after its background
+work) are under **Advanced**, and Codex's choice for commands its sandbox blocks shows only
+when Codex is installed. **Edit config file…** unfolds the complete TOML editor. Writes
+reuse the TUI's comment-preserving, locked, crash-recoverable writer. Full-text saves check
+the text's hash and the merged `boxes.toml`, so an unseen change is not overwritten. Unsaved
+editor drafts stay in memory across navigation, not in browser storage. Closing/reloading
+asks before discarding them. Hub settings require a deliberate hub restart. Suggestions and
+summaries share `[tui]` preferences with the CLI and apply immediately on revisiting the
+conversation. Before the
 first provider call, an in-app notice explains the exact text sent, models, providers and
 that calls count toward your plan's usage; it names no price. As in the TUI, a suggestion
 shows greyed as the empty message box's placeholder: `Tab` or `→` puts it in the box (once
@@ -169,7 +187,10 @@ it has been on screen 300 ms, so a key pressed as it appears isn't taken for it)
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
 
-Settings › Orchestrator also sets the orchestrator's [access](orchestrator.md#full-access)
+Settings › Agents › Orchestrator shows the orchestrator's runtime and model as lists:
+**Apply** switches to the ones chosen, with a handoff summary (`orchestrator.use`), as the
+palette's **Switch orchestrator** does. **Fresh conversation…** starts over, and **Start with
+the hub** is `[orchestrator] autostart`. It also sets the orchestrator's [access](orchestrator.md#full-access)
 (`orchestrator.access`): **Limited** or **Full**, each described in one line. Full asks
 first, in words, what it gives up; Limited doesn't. The answer says when it applies (at
 once, when the orchestrator's current turn ends, or at its next start) and warns when
@@ -315,7 +336,8 @@ machine.
   offers to start a loop on its threads: the buttons wait and say `Box devbox is away: a
   loop can start once it is back.`
 - **Settings.** **Change…** in the Loops section and `/loop settings` open the editor:
-  the four presets, the implementer (the thread's own, or a runtime, model and effort), its
+  the four presets first; the rest sits behind **Customize**, which is open when the
+  settings match no preset (or there are no presets, or the hub names a problem): the implementer (the thread's own, or a runtime, model and effort), its
   workers where its runtime has subagents, the reviewer (runtime, model, and account where
   it has several), the profile, an implementation loop's plan check and commits, what a
   review loop commits, **Sweep** (the thread audits the rules, or a reviewer run per rule:
@@ -349,7 +371,7 @@ On Linux the icon needs a StatusNotifierItem host: the tray of Omarchy's bar (th
 KDE Plasma, or GNOME with the AppIndicator extension. Without one, Settings says so
 and background mode stays off, so the window can always be brought back.
 
-Settings › Application has four switches:
+Settings › General › Application has four switches:
 
 - **Launch at login.** On macOS this registers a login item (macOS may ask you to
   allow it in System Settings › General › Login Items). On Linux it writes
@@ -399,7 +421,7 @@ Settings › Application has four switches:
 | AUR (`twr-desktop-bin`) | Your AUR helper updates it with the system (`yay -Syu`, Omarchy's **Update**); the app also notifies |
 
 The app checks the latest GitHub release 45 seconds after launch and then every six
-hours. Turn this off, or check by hand, in Settings › Updates or Help › Check for Updates.
+hours. Turn this off, or check by hand, in Settings › General › Updates or Help › Check for Updates.
 It only reacts to a release once that release has the installers and update metadata for
 this platform. Self-updating builds verify the download against the SHA-512 in the
 release's `latest-*.yml`, and on macOS against the app's code signature. An AppImage also
@@ -415,14 +437,14 @@ content-addressed directory, so a running hub's executable is never replaced.
 ## Diagnostics
 
 twr keeps a local log (`twr-desktop.log`, rotated at 2 MiB) in the folder shown by
-**Help › Open Log Folder** and in Settings › Diagnostics (`~/Library/Logs/twr-desktop`
+**Help › Open Log Folder** and in Settings › Advanced › Diagnostics (`~/Library/Logs/twr-desktop`
 on macOS; under the app's configuration folder on Linux). The log records startup, update checks, hub connection failures, renderer errors
 and crashed helper processes. Chromium crash reports are kept on disk and never uploaded.
 If the window's page ends unexpectedly (out of memory, a GPU failure), twr reloads it, up to
 three times in five minutes, then asks whether to reload or quit. A window that stops
 responding offers Wait or Reload; the question closes itself if the window recovers.
 Reloading keeps the hub, its agents and open terminals.
-**Settings › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
+**Settings › Advanced › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
 version, install kind, platform and session details, GPU status, memory use and the recent
 log. Tokens, keys, URL credentials and your home folder path are removed first.
 
@@ -696,9 +718,9 @@ it was last moved, resized or closed (saved in the app's `desktop.json`). It is 
 shrunk to fit the display that shows most of it; if that display is gone, it keeps its size
 and opens in the default place.
 
-Settings → Layout & text offers Compact and Comfortable density, independent interface and code text sizes, and sidebar/inspector width sliders. Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
+Settings › General › Layout & text has a **Compact layout** switch and the interface and code text sizes (Small, Default, Large, Extra large; a size an earlier version saved shows as Custom). Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
 
-Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings. Configuration/editor drafts stay in memory because they may contain credentials.
+Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings › Advanced. Configuration/editor drafts stay in memory because they may contain credentials.
 
 When a saved hub is offline, the app shows dated cached history with request buttons disabled. Plain messages can be saved in the outbox for their original workspace and destination. Reopening the app preserves the original request ID; reconnecting retries that ID within 23 hours. An expired receipt or an unknown delivery outcome requires review in the conversation before a new message is sent. Removing an outbox entry never recalls a message already delivered to the hub. Shell commands, slash commands and permission answers require a live connection. Forgetting a hub removes its local encrypted history, drafts, outbox and bootstrap metadata.
 

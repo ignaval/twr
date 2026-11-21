@@ -163,6 +163,7 @@ export async function captureUI(page, { hubPids } = {}) {
   };
   const theme = async (value) => {
     await nav("Settings");
+    await page.getByRole("tab", { name: "General", exact: true }).click();
     await page
       .getByRole("heading", { name: "Appearance", exact: true })
       .waitFor();
@@ -309,6 +310,7 @@ export async function captureUI(page, { hubPids } = {}) {
   await palette("dark");
   await newThread("dark", true);
   await nav("Settings");
+  await page.getByRole("tab", { name: "General", exact: true }).click();
   await page
     .getByRole("heading", { name: "Appearance", exact: true })
     .waitFor();

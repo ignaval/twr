@@ -698,8 +698,9 @@ const auditTheme = async (unit) => {
     .getByText("Loading loop settings…")
     .waitFor({ state: "hidden", timeout: 30000 });
   await add("loop-editor");
+  // The first visible field: the controls past the preset may sit behind Customize.
   const editorField = editor
-    .locator("select, input:not([type=checkbox], [type=radio])")
+    .locator("select:visible, input:not([type=checkbox], [type=radio]):visible")
     .first();
   if (await editorField.count()) {
     await keyboardFocus(editorField);
@@ -713,10 +714,12 @@ const auditTheme = async (unit) => {
   await page.locator(".manager .attention-card").first().waitFor();
   await add("needs-you");
   await navTo("Settings");
+  await page.getByRole("tab", { name: "General", exact: true }).click();
   await page
     .getByRole("heading", { name: "Appearance", exact: true })
     .waitFor();
   await add("settings");
+  await page.getByRole("tab", { name: "Loops", exact: true }).click();
   const loopSettings = page
     .locator(".settings-section")
     .filter({ has: page.getByRole("heading", { name: "Loops", exact: true }) });
@@ -1161,6 +1164,7 @@ try {
     .locator(".sidebar-footer")
     .getByRole("button", { name: "Settings", exact: true })
     .click();
+  await page.getByRole("tab", { name: "General", exact: true }).click();
   await page.getByRole("button", { name: "System", exact: true }).click();
   const light = await verifySystem(palettes.light);
   await captureSurfaces("light");

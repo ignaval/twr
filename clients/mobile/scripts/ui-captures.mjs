@@ -109,6 +109,7 @@ export async function captureMobileUI(page, { label, thread }) {
       .locator(".sidebar-footer")
       .getByRole("button", { name: "Settings", exact: true })
       .click();
+    await page.getByRole("tab", { name: "General", exact: true }).click();
     await page
       .getByRole("heading", { name: "Appearance", exact: true })
       .waitFor();

@@ -349,6 +349,7 @@ async function orchestratorAccessQA() {
     .getByRole("button", { name: "More", exact: true })
     .click();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("tab", { name: "Agents", exact: true }).click();
   const group = page.getByRole("group", { name: "Orchestrator access" });
   await group.scrollIntoViewIfNeeded();
   const limited = group.getByRole("button", { name: "Limited", exact: true });

@@ -615,8 +615,10 @@ try {
       .getByRole("button", { name: "Settings", exact: true })
       .first()
       .click();
+    await page.getByRole("tab", { name: "General", exact: true }).click();
     await page.getByRole("heading", { name: "Application" }).waitFor();
     await page.getByRole("switch", { name: "Launch at login" }).waitFor();
+    await page.getByRole("tab", { name: "Advanced", exact: true }).click();
     await page.getByRole("heading", { name: "Diagnostics" }).waitFor();
     console.log(
       `PASS: packaged tray settings, background close/reopen, redacted diagnostics and ad hoc update policy${signing === "adhoc" ? "" : " (QA copy of a Developer ID build)"}`,
