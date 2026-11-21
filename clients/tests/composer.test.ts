@@ -2506,6 +2506,18 @@ describe("messages put back in the box stay messages", () => {
     expect(sentMessages()).toEqual(["/usage", "!ls"]);
   });
 
+  it("keeps a taken-back message when the box holds a command, sending both as text", async () => {
+    await start();
+    app().host.queues.w1 = [{ ref: 1, prompt: "taken back", mine: true }];
+    await app().talkTo("builder");
+    await app().type("/usage");
+    await app().click(app().find(".queued-message button", "Take back"));
+    expect(app().box().value).toBe("//usage\n\ntaken back");
+    await app().press("Enter");
+    expect(app().all(".usage-panel")).toHaveLength(0);
+    expect(sentMessages()).toEqual(["/usage\n\ntaken back"]);
+  });
+
   it("puts back what a switch dropped escaped, and says the new orchestrator can't start", async () => {
     const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
     const uses: Json[] = [];
@@ -2542,10 +2554,9 @@ describe("messages put back in the box stay messages", () => {
         .find((n) => n.textContent.includes("Low"))! as FakeElement,
     );
     await app().click(app().find("button", "Switch without summary"));
-    // The effort alone changed: the account it runs on goes with it, the native one too.
-    expect(uses).toEqual([
-      { runtime: "fake:default", effort: "low", summary: false },
-    ]);
+    // The effort alone changed. `fake` takes no accounts, so no account goes with it
+    // (an account runtime's native login does: "keeps the native login by its name…").
+    expect(uses).toEqual([{ runtime: "fake", effort: "low", summary: false }]);
     expect(app().find(".notice-toast").textContent).toContain(
       "fake is not on PATH: the new orchestrator cannot start until it is there (install it).",
     );

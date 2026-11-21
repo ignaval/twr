@@ -75,7 +75,9 @@ Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a l
 A line that starts with `!` runs a shell command; start it with `\!` to send a message that
 begins with `!`, as in the TUI. A message you take back from the queue, put back after an
 orchestrator switch, or take as a suggestion comes back escaped this way when it starts the
-box, so Send sends it as a message again, never as a command.
+box, so Send sends it as a message again, never as a command. When the box already holds a
+`/` command or a `!` line, that line is escaped too, so Send sends both as one message
+rather than running the command and clearing the text that came back.
 
 Above the history, the orchestrator and each thread's conversation show the first line
 of your preceding message, on desktop and phone. At the bottom, this is your latest
@@ -277,7 +279,8 @@ summary, **Switch without summary** hands over only what the log shows
 ([orchestrator.md](orchestrator.md#switching-the-orchestrator)). On the same runtime the
 switch names the account the orchestrator runs on (`codex:work`), the native login by its
 current name (`codex:default`, from `orchestrator.show` `account`), so changing only the
-model or effort never moves it to the runtime's default account. To a runtime that isn't
+model or effort never moves it to the runtime's default account. An ACP agent takes no
+account: the switch names a bare `acp`, which keeps the agent it runs. To a runtime that isn't
 installed, the question says the new orchestrator can't start until it is. After a switch,
 the hub's warning and a start that failed (`warning`, `start_error`) show as a notice, as
 does a thread move's warning. A switch drops the messages

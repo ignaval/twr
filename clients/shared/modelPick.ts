@@ -12,6 +12,10 @@ import {
 } from "./models";
 import type { Json, Thread } from "./types";
 
+/** The runtimes that take accounts, as `twr_core::account::ACCOUNT_RUNTIMES` lists them:
+ * only they take `runtime:account`. */
+const ACCOUNT_RUNTIMES = new Set(["claude-code", "codex", "grok-build"]);
+
 /** What the picker has chosen: a runtime, and its model and effort (`undefined`: the
  * runtime's own default). */
 export interface Pick {
@@ -244,7 +248,11 @@ export function planChange(
   if (target === "orchestrator") {
     if (same && pick.model === now.model && pick.effort === now.effort)
       return { kind: "none" };
-    const kept = thread.account || account;
+    // Only a runtime with accounts takes `runtime:account`: for an ACP agent the part
+    // after the colon is a command, and a bare `acp` keeps the recorded agent.
+    const kept = ACCOUNT_RUNTIMES.has(baseRuntime(pick.runtime))
+      ? thread.account || account
+      : undefined;
     const params: Json = {
       runtime: same && kept ? `${pick.runtime}:${kept}` : pick.runtime,
       summary: true,

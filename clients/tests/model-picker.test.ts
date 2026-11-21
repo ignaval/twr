@@ -190,6 +190,24 @@ describe("what a choice asks of the hub", () => {
     ).toEqual({ kind: "none" });
   });
 
+  it("keeps an ACP orchestrator's agent: no account goes after `acp`", () => {
+    // `orchestrator.show` names an account for an ACP orchestrator too, but after `acp:`
+    // the hub reads a command: a bare `acp` keeps the recorded agent.
+    const orch = thread({ id: "o", runtime: "acp", is_orchestrator: true });
+    const show = { thread: "o", account: "default" };
+    expect(
+      planChange(
+        "orchestrator",
+        orch,
+        { runtime: "acp", model: "m2" },
+        orchAccount(show, orch),
+      ),
+    ).toEqual({
+      kind: "orchestrator",
+      params: { runtime: "acp", model: "m2", summary: true },
+    });
+  });
+
   it("keeps the native login by its name when only the effort changes", () => {
     // On the native login the thread records no account; `orchestrator.show` names it.
     const orch = thread({ id: "o", runtime: "codex", is_orchestrator: true });

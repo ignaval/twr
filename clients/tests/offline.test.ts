@@ -6,6 +6,8 @@ import {
   forgetOfflineHost,
   offlineJournal,
   appendDraft,
+  appendMessage,
+  isCommandDraft,
   recordSize,
 } from "../shared/offline";
 import { MessageReceipts } from "../desktop/message-receipts";
@@ -168,6 +170,18 @@ describe("encrypted offline recovery", () => {
     expect(merged).toBe("new typing\n\n//literal");
     expect(journal.snapshot.drafts["work:orchestrator"]).toBe(merged);
     expect(appendDraft(merged, result.restored_draft.text)).toBe(merged);
+  });
+  it("turns a command draft into text when a message is added after it", () => {
+    // Send would run `/usage` (or the `!` line) and clear the box, text added after it too.
+    expect(appendDraft("/usage", "taken back")).toBe("//usage\n\ntaken back");
+    expect(appendDraft("!ls", "taken back")).toBe("\\!ls\n\ntaken back");
+    expect(appendMessage("/usage", "/literal")).toBe("//usage\n\n/literal");
+    // A draft that already sends as a message, or plain text, is kept as it is.
+    expect(appendDraft("//usage", "x")).toBe("//usage\n\nx");
+    expect(appendDraft("\\!ls", "x")).toBe("\\!ls\n\nx");
+    expect(appendDraft("hello", "x")).toBe("hello\n\nx");
+    expect(isCommandDraft("/usage")).toBe(true);
+    expect(isCommandDraft("//usage")).toBe(false);
   });
   it("moves a queued message to a draft before it can be edited and resent", async () => {
     const disk = storage();

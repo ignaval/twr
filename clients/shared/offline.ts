@@ -16,9 +16,18 @@ export interface OutboxMessage extends DurableMessage {
 }
 export function appendDraft(current: string | undefined, text: string) {
   if (!current) return text;
-  return current === text || current.endsWith("\n\n" + text)
-    ? current
-    : current + "\n\n" + text;
+  if (current === text || current.endsWith("\n\n" + text)) return current;
+  // A draft that is a `/` command or a `!` shell line would send none of the text added
+  // after it (Send runs the command and clears the box): it becomes a message too.
+  const head = isCommandDraft(current) ? literalDraft(current) : current;
+  return head + "\n\n" + text;
+}
+/** A draft Send runs as a `/` command or a `!` shell line rather than sending it. */
+export function isCommandDraft(draft: string) {
+  return (
+    (draft.startsWith("/") || draft.startsWith("!")) &&
+    messageText(draft) === draft
+  );
 }
 /**
  * The message a composer draft sends, as the TUI's `message_text` reads a line: `//...`
