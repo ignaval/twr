@@ -296,13 +296,36 @@ voice = "Ava (Premium)"
 voices = { en = "Ava (Premium)", es = "kokoro/ef_dora" }
 ```
 
+A speaker that is running reads with a voice chosen meanwhile from its next sentence on: each
+one looks at `[speech] voice` and `voices` again once a second, when the config file has
+changed. `twr speak --voice` and `--voice-for` still beat them, and a voice set with `/read
+voice` beats `voice` (not `voices`), as it does at start.
+
+### Choosing a voice in the apps
+
+In the desktop app, **Settings › Read-aloud voice** has a picker for English and one for
+Spanish: this computer's voices (on a Mac, its Premium and Enhanced ones first; **Get more Mac
+voices…** opens System Settings › Accessibility › Spoken Content) and twr's natural voices.
+**Preview** says a sentence with the voice (`twr voices try`). Choosing a natural voice that
+isn't downloaded offers its download, with its progress, and saves the choice once it is
+installed; a note says what a voice still needs (espeak-ng) or that this computer is too slow
+for it. With nothing chosen, a suggestion names the best voice ready, else Kokoro to download.
+The choice is `[speech] voice` (the English choice, else the Spanish one) and `voices` in this
+computer's config, written in place: every other line stays. A `[speech.voices]` table of its
+own, or a `voices` value over several lines, is left alone, and the app says to edit it in
+Settings › Configuration.
+
+The phone apps have the same section for the phone's speaker: [mobile.md](mobile.md#voices).
+The TUI has `/read voice <name>` for every speaker at once; a voice per language there is
+`[speech] voices`, which its own speaker follows as you save it.
+
 macOS's documentation doesn't say whether its ordinary voices work offline. With the `command`
 engine, the text goes wherever your program sends it: a hosted voice gets every word of the
 conversation.
 
 Windows isn't supported. A phone can't run `twr speak`; the iOS and Android apps' voice mode has
-the mobile gateway run a speaker for the phone, which speaks with the platform's own voice
-([mobile.md](mobile.md#voice)). On Android, Termux can also read the plain feed (below) with
+the mobile gateway run a speaker for the phone, which speaks with the phone's own voices or
+with twr's natural voices made on the hub's computer ([mobile.md](mobile.md#voices)). On Android, Termux can also read the plain feed (below) with
 `termux-tts-speak`.
 
 ## The feed, for your own reader

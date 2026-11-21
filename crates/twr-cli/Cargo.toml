@@ -43,6 +43,8 @@ ring.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `twr voices render`: audio for the mobile gateway, as base64 in JSON lines.
+base64 = "0.23.1"
 # Private, unique, automatically cleaned voice model downloads.
 tempfile.workspace = true
 tokio.workspace = true

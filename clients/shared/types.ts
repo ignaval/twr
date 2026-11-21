@@ -87,6 +87,10 @@ export interface DesktopEvent {
   data?: string;
   exitCode?: number;
   theme?: Record<string, string> | null;
+  /** `voice-install`: a natural voice model's download (desktop/voices.ts). */
+  install?: import("./readAloudVoices").VoiceInstall;
+  /** `voice-preview`: the voice being previewed (none: it ended). */
+  preview?: { voice?: string };
   /** `voice-speaker`: this computer's own speaker (desktop/voice.ts). */
   speaker?: {
     running: boolean;
@@ -152,6 +156,8 @@ export interface DesktopAPI {
   ): Promise<NonNullable<DesktopEvent["speaker"]>>;
   /** Voice mode with the platform's own recognizer and voice (mobile). */
   nativeVoice?: import("./voice").NativeVoice;
+  /** Settings › Read-aloud voice: this device's voices and twr's natural ones. */
+  readAloudVoices?: import("./readAloudVoices").ReadAloudVoices;
   quit(): Promise<void>;
   copyText(text: string): Promise<void>;
   bootstrap(): Promise<{

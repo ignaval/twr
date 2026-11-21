@@ -6,6 +6,13 @@
 //! engine's future. A future dropped early (stop, skip, a pause) tells the phone to stop
 //! (`voice-speak-stop`).
 //!
+//! - **Voices.** A voice per language is the phone's own choice ([`select`], kept in its state
+//!   file, never the hub machine's `[speech]` voices): one of the phone's voices (an
+//!   identifier without `/`), said by the phone from the text as above, the message's
+//!   language with it (`lang`); or one of twr's natural voices (`kokoro/af_heart`), made here
+//!   by `twr voices render` ([`Renderer`]) and sent to the phone as audio (`voice-audio`:
+//!   16-bit mono PCM pieces, paced to how fast they play), which plays it and acks it the
+//!   same way. Nothing plays on this machine.
 //! - **Controls** come from the phone as `voice-speaker` calls and go to the speaker as
 //!   [`Key`]s, here: pausing the voice the moment the user talks never waits for the hub.
 //! - **State** ([`twr_speech::SpeakerOpts::observe`]) goes to the phone as
@@ -27,8 +34,8 @@
 //! text, so a phone can never make the hub (or another speaker) say anything. Acks resolve
 //! only this device's own pending utterances.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -217,14 +224,461 @@ impl Drop for SocketGuard {
     }
 }
 
+/// The languages a phone picks a voice for (`twr_core::speech::LANGUAGES`).
+pub fn language_ok(lang: &str) -> bool {
+    twr_core::speech::LANGUAGES.contains(&lang)
+}
+
+/// Whether `voice` is one of twr's natural voices (`<model>/<voice>`), which this machine
+/// makes for the phone, rather than one of the phone's own (an iOS identifier such as
+/// `com.apple.voice.premium.en-US.Ava`, an Android name such as `es-us-x-esd-local`: neither
+/// has a `/`).
+pub fn is_natural(voice: &str) -> bool {
+    voice.split_once('/').is_some_and(|(model, name)| {
+        !model.is_empty()
+            && !name.is_empty()
+            && model
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
+}
+
+/// A sentence in each language, said by a voice the phone previews: the gateway's own words
+/// (no call takes text to say).
+pub fn preview_text(lang: &str) -> &'static str {
+    match lang {
+        "es" => "Hola. Así sueno cuando leo tus respuestas en voz alta.",
+        _ => "Hi. This is how I sound when I read your replies aloud.",
+    }
+}
+
+/// twr's natural voices on this machine, as `twr voices list --json` (run as `binary`) lists
+/// them, for a phone: only twr's own (this machine's system voices are not the phone's), and
+/// ready once installed with what they need to be made (espeak-ng), whether or not this
+/// machine has speakers.
+pub async fn natural_listing(binary: &Path) -> Result<Value> {
+    let out = tokio::process::Command::new(binary)
+        .args(["voices", "list", "--json"])
+        .env_remove("TWR_DEVICE_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("Listing twr's voices")?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "{}",
+            why.lines()
+                .last()
+                .unwrap_or("This hub's twr has no `twr voices`")
+                .trim_start_matches("twr: ")
+        );
+    }
+    let mut listing: Value = serde_json::from_slice(&out.stdout).context("Reading twr's voices")?;
+    Ok(natural_only(&mut listing))
+}
+
+/// [`natural_listing`]'s filter over a listing.
+pub fn natural_only(listing: &mut Value) -> Value {
+    let mut models = Vec::new();
+    for m in listing["models"].as_array().cloned().unwrap_or_default() {
+        let mut m = m;
+        let espeak = m["needs"].as_str().is_some_and(|n| n.contains("espeak-ng"));
+        m["needs"] = if espeak {
+            json!("espeak-ng")
+        } else {
+            Value::Null
+        };
+        models.push(m);
+    }
+    let ready = |model: &str| {
+        models
+            .iter()
+            .any(|m| m["name"] == model && m["installed"] == true && m["needs"].is_null())
+    };
+    let voices: Vec<Value> = listing["voices"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| v["engine"] == "twr")
+        .map(|mut v| {
+            v["ready"] = json!(ready(v["model"].as_str().unwrap_or_default()));
+            v
+        })
+        .collect();
+    json!({"voices": voices, "models": models, "espeak": listing["espeak"].clone()})
+}
+
+/// `twr voices install MODEL --json`, its progress told to the phone.
+async fn install(out: &Outbox, binary: &Path, model: &str) -> Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let mut child = tokio::process::Command::new(binary)
+        .args(["voices", "install", model, "--json"])
+        .env_remove("TWR_DEVICE_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("Starting the voice download")?;
+    let stdout = child.stdout.take().context("no stdout")?;
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut failure = None;
+    let event = |install: Value| json!({"type":"voice-install","install":install});
+    while let Some(line) = lines.next_line().await? {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("progress") => out.send(event(json!({
+                "model": model, "phase": "downloading",
+                "bytes": v["bytes"], "total": v["total"],
+            }))),
+            Some("phase") => out.send(event(json!({"model": model, "phase": v["phase"]}))),
+            Some("error") => failure = v["message"].as_str().map(str::to_owned),
+            _ => {}
+        }
+    }
+    let status = child.wait().await?;
+    match (status.success(), failure) {
+        (true, _) => Ok(()),
+        (false, Some(why)) => Err(anyhow!(why)),
+        (false, None) => Err(anyhow!("The voice download failed")),
+    }
+}
+
+/// The phone's choice ([`SpeechState::voices`]) as a speaker's voices: the voice of other
+/// languages is the English one, else the Spanish one.
+pub fn chosen_voices(voices: &BTreeMap<String, String>) -> twr_speech::Voices {
+    twr_speech::Voices {
+        voice: voices.get("en").or_else(|| voices.get("es")).cloned(),
+        voices: voices.clone(),
+    }
+}
+
+/// Sets (or, with `None`, clears) the phone's voice for `lang` in its state file.
+pub fn select(
+    store: &StateStore,
+    lang: &str,
+    voice: Option<&str>,
+) -> Result<BTreeMap<String, String>> {
+    anyhow::ensure!(language_ok(lang), "Unknown language");
+    if let Some(v) = voice {
+        anyhow::ensure!(
+            twr_core::speech::name_error("voice", v, twr_speech::speaker::VOICE_MAX).is_none(),
+            "Invalid voice"
+        );
+    }
+    let state = store
+        .update(|s| match voice {
+            Some(v) => {
+                s.voices.insert(lang.to_owned(), v.to_owned());
+            }
+            None => {
+                s.voices.remove(lang);
+            }
+        })
+        .context("Saving the phone's voice")?;
+    Ok(state.voices)
+}
+
+/// The most audio of one `voice-audio` event, in bytes of PCM (about 2.7 s at 24 kHz): small
+/// next to a socket's event backlog ([`super::events`]).
+const PIECE_BYTES: usize = 128 * 1024;
+/// How far the audio sent may run ahead of the time it takes to play.
+const AHEAD: Duration = Duration::from_secs(8);
+
+/// One piece of audio: base64 of 16-bit little-endian mono PCM at `rate`.
+#[derive(Debug, Clone)]
+pub struct Piece {
+    pub pcm: Arc<str>,
+    pub rate: u32,
+}
+
+impl Piece {
+    /// How long it plays.
+    fn secs(&self) -> f64 {
+        let bytes = self.pcm.len() / 4 * 3;
+        bytes as f64 / 2.0 / f64::from(self.rate.max(1))
+    }
+}
+
+/// A chunk being made into audio, as far as it is.
+#[derive(Debug, Clone, Default)]
+pub struct Render {
+    pub pieces: Vec<Piece>,
+    pub done: bool,
+    pub error: Option<String>,
+}
+
+/// `pcm` (a sentence's base64) cut into pieces of [`PIECE_BYTES`] at most (whole base64
+/// quads, so each decodes alone).
+fn pieces(pcm: &str, rate: u32) -> Vec<Piece> {
+    let step = PIECE_BYTES / 3 * 4;
+    let mut out = Vec::new();
+    let mut rest = pcm;
+    while !rest.is_empty() {
+        let n = rest.len().min(step);
+        let (head, tail) = rest.split_at(n);
+        out.push(Piece {
+            pcm: Arc::from(head),
+            rate,
+        });
+        rest = tail;
+    }
+    out
+}
+
+/// What a request to [`Renderer`] is.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RenderKey {
+    pub voice: String,
+    pub text: String,
+    pub lang: Option<String>,
+    pub rate: u32,
+}
+
+struct RenderProc {
+    stdin: mpsc::UnboundedSender<String>,
+    routes: Arc<Mutex<HashMap<u64, watch::Sender<Render>>>>,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// twr's natural voices, made on this machine for phones: one `twr voices render` process
+/// (its models stay loaded while it is used), started when first needed and again if it
+/// ends. Its audio goes to the phone, never to this machine's speakers.
+pub struct Renderer {
+    binary: PathBuf,
+    proc: Mutex<Option<RenderProc>>,
+    next: AtomicU64,
+}
+
+impl Renderer {
+    pub fn new(binary: PathBuf) -> Arc<Renderer> {
+        Arc::new(Renderer {
+            binary,
+            proc: Mutex::new(None),
+            next: AtomicU64::new(0),
+        })
+    }
+
+    fn spawn(&self) -> Result<RenderProc> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let mut child = tokio::process::Command::new(&self.binary)
+            .args(["voices", "render"])
+            .env_remove("TWR_DEVICE_TOKEN")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("Starting twr's voices")?;
+        let mut stdin = child.stdin.take().context("twr's voices: no stdin")?;
+        let stdout = child.stdout.take().context("twr's voices: no stdout")?;
+        let stderr = child.stderr.take().context("twr's voices: no stderr")?;
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let routes: Arc<Mutex<HashMap<u64, watch::Sender<Render>>>> = Arc::default();
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        tokio::spawn(async move {
+            while let Some(line) = rx.recv().await {
+                if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                crate::gateway_log!(
+                    "twr voices render: {}",
+                    line.chars().take(300).collect::<String>()
+                );
+            }
+        });
+        {
+            let (routes, alive) = (routes.clone(), alive.clone());
+            tokio::spawn(async move {
+                let mut child = child;
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(v) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    let Some(id) = v["id"].as_u64() else { continue };
+                    let mut routes = routes.lock().unwrap();
+                    let Some(route) = routes.get(&id) else {
+                        continue;
+                    };
+                    let finished = if let Some(pcm) = v["pcm"].as_str() {
+                        let rate = v["rate"]
+                            .as_u64()
+                            .and_then(|r| u32::try_from(r).ok())
+                            .unwrap_or(24_000);
+                        route.send_modify(|r| r.pieces.extend(pieces(pcm, rate)));
+                        false
+                    } else if v["done"] == true {
+                        route.send_modify(|r| r.done = true);
+                        true
+                    } else {
+                        let why = v["error"].as_str().unwrap_or("the voice failed").to_owned();
+                        route.send_modify(|r| r.error = Some(why));
+                        true
+                    };
+                    if finished {
+                        routes.remove(&id);
+                    }
+                }
+                alive.store(false, Ordering::SeqCst);
+                let _ = child.kill().await;
+                for (_, route) in routes.lock().unwrap().drain() {
+                    route.send_modify(|r| r.error = Some("twr's voices stopped".into()));
+                }
+            });
+        }
+        Ok(RenderProc {
+            stdin: tx,
+            routes,
+            alive,
+        })
+    }
+
+    /// Starts making `key` into audio: what there is so far, as it grows.
+    pub fn render(&self, key: &RenderKey) -> (u64, watch::Receiver<Render>) {
+        let id = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let (tx, rx) = watch::channel(Render::default());
+        let mut proc = self.proc.lock().unwrap();
+        if proc
+            .as_ref()
+            .is_none_or(|p| !p.alive.load(Ordering::SeqCst))
+        {
+            match self.spawn() {
+                Ok(p) => *proc = Some(p),
+                Err(e) => {
+                    tx.send_modify(|r| r.error = Some(format!("{e:#}")));
+                    return (id, rx);
+                }
+            }
+        }
+        let p = proc.as_ref().expect("started");
+        p.routes.lock().unwrap().insert(id, tx);
+        // It ended meanwhile (a twr without its own voices ends at once): its reader may have
+        // told the routes so before this one was there.
+        if !p.alive.load(Ordering::SeqCst) {
+            if let Some(route) = p.routes.lock().unwrap().remove(&id) {
+                route.send_modify(|r| r.error = Some("twr's voices stopped".into()));
+            }
+            return (id, rx);
+        }
+        let line = json!({"id": id, "voice": key.voice, "text": key.text, "lang": key.lang, "rate": key.rate});
+        let _ = p.stdin.send(format!("{line}\n"));
+        (id, rx)
+    }
+
+    /// Stops making request `id` (its audio is no longer wanted).
+    pub fn cancel(&self, id: u64) {
+        if let Some(p) = self.proc.lock().unwrap().as_ref() {
+            if p.routes.lock().unwrap().remove(&id).is_some() {
+                let _ = p
+                    .stdin
+                    .send(format!("{}\n", json!({"id": id, "cancel": true})));
+            }
+        }
+    }
+}
+
+/// A chunk made (or being made) for the phone, kept so a pause's repeat or the chunk
+/// [`Engine::prepare`] announced isn't made twice.
+struct Made {
+    key: RenderKey,
+    id: u64,
+    render: watch::Receiver<Render>,
+}
+
 /// The phone's voice, as a speaker's engine (see the module documentation).
 pub struct DeviceEngine {
     out: Arc<Outbox>,
+    renderer: Option<Arc<Renderer>>,
+    /// The chunks made last (the one said, and the next one): at most two.
+    made: Vec<Made>,
 }
 
 impl DeviceEngine {
-    pub fn new(out: Arc<Outbox>) -> DeviceEngine {
-        DeviceEngine { out }
+    pub fn new(out: Arc<Outbox>, renderer: Option<Arc<Renderer>>) -> DeviceEngine {
+        DeviceEngine {
+            out,
+            renderer,
+            made: Vec::new(),
+        }
+    }
+
+    /// `key`'s audio: as made before, or started now. Older chunks are forgotten (and
+    /// stopped if still being made).
+    fn made(&mut self, key: RenderKey) -> Option<watch::Receiver<Render>> {
+        let renderer = self.renderer.clone()?;
+        if let Some(m) = self.made.iter().find(|m| m.key == key) {
+            return Some(m.render.clone());
+        }
+        let (id, render) = renderer.render(&key);
+        self.made.push(Made {
+            key,
+            id,
+            render: render.clone(),
+        });
+        while self.made.len() > 2 {
+            let old = self.made.remove(0);
+            if !old.render.borrow().done {
+                renderer.cancel(old.id);
+            }
+        }
+        Some(render)
+    }
+}
+
+fn render_key(chunk: &str, prefs: &Prefs) -> Option<RenderKey> {
+    let voice = prefs.voice.as_deref().filter(|v| is_natural(v))?;
+    Some(RenderKey {
+        voice: voice.to_owned(),
+        text: chunk.to_owned(),
+        lang: prefs.lang.clone(),
+        rate: prefs.rate,
+    })
+}
+
+/// Sends `render`'s audio to the phone as utterance `id`, as it is made, no faster than
+/// [`AHEAD`] before it plays; the last event says it is the last.
+async fn send_audio(out: &Outbox, id: u64, mut render: watch::Receiver<Render>) -> Result<()> {
+    let start = tokio::time::Instant::now();
+    let mut sent = 0usize;
+    let mut played = 0f64;
+    loop {
+        let state = render
+            .wait_for(|r| r.pieces.len() > sent || r.done || r.error.is_some())
+            .await
+            .map_err(|_| anyhow!("twr's voices stopped"))?
+            .clone();
+        if state.pieces.len() > sent {
+            let piece = &state.pieces[sent];
+            let due = start + Duration::from_secs_f64(played);
+            tokio::time::sleep_until(due.checked_sub(AHEAD).unwrap_or(due)).await;
+            out.events
+                .send(json!({"type":"voice-audio","id":id,"seq":sent,"rate":piece.rate,"pcm":&*piece.pcm,"last":false}))
+                .await
+                .map_err(|_| anyhow!("the phone's connection closed"))?;
+            played += piece.secs();
+            sent += 1;
+            continue;
+        }
+        if let Some(why) = state.error {
+            bail!("natural voice: {why}");
+        }
+        out.events
+            .send(
+                json!({"type":"voice-audio","id":id,"seq":sent,"rate":24_000,"pcm":"","last":true}),
+            )
+            .await
+            .map_err(|_| anyhow!("the phone's connection closed"))?;
+        return Ok(());
     }
 }
 
@@ -256,17 +710,12 @@ impl Engine for DeviceEngine {
     fn speak(&mut self, chunk: &str, prefs: &Prefs) -> SpeakFuture {
         let out = self.out.clone();
         let text = chunk.to_owned();
-        let (voice, rate) = (prefs.voice.clone(), prefs.rate);
+        let (voice, rate, lang) = (prefs.voice.clone(), prefs.rate, prefs.lang.clone());
+        let audio = render_key(chunk, prefs).and_then(|key| self.made(key));
+        if self.renderer.is_none() && voice.as_deref().is_some_and(is_natural) {
+            return Box::pin(async { bail!("natural voices are not available for this phone") });
+        }
         Box::pin(async move {
-            let id = out.next.fetch_add(1, Ordering::SeqCst) + 1;
-            let (tx, mut rx) = oneshot::channel();
-            out.pending.lock().unwrap().insert(id, tx);
-            let mut utterance = Utterance {
-                out: out.clone(),
-                id,
-                sent: false,
-                done: false,
-            };
             let mut sockets = out.sockets.subscribe();
             let deadline = tokio::time::Instant::now() + utterance_budget(&text);
             loop {
@@ -276,14 +725,32 @@ impl Engine for DeviceEngine {
                 if open != Ok(true) {
                     bail!("the phone is not connected");
                 }
-                out.events
-                    .send(
-                        json!({"type":"voice-speak","id":id,"text":text,"voice":voice,"rate":rate}),
-                    )
-                    .await
-                    .map_err(|_| anyhow!("the phone's connection closed"))?;
-                utterance.sent = true;
+                // Each attempt is an utterance of its own: one said again after a lost socket
+                // starts over on the phone (its audio from the first piece).
+                let id = out.next.fetch_add(1, Ordering::SeqCst) + 1;
+                let (tx, mut rx) = oneshot::channel();
+                out.pending.lock().unwrap().insert(id, tx);
+                let mut utterance = Utterance {
+                    out: out.clone(),
+                    id,
+                    sent: true,
+                    done: false,
+                };
+                // A natural voice's audio goes as it is made, while the ack is waited for.
+                let sending = async {
+                    match &audio {
+                        Some(render) => send_audio(&out, id, render.clone()).await?,
+                        None => out
+                            .events
+                            .send(json!({"type":"voice-speak","id":id,"text":text,"voice":voice,"rate":rate,"lang":lang}))
+                            .await
+                            .map_err(|_| anyhow!("the phone's connection closed"))?,
+                    }
+                    std::future::pending::<Result<()>>().await
+                };
+                tokio::pin!(sending);
                 tokio::select! {
+                    failed = &mut sending => return failed,
                     result = &mut rx => {
                         utterance.done = true;
                         return match result {
@@ -304,6 +771,12 @@ impl Engine for DeviceEngine {
                 }
             }
         })
+    }
+
+    fn prepare(&mut self, next: &str, prefs: &Prefs) {
+        if let Some(key) = render_key(next, prefs) {
+            let _ = self.made(key);
+        }
     }
 }
 
@@ -335,6 +808,8 @@ pub struct Start {
     pub store: StateStore,
     pub link: LinkSpec,
     pub config: SpeechConfig,
+    /// Makes twr's natural voices for it (`None`: only the phone's own voices).
+    pub renderer: Option<Arc<Renderer>>,
     /// Whether the device may still listen (not revoked, still `read`).
     pub allowed: Arc<dyn Fn() -> bool + Send + Sync>,
 }
@@ -357,6 +832,10 @@ pub struct DeviceVoice {
     /// replaced another's speaker would otherwise leave the first one's end publishing
     /// "stopped" over the running one.
     changing: tokio::sync::Mutex<()>,
+    /// A natural voice's preview being sent ([`DeviceVoice::preview`]).
+    preview: Mutex<Option<tokio::task::AbortHandle>>,
+    /// The model downloads under way, by model.
+    installs: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl DeviceVoice {
@@ -367,7 +846,80 @@ impl DeviceVoice {
             status: Arc::new(Mutex::new(Status::default())),
             starts: AtomicU64::new(0),
             changing: tokio::sync::Mutex::new(()),
+            preview: Mutex::new(None),
+            installs: Arc::default(),
         }
+    }
+
+    /// Sends the phone a sample sentence in `lang` said by twr's natural `voice`, made here
+    /// (the phone says its own voices' samples itself). The utterance id it plays as: its ack
+    /// is ignored. A preview still being sent is dropped.
+    pub fn preview(&self, renderer: &Arc<Renderer>, voice: &str, lang: &str) -> Result<u64> {
+        anyhow::ensure!(is_natural(voice), "Not one of twr's natural voices");
+        anyhow::ensure!(language_ok(lang), "Unknown language");
+        self.stop_preview();
+        let key = RenderKey {
+            voice: voice.to_owned(),
+            text: preview_text(lang).to_owned(),
+            lang: Some(lang.to_owned()),
+            rate: 0,
+        };
+        let (render_id, render) = renderer.render(&key);
+        let id = self.out.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let (out, renderer) = (self.out.clone(), renderer.clone());
+        let task = tokio::spawn(async move {
+            struct Cancel(Arc<Renderer>, u64);
+            impl Drop for Cancel {
+                fn drop(&mut self) {
+                    self.0.cancel(self.1);
+                }
+            }
+            let _cancel = Cancel(renderer, render_id);
+            if let Err(e) = send_audio(&out, id, render).await {
+                out.send(json!({"type":"voice-preview-error","id":id,"error":format!("{e:#}")}));
+            }
+        });
+        *self.preview.lock().unwrap() = Some(task.abort_handle());
+        Ok(id)
+    }
+
+    /// Stops sending a preview.
+    pub fn stop_preview(&self) {
+        if let Some(task) = self.preview.lock().unwrap().take() {
+            task.abort();
+        }
+    }
+
+    /// Starts downloading twr's voice `model` on this machine (`twr voices install --json`,
+    /// run as `binary`) and returns: its progress, then `done` or `error`, reach the phone as
+    /// `voice-install` events (a phone's calls are answered one at a time, and a download
+    /// takes minutes). One under way for `model` is refused.
+    pub fn start_install(&self, binary: PathBuf, model: &str) -> Result<()> {
+        anyhow::ensure!(
+            !model.is_empty()
+                && model.len() <= 32
+                && model
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+            "Unknown voice model"
+        );
+        if !self.installs.lock().unwrap().insert(model.to_owned()) {
+            bail!("That voice is already downloading");
+        }
+        let (out, installs, model) = (self.out.clone(), self.installs.clone(), model.to_owned());
+        tokio::spawn(async move {
+            let result = install(&out, &binary, &model).await;
+            installs.lock().unwrap().remove(&model);
+            // Waited for (not dropped like progress): the phone waits for it.
+            let _ = out
+                .events
+                .send(json!({"type":"voice-install","install": match &result {
+                    Ok(()) => json!({"model": model, "phase": "done"}),
+                    Err(e) => json!({"model": model, "phase": "error", "error": format!("{e:#}")}),
+                }}))
+                .await;
+        });
+        Ok(())
     }
 
     /// A socket of the phone is open while the guard lives.
@@ -470,12 +1022,31 @@ impl DeviceVoice {
                 },
             )
         };
+        // The voices are the phone's own choice, followed while it speaks; the hub machine's
+        // `[speech] voice` and `voices` name its voices, not the phone's.
+        let mut config = start.config;
+        config.voice.clear();
+        config.voices.clear();
+        let voices_source: twr_speech::VoicesSource = {
+            let store = start.store.clone();
+            let last = Mutex::new(None::<BTreeMap<String, String>>);
+            Arc::new(move || {
+                let voices = store.load().ok()?.voices;
+                let mut last = last.lock().unwrap();
+                if last.as_ref() == Some(&voices) {
+                    return None;
+                }
+                *last = Some(voices.clone());
+                Some(chosen_voices(&voices))
+            })
+        };
         let opts = SpeakerOpts {
             name: start.name.clone(),
-            config: start.config,
+            config,
             voice: None,
             rate: None,
             voices: Default::default(),
+            voices_source: Some(voices_source),
             state: start.store,
             report: Some(Arc::new(|note: &str| {
                 crate::gateway_log!("phone speaker: {note}")
@@ -517,7 +1088,7 @@ impl DeviceVoice {
                 }
             }
         };
-        let engine = Box::new(DeviceEngine::new(self.out.clone()));
+        let engine = Box::new(DeviceEngine::new(self.out.clone(), start.renderer.clone()));
         let task = tokio::spawn(async move {
             let result = twr_speech::run(opts, start.link, engine, Some(key_rx), shutdown).await;
             Self::publish(&status, &out, |s| {
@@ -702,7 +1273,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let out = Outbox::new(tx);
         let _socket = out.socket();
-        let mut engine = DeviceEngine::new(out.clone());
+        let mut engine = DeviceEngine::new(out.clone(), None);
         let prefs = Prefs {
             voice: Some("Ava".into()),
             rate: 180,
@@ -736,7 +1307,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         let out = Outbox::new(tx);
         let _socket = out.socket();
-        let mut engine = DeviceEngine::new(out.clone());
+        let mut engine = DeviceEngine::new(out.clone(), None);
         let speaking = tokio::spawn(engine.speak("A long sentence.", &Prefs::default()));
         let id = next_event(&mut rx, "voice-speak").await["id"]
             .as_u64()
@@ -751,7 +1322,7 @@ mod tests {
     async fn without_a_socket_it_waits_then_fails_and_a_lost_socket_says_it_again() {
         let (tx, mut rx) = mpsc::channel(16);
         let out = Outbox::new(tx);
-        let mut engine = DeviceEngine::new(out.clone());
+        let mut engine = DeviceEngine::new(out.clone(), None);
         let e = engine
             .speak("Nobody hears.", &Prefs::default())
             .await
@@ -768,9 +1339,13 @@ mod tests {
         tokio::task::yield_now().await;
         let _back = out.socket();
         let again = next_event(&mut rx, "voice-speak").await;
-        assert_eq!(again["id"].as_u64(), Some(first));
+        // An utterance of its own (a natural voice's audio starts over on the phone): a late
+        // ack of the first one is ignored.
+        let second = again["id"].as_u64().unwrap();
+        assert_ne!(second, first);
         assert_eq!(again["text"], "Said twice.");
-        out.ack(first, Ok(()));
+        assert!(!out.ack(first, Ok(())));
+        assert!(out.ack(second, Ok(())));
         speaking.await.unwrap().unwrap();
     }
 
@@ -797,6 +1372,13 @@ mod tests {
 
     impl Rig {
         async fn start(&mut self, allowed: Arc<dyn Fn() -> bool + Send + Sync>) -> Value {
+            self.start_with(allowed, SpeechConfig::default()).await
+        }
+        async fn start_with(
+            &mut self,
+            allowed: Arc<dyn Fn() -> bool + Send + Sync>,
+            config: SpeechConfig,
+        ) -> Value {
             let (link, hub) = manual();
             self.hub = Some(hub);
             let store = self.store.clone();
@@ -807,12 +1389,35 @@ mod tests {
                         name: speaker_name("Pixel"),
                         store,
                         link: LinkSpec::Manual(link),
-                        config: SpeechConfig::default(),
+                        config,
+                        renderer: None,
                         allowed,
                     })
                 })
                 .await
                 .unwrap()
+        }
+        /// The hub attaches the speaker, live, and sends `text` as message `seq`.
+        async fn say(&mut self, seq: u64, text: &str) {
+            let hub = self.hub.as_mut().unwrap();
+            if seq == 2 {
+                hub.events
+                    .send(ManualEvent::Connect {
+                        ws: "work".into(),
+                        ack: SpeechAttachAck {
+                            orchestrator: Some("T".into()),
+                            head: 1,
+                        },
+                    })
+                    .unwrap();
+                hub.attaches.recv().await.unwrap();
+            }
+            hub.events
+                .send(ManualEvent::Item {
+                    ws: "work".into(),
+                    item: msg(seq, text),
+                })
+                .unwrap();
         }
         fn hub(&self) -> &ManualHub {
             self.hub.as_ref().unwrap()
@@ -831,6 +1436,187 @@ mod tests {
             origin: Origin::Live,
             batch: None,
         }
+    }
+
+    /// A stand-in for `twr voices render`: one piece of audio per request, then done.
+    fn fake_renderer(dir: &Path) -> Arc<Renderer> {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("twr");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in *'\"cancel\":true'*) continue;; esac\n\
+               id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n\
+               printf '{\"id\":%s,\"seq\":0,\"rate\":24000,\"pcm\":\"AAAA\"}\\n' \"$id\"\n\
+               printf '{\"id\":%s,\"done\":true}\\n' \"$id\"\n\
+             done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Renderer::new(script)
+    }
+
+    #[tokio::test]
+    async fn a_natural_voice_is_made_here_and_sent_as_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let out = Outbox::new(tx);
+        let _socket = out.socket();
+        let mut engine = DeviceEngine::new(out.clone(), Some(fake_renderer(dir.path())));
+        let prefs = Prefs {
+            voice: Some("kokoro/af_heart".into()),
+            lang: Some("en".into()),
+            ..Prefs::default()
+        };
+        let said = tokio::spawn(engine.speak("Hello there.", &prefs));
+        let first = next_event(&mut rx, "voice-audio").await;
+        assert_eq!(
+            (first["seq"].as_u64(), first["last"].as_bool()),
+            (Some(0), Some(false))
+        );
+        assert_eq!(
+            (first["pcm"].as_str(), first["rate"].as_u64()),
+            (Some("AAAA"), Some(24_000))
+        );
+        let last = next_event(&mut rx, "voice-audio").await;
+        assert_eq!(last["id"], first["id"]);
+        assert_eq!(
+            (last["seq"].as_u64(), last["last"].as_bool()),
+            (Some(1), Some(true))
+        );
+        assert!(out.ack(first["id"].as_u64().unwrap(), Ok(())));
+        said.await.unwrap().unwrap();
+        // The text never goes to the phone for a natural voice.
+        while let Ok(e) = rx.try_recv() {
+            assert_ne!(e["type"], "voice-speak");
+        }
+        // Without a renderer (an older gateway's speaker), a natural voice fails at once.
+        let mut bare = DeviceEngine::new(out.clone(), None);
+        let e = bare.speak("Hi.", &prefs).await.unwrap_err();
+        assert!(format!("{e:#}").contains("not available"));
+    }
+
+    #[tokio::test]
+    async fn a_phone_voice_gets_the_message_language() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let out = Outbox::new(tx);
+        let _socket = out.socket();
+        let mut engine = DeviceEngine::new(out.clone(), None);
+        let prefs = Prefs {
+            voice: Some("com.apple.voice.premium.es-MX.Paulina".into()),
+            lang: Some("es".into()),
+            ..Prefs::default()
+        };
+        let said = tokio::spawn(engine.speak("Hola.", &prefs));
+        let e = next_event(&mut rx, "voice-speak").await;
+        assert_eq!(e["lang"], "es");
+        assert_eq!(e["voice"], "com.apple.voice.premium.es-MX.Paulina");
+        out.ack(e["id"].as_u64().unwrap(), Ok(()));
+        said.await.unwrap().unwrap();
+    }
+
+    /// The phone reads with its own choice, never the hub machine's `[speech]` voices, and a
+    /// choice made while its speaker runs is heard from the next message.
+    #[tokio::test]
+    async fn the_phone_speaker_reads_with_the_phone_s_own_voices() {
+        let mut rig = rig();
+        let _socket = rig.voice.socket();
+        select(&rig.store, "en", Some("com.apple.voice.premium.en-US.Ava")).unwrap();
+        let config = SpeechConfig {
+            voice: "Ava (Premium)".into(),
+            voices: [("en".to_string(), "Samantha".to_string())].into(),
+            ..SpeechConfig::default()
+        };
+        rig.start_with(Arc::new(|| true), config).await;
+        rig.say(2, "The tests pass.").await;
+        let e = next_event(&mut rig.events, "voice-speak").await;
+        assert_eq!(e["voice"], "com.apple.voice.premium.en-US.Ava");
+        rig.voice
+            .control(Op::Said(e["id"].as_u64().unwrap()), || unreachable!())
+            .await
+            .unwrap();
+        select(
+            &rig.store,
+            "en",
+            Some("com.apple.voice.enhanced.en-GB.Daniel"),
+        )
+        .unwrap();
+        select(&rig.store, "en", None).unwrap();
+        select(&rig.store, "es", Some("es-us-x-esd-local")).unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        rig.say(3, "The build is green.").await;
+        let e = next_event(&mut rig.events, "voice-speak").await;
+        // English cleared: the Spanish choice is the voice of other languages too.
+        assert_eq!(e["voice"], "es-us-x-esd-local");
+        rig.voice
+            .control(Op::Stop, || unreachable!())
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn choices_listings_and_pieces() {
+        assert!(is_natural("kokoro/af_heart") && is_natural("piper-es/claude"));
+        for not in [
+            "Ava (Premium)",
+            "com.apple.voice.premium.en-US.Ava",
+            "es-us-x-esd-local",
+            "/x",
+            "x/",
+            "Big/One",
+        ] {
+            assert!(!is_natural(not), "{not}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = state_store(dir.path(), "phone-1").unwrap();
+        assert!(select(&store, "fr", Some("Thomas")).is_err());
+        assert!(select(&store, "en", Some("a\u{200b}b")).is_err());
+        assert!(select(&store, "en", Some(&"x".repeat(129))).is_err());
+        let chosen = select(&store, "es", Some("kokoro/ef_dora")).unwrap();
+        assert_eq!(
+            chosen_voices(&chosen).voice.as_deref(),
+            Some("kokoro/ef_dora")
+        );
+        assert_eq!(
+            preview_text("es"),
+            "Hola. Así sueno cuando leo tus respuestas en voz alta."
+        );
+        // Only twr's voices, ready without this machine's speakers, espeak-ng still needed.
+        let mut listing = json!({
+            "voices": [
+                {"id": "Ava (Premium)", "engine": "system", "ready": true},
+                {"id": "kokoro/af_heart", "engine": "twr", "model": "kokoro", "ready": false},
+                {"id": "piper-en/lessac", "engine": "twr", "model": "piper-en", "ready": false},
+            ],
+            "models": [
+                {"name": "kokoro", "installed": true, "needs": "an audio output device"},
+                {"name": "piper-en", "installed": true, "needs": "espeak-ng and an audio output device"},
+            ],
+            "espeak": null,
+        });
+        let phone = natural_only(&mut listing);
+        let ids: Vec<_> = phone["voices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| (v["id"].as_str().unwrap(), v["ready"].as_bool().unwrap()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![("kokoro/af_heart", true), ("piper-en/lessac", false)]
+        );
+        assert_eq!(phone["models"][0]["needs"], Value::Null);
+        assert_eq!(phone["models"][1]["needs"], "espeak-ng");
+        // Audio is cut in whole base64 quads, each small next to a socket's backlog.
+        let pcm = "A".repeat(PIECE_BYTES / 3 * 4 * 2 + 8);
+        let cut = pieces(&pcm, 24_000);
+        assert_eq!(cut.len(), 3);
+        assert!(cut
+            .iter()
+            .all(|p| p.pcm.len() % 4 == 0 && p.pcm.len() <= PIECE_BYTES / 3 * 4));
+        assert_eq!(cut.iter().map(|p| p.pcm.len()).sum::<usize>(), pcm.len());
+        assert!((cut[0].secs() - (PIECE_BYTES / 3 * 3) as f64 / 48_000.0).abs() < 1e-9);
     }
 
     /// The whole speaker: started live, a hub message reaches the phone as an utterance, the

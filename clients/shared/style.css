@@ -4236,3 +4236,34 @@ meter::-webkit-meter-optimum-value {
     transition: none;
   }
 }
+.read-aloud-voice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin-bottom: 16px;
+  max-width: 100%;
+}
+.read-aloud-voice .voice-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+.read-aloud-voice select {
+  min-width: 0;
+  max-width: min(100%, 360px);
+  font-size: 1rem;
+  text-overflow: ellipsis;
+}
+.read-aloud-voice-note {
+  color: var(--muted);
+  font-size: 0.923077rem;
+  line-height: 1.5;
+  max-width: 650px;
+}
+.read-aloud-voice progress {
+  width: min(100%, 360px);
+  accent-color: var(--accent);
+}

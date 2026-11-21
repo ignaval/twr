@@ -74,7 +74,7 @@ words are literal text. See [voice.md](voice.md) for routing and review details.
 | On the device | When the recognizer supports it (`requiresOnDeviceRecognition`); otherwise the audio goes to Apple's servers | With `createOnDeviceSpeechRecognizer` (Android 12+) when the language is installed; otherwise the default recognizer, asked to prefer offline, whose service may use the network |
 | Permissions | Speech Recognition and Microphone, asked the first time voice starts | Microphone (`RECORD_AUDIO`), asked the first time voice starts |
 | Echo | `.playAndRecord` in `.voiceChat` mode with voice processing: the system's echo cancellation | the recognizer's own audio path; no app-level echo cancellation |
-| Voice | `AVSpeechSynthesizer` | `TextToSpeech` |
+| Voice | `AVSpeechSynthesizer`, or twr's natural voices as audio (`AVAudioEngine`) | `TextToSpeech`, or twr's natural voices as audio (`AudioTrack`) |
 
 Active voice status and errors appear inline in the composer, without an idle ready popup.
 The voice bar says whether recognition stays on the device; a denied permission shows how to allow it in Settings. Hands-free ends an utterance after about 2 s of silence, so a pause mid-sentence doesn't send half of it. It doesn't listen while the phone reads a reply aloud, nor for 0.8 s after, so the reply heard back is never sent; tap **Quiet** to cut a reply short. If you are already talking when a reply starts, it waits until what you said is sent. Push to talk works while a reply is read: the phone's voice pauses at once. Android has no continuous recognition: hands-free restarts the recognizer after each result, no-match or timeout, with a short pause in which a word can be missed, and some phones play a sound at each restart. Voice is foreground only on both platforms: leaving the app stops listening and the voice, and ends a hands-free session. On iOS, voice mode gives the audio session back once it stops listening and speaking, so music or a podcast it paused resumes. A call, Siri or another app's audio stops listening and the voice, and the voice bar says so; a hands-free session listens again when the interruption ends, if iOS says it may resume. Plugging in or removing headphones restarts the microphone in hands-free, and ends a push-to-talk recording with what it heard.
@@ -83,9 +83,37 @@ The voice bar says whether recognition stays on the device; a denied permission 
 
 A phone can't run `twr speak`, so the gateway runs a speaker for it on the hub's machine. Starting hands-free starts it for the connected workspace and turns live reading on for that phone only (`/read status` lists it as "<device name> phone"; `/read off` turns it off like any speaker, and the next hands-free session turns it on again). It attaches to the hub like `twr speak`, and sends each sentence to the phone, which says it and acknowledges it; controls (pause, skip, stop) act on the gateway's speaker directly, without a hub round trip. Its device id, live switch and the last message it read are the phone's own, in `mobile/speakers/<device>/speech-state.json` under twr's data directory, so it never stands by for the hub machine's own speaker: a TUI on that machine and the phone both read aloud. A sentence waits up to 30 seconds for a lost connection and is said again in full; the speaker ends when the phone stops it, switches workspace, has had no connection for a minute, or is revoked.
 
-Listening needs only the `read` scope: the speaker carries what the hub's speech feed sends a speaker (the orchestrator's finished messages, and those `/read N` asks for), which a read device can already open. Sending what you say needs `operate`, as typing does; asking the hub to repeat a message (`speech.request`) does too. The phone can only start, stop and control its speaker and acknowledge sentences: no call takes text, so it can never make the hub or another speaker say anything. The hub refuses `speech.attach` on a device's own connection, so the gateway attaches its speaker as your user, and checks the device's grant and revocation itself.
+### Voices
 
-Not verified on hardware: real microphone input, recognition, on-device availability, echo cancellation and the platform voices have only been built (iOS Simulator and Android debug builds), not exercised; Simulators and emulators have no usable microphone path in this repository's QA.
+**Settings › Read-aloud voice** picks the voice of the phone's speaker for English and for
+Spanish; each reply is read with the voice of its language:
+
+- **The phone's own voices.** iOS lists its voices, Premium and Enhanced first (download more in
+  Settings › Accessibility › Spoken Content › Voices); Android lists its text-to-speech
+  engine's installed voices, and marks "online" those that send the text to their maker's
+  servers (Google's) to speak it. The phone says them from the text, as before.
+- **twr's natural voices** (Kokoro, Supertonic, Piper: [read-aloud.md](read-aloud.md#twrs-own-voices)).
+  A phone can't run them, so the gateway makes them on the hub's computer (`twr voices
+  render`, one process whose models stay loaded while used) and sends each sentence to the
+  phone as audio: 16-bit mono at 24 kHz, about 48 KB a second while it speaks, in pieces of
+  at most 128 KB sent no more than eight seconds ahead of what plays, over the phone's
+  authenticated, encrypted connection. Nothing plays on the hub's computer. A model the hub's
+  computer doesn't have offers its download there, with its progress, if the device has
+  `operate`; otherwise `twr voices install` on that computer. Kokoro and Piper need
+  espeak-ng there.
+- **Default voice:** the phone's default voice for the message's language.
+
+**Preview** says a sentence with a voice; it stops what the speaker was reading. A natural
+voice's sample is the gateway's own sentence: no call sends text to be said. The choice is the
+phone's own, kept with its speaker's state on the hub's machine
+(`mobile/speakers/<device>/speech-state.json`); the hub machine's `[speech] voice` and
+`voices` name that machine's voices and play no part. A speaker that is running reads with a
+new choice from its next sentence. `/read voice <name>` still sets the voice of every speaker,
+a phone's too, and beats the phone's voice for messages in neither language.
+
+Listening needs only the `read` scope: the speaker carries what the hub's speech feed sends a speaker (the orchestrator's finished messages, and those `/read N` asks for), which a read device can already open. Sending what you say needs `operate`, as typing does; asking the hub to repeat a message (`speech.request`) does too. The phone can only start, stop and control its speaker, acknowledge sentences, and choose and preview its voices: no call takes text, so it can never make the hub or another speaker say anything. The hub refuses `speech.attach` on a device's own connection, so the gateway attaches its speaker as your user, and checks the device's grant and revocation itself.
+
+Not verified on hardware: real microphone input, recognition, on-device availability, echo cancellation, the platform voices and the playback of natural voices' audio have only been built (iOS Simulator and Android debug builds), not exercised; Simulators and emulators have no usable microphone path in this repository's QA.
 
 ## Notifications
 
