@@ -2476,6 +2476,42 @@ describe("implementation loops from the message box", () => {
   });
 });
 
+/* The palette's Switch orchestrator form: `[orchestrator] effort` applies to the first
+ * orchestrator only, so with one running, an unset effort is the runtime's own and says so. */
+describe("Switch orchestrator's effort", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mounted = await mount({
+      rpc: (method, params) => {
+        if (method === "orchestrator.show")
+          return Promise.resolve({
+            thread: "orch",
+            models: { fake: { models: [{ id: "m1" }], efforts: ["low"] } },
+          });
+        if (method === "desktop.parse_slash" && params.line.trim() === "/orch")
+          return Promise.resolve({ kind: "OrchPick" });
+        return undefined;
+      },
+    });
+    await app().wait(50);
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+
+  it("offers Runtime default, not As configured, while an orchestrator runs", async () => {
+    await app().type("/orch");
+    await app().press("Enter");
+    const form = app().find("[role=dialog]", "Switch orchestrator");
+    const options = form
+      .querySelectorAll("option")
+      .map((o: FakeElement) => o.textContent);
+    expect(options).toContain("low");
+    expect(options.join("|")).not.toContain("As configured");
+    expect(options).toContain("Runtime default");
+  });
+});
+
 /* `/access [limited|full]` (docs/orchestrator.md › Full access): the shared slash table's
  * command opens the palette's Orchestrator access form on the level named, and Full still
  * asks before anything reaches the hub. */

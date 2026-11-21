@@ -173,6 +173,14 @@ export function hubNow(data: Json | undefined, now: number, fetchedAt = now) {
   return Number.isFinite(served) ? served + Math.max(0, now - fetchedAt) : now;
 }
 
+/** Whether a `usage.get` answer has any window a session reported, reset or not: with none
+ * left now, the limits have reset rather than never been reported. */
+export function anyReported(data: Json | undefined): boolean {
+  const runtimes: Json[] = Array.isArray(data?.runtimes) ? data.runtimes : [];
+  return runtimes.some(
+    (runtime) => Array.isArray(runtime.windows) && runtime.windows.length > 0,
+  );
+}
 /**
  * The accounts of a `usage.get` answer, as they are `now`: the answer was read at
  * `fetchedAt`, so ages have grown since by the time between. Windows that have reset since

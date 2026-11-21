@@ -325,7 +325,7 @@ app on its own hub has every scope. A change
 made elsewhere (by the orchestrator, `twr model`, the TUI) shows as soon as the thread list
 updates. The command palette's **Change model, runtime or account** and **Switch
 orchestrator** forms still work, and are where accounts are chosen; **Switch orchestrator**
-has a reasoning effort field too: **As configured** leaves it to `[orchestrator] effort`, **Runtime default** is the runtime's own. An effort the runtime chosen there doesn't take is cleared, so the form never sends one you can't see.
+has a reasoning effort field too. Before the first orchestrator, **As configured** leaves it to `[orchestrator] effort` and **Runtime default** is the runtime's own; once one runs, the configured effort no longer applies, and the unset choice is **Runtime default**. An effort the runtime chosen there doesn't take is cleared, so the form never sends one you can't see.
 
 ### Usage limits
 
@@ -338,7 +338,7 @@ if you spent it evenly; it shows only for a window whose length and reset time t
 reports. The bar turns amber at 25% left or less and red at 10% or less. Data 10 minutes old
 or more is dimmed and says its age (`as of 12m ago`). A runtime with several accounts names
 each as threads do (`Claude:work`; a native login that shares its name with a named account
-says `(native login)`). Before any session has reported usage, it says so.
+says `(native login)`). Before any session has reported usage, it says so, and once every window reported has reset it says there are no current limits.
 
 - **`/usage`** in the message box opens the limits in a panel above it. Close it with its ✕
   or Escape. In a short window the panel gives way before the message box: it shrinks and

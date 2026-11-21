@@ -4674,6 +4674,9 @@ export default function App({
                           : field.type === "model" || field.type === "effort"
                             ? {
                                 ...field,
+                                // `[orchestrator] effort` applies to the first orchestrator
+                                // only: a switch of one left unset gets the runtime's own.
+                                unset: orchestrator ? undefined : field.unset,
                                 choices: (field.type === "model"
                                   ? modelChoices
                                   : effortChoices)(

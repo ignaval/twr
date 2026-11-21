@@ -16,6 +16,7 @@ import { errorMessage } from "./errors";
 import type { Json } from "./types";
 import {
   accountsOf,
+  anyReported,
   ageText,
   type AccountView,
   type WindowView,
@@ -75,6 +76,7 @@ export function useUsage(
   }, [active, load]);
   return {
     accounts: data ? accountsOf(data, now, fetchedAt) : undefined,
+    reported: anyReported(data),
     error,
     loading,
     reload: load,
@@ -142,16 +144,24 @@ export function UsagePage({
     const tick = setInterval(() => setTick((n) => n + 1), TICK_MS);
     return () => clearInterval(tick);
   }, []);
-  return <UsageLimits accounts={accountsOf(data, Date.now(), fetchedAt)} />;
+  return (
+    <UsageLimits
+      accounts={accountsOf(data, Date.now(), fetchedAt)}
+      reported={anyReported(data)}
+    />
+  );
 }
 
 /** Every account's windows, or why there are none. */
 export function UsageLimits({
   accounts,
+  reported = false,
   error,
   compact = false,
 }: {
   accounts?: AccountView[];
+  /** A session reported windows that have all reset since. */
+  reported?: boolean;
   error?: string;
   compact?: boolean;
 }) {
@@ -168,8 +178,9 @@ export function UsageLimits({
   if (!accounts.length)
     return (
       <p className="usage-empty">
-        No session has reported usage yet. Your limits show here once an agent
-        session reports them.
+        {reported
+          ? "No current limits: the windows last reported have reset. They show again once an agent session reports them."
+          : "No session has reported usage yet. Your limits show here once an agent session reports them."}
       </p>
     );
   return (
@@ -214,7 +225,12 @@ function UsageBody({
 }) {
   return (
     <>
-      <UsageLimits accounts={usage.accounts} error={usage.error} compact />
+      <UsageLimits
+        accounts={usage.accounts}
+        reported={usage.reported}
+        error={usage.error}
+        compact
+      />
       <button type="button" className="usage-page-link" onClick={onOpenPage}>
         Open Usage page <ArrowUpRight size={13} aria-hidden="true" />
       </button>
