@@ -1622,7 +1622,14 @@ export default function App({
           }
         }
       } catch (e) {
-        setOperationError(errorMessage(e));
+        const message = errorMessage(e);
+        setOperationError(message);
+        // A field the error is about, or New thread's missing folder, is shown.
+        if (
+          splitFields(operation.fields, {}, message).open ||
+          (operation.method === "thread.new" && !values._cwd)
+        )
+          setMoreOpen(true);
       } finally {
         setOperationBusy(false);
       }
