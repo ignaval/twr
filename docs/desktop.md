@@ -338,7 +338,7 @@ if you spent it evenly; it shows only for a window whose length and reset time t
 reports. The bar turns amber at 25% left or less and red at 10% or less. Data 10 minutes old
 or more is dimmed and says its age (`as of 12m ago`). A runtime with several accounts names
 each as threads do (`Claude:work`; a native login that shares its name with a named account
-says `(native login)`). Before any session has reported usage, it says so, and once every window reported has reset it says there are no current limits.
+says `(native login)`). With no window to show (no session has reported one yet, or every one reported has reset, which `usage.get` leaves out), it says there are no current limits.
 
 - **`/usage`** in the message box opens the limits in a panel above it. Close it with its ✕
   or Escape. In a short window the panel gives way before the message box: it shrinks and

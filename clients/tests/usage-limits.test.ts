@@ -3,7 +3,6 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import {
   accountsOf,
-  anyReported,
   ageText,
   hubNow,
   levelOf,
@@ -216,28 +215,10 @@ describe("usage limits rendering", () => {
     expect(html).toContain("as of 12m ago");
   });
 
-  it("says when the windows reported have all reset, apart from none reported", () => {
-    const runtimes = [
-      {
-        runtime: "claude-code",
-        windows: [{ window: "five_hour", used_pct: 40, resets_at: at(-5) }],
-      },
-    ];
-    expect(anyReported({ runtimes })).toBe(true);
-    expect(anyReported({ runtimes: [] })).toBe(false);
-    expect(anyReported(undefined)).toBe(false);
-    const html = renderToStaticMarkup(
-      createElement(UsageLimits, {
-        accounts: accountsOf({ runtimes }, now),
-        reported: anyReported({ runtimes }),
-      }),
-    );
-    expect(html).toContain("the windows last reported have reset");
-    expect(html).not.toContain("No session has reported usage yet");
-  });
-
-  it("says when no session has reported usage, and when it is still reading", () => {
-    expect(render([])).toContain("No session has reported usage yet");
+  it("says when no limits are current, and when it is still reading", () => {
+    // `usage.get` leaves out windows that have reset, so none reported and all reset look
+    // alike: the sentence holds for both.
+    expect(render([])).toContain("No current limits to show");
     expect(render(undefined)).toContain("Reading usage");
     expect(render(undefined, "Not connected")).toContain("Not connected");
   });

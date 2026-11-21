@@ -8342,7 +8342,9 @@ impl AppState {
         }
         match key.code {
             KeyCode::Enter => {
-                let text = self.view.input.trim().to_string();
+                // Trimmed as the hub trims a message: a file's path that ends it is kept
+                // exactly, a trailing space too (an older app's upload names ended in one).
+                let text = twr_core::upload::trim_message(&self.view.input).to_string();
                 // Only blanks: nothing to send (an empty line's Enter is the selection's).
                 if text.is_empty() {
                     return Vec::new();
@@ -11236,6 +11238,25 @@ pub(crate) mod tests {
         let st0 = three_threads();
         assert_eq!(st0.main_thread(), None);
         assert!(st0.transcript.is_none());
+    }
+
+    /// A message sent again from the history (one an orchestrator switch dropped) whose last
+    /// line is a file's path keeps that path exactly: an older app's upload names could end
+    /// in a space, and the path names that file.
+    #[test]
+    fn a_files_path_ending_a_message_is_sent_exactly() {
+        let mut st = three_threads();
+        let message = "see this\nUploaded file: notes.txt \n/w/.twr-uploads/u1/notes.txt ";
+        st.view.input.set(&format!("  {message}\n"));
+        let sent = st.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&sent[..], [Action::Say { text, .. }] if text == message),
+            "{sent:?}"
+        );
+        // Anything else is trimmed as before.
+        st.view.input.set("  deploy the api  ");
+        let sent = st.handle_key(key(KeyCode::Enter));
+        assert!(matches!(&sent[..], [Action::Say { text, .. }] if text == "deploy the api"));
     }
 
     /// With one worker thread, a typed line still goes to the orchestrator (`say` with `to:
