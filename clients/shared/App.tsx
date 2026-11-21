@@ -3175,16 +3175,6 @@ export default function App({
           },
         ]
       : []),
-    ...(offlineNotice
-      ? [
-          {
-            key: "offline-notice",
-            role: "status" as const,
-            tone: "offline" as const,
-            content: offlineNotice,
-          },
-        ]
-      : []),
     ...(paths?.versionMismatch
       ? [
           {
@@ -3198,7 +3188,8 @@ export default function App({
           },
         ]
       : []),
-    ...(hostNotices || []),
+    // A decision first (the suggestions consent), then news; the storage warning,
+    // which can stand for as long as the app runs, never hides either.
     ...(section === "chat" && assistance.needsDisclosure
       ? [
           {
@@ -3217,6 +3208,17 @@ export default function App({
                 }}
               />
             ),
+          },
+        ]
+      : []),
+    ...(hostNotices || []),
+    ...(offlineNotice
+      ? [
+          {
+            key: "offline-notice",
+            role: "status" as const,
+            tone: "offline" as const,
+            content: offlineNotice,
           },
         ]
       : []),

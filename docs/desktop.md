@@ -100,8 +100,10 @@ the command and clearing the text that came back.
 The app's notices share one strip under the header and show one at a time, the most
 pressing first: the connection (connecting, or why it dropped, with **Reconnect**, and
 what this device saved meanwhile), offline, an app whose engine is newer than the
-running hub (**Stop hub…**), an update (**Restart to update**, **Download**, **Dismiss**),
-then the assistance notices. **+N** shows the others under it; dismissing the one shown
+running hub (**Stop hub…**), the first-use notice for small-model suggestions and
+summaries (it asks you to decide), an update (**Restart to update**, **Download**,
+**Dismiss**), a problem with this device's encrypted storage (such as no unlocked keyring
+on Linux), then assistance errors. **+N** shows the others under it; dismissing the one shown
 brings up the next.
 
 Above the history, the orchestrator and each thread's conversation show the first line
