@@ -786,13 +786,45 @@ function register() {
       table: z.array(z.string().min(1).max(64)).max(8).parse(table),
       key: z.string().min(1).max(64).parse(key),
       value: z
-        .union([z.string().max(4096), z.number().int(), z.boolean()])
+        .union([
+          z.string().max(4096),
+          z.number().int(),
+          z.boolean(),
+          z.array(z.string().min(1).max(4096)).max(32),
+        ])
         .parse(value),
     }),
   );
   handle("pick-directory", async () => {
     const result = await dialog.showOpenDialog(window, {
       properties: ["openDirectory"],
+    });
+    return result.canceled ? null : result.filePaths[0];
+  });
+  handle("pick-file", async (request) => {
+    const { title, filters = [] } =
+      z
+        .object({
+          title: z.string().max(120).optional(),
+          filters: z
+            .array(
+              z.object({
+                name: z.string().max(80),
+                extensions: z
+                  .array(z.string().regex(/^[a-zA-Z0-9]{1,16}$/))
+                  .max(16),
+              }),
+            )
+            .max(8)
+            .optional(),
+        })
+        .strict()
+        .optional()
+        .parse(request) ?? {};
+    const result = await dialog.showOpenDialog(window, {
+      title,
+      properties: ["openFile", "showHiddenFiles"],
+      filters: [...filters, { name: "All files", extensions: ["*"] }],
     });
     return result.canceled ? null : result.filePaths[0];
   });

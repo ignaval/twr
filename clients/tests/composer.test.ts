@@ -878,7 +878,7 @@ describe("dictation in the shared desktop and mobile composer", () => {
     expect(app().box().value).toBe("Typed by holding by shortcut");
     expect(app().host.sent).toEqual([]);
   });
-  it("guards slash suggestions and Send as implementation loop against unreviewed dictation", async () => {
+  it("guards slash suggestions and Run as loop against unreviewed dictation", async () => {
     const methods: string[] = [];
     await start({
       rpc: (method) => {
@@ -897,11 +897,10 @@ describe("dictation in the shared desktop and mobile composer", () => {
     await app().click(app().find(".dialog button", "Cancel"));
     await app().talkTo("builder");
     await dictate("Implement a task");
-    await app().click(app().find(".send-caret"));
-    await app().click(
-      app().find(".send-loop-panel button", "Send as implementation loop"),
-    );
+    await app().click(app().find('[role="switch"]', "Run as loop"));
+    await app().press("Enter");
     expect(methods).not.toContain("thread.implement");
+    expect(methods).not.toContain("loop.request");
     expect(app().find(".dialog").textContent).toContain(
       "Confirm spoken message",
     );
@@ -1916,10 +1915,9 @@ describe("attached files", () => {
     await app().talkTo("builder");
     await attach("spec.md");
     await app().type("build this");
-    await app().click(app().find(".send-caret"));
-    await app().click(
-      app().find(".send-loop-panel button", "Send as implementation loop"),
-    );
+    // Run as loop on, Send (Enter: this test DOM submits no form on a click) starts it.
+    await app().click(app().find('[role="switch"]', "Run as loop"));
+    await app().press("Enter");
     expect(asked).toEqual([
       {
         thread: "w1",
@@ -2332,7 +2330,7 @@ describe("usage limits", () => {
     expect(reads).toBe(2);
   });
 
-  it("opens from the header's gauge as a popover, with the way to the Usage page", async () => {
+  it("opens from the header's gauge as a popover, with the way to the Activity page's usage", async () => {
     const gauge = app().find(
       '.conversation-actions button[aria-label="Usage limits"]',
     );
@@ -2344,7 +2342,7 @@ describe("usage limits", () => {
     expect(popover.textContent).toContain("20% left");
     await app().click(app().find(".usage-popover .usage-page-link"));
     expect(app().all(".usage-popover")).toHaveLength(0);
-    expect(app().find(".manager h1").textContent).toBe("Usage");
+    expect(app().find(".manager h1").textContent).toBe("Activity");
     expect(app().find(".usage-cards").textContent).toContain("20% left");
   });
 
@@ -2378,8 +2376,8 @@ describe("usage limits", () => {
   });
 });
 
-/* Send as implementation loop and /implement (docs/design/loops.md › Desktop and mobile):
- * the message box's other way to send, while its destination is a thread. */
+/* Run as loop and /implement (docs/design/loops.md › Desktop and mobile): the message box's
+ * other way to send, while its destination is a thread. */
 describe("implementation loops from the message box", () => {
   /** What the hub was asked for, by method. */
   const asked: { method: string; params: Json }[] = [];
@@ -2389,7 +2387,9 @@ describe("implementation loops from the message box", () => {
       rpc: (method, params) => {
         if (method === "loop.request") {
           asked.push({ method, params });
-          return Promise.resolve(answer);
+          return answer instanceof Error
+            ? Promise.reject(answer)
+            : Promise.resolve(answer);
         }
         if (method === "loop.get")
           return Promise.resolve({ started: null, id: "l1" });
@@ -2419,46 +2419,25 @@ describe("implementation loops from the message box", () => {
   afterEach(async () => {
     await mounted.unmount();
   });
+  const toggle = () => app().find('[role="switch"]', "Run as loop");
   const sendAsLoop = async () => {
-    await app().click(app().find(".send-caret"));
-    await app().click(
-      app().find(".send-loop-panel button", "Send as implementation loop"),
+    await app().click(toggle());
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(app().find(".send-button").getAttribute("aria-label")).toBe(
+      "Start implementation loop",
     );
+    // Enter sends as Send does (this test DOM submits no form on a click).
+    await app().press("Enter");
   };
 
-  it("closes the choice when the focus moves outside it", async () => {
-    await app().talkTo("builder");
-    await app().click(app().find(".send-caret"));
-    expect(app().all(".send-loop-panel")).toHaveLength(1);
-    await app().act(async () => {
-      app().box().focus();
-      app()
-        .box()
-        .dispatchEvent(new FakeEvent("focusin", { bubbles: true }));
-    });
-    expect(app().all(".send-loop-panel")).toHaveLength(0);
-    expect(asked).toEqual([]);
-  });
-
-  it("closes the choice with Esc from its button, staying in the conversation", async () => {
-    await app().talkTo("builder");
-    const caret = app().find(".send-caret");
-    await app().click(caret);
-    expect(app().all(".send-loop-panel")).toHaveLength(1);
-    // Shift-Tab from the panel lands on its button, the panel still open.
-    await app().act(async () => void press(caret, "Escape"));
-    expect(app().all(".send-loop-panel")).toHaveLength(0);
-    expect(app().box().getAttribute("aria-label")).toBe(
-      "Message builder directly",
-    );
-  });
-
   it("offers it only when the message goes to a thread", async () => {
-    expect(app().all(".send-caret")).toHaveLength(0);
+    expect(app().all(".send-loop-toggle")).toHaveLength(0);
     await app().talkTo("builder");
-    const caret = app().find(".send-caret");
-    expect(caret.getAttribute("aria-label")).toBe("More ways to send");
-    expect(caret.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+    // It goes with the conversation it was turned on in.
+    await app().click(toggle());
+    await app().talkTo("tester");
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
   });
 
   it("sends the message as the task of a loop on that thread, live", async () => {
@@ -2471,9 +2450,10 @@ describe("implementation loops from the message box", () => {
         params: { thread: "w1", kind: "implement", task: "add a CSV export" },
       },
     ]);
-    // Never an ordinary message, never the outbox.
+    // Never an ordinary message, never the outbox; the switch turns off once used.
     expect(app().host.sent).toEqual([]);
     expect(app().box().value).toBe("");
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
     expect(app().find(".notice-toast").textContent).toContain(
       "builder started an implementation loop: high · plan.",
     );
@@ -2508,17 +2488,60 @@ describe("implementation loops from the message box", () => {
     await app().talkTo("builder");
     await app().type("add a CSV export");
     await app().connection(false);
-    await app().click(app().find(".send-caret"));
-    const choice = app().find(
-      ".send-loop-panel button",
-      "Send as implementation loop",
-    );
-    expect(choice.hasAttribute("disabled")).toBe(true);
-    expect(app().find(".send-loop-panel small").textContent).toContain(
-      "Loop actions need a live connection",
-    );
+    expect(toggle().hasAttribute("disabled")).toBe(true);
+    expect(
+      app().find(`#${toggle().getAttribute("aria-describedby")}`).textContent,
+    ).toContain("Loop actions need a live connection");
     expect(asked).toEqual([]);
     expect(app().box().value).toBe("add a CSV export");
+  });
+
+  it("stays on when the connection drops: Send waits, and nothing goes to the outbox", async () => {
+    app().host.sendMessage = async () => ({ action: "sent" });
+    await app().talkTo("builder");
+    await app().type("add a CSV export");
+    await app().click(toggle());
+    await app().connection(false);
+    // Still on, and still able to be turned off.
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(toggle().hasAttribute("disabled")).toBe(false);
+    expect(
+      app().find(`#${toggle().getAttribute("aria-describedby")}`).textContent,
+    ).toContain("Send waits until a loop can start");
+    const send = app().find(".send-button");
+    expect(send.getAttribute("aria-label")).toBe("Start implementation loop");
+    expect(send.hasAttribute("disabled")).toBe(true);
+    expect(send.getAttribute("title")).toContain(
+      "Turn off Run as loop to send it as a message.",
+    );
+    // Enter neither starts a loop nor saves the task as an ordinary message.
+    await app().press("Enter");
+    expect(asked).toEqual([]);
+    expect(app().all(".outbox-message")).toHaveLength(0);
+    expect(app().box().value).toBe("add a CSV export");
+    // Back online, Send starts the loop: the task never reaches the thread as a message.
+    await app().live("default");
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    await app().press("Enter");
+    expect(asked).toEqual([
+      {
+        method: "loop.request",
+        params: { thread: "w1", kind: "implement", task: "add a CSV export" },
+      },
+    ]);
+    expect(app().host.sent).toEqual([]);
+    expect(toggle().getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("stays on, with the task, when the loop doesn't start", async () => {
+    answer = new Error("The hub refused the loop");
+    await app().talkTo("builder");
+    await app().type("add a CSV export");
+    await sendAsLoop();
+    expect(asked).toHaveLength(1);
+    expect(app().box().value).toBe("add a CSV export");
+    expect(toggle().getAttribute("aria-checked")).toBe("true");
+    expect(app().host.sent).toEqual([]);
   });
 
   it("runs /implement in a thread's conversation with every word as the task", async () => {
@@ -2668,6 +2691,82 @@ describe("/access in the message box", () => {
   });
 });
 
+/* A thread action's form (docs/desktop.md › forms): opened from a thread (its inspector,
+ * its ⋯ menu, a slash command naming it) it is for that thread and says so; from the
+ * palette it asks which, the conversation's thread first. */
+describe("a thread action's form", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mounted = await mount();
+  });
+  afterEach(async () => {
+    await mounted.unmount();
+  });
+  const dialog = () => app().find("[role=dialog]");
+  /** The option a select shows (react-dom marks it `selected`). */
+  const chosen = (select: FakeElement) =>
+    (select.querySelectorAll("option").find((o) => (o as any).selected) as any)
+      ?.value;
+  const fromPalette = async (title: string) => {
+    await app().click(app().find(".sidebar-footer button", "Commands"));
+    await app().click(app().find(".palette-options [role=option]", title));
+  };
+
+  it("asks which thread from the palette, the conversation's first", async () => {
+    await app().talkTo("builder");
+    await fromPalette("Stop thread");
+    const picker = dialog().querySelector("select#field-thread")!;
+    expect(picker).toBeTruthy();
+    expect(chosen(picker)).toBe("w1");
+    expect(dialog().querySelector("header p")?.textContent ?? "").not.toMatch(
+      /^For /,
+    );
+    await app().click(
+      app().find("[role=dialog] button[aria-label='Close dialog']"),
+    );
+    // History search can still look through every thread.
+    await fromPalette("Search saved conversations");
+    const search = dialog().querySelector("select#field-thread")!;
+    expect(chosen(search)).toBe("w1");
+    expect(
+      search.querySelectorAll("option").map((o) => o.textContent),
+    ).toContain("Every thread");
+  });
+
+  it("is for the thread it was opened from, and says so", async () => {
+    await app().talkTo("builder");
+    await app().click(app().find("button[title='Show thread details']"));
+    await app().click(app().find(".inspector-actions button", "Rename…"));
+    expect(dialog().querySelector("select#field-thread")).toBeFalsy();
+    const fixed = dialog().querySelector("input#field-thread") as any;
+    expect(fixed?.type ?? fixed?.getAttribute("type")).toBe("hidden");
+    expect(fixed?.value).toBe("w1");
+    expect(dialog().querySelector("header p")?.textContent).toMatch(
+      /^For builder\./,
+    );
+  });
+
+  it("gives focus back to the More button an action was chosen from", async () => {
+    await app().talkTo("builder");
+    await app().click(app().find("button[title='Show thread details']"));
+    const menu = app().find(".inspector-more");
+    const more = menu.querySelector("summary")!;
+    menu.setAttribute("open", "");
+    const compact = app().find(".inspector-more button", "Compact…");
+    compact.focus();
+    await app().click(compact);
+    // The menu closed with focus on its button, not on the action it hid.
+    expect(menu.hasAttribute("open")).toBe(false);
+    expect(dialog().querySelector("header p")?.textContent).toMatch(
+      /^For builder\./,
+    );
+    await app().click(
+      app().find("[role=dialog] button[aria-label='Close dialog']"),
+    );
+    expect(app().document.activeElement).toBe(more);
+  });
+});
+
 describe("messages put back in the box stay messages", () => {
   afterEach(async () => {
     await mounted.unmount();
@@ -2767,6 +2866,39 @@ describe("messages put back in the box stay messages", () => {
     expect(calls).toEqual([
       { method: "thread.set_model", params: { thread: "orch", effort: "low" } },
     ]);
+  });
+
+  it("opens the picker from the conversation's ⋯ menu and the inspector's Model, and /usage from the menu", async () => {
+    const catalog = { fake: { models: [{ id: "m1" }], efforts: ["low"] } };
+    await start({
+      rpc: (method) => {
+        if (method === "orchestrator.show")
+          return Promise.resolve({ models: catalog, thread: "orch" });
+        if (method === "usage.get") return Promise.resolve({ runtimes: [] });
+        return undefined;
+      },
+    });
+    const menuItem = (label: string) =>
+      app().find(".conversation-actions .actions-menu-items button", label);
+    // The one place for a model: the message box's picker, not a form.
+    await app().click(menuItem("Model & runtime…"));
+    expect(app().all(".model-picker-popup").length).toBe(1);
+    expect(app().all("[role=dialog] form").length).toBe(0);
+    const closePicker = () =>
+      app().act(
+        async () => void press(app().find(".model-picker-search"), "Escape"),
+      );
+    await closePicker();
+    expect(app().all(".model-picker-popup").length).toBe(0);
+    await app().talkTo("builder");
+    await app().click(app().find("button[title='Show thread details']"));
+    await app().click(
+      app().find("button[aria-label='Change model of builder']"),
+    );
+    expect(app().all(".model-picker-popup").length).toBe(1);
+    await closePicker();
+    await app().click(menuItem("Usage limits"));
+    expect(app().all(".usage-panel").length).toBe(1);
   });
 
   it("puts back what a switch dropped escaped, and says the new orchestrator can't start", async () => {

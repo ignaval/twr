@@ -303,17 +303,17 @@ voice` beats `voice` (not `voices`), as it does at start.
 
 ### Choosing a voice in the apps
 
-In the desktop app, **Settings › Read-aloud voice** has a picker for English and one for
+In the desktop app, **Settings › Voice › Read-aloud voice** has a picker for English and one for
 Spanish: this computer's voices (on a Mac, its Premium and Enhanced ones first; **Get more Mac
 voices…** opens System Settings › Accessibility › Spoken Content) and twr's natural voices.
 **Preview** says a sentence with the voice (`twr voices try`). Choosing a natural voice that
 isn't downloaded offers its download, with its progress, and saves the choice once it is
 installed; a note says what a voice still needs (espeak-ng) or that this computer is too slow
-for it. With nothing chosen, a suggestion names the best voice ready, else Kokoro to download.
+for it. The list marks the best voice ready, else Kokoro to download, as (recommended).
 The choice is `[speech] voice` (the English choice, else the Spanish one) and `voices` in this
 computer's config, written in place: every other line stays. A `[speech.voices]` table of its
 own, or a `voices` value over several lines, is left alone, and the app says to edit it in
-Settings › Configuration.
+Settings › Advanced › Config file.
 
 The phone apps have the same section for the phone's speaker: [mobile.md](mobile.md#voices).
 The TUI has `/read voice <name>` for every speaker at once; a voice per language there is

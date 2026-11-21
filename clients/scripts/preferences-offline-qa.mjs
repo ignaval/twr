@@ -422,11 +422,22 @@ async function exerciseDefiniteRejection(page) {
     "QA: definite native rejection preserves original error and same-ID retry",
   );
 }
+/** Settings › Advanced › Config file, unfolded. */
+async function openConfigEditor(page) {
+  await page.getByRole("tab", { name: "Advanced", exact: true }).click();
+  const unfold = page.getByRole("button", {
+    name: "Edit config file…",
+    exact: true,
+  });
+  if ((await unfold.getAttribute("aria-expanded")) === "false")
+    await unfold.click();
+}
 async function checkConfigDraftIsMemoryOnly(page) {
   await page
     .locator(".sidebar-footer")
     .getByRole("button", { name: "Settings", exact: true })
     .click();
+  await openConfigEditor(page);
   const editor = page.locator("textarea.config-editor");
   await editor.waitFor();
   const original = await editor.inputValue();
@@ -462,6 +473,7 @@ async function checkConfigDraftIsMemoryOnly(page) {
     .locator(".sidebar-footer")
     .getByRole("button", { name: "Settings", exact: true })
     .click();
+  await openConfigEditor(page);
   await expect(page.locator("textarea.config-editor")).not.toHaveValue(
     new RegExp(marker),
   );
@@ -489,6 +501,7 @@ async function exerciseStorageRecovery() {
     .locator(".sidebar-footer")
     .getByRole("button", { name: "Settings", exact: true })
     .click();
+  await page.getByRole("tab", { name: "Advanced", exact: true }).click();
   const retry = page.getByRole("button", {
     name: "Retry encrypted storage",
     exact: true,
@@ -510,6 +523,7 @@ async function exerciseStorageRecovery() {
     .locator(".sidebar-footer")
     .getByRole("button", { name: "Settings", exact: true })
     .click();
+  await page.getByRole("tab", { name: "Advanced", exact: true }).click();
   await page
     .getByRole("button", { name: "Reset offline storage…", exact: true })
     .click();
@@ -622,13 +636,13 @@ async function exerciseRemoteForget(page, history) {
     });
     throw error;
   }
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   let dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
+  // The address and code go in by hand (no invitation to paste).
+  await dialog.getByText("Enter details manually", { exact: true }).click();
   await dialog
     .getByLabel("Hub name", { exact: true })
     .fill("Disposable forget QA");
@@ -645,7 +659,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Pair and connect", exact: true })
     .click();
   await expect(
-    page.getByRole("button", { name: "Hubs and remote access", exact: true }),
+    page.getByRole("button", { name: /^Computer: .+ — switch$/ }),
   ).toHaveText("Disposable forget QA");
   await page
     .locator(".connection-status")
@@ -677,11 +691,9 @@ async function exerciseRemoteForget(page, history) {
     )
     .toBe("REMOTE_FORGET_DRAFT_MARKER");
   // Revisit the same saved hub to create another mounted journal before forgetting.
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog
@@ -691,11 +703,9 @@ async function exerciseRemoteForget(page, history) {
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
     .waitFor();
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog
@@ -704,7 +714,7 @@ async function exerciseRemoteForget(page, history) {
     .getByRole("button", { name: "Connect", exact: true })
     .click();
   await expect(
-    page.getByRole("button", { name: "Hubs and remote access", exact: true }),
+    page.getByRole("button", { name: /^Computer: .+ — switch$/ }),
   ).toHaveText(hub.name);
   await page
     .locator(".connection-status")
@@ -728,11 +738,9 @@ async function exerciseRemoteForget(page, history) {
   await expect
     .poll(async () => JSON.parse((await records())[1]).outbox.length)
     .toBe(1);
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog
@@ -742,11 +750,9 @@ async function exerciseRemoteForget(page, history) {
     .locator(".connection-status")
     .filter({ hasText: "Hub connected" })
     .waitFor();
-  await page
-    .getByRole("button", { name: "Hubs and remote access", exact: true })
-    .click();
+  await page.getByRole("button", { name: /^Computer: .+ — switch$/ }).click();
   dialog = page.getByRole("dialog", {
-    name: "Hubs and remote access",
+    name: "Computers",
     exact: true,
   });
   await dialog
@@ -855,6 +861,7 @@ try {
       .locator(".sidebar-footer")
       .getByRole("button", { name: "Settings", exact: true })
       .click();
+    await page.getByRole("tab", { name: "General", exact: true }).click();
     const options = page.locator(".layout-options");
     const card = page
       .locator(".thread-list .thread-card")
@@ -862,8 +869,8 @@ try {
     await card.waitFor();
     const comfortable = (await card.boundingBox()).height;
     await options
-      .getByRole("combobox", { name: "Density", exact: true })
-      .selectOption("compact");
+      .getByRole("switch", { name: "Compact layout", exact: true })
+      .check();
     await expect
       .poll(async () => (await card.boundingBox()).height)
       .toBeLessThan(comfortable);
@@ -876,17 +883,11 @@ try {
       compact,
     );
     await options
-      .getByRole("slider", { name: "Interface text", exact: true })
-      .focus();
+      .getByRole("combobox", { name: "Interface text", exact: true })
+      .selectOption({ label: "Extra large" });
     await options
-      .getByRole("slider", { name: "Interface text", exact: true })
-      .press("End");
-    await options
-      .getByRole("slider", { name: "Code & terminal text", exact: true })
-      .focus();
-    await options
-      .getByRole("slider", { name: /Code & terminal text/ })
-      .press("End");
+      .getByRole("combobox", { name: "Code & terminal text", exact: true })
+      .selectOption({ label: "Extra large" });
     await talk(page, "history");
     await page
       .locator(".block-assistant")

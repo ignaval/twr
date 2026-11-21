@@ -52,6 +52,50 @@ select {
 [data-mobile="true"] .manage-nav > summary {
   min-height: 44px;
 }
+/* A switch on the phone: the input itself is the 44-point target; its ::after draws the
+ * 44 x 26 track inside it and its ::before the thumb, so what is measured and tapped is the
+ * whole target, not only the track. */
+[data-mobile="true"] input[type="checkbox"][role="switch"],
+[data-mobile="true"] input[type="checkbox"][role="switch"]:checked {
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 13px;
+  background: transparent;
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]::after {
+  content: "";
+  position: absolute;
+  top: 9px;
+  left: 0;
+  width: 44px;
+  height: 26px;
+  box-sizing: border-box;
+  border: 1px solid var(--field-border);
+  border-radius: 999px;
+  background: var(--bg);
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]:checked::after {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]::before {
+  z-index: 1;
+  top: 13px;
+  left: 4px;
+  width: 18px;
+  height: 18px;
+}
+[data-mobile="true"] input[type="checkbox"][role="switch"]:checked::before {
+  width: 18px;
+  height: 18px;
+  transform: translateX(18px);
+}
 [data-mobile="true"] .icon-button {
   min-width: 44px;
 }
@@ -495,7 +539,7 @@ select {
   [data-mobile="true"] .workspace-breadcrumb,
   [data-mobile="true"] .topbar-left > .workspace-breadcrumb + svg,
   [data-mobile="true"] .live-indicator,
-  [data-mobile="true"] .topbar-actions > [aria-label="Open command palette"],
+  [data-mobile="true"] .topbar-actions > [aria-label="Open shell"],
   [data-mobile="true"] .topbar-new-thread {
     display: none;
   }
@@ -547,7 +591,7 @@ select {
   [data-mobile="true"] .workspace-breadcrumb,
   [data-mobile="true"] .topbar-left > .workspace-breadcrumb + svg,
   [data-mobile="true"] .live-indicator,
-  [data-mobile="true"] .topbar-actions > [aria-label="Open command palette"],
+  [data-mobile="true"] .topbar-actions > [aria-label="Open shell"],
   [data-mobile="true"] .topbar-new-thread {
     display: none;
   }
@@ -564,9 +608,6 @@ select {
     min-width: 44px;
     min-height: 44px;
   }
-}
-[data-mobile="true"] .grid-new-thread {
-  display: inline-flex;
 }
 @media (max-width: 1099px) {
   [data-mobile="true"] .mobile-runtime {
@@ -637,7 +678,7 @@ select {
 [data-fold="vertical"] .topbar-left > .workspace-breadcrumb + svg,
 [data-fold="vertical"] .topbar-left > .live-indicator,
 [data-fold="vertical"] .topbar-left > [aria-label="Show sidebar"],
-[data-fold="vertical"] .topbar-actions > [aria-label="Open command palette"],
+[data-fold="vertical"] .topbar-actions > [aria-label="Open shell"],
 [data-fold="vertical"] .topbar-new-thread {
   display: none;
 }
@@ -727,8 +768,7 @@ select {
 :root[data-mobile="true"].short-content .queue,
 :root[data-mobile="true"].short-content .shell-runs,
 :root[data-mobile="true"].short-content .reports,
-:root[data-mobile="true"].short-content .assistance-notice,
-:root[data-mobile="true"].short-content .assistance-status,
+:root[data-mobile="true"].short-content .status-strip,
 :root[data-mobile="true"].short-content .suggested-message {
   min-height: 0;
   max-height: 25%;
@@ -843,11 +883,6 @@ select {
   max-height: 5em;
   overflow: auto;
 }
-@media (max-width: 799px) {
-  [data-mobile="true"] .topbar-actions > [aria-label="Open shell"] {
-    display: none;
-  }
-}
 
 :root[data-mobile="true"].tiny-content .composer > textarea {
   height: auto;
@@ -938,20 +973,13 @@ select {
   min-width: 44px;
 }
 
-/* Send as implementation loop: the ↻ button beside Send, and the choice it opens. */
+/* Run as loop: the ↻ switch beside Send. */
 [data-mobile="true"] .send-loop-button {
   min-width: 44px;
   min-height: 44px;
   width: 44px;
   height: 44px;
 }
-[data-mobile="true"] .send-loop-panel {
-  width: min(
-    320px,
-    calc(100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right))
-  );
-}
-[data-mobile="true"] .send-loop-panel > button,
 [data-mobile="true"] .inspector-notice > button,
 [data-mobile="true"] .loop-starts > button {
   min-height: 44px;

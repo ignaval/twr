@@ -233,6 +233,47 @@ input[type="range"]:disabled {
   opacity: 0.55;
   cursor: default;
 }
+/* A switch (`role="switch"`: a setting that turns something on): a track with a thumb at
+ * its end, the accent when on. Off, the thumb is the edge's colour on the page's; on, the
+ * accent's ink on the accent. The focus ring and the disabled look are the checkbox's. */
+input[type="checkbox"][role="switch"] {
+  position: relative;
+  display: inline-block;
+  width: 32px;
+  min-width: 32px;
+  height: 18px;
+  min-height: 18px;
+  border: 1px solid var(--field-border);
+  border-radius: 999px;
+  background: var(--bg);
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+input[type="checkbox"][role="switch"]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--field-border);
+  transform: none;
+  transition: transform 120ms ease;
+}
+input[type="checkbox"][role="switch"]:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+input[type="checkbox"][role="switch"]:checked::before {
+  width: 12px;
+  height: 12px;
+  border: 0;
+  background: var(--accent-fg);
+  transform: translateX(14px);
+}
 input[type="range"] {
   appearance: none;
   padding: 0;
@@ -1650,12 +1691,10 @@ kbd {
   font-size: 1rem;
 }
 .inspector-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px;
-  border-top: 1px solid var(--border);
-  padding-top: 16px;
-  margin: 20px 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 12px 0 0;
 }
 .inspector-actions > button {
   text-align: left;
@@ -1663,6 +1702,7 @@ kbd {
   background: none;
   padding: 8px;
   font-size: 0.923077rem;
+  gap: 6px;
 }
 .terminal-dock {
   min-height: 160px;
@@ -2674,41 +2714,24 @@ kbd {
   position: relative;
   display: flex;
 }
-.send-caret {
-  width: 20px;
-  min-width: 20px;
+/* Run as loop: a switch beside Send (shared/LoopViews.tsx › SendAsLoop). */
+.send-loop-toggle {
   height: 32px;
-  padding: 0;
-  margin-left: -5px;
-  border-radius: 0 6px 6px 0;
+  min-height: 32px;
+  padding: 4px 8px;
+  gap: 6px;
+  font-size: 0.923077rem;
   color: var(--muted);
+  white-space: nowrap;
 }
 .send-loop-button {
   color: var(--loop);
 }
-.send-loop-panel {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 6px);
-  z-index: 5;
-  width: min(320px, calc(100vw - 32px));
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px;
-  background: var(--raised);
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  box-shadow: var(--shadow-pop);
-}
-.send-loop-panel > button {
-  justify-content: flex-start;
+.send-loop-toggle[aria-checked="true"],
+.send-loop-button[aria-checked="true"] {
   color: var(--loop);
-}
-.send-loop-panel > small {
-  color: var(--muted);
-  font-size: 0.846154rem;
-  line-height: 1.4;
+  border-color: var(--loop);
+  background: var(--loop-soft);
 }
 /* A phone's inspector shows a notice in its flow, where no toast covers its controls. */
 .inspector-notice {
@@ -2739,28 +2762,6 @@ kbd {
   color: var(--success);
   flex-shrink: 0;
 }
-.connection-banner {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--border);
-  color: var(--muted);
-  flex-shrink: 0;
-  background: var(--panel);
-  padding: 8px 20px;
-  font-size: 0.923077rem;
-}
-.connection-banner.warning {
-  color: var(--warning);
-}
-.connection-banner > span {
-  flex: 1;
-  overflow-wrap: anywhere;
-}
-.connection-banner > button {
-  font-size: 0.923077rem;
-  padding: 4px 8px;
-}
 .operation-error.error-banner {
   margin: 0 24px 12px;
   flex-shrink: 0;
@@ -2783,7 +2784,9 @@ kbd {
 }
 .toast {
   position: fixed;
-  top: calc(var(--header-height) + 12px);
+  /* Under the header, the status strip and the conversation's heading (App.tsx measures
+   * them): a toast never covers their controls. */
+  top: calc(var(--toast-top, var(--header-height)) + 8px);
   max-height: min(240px, calc(100dvh - 240px));
   overflow: auto;
   max-width: min(620px, calc(100vw - 44px));
@@ -2876,7 +2879,8 @@ kbd {
   font-size: 1rem;
   gap: 6px;
 }
-.field > span {
+.field > span,
+.field > .field-label {
   font-weight: 500;
 }
 .field > small {
@@ -3211,35 +3215,6 @@ kbd {
   white-space: pre;
   font-size: 0.923077rem;
 }
-.setting-row {
-  display: grid;
-  grid-template-columns: minmax(150px, 1fr) minmax(100px, 180px) 60px;
-  gap: 12px;
-  align-items: center;
-  border-bottom: 1px solid var(--border);
-  padding: 12px 0;
-}
-.setting-row > label {
-  font-size: 1rem;
-}
-.setting-row small {
-  display: block;
-  margin-top: 4px;
-  font-size: 0.923077rem;
-  color: var(--muted);
-}
-.setting-row input,
-.setting-row select {
-  font-size: 0.923077rem;
-  padding: 8px;
-}
-.setting-row > input[type="checkbox"] {
-  justify-self: end;
-}
-.setting-row > button {
-  font-size: 0.923077rem;
-  padding: 8px;
-}
 .shell-runs:empty {
   display: none;
 }
@@ -3340,23 +3315,6 @@ kbd {
   font-size: 0.923077rem;
   margin-right: 6px;
   padding: 4px 8px;
-}
-.assistance-status {
-  margin: 4px 24px;
-  font-size: 0.923077rem;
-  color: var(--muted);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: calc(100% - 48px);
-  max-width: var(--content-width);
-  margin-left: auto;
-  margin-right: auto;
-}
-.assistance-status button {
-  padding: 2px;
-  background: transparent;
-  border: 0;
 }
 .suggested-message {
   margin: 4px 24px;
@@ -3533,13 +3491,18 @@ kbd {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+/* The topbar's copy of the conversation's actions menu: only on a phone, where the
+ * conversation's header is hidden (mobile.css). */
 .conversation-menu {
   display: none;
+}
+
+.actions-menu {
   position: relative;
   flex-shrink: 0;
 }
 
-.conversation-menu > summary {
+.actions-menu > summary {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -3551,11 +3514,11 @@ kbd {
   color: var(--muted);
 }
 
-.conversation-menu > summary::-webkit-details-marker {
+.actions-menu > summary::-webkit-details-marker {
   display: none;
 }
 
-.conversation-menu > div {
+.actions-menu > div {
   position: absolute;
   right: 0;
   top: calc(100% + 6px);
@@ -3568,7 +3531,7 @@ kbd {
   box-shadow: var(--shadow-pop);
 }
 
-.conversation-menu > div > button {
+.actions-menu > div > button {
   width: 100%;
   justify-content: flex-start;
   border: 0;
@@ -3578,11 +3541,11 @@ kbd {
   font-size: 1rem;
 }
 
-.conversation-menu > div > button:hover {
+.actions-menu > div > button:hover {
   background: var(--hover);
 }
 /* Tool calls and Reasoning are on: a check at the row's end. */
-.conversation-menu > div > button[aria-pressed="true"]::after {
+.actions-menu > div > button[aria-pressed="true"]::after {
   content: "";
   width: 8px;
   height: 4px;
@@ -3712,15 +3675,10 @@ kbd {
   .compact-nav .count {
     margin-left: 4px;
   }
-  .setting-row {
-    grid-template-columns: minmax(110px, 1fr) minmax(90px, 140px) 56px;
-    gap: 8px;
-  }
   .reports,
   .queue,
   .shell-runs,
   .assistance-notice,
-  .assistance-status,
   .suggested-message {
     width: calc(100% - 32px);
   }
@@ -3735,6 +3693,9 @@ kbd {
   }
   .topbar-actions > button:last-child {
     padding-inline: 8px;
+  }
+  .topbar {
+    gap: 8px;
   }
   .composer-bottom > span {
     display: none;
@@ -3818,9 +3779,6 @@ kbd {
 .mobile-runtime {
   display: none;
 }
-.grid-new-thread {
-  display: none;
-}
 
 /* A collapsed tool stays one row even when its first input line is very long. */
 .block-tool > details > summary {
@@ -3887,23 +3845,6 @@ kbd {
   flex-direction: column;
   gap: 12px;
 }
-.layout-options label {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 12px;
-}
-.layout-options select {
-  margin-inline-start: auto;
-}
-.layout-options input[type="range"] {
-  width: min(240px, 100%);
-  margin-inline-start: auto;
-}
-.layout-options output {
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
 .layout-options > button {
   align-self: flex-start;
 }
@@ -3930,14 +3871,6 @@ kbd {
   height: auto;
 }
 
-.offline-banner {
-  flex-shrink: 0;
-  padding: 8px 16px;
-  background: var(--warning-soft);
-  color: var(--text);
-  border-bottom: 1px solid var(--border);
-  font-size: 0.923077rem;
-}
 .outbox {
   width: 100%;
   max-width: var(--content-width);
@@ -3975,12 +3908,18 @@ kbd {
   font-size: 0.923077rem;
 }
 
+/* A narrow window: New thread is its icon alone (named by its aria-label), so the topbar
+ * fits without a horizontal scroll down to 360 px. (The label is hidden, not shrunk:
+ * `.topbar-actions > button:last-child` sets the button's font size.) */
 @media (max-width: 800px) {
   .topbar-actions > .topbar-new-thread {
-    font-size: 0;
     padding: 6px;
     gap: 0;
     min-width: 32px;
+    justify-content: center;
+  }
+  .topbar-new-thread-label {
+    display: none;
   }
 }
 
@@ -4011,12 +3950,6 @@ kbd {
 }
 [data-density="compact"] .inspector-body > section {
   margin-block: 8px;
-}
-[data-mobile="true"] .pane-width-controls {
-  display: none;
-}
-.pane-width-controls {
-  display: contents;
 }
 
 .attachment-button {

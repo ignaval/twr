@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { UpdateStatus } from "../shared/types";
+import { StatusStrip, type StripItem } from "../shared/StatusStrip";
 
 const DISMISSED = "twr.update.dismissed";
 function dismissedVersion() {
@@ -10,8 +11,9 @@ function dismissedVersion() {
   }
 }
 
-/** A quiet, dismissible notice when a newer desktop release exists. */
-export function UpdateBanner() {
+/** A quiet, dismissible notice when a newer desktop release exists, for the app's status
+ * strip (which shows it after the connection's notices). */
+export function useUpdateNotice(): StripItem | undefined {
   const [status, setStatus] = useState<UpdateStatus>();
   const [dismissed, setDismissed] = useState(dismissedVersion);
   const [error, setError] = useState("");
@@ -25,14 +27,14 @@ export function UpdateBanner() {
       .catch(() => {});
     return app.onUpdate(setStatus);
   }, []);
-  if (!status?.latest) return null;
+  if (!status?.latest) return undefined;
   const ready = status.state === "downloaded";
   const available = status.state === "available";
   const downloading = status.state === "downloading";
-  if (!ready && !available && !downloading) return null;
+  if (!ready && !available && !downloading) return undefined;
   // Only a downloaded update keeps asking; other notices stay dismissed per version.
-  if (!ready && dismissed === status.latest) return null;
-  if (ready && later) return null;
+  if (!ready && dismissed === status.latest) return undefined;
+  if (ready && later) return undefined;
   const dismiss = () => {
     if (ready) return setLater(true);
     try {
@@ -44,9 +46,11 @@ export function UpdateBanner() {
     void task().catch((e) =>
       setError(e instanceof Error ? e.message : String(e)),
     );
-  return (
-    <div className="update-banner" role="status" aria-live="polite">
-      <div>
+  return {
+    key: "update",
+    role: "status",
+    content: (
+      <div className="update-notice">
         <strong>
           {ready ? (
             `twr ${status.latest} is ready`
@@ -65,7 +69,9 @@ export function UpdateBanner() {
         )}
         {error && <p className="update-error">{error}</p>}
       </div>
-      <div className="update-actions">
+    ),
+    actions: (
+      <>
         {ready && (
           <button
             className="primary"
@@ -109,7 +115,17 @@ export function UpdateBanner() {
             {ready ? "Later" : "Dismiss"}
           </button>
         )}
-      </div>
+      </>
+    ),
+  };
+}
+
+/** The update notice on its own, floating, while no app is shown to hold it. */
+export function UpdateBanner({ notice }: { notice?: StripItem }) {
+  if (!notice) return null;
+  return (
+    <div className="update-banner">
+      <StatusStrip items={[notice]} />
     </div>
   );
 }

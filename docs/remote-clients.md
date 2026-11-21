@@ -1,14 +1,18 @@
 # Remote hubs and pairing
 
-On desktop, open **This computer → Share this computer**. Enter a public HTTPS
-address, a listening IP and port, and absolute paths to a TLS certificate chain
-and its private key. The certificate must cover the address and be trusted by
-your devices. The app checks certificate dates, hostname, matching key, HTTPS
+On desktop, open the hub switcher (**This computer**) and choose **Let other devices
+connect** in the **Computers** dialog. It is three steps. First enter a public HTTPS
+address and choose the TLS certificate chain and its private key with **Choose the
+certificate…** and **Choose the private key…** (or **Edit path** to type an absolute
+path); the listening IP and port wait under **Advanced**, `0.0.0.0:47321` by default.
+Then choose the device access level, and start. The certificate must cover the address
+and be trusted by your devices. The app checks certificate dates, hostname, matching key, HTTPS
 connectivity, gateway protocol and this installation's gateway identity. It
 starts a detached gateway when needed. Closing the app keeps the gateway, hub
 and agents running; restart the computer or use the gateway owner controls to stop it.
-Opening Share this computer probes gateway status without starting it. It shows the
-running version and listener and offers an explicit restart when configuration or
+Opening Let other devices connect probes gateway status without starting it. One line
+says whether remote access is on, with the running version and listener (the gateway's
+recent log is under **Details**), and it offers an explicit restart when configuration or
 the installed engine changes. Restarting closes gateway terminal sessions; the hub
 continues running. If the replacement fails verification, the app cleans it up and
 restores the previous working configuration.
@@ -27,7 +31,8 @@ networks without NAT loopback. TLS certificate renewals reload automatically; fa
 renewals keep the previous TLS context and appear in gateway status.
 
 Choose the device access level, finish the check, then create an invitation. Its
-QR code contains only the HTTPS URL, a one-use code and a five-minute expiration.
+QR code contains only the HTTPS URL, a one-use code and a five-minute expiration;
+**Copy invitation** copies the same text for another computer.
 Creating another code replaces the previous one; closing the dialog cancels its
 unused invitation when the gateway is reachable. Otherwise the hub still enforces
 the five-minute expiration. The invitation shows its granted access, and the hub consumes
@@ -36,7 +41,12 @@ On iOS or Android, choose **Pair a hub → Scan QR code**, confirm the hub/devic
 names, and pair. You can still enter the address and code manually. The scanner
 uses native camera capture; Android keeps its minimum API level at 24.
 
-Under **Saved hubs**, pair a remote gateway with its URL and a one-use code.
+Under **Connect to another computer**, paste that invitation into **Paste invitation**:
+it fills the hub's address and code, and names the hub after its host. **Pair and
+connect** reads the invitation as the box holds it then: text that isn't a valid
+invitation is refused with what to do, and clearing the box clears the address and code it
+filled. To type them instead, leave the box empty and open **Enter details manually** (hub
+name, HTTPS hub URL, one-use code and this device's name). The same tab lists your saved hubs, to connect to or forget.
 Desktop and mobile use the same remote protocol and shared reconnect/framing
 logic. Tokens stay in native storage: Electron safeStorage with plaintext
 fallback refused, iOS Keychain, or Android Keystore encryption. Tokens never

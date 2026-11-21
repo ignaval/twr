@@ -367,9 +367,10 @@ const report = {
 };
 if (report.renderedBlocks >= 80)
   throw new Error("Unbounded transcript rendering");
-const toolToggle = document.querySelector(
-  'button[aria-label="Toggle tool calls"]',
-);
+// Show tool calls, in the ⋯ menu (clicked without opening the menu).
+const toolToggle = [
+  ...document.querySelectorAll(".actions-menu-items > button"),
+].find((button) => button.textContent.trim() === "Show tool calls");
 toolToggle.click();
 await wait(() => document.querySelectorAll(".block-tool").length > 0, 15000);
 report.detailedRenderedBlocks =

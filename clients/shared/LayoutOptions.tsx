@@ -1,82 +1,49 @@
-import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { useEffect, useId, useRef, useState, type PointerEvent } from "react";
 import {
   defaultLayout,
   initializeLayout,
+  textSizeChoices,
   updateLayout,
   useLayoutPreferences,
 } from "./layoutPreferences";
+import { Toggle } from "./Toggle";
 
 export function LayoutOptions() {
   const prefs = useLayoutPreferences();
+  const ids = useId();
+  const size = (kind: "textSize" | "codeSize", label: string) => (
+    <div className="layout-size">
+      <label htmlFor={`${ids}-${kind}`}>{label}</label>
+      <select
+        id={`${ids}-${kind}`}
+        value={String(prefs[kind])}
+        onChange={(e) => updateLayout({ [kind]: Number(e.target.value) })}
+      >
+        {textSizeChoices(kind, prefs[kind]).map((c) => (
+          <option key={c.value} value={c.value}>
+            {c.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
   return (
     <section className="settings-section layout-options">
       <h2>Layout & text</h2>
       <p>
-        Pane widths are remembered on this device. Mobile text also follows your
-        system text size. Sizes below are before system scaling; interface and
-        terminal controls use a bounded scale while conversation text follows
-        the full setting.
+        These apply to this device. On a phone, text also follows your system
+        text size.
       </p>
-      <label>
-        Density
-        <select
-          value={prefs.density}
-          onChange={(e) =>
-            updateLayout({
-              density: e.target.value as "compact" | "comfortable",
-            })
-          }
-        >
-          <option value="comfortable">Comfortable</option>
-          <option value="compact">Compact</option>
-        </select>
-      </label>
-      <label>
-        Interface text <output aria-hidden="true">{prefs.textSize} px</output>
-        <input
-          type="range"
-          aria-label="Interface text"
-          min="12"
-          max="22"
-          aria-valuetext={`${prefs.textSize} pixels before system scaling`}
-          value={prefs.textSize}
-          onChange={(e) => updateLayout({ textSize: Number(e.target.value) })}
-        />
-      </label>
-      <label>
-        Code & terminal text{" "}
-        <output aria-hidden="true">{prefs.codeSize} px</output>
-        <input
-          type="range"
-          aria-label="Code & terminal text"
-          min="11"
-          max="24"
-          aria-valuetext={`${prefs.codeSize} pixels before system scaling`}
-          value={prefs.codeSize}
-          onChange={(e) => updateLayout({ codeSize: Number(e.target.value) })}
-        />
-      </label>
-      <div className="pane-width-controls">
-        {(["sidebar", "inspector"] as const).map((pane) => (
-          <label key={pane}>
-            {pane === "sidebar" ? "Sidebar width" : "Inspector width"}
-            <output aria-hidden="true">{prefs[pane]} px</output>
-            <input
-              type="range"
-              aria-label={
-                pane === "sidebar" ? "Sidebar width" : "Inspector width"
-              }
-              min={pane === "sidebar" ? 200 : 280}
-              max={pane === "sidebar" ? 440 : 600}
-              value={prefs[pane]}
-              aria-valuetext={`${prefs[pane]} pixels, constrained to fit the window`}
-              onChange={(event) =>
-                updateLayout({ [pane]: Number(event.target.value) })
-              }
-            />
-          </label>
-        ))}
-      </div>
+      <Toggle
+        label="Compact layout"
+        detail="Tighter spacing, so more fits on screen."
+        checked={prefs.density === "compact"}
+        onChange={(on) =>
+          updateLayout({ density: on ? "compact" : "comfortable" })
+        }
+      />
+      {size("textSize", "Interface text")}
+      {size("codeSize", "Code & terminal text")}
       <button onClick={() => updateLayout(defaultLayout)}>
         Reset layout & text
       </button>
@@ -166,7 +133,7 @@ export function PaneResize({ pane }: { pane: "sidebar" | "inspector" }) {
       aria-valuenow={Math.min(maximum, Math.max(minimum, rendered))}
       aria-valuetext={`${rendered} pixels`}
       className={`pane-resize pane-resize-${pane}`}
-      title="Drag to resize, use arrow keys, or change widths in Settings"
+      title="Drag to resize or use the arrow keys. Double-click to reset."
       onPointerDown={(event) => {
         const node = event.currentTarget.parentElement;
         if (event.button !== 0 || !node) return;

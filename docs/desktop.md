@@ -57,29 +57,54 @@ Choosing an orchestrator or a thread in another workspace switches to that works
 opens it there, with no separate switch. A single click opens a thread's conversation,
 and `+N more` opens that workspace's grid. Each workspace's
 `+` starts a new thread in it. Its name collapses or expands it, and the app remembers
-that on this device. **New workspace** at the end of the list, and the folder button
-beside the heading, create or remove workspaces. Needs you and the thread grid stay at
-the top.
+that on this device. **New workspace** at the end of the list creates or removes
+workspaces. Needs you and the thread grid stay at the top.
+
+Under the workspaces, **Manage** lists **Machines & accounts** (the hub's boxes and your
+accounts; it needs `admin` on a paired device), **Activity** (jobs and usage), **Context &
+memory**, **Trash** and **Decisions**. At the foot, **Commands** (Cmd/Ctrl-K) opens the
+command palette and **Settings** the settings, Read aloud and Hub & storage among them.
 
 Drag the sidebar's right edge to resize it (200 to 440 px, default 260, and at most
 about a third of the window). Double-click the edge to reset it. With the edge focused,
 Left/Right change it by 10 px and Home/End jump to the limits. The width is saved with
-the other layout settings (Settings › Layout & text) and restored on the next launch.
+the other layout settings (Settings › General › Layout & text) and restored on the next launch.
 
 ## Workflows and CLI coverage
 
 The orchestrator conversation is primary. Selecting a thread opens its conversation; the
-**Show thread details** button beside its heading toggles its inspector. The
-composer always names its destination. Mentions reference threads without changing it.
-Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//` sends a literal slash.
-A line that starts with `!` runs a shell command; start it with `\!` to send a message that
-begins with `!`, as in the TUI. A message you take back from the queue, move back from the
-device's saved messages, put back after an orchestrator switch, or take as a suggestion
-comes back escaped this way when it starts the box, so Send sends it as a message again,
-never as a command. After text already in the box it comes back unescaped, as it was sent:
-Send reads `//` and `\!` only at the start of the box. When the box already holds a
-`/` command or a `!` line, that line is escaped too, so Send sends both as one message
-rather than running the command and clearing the text that came back.
+**Show thread details** button beside its heading toggles its inspector. Beside it are
+read aloud, the [usage gauge](#usage-limits) and the conversation's **⋯** menu: **Show tool
+calls** and **Show reasoning** (each checked while on), **Export conversation**, **Model &
+runtime…** (which opens the message box's [model picker](#model-and-effort)), **Usage
+limits** and, in a thread's conversation, **Rename…**, **Park…**, **Compact…** and **Move
+to trash…**. The header above has search, **Open shell** and **New thread**; each action
+has one place. On a phone the conversation's header is hidden, and the same menu, with New
+thread and Open shell, is the **⋯** at the top.
+
+The composer always names its destination; **Back to orchestrator** in the conversation's
+header (the back arrow on a phone) returns to the orchestrator. Mentions reference threads
+without changing it. Enter sends, Shift-Enter inserts a line, `/` offers commands, and `//`
+sends a literal slash. The hints under the box show while it is empty. A message that
+starts with `!` runs a shell command (in the thread's worktree, or the workspace's folder),
+`!!` also shares its output, and `!!!` sends the line as a message; while the box starts
+with `!` the hints say so. Start it with `\!` to send a message that begins with `!`, as in
+the TUI. A message you take back from the queue, move back from the device's saved
+messages, put back after an orchestrator switch, or take as a suggestion comes back
+escaped this way when it starts the box, so Send sends it as a message again, never as a
+command. After text already in the box it comes back unescaped, as it was sent: Send reads
+`//` and `\!` only at the start of the box. When the box already holds a `/` command or a
+`!` line, that line is escaped too, so Send sends both as one message rather than running
+the command and clearing the text that came back.
+
+The app's notices share one strip under the header and show one at a time, the most
+pressing first: the connection (connecting, or why it dropped, with **Reconnect**, and
+what this device saved meanwhile), offline, an app whose engine is newer than the
+running hub (**Stop hub…**), the first-use notice for small-model suggestions and
+summaries (it asks you to decide), an update (**Restart to update**, **Download**,
+**Dismiss**), a problem with this device's encrypted storage (such as no unlocked keyring
+on Linux), then assistance errors. **+N** shows the others under it; dismissing the one shown
+brings up the next.
 
 Above the history, the orchestrator and each thread's conversation show the first line
 of your preceding message, on desktop and phone. At the bottom, this is your latest
@@ -134,27 +159,54 @@ as code with a copy button instead of a link that does nothing.
 | CLI capability | Desktop workflow |
 | --- | --- |
 | Conversations, send, orchestrator selection/reset | Conversation, explicit destination, orchestrator actions |
-| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
-| Stop, park/resume, compact, trim, delete | Inspector actions; deletion uses the hub's confirmation card |
+| New/list/show, mode/model/runtime/account, rename | New-thread form, sidebar/grid, inspector and typed action forms; the inspector's **Permission mode** is a dropdown of the modes in words that changes the mode at once (narrowed to the safe ones without `admin`; with it, the runtime's own modes too, such as Codex's `on-request`), shown as text for the orchestrator, whose mode the hub fixes, and its **Model** has **Change…**; model and effort are pickers of the runtime's known models and efforts, with the runtime's default first and a custom model id last |
+| Stop, park/resume, compact, trim, delete | The inspector shows **Stop…** while a thread works or **Resume…** when it is parked, with **Pin** and **Rename…**; **More** holds **Park…** (stop it and free its worktree; keep the branch), **Trim…** (delete its build output), **Compact…** (summarize its context to free space) and **Move to trash…**; deletion uses the hub's confirmation card |
 | Attention and responses | Needs you and inline request cards; revision-bound answers and notes |
-| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Send as implementation loop, the Review once and Review loop buttons on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
+| Loops (`twr loop`, `/review`, `/implement`, `/loop`, `twr thread new --loop implement`) | The inspector's Loops section, Run as loop beside Send, the Review once and Review loop buttons on a finished turn with changes, the New thread form's switch, the loop chip on a thread's sidebar card, the setup card and Settings › Loops ([Loops](#loops)) |
 | Message queues and dependencies | Queue with take-back/send-now, send-after and cancel-held-message forms |
 | Attach, PTY fallback, arbitrary shell | Embedded xterm.js terminals using the matching real CLI or login shell |
-| Account list/check/add/login/remove/native naming | Accounts page, typed actions and generated interactive forms |
-| Boxes, SSH/container/dial-in setup, login, projects, tokens | Boxes page and generated interactive CLI forms |
-| Jobs, slots, timeouts, output and cancellation | Jobs table, launch form, live log and cancellation actions |
-| Usage and grouping/time windows | Usage limits (`/usage` above the message box, the header's gauge, the Usage page) and typed reporting form; CLI forms retain duration flags |
+| Account list/check/add/login/remove/native naming | Machines & accounts page, typed actions and generated interactive forms |
+| Boxes, SSH/container/dial-in setup, login, projects, tokens | Machines & accounts page (each machine's **Diagnose** and **Sign in**, the rest in its **⋯** menu) and generated interactive CLI forms |
+| Jobs, slots, timeouts, output and cancellation | Activity page's jobs table, launch form, live log and cancellation actions |
+| Usage and grouping/time windows | Usage limits (`/usage` above the message box, the header's gauge, the Activity page's usage) and typed reporting form; CLI forms retain duration flags |
 | Next-message suggestions, routine summaries | Shared hub small-model calls (`suggest.next`, `summary.thread`), first-use disclosure, the suggestion as the empty message box's placeholder taken with Tab or → (tap it on a phone), expandable routine updates |
 | Context and memory | Revision-aware editors, note cards and standing-context editor |
-| Speech, remote sessions, speaker controls | Read-aloud page and embedded CLI forms |
+| Speech, remote sessions, speaker controls | Settings › Voice (each speaker's own controls) and embedded CLI forms |
 | Workspaces | Sidebar workspace tree (every workspace, its threads nested), creation and removal forms |
 | Trash list/restore/purge | Trash table and preview-first purge form |
-| Log statistics/archive/checkpoints, info, events/control | Hub & storage, diagnostics and generated CLI forms |
+| Log statistics/archive/checkpoints, info, events/control | Settings › Advanced › Hub & storage, diagnostics and generated CLI forms |
 | Runner provisioning and terminal setup | Advanced CLI forms; runner commands do not receive workspace flags |
 | Update | App-level release check and platform installer; the CLI never overwrites the app's engine |
 
-The command palette discovers commands, arguments and options from the **bundled binary's
-own help**, including clap's multiline help. Arguments are preflighted with the bundled CLI’s actual clap parser before a terminal
+The app's own forms (New thread, Change permission mode, Run a job and the rest) ask with
+dropdowns wherever the hub knows the values: threads by name and status, installed runtimes,
+boxes (local first), the chosen runtime's accounts, permission modes in words (only the
+narrow ones on a device without admin), jobs, trash items, watches, paired devices, memory
+notes, held messages, device access levels and usage periods. A list the hub can't give
+(an older hub, a device not allowed to read it) leaves a text box. The runtime, account and
+(with admin) permission mode lists end with **Other…**, which turns the list into a text box
+for what it doesn't name: a one-off `acp:<command>` runtime, an account pool or pattern
+(`work-a,work-b`, `work-*`), a runtime's own mode id; a button beside the box goes back to
+the list, and a value the list lacks opens as typed text. With admin, the mode list also
+names the thread's runtime's own modes (Codex's `untrusted`, `on-request`, `never`,
+`danger-full-access` and `yolo`). A form opened from a thread (the inspector's buttons, its
+**⋯** or **More** menu, a slash command naming one) is for that thread: it says **For
+<thread>** under its title instead of asking. From the command palette, or a slash command
+that names no thread, the form asks, with the conversation's thread chosen first. Less common fields wait under **More options**, which opens by
+itself when one of them holds a value or an error names one; New thread shows Project,
+Name, First prompt and Run as an implementation loop, and keeps the runtime, box, model,
+effort, permission mode, account, aliases, base, checkout and the folder relative project
+paths resolve from under it. Common results read as a sentence or a small table (the thread
+made, with Open; a mode or model change; a rename, park, resume, stop, compaction or trim;
+accounts and their logins; storage sizes; usage; a box's agents and projects; an update
+check, with its download or Restart to update; a memory note's text), with the data itself
+under **Details**; anything else shows as data.
+
+The command palette (**Commands**, Cmd/Ctrl-K) lists the app's actions. The CLI's own
+commands show when the search names one, or all of them with **Show CLI commands** on; an
+action that asks for an id another screen shows (an event, a device, a job) also shows only
+when searched, and update checks are Settings'. The palette discovers the CLI's commands,
+arguments and options from the **bundled binary's own help**, including clap's multiline help. Arguments are preflighted with the bundled CLI’s actual clap parser before a terminal
 opens; invalid arguments leave the form intact. CLI forms show their working directory,
 and project paths in the New form use its explicit working directory. It generates forms rather than asking you to
 construct a command line. Interactive operations run in embedded terminals, so login,
@@ -164,12 +216,34 @@ Automatic `--yes` flags and agent-only MCP entry points are deliberately not off
 Global socket/workspace overrides cannot escape the selected workspace; subprocess arguments
 after `--` remain literal. Every other user command and option remains discoverable.
 
-Settings offers common defaults plus the complete TOML editor. Writes reuse the TUI's
-comment-preserving, locked, crash-recoverable writer. Full-text saves check the text's hash
-and the merged `boxes.toml`, so an unseen change is not overwritten. Unsaved editor drafts
-stay in memory across navigation, not in browser storage. Closing/reloading asks before
-discarding them. Hub settings require a deliberate hub restart. Suggestions and summaries share `[tui]`
-preferences with the CLI and apply immediately on revisiting the conversation. Before the
+The Manage pages are **Machines & accounts** (accounts, then the machines your agents work
+on), **Activity** (jobs, then subscription usage), **Context & memory** and **Trash**. A row
+or card carries its own actions (Restore, Sign in, Diagnose…); the buttons above a list are
+only for what isn't on a row.
+
+Settings is in tabs, and opens on the one used last on this device: **General** (appearance,
+layout and text, accessibility, and on the desktop the application and its updates),
+**Agents** (the orchestrator, and **New thread defaults**), **Loops**, **Voice** (this
+device's read-aloud voice and the speakers connected to the hub, each with its own pause,
+resume, skip and stop, **Read new messages** and reading speed) and **Advanced** (offline
+history, diagnostics, **Hub & storage**, the config file and the effective configuration).
+Arrow keys move between the tabs. A device without admin access sees General, Loops, Voice
+(its own voice only) and Advanced (its own offline history). New thread defaults are
+switches and lists of the values the config takes, in words: each saves as you change it and
+says **Saved** (changes made quickly save one at a time, the last one winning, and the file
+is read again once they end); a hub setting adds that it applies after the hub restarts. The rarer ones
+(log retention and archiving, the background timeout, waking a thread after its background
+work) are under **Advanced**, and Codex's choice for commands its sandbox blocks shows only
+when Codex is installed. On the desktop, **Project folders** lists where New thread looks
+for a project you give by name (`project_roots`; the built-in folders until you change it),
+with **Add folder…** and a remove button per folder; a list spread over several lines in the
+file is left to edit by hand. **Edit config file…** unfolds the complete TOML editor. Writes
+reuse the TUI's comment-preserving, locked, crash-recoverable writer. Full-text saves check
+the text's hash and the merged `boxes.toml`, so an unseen change is not overwritten. Unsaved
+editor drafts stay in memory across navigation, not in browser storage. Closing/reloading
+asks before discarding them. Hub settings require a deliberate hub restart. Suggestions and
+summaries share `[tui]` preferences with the CLI and apply immediately on revisiting the
+conversation. Before the
 first provider call, an in-app notice explains the exact text sent, models, providers and
 that calls count toward your plan's usage; it names no price. As in the TUI, a suggestion
 shows greyed as the empty message box's placeholder: `Tab` or `→` puts it in the box (once
@@ -177,7 +251,14 @@ it has been on screen 300 ms, so a key pressed as it appears isn't taken for it)
 types over it, and it is sent only when you press Enter. Only visible routine-update groups receive summaries; permission/question
 updates remain visible and summaries are bound to their conversation and covered update.
 
-Settings › Orchestrator also sets the orchestrator's [access](orchestrator.md#full-access)
+Settings › Agents › Orchestrator shows the orchestrator's runtime, model and effort as
+lists. On the runtime it runs, **Apply** changes the model and effort in place, as the
+[model picker](#model-and-effort) does (`thread.set_model` on its thread with what changed,
+on the account and agent it runs). Another runtime is a new orchestrator session, so the
+button says **Switch…** and opens the palette's **Switch orchestrator** form with your
+choice, which switches with a handoff summary (`orchestrator.use`) and offers back the
+messages the switch dropped. **Fresh conversation…** starts over, and **Start with
+the hub** is `[orchestrator] autostart`. It also sets the orchestrator's [access](orchestrator.md#full-access)
 (`orchestrator.access`): **Limited** or **Full**, each described in one line. Full asks
 first, in words, what it gives up; Limited doesn't. The answer says when it applies (at
 once, when the orchestrator's current turn ends, or at its next start) and warns when
@@ -243,8 +324,9 @@ destination runs: the orchestrator, or the thread you opened. It names the runti
 short mark (`Cl` Claude Code, `Cx` Codex, `Gk` Grok Build), the model (the one the runtime
 reports it runs, else the one you asked for, else **Default**) and the reasoning effort
 (**High**, or **Default**). The command hints beside it shorten, then hide, as the window
-narrows. Click it, or press Ctrl+Shift+M (⌘+Shift+M on a Mac), to open the picker above the
-message box:
+narrows. Click it, press Ctrl+Shift+M (⌘+Shift+M on a Mac), or choose **Model & runtime…**
+in the conversation's **⋯** menu or **Change…** by the inspector's Model (for the
+conversation shown), to open the picker above the message box:
 
 - On the left, the runtimes twr lists models for (Claude Code, Codex, Grok Build), the
   current one checked. A thread on another runtime, such as an ACP agent, lists its own
@@ -345,12 +427,13 @@ says `(native login)`). With no window to show (no session has reported one yet,
   its rows scroll inside it, so Send stays on screen. On a phone with very little height
   left (300 points or less, the keyboard open) it steps aside while you type and comes back
   when the keyboard closes.
-- **The gauge** in the conversation's header, beside the read-aloud and tool-call buttons,
-  opens them in a popover under the header's right edge, kept inside the conversation however
-  narrow the window. Escape (in the popover or on the gauge), a click outside it or the focus leaving it closes it. On a phone, **Usage limits** in the conversation's menu opens the
-  panel.
-- **The Usage page** in the side navigation shows them in full, with the usage by thread,
-  project or runtime. The panel and the popover link to it.
+- **The gauge** in the conversation's header, beside read aloud, opens them in a popover
+  under the header's right edge, kept inside the conversation however narrow the window.
+  Escape (in the popover or on the gauge), a click outside it or the focus leaving it closes
+  it. **Usage limits** in the conversation's **⋯** menu opens the panel (on a phone, where
+  the header is hidden, the **⋯** at the top).
+- **The Activity page** (Manage › Activity) shows them in full in its Usage section, with
+  the usage by thread, project or runtime. The panel and the popover link to it.
 
 Resets, countdowns and the pace tick go by the hub's clock (`usage.get` says what time it is
 there), so a device whose clock is off still shows the windows that haven't reset. The clock
@@ -368,16 +451,22 @@ the same review runs on its work, and the loop commits it at the end ([the
 design](design/loops.md)). The app starts and follows both kinds in threads on the hub's own
 machine.
 
-- **Send as implementation loop.** When you talk to a thread, Send has a caret (a `↻`
-  button beside Send on a phone) with **Send as implementation loop**: what you wrote is the
-  loop's task. A click outside the choice, or the focus leaving it, closes it. Sent with nothing written, it asks first, since the task is then what your
-  conversation with the thread already settled. It needs a live connection, like every loop
-  action: without one, or on a read-only device, the choice says why and nothing is saved
-  for later.
+- **Run as loop.** When you talk to a thread, a **Run as loop** switch sits beside Send (a
+  `↻` button on a phone). With it on, Send (**Start implementation loop**) makes what you
+  wrote the task of an implementation loop, and the switch turns off once the hub takes the
+  loop (it stays on, with your task, when the start fails). Sent with nothing written, it
+  asks first, since the task is then what your conversation with the thread already
+  settled. It needs a live connection, like every loop action: without one, or on a
+  read-only device, the switch can't be turned on and says why, and nothing is saved for
+  later. Turned on before the connection (or the thread's box) went away, it stays on and
+  Send waits, saying why, until a loop can start: the task never goes out, or to the
+  outbox, as an ordinary message unless you turn the switch off. Opening another
+  conversation turns it off.
 - **Start one.** Select a thread: its inspector has a **Loops** section with **Review
   loop**, **Review once** (a [single review pass](usage.md#a-single-review-pass): one review,
-  the thread's triage, the report) and **Implementation loop…** (which asks for the task, empty meaning what the
-  conversation settled) and, under them, the settings a loop would run on (profile,
+  the thread's triage, the report) and **Implementation loop…** (which asks for the task,
+  empty meaning what the conversation settled), a line under them saying what each does and,
+  under that, the settings a loop would run on (profile,
   implementer, reviewer, and whether they are this project's) or `first run: you will be
   asked to choose models`, with **Change…**. When a thread's turn ends with changes in its worktree (files not committed, or
   commits ahead of its base) and no loop has reviewed them, its sidebar card, its
@@ -431,9 +520,11 @@ machine.
   `auditing 3 of 5 rules` and the loop line `sweep · auditing 2/5`. An
   implementation loop also shows its plan (revision, contract risk yes or no with the reason,
   and where `plan.md` is), its implement turn's result and gates, and what it commits.
-  **Pause** or **Resume**, **Skip to verify** and **Stop** (after a confirmation) control
-  it, as do `/loop pause|resume|skip|stop`; Skip to verify waits for the ladder in an
-  implementation loop, which has built nothing to verify before it, and says so. A stuck
+  **Pause** or **Resume**, **Finish early** (skip to verify: end the review rounds after the
+  current one and go on to the final verification) and **Stop** (after a confirmation)
+  control it, as do `/loop pause|resume|skip|stop`; Finish early waits for the review
+  rounds in an implementation loop, which has built nothing to verify before them, and says
+  so. A stuck
   loop raises a card with **Resume** and **Stop**. A loop started from the app says what it
   runs on (`api started a review loop: low · implementer … · reviewer … (saved
   settings)`), and a screen reader hears a setup card, a stuck loop and a loop that ends
@@ -462,7 +553,8 @@ machine.
   offers to start a loop on its threads: the buttons wait and say `Box devbox is away: a
   loop can start once it is back.`
 - **Settings.** **Change…** in the Loops section and `/loop settings` open the editor:
-  the four presets, the implementer (the thread's own, or a runtime, model and effort), its
+  the four presets first; the rest sits behind **Customize**, which is open when the
+  settings match no preset (or there are no presets, or the hub names a problem): the implementer (the thread's own, or a runtime, model and effort), its
   workers where its runtime has subagents, the reviewer (runtime, model, and account where
   it has several), the profile, an implementation loop's plan check and commits, what a
   review loop commits, **Sweep** (the thread audits the rules, or a reviewer run per rule:
@@ -496,7 +588,7 @@ On Linux the icon needs a StatusNotifierItem host: the tray of Omarchy's bar (th
 KDE Plasma, or GNOME with the AppIndicator extension. Without one, Settings says so
 and background mode stays off, so the window can always be brought back.
 
-Settings › Application has four switches:
+Settings › General › Application has four switches:
 
 - **Launch at login.** On macOS this registers a login item (macOS may ask you to
   allow it in System Settings › General › Login Items). On Linux it writes
@@ -546,7 +638,7 @@ Settings › Application has four switches:
 | AUR (`twr-desktop-bin`) | Your AUR helper updates it with the system (`yay -Syu`, Omarchy's **Update**); the app also notifies |
 
 The app checks the latest GitHub release 45 seconds after launch and then every six
-hours. Turn this off, or check by hand, in Settings › Updates or Help › Check for Updates.
+hours. Turn this off, or check by hand, in Settings › General › Updates or Help › Check for Updates.
 It only reacts to a release once that release has the installers and update metadata for
 this platform. Self-updating builds verify the download against the SHA-512 in the
 release's `latest-*.yml`, and on macOS against the app's code signature. An AppImage also
@@ -562,14 +654,14 @@ content-addressed directory, so a running hub's executable is never replaced.
 ## Diagnostics
 
 twr keeps a local log (`twr-desktop.log`, rotated at 2 MiB) in the folder shown by
-**Help › Open Log Folder** and in Settings › Diagnostics (`~/Library/Logs/twr-desktop`
+**Help › Open Log Folder** and in Settings › Advanced › Diagnostics (`~/Library/Logs/twr-desktop`
 on macOS; under the app's configuration folder on Linux). The log records startup, update checks, hub connection failures, renderer errors
 and crashed helper processes. Chromium crash reports are kept on disk and never uploaded.
 If the window's page ends unexpectedly (out of memory, a GPU failure), twr reloads it, up to
 three times in five minutes, then asks whether to reload or quit. A window that stops
 responding offers Wait or Reload; the question closes itself if the window recovers.
 Reloading keeps the hub, its agents and open terminals.
-**Settings › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
+**Settings › Advanced › Diagnostics › Copy diagnostics** (or **Help › Copy Diagnostics**) copies the
 version, install kind, platform and session details, GPU status, memory use and the recent
 log. Tokens, keys, URL credentials and your home folder path are removed first.
 
@@ -829,9 +921,10 @@ by conversation to narrow the results. Search older events continues through old
 pages, including pages without matches. The first archive read after an upgrade may take
 longer while an existing archive receives its search index.
 
-Selecting a result opens its exact event and surrounding history, labeled with the
-hub, workspace, thread and event sequence. It keeps your current message destination
-and draft. Large context fields carry a display-truncated marker. The bounded view
+Each result names its conversation, who it came from (You, Agent, Tool, Reasoning,
+Orchestrator, Decision or Update) and when. Selecting a result opens its exact event and
+surrounding history, labeled the same way with the hub and workspace. It keeps your current
+message destination and draft. Large context fields carry a display-truncated marker. The bounded view
 retains the event id and sequence and omits runtime extras and blob references.
 Use `twr events THREAD --hydrate` to read the full recorded data. Search runs on
 the hub, so it requires a connection to that workspace.
@@ -843,9 +936,9 @@ it was last moved, resized or closed (saved in the app's `desktop.json`). It is 
 shrunk to fit the display that shows most of it; if that display is gone, it keeps its size
 and opens in the default place.
 
-Settings → Layout & text offers Compact and Comfortable density, independent interface and code text sizes, and sidebar/inspector width sliders. Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
+Settings › General › Layout & text has a **Compact layout** switch and the interface and code text sizes (Small, Default, Large, Extra large; a size an earlier version saved shows as Custom). Drag the sidebar's right edge or the inspector's header edge, or focus the separator and use Left/Right, Home or End. Widths are constrained to fit a tiled window and saved on this device. Mobile conversation text follows the system text-size setting; chrome and terminal sizes use a bounded scale so their controls remain usable.
 
-Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings. Configuration/editor drafts stay in memory because they may contain credentials.
+Recent conversations and message drafts are encrypted locally using the macOS keychain, a Linux secret service, iOS Keychain or Android Keystore. Linux sessions without an unlocked keyring keep live operation available and report that encrypted persistence is unavailable; no plaintext fallback is used. History is bounded, retained for up to seven days and can be cleared in Settings › Advanced. Configuration/editor drafts stay in memory because they may contain credentials.
 
 When a saved hub is offline, the app shows dated cached history with request buttons disabled. Plain messages can be saved in the outbox for their original workspace and destination, their attached files with them; a message escaped with `//` or `\!` (as Take back puts one back) is a plain message. Reopening the app preserves the original request ID; reconnecting retries that ID within 23 hours. An expired receipt or an unknown delivery outcome requires review in the conversation before a new message is sent. Removing an outbox entry never recalls a message already delivered to the hub. Shell commands, slash commands and permission answers require a live connection. Forgetting a hub removes its local encrypted history, drafts, outbox and bootstrap metadata.
 

@@ -131,7 +131,8 @@ export async function captureUI(page, { hubPids } = {}) {
   };
   const palette = async (appearance) => {
     await page
-      .getByRole("button", { name: "Open command palette", exact: true })
+      .locator(".sidebar-footer")
+      .getByRole("button", { name: "Commands", exact: true })
       .click();
     await page
       .getByRole("textbox", { name: "Search commands", exact: true })
@@ -163,6 +164,7 @@ export async function captureUI(page, { hubPids } = {}) {
   };
   const theme = async (value) => {
     await nav("Settings");
+    await page.getByRole("tab", { name: "General", exact: true }).click();
     await page
       .getByRole("heading", { name: "Appearance", exact: true })
       .waitFor();
@@ -197,7 +199,7 @@ export async function captureUI(page, { hubPids } = {}) {
 
   // A separate real workspace keeps earlier QA history and benchmark dumps out of the shots.
   await page
-    .getByRole("button", { name: "Manage workspaces", exact: true })
+    .getByRole("button", { name: "New workspace", exact: true })
     .click();
   const workspace = page.getByRole("dialog", {
     name: "Workspaces",
@@ -309,6 +311,7 @@ export async function captureUI(page, { hubPids } = {}) {
   await palette("dark");
   await newThread("dark", true);
   await nav("Settings");
+  await page.getByRole("tab", { name: "General", exact: true }).click();
   await page
     .getByRole("heading", { name: "Appearance", exact: true })
     .waitFor();
@@ -455,12 +458,14 @@ export async function captureUI(page, { hubPids } = {}) {
     longPrompt,
   );
   await user.locator(".message-expand").click();
-  const showTools = page.getByRole("button", {
-    name: "Toggle tool calls",
-    exact: true,
+  const conversationMenu = page.locator(".conversation-heading .actions-menu");
+  const showTools = conversationMenu.locator(".actions-menu-items > button", {
+    hasText: "Show tool calls",
   });
-  if (!(await showTools.getAttribute("class")).split(/\s+/).includes("on"))
+  if ((await showTools.getAttribute("aria-pressed")) !== "true") {
+    await conversationMenu.locator(":scope > summary").click();
     await showTools.click();
+  }
   const tool = page
     .locator(".block-tool")
     .filter({ hasText: "src/search.test.ts" });

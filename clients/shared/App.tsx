@@ -24,7 +24,7 @@ import {
 } from "./attachmentText";
 import { UsageButton, UsagePanel } from "./UsageLimits";
 import { Composer, Drafts, composerMemory, useHasDraft } from "./Composer";
-import { ModelPicker } from "./ModelPicker";
+import { ModelPicker, openModelPicker } from "./ModelPicker";
 import { onSaveNow } from "./save-now";
 import {
   changeProblem,
@@ -37,7 +37,7 @@ import { ConversationSearch, NeedsYouInbox } from "./InboxSearch";
 import { PaneResize } from "./LayoutOptions";
 import { WORKSPACE_REFRESH_MS, workspaceEntries } from "./workspaceTree";
 import { attentionSummary } from "./attentionSummary";
-import { errorMessage } from "./errors";
+import { connectionWords, errorMessage } from "./errors";
 import { savedAppearance } from "./appearance";
 import { useHostAPI } from "./host";
 import {
@@ -60,8 +60,6 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Asterisk,
   Wrench,
-  Database,
-  ListTodo,
   ArrowLeft,
   ArrowDown,
   ArrowUpRight,
@@ -81,16 +79,13 @@ import {
   ChevronRight,
   MoreHorizontal,
   GitBranch,
-  Play,
   Square,
   Pin,
   Server,
-  KeyRound,
   Activity,
   FileText,
   Trash2,
   Volume2,
-  Command as CommandIcon,
   Check,
   CheckCircle2,
   Circle,
@@ -98,10 +93,13 @@ import {
   Download,
   Eye,
   Gauge,
-  EyeOff,
   Filter,
   AlertCircle,
-  FolderPlus,
+  Cpu,
+  Pencil,
+  CirclePause,
+  Scissors,
+  Shrink,
 } from "lucide-react";
 import {
   commands as applicationCommands,
@@ -117,6 +115,7 @@ import type {
   DesktopEvent,
   HubEvent,
   Json,
+  OperationOptions,
   TerminalSession,
   Thread,
   ViewState,
@@ -131,7 +130,13 @@ import {
   Markdown,
   Spinner,
 } from "./ui";
-import { effortChoices, formRuntime, modelChoices } from "./models";
+import {
+  findThread,
+  pickerSources,
+  resolveField,
+  splitFields,
+} from "./fieldChoices";
+import { CommandResult } from "./CommandResult";
 import { AssistanceNotice, useAssistance, type Summary } from "./assistance";
 import { announcements, voiceHint } from "./voice";
 import {
@@ -140,7 +145,11 @@ import {
   foldRoutineBlocks,
   messageTime,
 } from "./transcript";
-import { Manager, JobLog, type Section } from "./Managers";
+import { Manager, JobLog, navSection, type Section } from "./Managers";
+import { ActionsMenu, type MenuItem } from "./ActionsMenu";
+import { StatusStrip, type StripItem } from "./StatusStrip";
+import { PermissionModePicker, ThreadActions } from "./ThreadActions";
+import "./palette.css";
 import { useEditorSessions } from "./editors";
 import { localWorkingDirectory } from "./paths";
 import { approvalShortcut, canRespond } from "./attention";
@@ -209,17 +218,23 @@ const initial: ViewState = {
   decisions_seen: 0,
   head: 0,
 };
+/** The Manage pages, then Settings. Other sections render one of these pages (Boxes and
+ * Usage are parts of Machines & accounts and Activity; Read aloud and Hub & storage are
+ * Settings pages): `navSection` says which entry is current for them. */
 const nav: { id: Section; label: string; icon: typeof Activity }[] = [
-  { id: "accounts", label: "Accounts", icon: KeyRound },
-  { id: "boxes", label: "Boxes", icon: Server },
-  { id: "jobs", label: "Jobs", icon: ListTodo },
-  { id: "usage", label: "Usage", icon: Activity },
+  { id: "accounts", label: "Machines & accounts", icon: Server },
+  { id: "jobs", label: "Activity", icon: Activity },
   { id: "memory", label: "Context & memory", icon: FileText },
-  { id: "speech", label: "Read aloud", icon: Volume2 },
   { id: "trash", label: "Trash", icon: Trash2 },
-  { id: "maintenance", label: "Hub & storage", icon: Database },
   { id: "settings", label: "Settings", icon: Settings2 },
 ];
+/** The words the topbar shows for a section. */
+function sectionTitle(section: Section): string {
+  if (section === "grid") return "Threads";
+  if (section === "attention") return "Needs you";
+  if (section === "decisions") return "Decisions";
+  return nav.find((n) => n.id === navSection(section))?.label || "";
+}
 const statusIcon = (status: string) =>
   status === "running" || status === "background" ? (
     <span className="working-dot" />
@@ -288,11 +303,15 @@ export default function App({
   onReady,
   headerAccessory,
   onDismissKeyboard,
+  notices: hostNotices,
 }: {
   deviceScopes?: string[];
   onReady?: () => void;
   headerAccessory?: ReactNode;
   onDismissKeyboard?: () => void;
+  /** The host's own notices for the status strip (the desktop's update), ranked after the
+   * connection's and before the assistance notices. */
+  notices?: StripItem[];
 } = {}) {
   const hostApi = useHostAPI();
   const [allowedMethods, setAllowedMethods] = useState<string[]>();
@@ -309,12 +328,9 @@ export default function App({
       ),
     [deviceScopes, allowedMethods],
   );
+  // Machines & accounts is for a device with `admin`; Settings shows what a device may change.
   const visibleNav = nav.filter(
-    (n) =>
-      !(
-        ["accounts", "boxes", "maintenance"].includes(n.id) &&
-        !permitted("admin")
-      ),
+    (n) => n.id !== "accounts" || permitted("admin"),
   );
 
   const [view, setView] = useState(initial);
@@ -740,10 +756,26 @@ export default function App({
     }
   }
   const openOperation = useCallback(
-    (command: Command, initialValues: Json = {}) => {
+    (
+      command: Command,
+      initialValues: Json = {},
+      { fixed = false }: OperationOptions = {},
+    ) => {
       setPalette(false);
       setOperation(command);
-      setValues({
+      const threads = threadsRef.current;
+      // Opened for a thread (the inspector, its ⋯ menu, a slash command naming one): the
+      // form says which in its subtitle instead of asking. Anywhere else (the palette, a
+      // slash command naming no thread) the thread given is only the picker's first choice.
+      const given =
+        !command.cli &&
+        command.fields.some((f) => f.key === "thread") &&
+        findThread(threads, initialValues.thread);
+      setFixedThread(fixed && given ? given.name : undefined);
+      // Change permission mode opens on the thread's current mode.
+      if (command.id === "mode" && given && !initialValues.mode)
+        initialValues = { ...initialValues, mode: given.mode };
+      const opened = {
         _cwd: initialValues._cwd || localWorkingDirectory(target, homePath),
         ...Object.fromEntries(
           command.fields.map((f) => [
@@ -764,7 +796,9 @@ export default function App({
               (f.type === "boolean" ? false : ""),
           ]),
         ),
-      });
+      };
+      setValues(opened);
+      setMoreOpen(splitFields(command.fields, opened).open);
       setOperationError("");
       setResult(undefined);
     },
@@ -772,8 +806,35 @@ export default function App({
   );
   const infoRef = useRef(info);
   infoRef.current = info;
+  const threadsRef = useRef(view.threads);
+  threadsRef.current = view.threads;
+  // The thread a form was opened for (its name), its More options disclosure, and the
+  // lists its pickers read once it opens (`pickerSources`): null for one that failed.
+  const [fixedThread, setFixedThread] = useState<string>();
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [pickerLists, setPickerLists] = useState<Record<string, Json>>({});
+  useEffect(() => {
+    setPickerLists({});
+    if (!operation) return;
+    let live = true;
+    for (const method of pickerSources(operation)) {
+      const allowed =
+        connected && (!deviceScopes || !!allowedMethods?.includes(method));
+      const settle = (value: Json) => {
+        if (live) setPickerLists((old) => ({ ...old, [method]: value }));
+      };
+      if (!allowed) settle(null);
+      else
+        void rpc(method)
+          .then((value) => settle(value ?? null))
+          .catch(() => settle(null));
+    }
+    return () => {
+      live = false;
+    };
+  }, [operation, connected]);
   const action = useCallback(
-    (id: string, initialValues: Json = {}) => {
+    (id: string, initialValues: Json = {}, options?: OperationOptions) => {
       const command = commands.find((c) => c.id === id);
       // Choosing the first orchestrator starts from the one the hub would start: its
       // runtime, and the runtime's default model unless one is picked.
@@ -782,7 +843,7 @@ export default function App({
         const runtime = o.configured?.runtime || o.runtime;
         if (runtime) initialValues = { ...initialValues, runtime };
       }
-      if (command) openOperation(command, initialValues);
+      if (command) openOperation(command, initialValues, options);
     },
     [openOperation, commands],
   );
@@ -1449,7 +1510,7 @@ export default function App({
         document.documentElement.dataset.platform || "",
       );
       const menu = document.querySelector<HTMLDetailsElement>(
-        ".conversation-menu[open]",
+        ".actions-menu[open]",
       );
       if (event.key === "Escape" && menu) {
         event.preventDefault();
@@ -1525,12 +1586,10 @@ export default function App({
     const closeMenu = (event: PointerEvent) => {
       if (
         event.target instanceof Element &&
-        event.target.closest(".conversation-menu")
+        event.target.closest(".actions-menu")
       )
         return;
-      document
-        .querySelector(".conversation-menu[open]")
-        ?.removeAttribute("open");
+      document.querySelector(".actions-menu[open]")?.removeAttribute("open");
     };
     window.addEventListener("keydown", keyboard);
     window.addEventListener("pointerdown", closeMenu);
@@ -1559,10 +1618,12 @@ export default function App({
     if (connected) announce(`Connected to ${workspace}`);
     else if (previous)
       announce(
-        `Disconnected from ${workspace}${connectionError ? ". " + connectionError : ""}`,
+        `Disconnected from ${workspace}${connectionError ? ". " + connectionWords(connectionError).text : ""}`,
       );
     else if (connectionError)
-      announce(`Could not connect to ${workspace}. ${connectionError}`);
+      announce(
+        `Could not connect to ${workspace}. ${connectionWords(connectionError).text}`,
+      );
   }, [connected, connecting, workspace]);
   const knownAttention = useRef<{ workspace: string; ids: Set<string> }>(
     undefined,
@@ -1723,7 +1784,14 @@ export default function App({
           }
         }
       } catch (e) {
-        setOperationError(errorMessage(e));
+        const message = errorMessage(e);
+        setOperationError(message);
+        // A field the error is about, or New thread's missing folder, is shown.
+        if (
+          splitFields(operation.fields, {}, message).open ||
+          (operation.method === "thread.new" && !values._cwd)
+        )
+          setMoreOpen(true);
       } finally {
         setOperationBusy(false);
       }
@@ -1947,7 +2015,7 @@ export default function App({
   /** Send as implementation loop: the draft is the task of a loop on the thread whose
    * conversation is shown. Live only, never to the outbox; an empty draft asks first, since
    * the task is then what the conversation already settled. */
-  const sendAsImplementation = () => {
+  const sendAsImplementation = (started: () => void) => {
     const thread = destination
       ? view.threads.find((t) => t.id === destination)
       : undefined;
@@ -1990,6 +2058,7 @@ export default function App({
         ) {
           drafts.set(key, (old) => (old === draft ? "" : old));
           uploads.take(fileIds);
+          started();
         }
       } finally {
         uploads.release(fileIds);
@@ -2158,9 +2227,12 @@ export default function App({
         case "Account": {
           let name = args.account,
             target = args.thread;
+          // A thread named in the command is the form's; the conversation's is a default.
+          let fixed = !!target;
           if (destination && target && !name && !named(target)) {
             name = target;
             target = destination;
+            fixed = false;
           }
           if (!name)
             openOperation(
@@ -2174,17 +2246,23 @@ export default function App({
                 fields: [{ key: "thread", label: "Thread", required: true }],
               },
               { thread: thread(target) },
+              { fixed },
             );
           else
-            action("model", {
-              thread: thread(target),
-              account: name,
-              outside_pin: args.outside_pin,
-            });
+            action(
+              "model",
+              {
+                thread: thread(target),
+                account: name,
+                outside_pin: args.outside_pin,
+              },
+              { fixed },
+            );
           break;
         }
         case "Model": {
           const values = { ...args, thread: thread(args.thread) };
+          const fixed = { fixed: !!args.thread };
           if (!args.model && !args.effort && !args.runtime)
             openOperation(
               {
@@ -2197,15 +2275,24 @@ export default function App({
                 fields: [{ key: "thread", label: "Thread", required: true }],
               },
               values,
+              fixed,
             );
-          else action("model", values);
+          else action("model", values, fixed);
           break;
         }
         case "Mode":
-          action("mode", { ...args, thread: thread(args.thread) });
+          action(
+            "mode",
+            { ...args, thread: thread(args.thread) },
+            { fixed: !!args.thread },
+          );
           break;
         case "Rename":
-          action("rename", { ...args, thread: thread(args.thread) });
+          action(
+            "rename",
+            { ...args, thread: thread(args.thread) },
+            { fixed: !!args.thread },
+          );
           break;
         case "New":
           // `/new <project> --implement <task>`: the form, with its switch on and the task
@@ -2245,6 +2332,7 @@ export default function App({
               } as Record<string, string>
             )[parsed.kind],
             { thread: thread(args) },
+            { fixed: !!args },
           );
           break;
         case "Attach": {
@@ -2317,11 +2405,15 @@ export default function App({
             speaker = args.on || undefined;
           if (cmd.kind === "Status") setSection("speech");
           else if (cmd.kind === "Last")
-            action("read", {
-              last: cmd.args.n,
-              thread: cmd.args.orch ? orchestrator?.id : destination,
-              speaker,
-            });
+            action(
+              "read",
+              {
+                last: cmd.args.n,
+                thread: cmd.args.orch ? orchestrator?.id : destination,
+                speaker,
+              },
+              { fixed: !!cmd.args.orch },
+            );
           else if (cmd.kind === "This") {
             const event = events.findLast(
               (event) => event.kind === "agent.text" && event.data.final,
@@ -2330,12 +2422,12 @@ export default function App({
               throw new Error(
                 "There is no completed message in this conversation to read.",
               );
-            action("read", {
-              thread: target.id,
-              seq: event.seq,
-              last: "",
-              speaker,
-            });
+            // The message read is this thread's: the form is for it.
+            action(
+              "read",
+              { thread: target.id, seq: event.seq, last: "", speaker },
+              { fixed: true },
+            );
           } else
             action("speech-control", {
               op: (
@@ -2666,6 +2758,58 @@ export default function App({
     const timer = setTimeout(() => setNotice(""), 6000);
     return () => clearTimeout(timer);
   }, [notice]);
+  // A success notice is about where it was given: going elsewhere clears it. (A notice
+  // given with the move that goes with it, such as a new thread opening, stays: both
+  // effects run after the same render, this place recorded first.)
+  const place = `${section}\u0000${destination ?? ""}\u0000${selected ?? ""}`;
+  const noticePlace = useRef(place);
+  useEffect(() => {
+    if (notice) noticePlace.current = place;
+    // Recorded when the notice is given, not when the place changes.
+  }, [notice]);
+  useEffect(() => {
+    if (noticePlace.current !== place) setNotice("");
+  }, [place]);
+  // Where a toast goes: under the header, the status strip and the conversation's heading,
+  // so that it never covers their controls (`--toast-top`).
+  useLayoutEffect(() => {
+    if (!error && !notice) return;
+    const main = document.getElementById("twr-main");
+    if (!main?.getBoundingClientRect) return;
+    const parts = () =>
+      [
+        ...main.querySelectorAll<HTMLElement>(
+          ":scope > .topbar, :scope > .status-strip, .conversation-heading",
+        ),
+      ].filter((part) => part.getBoundingClientRect);
+    const placeToast = () => {
+      let bottom = 0;
+      for (const part of parts())
+        bottom = Math.max(bottom, part.getBoundingClientRect().bottom);
+      if (bottom > 0)
+        document.documentElement.style.setProperty(
+          "--toast-top",
+          `${Math.round(bottom)}px`,
+        );
+    };
+    placeToast();
+    window.addEventListener("resize", placeToast);
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver(placeToast);
+    // The work area too: a strip that comes or grows later shrinks it (the heading only
+    // moves, which no observer of its own size sees).
+    for (const part of [
+      ...parts(),
+      ...main.querySelectorAll<HTMLElement>(":scope > .work-area"),
+    ])
+      observer?.observe(part);
+    return () => {
+      window.removeEventListener("resize", placeToast);
+      observer?.disconnect();
+    };
+  }, [error, notice, section, destination]);
   // An orchestrator switch that dropped queued messages says so, and offers to put the
   // user's own back in the orchestrator's message box, files and all (as Take back does).
   // One whose new orchestrator can't start (its program is missing, its start failed)
@@ -2922,18 +3066,39 @@ export default function App({
   }, [paletteIndex]);
   // Orchestrator access only where the hub reports a level: an older hub has neither.
   const hasAccess = accessLevel(info?.orchestrator?.access) !== undefined;
-  const allCommands = useMemo(
-    () => [
-      ...commands.filter((c) => c.id !== "access" || hasAccess),
-      ...(permitted("terminal") ? cliCommands : []),
-    ],
-    [cliCommands, commands, hasAccess],
+  // The palette lists the app's actions; the CLI's own commands come when the search names
+  // one, or when Show CLI commands is on. An action that asks for an id no screen shows (an
+  // event, a device, a job) waits for a search too: the screen that has the id offers it.
+  // Updates are the update notice's and Settings'.
+  const [paletteCli, setPaletteCli] = useState(false);
+  const appCommands = useMemo(
+    () =>
+      commands.filter(
+        (c) => (c.id !== "access" || hasAccess) && c.id !== "app-update",
+      ),
+    [commands, hasAccess],
   );
-  const matching = allCommands.filter((c) =>
-    (c.title + " " + c.group + " " + c.id)
+  const asksForId = (c: Command) =>
+    c.fields.some(
+      (f) =>
+        f.required &&
+        f.initial == null &&
+        !f.options &&
+        /(^|_)id$|^job$/.test(f.key),
+    );
+  const searching = query.trim().toLowerCase();
+  const paletteMatches = (c: Command) =>
+    (c.title + " " + c.group + " " + c.id + " " + (c.cli?.join(" ") || ""))
       .toLowerCase()
-      .includes(query.toLowerCase()),
-  );
+      .includes(searching);
+  const matching = [
+    ...appCommands.filter(
+      (c) => paletteMatches(c) && (searching || !asksForId(c)),
+    ),
+    ...(paletteCli || searching
+      ? (permitted("terminal") ? cliCommands : []).filter(paletteMatches)
+      : []),
+  ];
   // A thread's conversation: its colour, and the ink its name is written in ("To:").
   const rootStyle = target
     ? ({
@@ -2947,6 +3112,249 @@ export default function App({
           : {}),
       } as CSSProperties)
     : {};
+  const openShell = () =>
+    void openTerminal({
+      shell: true,
+      cwd: localWorkingDirectory(target, homePath) || undefined,
+    });
+  const has = (id: string) => commands.some((c) => c.id === id);
+  /** The status strip's notices, the most pressing first: the connection, offline, a
+   * version mismatch, the host's (an update), then the assistance notices. */
+  const savedOffline = !connected
+    ? journal?.snapshot.workspaces[workspace]
+    : undefined;
+  const offlineWords = savedOffline
+    ? `Offline · saved ${new Date(savedOffline.savedAt).toLocaleString()}. Requests need a live connection before you can answer.`
+    : "";
+  const connectionNotice = !!(connectionError || connecting);
+  // The host reconnecting on its own (its error names the hub's socket): news, not alarm.
+  const reconnecting = !connecting && !!connectionWords(connectionError).detail;
+  const notices: StripItem[] = [
+    ...(connectionNotice
+      ? [
+          {
+            key: "connection",
+            role:
+              connecting || reconnecting
+                ? ("status" as const)
+                : ("alert" as const),
+            tone: connectionError ? ("warning" as const) : undefined,
+            busy: connecting || reconnecting,
+            icon:
+              connecting || reconnecting ? (
+                <Spinner />
+              ) : (
+                <AlertCircle size={15} />
+              ),
+            // What this device saved shows meanwhile: one notice says both.
+            content: (
+              <>
+                {connecting ? (
+                  "Connecting to your workspace…"
+                ) : (
+                  <span title={connectionWords(connectionError).detail}>
+                    {connectionWords(connectionError).text}
+                  </span>
+                )}
+                {offlineWords && <p>{offlineWords}</p>}
+              </>
+            ),
+            actions: !connecting && (
+              <button onClick={() => void connect(workspace)}>Reconnect</button>
+            ),
+          },
+        ]
+      : []),
+    ...(offlineWords && !connectionNotice
+      ? [
+          {
+            key: "offline",
+            role: "status" as const,
+            tone: "offline" as const,
+            content: offlineWords,
+          },
+        ]
+      : []),
+    ...(paths?.versionMismatch
+      ? [
+          {
+            key: "version",
+            tone: "warning" as const,
+            icon: <AlertCircle size={15} />,
+            content: `The app bundles twr ${paths.version}; this hub still runs ${paths.hubVersion}. Stop and reconnect when you’re ready to use the new engine.`,
+            actions: (
+              <button onClick={() => action("hub-stop")}>Stop hub…</button>
+            ),
+          },
+        ]
+      : []),
+    // A decision first (the suggestions consent), then news; the storage warning,
+    // which can stand for as long as the app runs, never hides either.
+    ...(section === "chat" && assistance.needsDisclosure
+      ? [
+          {
+            key: "assistance-disclosure",
+            content: (
+              <AssistanceNotice
+                settings={assistance.settings}
+                acknowledge={assistance.acknowledge}
+                disable={() => {
+                  void Promise.all([
+                    hostApi.configSet(["tui"], "suggest", false),
+                    hostApi.configSet(["tui"], "summaries", false),
+                  ])
+                    .then(() => setRefresh((n) => n + 1))
+                    .catch(fail);
+                }}
+              />
+            ),
+          },
+        ]
+      : []),
+    ...(hostNotices || []),
+    ...(offlineNotice
+      ? [
+          {
+            key: "offline-notice",
+            role: "status" as const,
+            tone: "offline" as const,
+            content: offlineNotice,
+          },
+        ]
+      : []),
+    ...(section === "chat" && assistance.notice
+      ? [
+          {
+            key: "assistance",
+            role: "status" as const,
+            content: assistance.notice,
+            actions: (
+              <>
+                <button onClick={assistance.retry}>Retry assistance</button>
+                <button
+                  onClick={assistance.clearNotice}
+                  aria-label="Dismiss assistance notice"
+                  title="Dismiss"
+                >
+                  <X size={12} />
+                </button>
+              </>
+            ),
+          },
+        ]
+      : []),
+  ];
+  /** The conversation's less common actions: its "⋯" menu (in the topbar on a phone). */
+  const conversationMenu: MenuItem[] =
+    section !== "chat"
+      ? []
+      : [
+          {
+            key: "tools",
+            label: "Show tool calls",
+            icon: <Wrench size={16} aria-hidden="true" />,
+            pressed: showTools,
+            onSelect: () => setShowTools((v) => !v),
+          },
+          {
+            key: "reasoning",
+            label: "Show reasoning",
+            icon: <Eye size={16} aria-hidden="true" />,
+            pressed: showThinking,
+            onSelect: () => setShowThinking((v) => !v),
+          },
+          ...(target
+            ? [
+                {
+                  key: "export",
+                  label: "Export conversation",
+                  icon: <Download size={16} aria-hidden="true" />,
+                  onSelect: () => void exportConversation(),
+                },
+              ]
+            : []),
+          ...(has(destination ? "model" : "orch")
+            ? [
+                {
+                  key: "model",
+                  label: "Model & runtime…",
+                  icon: <Cpu size={16} aria-hidden="true" />,
+                  dialog: true,
+                  // The composer's model picker, the one place for its model and
+                  // effort (and a move to another runtime); before there is a thread to
+                  // pick for (no orchestrator yet), the form.
+                  disabled: !!target && (!connected || !permitted("operate")),
+                  onSelect: () =>
+                    target
+                      ? openModelPicker()
+                      : action(
+                          destination ? "model" : "orch",
+                          destination ? { thread: destination } : {},
+                          { fixed: true },
+                        ),
+                },
+              ]
+            : []),
+          {
+            key: "usage",
+            label: "Usage limits",
+            icon: <Gauge size={16} aria-hidden="true" />,
+            disabled: !connected,
+            onSelect: () => setUsagePanel(true),
+          },
+          ...(destination && target && !target.is_orchestrator
+            ? threadMenu(target.id).map((item, i) => ({
+                ...item,
+                group: i === 0,
+              }))
+            : []),
+        ];
+  /** A thread's less common actions, each opening its form (the hub confirms). */
+  function threadMenu(thread: string, hints = false): MenuItem[] {
+    const entries: [string, string, string, ReactNode][] = [
+      [
+        "rename",
+        "Rename…",
+        "",
+        <Pencil size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "park",
+        "Park…",
+        "Stop it and free its worktree; keep the branch.",
+        <CirclePause size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "trim",
+        "Trim…",
+        "Delete its build output.",
+        <Scissors size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "compact",
+        "Compact…",
+        "Summarize its context to free space.",
+        <Shrink size={16} aria-hidden="true" key="i" />,
+      ],
+      [
+        "delete",
+        "Move to trash…",
+        "Recoverable from Trash for a while.",
+        <Trash2 size={16} aria-hidden="true" key="i" />,
+      ],
+    ];
+    return entries
+      .filter(([id]) => has(id) && (hints ? id !== "rename" : id !== "trim"))
+      .map(([id, label, hint, icon]) => ({
+        key: id,
+        label,
+        icon,
+        hint: hints ? hint : undefined,
+        dialog: true,
+        danger: id === "delete",
+        onSelect: () => action(id, { thread }, { fixed: true }),
+      }));
+  }
   const shell = (
     <div className={`app ${sidebar ? "" : "sidebar-hidden"}`} style={rootStyle}>
       <button
@@ -2990,7 +3398,6 @@ export default function App({
           <span className="wordmark">
             twr<span>_</span>
           </span>
-          <span className="brand-caption">Hub client</span>
           <button
             className="icon-button no-drag"
             aria-label="Hide sidebar"
@@ -3041,15 +3448,6 @@ export default function App({
               onClick={() => setFocus((v) => !v)}
             >
               <Filter size={13} />
-            </button>
-            <button
-              className="icon-button"
-              aria-label="Manage workspaces"
-              title="New or remove workspaces"
-              aria-haspopup="dialog"
-              onClick={() => setWorkspaceModal(true)}
-            >
-              <FolderPlus size={15} />
             </button>
           </div>
         </div>
@@ -3268,7 +3666,9 @@ export default function App({
               .map((n) => (
                 <button
                   key={n.id}
-                  aria-current={section === n.id ? "page" : undefined}
+                  aria-current={
+                    navSection(section) === n.id ? "page" : undefined
+                  }
                   onClick={() => setSection(n.id)}
                 >
                   <n.icon size={15} />
@@ -3301,7 +3701,9 @@ export default function App({
             </span>
           </button>
           <button
-            aria-current={section === "settings" ? "page" : undefined}
+            aria-current={
+              navSection(section) === "settings" ? "page" : undefined
+            }
             onClick={() => setSection("settings")}
           >
             <Settings2 size={15} />
@@ -3322,20 +3724,6 @@ export default function App({
         </div>
       </aside>
       <main className="main-shell" id="twr-main" tabIndex={-1}>
-        {!connected && journal?.snapshot.workspaces[workspace] && (
-          <div className="offline-banner" role="status">
-            Offline · saved{" "}
-            {new Date(
-              journal.snapshot.workspaces[workspace].savedAt,
-            ).toLocaleString()}
-            . Requests need a live connection before you can answer.
-          </div>
-        )}
-        {offlineNotice && (
-          <div className="offline-banner" role="status">
-            {offlineNotice}
-          </div>
-        )}
         <header className="topbar drag-region">
           <div className="topbar-left">
             {!sidebar && (
@@ -3368,11 +3756,7 @@ export default function App({
                 ? target?.name
                 : section === "chat"
                   ? "Orchestrator"
-                  : section === "grid"
-                    ? "Threads"
-                    : section === "attention"
-                      ? "Needs you"
-                      : nav.find((n) => n.id === section)?.label || "Decisions"}
+                  : sectionTitle(section)}
               {section === "chat" && target && (
                 <small className="mobile-runtime">
                   {target.runtime} ·{" "}
@@ -3413,157 +3797,35 @@ export default function App({
                   ? "This device has no terminal access"
                   : "Open shell"
               }
-              onClick={() =>
-                void openTerminal({
-                  shell: true,
-                  cwd: localWorkingDirectory(target, homePath) || undefined,
-                })
-              }
+              onClick={openShell}
             >
               <TerminalSquare size={17} />
             </button>
-            <button
-              className="icon-button"
-              aria-label="Open command palette"
-              title="Commands (⌘/Ctrl K)"
-              aria-haspopup="dialog"
-              onClick={() => {
-                setPalette(true);
-                setQuery("");
-              }}
-            >
-              <CommandIcon size={17} />
-            </button>
-            <details
+            <ActionsMenu
+              // A phone hides the conversation's header: its actions menu shows here,
+              // with New thread and Open shell, whose own buttons a phone hides.
               className="conversation-menu"
-              onToggle={(event) => {
-                const menu = event.currentTarget;
-                // Keyboard users land on the first action; pointer users keep focus.
-                if (menu.open && menu.dataset.keyboard === "true")
-                  menu
-                    .querySelector<HTMLElement>("div > button:not(:disabled)")
-                    ?.focus();
-                delete menu.dataset.keyboard;
-              }}
-            >
-              <summary
-                className="no-drag"
-                aria-label={
-                  section === "chat" ? "Thread actions" : "More actions"
-                }
-                title={section === "chat" ? "Thread actions" : "More actions"}
-                onKeyDown={(event) => {
-                  const menu = event.currentTarget
-                    .parentElement as HTMLDetailsElement;
-                  if (["Enter", " "].includes(event.key))
-                    menu.dataset.keyboard = "true";
-                  if (event.key === "ArrowDown") {
-                    event.preventDefault();
-                    menu.dataset.keyboard = "true";
-                    if (!menu.open) menu.open = true;
-                    else
-                      menu
-                        .querySelector<HTMLElement>(
-                          "div > button:not(:disabled)",
-                        )
-                        ?.focus();
-                  }
-                }}
-              >
-                <MoreHorizontal size={18} />
-              </summary>
-              <div
-                className="no-drag"
-                onKeyDown={(event) =>
-                  handleRovingKey(event, event.currentTarget, ":scope > button")
-                }
-                onClick={(event) =>
-                  (
-                    event.currentTarget.parentElement as HTMLDetailsElement
-                  ).removeAttribute("open")
-                }
-              >
-                <button
-                  aria-controls="twr-sidebar"
-                  onClick={() => setSidebar(true)}
-                >
-                  <PanelLeftOpen size={16} />
-                  Threads and navigation
-                </button>
-                <button
-                  disabled={!permitted("operate")}
-                  onClick={() => action("new")}
-                >
-                  <Plus size={16} />
-                  New thread
-                </button>
-                <button
-                  disabled={!permitted("terminal")}
-                  onClick={() =>
-                    void openTerminal({
-                      shell: true,
-                      cwd: localWorkingDirectory(target, homePath) || undefined,
-                    })
-                  }
-                >
-                  <TerminalSquare size={16} />
-                  Open shell
-                </button>
-                {section === "chat" && (
-                  <>
-                    <button
-                      aria-pressed={showTools}
-                      onClick={() => setShowTools((v) => !v)}
-                    >
-                      <Wrench size={16} />
-                      Tool calls
-                    </button>
-                    <button
-                      aria-pressed={showThinking}
-                      onClick={() => setShowThinking((v) => !v)}
-                    >
-                      <Eye size={16} />
-                      Reasoning
-                    </button>
-                    <button
-                      disabled={!connected}
-                      onClick={() => setUsagePanel(true)}
-                    >
-                      <Gauge size={16} />
-                      Usage limits
-                    </button>
-                    {target && (
-                      <button onClick={() => void exportConversation()}>
-                        <Download size={16} />
-                        Export conversation
-                      </button>
-                    )}
-                    <button
-                      onClick={() =>
-                        action(
-                          destination ? "model" : "orch",
-                          destination ? { thread: destination } : {},
-                        )
-                      }
-                    >
-                      <Settings2 size={16} />
-                      {destination
-                        ? "Thread settings"
-                        : "Orchestrator settings"}
-                    </button>
-                  </>
-                )}
-                <button
-                  onClick={() => {
-                    setPalette(true);
-                    setQuery("");
-                  }}
-                >
-                  <Search size={16} />
-                  Commands
-                </button>
-              </div>
-            </details>
+              label="More actions"
+              items={[
+                ...conversationMenu,
+                {
+                  key: "new",
+                  label: "New thread",
+                  icon: <Plus size={16} aria-hidden="true" />,
+                  dialog: true,
+                  disabled: !permitted("operate"),
+                  group: conversationMenu.length > 0,
+                  onSelect: () => action("new"),
+                },
+                {
+                  key: "shell",
+                  label: "Open shell",
+                  icon: <TerminalSquare size={16} aria-hidden="true" />,
+                  disabled: !permitted("terminal"),
+                  onSelect: openShell,
+                },
+              ]}
+            />
             <button
               className="topbar-new-thread"
               aria-label="New thread"
@@ -3571,36 +3833,13 @@ export default function App({
               disabled={!permitted("operate")}
               onClick={() => action("new")}
             >
-              <Plus size={14} />
-              New thread
+              <Plus size={14} aria-hidden="true" />
+              {/* Icon alone in a narrow window (style.css); the button keeps its name. */}
+              <span className="topbar-new-thread-label">New thread</span>
             </button>
           </div>
         </header>
-        {paths?.versionMismatch && (
-          <div className="connection-banner warning">
-            <AlertCircle size={15} />
-            <span>
-              The app bundles twr {paths.version}; this hub still runs{" "}
-              {paths.hubVersion}. Stop and reconnect when you’re ready to use
-              the new engine.
-            </span>
-            <button onClick={() => action("hub-stop")}>Stop hub…</button>
-          </div>
-        )}
-        {(connectionError || connecting) && (
-          <div
-            className={`connection-banner ${connectionError ? "warning" : ""}`}
-            aria-busy={connecting || undefined}
-          >
-            {connecting ? <Spinner /> : <AlertCircle size={15} />}
-            <span>
-              {connecting ? "Connecting to your workspace…" : connectionError}
-            </span>
-            {!connecting && (
-              <button onClick={() => void connect(workspace)}>Reconnect</button>
-            )}
-          </div>
-        )}
+        <StatusStrip items={notices} />
         <div className="work-area">
           <div className="content-column">
             {section === "chat" && (
@@ -3653,56 +3892,6 @@ export default function App({
                       connected={connected}
                       onOpenPage={() => setSection("usage")}
                     />
-                    <button
-                      className={`icon-button ${showTools ? "on" : ""}`}
-                      aria-label="Toggle tool calls"
-                      aria-pressed={showTools}
-                      title="Show tool calls"
-                      onClick={() => setShowTools((v) => !v)}
-                    >
-                      <Wrench size={16} />
-                    </button>
-                    <button
-                      className={`icon-button ${showThinking ? "on" : ""}`}
-                      aria-label="Toggle reasoning"
-                      aria-pressed={showThinking}
-                      title="Show reasoning"
-                      onClick={() => setShowThinking((v) => !v)}
-                    >
-                      <Eye size={16} />
-                    </button>
-                    {target && (
-                      <button
-                        className="icon-button"
-                        aria-label="Export conversation"
-                        title="Export conversation"
-                        onClick={() => void exportConversation()}
-                      >
-                        <Download size={16} />
-                      </button>
-                    )}
-                    <button
-                      className="icon-button"
-                      aria-label={
-                        destination
-                          ? "Thread settings"
-                          : "Orchestrator settings"
-                      }
-                      title={
-                        destination
-                          ? "Thread settings"
-                          : "Orchestrator settings"
-                      }
-                      aria-haspopup="dialog"
-                      onClick={() =>
-                        action(
-                          destination ? "model" : "orch",
-                          destination ? { thread: destination } : {},
-                        )
-                      }
-                    >
-                      <MoreHorizontal size={18} />
-                    </button>
                     {destination &&
                       target &&
                       document.documentElement.dataset.mobile !== "true" && (
@@ -3734,6 +3923,10 @@ export default function App({
                           )}
                         </button>
                       )}
+                    <ActionsMenu
+                      label="Conversation actions"
+                      items={conversationMenu}
+                    />
                   </div>
                 </header>
                 <div
@@ -3922,33 +4115,6 @@ export default function App({
                     </div>
                   ))}
                 </div>
-                {assistance.needsDisclosure && (
-                  <AssistanceNotice
-                    settings={assistance.settings}
-                    acknowledge={assistance.acknowledge}
-                    disable={() => {
-                      void Promise.all([
-                        hostApi.configSet(["tui"], "suggest", false),
-                        hostApi.configSet(["tui"], "summaries", false),
-                      ])
-                        .then(() => setRefresh((n) => n + 1))
-                        .catch(fail);
-                    }}
-                  />
-                )}
-                {assistance.notice && (
-                  <div className="assistance-status" role="status">
-                    {assistance.notice}
-                    <button onClick={assistance.retry}>Retry assistance</button>
-                    <button
-                      onClick={assistance.clearNotice}
-                      aria-label="Dismiss assistance notice"
-                      title="Dismiss"
-                    >
-                      <X size={12} />
-                    </button>
-                  </div>
-                )}
                 {usagePanel && (
                   <UsagePanel
                     // Each workspace's limits from its own hub: a switch starts afresh.
@@ -4040,14 +4206,6 @@ export default function App({
                       Live work, clear outcomes, and the things waiting on you.
                     </p>
                   </div>
-                  <button
-                    className="primary grid-new-thread"
-                    disabled={!permitted("operate")}
-                    onClick={() => action("new")}
-                  >
-                    <Plus size={16} />
-                    New thread
-                  </button>
                 </header>
                 <div
                   className="manager-actions"
@@ -4280,17 +4438,56 @@ export default function App({
                   <TerminalSquare size={15} />
                   Attach agent terminal
                 </button>
+                <ThreadActions
+                  thread={selectedThread}
+                  has={has}
+                  pinned={pins.includes(selectedThread.id)}
+                  onPin={() => togglePin(selectedThread.id)}
+                  action={action}
+                  more={threadMenu(selectedThread.id, true)}
+                />
                 <div className="inspector-meta">
                   <span>Project</span>
                   <b>{selectedThread.project || "—"}</b>
                   <span>Model</span>
-                  <b>
-                    {selectedThread.model_actual ||
-                      selectedThread.model ||
-                      "Default"}
-                  </b>
-                  <span>Permission mode</span>
-                  <b>{selectedThread.mode}</b>
+                  <span className="inspector-value">
+                    <b>
+                      {selectedThread.model_actual ||
+                        selectedThread.model ||
+                        "Default"}
+                    </b>
+                    {has("model") && (
+                      <button
+                        className="text-button"
+                        aria-haspopup="dialog"
+                        aria-label={`Change model of ${selectedThread.name}`}
+                        onClick={() =>
+                          // The conversation shown: its composer's model picker.
+                          section === "chat" && target?.id === selectedThread.id
+                            ? openModelPicker()
+                            : action(
+                                "model",
+                                { thread: selectedThread.id },
+                                { fixed: true },
+                              )
+                        }
+                      >
+                        Change…
+                      </button>
+                    )}
+                  </span>
+                  <label htmlFor="twr-inspector-mode">Permission mode</label>
+                  <PermissionModePicker
+                    id="twr-inspector-mode"
+                    thread={selectedThread}
+                    admin={permitted("admin")}
+                    editable={has("mode") && connected && permitted("operate")}
+                    rpc={rpc}
+                    fail={fail}
+                    onChanged={(label) =>
+                      setNotice(`${selectedThread.name} now: ${label}.`)
+                    }
+                  />
                   <span>Worktree</span>
                   <button
                     className="text-button path"
@@ -4333,38 +4530,6 @@ export default function App({
                     <Markdown text={selectedThread.last_report.summary || ""} />
                   </section>
                 )}
-                <div className="inspector-actions">
-                  <button
-                    aria-pressed={pins.includes(selectedThread.id)}
-                    onClick={() => togglePin(selectedThread.id)}
-                  >
-                    <Pin size={14} />
-                    {pins.includes(selectedThread.id) ? "Unpin" : "Pin"} thread
-                  </button>
-                  {[
-                    "mode",
-                    "model",
-                    "rename",
-                    "compact",
-                    "resume",
-                    "stop",
-                    "park",
-                    "trim",
-                    "delete",
-                  ]
-                    .filter((id) => commands.some((c) => c.id === id))
-                    .map((id) => (
-                      <button
-                        className={id === "delete" ? "danger-quiet" : ""}
-                        key={id}
-                        onClick={() =>
-                          action(id, { thread: selectedThread.id })
-                        }
-                      >
-                        {commands.find((c) => c.id === id)?.title}
-                      </button>
-                    ))}
-                </div>
                 <details>
                   <summary>Full thread state</summary>
                   <DataView value={selectedThread} />
@@ -4489,14 +4654,6 @@ export default function App({
                   </button>
                 </div>
               ))}
-              <button
-                className="icon-button"
-                aria-label="New shell terminal"
-                title="New shell terminal"
-                onClick={() => void openTerminal({ shell: true })}
-              >
-                <Plus size={15} />
-              </button>
             </div>
             <div
               className="terminal-content"
@@ -4563,7 +4720,7 @@ export default function App({
       {palette && (
         <Dialog
           title="Commands"
-          subtitle="Every workflow, one place. CLI actions run in an embedded terminal."
+          subtitle="Search actions and settings"
           onClose={() => setPalette(false)}
         >
           <div className="palette-search">
@@ -4580,7 +4737,7 @@ export default function App({
               }
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search commands, settings, or CLI actions…"
+              placeholder="Search actions…"
               onKeyDown={(e) => {
                 if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                   e.preventDefault();
@@ -4637,220 +4794,229 @@ export default function App({
                 No matching commands.
               </p>
             )}
-            {!cliCommands.length && (
-              <button
-                onClick={() =>
-                  void hostApi.catalog().then(setCliCommands).catch(fail)
-                }
-              >
-                Reload CLI workflows
-              </button>
+            {permitted("terminal") && (
+              <div className="palette-cli">
+                <label>
+                  <input
+                    type="checkbox"
+                    role="switch"
+                    checked={paletteCli}
+                    aria-describedby="twr-palette-cli-hint"
+                    onChange={(event) => setPaletteCli(event.target.checked)}
+                  />
+                  Show CLI commands
+                </label>
+                <small id="twr-palette-cli-hint">
+                  Each runs in a terminal here.
+                </small>
+                {(paletteCli || query.trim()) && !cliCommands.length && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void hostApi.catalog().then(setCliCommands).catch(fail)
+                    }
+                  >
+                    Reload CLI commands
+                  </button>
+                )}
+              </div>
             )}
           </div>
-          <footer className="dialog-footer">
-            <span>
-              {cliCommands.length} CLI workflows · {commands.length} application
-              actions
-            </span>
-          </footer>
         </Dialog>
       )}
-      {operation && (
-        <Dialog
-          title={operation.title}
-          subtitle={operation.description}
-          onClose={() => {
-            if (!operationBusy) setOperation(undefined);
-          }}
-          wide={operation.fields.some((f) => f.type === "textarea")}
-        >
-          {operationError && (
-            <div className="operation-error error-banner" role="alert">
-              {operationError}
-            </div>
-          )}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              void execute();
-            }}
-          >
-            <div className="operation-fields">
-              {operation.fields
-                .filter(
-                  (field) =>
-                    // The setup card choice goes with the New thread form's loop only.
-                    !(
-                      operation.id === "new" &&
-                      field.key === "loop_setup" &&
-                      !values.implement
-                    ),
-                )
-                .map((field) => (
-                  <Fragment key={field.key}>
-                    <FieldInput
-                      field={
-                        field.key === "runtime"
-                          ? {
-                              ...field,
-                              options: [
-                                ...new Set([
-                                  "claude-code",
-                                  "codex",
-                                  "grok-build",
-                                  ...(info?.agents || []).map(
-                                    (a: Json) => a.runtime,
-                                  ),
-                                ]),
-                              ],
-                            }
-                          : field.type === "model" || field.type === "effort"
-                            ? {
-                                ...field,
-                                // `[orchestrator] effort` applies to the first orchestrator
-                                // only: a switch of one left unset gets the runtime's own.
-                                unset: orchestrator ? undefined : field.unset,
-                                choices: (field.type === "model"
-                                  ? modelChoices
-                                  : effortChoices)(
-                                  modelCatalog,
-                                  formRuntime(
-                                    operation,
-                                    values,
-                                    view.threads,
-                                    info?.orchestrator?.configured?.explicit ===
-                                      false
-                                      ? info.orchestrator.configured.runtime
-                                      : undefined,
-                                  ),
-                                ),
-                              }
-                            : field.key === "mode" && !permitted("admin")
-                              ? {
-                                  ...field,
-                                  options: [
-                                    "manual",
-                                    "plan",
-                                    "read-only",
-                                    "dontAsk",
-                                  ],
-                                }
-                              : field
-                      }
-                      value={values[field.key]}
-                      onChange={(value) =>
-                        setValues((old) => ({ ...old, [field.key]: value }))
-                      }
-                    />
-                    {operation.id === "new" &&
-                      field.key === "implement" &&
-                      values.implement && (
-                        <NewThreadLoopLine
-                          project={values.project}
-                          connected={connected}
-                        />
-                      )}
-                  </Fragment>
-                ))}
-              {(operation.cli || operation.method === "thread.new") && (
-                <FieldInput
-                  field={{
-                    key: "_cwd",
-                    label: "Working directory",
-                    type: "directory",
-                    required: true,
-                    description:
-                      "Relative paths in this command are resolved from this folder.",
-                  }}
-                  value={values._cwd}
-                  onChange={(value) =>
-                    setValues((old) => ({ ...old, _cwd: value }))
-                  }
-                />
-              )}
-              {operation.cli && (
-                <p className="form-note">
-                  Runs in this workspace’s embedded terminal. Any interactive
-                  confirmation or login stays there.
-                </p>
-              )}
-
-              {result !== undefined && (
-                <div className="operation-result">
-                  {operation.id === "job-log" ? (
-                    <JobLog job={values.job} rpc={rpc} />
-                  ) : operation.id === "app-update" ? (
-                    <>
-                      <DataView value={result} />
-                      {result?.releaseUrl && (
-                        <button
-                          onClick={() =>
-                            void hostApi
-                              .openExternal(
-                                result.download?.url || result.releaseUrl,
-                              )
-                              .catch(fail)
-                          }
-                        >
-                          {result.download
-                            ? `Download ${result.download.name}`
-                            : "Open release page"}{" "}
-                          <ExternalLink size={14} aria-hidden="true" />
-                        </button>
-                      )}
-                      <button onClick={() => setSection("settings")}>
-                        Update settings
-                      </button>
-                    </>
-                  ) : operation.id === "access" ? (
-                    <AccessResult value={result} />
-                  ) : operation.id === "context-read" ? (
-                    <ContextEditor
-                      key={values.project + ":" + result.hash}
-                      value={result}
-                      project={values.project}
-                      rpc={rpc}
-                      fail={fail}
-                    />
-                  ) : (
-                    <DataView value={result} />
-                  )}
+      {operation &&
+        (() => {
+          const context = {
+            command: operation,
+            values,
+            threads: view.threads,
+            info,
+            admin: permitted("admin"),
+            modelCatalog,
+            lists: pickerLists,
+            orchestrator: Boolean(orchestrator),
+          };
+          const shown = operation.fields.filter(
+            (field) =>
+              // The setup card choice goes with the New thread form's loop only.
+              !(
+                operation.id === "new" &&
+                field.key === "loop_setup" &&
+                !values.implement
+              ) &&
+              // A form opened for a thread names it in its subtitle instead.
+              !(field.key === "thread" && fixedThread),
+          );
+          const { essential, advanced } = splitFields(shown, values);
+          const renderField = (field: (typeof shown)[number]) => (
+            <Fragment key={field.key}>
+              <FieldInput
+                field={resolveField(field, context)}
+                value={values[field.key]}
+                onChange={(value) =>
+                  setValues((old) => ({ ...old, [field.key]: value }))
+                }
+              />
+              {operation.id === "new" &&
+                field.key === "implement" &&
+                values.implement && (
+                  <NewThreadLoopLine
+                    project={values.project}
+                    connected={connected}
+                  />
+                )}
+            </Fragment>
+          );
+          const cwd = (operation.cli || operation.method === "thread.new") && (
+            <FieldInput
+              field={{
+                key: "_cwd",
+                label:
+                  operation.method === "thread.new"
+                    ? "Resolve project paths from"
+                    : "Working directory",
+                type: "directory",
+                required: true,
+                description:
+                  "Relative paths in this command are resolved from this folder.",
+              }}
+              value={values._cwd}
+              onChange={(value) =>
+                setValues((old) => ({ ...old, _cwd: value }))
+              }
+            />
+          );
+          // New thread's folder for relative paths goes under More options with the rest.
+          const cwdAdvanced = operation.method === "thread.new";
+          return (
+            <Dialog
+              title={operation.title}
+              subtitle={
+                fixedThread
+                  ? `For ${fixedThread}.${operation.description ? " " + operation.description : ""}`
+                  : operation.description
+              }
+              onClose={() => {
+                if (!operationBusy) setOperation(undefined);
+              }}
+              wide={operation.fields.some((f) => f.type === "textarea")}
+            >
+              {operationError && (
+                <div className="operation-error error-banner" role="alert">
+                  {operationError}
                 </div>
               )}
-            </div>
-            <footer className="dialog-footer">
-              <span>In {workspace}</span>
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setOperation(undefined)}
-                  disabled={operationBusy}
-                >
-                  {result !== undefined ? "Close" : "Cancel"}
-                </button>
-                <button
-                  className="primary"
-                  type="submit"
-                  disabled={operationBusy}
-                >
-                  {operationBusy ? (
-                    <Spinner />
-                  ) : operation.cli ? (
-                    <TerminalSquare size={15} />
-                  ) : operation.id === "new" ? (
-                    <Plus size={15} />
-                  ) : (
-                    <ArrowUpRight size={15} />
-                  )}{" "}
-                  {operation.cli
-                    ? "Open terminal"
-                    : operationAction(operation, result !== undefined)}
-                </button>
-              </div>
-            </footer>
-          </form>
-        </Dialog>
-      )}
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void execute();
+                }}
+              >
+                <div className="operation-fields">
+                  {fixedThread && (
+                    // Still the form's value, for the QA suites and the hub.
+                    <input
+                      type="hidden"
+                      id="field-thread"
+                      value={values.thread ?? ""}
+                    />
+                  )}
+                  {essential.map(renderField)}
+                  {(advanced.length > 0 || (cwd && cwdAdvanced)) && (
+                    <details
+                      className="more-options"
+                      open={moreOpen}
+                      onToggle={(event) =>
+                        setMoreOpen(event.currentTarget.open)
+                      }
+                    >
+                      <summary>More options</summary>
+                      <div className="more-options-fields">
+                        {advanced.map(renderField)}
+                        {cwdAdvanced && cwd}
+                      </div>
+                    </details>
+                  )}
+                  {!cwdAdvanced && cwd}
+                  {operation.cli && (
+                    <p className="form-note">
+                      Runs in this workspace’s embedded terminal. Any
+                      interactive confirmation or login stays there.
+                    </p>
+                  )}
+
+                  {result !== undefined && (
+                    <div className="operation-result">
+                      {operation.id === "job-log" ? (
+                        <JobLog job={values.job} rpc={rpc} />
+                      ) : operation.id === "access" ? (
+                        <AccessResult value={result} />
+                      ) : operation.id === "context-read" ? (
+                        <ContextEditor
+                          key={values.project + ":" + result.hash}
+                          value={result}
+                          project={values.project}
+                          rpc={rpc}
+                          fail={fail}
+                        />
+                      ) : (
+                        <CommandResult
+                          method={operation.method}
+                          value={result}
+                          values={values}
+                          onOpenThread={(id) => {
+                            setOperation(undefined);
+                            setDestination(id);
+                            setSelected(undefined);
+                            setSection("chat");
+                          }}
+                          onOpenLink={(url) =>
+                            void hostApi.openExternal(url).catch(fail)
+                          }
+                          onUpdateSettings={() => {
+                            setOperation(undefined);
+                            setSection("settings");
+                          }}
+                          onError={fail}
+                        />
+                      )}
+                    </div>
+                  )}
+                </div>
+                <footer className="dialog-footer">
+                  <span>In {workspace}</span>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => setOperation(undefined)}
+                      disabled={operationBusy}
+                    >
+                      {result !== undefined ? "Close" : "Cancel"}
+                    </button>
+                    <button
+                      className="primary"
+                      type="submit"
+                      disabled={operationBusy}
+                    >
+                      {operationBusy ? (
+                        <Spinner />
+                      ) : operation.cli ? (
+                        <TerminalSquare size={15} />
+                      ) : operation.id === "new" ? (
+                        <Plus size={15} />
+                      ) : (
+                        <ArrowUpRight size={15} />
+                      )}{" "}
+                      {operation.cli
+                        ? "Open terminal"
+                        : operationAction(operation, result !== undefined)}
+                    </button>
+                  </div>
+                </footer>
+              </form>
+            </Dialog>
+          );
+        })()}
       {confirmation && (
         <Dialog
           title={confirmation.title}
@@ -4962,11 +5128,11 @@ export default function App({
                   required
                   placeholder="e.g. client-project"
                 />
-                <span className="visually-hidden" id="twr-workspace-name-hint">
-                  Lowercase letters, numbers and hyphens, starting with a letter
-                  or number; up to 32 characters.
-                </span>
               </label>
+              <span className="visually-hidden" id="twr-workspace-name-hint">
+                Lowercase letters, numbers and hyphens, starting with a letter
+                or number; up to 32 characters.
+              </span>
               <button className="primary">
                 <Plus size={15} />
                 Create workspace

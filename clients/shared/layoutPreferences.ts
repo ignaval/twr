@@ -100,3 +100,30 @@ export function useLayoutPreferences() {
     () => current,
   );
 }
+
+/** Settings › Layout & text's sizes, before system scaling: the defaults are the second,
+ * the largest the most each setting allows. */
+export const TEXT_SIZE_PRESETS = {
+  textSize: [12, 13, 16, 22],
+  codeSize: [11, 13, 16, 24],
+} as const;
+const SIZE_NAMES = ["Small", "Default", "Large", "Extra large"];
+
+/** A text size select's choices: the presets in words, and a size set another way (an
+ * earlier version's slider) as "Custom (N px)" so it still shows. */
+export function textSizeChoices(
+  kind: keyof typeof TEXT_SIZE_PRESETS,
+  current: number,
+): { value: string; label: string }[] {
+  const presets: readonly number[] = TEXT_SIZE_PRESETS[kind];
+  const choices = presets.map((size, i) => ({
+    value: String(size),
+    label: SIZE_NAMES[i],
+  }));
+  if (presets.includes(current)) return choices;
+  const custom = { value: String(current), label: `Custom (${current} px)` };
+  const at = presets.findIndex((size) => size > current);
+  return at < 0
+    ? [...choices, custom]
+    : [...choices.slice(0, at), custom, ...choices.slice(at)];
+}

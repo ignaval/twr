@@ -1533,8 +1533,8 @@ mod tests {
                 format!("{t}/latest"),
                 json!(store::latest_final_text(&conn, t).unwrap().map(|e| e.id)),
             );
-            // Each turn's transcript, but the tool calls and results of old turns (which
-            // move: `twr events` reads them from the archive).
+            // Each turn's transcript, but the thinking, tool calls and results of old turns
+            // (which move: `twr events` reads them from the archive).
             for n in 1..=5 {
                 let Ok((s, b, _)) = store::transcript_bounds(&conn, t, Some(n)) else {
                     continue;
@@ -1542,7 +1542,7 @@ mod tests {
                 let tr: Vec<String> = store::read_transcript_events(&conn, t, s, b, 500)
                     .unwrap()
                     .into_iter()
-                    .filter(|e| !e.kind().starts_with("agent.tool"))
+                    .filter(|e| !e.kind().starts_with("agent.tool") && e.kind() != "agent.thinking")
                     .map(|e| e.id)
                     .collect();
                 out.insert(format!("{t}/{n}/transcript"), json!(tr));

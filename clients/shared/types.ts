@@ -1,5 +1,11 @@
 import type { Appearance } from "./appearance";
 export type Json = any;
+/** How an action's form opens (App's `action`). `fixed`: opened from one thread (its
+ * inspector, its ⋯ menu, a slash command naming it): the form is for that thread and says
+ * so instead of asking. Otherwise a `thread` it is given is only the picker's default. */
+export interface OperationOptions {
+  fixed?: boolean;
+}
 export interface Thread {
   id: string;
   name: string;
@@ -130,6 +136,12 @@ export interface InboxSource {
   cached?: boolean;
   error?: string;
 }
+/** What a file dialog offers: its title, and the kinds of file to show (each with "All
+ * files" after them). */
+export interface FilePickRequest {
+  title?: string;
+  filters?: { name: string; extensions: string[] }[];
+}
 export interface DesktopAPI {
   sendMessage?(message: import("./offline").DurableMessage): Promise<Json>;
   inboxSources?(): Promise<InboxSource[]>;
@@ -195,6 +207,9 @@ export interface DesktopAPI {
     id: string,
   ): Promise<{ data: string; sequence: number; exited?: boolean }>;
   pickDirectory(): Promise<string | null>;
+  /** Choose a file (the desktop app's own dialog): its path, or null when cancelled.
+   * Absent where there is no file dialog (the phone, a remote hub's view). */
+  pickFile?(request?: FilePickRequest): Promise<string | null>;
   openExternal(url: string): Promise<void>;
   reveal(path: string): Promise<void>;
   configRead(): Promise<{
@@ -207,7 +222,7 @@ export interface DesktopAPI {
   configSet(
     table: string[],
     key: string,
-    value: string | number | boolean,
+    value: string | number | boolean | string[],
   ): Promise<void>;
   exportText(name: string, content: string): Promise<void>;
   onEvent(callback: (event: DesktopEvent) => void): () => void;

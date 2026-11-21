@@ -2,6 +2,7 @@ import WebSocket from "ws";
 import { z } from "zod";
 import { gatewayRequest, systemCAs } from "./gateway-network";
 import type { Hub, PairRequest } from "../shared/remote";
+import { PAIR_LIMITS, missingPairFields, pairFieldProblem } from "./pairing";
 
 export interface CredentialVault {
   ensureAvailable(): void | Promise<void>;
@@ -112,15 +113,37 @@ export class DesktopTransport {
   pair(input: PairRequest) {
     return this.mutate(async () => {
       await this.vault.ensureAvailable();
-      const request = z
+      const parsed = z
         .object({
           url: z.string(),
-          code: z.string().trim().min(4).max(128),
-          name: z.string().trim().min(1).max(80),
-          hubName: z.string().trim().min(1).max(80),
+          code: z
+            .string()
+            .trim()
+            .min(PAIR_LIMITS.codeMin)
+            .max(PAIR_LIMITS.code),
+          name: z.string().trim().min(1).max(PAIR_LIMITS.name),
+          hubName: z.string().trim().min(1).max(PAIR_LIMITS.name),
         })
         .strict()
-        .parse(input);
+        .safeParse(input);
+      // In words, never zod's issue list.
+      if (!parsed.success) {
+        const fields = input as Partial<PairRequest> | null;
+        const text = (key: keyof PairRequest) =>
+          typeof fields?.[key] === "string" ? (fields[key] as string) : "";
+        const all = {
+          url: text("url"),
+          code: text("code"),
+          hubName: text("hubName"),
+          name: text("name"),
+        };
+        throw new Error(
+          missingPairFields(all) ??
+            pairFieldProblem(all) ??
+            "The pairing details can't be used. Check them and try again.",
+        );
+      }
+      const request = parsed.data;
       const health = await this.check(request.url);
       const all = await this.all();
       if (
