@@ -1,0 +1,57 @@
+/* Runner pairing (shared/RunnerPanel.tsx): numbered steps and copyable commands. */
+.runner-steps {
+  display: grid;
+  gap: 16px;
+  margin: 12px 0;
+  padding-left: 24px;
+}
+.runner-steps > li {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.runner-steps h4 {
+  margin: 0;
+  font-size: 1rem;
+}
+.runner-steps p,
+.runner-command p {
+  margin: 0;
+  line-height: 1.5;
+}
+.runner-steps label {
+  display: grid;
+  gap: 6px;
+}
+.runner-steps .primary {
+  justify-self: start;
+}
+.runner-command {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.runner-command .code-block pre {
+  overflow-x: auto;
+}
+.runner-code {
+  user-select: all;
+  font-size: 1.15rem;
+  overflow-wrap: anywhere;
+}
+.runner-advanced {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.runner-advanced > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.runner-replace {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 8px 0;
+  line-height: 1.5;
+}
